@@ -5,6 +5,7 @@ on:
     branches: [agent/iq2-iq2-q4]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
+      - "ds4_cuda.cu"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
       - "compare-q2-hybrid-q4.sh"

@@ -6969,6 +6969,7 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
  * change any output bit as long as each individual dot keeps its order. */
 #define DS4_SCORE_TILE_HEADS 16u
 #define DS4_SCORE_TILE_ROWS 16u
+#define DS4_SCORE_TILE_ROWS_SMALL 8u
 #define DS4_SCORE_TILE_STRIDE 516u /* 512 + 4 floats: 16B-aligned rows, banks shifted by 4 */
 
 __global__ static void attention_decode_score_split_scores_tile512_kernel(
@@ -6986,7 +6987,8 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t tile_rows) {
     const bool single_all = (ratio == 0u);
     const uint32_t qpos = pos0;
     const uint32_t first_raw_pos = pos0 + 1u - n_raw;
@@ -7018,10 +7020,10 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
 
     extern __shared__ float score_tile_shared[];
     float *sh_q = score_tile_shared; /* 16 x 516 */
-    float *sh_kv = sh_q + DS4_SCORE_TILE_HEADS * DS4_SCORE_TILE_STRIDE; /* 16 x 516 */
+    float *sh_kv = sh_q + DS4_SCORE_TILE_HEADS * DS4_SCORE_TILE_STRIDE;
     __shared__ float sh_add[DS4_SCORE_TILE_ROWS];
 
-    const uint32_t g_base = blockIdx.x * DS4_SCORE_TILE_ROWS;
+    const uint32_t g_base = blockIdx.x * tile_rows;
     const uint32_t h_base = blockIdx.y * DS4_SCORE_TILE_HEADS;
     if (g_base >= n_score || h_base >= n_head) return;
 
@@ -7039,7 +7041,7 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
         }
     }
     /* Row classification + mask staging (thread per row). */
-    if (threadIdx.x < DS4_SCORE_TILE_ROWS) {
+    if (threadIdx.x < tile_rows) {
         const uint32_t g = g_base + threadIdx.x;
         float add = -INFINITY;
         if (g < n_score) {
@@ -7059,7 +7061,7 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
         const uint32_t rows_per_pass = blockDim.x >> 7u; /* 128 threads per row */
         const uint32_t rr0 = threadIdx.x >> 7u;
         const uint32_t dd = threadIdx.x & 127u;
-        for (uint32_t r = rr0; r < DS4_SCORE_TILE_ROWS; r += rows_per_pass) {
+        for (uint32_t r = rr0; r < tile_rows; r += rows_per_pass) {
             const uint32_t g = g_base + r;
             if (g >= n_score) continue;
             const bool visible = g < raw_count || sh_add[r] > -1.0e20f;
@@ -7079,16 +7081,16 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
     }
     __syncthreads();
 
-    /* One score per thread: r = tid&15 (consecutive threads, coalesced score
-     * writes), h = tid>>4. The dot keeps the reference kernel's exact scalar
-     * ascending-d accumulation. */
-    const uint32_t r = threadIdx.x & (DS4_SCORE_TILE_ROWS - 1u);
-    const uint32_t h = h_base + (threadIdx.x >> 4u);
+    /* One score per thread. The dot keeps the reference kernel's exact scalar
+     * ascending-d accumulation for both the 16- and 8-row host layouts. */
+    const uint32_t r = threadIdx.x % tile_rows;
+    const uint32_t h_in_tile = threadIdx.x / tile_rows;
+    const uint32_t h = h_base + h_in_tile;
     const uint32_t g = g_base + r;
     if (h >= n_head || g >= n_score) return;
     const float scale = rsqrtf((float)head_dim);
     float *row_scores = score_out + (uint64_t)h * n_score;
-    const float *qh = sh_q + (uint64_t)(threadIdx.x >> 4u) * DS4_SCORE_TILE_STRIDE;
+    const float *qh = sh_q + (uint64_t)h_in_tile * DS4_SCORE_TILE_STRIDE;
     const float *kvrow = sh_kv + (uint64_t)r * DS4_SCORE_TILE_STRIDE;
     float s = -INFINITY;
     const bool need_dot = g < raw_count || sh_add[r] > -1.0e20f;
@@ -7137,7 +7139,8 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
         uint32_t n_rows,
         uint32_t score_stride,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t tile_rows) {
     const uint32_t row = blockIdx.z;
     if (row >= n_rows) return;
     const ds4_gpu_attention_decode_row dsc = rows.row[row];
@@ -7179,7 +7182,7 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
     float *sh_q = score_tile_shared;
     float *sh_kv = sh_q + DS4_SCORE_TILE_HEADS * DS4_SCORE_TILE_STRIDE;
 
-    const uint32_t g_base = blockIdx.x * DS4_SCORE_TILE_ROWS;
+    const uint32_t g_base = blockIdx.x * tile_rows;
     const uint32_t h_base = blockIdx.y * DS4_SCORE_TILE_HEADS;
     if (g_base >= n_score || h_base >= n_head) return;
 
@@ -7204,7 +7207,7 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
         const uint32_t rows_per_pass = blockDim.x >> 7u;
         const uint32_t rr0 = threadIdx.x >> 7u;
         const uint32_t dd = threadIdx.x & 127u;
-        for (uint32_t r = rr0; r < DS4_SCORE_TILE_ROWS; r += rows_per_pass) {
+        for (uint32_t r = rr0; r < tile_rows; r += rows_per_pass) {
             const uint32_t g = g_base + r;
             if (g >= n_score) continue;
             const float4 *src;
@@ -7223,15 +7226,16 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
     }
     __syncthreads();
 
-    const uint32_t r = threadIdx.x & (DS4_SCORE_TILE_ROWS - 1u);
-    const uint32_t h = h_base + (threadIdx.x >> 4u);
+    const uint32_t r = threadIdx.x % tile_rows;
+    const uint32_t h_in_tile = threadIdx.x / tile_rows;
+    const uint32_t h = h_base + h_in_tile;
     const uint32_t g = g_base + r;
     if (h >= n_head || g >= n_score) return;
     const float scale = rsqrtf((float)head_dim);
     float *row_scores = score_out +
         ((uint64_t)row * n_head + h) * score_stride;
     const float *qh = sh_q +
-        (uint64_t)(threadIdx.x >> 4u) * DS4_SCORE_TILE_STRIDE;
+        (uint64_t)h_in_tile * DS4_SCORE_TILE_STRIDE;
     const float *kvrow = sh_kv + (uint64_t)r * DS4_SCORE_TILE_STRIDE;
     float dot = 0.0f;
 #pragma unroll 1
@@ -7274,6 +7278,69 @@ __device__ __forceinline__ float ds4_dot512_float4_ordered(
         dot = __fadd_rn(dot, __fmul_rn(av.w, bv.w));
     }
     return dot;
+}
+
+/* Select the largest exact-score tile that fits the current device. The
+ * original 16x16 tile needs 66048 dynamic bytes, just above SM75's 64 KiB
+ * opt-in limit. A 16x8 tile keeps the important 16-head KV reuse while
+ * fitting Turing comfortably. Return zero only when neither exact tile fits. */
+static uint32_t attention_score_tile_prepare(
+        const void *kernel,
+        const char *label,
+        size_t *out_dynamic_bytes) {
+    int device = 0;
+    int max_optin = 0;
+    cudaFuncAttributes attr;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0u;
+    }
+    err = cudaDeviceGetAttribute(
+        &max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (err != cudaSuccess || max_optin <= 0) {
+        (void)cudaGetLastError();
+        return 0u;
+    }
+    err = cudaFuncGetAttributes(&attr, kernel);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0u;
+    }
+
+    const uint32_t candidates[] = {
+        DS4_SCORE_TILE_ROWS,
+        DS4_SCORE_TILE_ROWS_SMALL,
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        const uint32_t rows = candidates[i];
+        const size_t dynamic_bytes =
+            (size_t)(DS4_SCORE_TILE_HEADS + rows) *
+            DS4_SCORE_TILE_STRIDE * sizeof(float);
+        if (dynamic_bytes + (size_t)attr.sharedSizeBytes > (size_t)max_optin) {
+            continue;
+        }
+        err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)dynamic_bytes);
+        if (err == cudaSuccess) {
+            if (out_dynamic_bytes) *out_dynamic_bytes = dynamic_bytes;
+            if (rows != DS4_SCORE_TILE_ROWS) {
+                fprintf(stderr,
+                        "ds4: CUDA %s using %ux%u tile on device %d "
+                        "(%.2f KiB dynamic shared memory)\n",
+                        label, DS4_SCORE_TILE_HEADS, rows, device,
+                        (double)dynamic_bytes / 1024.0);
+            }
+            return rows;
+        }
+        (void)cudaGetLastError();
+    }
+    fprintf(stderr,
+            "ds4: CUDA %s disabled on device %d; shared-memory limit is "
+            "%.2f KiB\n",
+            label, device, (double)max_optin / 1024.0);
+    return 0u;
 }
 
 __device__ __forceinline__ float ds4_dot512_float4_plain(
@@ -8295,40 +8362,39 @@ static int attention_decode_score_split_launch(
     if (score_tile_disabled < 0) {
         score_tile_disabled = getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ? 1 : 0;
     }
-    if (!score_tile_disabled &&
+    const bool tile_candidate =
+        !score_tile_disabled &&
         head_dim == 512u &&
         !use_ldg_scores &&
         !use_vec4_plain_scores &&
-        !use_vec4_scores) {
-        /* cudaFuncSetAttribute() applies to the current device only, so opt in
-         * to >48KB dynamic shared memory once per device. */
-        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
-        const size_t tile_shmem =
-            (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
-            DS4_SCORE_TILE_STRIDE * sizeof(float);
-        int tile_dev = 0;
-        cudaGetDevice(&tile_dev);
-        if (tile_dev >= 0 && tile_dev < DS4_MAX_GPUS &&
-            !tile_shmem_ready[tile_dev]) {
-            if (!cuda_ok(cudaFuncSetAttribute(
-                             attention_decode_score_split_scores_tile512_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)tile_shmem),
-                         "attention score tile shared-memory opt-in")) {
-                score_tile_disabled = 1;
-            }
-            tile_shmem_ready[tile_dev] = 1;
+        !use_vec4_scores;
+    uint32_t tile_rows = 0u;
+    size_t tile_shmem = 0u;
+    if (tile_candidate && logical_tier >= 0 && logical_tier < DS4_MAX_GPUS) {
+        /* cudaFuncSetAttribute() applies to the current device only. Cache
+         * the selected 16- or 8-row layout per logical tier. */
+        static int tile_prepared[DS4_MAX_GPUS] = {0};
+        static uint32_t tile_rows_ready[DS4_MAX_GPUS] = {0};
+        static size_t tile_shmem_ready[DS4_MAX_GPUS] = {0};
+        if (!tile_prepared[logical_tier]) {
+            tile_rows_ready[logical_tier] = attention_score_tile_prepare(
+                (const void *)attention_decode_score_split_scores_tile512_kernel,
+                "attention exact-score", &tile_shmem_ready[logical_tier]);
+            tile_prepared[logical_tier] = 1;
         }
-        if (score_tile_disabled) {
-            return 0; /* retry via the generic path on the next call */
-        }
-        dim3 tile_grid((n_score + DS4_SCORE_TILE_ROWS - 1u) / DS4_SCORE_TILE_ROWS,
+        tile_rows = tile_rows_ready[logical_tier];
+        tile_shmem = tile_shmem_ready[logical_tier];
+    }
+    if (tile_candidate && tile_rows != 0u) {
+        dim3 tile_grid((n_score + tile_rows - 1u) / tile_rows,
                        (n_head + DS4_SCORE_TILE_HEADS - 1u) / DS4_SCORE_TILE_HEADS,
                        1);
-        attention_decode_score_split_scores_tile512_kernel<<<tile_grid, 256, tile_shmem>>>(
+        const uint32_t tile_threads = DS4_SCORE_TILE_HEADS * tile_rows;
+        attention_decode_score_split_scores_tile512_kernel
+            <<<tile_grid, tile_threads, tile_shmem>>>(
                 scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim);
+                n_head, head_dim, tile_rows);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split tile launch")) return -1;
     } else {
     dim3 score_grid(1, n_head, S);
@@ -14804,35 +14870,28 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
             "attention exact decode rows");
         if (!scores) return 0;
 
-        const size_t tile_shmem =
-            (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
-            DS4_SCORE_TILE_STRIDE * sizeof(float);
-        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
-        int physical_device = 0;
-        if (cudaGetDevice(&physical_device) != cudaSuccess ||
-            physical_device < 0 || physical_device >= DS4_MAX_GPUS) {
-            return 0;
+        static int tile_prepared[DS4_MAX_GPUS] = {0};
+        static uint32_t tile_rows_ready[DS4_MAX_GPUS] = {0};
+        static size_t tile_shmem_ready[DS4_MAX_GPUS] = {0};
+        if (!tile_prepared[logical_tier]) {
+            tile_rows_ready[logical_tier] = attention_score_tile_prepare(
+                (const void *)attention_decode_score_split_scores_tile512_rows_kernel,
+                "attention exact-score rows", &tile_shmem_ready[logical_tier]);
+            tile_prepared[logical_tier] = 1;
         }
-        if (!tile_shmem_ready[physical_device]) {
-            if (!cuda_ok(cudaFuncSetAttribute(
-                    attention_decode_score_split_scores_tile512_rows_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)tile_shmem),
-                    "attention score rows shared-memory opt-in")) {
-                return 0;
-            }
-            tile_shmem_ready[physical_device] = 1;
-        }
+        const uint32_t tile_rows = tile_rows_ready[logical_tier];
+        const size_t tile_shmem = tile_shmem_ready[logical_tier];
+        if (tile_rows == 0u) return 0;
         dim3 score_grid(
-            (max_dense_score + DS4_SCORE_TILE_ROWS - 1u) /
-                DS4_SCORE_TILE_ROWS,
+            (max_dense_score + tile_rows - 1u) / tile_rows,
             (n_head + DS4_SCORE_TILE_HEADS - 1u) /
                 DS4_SCORE_TILE_HEADS,
             n_rows);
+        const uint32_t tile_threads = DS4_SCORE_TILE_HEADS * tile_rows;
         attention_decode_score_split_scores_tile512_rows_kernel
-            <<<score_grid, 256, tile_shmem>>>(
+            <<<score_grid, tile_threads, tile_shmem>>>(
                 scores, (const float *)q->ptr, table, n_rows,
-                max_dense_score, n_head, head_dim);
+                max_dense_score, n_head, head_dim, tile_rows);
         if (!cuda_ok(cudaGetLastError(),
                      "attention exact score rows launch")) {
             return 0;
