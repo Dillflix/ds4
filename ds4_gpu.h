@@ -92,6 +92,14 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Nsight Systems capture control.  These wrappers exist only in the CUDA
+ * build; callers must keep them behind the same platform guards.  They do not
+ * add events or synchronization to the measured command streams. */
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+int ds4_gpu_profiler_start(void);
+int ds4_gpu_profiler_stop(void);
+#endif
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

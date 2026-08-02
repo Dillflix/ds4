@@ -6,8 +6,11 @@ on:
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
+      - "ds4_bench.c"
       - "ds4_cuda.cu"
       - "ds4_gpu.h"
+      - "Makefile"
+      - "speed-bench/cuda-prefill-audit.sh"
       - "tests/cuda_long_context_smoke.c"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
@@ -36,4 +39,5 @@ jobs:
       - name: Check comparison suite tools
         run: |
           bash -n compare-q2-hybrid-q4.sh
+          bash -n speed-bench/cuda-prefill-audit.sh
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py

@@ -2,6 +2,9 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#include "ds4_gpu.h"
+#endif
 
 /* Purpose-built throughput benchmark.
  *
@@ -679,6 +682,12 @@ int main(int argc, char **argv) {
     char err[256];
     int previous = 0;
     int rc = 0;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const bool nsys_capture_prefill =
+        cfg.backend == DS4_BACKEND_CUDA &&
+        getenv("DS4_NSYS_CAPTURE_PREFILL") != NULL;
+    bool nsys_capture_done = false;
+#endif
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
         ds4_tokens prefix = {
@@ -687,6 +696,20 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        const bool capture_this_prefill =
+            nsys_capture_prefill && !nsys_capture_done;
+        if (capture_this_prefill) {
+            fprintf(stderr,
+                    "ds4-bench: starting Nsight CUDA capture for prefill frontier %d\n",
+                    frontier);
+            if (!ds4_gpu_profiler_start()) {
+                fprintf(stderr, "ds4-bench: failed to start Nsight CUDA capture\n");
+                rc = 1;
+                break;
+            }
+        }
+#endif
         const double prefill_t0 = bench_now_sec();
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
@@ -694,6 +717,19 @@ int main(int argc, char **argv) {
             break;
         }
         const double prefill_t1 = bench_now_sec();
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (capture_this_prefill) {
+            if (!ds4_gpu_profiler_stop()) {
+                fprintf(stderr, "ds4-bench: failed to stop Nsight CUDA capture\n");
+                rc = 1;
+                break;
+            }
+            nsys_capture_done = true;
+            fprintf(stderr,
+                    "ds4-bench: stopped Nsight CUDA capture for prefill frontier %d\n",
+                    frontier);
+        }
+#endif
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 

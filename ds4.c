@@ -33053,6 +33053,87 @@ static bool metal_graph_build_prefill_stages(
     return ns != 0;
 }
 
+/* Print the production CUDA prefill plan without inserting timing events,
+ * stream waits, or command-buffer boundaries.  This is deliberately a
+ * structural audit: Nsight supplies the measured durations and overlap. */
+static void metal_graph_report_cuda_prefill_audit(
+        const ds4_gpu_graph               *g,
+        const metal_graph_prefill_stage   *stages,
+        uint32_t                           n_stages,
+        uint32_t                           n_tokens,
+        uint32_t                           mb_cap,
+        uint32_t                           n_mb) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+    (void)g;
+    (void)stages;
+    (void)n_stages;
+    (void)n_tokens;
+    (void)mb_cap;
+    (void)n_mb;
+#else
+    static bool reported = false;
+    if (reported || !getenv("DS4_CUDA_PREFILL_AUDIT")) return;
+    reported = true;
+
+    const uint32_t full_rows = n_tokens < mb_cap ? n_tokens : mb_cap;
+    const uint64_t hc_bytes =
+        (uint64_t)full_rows * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t norm_bytes =
+        (uint64_t)full_rows * DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)full_rows * DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t weights_bytes =
+        (uint64_t)full_rows * DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t routed_out_bytes = norm_bytes;
+    const uint32_t waves = n_mb + n_stages - 1u;
+
+    fprintf(stderr,
+            "ds4: CUDA prefill audit tokens=%u microbatch_cap=%u microbatches=%u stages=%u waves=%u\n",
+            n_tokens, mb_cap, n_mb, n_stages, waves);
+    fprintf(stderr,
+            "ds4: CUDA prefill audit features pipeline=1 expert_parallel=%d q8_f16_cache=%d attention_head_split=%d\n",
+            g->cuda_tp_ep ? 1 : 0,
+            metal_graph_cuda_prefill_pipeline_q8_cache_requested() ? 1 : 0,
+            g->cuda_tp_prefill_attn_heads ? 1 : 0);
+    for (uint32_t s = 0; s < n_stages; s++) {
+        const uint32_t layers = stages[s].end_layer - stages[s].first_layer;
+        const int partner = metal_graph_cuda_tp_partner_tier(stages[s].tier);
+        fprintf(stderr,
+                "ds4: CUDA prefill audit stage=%u home_tier=%d partner_tier=%d layers=[%u,%u) count=%u\n",
+                s, stages[s].tier, partner, stages[s].first_layer,
+                stages[s].end_layer, layers);
+        if (g->cuda_tp_ep && partner >= 0) {
+            fprintf(stderr,
+                    "ds4: CUDA prefill audit stage=%u per_layer_full_microbatch home_to_partner=%llu bytes (norm=%llu selected=%llu weights=%llu) partner_to_home=%llu bytes (routed_out)\n",
+                    s,
+                    (unsigned long long)(norm_bytes + selected_bytes + weights_bytes),
+                    (unsigned long long)norm_bytes,
+                    (unsigned long long)selected_bytes,
+                    (unsigned long long)weights_bytes,
+                    (unsigned long long)routed_out_bytes);
+        }
+    }
+    for (uint32_t s = 0; s + 1u < n_stages; s++) {
+        fprintf(stderr,
+                "ds4: CUDA prefill audit boundary=%u->%u per_full_microbatch=%llu bytes (HC=%u x embedding=%u x rows=%u x fp32)\n",
+                s, s + 1u, (unsigned long long)hc_bytes,
+                DS4_N_HC, DS4_N_EMBD, full_rows);
+    }
+    for (uint32_t wave = 0; wave < waves; wave++) {
+        fprintf(stderr, "ds4: CUDA prefill audit wave=%u", wave);
+        uint32_t smax = wave < n_stages ? wave : n_stages - 1u;
+        for (int si = (int)smax; si >= 0; si--) {
+            const uint32_t stage_i = (uint32_t)si;
+            const uint32_t mb_i = wave - stage_i;
+            if (mb_i < n_mb) {
+                fprintf(stderr, " stage%u:mb%u", stage_i, mb_i);
+            }
+        }
+        fputc('\n', stderr);
+    }
+#endif
+}
+
 static bool metal_graph_encode_prefill_stage_batch(
         ds4_gpu_graph              *g,
         const ds4_model            *model,
@@ -33120,6 +33201,9 @@ static bool metal_graph_prefill_pipeline_stage_major(
     if (mb_cap > g->prefill_cap) mb_cap = g->prefill_cap;
     const uint32_t n_mb = (n_tokens + mb_cap - 1u) / mb_cap;
     if (n_mb < 2) return false;
+
+    metal_graph_report_cuda_prefill_audit(
+            g, stages, n_stages, n_tokens, mb_cap, n_mb);
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);

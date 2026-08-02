@@ -26,3 +26,32 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
+
+### CUDA prefill audit
+
+`cuda-prefill-audit.sh` captures both an ordinary 2K measurement and an Nsight
+Systems trace of the same production pipeline. The trace starts after model
+loading and workspace allocation, so the report contains the prefill itself
+rather than the roughly 100 GiB model-residency setup. It also records the GPU
+inventory and topology, NUMA layout, exact pipeline schedule and transfer-byte
+accounting, GPU telemetry, kernel/API summaries, and the raw `.nsys-rep` and
+SQLite trace.
+
+The audit explicitly selects the established baseline: Q8-to-F16 cache and the
+two-stage pipeline on, experimental attention head splitting off. It does not
+enable the existing event-based MoE, attention-output, or layer-stage profilers;
+those synchronize streams and alter the schedule being measured.
+
+```bash
+cd ~/ds4-iq2-q4
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+./speed-bench/cuda-prefill-audit.sh
+```
+
+The default logical tier order is `0,2,1,3`. On a machine whose physical
+NVLink pairs are `0<->1` and `2<->3`, this makes logical tier 2 the partner of
+tier 0 and logical tier 3 the partner of tier 1 while the two pipeline homes
+remain logical tiers 0 and 1. Override `GPU_DEVICES` only when the physical
+topology differs.
