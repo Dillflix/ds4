@@ -9370,7 +9370,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head_total + head) * head_dim)
+        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
@@ -9839,7 +9839,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        ? (const float4 *)(q + ((uint64_t)t * n_head_total + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
@@ -16144,6 +16144,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
     return ok;
 }
+extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups_total, uint32_t group0, uint32_t group_cnt,
+        const ds4_gpu_tensor *heads, uint32_t n_rows);
+
 extern "C" int ds4_gpu_attention_output_q8_batch_shard_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,
