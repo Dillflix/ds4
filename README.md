@@ -749,9 +749,13 @@ caches. An explicit `--prefill-chunk` remains an override for other topologies.
 On Turing (`sm_75`), prefill uses native `mma.sync.m8n8k16` INT8 tensor-core
 tiles for dense Q8 matrices and for IQ2_XXS routed-expert gate/up matrices.
 The IQ2 path applies its group scale after the integer MMA, preserving the
-existing quantized dot product. For regression diagnosis only, the individual
-paths can be disabled with `DS4_CUDA_NO_Q8_MMA_SM75=1` and
-`DS4_CUDA_MOE_NO_IQ2_MMA_SM75=1`, respectively.
+existing quantized dot product. Large prefill batches group 16 routed pairs per
+expert for IQ2_XXS gate/up and Q4_K down, reusing each expert weight fragment
+across two 8-token Turing MMA halves. For regression diagnosis only, the paths
+can be disabled with `DS4_CUDA_NO_Q8_MMA_SM75=1`,
+`DS4_CUDA_MOE_NO_IQ2_MMA_SM75=1`,
+`DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75=1`, and
+`DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75=1`.
 
 Any even card count that can hold the selected model and graph scratch is a
 valid topology. On this class of 48 GB card, the useful measured endpoints are

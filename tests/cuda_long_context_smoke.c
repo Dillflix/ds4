@@ -110,7 +110,7 @@ cleanup:
 static int check_sm75_iq2_moe_mma_exact(void) {
     const uint32_t n_total_expert = 8;
     const uint32_t n_expert = 6;
-    const uint32_t n_tokens = 32;
+    const uint32_t n_tokens = 128;
     const uint32_t in_dim = 4096;
     const uint32_t mid_dim = 256;
     const uint32_t out_dim = 256;
@@ -127,12 +127,15 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
     const uint64_t mid_count = pair_count * mid_dim;
     const uint64_t x_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t out_count = (uint64_t)n_tokens * out_dim;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_bytes);
     float *x_host = (float *)malloc((size_t)x_count * sizeof(float));
     int32_t *selected_host = (int32_t *)malloc((size_t)pair_count * sizeof(int32_t));
     float *weights_host = (float *)malloc((size_t)pair_count * sizeof(float));
     float *reference = (float *)malloc((size_t)mid_count * sizeof(float));
     float *candidate = (float *)malloc((size_t)mid_count * sizeof(float));
+    float *down_reference = (float *)malloc((size_t)out_count * sizeof(float));
+    float *down_candidate = (float *)malloc((size_t)out_count * sizeof(float));
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_count * sizeof(float));
     ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(pair_count * sizeof(int32_t));
     ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
@@ -143,7 +146,8 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(pair_count * out_dim * sizeof(float));
     int rc = 1;
     if (!model || !x_host || !selected_host || !weights_host ||
-        !reference || !candidate || !x || !selected || !weights || !out ||
+        !reference || !candidate || !down_reference || !down_candidate ||
+        !x || !selected || !weights || !out ||
         !gate || !up || !mid || !down) goto cleanup;
 
     for (uint32_t matrix = 0; matrix < 2u; matrix++) {
@@ -178,6 +182,25 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                         q2[j * 4u + 3u] = (uint16_t)(aux1 >> 16u);
                     }
                 }
+            }
+        }
+    }
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t row = 0; row < out_dim; row++) {
+            for (uint32_t b = 0; b < down_blocks; b++) {
+                unsigned char *blk = model + down_offset +
+                    (uint64_t)e * down_expert_bytes +
+                    (uint64_t)row * down_row_bytes + (uint64_t)b * 144u;
+                const uint16_t d = 0x2000u;    /* 1 / 128. */
+                const uint16_t dmin = 0x1800u; /* 1 / 512. */
+                memcpy(blk + 0u, &d, sizeof(d));
+                memcpy(blk + 2u, &dmin, sizeof(dmin));
+                for (uint32_t i = 0; i < 12u; i++)
+                    blk[4u + i] = (unsigned char)(
+                        (e * 29u + row * 11u + b * 7u + i * 13u) & 0xffu);
+                for (uint32_t i = 0; i < 128u; i++)
+                    blk[16u + i] = (unsigned char)(
+                        (e * 17u + row * 23u + b * 31u + i * 5u) & 0xffu);
             }
         }
     }
@@ -235,13 +258,56 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
     }
-    fprintf(stderr, "cuda-regression: sm75 iq2 moe mma exact (%llu values)\n",
+    fprintf(stderr, "cuda-regression: sm75 iq2 moe tile16 exact (%llu values)\n",
             (unsigned long long)mid_count);
+
+    (void)setenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, down_reference,
+                             out_count * sizeof(float))) goto cleanup;
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, down_candidate,
+                             out_count * sizeof(float))) goto cleanup;
+    if (memcmp(down_reference, down_candidate,
+               out_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < out_count &&
+               memcmp(down_reference + first, down_candidate + first,
+                      sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr,
+                "sm75 q4 down tile16 mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)down_reference[first],
+                (double)down_candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 q4 down tile16 exact (%llu values)\n",
+            (unsigned long long)out_count);
     rc = 0;
 
 cleanup:
     if (model && !retire_temporary_model_map()) rc = 1;
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -253,6 +319,8 @@ cleanup:
     ds4_gpu_tensor_free(x);
     free(candidate);
     free(reference);
+    free(down_candidate);
+    free(down_reference);
     free(weights_host);
     free(selected_host);
     free(x_host);

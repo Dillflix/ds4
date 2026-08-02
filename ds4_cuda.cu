@@ -19932,6 +19932,195 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
     }
 }
 
+/* One IQ2_XXS matrix pass for a 16-pair Turing tile.  The first eight Q8_K
+ * activation rows live in shared memory; the second eight are read through
+ * the read-only/L2 path while the decoded IQ2 weight fragment is still live.
+ * Staging all 16 rows would require more than SM75's 64 KiB shared-memory
+ * limit once the IQ2 lookup tables are included.  Each output retains the
+ * tile8 kernel's integer and eight-slot floating-point reduction order. */
+__device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
+        const char *wrow,
+        uint64_t row_bytes,
+        const cuda_block_q8_K (*sxq)[16],
+        const cuda_block_q8_K *xq,
+        const uint32_t *tok,
+        uint32_t np,
+        uint32_t xq_blocks,
+        uint32_t lane,
+        const uint64_t *grid,
+        const uint8_t *signs,
+        float r[4]) {
+    const uint32_t mtok_a = lane >> 2u;
+    const uint32_t mtok_b = mtok_a + 8u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const bool have_b = mtok_b < np;
+    float s0[8] = {0,0,0,0,0,0,0,0};
+    float s1[8] = {0,0,0,0,0,0,0,0};
+    float s2[8] = {0,0,0,0,0,0,0,0};
+    float s3[8] = {0,0,0,0,0,0,0,0};
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        const cuda_block_iq2_xxs *w0 =
+            (const cuda_block_iq2_xxs *)(wrow + (uint64_t)n0 * row_bytes) + b;
+        const cuda_block_iq2_xxs *w1 =
+            (const cuda_block_iq2_xxs *)(wrow + (uint64_t)(n0 + 1u) * row_bytes) + b;
+        const cuda_block_iq2_xxs *wload =
+            (const cuda_block_iq2_xxs *)(wrow + (uint64_t)(lane >> 2u) * row_bytes) + b;
+        const cuda_block_q8_K *xa = &sxq[mtok_a][b];
+        const cuda_block_q8_K *xb = have_b
+            ? xq + (uint64_t)tok[mtok_b] * xq_blocks + b
+            : xa;
+        const int8_t *aqs_a = xa->qs;
+        const int8_t *aqs_b = xb->qs;
+        int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            int32_t ca0 = 0, ca1 = 0, cb0 = 0, cb1 = 0;
+#pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                const uint32_t quarter = lane & 3u;
+                const uint32_t off = j * 32u + h * 16u + quarter * 4u;
+                const uint32_t aa = *(const uint32_t *)(aqs_a + off);
+                const uint32_t ab = have_b
+                    ? *(const uint32_t *)(aqs_b + off) : 0u;
+                const uint32_t ww = iq2_i8x4_fragment(
+                        wload, j, h, quarter, grid, signs);
+                mma_m8n8k16_s8(ca0, ca1, aa, ww);
+                mma_m8n8k16_s8(cb0, cb1, ab, ww);
+            }
+            ia0 += iq2_group_scale(w0, j) * ca0;
+            ia1 += iq2_group_scale(w1, j) * ca1;
+            ib0 += iq2_group_scale(w0, j) * cb0;
+            ib1 += iq2_group_scale(w1, j) * cb1;
+        }
+        const float yd_a = xa->d;
+        const float yd_b = have_b ? xb->d : 0.0f;
+        const float wd0 = 0.125f * dev_f16_to_f32(w0->d);
+        const float wd1 = 0.125f * dev_f16_to_f32(w1->d);
+        const uint32_t sl = b & 7u;
+        s0[sl] += wd0 * yd_a * (float)ia0;
+        s1[sl] += wd1 * yd_a * (float)ia1;
+        s2[sl] += wd0 * yd_b * (float)ib0;
+        s3[sl] += wd1 * yd_b * (float)ib1;
+    }
+    float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
+    float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
+    r[0] = (a0 + a2) + (a1 + a3);
+    a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
+    a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
+    r[1] = (a0 + a2) + (a1 + a3);
+    a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
+    a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
+    r[2] = (a0 + a2) + (a1 + a3);
+    a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
+    a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
+    r[3] = (a0 + a2) + (a1 + a3);
+}
+
+template <uint32_t ROW_SPAN>
+__global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint32_t s_pair[16], s_tok[16], s_slot[16], s_np;
+    if (threadIdx.x == 0) {
+        uint32_t np = 0;
+        for (; np < 16u; np++) {
+            const uint32_t local_pair = local_start + np;
+            if (local_pair >= counts[expert]) break;
+            const uint32_t pr = sorted_pairs[offsets[expert] + local_pair];
+            s_pair[np] = pr;
+            s_tok[np] = pr / n_expert;
+            s_slot[np] = pr - s_tok[np] * n_expert;
+        }
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t words_per_block =
+        (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+    const uint32_t words_per_tok = xq_blocks * words_per_block;
+    for (uint32_t i = threadIdx.x; i < 8u * words_per_tok; i += blockDim.x) {
+        const uint32_t p = i / words_per_tok;
+        const uint32_t w = i - p * words_per_tok;
+        ((uint32_t *)sxq[p])[w] = p < np
+            ? ((const uint32_t *)(xq + (uint64_t)s_tok[p] * xq_blocks))[w]
+            : 0u;
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x)
+        s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x)
+        s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+
+    const uint32_t mtok_a = lane >> 2u;
+    const uint32_t mtok_b = mtok_a + 8u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
+        const uint32_t row0 =
+            blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+        if (row0 >= expert_mid_dim) continue;
+        const char *grow = gate_base +
+            (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row0 * gate_row_bytes;
+        const char *urow = up_base +
+            (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row0 * gate_row_bytes;
+        float gr[4], ur[4];
+        moe_iq2_tile16_mma_sm75_pass(
+            grow, gate_row_bytes, sxq, xq, s_tok, np, xq_blocks,
+            lane, s_iq2_grid, s_iq2_signs, gr);
+        moe_iq2_tile16_mma_sm75_pass(
+            urow, gate_row_bytes, sxq, xq, s_tok, np, xq_blocks,
+            lane, s_iq2_grid, s_iq2_signs, ur);
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) {
+            const uint32_t p = e < 2u ? mtok_a : mtok_b;
+            const uint32_t row = row0 + n0 + (e & 1u);
+            if (p >= np || row >= expert_mid_dim) continue;
+            float gate = gr[e], up = ur[e];
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off =
+                (uint64_t)s_pair[p] * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up *
+                weights[(uint64_t)s_tok[p] * n_expert + s_slot[p]];
+        }
+    }
+}
+
 /* INT8 tensor-core (m8n8k16) exact MoE prefill tile kernels.
  *
  * Each warp computes an 8-token x 8-row tile. The Q4_K x Q8_K superblock dot
@@ -20206,6 +20395,171 @@ __global__ static void moe_down_q4K_tile8_mma_kernel(
             const float r1 = (a0 + a2) + (a1 + a3);
             if (row0 + n0 < out_dim) down_out[(uint64_t)s_pair[p] * out_dim + row0 + n0] = r0;
             if (row0 + n0 + 1u < out_dim) down_out[(uint64_t)s_pair[p] * out_dim + row0 + n0 + 1u] = r1;
+        }
+    }
+}
+
+/* SM75 16-pair Q4_K down tile.  Turing lacks the m16n8k32 instruction used
+ * by the Ampere tile16 kernel, so each 32-wide Q4 group is evaluated as two
+ * exact m8n8k16 operations for each 8-token half.  All 16 Q8_K activation
+ * rows fit in shared memory for the shipping 2048-wide expert down input
+ * (16 * 8 * 292 = 37,376 bytes). */
+template <uint32_t ROW_SPAN>
+__global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ cuda_block_q8_K sxq[16][8];
+    __shared__ uint32_t s_pair[16], s_np;
+    if (threadIdx.x == 0) {
+        uint32_t np = 0;
+        for (; np < 16u; np++) {
+            const uint32_t local_pair = local_start + np;
+            if (local_pair >= counts[expert]) break;
+            s_pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        }
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t words_per_block =
+        (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
+    const uint32_t words_per_tok = midq_blocks * words_per_block;
+    for (uint32_t i = threadIdx.x;
+         i < 16u * words_per_tok;
+         i += blockDim.x) {
+        const uint32_t p = i / words_per_tok;
+        const uint32_t w = i - p * words_per_tok;
+        ((uint32_t *)sxq[p])[w] = p < np
+            ? ((const uint32_t *)(midq +
+                 (uint64_t)s_pair[p] * midq_blocks))[w]
+            : 0u;
+    }
+    __syncthreads();
+
+    const uint32_t mtok_a = lane >> 2u;
+    const uint32_t mtok_b = mtok_a + 8u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
+        const uint32_t row0 =
+            blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+        if (row0 >= out_dim) continue;
+        const char *wrow = down_base +
+            (uint64_t)expert * down_expert_bytes +
+            (uint64_t)row0 * down_row_bytes;
+        float s0[8] = {0,0,0,0,0,0,0,0};
+        float s1[8] = {0,0,0,0,0,0,0,0};
+        float s2[8] = {0,0,0,0,0,0,0,0};
+        float s3[8] = {0,0,0,0,0,0,0,0};
+        for (uint32_t b = 0; b < midq_blocks; b++) {
+            const uint4 hdr0 = *(const uint4 *)(
+                (const cuda_block_q4_K *)(wrow +
+                    (uint64_t)n0 * down_row_bytes) + b);
+            const uint4 hdr1 = *(const uint4 *)(
+                (const cuda_block_q4_K *)(wrow +
+                    (uint64_t)(n0 + 1u) * down_row_bytes) + b);
+            const uint32_t *wqw = (const uint32_t *)(
+                ((const cuda_block_q4_K *)(wrow +
+                    (uint64_t)(lane >> 2u) * down_row_bytes) + b)->qs);
+            const cuda_block_q8_K *xa = &sxq[mtok_a][b];
+            const cuda_block_q8_K *xb = &sxq[mtok_b][b];
+            uint32_t w8[8];
+#pragma unroll
+            for (uint32_t k = 0; k < 8u; k++)
+                w8[k] = wqw[k * 4u + (lane & 3u)];
+            int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
+            int ma0 = 0, ma1 = 0, mb0 = 0, mb1 = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                const int shift = (j & 1u) ? 4 : 0;
+                int32_t ca0 = 0, ca1 = 0, cb0 = 0, cb1 = 0;
+#pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const uint32_t off =
+                        j * 32u + h * 16u + (lane & 3u) * 4u;
+                    const uint32_t aa =
+                        *(const uint32_t *)(xa->qs + off);
+                    const uint32_t ab =
+                        *(const uint32_t *)(xb->qs + off);
+                    const uint32_t ww =
+                        (w8[(j >> 1u) * 2u + h] >> shift) &
+                        0x0f0f0f0fu;
+                    mma_m8n8k16_s8(ca0, ca1, aa, ww);
+                    mma_m8n8k16_s8(cb0, cb1, ab, ww);
+                }
+                uint8_t sc0, sm0, sc1, sm1;
+                dev_q4_K_get_scale_min(
+                    j, (const uint8_t *)&hdr0.y, &sc0, &sm0);
+                dev_q4_K_get_scale_min(
+                    j, (const uint8_t *)&hdr1.y, &sc1, &sm1);
+                const int bs_a = (int)xa->bsums[2u * j] +
+                                 (int)xa->bsums[2u * j + 1u];
+                const int bs_b = (int)xb->bsums[2u * j] +
+                                 (int)xb->bsums[2u * j + 1u];
+                ia0 += (int)sc0 * ca0;
+                ia1 += (int)sc1 * ca1;
+                ib0 += (int)sc0 * cb0;
+                ib1 += (int)sc1 * cb1;
+                ma0 += (int)sm0 * bs_a;
+                ma1 += (int)sm1 * bs_a;
+                mb0 += (int)sm0 * bs_b;
+                mb1 += (int)sm1 * bs_b;
+            }
+            const float yd_a = xa->d, yd_b = xb->d;
+            const float d0 =
+                dev_f16_to_f32((uint16_t)(hdr0.x & 0xffffu));
+            const float m0 =
+                dev_f16_to_f32((uint16_t)(hdr0.x >> 16u));
+            const float d1 =
+                dev_f16_to_f32((uint16_t)(hdr1.x & 0xffffu));
+            const float m1 =
+                dev_f16_to_f32((uint16_t)(hdr1.x >> 16u));
+            const uint32_t sl = b & 7u;
+            s0[sl] += yd_a * d0 * (float)ia0 -
+                      yd_a * m0 * (float)ma0;
+            s1[sl] += yd_a * d1 * (float)ia1 -
+                      yd_a * m1 * (float)ma1;
+            s2[sl] += yd_b * d0 * (float)ib0 -
+                      yd_b * m0 * (float)mb0;
+            s3[sl] += yd_b * d1 * (float)ib1 -
+                      yd_b * m1 * (float)mb1;
+        }
+        float out4[4];
+        float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
+        float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
+        out4[0] = (a0 + a2) + (a1 + a3);
+        a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
+        a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
+        out4[1] = (a0 + a2) + (a1 + a3);
+        a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
+        a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
+        out4[2] = (a0 + a2) + (a1 + a3);
+        a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
+        a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
+        out4[3] = (a0 + a2) + (a1 + a3);
+#pragma unroll
+        for (uint32_t e = 0; e < 4u; e++) {
+            const uint32_t p = e < 2u ? mtok_a : mtok_b;
+            const uint32_t row = row0 + n0 + (e & 1u);
+            if (p < np && row < out_dim)
+                down_out[(uint64_t)s_pair[p] * out_dim + row] = out4[e];
         }
     }
 }
@@ -21403,10 +21757,20 @@ static int routed_moe_launch(
             expert_tile_m == 8u && n_tokens > 1u && xq_blocks <= 16u &&
             (expert_mid_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75") == NULL;
+        const uint32_t use_iq2_mma_sm75_tile16 = use_iq2_mma_sm75 &&
+            n_tokens >= 128u &&
+            getenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75") == NULL;
+        const uint32_t use_q4_down_mma_sm75_tile16 =
+            down_q4k && use_expert_tiles && expert_tile_m == 8u &&
+            n_tokens >= 128u && midq_blocks <= 8u &&
+            (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
+            getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
+            getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75") == NULL;
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_any_tile16 = use_down_tile16 ||
-            use_q4_gate_mma_tiles16 || use_q4_down_mma_tiles16;
+            use_q4_gate_mma_tiles16 || use_q4_down_mma_tiles16 ||
+            use_iq2_mma_sm75_tile16 || use_q4_down_mma_sm75_tile16;
         const uint32_t use_small_sorted_prep =
             owned_filtered && (gate_q4k || down_q4k) &&
             n_tokens <= 16u && pair_count <= 96u &&
@@ -21733,7 +22097,54 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     }
                 } else if (use_iq2_mma_sm75) {
-                    if (!use_gate_row2048) {
+                    if (use_iq2_mma_sm75_tile16 && tile16_total &&
+                        tile16_experts && tile16_starts) {
+                        if (!use_gate_row2048) {
+                            dim3 tgrid((expert_mid_dim + 63u) / 64u,
+                                       tile16_capacity, 1);
+                            moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<64><<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr,
+                                (float *)mid->ptr, gate_w, up_w, xq,
+                                sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert, write_gate_up, clamp);
+                        } else if (gate_row_span == 512u) {
+                            dim3 tgrid((expert_mid_dim + 511u) / 512u,
+                                       tile16_capacity, 1);
+                            moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512><<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr,
+                                (float *)mid->ptr, gate_w, up_w, xq,
+                                sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert, write_gate_up, clamp);
+                        } else if (gate_row_span == 1024u) {
+                            dim3 tgrid((expert_mid_dim + 1023u) / 1024u,
+                                       tile16_capacity, 1);
+                            moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<1024><<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr,
+                                (float *)mid->ptr, gate_w, up_w, xq,
+                                sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert, write_gate_up, clamp);
+                        } else {
+                            dim3 tgrid((expert_mid_dim + 2047u) / 2048u,
+                                       tile16_capacity, 1);
+                            moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<2048><<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr,
+                                (float *)mid->ptr, gate_w, up_w, xq,
+                                sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert, write_gate_up, clamp);
+                        }
+                    } else if (!use_gate_row2048) {
                         dim3 tgrid((expert_mid_dim + 63u) / 64u,
                                    tile_capacity, 1);
                         moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<64><<<tgrid, 256>>>(
@@ -22162,10 +22573,39 @@ static int routed_moe_launch(
                     const int use_q4_down_mma = cuda_q4_mma_ok() &&
                         ((((uintptr_t)down_w | down_row_bytes | down_expert_bytes) & 15u) == 0u) &&
                         midq_blocks <= 8u && (out_dim & 7u) == 0u;
-                    const int use_q4_down_t16 = use_q4_down_mma && use_q4_down_mma_tiles16 &&
+                    const int use_q4_down_t16_sm75 = use_q4_down_mma &&
+                        use_q4_down_mma_sm75_tile16 &&
+                        tile16_total && tile16_experts && tile16_starts;
+                    const int use_q4_down_t16_sm80 = use_q4_down_mma && use_q4_down_mma_tiles16 &&
                         tile16_total && tile16_experts && tile16_starts &&
                         midq_blocks <= 16u && cuda_q4_mma_tile16_shmem_ok(1);
-                    if (use_q4_down_t16 && use_q4_down_rowspan) {
+                    if (use_q4_down_t16_sm75 && use_q4_down_rowspan) {
+                        if (down_row_span == 512u) {
+                            dim3 tgrid((out_dim + 511u) / 512u, tile16_capacity, 1);
+                            moe_down_q4K_tile16_mma_sm75_kernel<512><<<tgrid, 256>>>(
+                                (float *)down->ptr,
+                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                down_expert_bytes, down_row_bytes,
+                                midq_blocks, out_dim, n_expert);
+                        } else if (down_row_span == 1024u) {
+                            dim3 tgrid((out_dim + 1023u) / 1024u, tile16_capacity, 1);
+                            moe_down_q4K_tile16_mma_sm75_kernel<1024><<<tgrid, 256>>>(
+                                (float *)down->ptr,
+                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                down_expert_bytes, down_row_bytes,
+                                midq_blocks, out_dim, n_expert);
+                        } else {
+                            dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
+                            moe_down_q4K_tile16_mma_sm75_kernel<2048><<<tgrid, 256>>>(
+                                (float *)down->ptr,
+                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile16_total, tile16_experts, tile16_starts,
+                                down_expert_bytes, down_row_bytes,
+                                midq_blocks, out_dim, n_expert);
+                        }
+                    } else if (use_q4_down_t16_sm80 && use_q4_down_rowspan) {
                         const unsigned t16cap = (unsigned)((pair_count + 15u) / 16u + n_total_expert);
                         const size_t dt16sh = 16u * (size_t)midq_blocks * sizeof(cuda_block_q8_K);
                         if (down_row_span == 512u) {
