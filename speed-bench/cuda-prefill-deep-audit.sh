@@ -372,11 +372,17 @@ ncu_capture() {
 if [[ $RUN_NCU == 1 ]]; then
     current_phase=nsight-compute
     command -v ncu >/dev/null 2>&1 || die "Nsight Compute CLI (ncu) not found"
-    ncu_command=(ncu)
+    ncu_bin=$(command -v ncu)
+    [[ $ncu_bin == /* && -x $ncu_bin ]] ||
+        die "cannot resolve ncu to an absolute executable path: $ncu_bin"
+    ncu_command=("$ncu_bin")
     if [[ $NCU_USE_SUDO == 1 ]]; then
         command -v sudo >/dev/null 2>&1 || die "NCU_USE_SUDO=1 but sudo is not found"
         sudo -v
-        ncu_command=(sudo -E ncu)
+        # sudo commonly replaces PATH with secure_path, which may omit the
+        # Nsight Compute installation directory. Preserve the exact binary
+        # selected and recorded above rather than resolving `ncu` as root.
+        ncu_command=(sudo -E "$ncu_bin")
     fi
     ncu_failed=0
     ncu_capture \
