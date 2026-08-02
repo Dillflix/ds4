@@ -9459,7 +9459,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         __syncthreads();
     }
     if (valid_head) {
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head_total + head) * head_dim);
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -9923,7 +9923,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head_total + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
