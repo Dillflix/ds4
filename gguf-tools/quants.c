@@ -721,6 +721,9 @@ typedef struct {
     uint64_t *grid;
     int *map;
     uint16_t *neighbours;
+    size_t grid_len;
+    size_t map_len;
+    size_t neighbours_len;
 } ds4q_iq2_data;
 
 static ds4q_iq2_data ds4q_iq2_xxs_data;
@@ -847,6 +850,9 @@ static void ds4q_iq2_xxs_init(void) {
     ds4q_iq2_xxs_data.map = map;
     ds4q_iq2_xxs_data.neighbours = neighbours;
     ds4q_iq2_xxs_data.grid = grid;
+    ds4q_iq2_xxs_data.grid_len = grid_size;
+    ds4q_iq2_xxs_data.map_len = map_size;
+    ds4q_iq2_xxs_data.neighbours_len = (size_t)(num_neighbors + num_not_in_map);
     pthread_mutex_unlock(&ds4q_init_mutex);
 }
 
@@ -1132,6 +1138,23 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     (void)imatrix;
     assert(!"unsupported DS4 quantization target");
     return 0;
+}
+
+bool ds4q_iq2_xxs_tables(const uint64_t **grid, size_t *grid_len,
+                         const int **map, size_t *map_len,
+                         const uint16_t **neighbours, size_t *neighbours_len) {
+    ds4q_iq2_xxs_init();
+    if (!ds4q_iq2_xxs_data.grid || !ds4q_iq2_xxs_data.map ||
+        !ds4q_iq2_xxs_data.neighbours) {
+        return false;
+    }
+    if (grid) *grid = ds4q_iq2_xxs_data.grid;
+    if (grid_len) *grid_len = ds4q_iq2_xxs_data.grid_len;
+    if (map) *map = ds4q_iq2_xxs_data.map;
+    if (map_len) *map_len = ds4q_iq2_xxs_data.map_len;
+    if (neighbours) *neighbours = ds4q_iq2_xxs_data.neighbours;
+    if (neighbours_len) *neighbours_len = ds4q_iq2_xxs_data.neighbours_len;
+    return true;
 }
 
 float ds4q_f16_to_f32(uint16_t bits) {

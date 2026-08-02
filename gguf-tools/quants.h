@@ -15,6 +15,10 @@
 
 #define DS4Q_MAX_DIMS 4
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     DS4Q_TYPE_F32     = 0,
     DS4Q_TYPE_F16     = 1,
@@ -71,5 +75,14 @@ float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);
 void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n);
+
+/* Internal IQ2_XXS search tables shared with the optional CUDA encoder. */
+bool ds4q_iq2_xxs_tables(const uint64_t **grid, size_t *grid_len,
+                         const int **map, size_t *map_len,
+                         const uint16_t **neighbours, size_t *neighbours_len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

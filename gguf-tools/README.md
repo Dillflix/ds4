@@ -131,6 +131,36 @@ The two hybrid recipes can be generated with the existing family overrides:
 These flags can be appended to either full quantizer command above. Use an
 imatrix collected for the same model whenever possible.
 
+## CUDA Quantization
+
+Linux CUDA hosts can build the routed-expert encoder separately from the
+portable CPU quantizer:
+
+```sh
+make -C gguf-tools deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
+gguf-tools/test-quants-cuda 0,2,1,3
+```
+
+The CUDA encoder implements imatrix-weighted `iq2_xxs`, `q4_k`, and `q2_k`,
+covering every routed type in the supported 2x2 inference matrix. Each host
+worker decodes an expert from the source safetensors and submits its independent
+256-value blocks to a persistent CUDA stream. Workers are distributed across
+the selected devices, allowing source decode, transfer, and encoding to overlap.
+Other tensor types and unweighted blocks retain the reference CPU path.
+
+Select it on a full conversion with:
+
+```sh
+gguf-tools/deepseek4-quantize-cuda \
+  ... \
+  --quant-backend cuda \
+  --quant-gpu-devices 0,2,1,3
+```
+
+`test-quants-cuda` byte-compares small CPU and CUDA encodes for all three
+formats before a long conversion. The one-step IQ2/IQ2/Q4 runner builds and
+runs this check automatically.
+
 For the four-card RTX 8000 target, the repository includes a one-step producer
 and benchmark runner for the `iq2_xxs` gate / `iq2_xxs` up / `q4_k` down
 recipe:
@@ -148,7 +178,8 @@ supplied Hugging Face directory. Set `DS4_TEMPLATE_GGUF`, `DS4_IMATRIX`, or
 `DS4_ASSET_CACHE` to override those assets. The original explicit four-path
 interface remains available for fully offline runs.
 
-The script builds the quantizer and an `sm_75` CUDA benchmark, verifies the
+The script builds the CUDA quantizer and an `sm_75` CUDA benchmark, verifies the
+routed-format CPU/CUDA byte checks and the
 routed-MoE matrix classification test, writes the GGUF through an atomic
 temporary file, then benchmarks prefill and generation with
 `--cuda-tensor-parallel`. The default device order is `0,2,1,3`, pairing

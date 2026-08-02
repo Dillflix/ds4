@@ -246,6 +246,10 @@ fi
 [[ $out != "$template" ]] || die "OUTPUT.gguf must not be the template GGUF"
 
 printf 'Building the %s CUDA benchmark...\n' "$cuda_arch"
+make -j "$make_jobs" -C gguf-tools deepseek4-quantize-cuda test-quants-cuda \
+    CUDA_ARCH="$cuda_arch"
+quantizer=$script_dir/gguf-tools/deepseek4-quantize-cuda
+gguf-tools/test-quants-cuda "$gpu_devices"
 # Force the CUDA object to rebuild: changing CUDA_ARCH alone is not a Makefile
 # dependency and could otherwise leave an object compiled for another GPU.
 make -B -j "$make_jobs" ds4-bench tests/test_engine_mgpu_placement \
@@ -260,6 +264,8 @@ quant_args=(
     --routed-w3 iq2_xxs
     --routed-w2 q4_k
     --threads "$quant_threads"
+    --quant-backend cuda
+    --quant-gpu-devices "$gpu_devices"
 )
 
 partial=
@@ -305,6 +311,8 @@ pair1="${gpu_list[1]}<->${gpu_list[3]}"
     printf 'model=%s\n' "$out"
     printf 'model_bytes=%s\n' "$(stat -c %s "$out")"
     printf 'quant=gate:iq2_xxs,up:iq2_xxs,down:q4_k\n'
+    printf 'quant_backend=cuda\n'
+    printf 'quant_gpu_devices=%s\n' "$gpu_devices"
     printf 'template=%s\n' "$template"
     printf 'template_bytes=%s\n' "$(stat -c %s "$template")"
     printf 'imatrix=%s\n' "$imatrix"

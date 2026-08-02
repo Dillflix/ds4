@@ -1,0 +1,23 @@
+name: CUDA quantizer build
+
+on:
+  push:
+    branches: [agent/iq2-iq2-q4]
+    paths:
+      - ".github/workflows/cuda-quantizer-build.yml"
+      - "gguf-tools/**"
+      - "produce-benchmark-iq2-iq2-q4.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  sm75-build:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host compiler
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential
+      - name: Build CPU and CUDA quantizers
+        run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75

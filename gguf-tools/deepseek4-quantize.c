@@ -23,6 +23,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "quants.h"
+#ifdef DS4Q_USE_CUDA
+#include "quants_cuda.h"
+#endif
 
 #include <assert.h>
 #include <ctype.h>
@@ -36,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"
@@ -1101,7 +1105,31 @@ typedef struct {
     size_t size;
 } byte_buf;
 
-static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
+#define DS4Q_MAX_CUDA_DEVICES 32
+typedef struct {
+    bool enabled;
+    int devices[DS4Q_MAX_CUDA_DEVICES];
+    int n_devices;
+} quant_cuda_config;
+
+static quant_cuda_config g_quant_cuda;
+
+static int quant_cuda_device_for_worker(int worker_id) {
+    if (!g_quant_cuda.enabled || g_quant_cuda.n_devices <= 0) return -1;
+    return g_quant_cuda.devices[worker_id % g_quant_cuda.n_devices];
+}
+
+static bool quant_cuda_can_encode(ds4q_type type) {
+#ifdef DS4Q_USE_CUDA
+    return g_quant_cuda.enabled && ds4q_cuda_type_supported(type);
+#else
+    (void)type;
+    return false;
+#endif
+}
+
+static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type,
+                            int64_t ncols, const float *imat, int cuda_device) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
     byte_buf out = {0};
     if (type == DS4Q_TYPE_F32) {
@@ -1138,7 +1166,25 @@ static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t
         }
         im_ptr = synthetic;
     }
-    size_t written = ds4q_quantize_chunk(type, src, out.data, 0, nrows, ncols, im_ptr);
+    size_t written = 0;
+#ifdef DS4Q_USE_CUDA
+    if (cuda_device >= 0 && im_ptr && ds4q_cuda_type_supported(type)) {
+        char cuda_error[256];
+        written = ds4q_cuda_quantize_chunk(type, src, out.data, nrows, ncols,
+                                           im_ptr, cuda_device,
+                                           cuda_error, sizeof(cuda_error));
+        if (!written) {
+            fprintf(stderr, "error: CUDA quantization on device %d failed: %s\n",
+                    cuda_device, cuda_error[0] ? cuda_error : "unknown CUDA error");
+            exit(1);
+        }
+    } else
+#else
+    (void)cuda_device;
+#endif
+    {
+        written = ds4q_quantize_chunk(type, src, out.data, 0, nrows, ncols, im_ptr);
+    }
     free(synthetic);
     if (written != out.size) die("ds4q_quantize_chunk wrote unexpected byte count");
     return out;
@@ -1226,7 +1272,8 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
     }
     const char *names[2] = { gguf_name, hf_name };
     const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
-    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
+    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat,
+                             quant_cuda_device_for_worker(0));
     free(f32);
     return b;
 }
@@ -1257,7 +1304,12 @@ typedef struct {
     pthread_mutex_t lock;
 } expert_job;
 
-static void generate_one_expert(expert_job *j, int xid) {
+typedef struct {
+    expert_job *job;
+    int worker_id;
+} expert_worker_arg;
+
+static void generate_one_expert(expert_job *j, int xid, int worker_id) {
     char prefix[256];
     if (j->expert.scope == EXP_SCOPE_MTP) {
         snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
@@ -1282,7 +1334,8 @@ static void generate_one_expert(expert_job *j, int xid) {
     }
     const char *names[3] = { j->gguf_name, weight_name, NULL };
     const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
-    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
+    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat,
+                             quant_cuda_device_for_worker(worker_id));
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
     free(q.data);
@@ -1291,13 +1344,14 @@ static void generate_one_expert(expert_job *j, int xid) {
 }
 
 static void *expert_worker(void *arg) {
-    expert_job *j = arg;
+    expert_worker_arg *worker = arg;
+    expert_job *j = worker->job;
     for (;;) {
         pthread_mutex_lock(&j->lock);
         int xid = j->next++;
         pthread_mutex_unlock(&j->lock);
         if (xid >= j->n_experts) break;
-        generate_one_expert(j, xid);
+        generate_one_expert(j, xid, worker->worker_id);
         pthread_mutex_lock(&j->lock);
         int done = ++j->done;
         if (done % 32 == 0 || done == j->n_experts) {
@@ -1307,6 +1361,9 @@ static void *expert_worker(void *arg) {
         }
         pthread_mutex_unlock(&j->lock);
     }
+#ifdef DS4Q_USE_CUDA
+    if (g_quant_cuda.enabled) ds4q_cuda_thread_shutdown();
+#endif
     return NULL;
 }
 
@@ -1324,10 +1381,18 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     ds4q_quantize_init(target);
     int worker_count = n_threads > 0 ? n_threads : 8;
     if (worker_count < 1) worker_count = 1;
+    if (g_quant_cuda.enabled && worker_count < g_quant_cuda.n_devices) {
+        worker_count = g_quant_cuda.n_devices;
+    }
     if (worker_count > n_experts) worker_count = n_experts;
-    fprintf(stderr, "generate_expert_tensor: %s %d %s using %d worker%s\n",
+    fprintf(stderr, "generate_expert_tensor: %s %d %s using %d worker%s",
             e.scope == EXP_SCOPE_MTP ? "stage" : "layer",
             e.layer, wid, worker_count, worker_count == 1 ? "" : "s");
+    if (quant_cuda_can_encode(target)) {
+        fprintf(stderr, " across %d CUDA device%s", g_quant_cuda.n_devices,
+                g_quant_cuda.n_devices == 1 ? "" : "s");
+    }
+    fputc('\n', stderr);
     expert_job job = {
         .db = db, .gguf_name = gguf_name, .tmpl = tmpl, .target = target,
         .n_experts = n_experts, .imatrix = imatrix, .expert = e, .wid = wid,
@@ -1335,11 +1400,17 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     };
     pthread_mutex_init(&job.lock, NULL);
     pthread_t *threads = xcalloc((size_t)worker_count, sizeof(threads[0]));
-    for (int i = 1; i < worker_count; i++) pthread_create(&threads[i], NULL, expert_worker, &job);
-    expert_worker(&job);
+    expert_worker_arg *workers = xcalloc((size_t)worker_count, sizeof(workers[0]));
+    for (int i = 0; i < worker_count; i++) {
+        workers[i].job = &job;
+        workers[i].worker_id = i;
+    }
+    for (int i = 1; i < worker_count; i++) pthread_create(&threads[i], NULL, expert_worker, &workers[i]);
+    expert_worker(&workers[0]);
     for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
     pthread_mutex_destroy(&job.lock);
     free(threads);
+    free(workers);
     return out;
 }
 
@@ -1688,7 +1759,9 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        const double started = monotonic_seconds();
+        byte_buf data = generate_tensor(db, dst->name, src, dst->type,
+                                        n_experts, n_threads, imatrix);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1697,7 +1770,10 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         if (fwrite(data.data, 1, data.size, fp) != data.size) die_errno("write tensor", out_path);
         size_t padded = ds4q_pad(data.size, out_ctx->alignment);
         write_padding(fp, padded - data.size);
-        fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
+        const double elapsed = monotonic_seconds() - started;
+        const double mib = (double)data.size / 1048576.0;
+        fprintf(stderr, "       generated %.2f MiB in %.2fs (%.2f MiB/s)\n",
+                mib, elapsed, elapsed > 0 ? mib / elapsed : 0.0);
         free(data.data);
     }
     fclose(fp);
@@ -1757,6 +1833,8 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *quant_backend;
+    char *quant_gpu_devices;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -2488,6 +2566,8 @@ static void usage(const char *argv0) {
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
+    printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
+    printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
@@ -2618,6 +2698,10 @@ static params parse_args(int argc, char **argv) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {
             p.n_threads = atoi(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--quant-backend") == 0) {
+            p.quant_backend = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--quant-gpu-devices") == 0) {
+            p.quant_gpu_devices = need_value(argc, argv, &i, arg);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
@@ -2640,6 +2724,71 @@ static params parse_args(int argc, char **argv) {
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
+}
+
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void configure_quant_backend(const params *p) {
+    const char *backend = p->quant_backend ? p->quant_backend : "cpu";
+    if (strcmp(backend, "cpu") == 0) return;
+    if (strcmp(backend, "cuda") != 0) die("--quant-backend must be cpu or cuda");
+#ifndef DS4Q_USE_CUDA
+    die("this binary has no CUDA quantizer; build and run deepseek4-quantize-cuda");
+#else
+    char error[256];
+    const int available = ds4q_cuda_device_count(error, sizeof(error));
+    if (available < 1) {
+        fprintf(stderr, "error: CUDA quantizer found no devices: %s\n",
+                error[0] ? error : "cudaGetDeviceCount returned zero");
+        exit(1);
+    }
+
+    if (!p->quant_gpu_devices || !p->quant_gpu_devices[0]) {
+        if (available > DS4Q_MAX_CUDA_DEVICES) die("too many CUDA devices");
+        for (int i = 0; i < available; i++) g_quant_cuda.devices[i] = i;
+        g_quant_cuda.n_devices = available;
+    } else {
+        char *list = xstrdup(p->quant_gpu_devices);
+        char *save = NULL;
+        for (char *item = strtok_r(list, ",", &save);
+             item;
+             item = strtok_r(NULL, ",", &save)) {
+            if (g_quant_cuda.n_devices >= DS4Q_MAX_CUDA_DEVICES) {
+                free(list);
+                die("too many --quant-gpu-devices entries");
+            }
+            errno = 0;
+            char *end = NULL;
+            const long device = strtol(item, &end, 10);
+            if (errno || end == item || *end || device < 0 || device >= available) {
+                fprintf(stderr, "error: bad CUDA quantization device: %s (available: 0..%d)\n",
+                        item, available - 1);
+                free(list);
+                exit(1);
+            }
+            for (int i = 0; i < g_quant_cuda.n_devices; i++) {
+                if (g_quant_cuda.devices[i] == device) {
+                    free(list);
+                    die("duplicate CUDA quantization device");
+                }
+            }
+            g_quant_cuda.devices[g_quant_cuda.n_devices++] = (int)device;
+        }
+        free(list);
+        if (!g_quant_cuda.n_devices) die("empty --quant-gpu-devices list");
+    }
+    g_quant_cuda.enabled = true;
+    fprintf(stderr, "CUDA quantization enabled on device%s ",
+            g_quant_cuda.n_devices == 1 ? "" : "s");
+    for (int i = 0; i < g_quant_cuda.n_devices; i++) {
+        fprintf(stderr, "%s%d", i ? "," : "", g_quant_cuda.devices[i]);
+    }
+    fputc('\n', stderr);
+#endif
 }
 
 static void free_gguf_file(gguf_file *g) {
@@ -2754,6 +2903,7 @@ int main(int argc, char **argv) {
 
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+    if (!p.dry_run) configure_quant_backend(&p);
 
     if (p.dspark_support) {
         st_db db;

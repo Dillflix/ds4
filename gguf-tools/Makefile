@@ -25,6 +25,7 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+QUANT_NVCCFLAGS ?= -O3 -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 QUALITY_TARGETS := ds4.o ds4_cuda.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o
 QUALITY_OBJS := ../ds4.o ../ds4_cuda.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o
@@ -43,6 +44,24 @@ all: deepseek4-quantize
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
+deepseek4-quantize-cuda.o: deepseek4-quantize.c quants.h quants_cuda.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DDS4Q_USE_CUDA -c -o $@ deepseek4-quantize.c
+
+quants-cuda-host.o: quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ quants.c
+
+quants_cuda.o: quants_cuda.cu quants_cuda.h quants.h
+	$(NVCC) $(QUANT_NVCCFLAGS) -c -o $@ quants_cuda.cu
+
+deepseek4-quantize-cuda: deepseek4-quantize-cuda.o quants-cuda-host.o quants_cuda.o
+	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
+
+test_quants_cuda.o: test_quants_cuda.c quants.h quants_cuda.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ test_quants_cuda.c
+
+test-quants-cuda: test_quants_cuda.o quants-cuda-host.o quants_cuda.o
+	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
+
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
@@ -51,4 +70,6 @@ quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official quality-testing/score_llama
+	rm -f deepseek4-quantize deepseek4-quantize-cuda deepseek4-quantize-cuda.o \
+		quants-cuda-host.o quants_cuda.o test-quants-cuda test_quants_cuda.o \
+		quality-testing/score_official quality-testing/score_llama
