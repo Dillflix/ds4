@@ -120,3 +120,16 @@ complete source kernel/launch/gate inventories, extracts per-function cubin
 resource usage, and counts IMMA, HMMA, DP4A, load, and barrier instructions.
 It packages the report as `sm-dispatch-resource-<commit>-<timestamp>.tar.gz`.
 No `MODEL` variable is required because this audit does not execute inference.
+
+To reparse and repackage an existing audit without recompiling its CUDA
+objects, name its existing directory explicitly:
+
+```bash
+OUT_DIR="$PWD/sm-dispatch-resource-<commit>-<timestamp>" \
+REPARSE_ONLY=1 \
+./speed-bench/cuda-sm-dispatch-resource-audit.sh
+```
+
+Object-wide instruction totals are compiler-coverage checks only. Both objects
+contain symbols excluded by runtime architecture gates; use the paired
+per-function tables together with the production dispatch matrix.

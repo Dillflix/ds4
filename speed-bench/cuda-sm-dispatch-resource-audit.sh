@@ -6,21 +6,29 @@ cd "$ROOT"
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 COMMIT=$(git rev-parse --short=12 HEAD 2>/dev/null || printf unknown)
-GIT_DIRTY=$(test -n "$(git status --porcelain 2>/dev/null)" && printf true || printf false)
+GIT_STATUS=$(git status --porcelain=v1 2>/dev/null || true)
+GIT_DIRTY=$(test -n "$GIT_STATUS" && printf true || printf false)
+OUT_DIR_WAS_SET=${OUT_DIR+x}
 OUT_DIR=${OUT_DIR:-"$ROOT/sm-dispatch-resource-${COMMIT}-${STAMP}"}
 NVCC_BIN=${NVCC:-${CUDA_HOME:-/usr/local/cuda}/bin/nvcc}
 CUOBJDUMP_BIN=${CUOBJDUMP:-${CUDA_HOME:-/usr/local/cuda}/bin/cuobjdump}
 CXXFILT_BIN=${CXXFILT:-c++filt}
 KEEP_OBJECTS=${KEEP_OBJECTS:-0}
 KEEP_SASS=${KEEP_SASS:-0}
+REPARSE_ONLY=${REPARSE_ONLY:-0}
 
 fail() {
     printf 'error: %s\n' "$*" >&2
     exit 2
 }
 
-command -v "$NVCC_BIN" >/dev/null 2>&1 || fail "nvcc not found: $NVCC_BIN"
-command -v "$CUOBJDUMP_BIN" >/dev/null 2>&1 || fail "cuobjdump not found: $CUOBJDUMP_BIN"
+if [[ "$REPARSE_ONLY" == 1 && -z "$OUT_DIR_WAS_SET" ]]; then
+    fail "REPARSE_ONLY=1 requires OUT_DIR to name an existing audit directory"
+fi
+if [[ "$REPARSE_ONLY" != 1 ]]; then
+    command -v "$NVCC_BIN" >/dev/null 2>&1 || fail "nvcc not found: $NVCC_BIN"
+    command -v "$CUOBJDUMP_BIN" >/dev/null 2>&1 || fail "cuobjdump not found: $CUOBJDUMP_BIN"
+fi
 command -v "$CXXFILT_BIN" >/dev/null 2>&1 || fail "C++ demangler not found: $CXXFILT_BIN"
 command -v awk >/dev/null 2>&1 || fail "awk is required"
 
@@ -41,36 +49,42 @@ archive_on_exit() {
 }
 trap archive_on_exit EXIT
 
-{
-    printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
-    printf 'git_dirty=%s\n' "$GIT_DIRTY"
-    printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'host=%s\n' "$(uname -a)"
-    printf 'nvcc=%s\n' "$NVCC_BIN"
-    "$NVCC_BIN" --version | sed 's/^/nvcc_version=/'
-    printf 'cuobjdump=%s\n' "$CUOBJDUMP_BIN"
-    "$CUOBJDUMP_BIN" --version | sed 's/^/cuobjdump_version=/'
-    printf 'cxxfilt=%s\n' "$CXXFILT_BIN"
-} > "$OUT_DIR/manifest.txt"
+if [[ "$REPARSE_ONLY" != 1 ]]; then
+    {
+        printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
+        printf 'git_dirty=%s\n' "$GIT_DIRTY"
+        printf 'ds4_cuda_blob=%s\n' "$(git hash-object ds4_cuda.cu 2>/dev/null || printf unknown)"
+        printf 'ds4_c_blob=%s\n' "$(git hash-object ds4.c 2>/dev/null || printf unknown)"
+        if [[ -n "$GIT_STATUS" ]]; then
+            printf '%s\n' "$GIT_STATUS" | sed 's/^/git_status=/'
+        fi
+        printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'host=%s\n' "$(uname -a)"
+        printf 'nvcc=%s\n' "$NVCC_BIN"
+        "$NVCC_BIN" --version | sed 's/^/nvcc_version=/'
+        printf 'cuobjdump=%s\n' "$CUOBJDUMP_BIN"
+        "$CUOBJDUMP_BIN" --version | sed 's/^/cuobjdump_version=/'
+        printf 'cxxfilt=%s\n' "$CXXFILT_BIN"
+    } > "$OUT_DIR/manifest.txt"
 
-# These inventories are deliberately source-derived. They make additions to the
-# CUDA translation unit visible even when a new kernel has not yet been added to
-# the hand-reviewed operation matrix.
-awk '/__global__/ {
-         line=$0
-         sub(/^.*void[[:space:]]+/, "", line)
-         sub(/\(.*/, "", line)
-         printf "%d\t%s\n", NR, line
-     }' ds4_cuda.cu > "$OUT_DIR/kernel-declarations-and-definitions.tsv"
+    # These inventories are deliberately source-derived. They make additions
+    # visible even when a kernel is absent from the hand-reviewed matrix.
+    awk '/__global__/ {
+             line=$0
+             sub(/^.*void[[:space:]]+/, "", line)
+             sub(/\(.*/, "", line)
+             printf "%d\t%s\n", NR, line
+         }' ds4_cuda.cu > "$OUT_DIR/kernel-declarations-and-definitions.tsv"
 
-awk '/<<</ { printf "%d\t%s\n", NR, $0 }' ds4_cuda.cu \
-    > "$OUT_DIR/kernel-launch-sites.tsv"
+    awk '/<<</ { printf "%d\t%s\n", NR, $0 }' ds4_cuda.cu \
+        > "$OUT_DIR/kernel-launch-sites.tsv"
 
-grep -nE '__CUDA_ARCH__|binaryVersion|cuda_sm75_mma_ok|cuda_q4_mma_ok|cudaFunc(Get|Set)Attribute|cudaDevAttr(MaxSharedMemory|ComputeCapability)' \
-    ds4_cuda.cu > "$OUT_DIR/architecture-dispatch-gates.txt" || true
+    grep -nE '__CUDA_ARCH__|binaryVersion|cuda_sm75_mma_ok|cuda_q4_mma_ok|cudaFunc(Get|Set)Attribute|cudaDevAttr(MaxSharedMemory|ComputeCapability)' \
+        ds4_cuda.cu > "$OUT_DIR/architecture-dispatch-gates.txt" || true
 
-grep -nE 'DS4_CUDA_[A-Za-z0-9_]+' ds4_cuda.cu ds4.c \
-    > "$OUT_DIR/cuda-environment-gates.txt" || true
+    grep -nE 'DS4_CUDA_[A-Za-z0-9_]+' ds4_cuda.cu ds4.c \
+        > "$OUT_DIR/cuda-environment-gates.txt" || true
+fi
 
 compile_arch() {
     local arch=$1
@@ -99,9 +113,10 @@ parse_resources() {
     local out="$OUT_DIR/${arch}.resources.tsv"
 
     awk -v arch="$arch" '
-        /^[[:space:]]*Function[[:space:]]*:/ {
+        /^[[:space:]]*Function[[:space:]]+/ {
             line=$0
-            sub(/^[^:]*:[[:space:]]*/, "", line)
+            sub(/^[[:space:]]*Function[[:space:]]*:?[[:space:]]*/, "", line)
+            sub(/:[[:space:]]*$/, "", line)
             fn=line
             next
         }
@@ -164,12 +179,24 @@ summarize_sass() {
     rm -f "$raw"
 }
 
-compile_arch sm_75
-compile_arch sm_80
+if [[ "$REPARSE_ONLY" != 1 ]]; then
+    compile_arch sm_75
+    compile_arch sm_80
+else
+    for required in \
+        "$OUT_DIR/sm_75.resource-usage.txt" \
+        "$OUT_DIR/sm_80.resource-usage.txt" \
+        "$OUT_DIR/sm_75.sass-summary.tsv" \
+        "$OUT_DIR/sm_80.sass-summary.tsv"; do
+        [[ -f "$required" ]] || fail "reparse input not found: $required"
+    done
+fi
 parse_resources sm_75
 parse_resources sm_80
-summarize_sass sm_75
-summarize_sass sm_80
+if [[ "$REPARSE_ONLY" != 1 ]]; then
+    summarize_sass sm_75
+    summarize_sass sm_80
+fi
 
 awk -F '\t' '
     NR == FNR {
@@ -230,24 +257,31 @@ awk -F '\t' '
     printf 'compiled_sass_functions\t%s\t%s\n' \
         "$(( $(wc -l < "$OUT_DIR/sm_75.sass-summary.tsv") - 1 ))" \
         "$(( $(wc -l < "$OUT_DIR/sm_80.sass-summary.tsv") - 1 ))"
-    printf 'imma_instructions\t%s\t%s\n' \
+    printf 'object_imma_instructions\t%s\t%s\n' \
         "$(awk -F '\t' 'NR>1{s+=$5}END{print s+0}' "$OUT_DIR/sm_75.sass-summary.tsv")" \
         "$(awk -F '\t' 'NR>1{s+=$5}END{print s+0}' "$OUT_DIR/sm_80.sass-summary.tsv")"
-    printf 'hmma_instructions\t%s\t%s\n' \
+    printf 'object_hmma_instructions\t%s\t%s\n' \
         "$(awk -F '\t' 'NR>1{s+=$6}END{print s+0}' "$OUT_DIR/sm_75.sass-summary.tsv")" \
         "$(awk -F '\t' 'NR>1{s+=$6}END{print s+0}' "$OUT_DIR/sm_80.sass-summary.tsv")"
-    printf 'idp4a_instructions\t%s\t%s\n' \
+    printf 'object_idp4a_instructions\t%s\t%s\n' \
         "$(awk -F '\t' 'NR>1{s+=$7}END{print s+0}' "$OUT_DIR/sm_75.sass-summary.tsv")" \
         "$(awk -F '\t' 'NR>1{s+=$7}END{print s+0}' "$OUT_DIR/sm_80.sass-summary.tsv")"
-    printf 'ldgsts_instructions\t%s\t%s\n' \
+    printf 'object_ldgsts_instructions\t%s\t%s\n' \
         "$(awk -F '\t' 'NR>1{s+=$8}END{print s+0}' "$OUT_DIR/sm_75.sass-summary.tsv")" \
         "$(awk -F '\t' 'NR>1{s+=$8}END{print s+0}' "$OUT_DIR/sm_80.sass-summary.tsv")"
 } > "$OUT_DIR/architecture-summary.tsv"
 
-if [[ "$KEEP_SASS" != 1 ]]; then
+printf '%s\n' \
+    'The object-wide instruction totals include every compiled template and symbols' \
+    'that runtime architecture gates will never launch. They are compiler coverage' \
+    'checks, not a workload instruction mix or a performance comparison. Use the' \
+    'per-function paired table together with the production dispatch matrix.' \
+    > "$OUT_DIR/architecture-summary-NOTICE.txt"
+
+if [[ "$REPARSE_ONLY" != 1 && "$KEEP_SASS" != 1 ]]; then
     rm -f "$OUT_DIR/sm_75.sass.txt" "$OUT_DIR/sm_80.sass.txt"
 fi
-if [[ "$KEEP_OBJECTS" != 1 ]]; then
+if [[ "$REPARSE_ONLY" != 1 && "$KEEP_OBJECTS" != 1 ]]; then
     rm -f "$OUT_DIR/ds4_cuda.sm_75.o" "$OUT_DIR/ds4_cuda.sm_80.o"
 fi
 
