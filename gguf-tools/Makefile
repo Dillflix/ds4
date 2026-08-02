@@ -46,19 +46,19 @@ all: deepseek4-quantize
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
-deepseek4-quantize-cuda.o: deepseek4-quantize.c quants.h quants_cuda.h
+deepseek4-quantize-cuda.o: deepseek4-quantize.c quants.h quants_cuda.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DDS4Q_USE_CUDA -c -o $@ deepseek4-quantize.c
 
-quants-cuda-host.o: quants.c quants.h
+quants-cuda-host.o: quants.c quants.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ quants.c
 
-quants_cuda.o: quants_cuda.cu quants_cuda.h quants.h
+quants_cuda.o: quants_cuda.cu quants_cuda.h quants.h Makefile
 	$(NVCC) $(QUANT_NVCCFLAGS) -c -o $@ quants_cuda.cu
 
 deepseek4-quantize-cuda: deepseek4-quantize-cuda.o quants-cuda-host.o quants_cuda.o
 	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
 
-test_quants_cuda.o: test_quants_cuda.c quants.h quants_cuda.h
+test_quants_cuda.o: test_quants_cuda.c quants.h quants_cuda.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ test_quants_cuda.c
 
 test-quants-cuda: test_quants_cuda.o quants-cuda-host.o quants_cuda.o
