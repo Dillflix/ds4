@@ -737,6 +737,11 @@ cache. Reduce the session count or context size if the requested resident KV
 caches do not fit after model loading. CUDA TP, half-resident expert ownership,
 output sharding, pipelined prefill, and compatible grouped decode are selected
 by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
+Pipelined prefill enables the selective Q8-to-F16 weight cache by default and
+uses cuBLAS for eligible dense and shared-expert projections. Cache growth stops
+at the CUDA VRAM reserve and transparently falls back to native Q8 kernels when
+an expansion cannot fit. `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables this
+cache for memory-pressure diagnosis; it is not the performance default.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.

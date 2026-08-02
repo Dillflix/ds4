@@ -16719,7 +16719,11 @@ static bool metal_graph_cuda_prefill_pipeline_q8_cache_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    return metal_graph_tp_env_flag("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE", false);
+    /* Cache growth is already bounded by the CUDA VRAM reserve and allocation
+     * failures transparently fall back to native Q8 kernels. Suppressing the
+     * cache by default makes pipelined prefill several times slower on systems
+     * with sufficient headroom. Keep =0 as a diagnostic opt-out. */
+    return metal_graph_tp_env_flag("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE", true);
 #endif
 }
 
@@ -55270,6 +55274,10 @@ bool ds4_test_cuda_routed_moe_quant_types_supported(
         uint32_t down_type) {
     return cuda_routed_moe_quant_types_supported(
             gate_type, up_type, down_type);
+}
+
+bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void) {
+    return metal_graph_cuda_prefill_pipeline_q8_cache_requested();
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
