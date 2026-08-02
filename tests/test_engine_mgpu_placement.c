@@ -13,7 +13,8 @@
  *     tiers used.
  *  4. CPU-spill placement: 2 GPUs with tiny budgets so some layers
  *     spill. multi_tier == 1 and at least one DS4_LAYER_PACK_CPU entry.
- *  5. GLM compact-cache accounting: ordinary, indexed, and NextN layers. */
+ *  5. GLM compact-cache accounting: ordinary, indexed, and NextN layers.
+ *  6. CUDA routed-MoE quant classification: the complete 2x2 matrix. */
 
 #define DS4_TEST_HOOKS
 #include "../ds4.h"
@@ -82,6 +83,9 @@ size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 #define DS4_N_LAYER_LOCAL 43
 #define DS4_N_VOCAB_LOCAL 129280
 #define DS4_N_ENTRIES (DS4_N_LAYER_LOCAL + 2)
+#define DS4_TENSOR_Q2_K_LOCAL 10u
+#define DS4_TENSOR_Q4_K_LOCAL 12u
+#define DS4_TENSOR_IQ2_XXS_LOCAL 16u
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -93,6 +97,41 @@ static int g_checks = 0;
         g_failures++; \
     } \
 } while (0)
+
+static void test_cuda_routed_moe_quant_matrix(void) {
+    fprintf(stderr, "RUN: test_cuda_routed_moe_quant_matrix\n");
+    const uint32_t gate_types[] = {
+        DS4_TENSOR_IQ2_XXS_LOCAL,
+        DS4_TENSOR_Q4_K_LOCAL,
+    };
+    const uint32_t down_types[] = {
+        DS4_TENSOR_Q2_K_LOCAL,
+        DS4_TENSOR_Q4_K_LOCAL,
+    };
+
+    for (size_t gate = 0; gate < 2; gate++) {
+        for (size_t down = 0; down < 2; down++) {
+            CHECK(ds4_test_cuda_routed_moe_quant_types_supported(
+                          gate_types[gate], gate_types[gate], down_types[down]),
+                  "IQ2/Q4 gate-up x Q2/Q4 down matrix entry is supported");
+        }
+    }
+    CHECK(!ds4_test_cuda_routed_moe_quant_types_supported(
+                  DS4_TENSOR_IQ2_XXS_LOCAL,
+                  DS4_TENSOR_Q4_K_LOCAL,
+                  DS4_TENSOR_Q2_K_LOCAL),
+          "mixed gate/up types remain rejected");
+    CHECK(!ds4_test_cuda_routed_moe_quant_types_supported(
+                  DS4_TENSOR_Q2_K_LOCAL,
+                  DS4_TENSOR_Q2_K_LOCAL,
+                  DS4_TENSOR_Q2_K_LOCAL),
+          "unsupported gate/up type remains rejected");
+    CHECK(!ds4_test_cuda_routed_moe_quant_types_supported(
+                  DS4_TENSOR_Q4_K_LOCAL,
+                  DS4_TENSOR_Q4_K_LOCAL,
+                  DS4_TENSOR_IQ2_XXS_LOCAL),
+          "unsupported down type remains rejected");
+}
 
 static void test_tensor_to_entry(void) {
     fprintf(stderr, "RUN: test_tensor_to_entry\n");
@@ -640,6 +679,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 }
 
 int main(void) {
+    test_cuda_routed_moe_quant_matrix();
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();

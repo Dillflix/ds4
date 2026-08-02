@@ -20833,9 +20833,18 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    /* Q4_K routed-MoE dispatch:
+    const int gate_q4k = gate_type == 12u;
+    const int gate_iq2 = gate_type == 16u;
+    const int down_q4k = down_type == 12u;
+    const int down_q2k = down_type == 10u;
+    const int all_q4k = gate_q4k && down_q4k;
+    if ((!gate_q4k && !gate_iq2) || (!down_q4k && !down_q2k)) return 0;
+    /* Routed-MoE dispatch supports the full matrix of IQ2_XXS/Q4_K gate+up
+     * and Q2_K/Q4_K down tensors. Gate/up stay the same type because their
+     * fused kernels share one byte stride; the Q8_K mid activation is the
+     * stable interface that lets either down family follow either gate family.
+     *
+     * Q4_K routed-MoE dispatch:
      *   n_tokens == 1 and n_expert == 6:
      *                  use_direct_down_sum + moe_gate_up_mid_decode_q4K_qwarp32
      *                  + moe_down_q4K_sum6_qwarp32.
@@ -20927,14 +20936,14 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_q4_sorted_pairs =
-            q4k_path && n_tokens > 1u &&
+            gate_q4k && n_tokens > 1u &&
             (owned_filtered ||
              (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
               getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
               getenv("DS4_CUDA_MOE_TILE4") == NULL));
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
-            (owned_filtered || !q4k_path || use_q4_sorted_pairs);
+            (owned_filtered || gate_iq2 || use_q4_sorted_pairs);
         const uint32_t use_expert_tiles =
             use_sorted_pairs &&
             (owned_filtered || getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
@@ -20948,9 +20957,9 @@ static int routed_moe_launch(
              (n_tokens <= 8u ? 4u : 8u));
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted =
-            use_sorted_pairs && !owned_filtered &&
+            use_sorted_pairs && gate_iq2 && down_q2k && !owned_filtered &&
             getenv("DS4_CUDA_MOE_NO_P2") == NULL;
-        const uint32_t use_atomic_down = !q4k_path && use_expert_tiles &&
+        const uint32_t use_atomic_down = down_q2k && use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
         const uint32_t use_owned_sparse_buffers = owned_filtered &&
@@ -20963,16 +20972,22 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
-        const uint32_t use_q4_mma_tiles16 = q4k_path && use_expert_tiles &&
+        const uint32_t use_q4_gate_mma_tiles16 = gate_q4k && use_expert_tiles &&
             expert_tile_m == 8u && cuda_q4_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
-        const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_q4_down_mma_tiles16 = down_q4k && use_expert_tiles &&
+            expert_tile_m == 8u && cuda_q4_mma_ok() &&
+            getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
+        const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
+        const uint32_t use_any_tile16 = use_down_tile16 ||
+            use_q4_gate_mma_tiles16 || use_q4_down_mma_tiles16;
         const uint32_t use_small_sorted_prep =
-            owned_filtered && q4k_path && n_tokens <= 16u && pair_count <= 96u &&
+            owned_filtered && (gate_q4k || down_q4k) &&
+            n_tokens <= 16u && pair_count <= 96u &&
             n_total_expert <= 128u && use_sorted_pairs && use_expert_tiles &&
             getenv("DS4_CUDA_MOE_NO_SMALL_SORTED_PREP") == NULL;
-        const uint32_t use_q4_down_rowspan = q4k_path && use_expert_tiles && expert_tile_m == 8u &&
+        const uint32_t use_q4_down_rowspan = down_q4k && use_expert_tiles && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN") == NULL;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
@@ -20984,7 +20999,7 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ? 2048u :
             getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 512u;
-        const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_down_row2048 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             (getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ||
              getenv("DS4_CUDA_MOE_DOWN_ROW256") != NULL ||
              getenv("DS4_CUDA_MOE_DOWN_ROW128") != NULL ||
@@ -20998,34 +21013,34 @@ static int routed_moe_launch(
             n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         const uint32_t use_direct_midq =
-            q4k_path && use_direct_down_sum && !write_gate_up &&
+            gate_q4k && use_direct_down_sum && !write_gate_up &&
             getenv("DS4_CUDA_MOE_DIRECT_MIDQ") != NULL &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_MIDQ") == NULL;
         const uint32_t use_q4_gate_h16r8 =
-            q4k_path && !use_direct_midq &&
+            gate_q4k && !use_direct_midq &&
             getenv("DS4_CUDA_MOE_Q4_GATE_H16R8") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16R8") == NULL;
         const uint32_t use_q4_gate_h16 =
-            q4k_path && !use_direct_midq && !use_q4_gate_h16r8 &&
+            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 &&
             getenv("DS4_CUDA_MOE_Q4_GATE_H16") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16") == NULL;
         const uint32_t use_q4_gate_w32r16 =
-            q4k_path && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
+            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
             getenv("DS4_CUDA_MOE_Q4_GATE_W32R16") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32R16") == NULL;
         const uint32_t use_q4_gate_w32 =
-            q4k_path && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
+            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
             !use_q4_gate_w32r16 &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32") == NULL;
         const uint32_t use_q4_gate_w32_noaux =
             use_q4_gate_w32 && !write_gate_up &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32_NOAUX") == NULL;
         const uint32_t use_q4_down_slot3 =
-            q4k_path && use_direct_down_sum && n_expert == 3u &&
+            down_q4k && use_direct_down_sum && n_expert == 3u &&
             getenv("DS4_CUDA_MOE_Q4_DOWN_SLOT3") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_DOWN_SLOT3") == NULL;
         const uint32_t use_q4_midq_sidecar =
-            q4k_path && use_direct_down_sum && use_q4_gate_w32_noaux &&
+            gate_q4k && use_direct_down_sum && use_q4_gate_w32_noaux &&
             !use_direct_midq && !write_gate_up &&
             (expert_mid_dim % CUDA_QK_K) == 0u &&
             getenv("DS4_CUDA_MOE_MIDQ_SIDECAR") != NULL &&
@@ -21034,7 +21049,7 @@ static int routed_moe_launch(
         if (g_cuda_moe_decode_graph &&
             !owned_filtered &&
             !profile_moe &&
-            q4k_path &&
+            all_q4k &&
             n_tokens == 1u &&
             use_direct_down_sum &&
             use_q4_gate_w32 &&
@@ -21091,13 +21106,13 @@ static int routed_moe_launch(
             const uint64_t cursors_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
             tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + n_total_expert;
-            tile16_capacity = (use_down_tile16 || use_q4_mma_tiles16) ? ((pair_count + 15u) / 16u + n_total_expert) : 0u;
+            tile16_capacity = use_any_tile16 ? ((pair_count + 15u) / 16u + n_total_expert) : 0u;
             const uint64_t tile_offsets_bytes = ((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
             const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = (use_down_tile16 || use_q4_mma_tiles16) ? (((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t)) : 0u;
-            const uint64_t tile16_total_bytes = (use_down_tile16 || use_q4_mma_tiles16) ? sizeof(uint32_t) : 0u;
+            const uint64_t tile16_offsets_bytes = use_any_tile16 ? (((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t)) : 0u;
+            const uint64_t tile16_total_bytes = use_any_tile16 ? sizeof(uint32_t) : 0u;
             const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile_offsets_off = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
@@ -21124,17 +21139,17 @@ static int routed_moe_launch(
                 tile_total = (uint32_t *)(scratch + tile_total_off);
                 tile_experts = (uint32_t *)(scratch + tile_experts_off);
                 tile_starts = (uint32_t *)(scratch + tile_starts_off);
-                uint32_t *tile16_offsets = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_offsets_off) : NULL;
-                tile16_total = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_total_off) : NULL;
-                tile16_experts = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
-                tile16_starts = (use_down_tile16 || use_q4_mma_tiles16) ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
+                uint32_t *tile16_offsets = use_any_tile16 ? (uint32_t *)(scratch + tile16_offsets_off) : NULL;
+                tile16_total = use_any_tile16 ? (uint32_t *)(scratch + tile16_total_off) : NULL;
+                tile16_experts = use_any_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
+                tile16_starts = use_any_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
                 if (use_small_sorted_prep) {
                     moe_prepare_sorted_tiles_small_kernel<<<1, 128>>>(
                         counts, offsets, cursors, sorted_pairs,
                         tile_offsets, tile_total, tile_experts, tile_starts,
                         tile16_offsets, tile16_total, tile16_experts, tile16_starts,
                         (const int32_t *)selected->ptr, pair_count, n_total_expert,
-                        expert_tile_m, use_down_tile16 || use_q4_mma_tiles16);
+                        expert_tile_m, use_any_tile16);
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe small sorted setup launch");
                 } else {
@@ -21172,12 +21187,12 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep &&
-                    (use_down_tile16 || use_q4_mma_tiles16)) {
+                    use_any_tile16) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep &&
-                    (use_down_tile16 || use_q4_mma_tiles16)) {
+                    use_any_tile16) {
                     moe_build_expert_tiles_kernel<<<(n_total_expert + 255u) / 256u, 256>>>(
                         tile16_experts, tile16_starts, tile16_offsets, counts, 16u, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
@@ -21195,12 +21210,12 @@ static int routed_moe_launch(
         if (ok) {
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
-                if (q4k_path) {
+                if (gate_q4k) {
                     const int use_q4_mma = cuda_q4_mma_ok() &&
                         ((((uintptr_t)gate_w | (uintptr_t)up_w |
                            gate_row_bytes | gate_expert_bytes) & 15u) == 0u) &&
                         xq_blocks <= 16u && (expert_mid_dim & 7u) == 0u;
-                    const int use_q4_mma_t16 = use_q4_mma && use_q4_mma_tiles16 &&
+                    const int use_q4_mma_t16 = use_q4_mma && use_q4_gate_mma_tiles16 &&
                         tile16_total && tile16_experts && tile16_starts &&
                         xq_blocks == 16u && cuda_q4_mma_tile16_shmem_ok(0);
                     if (use_q4_mma_t16 && use_gate_row2048) {
@@ -21354,7 +21369,7 @@ static int routed_moe_launch(
                     n_expert,
                     pair_count,
                     clamp);
-            } else if (ok && sorted_pairs) {
+            } else if (ok && sorted_pairs && gate_iq2) {
                 moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
@@ -21373,11 +21388,12 @@ static int routed_moe_launch(
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) / MOE_DECODE_ROWS_PER_BLOCK, n_tokens * n_expert, 1);
-                if (q4k_path) {
+                if (gate_q4k) {
                     /* Q4_K gate/up: the decode kernel is token-indexed via
                      * pair = blockIdx.y; tok = pair / n_expert, so the same
                      * launch covers both n_tokens == 1 (decode) and n_tokens > 1
-                     * (prefill). q4k_path is steered here by use_sorted_pairs = 0
+                     * (prefill). An all-Q4 layer is steered here by
+                     * use_sorted_pairs = 0
                      * cascading the IQ2 sorted/expert-tile branches off. */
                     if (use_direct_midq) {
                         dim3 mqgrid(midq_blocks, n_tokens * n_expert, 1);
@@ -21604,7 +21620,7 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                if (q4k_path) {
+                if (down_q4k) {
                     if (n_expert == 6u) {
                         moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                             (float *)out->ptr,
@@ -21671,11 +21687,11 @@ static int routed_moe_launch(
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
-                if (q4k_path) {
+                if (down_q4k) {
                     const int use_q4_down_mma = cuda_q4_mma_ok() &&
                         ((((uintptr_t)down_w | down_row_bytes | down_expert_bytes) & 15u) == 0u) &&
                         midq_blocks <= 8u && (out_dim & 7u) == 0u;
-                    const int use_q4_down_t16 = use_q4_down_mma && use_q4_mma_tiles16 &&
+                    const int use_q4_down_t16 = use_q4_down_mma && use_q4_down_mma_tiles16 &&
                         tile16_total && tile16_experts && tile16_starts &&
                         midq_blocks <= 16u && cuda_q4_mma_tile16_shmem_ok(1);
                     if (use_q4_down_t16 && use_q4_down_rowspan) {
@@ -21816,7 +21832,7 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert,
                     pair_count);
-            } else if (sorted_pairs) {
+            } else if (sorted_pairs && down_q2k) {
                 moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
                     (float *)down->ptr,
                     down_w,
@@ -21828,7 +21844,7 @@ static int routed_moe_launch(
                     midq_blocks,
                     out_dim,
                     n_expert);
-            } else if (q4k_path) {
+            } else if (down_q4k) {
                 /* Q4_K prefill down. New kernel mirrors moe_down_qwarp32_kernel
                  * grid/geometry, swapping the weight block type to cuda_block_q4_K
                  * and the dot helper to dev_dot_q4_K_q8_K_block. Writes per-pair
@@ -21899,6 +21915,11 @@ static int routed_moe_launch(
         return ok;
     }
 
+    /* The low-scratch reference kernels are specialized to the shipping Q2
+     * recipe. Returning failure is safer than silently interpreting Q4 blocks
+     * as IQ2/Q2 if a future graph is allocated without the Q8_K scratch used
+     * by every optimized Q4 or hybrid path. */
+    if (!gate_iq2 || !down_q2k) return 0;
     if (ok) {
         dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
         moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
@@ -21988,18 +22009,21 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         return 0;
     }
     if (pack_fixed3 && resident_expert_base == 0u) return 0;
-    const bool q4k_path = gate_type == 12u && down_type == 12u;
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL) {
+    const bool gate_q4k = gate_type == 12u;
+    const bool gate_iq2 = gate_type == 16u;
+    const bool down_q4k = down_type == 12u;
+    const bool down_q2k = down_type == 10u;
+    if ((!gate_q4k && !gate_iq2) || (!down_q4k && !down_q2k)) return 0;
+    if (gate_q4k && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL) {
         fprintf(stderr, "ds4: CUDA owned Q4 decode does not support gate/up auxiliary output\n");
         return 0;
     }
-    if (!q4k_path && getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") != NULL) {
+    if (gate_iq2 && getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") != NULL) {
         fprintf(stderr, "ds4: CUDA owned IQ2 decode requires the LUT gate path\n");
         return 0;
     }
     const bool write_aux =
-        !q4k_path && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
+        gate_iq2 && getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
 
     if (resident_expert_base > UINT64_MAX / gate_expert_bytes ||
         resident_expert_count > UINT64_MAX / gate_expert_bytes ||
@@ -22072,7 +22096,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe x quantize launch")) return 0;
 
-    if (q4k_path) {
+    if (gate_q4k) {
         dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
         moe_gate_up_mid_decode_q4K_owned_warp32_noaux_kernel<<<gate_grid, 256>>>(
                 (float *)mid->ptr,
@@ -22124,7 +22148,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe mid quantize launch")) return 0;
 
     dim3 down_grid((out_dim + 31u) / 32u, pack_fixed3 ? 4u : 6u, 1u);
-    if (q4k_path && pack_fixed3) {
+    if (down_q4k && pack_fixed3) {
         moe_down_q4K_owned_packed_qwarp32_kernel<<<down_grid, 256>>>(
                 down_dst,
                 down_w,
@@ -22136,7 +22160,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                 out_dim,
                 resident_expert_base,
                 resident_expert_count);
-    } else if (q4k_path) {
+    } else if (down_q4k) {
         moe_down_q4K_owned_slots_qwarp32_kernel<<<down_grid, 256>>>(
                 down_dst,
                 down_w,

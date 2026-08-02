@@ -372,6 +372,8 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
 uint64_t ds4_test_mixed_native_count(void);
+bool ds4_test_cuda_routed_moe_quant_types_supported(
+        uint32_t gate_type, uint32_t up_type, uint32_t down_type);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

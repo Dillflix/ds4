@@ -20290,6 +20290,27 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
     return type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_Q4_K;
 }
 
+static bool cuda_routed_moe_quant_types_supported(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    return gate_type == up_type &&
+           (gate_type == DS4_TENSOR_IQ2_XXS ||
+            gate_type == DS4_TENSOR_Q4_K) &&
+           (down_type == DS4_TENSOR_Q2_K ||
+            down_type == DS4_TENSOR_Q4_K);
+}
+
+static bool cuda_routed_moe_quant_matrix_supported(
+        const ds4_layer_weights *layer) {
+    return layer && layer->ffn_gate_exps && layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           cuda_routed_moe_quant_types_supported(
+                   layer->ffn_gate_exps->type,
+                   layer->ffn_up_exps->type,
+                   layer->ffn_down_exps->type);
+}
+
 static bool metal_graph_decode_cuda_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
@@ -20307,17 +20328,19 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
         return false;
     }
-    const bool q4 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-        getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
-    const bool iq2 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
-    return q4 || iq2;
+    if (!cuda_routed_moe_quant_matrix_supported(layer)) return false;
+    const bool has_q4 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K ||
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    if (has_q4 &&
+        getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL) {
+        return false;
+    }
+    if (layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") != NULL) {
+        return false;
+    }
+    return true;
 #else
     (void)g;
     (void)layer;
@@ -20570,7 +20593,9 @@ static bool metal_graph_decode_set_hash_selected_override(
                                                       down_tensor_bytes);
     const bool iq2_selected =
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
-    if (!q4_selected && !iq2_selected) {
+    const bool cuda_selected =
+        metal_graph_decode_cuda_selected_slots_expected(g, layer);
+    if (!q4_selected && !iq2_selected && !cuda_selected) {
         return true;
     }
 
@@ -55237,6 +55262,14 @@ typedef struct {
     uint64_t bytes;
 } ds4_test_fake_tensor;
 
+bool ds4_test_cuda_routed_moe_quant_types_supported(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    return cuda_routed_moe_quant_types_supported(
+            gate_type, up_type, down_type);
+}
+
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
     ds4_tensor fake;
     memset(&fake, 0, sizeof(fake));
@@ -61338,9 +61371,7 @@ static bool metal_graph_session_batch_moe_supported(
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!layer->ffn_gate_exps || !layer->ffn_down_exps ||
-            layer->ffn_gate_exps->type != 12u ||
-            layer->ffn_down_exps->type != 12u) {
+        if (!cuda_routed_moe_quant_matrix_supported(layer)) {
             return false;
         }
         const int home = first->placement[il + 1u];

@@ -107,6 +107,51 @@ You can override tensor families:
 --output q8_0
 ```
 
+The CUDA routed-MoE path supports the full gate/up-by-down matrix below. Gate
+and up must use the same type because they are fused; down is selected
+independently.
+
+| Gate/up | Down |
+| --- | --- |
+| `iq2_xxs` | `q2_k` |
+| `iq2_xxs` | `q4_k` |
+| `q4_k` | `q2_k` |
+| `q4_k` | `q4_k` |
+
+The two hybrid recipes can be generated with the existing family overrides:
+
+```sh
+# IQ2 gate/up with Q4 down
+--experts iq2_xxs --routed-w2 q4_k
+
+# Q4 gate/up with Q2 down
+--experts q4_k --routed-w2 q2_k
+```
+
+These flags can be appended to either full quantizer command above. Use an
+imatrix collected for the same model whenever possible.
+
+For the four-card RTX 8000 target, the repository includes a one-step producer
+and benchmark runner for the `iq2_xxs` gate / `iq2_xxs` up / `q4_k` down
+recipe:
+
+```sh
+bash produce-benchmark-iq2-iq2-q4.sh \
+  /models/DeepSeek-V4-Flash-HF \
+  /models/DeepSeek-V4-Flash-Q4-template.gguf \
+  /models/DeepSeek-V4-Flash-routed-moe-imatrix.dat \
+  /models/DeepSeek-V4-Flash-IQ2-IQ2-Q4.gguf
+```
+
+It builds the quantizer and an `sm_75` CUDA benchmark, verifies the routed-MoE
+matrix classification test, writes the GGUF through an atomic temporary file,
+then benchmarks prefill and generation with `--cuda-tensor-parallel`. The
+default device order is `0,2,1,3`, pairing physical GPUs `(0,1)` and `(2,3)`.
+Set `GPU_DEVICES` if the CUDA numbering differs; the script prints the detected
+topology before loading the model. Results include CSV throughput data, an SVG
+chart when `python3` is available, the quantization plan and logs, and a GPU/git
+metadata record beside the output model.
+
 Useful checks before writing a full model:
 
 ```sh
