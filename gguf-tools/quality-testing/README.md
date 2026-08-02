@@ -150,3 +150,33 @@ Output fields:
   local top-N for the same position.
 - `api_top_mae`: local-vs-API logprob MAE over mapped API top alternatives.
 - `api_pair_rate`: pairwise ordering agreement among mapped API alternatives.
+
+## 6. Fixed Q2 / Hybrid / Q4 Suite
+
+For the four-card CUDA target, run the tracked quality fixture and the fixed
+performance suite together:
+
+```sh
+./compare-q2-hybrid-q4.sh \
+  /path/to/DeepSeek-V4-Flash-Q2.gguf \
+  /path/to/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf \
+  /path/to/DeepSeek-V4-Flash-Q4.gguf \
+  /path/to/results
+```
+
+The command scores all three artifacts against the same 100 official Flash
+continuations in exact-math quality mode. It then runs three balanced-order
+performance repetitions at 2K, 4K, 8K, 16K, 32K, and 64K context. The result
+directory contains a Markdown summary, machine-readable CSV, combined SVG,
+pairwise quality reports, raw score and benchmark files, logs, and sampled GPU
+memory/utilization/power/temperature.
+
+The default GPU order is `0,2,1,3`, matching two NVLink pairs whose physical
+pairs are 0/1 and 2/3. Set `RESUME=1` to reuse completed stages after an
+interruption. The script rejects already-busy GPUs by default so an unrelated
+resident model cannot silently invalidate VRAM or throughput measurements.
+
+Published Q2/Q4 artifacts may be based on a checkpoint older than 0731. In
+that case this suite is an end-to-end artifact comparison: its quality deltas
+combine checkpoint and quantization effects. Generating all three formats from
+0731 is required to isolate quantization error alone.

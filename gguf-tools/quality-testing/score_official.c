@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
 
 #include <ctype.h>
@@ -19,6 +20,8 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
+            "[--gpu-vram auto|N[,N...]] [--gpu-devices N[,N...]] "
+            "[--cuda-tensor-parallel] [--warm-weights] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N]\n",
@@ -522,10 +525,22 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    const char *gpu_vram_arg = NULL;
+    const char *gpu_devices_arg = NULL;
+    bool cuda_tensor_parallel = false;
+    bool warm_weights = false;
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
-        if (!strcmp(arg, "--ssd-streaming")) {
+        if (!strcmp(arg, "--gpu-vram")) {
+            gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            gpu_devices_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
+            cuda_tensor_parallel = true;
+        } else if (!strcmp(arg, "--warm-weights")) {
+            warm_weights = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             ssd_streaming_cold = true;
@@ -552,6 +567,19 @@ int main(int argc, char **argv) {
     }
     if (ctx_size < 1024) ctx_size = 1024;
 
+    ds4_gpu_config gpu_cfg = {0};
+    bool skip_cuda = false;
+    const bool have_gpu_config = gpu_vram_arg || gpu_devices_arg;
+    if (have_gpu_config) {
+        char gpu_err[256];
+        if (parse_gpu_vram_arg(gpu_vram_arg, gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               gpu_err, sizeof(gpu_err)) != 0) {
+            fprintf(stderr, "score_official: %s\n", gpu_err);
+            return 2;
+        }
+    }
+
     ds4_engine_options opt = {
         .model_path = model_path,
 #ifdef __APPLE__
@@ -560,17 +588,35 @@ int main(int argc, char **argv) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .n_threads = 0,
+        .context_size = ctx_size,
         .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
-        .warm_weights = false,
-        .quality = false,
+        .warm_weights = warm_weights,
+        /* Quality scoring must not use TF32 or throughput-only fast paths. */
+        .quality = true,
+        .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        .placement_ctx_hint = ctx_size,
     };
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
+    if (skip_cuda) opt.backend = DS4_BACKEND_CPU;
+    if (have_gpu_config && !skip_cuda) {
+        const bool was_auto =
+            (gpu_vram_arg && !strcmp(gpu_vram_arg, "auto")) ||
+            (!gpu_vram_arg && gpu_devices_arg);
+        char layout[256];
+        if (format_gpu_layout_line(&gpu_cfg, was_auto,
+                                   layout, sizeof(layout)) > 0) {
+            fprintf(stderr, "%s\n", layout);
+        }
+        if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0)
+            die("failed to open model");
+    } else if (ds4_engine_open(&engine, &opt) != 0) {
+        die("failed to open model");
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");

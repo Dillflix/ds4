@@ -7,6 +7,7 @@ on:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
+      - "compare-q2-hybrid-q4.sh"
 
 permissions:
   contents: read
@@ -21,3 +22,9 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends build-essential
       - name: Build CPU and CUDA quantizers
         run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
+      - name: Build CUDA quality scorer
+        run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
+      - name: Check comparison suite tools
+        run: |
+          bash -n compare-q2-hybrid-q4.sh
+          python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py
