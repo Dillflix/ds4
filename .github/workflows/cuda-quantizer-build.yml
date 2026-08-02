@@ -6,6 +6,8 @@ on:
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4_cuda.cu"
+      - "ds4_gpu.h"
+      - "tests/cuda_long_context_smoke.c"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
       - "compare-q2-hybrid-q4.sh"
@@ -25,6 +27,8 @@ jobs:
         run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
+      - name: Build SM75 engine and CUDA regressions
+        run: make ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75
       - name: Check comparison suite tools
         run: |
           bash -n compare-q2-hybrid-q4.sh

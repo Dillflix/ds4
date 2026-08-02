@@ -741,6 +741,13 @@ Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.
 
+On Turing (`sm_75`), prefill uses native `mma.sync.m8n8k16` INT8 tensor-core
+tiles for dense Q8 matrices and for IQ2_XXS routed-expert gate/up matrices.
+The IQ2 path applies its group scale after the integer MMA, preserving the
+existing quantized dot product. For regression diagnosis only, the individual
+paths can be disabled with `DS4_CUDA_NO_Q8_MMA_SM75=1` and
+`DS4_CUDA_MOE_NO_IQ2_MMA_SM75=1`, respectively.
+
 Any even card count that can hold the selected model and graph scratch is a
 valid topology. On this class of 48 GB card, the useful measured endpoints are
 Q2 on four cards (two pipeline stages) and Q4 on eight cards (four stages).
