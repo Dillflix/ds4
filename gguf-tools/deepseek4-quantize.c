@@ -1105,6 +1105,12 @@ typedef struct {
     size_t size;
 } byte_buf;
 
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 #define DS4Q_MAX_CUDA_DEVICES 32
 typedef struct {
     bool enabled;
@@ -2724,12 +2730,6 @@ static params parse_args(int argc, char **argv) {
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
-}
-
-static double monotonic_seconds(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 static void configure_quant_backend(const params *p) {
