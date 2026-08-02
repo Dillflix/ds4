@@ -2051,6 +2051,19 @@ enum {
     DS4_TENSOR_I32      = 26,
 };
 
+/* Kept outside DS4_NO_GPU so CPU-only placement tests exercise the exact
+ * recipe predicate used by the CUDA loading and execution paths. */
+static bool cuda_routed_moe_quant_types_supported(
+        uint32_t gate_type,
+        uint32_t up_type,
+        uint32_t down_type) {
+    return gate_type == up_type &&
+           (gate_type == DS4_TENSOR_IQ2_XXS ||
+            gate_type == DS4_TENSOR_Q4_K) &&
+           (down_type == DS4_TENSOR_Q2_K ||
+            down_type == DS4_TENSOR_Q4_K);
+}
+
 typedef struct {
     ds4_str key;
     uint32_t type;
@@ -20288,17 +20301,6 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
     }
     const uint32_t type = layer->ffn_gate_exps->type;
     return type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_Q4_K;
-}
-
-static bool cuda_routed_moe_quant_types_supported(
-        uint32_t gate_type,
-        uint32_t up_type,
-        uint32_t down_type) {
-    return gate_type == up_type &&
-           (gate_type == DS4_TENSOR_IQ2_XXS ||
-            gate_type == DS4_TENSOR_Q4_K) &&
-           (down_type == DS4_TENSOR_Q2_K ||
-            down_type == DS4_TENSOR_Q4_K);
 }
 
 static bool cuda_routed_moe_quant_matrix_supported(
