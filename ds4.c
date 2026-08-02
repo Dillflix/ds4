@@ -14886,6 +14886,16 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
         name, minv, maxv, sqrt(ss / (double)n));
 }
 
+static bool cuda_prefill_pipeline_q8_cache_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return true;
+#endif
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -15408,16 +15418,6 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
 
 /* ds4_gpu_set_current_device is declared in ds4_gpu_mgpu.h — single-tier
  * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
-
-static bool cuda_prefill_pipeline_q8_cache_env_enabled(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE");
-    if (env && env[0]) return strcmp(env, "0") != 0;
-    return true;
-#endif
-}
 
 #ifdef DS4_NO_GPU
 static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
