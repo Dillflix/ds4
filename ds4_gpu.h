@@ -98,6 +98,9 @@ int ds4_gpu_synchronize(void);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 int ds4_gpu_profiler_start(void);
 int ds4_gpu_profiler_stop(void);
+int ds4_gpu_prefill_tile_audit_begin(uint32_t capacity_per_device);
+int ds4_gpu_prefill_tile_audit_write_csv(const char *path);
+void ds4_gpu_prefill_tile_audit_end(void);
 #endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -2426,6 +2429,7 @@ int ds4_gpu_routed_moe_batch_owned_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              layer_index,
         uint32_t              n_tokens,
+        uint32_t              token_offset,
         bool                 *mid_is_f16);
 
 int ds4_gpu_routed_moe_owned_slots_combine_tensor(

@@ -11,6 +11,9 @@ on:
       - "ds4_gpu.h"
       - "Makefile"
       - "speed-bench/cuda-prefill-audit.sh"
+      - "speed-bench/cuda-prefill-deep-audit.sh"
+      - "speed-bench/summarize-prefill-placement.py"
+      - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
@@ -40,4 +43,7 @@ jobs:
         run: |
           bash -n compare-q2-hybrid-q4.sh
           bash -n speed-bench/cuda-prefill-audit.sh
+          bash -n speed-bench/cuda-prefill-deep-audit.sh
+          python3 -m py_compile speed-bench/summarize-prefill-placement.py
+          python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py

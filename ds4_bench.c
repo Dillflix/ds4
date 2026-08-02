@@ -88,6 +88,20 @@ static uint64_t bench_snapshot_max_bytes(void) {
     return (uint64_t)v;
 }
 
+static uint32_t bench_tile_audit_capacity(void) {
+    const char *env = getenv("DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY");
+    if (!env || env[0] == '\0') return 4096u;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || !end || *end != '\0' || v == 0ul || v > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4-bench: invalid DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY=%s\n",
+                env);
+        return 0u;
+    }
+    return (uint32_t)v;
+}
+
 static double bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
@@ -687,6 +701,9 @@ int main(int argc, char **argv) {
         cfg.backend == DS4_BACKEND_CUDA &&
         getenv("DS4_NSYS_CAPTURE_PREFILL") != NULL;
     bool nsys_capture_done = false;
+    const char *tile_audit_csv = cfg.backend == DS4_BACKEND_CUDA
+        ? getenv("DS4_CUDA_PREFILL_TILE_AUDIT_CSV") : NULL;
+    bool tile_audit_done = false;
 #endif
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
@@ -699,6 +716,18 @@ int main(int argc, char **argv) {
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         const bool capture_this_prefill =
             nsys_capture_prefill && !nsys_capture_done;
+        const bool audit_this_prefill =
+            tile_audit_csv && tile_audit_csv[0] && !tile_audit_done;
+        if (audit_this_prefill) {
+            const uint32_t capacity = bench_tile_audit_capacity();
+            if (capacity == 0u ||
+                !ds4_gpu_prefill_tile_audit_begin(capacity)) {
+                fprintf(stderr,
+                        "ds4-bench: failed to initialize CUDA tile audit\n");
+                rc = 1;
+                break;
+            }
+        }
         if (capture_this_prefill) {
             fprintf(stderr,
                     "ds4-bench: starting Nsight CUDA capture for prefill frontier %d\n",
@@ -713,6 +742,9 @@ int main(int argc, char **argv) {
         const double prefill_t0 = bench_now_sec();
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (audit_this_prefill) ds4_gpu_prefill_tile_audit_end();
+#endif
             rc = 1;
             break;
         }
@@ -728,6 +760,20 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: stopped Nsight CUDA capture for prefill frontier %d\n",
                     frontier);
+        }
+        if (audit_this_prefill) {
+            if (!ds4_gpu_prefill_tile_audit_write_csv(tile_audit_csv)) {
+                fprintf(stderr,
+                        "ds4-bench: failed to write CUDA tile audit %s\n",
+                        tile_audit_csv);
+                ds4_gpu_prefill_tile_audit_end();
+                rc = 1;
+                break;
+            }
+            ds4_gpu_prefill_tile_audit_end();
+            tile_audit_done = true;
+            fprintf(stderr, "ds4-bench: wrote CUDA tile audit %s\n",
+                    tile_audit_csv);
         }
 #endif
         const double prefill_sec = prefill_t1 - prefill_t0;

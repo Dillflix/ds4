@@ -647,6 +647,42 @@ static void test_cuda_tp_prefill_default_accounting(void) {
     restore_env_value("DS4_METAL_GRAPH_RAW_CAP", old_raw);
 }
 
+static void test_cuda_ep_forced_stage_split(void) {
+    fprintf(stderr, "RUN: test_cuda_ep_forced_stage_split\n");
+    ds4_test_fake_tensor tensors[256];
+    const int n = build_synthetic_model(tensors, 256);
+    CHECK(n > 0, "forced-split synthetic model built");
+    if (n <= 0) return;
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 4;
+    for (int i = 0; i < cfg.n_gpus; i++) {
+        cfg.device_indices[i] = i;
+        cfg.vram_bytes[i] = (size_t)45ull * 1024ull * 1024ull * 1024ull;
+    }
+
+    char *old_split = save_env_value("DS4_CUDA_EP_STAGE_SPLIT");
+    char *old_output = save_env_value("DS4_CUDA_TP_OUTPUT");
+    setenv("DS4_CUDA_EP_STAGE_SPLIT", "25", 1);
+    setenv("DS4_CUDA_TP_OUTPUT", "0", 1);
+    int placement[DS4_N_ENTRIES] = {0};
+    int multi_tier = 0;
+    int n_entries = 0;
+    const int rc = ds4_test_classify_multi_tier_with_ctx_cuda_tp(
+            tensors, n, &cfg, 2048, placement, &multi_tier, &n_entries);
+    CHECK(rc == 0, "forced 25/18 CUDA EP placement succeeds");
+    CHECK(multi_tier == 1, "forced split is multi-tier");
+    CHECK(n_entries == DS4_N_ENTRIES, "forced split n_entries");
+    for (int il = 0; il < DS4_N_LAYER_LOCAL; il++) {
+        const int expected = il < 25 ? 0 : 1;
+        CHECK(placement[il + 1] == expected,
+              "forced split assigns each transformer layer exactly");
+    }
+    restore_env_value("DS4_CUDA_EP_STAGE_SPLIT", old_split);
+    restore_env_value("DS4_CUDA_TP_OUTPUT", old_output);
+}
+
 static int build_output_tp_head_move_model(ds4_test_fake_tensor *out, int cap) {
     if (cap < DS4_N_LAYER_LOCAL + 2) return -1;
     int n = 0;
@@ -732,6 +768,7 @@ int main(void) {
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_default_accounting();
+    test_cuda_ep_forced_stage_split();
     test_cuda_tp_output_head_moves_to_lower_half();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",

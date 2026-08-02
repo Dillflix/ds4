@@ -257,6 +257,38 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
+typedef struct {
+    uint32_t sequence;
+    uint32_t logical_tier;
+    uint32_t physical_device;
+    uint32_t layer;
+    uint32_t token_offset;
+    uint32_t n_tokens;
+    uint32_t owner_base;
+    uint32_t owner_count;
+    uint32_t selected_slots;
+    uint32_t pair_count;
+    uint32_t tile_count;
+    uint32_t active_experts;
+    uint32_t padded_slots;
+} cuda_moe_tile_audit_record;
+
+typedef struct {
+    uint32_t count;
+    uint32_t overflow;
+    uint32_t capacity;
+    uint32_t reserved;
+    cuda_moe_tile_audit_record records[1];
+} cuda_moe_tile_audit_buffer;
+
+typedef struct {
+    cuda_moe_tile_audit_buffer *device;
+    uint32_t capacity;
+} cuda_moe_tile_audit_state;
+
+static cuda_moe_tile_audit_state g_moe_tile_audit[DS4_MAX_GPUS];
+extern "C" void ds4_gpu_prefill_tile_audit_end(void);
+
 /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
  * to the largest copy seen for that pair. Each pair is its own allocation
  * so concurrent fan-out copies from a single source GPU to multiple
@@ -2237,6 +2269,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
+    ds4_gpu_prefill_tile_audit_end();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
@@ -3132,6 +3165,123 @@ extern "C" int ds4_gpu_profiler_start(void) {
 
 extern "C" int ds4_gpu_profiler_stop(void) {
     return cuda_ok(cudaProfilerStop(), "cudaProfilerStop");
+}
+
+static size_t cuda_moe_tile_audit_bytes(uint32_t capacity) {
+    if (capacity == 0u) return 0u;
+    return sizeof(cuda_moe_tile_audit_buffer) +
+           (size_t)(capacity - 1u) * sizeof(cuda_moe_tile_audit_record);
+}
+
+extern "C" void ds4_gpu_prefill_tile_audit_end(void) {
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        cuda_moe_tile_audit_state *state = &g_moe_tile_audit[tier];
+        if (!state->device) continue;
+        (void)cudaSetDevice(g_gpu[tier].device_id);
+        (void)cudaFree(state->device);
+        state->device = NULL;
+        state->capacity = 0u;
+    }
+    g_current_logical_tier = -1;
+}
+
+extern "C" int ds4_gpu_prefill_tile_audit_begin(uint32_t capacity_per_device) {
+    if (g_n_gpus <= 0 || capacity_per_device == 0u) return 0;
+    ds4_gpu_prefill_tile_audit_end();
+    const size_t bytes = cuda_moe_tile_audit_bytes(capacity_per_device);
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        cuda_moe_tile_audit_state *state = &g_moe_tile_audit[tier];
+        if (cudaSetDevice(g_gpu[tier].device_id) != cudaSuccess ||
+            cudaMalloc((void **)&state->device, bytes) != cudaSuccess ||
+            cudaMemset(state->device, 0, bytes) != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA tile audit allocation failed on logical tier %d\n",
+                    tier);
+            (void)cudaGetLastError();
+            ds4_gpu_prefill_tile_audit_end();
+            return 0;
+        }
+        state->capacity = capacity_per_device;
+        uint32_t header[4] = {0u, 0u, capacity_per_device, 0u};
+        if (cudaMemcpy(state->device, header, sizeof(header),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA tile audit initialization failed on logical tier %d\n",
+                    tier);
+            (void)cudaGetLastError();
+            ds4_gpu_prefill_tile_audit_end();
+            return 0;
+        }
+    }
+    g_current_logical_tier = -1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_prefill_tile_audit_write_csv(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot create CUDA tile audit CSV %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    fprintf(fp,
+            "logical_tier,physical_device,sequence,layer,token_offset,n_tokens,"
+            "ownership,owner_base,owner_count,selected_slots,pair_count,"
+            "tile_count,active_experts,padded_slots,tile_fill_pct\n");
+    int ok = 1;
+    for (int tier = 0; tier < g_n_gpus && ok; tier++) {
+        const cuda_moe_tile_audit_state *state = &g_moe_tile_audit[tier];
+        if (!state->device || state->capacity == 0u) continue;
+        const size_t bytes = cuda_moe_tile_audit_bytes(state->capacity);
+        std::vector<uint8_t> host;
+        try {
+            host.resize(bytes);
+        } catch (...) {
+            ok = 0;
+            break;
+        }
+        if (cudaSetDevice(g_gpu[tier].device_id) != cudaSuccess ||
+            cudaMemcpy(host.data(), state->device, bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA tile audit read failed on logical tier %d\n",
+                    tier);
+            (void)cudaGetLastError();
+            ok = 0;
+            break;
+        }
+        const cuda_moe_tile_audit_buffer *buffer =
+            (const cuda_moe_tile_audit_buffer *)host.data();
+        const uint32_t count = buffer->count < state->capacity
+            ? buffer->count : state->capacity;
+        if (buffer->overflow != 0u || buffer->count > state->capacity) {
+            fprintf(stderr,
+                    "ds4: CUDA tile audit overflow on logical tier %d "
+                    "(records=%u capacity=%u overflow=%u)\n",
+                    tier, buffer->count, state->capacity, buffer->overflow);
+            ok = 0;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            const cuda_moe_tile_audit_record *r = &buffer->records[i];
+            const char *ownership = r->owner_base == 0u ? "home" : "partner";
+            const double fill = r->tile_count != 0u
+                ? 100.0 * (double)r->pair_count /
+                    ((double)r->tile_count * 16.0)
+                : 0.0;
+            fprintf(fp,
+                    "%u,%u,%u,%u,%u,%u,%s,%u,%u,%u,%u,%u,%u,%u,%.6f\n",
+                    r->logical_tier, r->physical_device, r->sequence,
+                    r->layer, r->token_offset, r->n_tokens, ownership,
+                    r->owner_base, r->owner_count, r->selected_slots,
+                    r->pair_count, r->tile_count, r->active_experts,
+                    r->padded_slots, fill);
+        }
+    }
+    if (fclose(fp) != 0) ok = 0;
+    g_current_logical_tier = -1;
+    return ok;
 }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) {
@@ -18001,15 +18151,52 @@ __global__ static void moe_build_expert_tile_offsets_kernel(
         uint32_t *tile_total,
         const uint32_t *counts,
         uint32_t block_m,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        cuda_moe_tile_audit_buffer *audit,
+        uint32_t logical_tier,
+        uint32_t physical_device,
+        uint32_t layer,
+        uint32_t token_offset,
+        uint32_t n_tokens,
+        uint32_t owner_base,
+        uint32_t owner_count,
+        uint32_t selected_slots) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
+        uint32_t pair_sum = 0;
+        uint32_t active_experts = 0;
         for (uint32_t e = 0; e < n_total_expert; e++) {
+            const uint32_t count = counts[e];
             tile_offsets[e] = sum;
-            sum += (counts[e] + block_m - 1u) / block_m;
+            sum += (count + block_m - 1u) / block_m;
+            if (audit && block_m == 16u) {
+                pair_sum += count;
+                active_experts += count != 0u;
+            }
         }
         tile_offsets[n_total_expert] = sum;
         *tile_total = sum;
+        if (audit && block_m == 16u) {
+            const uint32_t sequence = atomicAdd(&audit->count, 1u);
+            if (sequence < audit->capacity) {
+                cuda_moe_tile_audit_record *r = &audit->records[sequence];
+                r->sequence = sequence;
+                r->logical_tier = logical_tier;
+                r->physical_device = physical_device;
+                r->layer = layer;
+                r->token_offset = token_offset;
+                r->n_tokens = n_tokens;
+                r->owner_base = owner_base;
+                r->owner_count = owner_count;
+                r->selected_slots = selected_slots;
+                r->pair_count = pair_sum;
+                r->tile_count = sum;
+                r->active_experts = active_experts;
+                r->padded_slots = sum * 16u - pair_sum;
+            } else {
+                atomicAdd(&audit->overflow, 1u);
+            }
+        }
     }
 }
 
@@ -22090,7 +22277,10 @@ static int routed_moe_launch(
         uint32_t layer_index,
         uint32_t n_tokens,
         int allow_streaming,
-        int owned_filtered) {
+        int owned_filtered,
+        uint32_t audit_owner_base,
+        uint32_t audit_owner_count,
+        uint32_t audit_token_offset) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -22464,7 +22654,9 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m, n_total_expert);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+                        tile_offsets, tile_total, counts, expert_tile_m,
+                        n_total_expert, NULL, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep) {
@@ -22474,7 +22666,18 @@ static int routed_moe_launch(
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep &&
                     use_any_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u, n_total_expert);
+                    cuda_moe_tile_audit_buffer *audit =
+                        logical_tier >= 0 && logical_tier < g_n_gpus
+                            ? g_moe_tile_audit[logical_tier].device : NULL;
+                    const uint32_t audit_physical_device =
+                        logical_tier >= 0 && logical_tier < g_n_gpus
+                            ? (uint32_t)g_gpu[logical_tier].device_id : UINT32_MAX;
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(
+                        tile16_offsets, tile16_total, counts, 16u,
+                        n_total_expert, audit, (uint32_t)logical_tier,
+                        audit_physical_device, layer_index,
+                        audit_token_offset, n_tokens, audit_owner_base,
+                        audit_owner_count, pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && !use_small_sorted_prep &&
@@ -23695,7 +23898,8 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1, force_resident ? 0 : 1, 0);
+                             layer_index, 1, force_resident ? 0 : 1, 0,
+                             0u, n_total_expert, 0u);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     (void)force_resident;
@@ -23707,7 +23911,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0);
+                             layer_index, n_tokens, 1, 0,
+                             0u, n_total_expert, 0u);
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
@@ -23740,6 +23945,7 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens,
+        uint32_t token_offset,
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (!selected || !weights || n_tokens == 0u || n_expert == 0u ||
@@ -23786,7 +23992,8 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, resident_expert_count, n_expert,
-            clamp, x, layer_index, n_tokens, 0, 1);
+            clamp, x, layer_index, n_tokens, 0, 1,
+            resident_expert_base, resident_expert_count, token_offset);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

@@ -54992,6 +54992,56 @@ static int engine_compute_cuda_ep_placement(
     const int n_stages = pcfg->n_gpus / 2;
     if (n_stages > (int)DS4_N_LAYER) return -1;
 
+    const char *forced_split_env = getenv("DS4_CUDA_EP_STAGE_SPLIT");
+    if (forced_split_env && forced_split_env[0]) {
+        char *end = NULL;
+        const long split = strtol(forced_split_env, &end, 10);
+        if (n_stages != 2 || end == forced_split_env || !end || *end != '\0' ||
+            split <= 0 || split >= (long)DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_EP_STAGE_SPLIT=%s requires exactly two "
+                    "pipeline stages and a split in 1..%u\n",
+                    forced_split_env, (unsigned)DS4_N_LAYER - 1u);
+            return -1;
+        }
+        placement[0] = 0;
+        for (int stage = 0; stage < 2; stage++) {
+            const int first_layer = stage == 0 ? 0 : (int)split;
+            const int end_layer = stage == 0 ? (int)split : (int)DS4_N_LAYER;
+            uint64_t layer_bytes = 0u;
+            for (int il = first_layer; il < end_layer; il++) {
+                const uint64_t next = entry_bytes[il + 1];
+                if (layer_bytes > UINT64_MAX - next) return -1;
+                layer_bytes += next;
+            }
+            const uint64_t fixed_here =
+                (stage == 0 ? entry_bytes[0] : 0u) +
+                (stage == 1 ? entry_bytes[n_entries - 1] : 0u);
+            const uint64_t home_budget = pcfg->gpu_budget_bytes[stage];
+            const uint64_t partner_budget =
+                pcfg->gpu_budget_bytes[stage + n_stages];
+            if (fixed_here > home_budget ||
+                layer_bytes > home_budget - fixed_here ||
+                layer_bytes > partner_budget) {
+                fprintf(stderr,
+                        "ds4: forced CUDA EP stage %d (%d layers) does not fit "
+                        "pair budgets %.2f/%.2f GiB\n",
+                        stage, end_layer - first_layer,
+                        (double)home_budget / 1073741824.0,
+                        (double)partner_budget / 1073741824.0);
+                return -1;
+            }
+            for (int il = first_layer; il < end_layer; il++) {
+                placement[il + 1] = stage;
+            }
+        }
+        placement[n_entries - 1] = 1;
+        fprintf(stderr,
+                "ds4: CUDA EP forced pipeline split %ld/%u\n",
+                split, (unsigned)DS4_N_LAYER - (unsigned)split);
+        return 0;
+    }
+
     uint64_t remaining_layers = 0;
     for (int entry = 1; entry <= (int)DS4_N_LAYER; entry++) {
         if (remaining_layers > UINT64_MAX - entry_bytes[entry]) return -1;
@@ -63190,7 +63240,7 @@ static bool metal_graph_encode_routed_session_batch(
                 DS4_N_EXPERT / 2u,
                 DS4_N_EXPERT - DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
-                &peer_norm, il, (uint32_t)count,
+                &peer_norm, il, (uint32_t)count, g->batch_token_offset,
                 &peer_mid_is_f16) != 0;
     }
 
@@ -63217,7 +63267,7 @@ static bool metal_graph_encode_routed_session_batch(
                 DS4_N_EXPERT, DS4_N_EXPERT_USED,
                 0, DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
-                &local_norm, il, (uint32_t)count,
+                &local_norm, il, (uint32_t)count, g->batch_token_offset,
                 &g->batch_routed_mid_is_f16) != 0;
     }
     if (ok) {
@@ -63391,7 +63441,7 @@ static bool metal_graph_encode_mixed_routed_rows(
                 DS4_N_EXPERT / 2u,
                 DS4_N_EXPERT - DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
-                &peer_norm, il, total_rows,
+                &peer_norm, il, total_rows, g->batch_token_offset,
                 &peer_mid_is_f16) != 0;
     }
 
@@ -63418,7 +63468,7 @@ static bool metal_graph_encode_mixed_routed_rows(
                 DS4_N_EXPERT, DS4_N_EXPERT_USED,
                 0, DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
-                &local_norm, il, total_rows,
+                &local_norm, il, total_rows, g->batch_token_offset,
                 &g->batch_routed_mid_is_f16) != 0;
     }
 
