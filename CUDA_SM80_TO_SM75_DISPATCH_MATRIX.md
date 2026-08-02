@@ -4,6 +4,13 @@ This is the architecture audit for the DeepSeek V4 Flash CUDA path at commit
 `97201903f4e996763c80156f1458c3552ad38417`. It is the prerequisite for any
 further kernel or quantization proposal.
 
+This is a current-state inventory, not a list of newly discovered capabilities.
+In particular, the dense-Q8, IQ2 gate/up, Q4-down, and exact-attention SM75
+paths were added by the current SM75 initiative immediately before this audit.
+Every architecture-specific row must therefore be read together with the
+provenance ledger below. The relevant question is how well those new paths use
+Turing, not whether they exist.
+
 The scope is the normal resident four-GPU DeepSeek V4 Flash prefill and decode
 path, including Q8 expansion caching, all four routed-expert quantization
 combinations, output sharding, and inter-GPU movement. GLM 4.5/4.7, DSpark
@@ -33,6 +40,22 @@ The status classes are:
 - `SM75_IMPOSSIBLE`: the SM80 launch cannot fit or its required instruction is
   unavailable on SM75.
 - `DIAGNOSTIC_ONLY`: not part of the release path unless explicitly enabled.
+
+## Provenance ledger
+
+| Origin | Change relevant to this matrix | Interpretation |
+|---|---|---|
+| `48beef8` (`CUDA support`) | Original CUDA kernels, including generic/DP4A quantized paths such as Q2 down | Inherited CUDA baseline |
+| `36ee8c1` (`Add CUDA tensor parallelism and session batching`) | Paired TP/EP orchestration, SM80 dense-Q8 MMA, and the SM75-compatible Q4 tile8 MMA path | Inherited multi-GPU baseline |
+| `118aca3` (`Fit exact attention tile on SM75`) | Added runtime shared-memory fitting and the 16x8 exact-score tile for Turing | **Added by this SM75 initiative** |
+| `958ed67` (`Add SM75 IQ2 and dense Q8 MMA kernels`) | Added `m8n8k16` dense-Q8 and IQ2 gate/up kernels | **Added by this SM75 initiative** |
+| `049d2da` (`Enable CUDA prefill Q8 cache by default`) | Made the expanded Q8-to-F16 cache the normal prefill policy | **Added by this SM75 initiative**; changes which matrix rows actually run |
+| `7cac54e` (`Add SM75 tile16 hybrid MoE kernels`) | Added IQ2 tile16 gate/up, SM75 Q4 tile16 down, and the associated tile16 routed paths | **Added by this SM75 initiative** |
+| `8f9ebcd` through `cfc0391` | Added, corrected, measured, and then disabled the regressed 32/32 attention-head split by default | Experimental branch work; not a performance capability |
+
+`SM75_NATIVE` below describes the current dispatch, not its historical origin.
+It must not be reported as a finding without also saying whether it is inherited
+or was just implemented by this initiative.
 
 ## Architectural resource envelope
 
@@ -67,7 +90,7 @@ from an SM80 block with the same nominal thread count.
 |---|---|---|---|---|---|
 | Q8_0 expanded-weight prefill GEMM | `n_tok > 1`, cache allowed, expansion fits | Q8_0 -> F16 once, FP32 -> F16 activations, `cublasGemmEx` | Same application dispatch | Expansion consumes `2 * in_dim * out_dim` bytes per cached matrix; cuBLAS resources opaque | `LIBRARY_SELECTED`; `SOURCE`, runtime cache coverage is workload-dependent |
 | Q8_0 expanded-weight FP32 cache | Explicit F32 cache flags | Q8_0 -> F32, `cublasSgemm` | Same | Four bytes per weight; normally disabled | `DIAGNOSTIC_ONLY` |
-| Native Q8_0 prefill GEMM | Cache unavailable; `n_tok >= 8`, `B <= 256` | `matmul_q8_0_mma_exact_kernel<T>` using `m16n8k32.s8`; 16 tokens x 64 rows/block | `matmul_q8_0_mma_sm75_exact_kernel<T>` using `m8n8k16.s8`; 8 tokens x 64 rows/block | 256 threads. Dynamic shared: SM80 `192*B` bytes; SM75 `160*B` bytes. At `in_dim=8192`, SM75 uses 40,960 bytes and is limited to one block/SM by shared memory. | `SM75_NATIVE`; `SOURCE`, exact registers/spills `COMPILED` |
+| Native Q8_0 prefill GEMM | Cache unavailable; `n_tok >= 8`, `B <= 256` | `matmul_q8_0_mma_exact_kernel<T>` using `m16n8k32.s8`; 16 tokens x 64 rows/block | `matmul_q8_0_mma_sm75_exact_kernel<T>` using `m8n8k16.s8`; 8 tokens x 64 rows/block | 256 threads. Dynamic shared: SM80 `192*B` bytes; SM75 `160*B` bytes. At `in_dim=8192`, SM75 uses 40,960 bytes and is limited to one block/SM by shared memory. | `SM75_NATIVE`, added in `958ed67`; `SOURCE`, exact registers/spills `COMPILED` |
 | Native Q8_0 short-batch fallback | MMA gate fails or batch below eight | Token-8/4/2, batch-warp, or exact kernels; DP4A selectable | Same dispatch order | 32-256 threads depending shape; resources `COMPILED` | `EQUIVALENT` dispatch, architecture codegen unknown |
 | Native Q8_0 decode matvec | `n_tok == 1` | `matmul_q8_0_preq_warp8_kernel` | Same | 256 threads, DP4A unless disabled | `EQUIVALENT`; `SOURCE` |
 | F16 batched matrix multiply | `n_tok > 1`, normal path | FP32 -> F16 activations + `cublasGemmEx` | Same | cuBLAS resources opaque | `LIBRARY_SELECTED` |
@@ -100,7 +123,7 @@ Source anchors: Q8 architecture dispatch is in `ds4_cuda.cu:5414-5803` and
 | Masked mixed prefill attention | Compressed mask required | cuBLAS score/value path, then custom softmax; custom mixed fallback if cuBLAS disabled | Same | Score scratch grows as `heads*tokens*keys` outside kernel | `LIBRARY_SELECTED` / `EQUIVALENT` |
 | Indexed prefill attention | `top_k <= 512`, `head_dim=512` | `attention_indexed_mixed_heads8_online_kernel<8,16>` | Same | 512 threads; 16,384-byte KV tile plus about 1 KiB row metadata | `EQUIVALENT`; 512-thread block is 25% of SM80 versus 50% of SM75 warp capacity |
 | Indexed two-pass fallback | Explicit two-pass flag | `attention_indexed_mixed_heads8_rb4_kernel` | Same | About 35.0 KiB static shared (`scores`, KV tile, and row metadata), hence one block/SM on SM75 | `DIAGNOSTIC_ONLY`; resource-risk row |
-| Decode exact-score tiled dot | Exact score-split default, `head_dim=512` | 16 heads x 16 rows; 66,048-byte dynamic tile | 16 heads x 8 rows; 49,536-byte dynamic tile | 256 threads on SM75 (16*8). SM75 selection is based on `cudaDevAttrMaxSharedMemoryPerBlockOptin`. | `SM75_NATIVE`; one block/SM and 32 KiB L1 on SM75 |
+| Decode exact-score tiled dot | Exact score-split default, `head_dim=512` | 16 heads x 16 rows; 66,048-byte dynamic tile | 16 heads x 8 rows; 49,536-byte dynamic tile | 256 threads on SM75 (16*8). SM75 selection is based on `cudaDevAttrMaxSharedMemoryPerBlockOptin`. | `SM75_NATIVE`, added in `118aca3`; one block/SM and 32 KiB L1 on SM75 |
 | Decode exact-score finalize | Exact score-split default | `attention_decode_score_split_finalize_kernel` | Same | About 34.0 KiB static shared from 8,192 scores, raw-row metadata, and reduction state | `EQUIVALENT` source, one block/SM on SM75 |
 | Decode score variants | Explicit LDG/vec4/plain/dim2/graph flags | Corresponding score/finalize kernels | Same | Diagnostic dispatch, not architecture-selected | `DIAGNOSTIC_ONLY` |
 | Decode online attention | Score count exceeds fixed buffer, or online flag | `attention_decode_mixed_heads8_online_kernel` | Same | About 9.0 KiB static shared | `EQUIVALENT` |
@@ -112,8 +135,8 @@ Source anchors: Q8 architecture dispatch is in `ds4_cuda.cu:5414-5803` and
 | Indexer top-1 | `top_k=1` | 1,024-thread reduction | Same | 8,192 bytes static shared; one block occupies all SM75 warps | `EQUIVALENT` |
 | Indexer top-512/2048 | Shape-selected power-of-two or CUB sort | Same source | Same | 1,024 threads; 8-48 KiB static/dynamic shared depending `n_comp` | `EQUIVALENT` dispatch; exact CUB resource use `COMPILED` |
 | Attention output A, cached | Non-quality prefill, cache fits | F16 packed heads + strided batched cuBLAS GEMM | Same | Eight 4096x1024 group projections; cache residency is part of model footprint | `LIBRARY_SELECTED` |
-| Attention output A, uncached | Cache absent | Grouped SM80 Q8 MMA when batch >=8 | Grouped SM75 Q8 MMA when batch >=8 | Same Q8 formulas as core GEMM with `B=128`: SM80 24,576 B, SM75 20,480 B dynamic shared | `SM75_NATIVE` |
-| Attention output B | 8192 -> 4096 Q8 | Cached F16 cuBLAS if it fits; otherwise SM80 Q8 MMA | Cached F16 cuBLAS if it fits; otherwise SM75 Q8 MMA | Uncached SM75 uses 40,960 B dynamic shared and therefore one block/SM | `LIBRARY_SELECTED` or `SM75_NATIVE` fallback |
+| Attention output A, uncached | Cache absent | Grouped SM80 Q8 MMA when batch >=8 | Grouped SM75 Q8 MMA when batch >=8 | Same Q8 formulas as core GEMM with `B=128`: SM80 24,576 B, SM75 20,480 B dynamic shared | `SM75_NATIVE`, supplied by the dense-Q8 work in `958ed67` |
+| Attention output B | 8192 -> 4096 Q8 | Cached F16 cuBLAS if it fits; otherwise SM80 Q8 MMA | Cached F16 cuBLAS if it fits; otherwise SM75 Q8 MMA | Uncached SM75 uses 40,960 B dynamic shared and therefore one block/SM | `LIBRARY_SELECTED` or `SM75_NATIVE` from `958ed67` |
 | Vocabulary output head | Four-way vocabulary shard | Q8/F16/cuBLAS dispatch inherited from general matmul, per shard | Same | Output gathering is separate from matmul | `LIBRARY_SELECTED` / `EQUIVALENT` orchestration |
 
 Source anchors: attention prefill/decode dispatch is in
@@ -131,12 +154,12 @@ type because they are fused and share a byte stride.
 For the target shapes, `xq_blocks=16`, `midq_blocks=8`, 256 experts, six
 selected experts, and prefill microbatches normally contain 512 tokens.
 
-| Gate/up | Down | SM80 prefill dispatch | SM75 prefill dispatch | Source-visible block resource | Class/evidence |
-|---|---|---|---|---|---|
-| IQ2_XXS | Q2_K | Generic IQ2 expert tile8 row-span + Q2 tile16 atomic down | IQ2 tile16 `m8n8k16.s8` + Q2 tile16 atomic down | SM75 IQ2: 39,748 B static shared, 256 threads. Q2 down: 37,376 B static shared, 256 threads. Both force one block/SM. | Gate/up `SM75_NATIVE`; down `EQUIVALENT` DP4A |
-| IQ2_XXS | Q4_K | Generic IQ2 expert tile8 row-span + SM80 Q4 tile16 `m16n8k32.s8` down | IQ2 tile16 `m8n8k16.s8` + SM75 Q4 tile16 `m8n8k16.s8` down | SM75 IQ2 39,748 B; SM75 Q4 down 37,444 B; both 256 threads and one block/SM | Both `SM75_NATIVE`; `MEASURED` on hybrid |
-| Q4_K | Q2_K | SM80 Q4 gate/up tile16 `m16n8k32.s8` + Q2 tile16 atomic down | Q4 gate/up tile8 `m8n8k16.s8` + Q2 tile16 atomic down | SM80 Q4 gate tile16: 74,948 B total shared. SM75 Q4 gate tile8: 37,476 B static. Q2 down: 37,376 B. | Gate/up `SM75_FALLBACK`; down `EQUIVALENT` DP4A |
-| Q4_K | Q4_K | SM80 Q4 tile16 gate/up + SM80 Q4 tile16 down | SM75 Q4 tile8 gate/up + SM75 Q4 tile16 down | SM80: 74,948 B gate, 74,820 B down. SM75: 37,476 B gate, 37,444 B down. | Gate `SM75_FALLBACK`; down `SM75_NATIVE` |
+| Gate/up | Down | SM80 prefill dispatch | SM75 prefill dispatch | Source-visible block resource | SM75-path provenance | Class/evidence |
+|---|---|---|---|---|---|---|
+| IQ2_XXS | Q2_K | Generic IQ2 expert tile8 row-span + Q2 tile16 atomic down | IQ2 tile16 `m8n8k16.s8` + Q2 tile16 atomic down | SM75 IQ2: 39,748 B static shared, 256 threads. Q2 down: 37,376 B static shared, 256 threads. Both force one block/SM. | IQ2 tile8 `958ed67`; tile16 `7cac54e`; Q2 inherited from `48beef8` | Gate/up `SM75_NATIVE`; down `EQUIVALENT` DP4A |
+| IQ2_XXS | Q4_K | Generic IQ2 expert tile8 row-span + SM80 Q4 tile16 `m16n8k32.s8` down | IQ2 tile16 `m8n8k16.s8` + SM75 Q4 tile16 `m8n8k16.s8` down | SM75 IQ2 39,748 B; SM75 Q4 down 37,444 B; both 256 threads and one block/SM | IQ2 tile8 `958ed67`; IQ2 tile16 and Q4 down `7cac54e` | Both `SM75_NATIVE`; `MEASURED` on hybrid |
+| Q4_K | Q2_K | SM80 Q4 gate/up tile16 `m16n8k32.s8` + Q2 tile16 atomic down | Q4 gate/up tile8 `m8n8k16.s8` + Q2 tile16 atomic down | SM80 Q4 gate tile16: 74,948 B total shared. SM75 Q4 gate tile8: 37,476 B static. Q2 down: 37,376 B. | Q4 tile8 inherited from `36ee8c1`; Q2 inherited from `48beef8`; SM80 tile16 added in `7cac54e` | Gate/up `SM75_FALLBACK`; down `EQUIVALENT` DP4A |
+| Q4_K | Q4_K | SM80 Q4 tile16 gate/up + SM80 Q4 tile16 down | SM75 Q4 tile8 gate/up + SM75 Q4 tile16 down | SM80: 74,948 B gate, 74,820 B down. SM75: 37,476 B gate, 37,444 B down. | Q4 tile8 inherited from `36ee8c1`; Q4 tile16 down added in `7cac54e` | Gate `SM75_FALLBACK`; down `SM75_NATIVE` |
 
 ### Routed-expert suboperations
 
@@ -145,14 +168,14 @@ selected experts, and prefill microbatches normally contain 512 tokens.
 | Input F32 -> Q8_K | `q8_K_quantize_kernel` | Same | 256 threads per Q8_K block/row | `EQUIVALENT` |
 | Count/prefix/scatter selected pairs | Count, prefix, scatter kernels | Same | Atomics/scans are not architecture-specialized | `EQUIVALENT` |
 | Build tile8/tile16 descriptors | Expert tile builder | Same | Padding and active-expert behavior is data-dependent, not architecture-dependent | `EQUIVALENT`; tile counts `MEASURED` |
-| IQ2 gate/up tile16 | Not selected: `cuda_sm75_mma_ok()` requires exactly 7.5 | Two `m8n8k16.s8` passes, one for gate and one for up | SM75-specific path is not an SM80 backport; SM80 currently falls to generic IQ2 DP4A | `SM75_NATIVE`; 64 registers/thread and about 24.8% achieved occupancy `MEASURED` |
+| IQ2 gate/up tile16 | Not selected: `cuda_sm75_mma_ok()` requires exactly 7.5 | Two `m8n8k16.s8` passes, one for gate and one for up | SM75-specific path is not an SM80 backport; SM80 currently falls to generic IQ2 DP4A | `SM75_NATIVE`, added in `958ed67`/`7cac54e`; 64 registers/thread and about 24.8% achieved occupancy `MEASURED` |
 | Q4 gate/up tile16 | `m16n8k32.s8`; `binaryVersion >= 80` | Cannot launch: 74,752-byte activation tile alone exceeds SM75's 64 KiB block limit | SM75 dispatches tile8 even when the tile16 feature flag is true | `SM75_IMPOSSIBLE` for current layout |
 | Q4 gate/up tile8 | Secondary SM80 path | Primary SM75 path, `m8n8k16.s8` | 37,476 B static shared, so one block/SM; Q4 gate/up remains unprofiled on target | `SM75_FALLBACK`; runtime cost `UNKNOWN` |
 | IQ2 decode gate/up | Generic IQ2 decode LUT/DP4A | Same | No SM75 tensor-core decode specialization | `EQUIVALENT`; tuning status `UNKNOWN` |
 | Q4 decode gate/up | Q4 warp32/optional graph variants | Same | DP4A-style decode kernels, no SM80-only launch | `EQUIVALENT`; tuning status `UNKNOWN` |
 | Intermediate F32 -> Q8_K | Standard, owned, or sidecar quantizer | Same | Selected by ownership and decode flags | `EQUIVALENT` |
 | Q2 down prefill | Tile16/row-span DP4A, usually atomic direct accumulation | Same | Exactly 37,376 B shared at tile16. Each thread also declares 16 pair IDs, 16 input pointers, and 16 accumulators; compiled register/spill cost is still `UNKNOWN`. No INT2 MMA exists on either architecture. | `EQUIVALENT`; architecture-independent algorithmic gap |
-| Q4 down tile16 | `m16n8k32.s8`, dynamic activation tile | Turing-specific `m8n8k16.s8`, static half-width activation tile | SM75 path fits at 37,444 B but remains one block/SM | `SM75_NATIVE`; 64 registers/thread and about 24.9% achieved occupancy `MEASURED` |
+| Q4 down tile16 | `m16n8k32.s8`, dynamic activation tile | Turing-specific `m8n8k16.s8`, static half-width activation tile | SM75 path fits at 37,444 B but remains one block/SM | `SM75_NATIVE`, added in `7cac54e`; 64 registers/thread and about 24.9% achieved occupancy `MEASURED` |
 | Direct decode down | Sum-6 or sum-3 Q4/Q2 kernels | Same | One-token fast path, separate from prefill tiles | `EQUIVALENT`; tuning status `UNKNOWN` |
 | Owned output combine | Fixed-three slot/packed combine, then shared down/HC fusion | Same | Pair-local expert ownership, no architecture gate | `EQUIVALENT` |
 
@@ -251,26 +274,31 @@ kernels then require Nsight Compute.
 
 ## Audit conclusions (not optimization proposals)
 
-1. The engine has only three explicit SM75 compute specializations in the
-   normal prefill path: native dense-Q8 MMA, IQ2 gate/up MMA, and Q4-down MMA.
-   Exact-score attention has a fourth SM75 resource adaptation (16x8 rather
-   than 16x16), but not a distinct instruction-set implementation.
-2. Q4 gate/up is the confirmed important SM75 fallback: SM80 tile16 is
-   impossible with the current 74,752-byte activation staging layout, so
-   Turing uses tile8.
-3. The indexer WMMA128 and several attention/decode kernels also cross the
-   Turing 32-KiB shared-memory cliff. They were missing from the earlier
-   narrow MoE discussion and must remain in the architecture-level audit.
-4. Expanded Q8-to-F16 cache coverage changes the active architecture matrix.
-   A cached projection is a cuBLAS FP16 path; the same projection becomes a
-   custom SM75 INT8 kernel when the cache cannot fit. Quant size therefore
-   changes both residency and executed kernels.
-5. IQ2's current optimized path is SM75-only, while Q2 down has no Tensor Core
-   path on either architecture. The labels `SM80 optimized` and `SM75 fallback`
-   are invalid unless assigned operation by operation.
-6. No further optimization or custom quant choice is justified solely from
-   this static matrix. The paired cubin report and runtime branch coverage are
-   the remaining evidence needed before ranking targets.
+1. Dense-Q8 SM75 MMA, IQ2 gate/up SM75 MMA, Q4-down SM75 MMA, and the smaller
+   exact-attention tile are **outputs of the current initiative**, not findings
+   of this audit. Their existence says nothing about whether they are close to
+   optimal. The measured MoE kernels still achieve only about 25% occupancy.
+2. The inherited Q4 gate/up path already used Turing `m8n8k16` MMA. The
+   remaining gap is specifically tile shape and staging: the newer SM80 tile16
+   layout needs a 74,752-byte activation tile and cannot launch on SM75, which
+   therefore remains on the inherited 37,476-byte tile8 kernel. Calling the
+   entire Q4 gate/up operation an unoptimized DP4A fallback would be false.
+3. Q2 down remains an inherited DP4A path with no native INT2 MMA alternative.
+   Its tile16 kernel also declares large per-thread arrays whose compiled
+   register and spill cost has not yet been captured.
+4. Indexer WMMA128 and several attention/decode kernels cross Turing's 32-KiB
+   shared-memory cliff even though their dispatch is architecture-equivalent.
+   They are unresolved audit targets, not evidence that a replacement kernel
+   will automatically be faster.
+5. Expanded Q8-to-F16 cache coverage changes the active architecture matrix.
+   A cached projection is a cuBLAS FP16 path; the same projection becomes the
+   newly added custom SM75 INT8 kernel when the cache cannot fit. Quant size
+   therefore changes both residency and executed kernels.
+6. The next evidence pass must evaluate the work already added—not rediscover
+   it: paired cubin resources/SASS, runtime branch coverage, and representative
+   Nsight measurements for inherited and initiative-added paths. No further
+   optimization or custom quant choice is justified solely from this static
+   matrix.
 
 ## Architecture references
 
