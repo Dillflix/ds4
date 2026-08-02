@@ -14900,7 +14900,11 @@ static bool cuda_tp_prefill_attn_heads_env_enabled(void) {
     return false;
 #else
     const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
-    return !env || !env[0] || strcmp(env, "0") != 0;
+    /* Experimental only. On the 4x RTX 8000 NVLink-pair target, both the
+     * split output-B implementation and the later low-rank-gather/full-B
+     * implementation regressed the proven home-attention path by about 20%
+     * across 2K..65K. Measurements, not feature availability, set defaults. */
+    return env && env[0] && strcmp(env, "0") != 0;
 #endif
 }
 

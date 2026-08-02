@@ -742,15 +742,13 @@ uses cuBLAS for eligible dense and shared-expert projections. Cache growth stops
 at the CUDA VRAM reserve and transparently falls back to native Q8 kernels when
 an expansion cannot fit. `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables this
 cache for memory-pressure diagnosis; it is not the performance default.
-Prefill attention also splits the 64 query heads 32/32 within each validated
-P2P pair. Both halves run concurrently and feed group-sliced output-A
-projections on their local GPUs. The home GPU peer-reads only the partner's
-packed low-rank half, assembles the complete low-rank activation, and runs one
-full cached output-B GEMM. This avoids two inefficient half-K output-B GEMMs
-and the previous full-width projected-output exchange. Raw and compressed KV
-remain single-copy on the home GPU and are peer-read by the partner. Set
-`DS4_CUDA_TP_PREFILL_ATTN_HEADS=0` only to compare against the replicated
-single-GPU attention path.
+Prefill attention remains on the home GPU by default. The experimental 32/32
+head split can be enabled with `DS4_CUDA_TP_PREFILL_ATTN_HEADS=1`; it keeps raw
+and compressed KV single-copy on the home GPU, runs the two attention/output-A
+halves concurrently, gathers the packed low-rank halves, and runs one full
+cached output-B GEMM. It is not the performance default because both tested
+output strategies regressed prefill by roughly 20% across 2K..65K on the
+4x RTX 8000 NVLink-pair target.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.

@@ -583,12 +583,16 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_heads_requested(),
+          "CUDA TP keeps the proven home-attention path by default");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS", "1", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_heads_requested(),
-          "CUDA TP splits prefill attention heads by default");
+          "CUDA TP prefill head splitting retains an experimental opt-in");
 
     setenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_attn_heads_requested(),
-          "CUDA TP prefill head splitting retains an explicit opt-out");
+          "CUDA TP prefill head splitting accepts an explicit zero");
 
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS", old);
 }
