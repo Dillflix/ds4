@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install host compiler
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential python3
       - name: Build CPU and CUDA quantizers
         run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
       - name: Build CUDA quality scorer
