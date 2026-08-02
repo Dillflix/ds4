@@ -6,6 +6,18 @@
 #include <string.h>
 #include <time.h>
 
+static unsigned char *idle_model_map;
+static const uint64_t idle_model_bytes = 4096u;
+
+/* A registered model mapping must outlive every kernel that can reference it
+ * and must not be freed before ds4_gpu_set_model_map unregisters it. Keep one
+ * process-lifetime idle mapping so individual tests can retire temporary
+ * model buffers safely without tearing down the CUDA backend. */
+static int retire_temporary_model_map(void) {
+    return idle_model_map &&
+           ds4_gpu_set_model_map(idle_model_map, idle_model_bytes);
+}
+
 static double monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -83,6 +95,7 @@ static int check_sm75_q8_mma_exact(void) {
     rc = 0;
 
 cleanup:
+    if (model && !retire_temporary_model_map()) rc = 1;
     (void)unsetenv("DS4_CUDA_NO_Q8_MMA_SM75");
     (void)unsetenv("DS4_CUDA_NO_Q8_F16_CACHE");
     ds4_gpu_tensor_free(out);
@@ -227,6 +240,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     rc = 0;
 
 cleanup:
+    if (model && !retire_temporary_model_map()) rc = 1;
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     ds4_gpu_tensor_free(down);
@@ -342,6 +356,7 @@ static int check_decode_attention_overflow_path(void) {
         ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) &&
         ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
         ds4_gpu_tensor_write(comp, 0, comp_host, comp_count * sizeof(float)) &&
+        ds4_gpu_set_model_map(sinks, n_head * sizeof(float)) &&
         ds4_gpu_attention_decode_heads_tensor(heads,
                                               sinks,
                                               n_head * sizeof(float),
@@ -371,6 +386,7 @@ static int check_decode_attention_overflow_path(void) {
         }
     }
 
+    if (!retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(comp);
     ds4_gpu_tensor_free(raw);
     ds4_gpu_tensor_free(q);
@@ -384,12 +400,24 @@ static int check_decode_attention_overflow_path(void) {
 }
 
 int main(void) {
-    if (!ds4_gpu_init()) return 1;
+    idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
+    if (!idle_model_map) return 1;
+    if (!ds4_gpu_init()) {
+        free(idle_model_map);
+        return 1;
+    }
+    if (!retire_temporary_model_map()) {
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
     int rc = check_sm75_q8_mma_exact();
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
+    free(idle_model_map);
+    idle_model_map = NULL;
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
 }
