@@ -98,3 +98,25 @@ SKIP_BUILD=1 SKIP_PLACEMENT=1 SKIP_TILE=1 \
 
 If the system restricts counters to administrators, set `NCU_USE_SUDO=1` for
 the resume run or change the NVIDIA driver profiling-permission policy.
+
+### SM80 to SM75 dispatch and resource audit
+
+[`CUDA_SM80_TO_SM75_DISPATCH_MATRIX.md`](../CUDA_SM80_TO_SM75_DISPATCH_MATRIX.md)
+is the source-reviewed architecture matrix for the normal DeepSeek V4 Flash
+CUDA path. It covers dense projections, attention, indexer, all four routed
+expert quant combinations, decode, cache-dependent dispatch, and four-GPU
+orchestration. Unknown compiled resources are marked explicitly rather than
+inferred from source.
+
+Generate paired cubin resource and instruction reports without loading a model:
+
+```bash
+cd ~/ds4-iq2-q4
+./speed-bench/cuda-sm-dispatch-resource-audit.sh
+```
+
+The script compiles `ds4_cuda.cu` for both `sm_75` and `sm_80`, records the
+complete source kernel/launch/gate inventories, extracts per-function cubin
+resource usage, and counts IMMA, HMMA, DP4A, load, and barrier instructions.
+It packages the report as `sm-dispatch-resource-<commit>-<timestamp>.tar.gz`.
+No `MODEL` variable is required because this audit does not execute inference.
