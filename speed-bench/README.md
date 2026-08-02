@@ -82,4 +82,19 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 The default suite measures context frontiers from 2K through 64K three times
 for each placement. Set `PROMPT_MANIFEST` to a tab-separated `label<TAB>path`
 file to run the same fixed frontiers over multiple prompt corpora. Set
-`RUN_NCU=0` when only the placement and tile evidence is needed.
+`RUN_NCU=0` when only the placement and tile evidence is needed. The script
+always packages partial results on exit and records the failing phase in
+`run-status.txt`.
+
+Use `DEEP_AUDIT_DIR` to select or resume a directory; the generic `AUDIT_DIR`
+used by the earlier Nsight Systems script is intentionally ignored. To resume
+only the four Nsight Compute reports after enabling performance-counter access:
+
+```bash
+export DEEP_AUDIT_DIR="$PWD/prefill-deep-audit-YYYYMMDDTHHMMSSZ"
+SKIP_BUILD=1 SKIP_PLACEMENT=1 SKIP_TILE=1 \
+  ./speed-bench/cuda-prefill-deep-audit.sh
+```
+
+If the system restricts counters to administrators, set `NCU_USE_SUDO=1` for
+the resume run or change the NVIDIA driver profiling-permission policy.

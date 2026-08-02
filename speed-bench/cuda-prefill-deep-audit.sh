@@ -34,8 +34,11 @@ Optional environment:
   LATE_LAYER=36
   RUN_NCU=1                 Set to 0 to omit Nsight Compute
   NCU_SET=targeted          Set to full for every Nsight Compute section
+  NCU_USE_SUDO=0            Run ncu through sudo -E when counters are admin-only
   SKIP_BUILD=1
-  AUDIT_DIR=/absolute/path/output-directory
+  SKIP_PLACEMENT=1          Reuse placement results in DEEP_AUDIT_DIR
+  SKIP_TILE=1               Reuse tile results in DEEP_AUDIT_DIR
+  DEEP_AUDIT_DIR=/absolute/path/output-directory
 EOF
 }
 
@@ -51,6 +54,30 @@ die() {
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+
+current_phase=initialization
+archive_ready=0
+finalize() {
+    local status=$?
+    trap - EXIT
+    if [[ $archive_ready == 1 && -d ${AUDIT_DIR:-} ]]; then
+        {
+            printf 'exit_status=%s\n' "$status"
+            printf 'last_phase=%s\n' "$current_phase"
+            printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } >"$AUDIT_DIR/run-status.txt"
+        local archive="$AUDIT_DIR.tar.gz"
+        if tar -C "$(dirname "$AUDIT_DIR")" -czf "$archive" \
+                "$(basename "$AUDIT_DIR")"; then
+            printf 'Archive to return: %s\n' "$archive"
+        else
+            printf 'error: failed to create audit archive %s\n' "$archive" >&2
+            status=1
+        fi
+    fi
+    exit "$status"
+}
+trap finalize EXIT
 
 : "${MODEL:?set MODEL to the absolute GGUF path}"
 [[ -f $MODEL ]] || die "model not found: $MODEL"
@@ -72,7 +99,14 @@ EARLY_LAYER=${EARLY_LAYER:-3}
 LATE_LAYER=${LATE_LAYER:-36}
 RUN_NCU=${RUN_NCU:-1}
 NCU_SET=${NCU_SET:-targeted}
-AUDIT_DIR=${AUDIT_DIR:-$repo_dir/prefill-deep-audit-$(date -u +%Y%m%dT%H%M%SZ)}
+NCU_USE_SUDO=${NCU_USE_SUDO:-0}
+SKIP_PLACEMENT=${SKIP_PLACEMENT:-0}
+SKIP_TILE=${SKIP_TILE:-0}
+if [[ -n ${AUDIT_DIR:-} && -z ${DEEP_AUDIT_DIR:-} ]]; then
+    printf 'warning: ignoring inherited AUDIT_DIR=%s; use DEEP_AUDIT_DIR to select this run directory\n' \
+        "$AUDIT_DIR" >&2
+fi
+AUDIT_DIR=${DEEP_AUDIT_DIR:-$repo_dir/prefill-deep-audit-$(date -u +%Y%m%dT%H%M%SZ)}
 
 for item in \
     "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" "REPEATS:$REPEATS" \
@@ -95,6 +129,11 @@ done
 [[ $RUN_NCU == 0 || $RUN_NCU == 1 ]] || die "RUN_NCU must be 0 or 1"
 [[ $NCU_SET == targeted || $NCU_SET == full ]] ||
     die "NCU_SET must be targeted or full"
+[[ $NCU_USE_SUDO == 0 || $NCU_USE_SUDO == 1 ]] ||
+    die "NCU_USE_SUDO must be 0 or 1"
+[[ $SKIP_PLACEMENT == 0 || $SKIP_PLACEMENT == 1 ]] ||
+    die "SKIP_PLACEMENT must be 0 or 1"
+[[ $SKIP_TILE == 0 || $SKIP_TILE == 1 ]] || die "SKIP_TILE must be 0 or 1"
 
 IFS=',' read -r -a gpu_devices <<<"$GPU_DEVICES"
 (( ${#gpu_devices[@]} == 4 )) ||
@@ -125,6 +164,7 @@ fi
 
 mkdir -p "$AUDIT_DIR" "$AUDIT_DIR/placement" "$AUDIT_DIR/tile" "$AUDIT_DIR/ncu"
 AUDIT_DIR=$(cd "$AUDIT_DIR" && pwd)
+archive_ready=1
 
 if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     make -B -j"$(nproc)" ds4-bench tests/test_engine_mgpu_placement \
@@ -180,6 +220,8 @@ bench_common=(
         "$TILE_TOKENS" "$TILE_AUDIT_CAPACITY"
     printf 'early_layer=%s\nlate_layer=%s\nrun_ncu=%s\nncu_set=%s\n' \
         "$EARLY_LAYER" "$LATE_LAYER" "$RUN_NCU" "$NCU_SET"
+    printf 'ncu_use_sudo=%s\nskip_placement=%s\nskip_tile=%s\n' \
+        "$NCU_USE_SUDO" "$SKIP_PLACEMENT" "$SKIP_TILE"
     printf '\n[prompts]\n'
     for i in "${!prompt_paths[@]}"; do
         printf '%s\t%s\n' "${prompt_labels[$i]}" "${prompt_paths[$i]}"
@@ -198,60 +240,73 @@ bench_common=(
     ncu --list-sections 2>&1 || true
 } >"$AUDIT_DIR/manifest.txt"
 
-runs_tsv="$AUDIT_DIR/placement-runs.tsv"
-printf 'split\tprompt\trepeat\tcsv\n' >"$runs_tsv"
-for repeat in $(seq 1 "$REPEATS"); do
-    if (( repeat % 2 == 1 )); then
-        split_order=(21 25)
-    else
-        split_order=(25 21)
-    fi
-    for i in "${!prompt_paths[@]}"; do
-        label=${prompt_labels[$i]}
-        prompt=${prompt_paths[$i]}
-        for split in "${split_order[@]}"; do
-            stem="split${split}-${label}-r${repeat}"
-            csv="$AUDIT_DIR/placement/$stem.csv"
-            log="$AUDIT_DIR/placement/$stem.log"
-            printf 'Benchmarking split %s/%s, prompt %s, repeat %s/%s...\n' \
-                "$split" "$((43 - split))" "$label" "$repeat" "$REPEATS"
-            DS4_CUDA_EP_STAGE_SPLIT="$split" \
-                ./ds4-bench "${bench_common[@]}" \
-                    --prompt-file "$prompt" \
-                    --ctx-start "$CTX_START" \
-                    --ctx-max "$CTX_MAX" \
-                    --ctx-alloc "$((CTX_MAX + 1))" \
-                    --step-mul "$STEP_MUL" \
-                    --prefill-chunk "$PREFILL_CHUNK" \
-                    --csv "$csv" \
-                    >"$log" 2>&1
-            printf '%s\t%s\t%s\t%s\n' "$split" "$label" "$repeat" "$csv" \
-                >>"$runs_tsv"
+if [[ $SKIP_PLACEMENT == 0 ]]; then
+    current_phase=placement
+    runs_tsv="$AUDIT_DIR/placement-runs.tsv"
+    printf 'split\tprompt\trepeat\tcsv\n' >"$runs_tsv"
+    for repeat in $(seq 1 "$REPEATS"); do
+        if (( repeat % 2 == 1 )); then
+            split_order=(21 25)
+        else
+            split_order=(25 21)
+        fi
+        for i in "${!prompt_paths[@]}"; do
+            label=${prompt_labels[$i]}
+            prompt=${prompt_paths[$i]}
+            for split in "${split_order[@]}"; do
+                stem="split${split}-${label}-r${repeat}"
+                csv="$AUDIT_DIR/placement/$stem.csv"
+                log="$AUDIT_DIR/placement/$stem.log"
+                printf 'Benchmarking split %s/%s, prompt %s, repeat %s/%s...\n' \
+                    "$split" "$((43 - split))" "$label" "$repeat" "$REPEATS"
+                DS4_CUDA_EP_STAGE_SPLIT="$split" \
+                    ./ds4-bench "${bench_common[@]}" \
+                        --prompt-file "$prompt" \
+                        --ctx-start "$CTX_START" \
+                        --ctx-max "$CTX_MAX" \
+                        --ctx-alloc "$((CTX_MAX + 1))" \
+                        --step-mul "$STEP_MUL" \
+                        --prefill-chunk "$PREFILL_CHUNK" \
+                        --csv "$csv" \
+                        >"$log" 2>&1
+                printf '%s\t%s\t%s\t%s\n' "$split" "$label" "$repeat" "$csv" \
+                    >>"$runs_tsv"
+            done
         done
     done
-done
-
-python3 "$repo_dir/speed-bench/summarize-prefill-placement.py" \
-    "$runs_tsv" "$AUDIT_DIR/placement-summary.csv" \
-    | tee "$AUDIT_DIR/placement-summary.txt"
+    python3 "$repo_dir/speed-bench/summarize-prefill-placement.py" \
+        "$runs_tsv" "$AUDIT_DIR/placement-summary.csv" \
+        | tee "$AUDIT_DIR/placement-summary.txt"
+else
+    [[ -f $AUDIT_DIR/placement-summary.csv ]] ||
+        die "SKIP_PLACEMENT=1 but placement-summary.csv is missing from $AUDIT_DIR"
+    printf 'Reusing placement results in %s\n' "$AUDIT_DIR"
+fi
 
 audit_prompt=${prompt_paths[0]}
-printf 'Capturing deferred tile counters for the baseline 21/22 split...\n'
-DS4_CUDA_EP_STAGE_SPLIT=21 \
-DS4_CUDA_PREFILL_TILE_AUDIT_CSV="$AUDIT_DIR/tile/tile-audit.csv" \
-DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY="$TILE_AUDIT_CAPACITY" \
-    ./ds4-bench "${bench_common[@]}" \
-        --prompt-file "$audit_prompt" \
-        --ctx-start "$TILE_TOKENS" \
-        --ctx-max "$TILE_TOKENS" \
-        --ctx-alloc "$((TILE_TOKENS + 1))" \
-        --step-incr "$TILE_TOKENS" \
-        --prefill-chunk "$PREFILL_CHUNK" \
-        --csv "$AUDIT_DIR/tile/benchmark.csv" \
-        >"$AUDIT_DIR/tile/benchmark.log" 2>&1
-python3 "$repo_dir/speed-bench/summarize-tile-audit.py" \
-    "$AUDIT_DIR/tile/tile-audit.csv" "$AUDIT_DIR/tile/tile-summary.csv" \
-    >"$AUDIT_DIR/tile/tile-summary.txt"
+if [[ $SKIP_TILE == 0 ]]; then
+    current_phase=tile-audit
+    printf 'Capturing deferred tile counters for the baseline 21/22 split...\n'
+    DS4_CUDA_EP_STAGE_SPLIT=21 \
+    DS4_CUDA_PREFILL_TILE_AUDIT_CSV="$AUDIT_DIR/tile/tile-audit.csv" \
+    DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY="$TILE_AUDIT_CAPACITY" \
+        ./ds4-bench "${bench_common[@]}" \
+            --prompt-file "$audit_prompt" \
+            --ctx-start "$TILE_TOKENS" \
+            --ctx-max "$TILE_TOKENS" \
+            --ctx-alloc "$((TILE_TOKENS + 1))" \
+            --step-incr "$TILE_TOKENS" \
+            --prefill-chunk "$PREFILL_CHUNK" \
+            --csv "$AUDIT_DIR/tile/benchmark.csv" \
+            >"$AUDIT_DIR/tile/benchmark.log" 2>&1
+    python3 "$repo_dir/speed-bench/summarize-tile-audit.py" \
+        "$AUDIT_DIR/tile/tile-audit.csv" "$AUDIT_DIR/tile/tile-summary.csv" \
+        >"$AUDIT_DIR/tile/tile-summary.txt"
+else
+    [[ -f $AUDIT_DIR/tile/tile-audit.csv ]] ||
+        die "SKIP_TILE=1 but tile/tile-audit.csv is missing from $AUDIT_DIR"
+    printf 'Reusing tile results in %s\n' "$AUDIT_DIR"
+fi
 
 ncu_capture() {
     local label=$1
@@ -275,8 +330,9 @@ ncu_capture() {
     fi
     printf 'Nsight Compute: %s on physical GPU %s (matching launch %s)...\n' \
         "$label" "$physical_device" "$launch_skip"
+    local ncu_rc=0
     DS4_CUDA_EP_STAGE_SPLIT=21 \
-        ncu \
+        "${ncu_command[@]}" \
             --target-processes all \
             --devices "$physical_device" \
             --filter-mode per-gpu \
@@ -297,7 +353,16 @@ ncu_capture() {
                 --step-incr "$TILE_TOKENS" \
                 --prefill-chunk "$PREFILL_CHUNK" \
                 --csv "$report_base-benchmark.csv" \
-                >"$report_base.log" 2>&1
+                >"$report_base.log" 2>&1 || ncu_rc=$?
+    if (( ncu_rc != 0 )); then
+        printf 'error: Nsight Compute capture %s failed (exit %s); see %s.log\n' \
+            "$label" "$ncu_rc" "$report_base" >&2
+        if grep -q 'ERR_NVGPUCTRPERM' "$report_base.log"; then
+            printf 'error: NVIDIA performance-counter access is disabled for this user; '\
+'enable it or rerun with NCU_USE_SUDO=1 (https://developer.nvidia.com/ERR_NVGPUCTRPERM)\n' >&2
+        fi
+        return "$ncu_rc"
+    fi
     local report="$report_base.ncu-rep"
     [[ -f $report ]] || die "Nsight Compute did not produce $report"
     ncu --import "$report" --csv --page raw \
@@ -305,30 +370,40 @@ ncu_capture() {
 }
 
 if [[ $RUN_NCU == 1 ]]; then
+    current_phase=nsight-compute
     command -v ncu >/dev/null 2>&1 || die "Nsight Compute CLI (ncu) not found"
+    ncu_command=(ncu)
+    if [[ $NCU_USE_SUDO == 1 ]]; then
+        command -v sudo >/dev/null 2>&1 || die "NCU_USE_SUDO=1 but sudo is not found"
+        sudo -v
+        ncu_command=(sudo -E ncu)
+    fi
+    ncu_failed=0
     ncu_capture \
         "early-layer${EARLY_LAYER}-iq2-gate-up" \
         "${gpu_devices[0]}" \
         'regex:moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        "$EARLY_LAYER"
-    ncu_capture \
+        "$EARLY_LAYER" || ncu_failed=$?
+    if (( ncu_failed == 0 )); then ncu_capture \
         "early-layer${EARLY_LAYER}-q4-down" \
         "${gpu_devices[0]}" \
         'regex:moe_down_q4K_tile16_mma_sm75_kernel.*' \
-        "$EARLY_LAYER"
-    ncu_capture \
+        "$EARLY_LAYER" || ncu_failed=$?; fi
+    if (( ncu_failed == 0 )); then ncu_capture \
         "late-layer${LATE_LAYER}-iq2-gate-up" \
         "${gpu_devices[1]}" \
         'regex:moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        "$((LATE_LAYER - 21))"
-    ncu_capture \
+        "$((LATE_LAYER - 21))" || ncu_failed=$?; fi
+    if (( ncu_failed == 0 )); then ncu_capture \
         "late-layer${LATE_LAYER}-q4-down" \
         "${gpu_devices[1]}" \
         'regex:moe_down_q4K_tile16_mma_sm75_kernel.*' \
-        "$((LATE_LAYER - 21))"
+        "$((LATE_LAYER - 21))" || ncu_failed=$?; fi
+    if (( ncu_failed != 0 )); then
+        current_phase=nsight-compute-failed
+        exit "$ncu_failed"
+    fi
 fi
 
-archive="$AUDIT_DIR.tar.gz"
-tar -C "$(dirname "$AUDIT_DIR")" -czf "$archive" "$(basename "$AUDIT_DIR")"
+current_phase=complete
 printf 'Deep prefill audit complete: %s\n' "$AUDIT_DIR"
-printf 'Archive to return: %s\n' "$archive"
