@@ -14895,6 +14895,15 @@ static bool cuda_prefill_pipeline_q8_cache_env_enabled(void) {
 #endif
 }
 
+static bool cuda_tp_prefill_attn_heads_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
+    return !env || !env[0] || strcmp(env, "0") != 0;
+#endif
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -16739,7 +16748,7 @@ static bool metal_graph_cuda_tp_prefill_attn_heads_requested(void) {
 #else
     /* Head-parallel prefill consumes the home copy of Q/KV through validated
      * peer access and leaves the persistent compressed cache single-copy. */
-    return metal_graph_tp_env_flag("DS4_CUDA_TP_PREFILL_ATTN_HEADS", true);
+    return cuda_tp_prefill_attn_heads_env_enabled();
 #endif
 }
 
@@ -55551,7 +55560,7 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void) {
 }
 
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void) {
-    return metal_graph_cuda_tp_prefill_attn_heads_requested();
+    return cuda_tp_prefill_attn_heads_env_enabled();
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
