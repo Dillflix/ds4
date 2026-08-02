@@ -15409,6 +15409,16 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
 /* ds4_gpu_set_current_device is declared in ds4_gpu_mgpu.h — single-tier
  * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
 
+static bool cuda_prefill_pipeline_q8_cache_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return true;
+#endif
+}
+
 #ifdef DS4_NO_GPU
 static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
 static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
@@ -16716,15 +16726,11 @@ static bool metal_graph_cuda_prefill_pipeline_requested(const ds4_gpu_graph *g) 
 }
 
 static bool metal_graph_cuda_prefill_pipeline_q8_cache_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
     /* Cache growth is already bounded by the CUDA VRAM reserve and allocation
      * failures transparently fall back to native Q8 kernels. Suppressing the
      * cache by default makes pipelined prefill several times slower on systems
      * with sufficient headroom. Keep =0 as a diagnostic opt-out. */
-    return metal_graph_tp_env_flag("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE", true);
-#endif
+    return cuda_prefill_pipeline_q8_cache_env_enabled();
 }
 
 static uint32_t metal_graph_cuda_prefill_pipeline_microbatch(void) {
@@ -55277,7 +55283,7 @@ bool ds4_test_cuda_routed_moe_quant_types_supported(
 }
 
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void) {
-    return metal_graph_cuda_prefill_pipeline_q8_cache_requested();
+    return cuda_prefill_pipeline_q8_cache_env_enabled();
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
