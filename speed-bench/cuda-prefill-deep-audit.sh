@@ -332,6 +332,7 @@ ncu_capture() {
         "$label" "$physical_device" "$launch_skip"
     local ncu_rc=0
     DS4_CUDA_EP_STAGE_SPLIT=21 \
+    DS4_LOCK_FILE="$ncu_lock_file" \
         "${ncu_command[@]}" \
             --target-processes all \
             --devices "$physical_device" \
@@ -376,6 +377,7 @@ if [[ $RUN_NCU == 1 ]]; then
     [[ $ncu_bin == /* && -x $ncu_bin ]] ||
         die "cannot resolve ncu to an absolute executable path: $ncu_bin"
     ncu_command=("$ncu_bin")
+    ncu_lock_file=
     if [[ $NCU_USE_SUDO == 1 ]]; then
         command -v sudo >/dev/null 2>&1 || die "NCU_USE_SUDO=1 but sudo is not found"
         sudo -v
@@ -383,6 +385,12 @@ if [[ $RUN_NCU == 1 ]]; then
         # Nsight Compute installation directory. Preserve the exact binary
         # selected and recorded above rather than resolving `ncu` as root.
         ncu_command=(sudo -E "$ncu_bin")
+        # Linux protected_regular can reject root opening a user-owned file in
+        # sticky /tmp even though root has DAC override. Create a private lock
+        # in the user-owned audit directory and preserve it through sudo -E.
+        # All four captures share it, so accidental overlap is still refused.
+        ncu_lock_file="$AUDIT_DIR/ncu/ds4-profile.lock"
+        : >"$ncu_lock_file"
     fi
     ncu_failed=0
     ncu_capture \
