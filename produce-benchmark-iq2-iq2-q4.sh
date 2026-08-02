@@ -8,6 +8,14 @@ Produce and benchmark a DeepSeek V4 Flash GGUF with:
 
 Usage:
   bash produce-benchmark-iq2-iq2-q4.sh \
+    HF_DIR [OUTPUT.gguf] [RESULTS.csv]
+
+The published Q4 GGUF metadata and routed-MoE imatrix are downloaded and
+cached automatically. Only the small metadata prefix of the 165 GB Q4 GGUF is
+downloaded; tensor payloads are regenerated from HF_DIR.
+
+Advanced/legacy usage:
+  bash produce-benchmark-iq2-iq2-q4.sh \
     HF_DIR TEMPLATE.gguf IMATRIX.dat OUTPUT.gguf [RESULTS.csv]
 
 Defaults target two NVLink pairs of 48 GB Turing GPUs:
@@ -19,6 +27,11 @@ Defaults target two NVLink pairs of 48 GB Turing GPUs:
   CTX_MAX=65536
   STEP_INCR=2048
   GEN_TOKENS=128
+
+Optional asset overrides:
+  DS4_TEMPLATE_GGUF=/path/to/template.gguf
+  DS4_IMATRIX=/path/to/routed-moe-imatrix.dat
+  DS4_ASSET_CACHE=/path/to/cache
 
 Override any default as an environment variable, for example:
   GPU_DEVICES=0,4,1,5 CTX_MAX=32768 bash produce-benchmark-iq2-iq2-q4.sh ...
@@ -48,10 +61,6 @@ require_positive_integer() {
     usage
     exit 0
 }
-[[ $# -eq 4 || $# -eq 5 ]] || {
-    usage >&2
-    exit 2
-}
 [[ $(uname -s) == Linux ]] || die "this production/CUDA script must run on Linux"
 
 require_command make
@@ -63,24 +72,41 @@ require_command awk
 require_command df
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-[[ -d $1 ]] || die "HF directory not found: $1"
-[[ -f $2 ]] || die "template GGUF not found: $2"
-[[ -f $3 ]] || die "imatrix not found: $3"
-hf_dir=$(realpath "$1")
-template=$(realpath "$2")
-imatrix=$(realpath "$3")
-out_arg=$4
+
+case $# in
+    1|2|3)
+        hf_arg=$1
+        out_arg=${2:-${OUT:-$PWD/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf}}
+        csv_arg=${3:-}
+        template_arg=${DS4_TEMPLATE_GGUF:-${Q4_TEMPLATE:-}}
+        imatrix_arg=${DS4_IMATRIX:-${IMATRIX:-}}
+        ;;
+    4|5)
+        # Keep the original explicit-path interface working.
+        hf_arg=$1
+        template_arg=$2
+        imatrix_arg=$3
+        out_arg=$4
+        csv_arg=${5:-}
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+[[ -d $hf_arg ]] || die "HF directory not found: $hf_arg"
+hf_dir=$(realpath "$hf_arg")
 
 [[ -f $hf_dir/model.safetensors.index.json ]] || \
     die "HF directory has no model.safetensors.index.json: $hf_dir"
 
 mkdir -p -- "$(dirname -- "$out_arg")"
 out=$(realpath -m "$out_arg")
-[[ $out != "$template" ]] || die "OUTPUT.gguf must not be the template GGUF"
 
 prefix=${out%.gguf}
 [[ $prefix != "$out" ]] || prefix=$out
-csv_arg=${5:-${RESULTS_CSV:-$prefix.bench.csv}}
+csv_arg=${csv_arg:-${RESULTS_CSV:-$prefix.bench.csv}}
 mkdir -p -- "$(dirname -- "$csv_arg")"
 csv=$(realpath -m "$csv_arg")
 plan_log=$(realpath -m "${PLAN_LOG:-$prefix.quant-plan.txt}")
@@ -138,15 +164,94 @@ fi
 
 cd "$script_dir"
 
-printf 'Building the quantizer and %s CUDA benchmark...\n' "$cuda_arch"
+printf 'Building the quantizer...\n'
 make -j "$make_jobs" -C gguf-tools deepseek4-quantize
+quantizer=$script_dir/gguf-tools/deepseek4-quantize
+
+template_is_valid() {
+    local candidate=$1
+    "$quantizer" \
+        --hf "$hf_dir" \
+        --template "$candidate" \
+        --routed-w1 iq2_xxs \
+        --routed-w3 iq2_xxs \
+        --routed-w2 q4_k \
+        --dry-run >/dev/null 2>&1
+}
+
+cache_root=${XDG_CACHE_HOME:-${HOME:?HOME is required}/.cache}
+asset_revision=1cd7b564460821938add0475a60b942c409295e0
+asset_cache=${DS4_ASSET_CACHE:-$cache_root/ds4/iq2-iq2-q4/$asset_revision}
+mkdir -p -- "$asset_cache"
+
+template_repo=antirez/deepseek-v4-gguf
+template_name=DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf
+template_cache=$asset_cache/$template_name.metadata-only.gguf
+template_url=https://huggingface.co/$template_repo/resolve/$asset_revision/$template_name
+
+if [[ -n $template_arg ]]; then
+    [[ -f $template_arg ]] || die "template GGUF not found: $template_arg"
+    template=$(realpath "$template_arg")
+    template_is_valid "$template" || die "template GGUF metadata is invalid: $template"
+else
+    if [[ ! -s $template_cache ]] || ! template_is_valid "$template_cache"; then
+        require_command curl
+        printf 'Fetching the published Q4 template metadata (not its tensor payloads)...\n'
+        template_partial=$template_cache.partial.$$
+        template_ok=0
+        for template_mib in 8 16 32 64 128 256; do
+            template_bytes=$((template_mib * 1048576))
+            rm -f -- "$template_partial"
+            printf '  trying a %s MiB metadata prefix...\n' "$template_mib"
+            if curl --fail --location --retry 3 \
+                --range "0-$((template_bytes - 1))" \
+                --max-filesize "$template_bytes" \
+                --output "$template_partial" \
+                "$template_url"; then
+                downloaded_bytes=$(stat -c %s "$template_partial")
+                (( downloaded_bytes <= template_bytes )) || \
+                    die "template server ignored the bounded range request"
+                if template_is_valid "$template_partial"; then
+                    mv -f -- "$template_partial" "$template_cache"
+                    template_ok=1
+                    break
+                fi
+            fi
+        done
+        rm -f -- "$template_partial"
+        (( template_ok == 1 )) || \
+            die "could not obtain a complete template metadata prefix; set DS4_TEMPLATE_GGUF to a local Q4 GGUF"
+    fi
+    template=$(realpath "$template_cache")
+fi
+
+imatrix_repo=antirez/deepseek-v4-gguf
+imatrix_rel=imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat
+imatrix_cache=$asset_cache/$imatrix_rel
+if [[ -n $imatrix_arg ]]; then
+    [[ -f $imatrix_arg ]] || die "imatrix not found: $imatrix_arg"
+    imatrix=$(realpath "$imatrix_arg")
+else
+    if [[ ! -s $imatrix_cache ]]; then
+        require_command hf
+        printf 'Fetching the published routed-MoE calibration matrix...\n'
+        hf download "$imatrix_repo" "$imatrix_rel" \
+            --revision "$asset_revision" \
+            --local-dir "$asset_cache"
+    fi
+    [[ -s $imatrix_cache ]] || die "imatrix download did not produce: $imatrix_cache"
+    imatrix=$(realpath "$imatrix_cache")
+fi
+
+[[ $out != "$template" ]] || die "OUTPUT.gguf must not be the template GGUF"
+
+printf 'Building the %s CUDA benchmark...\n' "$cuda_arch"
 # Force the CUDA object to rebuild: changing CUDA_ARCH alone is not a Makefile
 # dependency and could otherwise leave an object compiled for another GPU.
 make -B -j "$make_jobs" ds4-bench tests/test_engine_mgpu_placement \
     CUDA_ARCH="$cuda_arch"
 ./tests/test_engine_mgpu_placement
 
-quantizer=$script_dir/gguf-tools/deepseek4-quantize
 quant_args=(
     --hf "$hf_dir"
     --template "$template"
@@ -200,6 +305,12 @@ pair1="${gpu_list[1]}<->${gpu_list[3]}"
     printf 'model=%s\n' "$out"
     printf 'model_bytes=%s\n' "$(stat -c %s "$out")"
     printf 'quant=gate:iq2_xxs,up:iq2_xxs,down:q4_k\n'
+    printf 'template=%s\n' "$template"
+    printf 'template_bytes=%s\n' "$(stat -c %s "$template")"
+    printf 'imatrix=%s\n' "$imatrix"
+    printf 'imatrix_bytes=%s\n' "$(stat -c %s "$imatrix")"
+    printf 'bootstrap_repo=%s\n' "$template_repo"
+    printf 'bootstrap_revision=%s\n' "$asset_revision"
     printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
     if [[ -n $(git status --short 2>/dev/null) ]]; then
         printf 'git_dirty=true\n'

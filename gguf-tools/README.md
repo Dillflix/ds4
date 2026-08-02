@@ -138,19 +138,25 @@ recipe:
 ```sh
 bash produce-benchmark-iq2-iq2-q4.sh \
   /models/DeepSeek-V4-Flash-HF \
-  /models/DeepSeek-V4-Flash-Q4-template.gguf \
-  /models/DeepSeek-V4-Flash-routed-moe-imatrix.dat \
   /models/DeepSeek-V4-Flash-IQ2-IQ2-Q4.gguf
 ```
 
-It builds the quantizer and an `sm_75` CUDA benchmark, verifies the routed-MoE
-matrix classification test, writes the GGUF through an atomic temporary file,
-then benchmarks prefill and generation with `--cuda-tensor-parallel`. The
-default device order is `0,2,1,3`, pairing physical GPUs `(0,1)` and `(2,3)`.
-Set `GPU_DEVICES` if the CUDA numbering differs; the script prints the detected
-topology before loading the model. Results include CSV throughput data, an SVG
-chart when `python3` is available, the quantization plan and logs, and a GPU/git
-metadata record beside the output model.
+It automatically caches a pinned version of the published routed-MoE imatrix
+and a metadata-only prefix of the published Q4 GGUF. It does not download that
+GGUF's 165 GB tensor payload: the quantizer regenerates all tensors from the
+supplied Hugging Face directory. Set `DS4_TEMPLATE_GGUF`, `DS4_IMATRIX`, or
+`DS4_ASSET_CACHE` to override those assets. The original explicit four-path
+interface remains available for fully offline runs.
+
+The script builds the quantizer and an `sm_75` CUDA benchmark, verifies the
+routed-MoE matrix classification test, writes the GGUF through an atomic
+temporary file, then benchmarks prefill and generation with
+`--cuda-tensor-parallel`. The default device order is `0,2,1,3`, pairing
+physical GPUs `(0,1)` and `(2,3)`. Set `GPU_DEVICES` if the CUDA numbering
+differs; the script prints the detected topology before loading the model.
+Results include CSV throughput data, an SVG chart when `python3` is available,
+the quantization plan and logs, and a GPU/git metadata record beside the output
+model.
 
 Useful checks before writing a full model:
 
