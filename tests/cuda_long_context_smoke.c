@@ -467,6 +467,86 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_prefill_attention_head_shards(void) {
+    const uint32_t n_tokens = 128;
+    const uint32_t n_head = 64;
+    const uint32_t half = n_head / 2u;
+    const uint32_t head_dim = 512;
+    const uint32_t n_rot = 64;
+    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t kv_count = (uint64_t)n_tokens * head_dim;
+    float *sinks = (float *)calloc(n_head, sizeof(float));
+    float *q_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *kv_host = (float *)malloc((size_t)kv_count * sizeof(float));
+    float *reference = (float *)malloc((size_t)q_count * sizeof(float));
+    float *candidate = (float *)malloc((size_t)q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(kv_count * sizeof(float));
+    ds4_gpu_tensor *full = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *split = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    int rc = 1;
+    if (!sinks || !q_host || !kv_host || !reference || !candidate ||
+        !q || !kv || !full || !split) goto cleanup;
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_host[i] = (float)((int)(i * 17u % 101u) - 50) / 127.0f;
+    }
+    for (uint64_t i = 0; i < kv_count; i++) {
+        kv_host[i] = (float)((int)(i * 29u % 113u) - 56) / 139.0f;
+    }
+    if (!ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(kv, 0, kv_host, kv_count * sizeof(float)) ||
+        !ds4_gpu_set_model_map(sinks, n_head * sizeof(float)) ||
+        !ds4_gpu_attention_prefill_raw_heads_tensor(
+                full, sinks, n_head * sizeof(float), 0, q, kv,
+                n_tokens, 128u, n_head, head_dim) ||
+        !ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+                split, sinks, n_head * sizeof(float), 0, q, kv,
+                n_tokens, 128u, 0u, half, n_head, head_dim) ||
+        !ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+                split, sinks, n_head * sizeof(float), 0, q, kv,
+                n_tokens, 128u, half, half, n_head, head_dim) ||
+        !ds4_gpu_rope_tail_tensor(full, n_tokens, n_head, head_dim, n_rot,
+                                  17u, 0u, true, 10000.0f, 1.0f, 0.0f,
+                                  1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_rope_tail_head_range_tensor(
+                split, n_tokens, 0u, half, n_head, head_dim, n_rot,
+                17u, 0u, true, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_rope_tail_head_range_tensor(
+                split, n_tokens, half, half, n_head, head_dim, n_rot,
+                17u, 0u, true, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(full, 0, reference, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(split, 0, candidate, q_count * sizeof(float))) {
+        goto cleanup;
+    }
+    if (memcmp(reference, candidate, (size_t)q_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < q_count && reference[first] == candidate[first]) first++;
+        fprintf(stderr,
+                "prefill attention head shard mismatch at %llu: full=%g split=%g\n",
+                (unsigned long long)first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: 64-head prefill split 32/32 exact (%llu values)\n",
+            (unsigned long long)q_count);
+    rc = 0;
+
+cleanup:
+    if (sinks && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(full);
+    ds4_gpu_tensor_free(kv);
+    ds4_gpu_tensor_free(q);
+    free(candidate);
+    free(reference);
+    free(kv_host);
+    free(q_host);
+    free(sinks);
+    return rc;
+}
+
 int main(void) {
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
@@ -483,6 +563,7 @@ int main(void) {
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (check_prefill_attention_head_shards() != 0) rc = 1;
     ds4_gpu_cleanup();
     free(idle_model_map);
     idle_model_map = NULL;

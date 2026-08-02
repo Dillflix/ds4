@@ -942,6 +942,24 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+int ds4_gpu_rope_tail_head_range_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_tok,
+        uint32_t        head0,
+        uint32_t        n_head_work,
+        uint32_t        n_head_total,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        bool            inverse,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow);
+
 int ds4_gpu_glm_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t        n_tokens,
@@ -1767,6 +1785,20 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t              n_tokens,
+        uint32_t              window,
+        uint32_t              head0,
+        uint32_t              n_head_work,
+        uint32_t              n_head_total,
+        uint32_t              head_dim);
+
 /* Rectangular raw prefill attention: q is a view of the n_q query rows at
  * token positions [q_row0, q_row0 + n_q) of the chunk, raw_kv keeps all
  * n_kv rows, heads receives n_q output rows.  Used by the TP prefill row
@@ -1837,6 +1869,28 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_attention_decode_mixed_batch_heads_shard_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              head0,
+        uint32_t              n_head_work,
+        uint32_t              n_head_total,
+        uint32_t              head_dim);
+
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -1859,6 +1913,30 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              top_k,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              head0,
+        uint32_t              n_head_work,
+        uint32_t              n_head_total,
+        uint32_t              head_dim);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -1874,6 +1952,24 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim);
+
+int ds4_gpu_attention_prefill_static_mixed_heads_shard_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_tokens,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              head0,
+        uint32_t              n_head_work,
+        uint32_t              n_head_total,
+        uint32_t              head_dim);
 
 /* Rectangular static-mixed prefill attention: q is a view of the n_q query
  * rows at token positions [q_row0, q_row0 + n_q) of the chunk, while raw_kv
@@ -1930,6 +2026,22 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+int ds4_gpu_attention_output_q8_batch_shard_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups_total,
+        uint32_t              group0,
+        uint32_t              group_count,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens);
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

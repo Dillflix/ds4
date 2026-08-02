@@ -6174,6 +6174,55 @@ __global__ static void rope_tail_kernel(
     tail[i + 1] = x0 * s + x1 * c;
 }
 
+__global__ static void rope_tail_head_range_kernel(
+        float *x, uint32_t n_tok, uint32_t head0,
+        uint32_t n_head_work, uint32_t n_head_total,
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, int inverse, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t rot_pairs = n_rot / 2u;
+    const uint32_t pairs = n_tok * n_head_work * rot_pairs;
+    if (gid >= pairs) return;
+    const uint32_t pair = gid % rot_pairs;
+    const uint32_t tmp = gid / rot_pairs;
+    const uint32_t local_head = tmp % n_head_work;
+    const uint32_t t = tmp / n_head_work;
+    const uint32_t head = head0 + local_head;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t i = pair * 2u;
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig /
+                (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig /
+                (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+    const float theta_extrap = (float)(pos0 + t) *
+        powf(freq_base, -((float)i) / (float)n_rot);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+    float *tail = x + ((uint64_t)t * n_head_total + head) * head_dim + n_nope;
+    const float x0 = tail[i];
+    const float x1 = tail[i + 1u];
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1u] = x0 * s + x1 * c;
+}
+
 __global__ static void rope_tail_decode_rows_kernel(
         float *x,
         cuda_attention_decode_row_table rows,
@@ -7454,6 +7503,22 @@ __device__ __forceinline__ float ds4_dot512_float4_ordered(
         dot = __fadd_rn(dot, __fmul_rn(av.w, bv.w));
     }
     return dot;
+}
+
+__global__ static void attention_pack_group_heads_slice_f16_kernel(
+        __half *dst, const float *heads, uint32_t n_tokens,
+        uint32_t n_groups_total, uint32_t group0,
+        uint32_t group_count, uint32_t group_dim) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)group_count * n_tokens * group_dim;
+    if (gid >= n) return;
+    const uint32_t d = gid % group_dim;
+    const uint64_t q = gid / group_dim;
+    const uint32_t t = q % n_tokens;
+    const uint32_t local_group = q / n_tokens;
+    const uint32_t group = group0 + local_group;
+    dst[gid] = __float2half(
+            heads[((uint64_t)t * n_groups_total + group) * group_dim + d]);
 }
 
 /* Select the largest exact-score tile that fits the current device. The
@@ -9305,7 +9370,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        ? (const float4 *)(q + ((uint64_t)t * n_head_total + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
@@ -9394,7 +9459,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         __syncthreads();
     }
     if (valid_head) {
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head_total + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -9419,15 +9484,18 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         uint32_t top_k,
         uint32_t window,
         uint32_t ratio,
-        uint32_t n_head,
+        uint32_t head0,
+        uint32_t n_head_work,
+        uint32_t n_head_total,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
-    const bool valid_head = head < n_head;
+    const uint32_t local_head = head_group * HEADS_PER_GROUP + warp;
+    const bool valid_head = local_head < n_head_work;
+    const uint32_t head = head0 + local_head;
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count;
@@ -9473,7 +9541,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        ? (const float4 *)(q + ((uint64_t)t * n_head_total + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
@@ -9560,7 +9628,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head_total + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -9578,15 +9646,18 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t n_comp,
         uint32_t window,
         uint32_t ratio,
-        uint32_t n_head,
+        uint32_t head0,
+        uint32_t n_head_work,
+        uint32_t n_head_total,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
+    const uint32_t local_head = head_group * 8u + warp;
+    const bool valid_head = local_head < n_head_work;
+    const uint32_t head = head0 + local_head;
 
     __shared__ float4 kv_shared[4 * 128];
 
@@ -9600,7 +9671,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
-        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        ? (const float4 *)(q + ((uint64_t)t * n_head_total + head) * head_dim)
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
@@ -9684,7 +9755,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head_total + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
@@ -9706,15 +9777,18 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t n_comp,
         uint32_t window,
         uint32_t ratio,
-        uint32_t n_head,
+        uint32_t head0,
+        uint32_t n_head_work,
+        uint32_t n_head_total,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * 8u + warp;
-    const bool valid_head = head < n_head;
+    const uint32_t local_head = head_group * 8u + warp;
+    const bool valid_head = local_head < n_head_work;
+    const uint32_t head = head0 + local_head;
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
@@ -14083,6 +14157,26 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
+extern "C" int ds4_gpu_rope_tail_head_range_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head0,
+        uint32_t n_head_work, uint32_t n_head_total, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    if (!x || n_tok == 0u || n_head_work == 0u ||
+        head0 > n_head_total || n_head_work > n_head_total - head0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        x->bytes < (uint64_t)n_tok * n_head_total * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t pairs = n_tok * n_head_work * (n_rot / 2u);
+    rope_tail_head_range_kernel<<<(pairs + 255u) / 256u, 256>>>(
+            (float *)x->ptr, n_tok, head0, n_head_work, n_head_total,
+            head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "rope tail head range launch");
+}
 extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
         ds4_gpu_tensor                       *x,
         const ds4_gpu_attention_decode_row   *rows,
@@ -14770,6 +14864,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               n_comp,
                                                                               0,
                                                                               0,
+                                                                              0,
+                                                                              n_head,
                                                                               n_head,
                                                                               head_dim);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
@@ -14795,6 +14891,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                           n_comp,
                                                                           0,
                                                                           0,
+                                                                          0,
+                                                                          n_head,
                                                                           n_head,
                                                                           head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode heads8 online launch");
@@ -15126,6 +15224,8 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    0,
                                                                    window,
                                                                    1,
+                                                                   0,
+                                                                   n_head,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
@@ -15202,6 +15302,35 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                 n_tokens, window, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
 }
+
+extern "C" int ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window,
+        uint32_t head0, uint32_t n_head_work, uint32_t n_head_total,
+        uint32_t head_dim) {
+    if (!heads || !q || !raw_kv || !model_map || n_tokens < 128u ||
+        n_head_work == 0u || head0 > n_head_total ||
+        n_head_work > n_head_total - head0 || head_dim != 512u ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head_total * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        window > 256u) return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head_total * sizeof(float),
+            logical_tier, "attn_sinks_shard");
+    if (!sinks) return 0;
+    dim3 grid(n_tokens, (n_head_work + 7u) / 8u, 1u);
+    attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr, (const float *)raw_kv->ptr,
+            n_tokens, 0u, window, 1u, head0, n_head_work, n_head_total,
+            head_dim);
+    return cuda_ok(cudaGetLastError(), "attention raw head shard launch");
+}
 static int attention_decode_batch_launch(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -15258,6 +15387,8 @@ static int attention_decode_batch_launch(
                                                                               n_comp,
                                                                               window,
                                                                               ratio,
+                                                                              0,
+                                                                              n_head,
                                                                               n_head,
                                                                               head_dim);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
@@ -15282,6 +15413,8 @@ static int attention_decode_batch_launch(
                                                                    n_comp,
                                                                    window,
                                                                    ratio,
+                                                                   0,
+                                                                   n_head,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
@@ -15303,6 +15436,8 @@ static int attention_decode_batch_launch(
                                                                    n_comp,
                                                                    window,
                                                                    ratio,
+                                                                   0,
+                                                                   n_head,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode heads8 online batch launch");
@@ -15395,9 +15530,46 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                head_dim) {
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
-                                      n_tokens, pos0, n_raw, raw_cap, raw_start,
-                                      n_comp, window, ratio, n_head, head_dim);
+                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
+                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                       n_comp, window, ratio, n_head, head_dim);
+}
+
+extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_shard_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t head0, uint32_t n_head_work, uint32_t n_head_total,
+        uint32_t head_dim) {
+    if (comp_kv_f16 || !heads || !q || !raw_kv || !model_map ||
+        n_tokens < 128u || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || (n_comp != 0u && !comp_kv) ||
+        n_head_work == 0u || head0 > n_head_total ||
+        n_head_work > n_head_total - head0 || head_dim != 512u ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head_total * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head_total * sizeof(float),
+            logical_tier, "attn_sinks_shard");
+    if (!sinks) return 0;
+    dim3 grid(n_tokens, (n_head_work + 7u) / 8u, 1u);
+    attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+            head0, n_head_work, n_head_total, head_dim);
+    return cuda_ok(cudaGetLastError(), "attention decode head shard launch");
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -15468,6 +15640,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                top_k,
                                                                                window,
                                                                                ratio,
+                                                                               0,
+                                                                               n_head,
                                                                                n_head,
                                                                                head_dim);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
@@ -15511,6 +15685,54 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   n_head,
                                                   head_dim);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
+}
+
+extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t top_k, uint32_t window, uint32_t ratio,
+        uint32_t head0, uint32_t n_head_work, uint32_t n_head_total,
+        uint32_t head_dim) {
+    if (comp_kv_f16 || !heads || !q || !raw_kv || !comp_kv || !topk ||
+        !model_map || n_tokens < 128u || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_comp == 0u || top_k == 0u || top_k > 512u ||
+        n_head_work == 0u || head0 > n_head_total ||
+        n_head_work > n_head_total - head0 || head_dim != 512u ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head_total * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head_total * sizeof(float),
+            logical_tier, "attn_sinks_shard");
+    if (!sinks) return 0;
+    const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    if (top_k == 512u && getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
+        int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(
+                logical_tier, sort_bytes, "indexed attention shard topk sort");
+        if (!sorted) return 0;
+        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(
+                sorted, topk_ptr, n_tokens);
+        if (!cuda_ok(cudaGetLastError(),
+                     "indexed attention shard topk sort launch")) return 0;
+        topk_ptr = sorted;
+    }
+    dim3 grid(n_tokens, (n_head_work + 15u) / 16u, 1u);
+    attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
+            topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+            top_k, window, ratio, head0, n_head_work, n_head_total, head_dim);
+    return cuda_ok(cudaGetLastError(), "attention indexed head shard launch");
 }
 
 static int attention_prefill_mixed_launch(
@@ -15557,6 +15779,8 @@ static int attention_prefill_mixed_launch(
                                                                    n_comp,
                                                                    window,
                                                                    ratio,
+                                                                   0,
+                                                                   n_head,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
@@ -15920,6 +16144,113 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
     return ok;
 }
+extern "C" int ds4_gpu_attention_output_q8_batch_shard_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
+        uint32_t group0, uint32_t group_count, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!out || !low || !heads || !model_map || group_dim == 0u ||
+        rank == 0u || n_groups_total == 0u || group_count == 0u ||
+        group0 > n_groups_total || group_count > n_groups_total - group0 ||
+        out_dim == 0u || n_tokens == 0u) return 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t low_total = (uint64_t)n_groups_total * rank;
+    const uint64_t low_count = (uint64_t)group_count * rank;
+    const uint64_t low_start = (uint64_t)group0 * rank;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = (uint64_t)n_groups_total * rank * row_a_bytes;
+    const uint64_t a_slice_offset = out_a_offset + low_start * row_a_bytes;
+    const uint64_t a_slice_bytes = low_count * row_a_bytes;
+    const uint64_t blocks_b = (low_total + 31u) / 32u;
+    const uint64_t out_b_bytes = out_dim * blocks_b * 34u;
+    if (out_a_offset > model_size || out_b_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        out_b_bytes > model_size - out_b_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups_total * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_count * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const int physical_device =
+        (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
+            ? g_gpu[logical_tier].device_id : 0;
+    const __half *a_f16 = NULL;
+    const __half *b_f16 = NULL;
+    if (!g_quality_mode && g_cublas_ready && n_tokens >= 2u) {
+        a_f16 = cuda_q8_f16_ptr(model_map, a_slice_offset, a_slice_bytes,
+                                group_dim, low_count, physical_device,
+                                "attn_output_a_shard");
+        b_f16 = cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes,
+                                low_total, out_dim, physical_device,
+                                "attn_output_b");
+    }
+    if (a_f16 && b_f16) {
+        const uint64_t heads_h_count =
+            (uint64_t)group_count * n_tokens * group_dim;
+        const uint64_t low_packed_count =
+            (uint64_t)group_count * n_tokens * rank;
+        const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+        const uint64_t low_packed_offset = (heads_h_bytes + 255u) & ~255ull;
+        const uint64_t tmp_bytes = low_packed_offset +
+            low_packed_count * sizeof(float);
+        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes,
+                                      "attention output shard a");
+        if (!tmp) return 0;
+        __half *heads_h = (__half *)tmp;
+        float *low_packed = (float *)((char *)tmp + low_packed_offset);
+        attention_pack_group_heads_slice_f16_kernel
+            <<<(heads_h_count + 255u) / 256u, 256>>>(
+                heads_h, (const float *)heads->ptr, n_tokens,
+                n_groups_total, group0, group_count, group_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention output shard pack launch")) return 0;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+                cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)rank, (int)n_tokens, (int)group_dim, &alpha,
+                a_f16, CUDA_R_16F, (int)group_dim,
+                (long long)rank * group_dim, heads_h, CUDA_R_16F,
+                (int)group_dim, (long long)n_tokens * group_dim, &beta,
+                low_packed, CUDA_R_32F, (int)rank,
+                (long long)rank * n_tokens, (int)group_count,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "attention output shard a gemm")) return 0;
+        attention_unpack_group_low_kernel
+            <<<(low_packed_count + 255u) / 256u, 256>>>(
+                (float *)low->ptr, low_packed, n_tokens, group_count, rank);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention output shard a unpack launch")) return 0;
+
+        const uint64_t low_h_count = (uint64_t)n_tokens * low_count;
+        __half *low_h = (__half *)cuda_tmp_alloc_on(
+                logical_tier, low_h_count * sizeof(__half),
+                "attention output shard b activation");
+        if (!low_h) return 0;
+        f32_to_f16_kernel<<<(low_h_count + 255u) / 256u, 256>>>(
+                low_h, (const float *)low->ptr, low_h_count);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention output shard b convert launch")) return 0;
+        st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
+                          CUBLAS_OP_T, CUBLAS_OP_N,
+                          (int)out_dim, (int)n_tokens, (int)low_count,
+                          &alpha, b_f16 + low_start, CUDA_R_16F,
+                          (int)low_total, low_h, CUDA_R_16F,
+                          (int)low_count, &beta, out->ptr, CUDA_R_32F,
+                          (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return cublas_ok(st, "attention output shard b gemm");
+    }
+
+    if (!ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+            low, model_map, model_size, out_a_offset, group_dim, rank,
+            n_groups_total, group0, group_count, heads, n_tokens)) return 0;
+    return ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            out, model_map, model_size, out_b_offset, low_total, out_dim,
+            low_start, low_count, low, n_tokens);
+}
+
 extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -19754,6 +20085,36 @@ __device__ __forceinline__ static uint32_t iq2_i8x4_fragment(
                      (aux1 >> (group8 * 7u)) & 127u,
                      &w0, &w1);
     return (uint32_t)((quarter & 1u) ? w1 : w0);
+}
+
+extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_shard_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, uint32_t n_tokens, uint32_t n_comp,
+        uint32_t window, uint32_t ratio, uint32_t head0,
+        uint32_t n_head_work, uint32_t n_head_total, uint32_t head_dim) {
+    if (comp_kv_f16 || !heads || !q || !raw_kv || !comp_kv || !model_map ||
+        n_tokens < 128u || ratio == 0u || n_head_work == 0u ||
+        head0 > n_head_total || n_head_work > n_head_total - head0 ||
+        head_dim != 512u || sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head_total * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head_total * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head_total * sizeof(float),
+            logical_tier, "attn_sinks_shard");
+    if (!sinks) return 0;
+    dim3 grid(n_tokens, (n_head_work + 7u) / 8u, 1u);
+    attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
+            n_tokens, n_comp, window, ratio, head0, n_head_work,
+            n_head_total, head_dim);
+    return cuda_ok(cudaGetLastError(), "attention mixed head shard launch");
 }
 
 __device__ __forceinline__ static int32_t iq2_group_scale(

@@ -40,6 +40,7 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -577,6 +578,21 @@ static void test_cuda_prefill_pipeline_q8_cache_default(void) {
     restore_env_value("DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE", old);
 }
 
+static void test_cuda_tp_prefill_attn_heads_default(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_heads_default\n");
+    char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
+
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS");
+    CHECK(ds4_test_cuda_tp_prefill_attn_heads_requested(),
+          "CUDA TP splits prefill attention heads by default");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_HEADS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_heads_requested(),
+          "CUDA TP prefill head splitting retains an explicit opt-out");
+
+    restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS", old);
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -710,6 +726,7 @@ int main(void) {
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
     test_cuda_prefill_pipeline_q8_cache_default();
+    test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
 
