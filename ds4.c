@@ -26824,7 +26824,8 @@ static bool metal_graph_cuda_tp_prefill_heads_active(
         g->batch_attn_low_by_tier[home] &&
         g->batch_attn_low_by_tier[partner] &&
         g->batch_attn_out_by_tier[home] &&
-        g->batch_attn_out_by_tier[partner];
+        g->batch_q_by_tier[home]->bytes >=
+            (uint64_t)n_tokens * DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float);
 #endif
 }
 
@@ -26855,7 +26856,8 @@ static bool metal_graph_cuda_tp_prefill_attention_launch(
         logged_home_mask |= 1u << (uint32_t)home;
         fprintf(stderr,
                 "ds4: CUDA prefill attention TP enabled: tier %d heads [0,%u), "
-                "tier %d heads [%u,%u); partner peer-reads single-copy KV\n",
+                "tier %d heads [%u,%u); partner peer-reads single-copy KV; "
+                "low-rank halves gather for one home output-B GEMM\n",
                 home, half, partner, half, DS4_N_HEAD);
     }
     bool ok = ds4_gpu_tensor_wait_xdev_default(q, partner) != 0;
@@ -26918,31 +26920,42 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
     const uint32_t half_groups = n_groups / 2u;
+    const uint64_t half_low = (uint64_t)half_groups * rank;
+    const uint64_t low_total = (uint64_t)n_groups * rank;
     bool ok = true;
     for (int pass = 0; ok && pass < 2; pass++) {
         const int tier = pass == 0 ? partner : home;
         const uint32_t group0 = pass == 0 ? half_groups : 0u;
         ok = ds4_gpu_set_current_device(tier) == 0 &&
-             ds4_gpu_attention_output_q8_batch_shard_tensor(
-                    g->batch_attn_out_by_tier[tier],
+             ds4_gpu_attention_output_q8_batch_low_shard_tensor(
                     g->batch_attn_low_by_tier[tier],
                     model->map, model->size,
                     layer->attn_output_a->abs_offset,
-                    layer->attn_output_b->abs_offset,
                     group_dim, rank, n_groups, group0, half_groups,
-                    DS4_N_EMBD, g->batch_heads_by_tier[tier],
-                    n_tokens) != 0;
+                    g->batch_heads_by_tier[tier], n_tokens) != 0;
     }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(
-                g->batch_attn_out_by_tier[partner], home) != 0;
+                g->batch_attn_low_by_tier[partner], home) != 0;
     }
     if (ds4_gpu_set_current_device(home) != 0) ok = false;
     if (ok) {
-        ok = ds4_gpu_add_tensor(g->batch_attn_out_by_tier[home],
-                                g->batch_attn_out_by_tier[home],
-                                g->batch_attn_out_by_tier[partner],
-                                n_tokens * DS4_N_EMBD) != 0;
+        /* The Q activation is dead after both attention launches. Reuse it as
+         * the full low-rank output so the home packed half is never expanded
+         * in place (which would overwrite later token rows). */
+        ok = ds4_gpu_gather_pair_rows_xdev_tensor(
+                g->batch_q_by_tier[home],
+                g->batch_attn_low_by_tier[home],
+                g->batch_attn_low_by_tier[partner],
+                n_tokens, half_low) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_attention_output_q8_batch_b_tensor(
+                g->batch_attn_out_by_tier[home],
+                model->map, model->size,
+                layer->attn_output_b->abs_offset,
+                low_total, DS4_N_EMBD,
+                g->batch_q_by_tier[home], n_tokens) != 0;
     }
     return ok;
 #endif

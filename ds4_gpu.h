@@ -2042,6 +2042,33 @@ int ds4_gpu_attention_output_q8_batch_shard_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t              n_tokens);
+int ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups_total,
+        uint32_t              group0,
+        uint32_t              group_count,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens);
+int ds4_gpu_gather_pair_rows_xdev_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *local,
+        const ds4_gpu_tensor *remote,
+        uint32_t              n_rows,
+        uint64_t              half_width);
+int ds4_gpu_attention_output_q8_batch_b_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_b_offset,
+        uint64_t              low_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *low,
+        uint32_t              n_tokens);
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,

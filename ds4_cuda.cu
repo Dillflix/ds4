@@ -16150,6 +16150,127 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         uint32_t n_groups_total, uint32_t group0, uint32_t group_cnt,
         const ds4_gpu_tensor *heads, uint32_t n_rows);
 
+extern "C" int ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups_total, uint32_t group0, uint32_t group_count,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups_total == 0u || group_count == 0u ||
+        group0 > n_groups_total || group_count > n_groups_total - group0 ||
+        n_tokens == 0u) return 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t low_count = (uint64_t)group_count * rank;
+    const uint64_t low_start = (uint64_t)group0 * rank;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = (uint64_t)n_groups_total * rank * row_a_bytes;
+    const uint64_t a_slice_offset = out_a_offset + low_start * row_a_bytes;
+    const uint64_t a_slice_bytes = low_count * row_a_bytes;
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups_total * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_count * sizeof(float)) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(low);
+    const int physical_device =
+        (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
+            ? g_gpu[logical_tier].device_id : 0;
+    const __half *a_f16 = NULL;
+    if (!g_quality_mode && g_cublas_ready && n_tokens >= 2u) {
+        a_f16 = cuda_q8_f16_ptr(model_map, a_slice_offset, a_slice_bytes,
+                                group_dim, low_count, physical_device,
+                                "attn_output_a_shard");
+    }
+    if (a_f16) {
+        const uint64_t heads_h_count =
+            (uint64_t)group_count * n_tokens * group_dim;
+        const uint64_t low_packed_count =
+            (uint64_t)group_count * n_tokens * rank;
+        const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+        const uint64_t low_packed_offset = (heads_h_bytes + 255u) & ~255ull;
+        const uint64_t tmp_bytes = low_packed_offset +
+            low_packed_count * sizeof(float);
+        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes,
+                                      "attention output shard a");
+        if (!tmp) return 0;
+        __half *heads_h = (__half *)tmp;
+        float *low_packed = (float *)((char *)tmp + low_packed_offset);
+        attention_pack_group_heads_slice_f16_kernel
+            <<<(heads_h_count + 255u) / 256u, 256>>>(
+                heads_h, (const float *)heads->ptr, n_tokens,
+                n_groups_total, group0, group_count, group_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention output shard pack launch")) return 0;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+                cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)rank, (int)n_tokens, (int)group_dim, &alpha,
+                a_f16, CUDA_R_16F, (int)group_dim,
+                (long long)rank * group_dim, heads_h, CUDA_R_16F,
+                (int)group_dim, (long long)n_tokens * group_dim, &beta,
+                low_packed, CUDA_R_32F, (int)rank,
+                (long long)rank * n_tokens, (int)group_count,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "attention output shard a gemm")) return 0;
+        attention_unpack_group_low_kernel
+            <<<(low_packed_count + 255u) / 256u, 256>>>(
+                (float *)low->ptr, low_packed, n_tokens, group_count, rank);
+        return cuda_ok(cudaGetLastError(),
+                       "attention output shard a unpack launch");
+    }
+
+    return ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+            low, model_map, model_size, out_a_offset, group_dim, rank,
+            n_groups_total, group0, group_count, heads, n_tokens);
+}
+
+__global__ static void gather_pair_rows_xdev_kernel(
+        float *dst, const float *local, const float *remote,
+        uint64_t n_rows, uint64_t half_width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t width = 2u * half_width;
+    const uint64_t count = n_rows * width;
+    if (i >= count) return;
+    const uint64_t row = i / width;
+    const uint64_t col = i - row * width;
+    dst[i] = col < half_width
+        ? local[row * half_width + col]
+        : remote[row * half_width + col - half_width];
+}
+
+extern "C" int ds4_gpu_gather_pair_rows_xdev_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *local,
+        const ds4_gpu_tensor *remote, uint32_t n_rows,
+        uint64_t half_width) {
+    const uint64_t byte_den = 2u * (uint64_t)n_rows * sizeof(float);
+    if (!dst || !local || !remote || n_rows == 0u || half_width == 0u ||
+        half_width > UINT64_MAX / byte_den) return 0;
+    const uint64_t half_count = (uint64_t)n_rows * half_width;
+    const uint64_t half_bytes = half_count * sizeof(float);
+    const uint64_t dst_bytes = 2u * half_bytes;
+    if (local->bytes < half_bytes || remote->bytes < half_bytes ||
+        dst->bytes < dst_bytes) return 0;
+    const int dd = ds4_tensor_device_idx(dst);
+    const int ld = ds4_tensor_device_idx(local);
+    const int rd = ds4_tensor_device_idx(remote);
+    if (dd < 0 || dd >= g_n_gpus || ld != dd || rd < 0 ||
+        rd >= g_n_gpus || rd == dd || !g_gpu_peer_ok[dd][rd]) return 0;
+    const uint64_t count = 2u * half_count;
+    gather_pair_rows_xdev_kernel<<<(count + 255u) / 256u, 256>>>(
+            (float *)dst->ptr, (const float *)local->ptr,
+            (const float *)remote->ptr, n_rows, half_width);
+    return cuda_ok(cudaGetLastError(), "attention output low peer gather launch");
+}
+
+extern "C" int ds4_gpu_attention_output_q8_batch_b_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t out_b_offset, uint64_t low_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *low, uint32_t n_tokens) {
+    return cuda_matmul_q8_0_tensor_labeled(
+            out, model_map, model_size, out_b_offset, low_dim, out_dim,
+            low, n_tokens, "attn_output_b");
+}
+
 extern "C" int ds4_gpu_attention_output_q8_batch_shard_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,

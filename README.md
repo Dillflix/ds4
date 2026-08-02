@@ -743,10 +743,12 @@ at the CUDA VRAM reserve and transparently falls back to native Q8 kernels when
 an expansion cannot fit. `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables this
 cache for memory-pressure diagnosis; it is not the performance default.
 Prefill attention also splits the 64 query heads 32/32 within each validated
-P2P pair. Both halves run concurrently and feed group-sliced attention-output
-projections on their local GPUs; the home GPU peer-reads only the projected
-partner contribution for the final sum. Raw and compressed KV remain
-single-copy on the home GPU and are peer-read by the partner. Set
+P2P pair. Both halves run concurrently and feed group-sliced output-A
+projections on their local GPUs. The home GPU peer-reads only the partner's
+packed low-rank half, assembles the complete low-rank activation, and runs one
+full cached output-B GEMM. This avoids two inefficient half-K output-B GEMMs
+and the previous full-width projected-output exchange. Raw and compressed KV
+remain single-copy on the home GPU and are peer-read by the partner. Set
 `DS4_CUDA_TP_PREFILL_ATTN_HEADS=0` only to compare against the replicated
 single-GPU attention path.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
