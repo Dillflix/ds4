@@ -442,6 +442,75 @@ static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
+
+struct cuda_q8_audit_record {
+    uint64_t sequence;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t fp16_bytes;
+    uint64_t cache_bytes_after;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t layer;
+    uint32_t token_offset;
+    int physical_device;
+    char module[40];
+    char label[40];
+    char result[24];
+    char reason[40];
+};
+
+static std::vector<cuda_q8_audit_record> g_q8_audit_records;
+static uint64_t g_q8_audit_sequence;
+static char g_q8_audit_module[40];
+static uint32_t g_q8_audit_layer = UINT32_MAX;
+static uint32_t g_q8_audit_token_offset = UINT32_MAX;
+
+static int cuda_q8_audit_enabled(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *path = getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV");
+        enabled = path && path[0];
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static void cuda_q8_audit_copy(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0u) return;
+    snprintf(dst, cap, "%s", src && src[0] ? src : "unscoped");
+}
+
+static void cuda_q8_audit_record_result(
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int physical_device,
+        const char *label,
+        const char *result,
+        const char *reason) {
+    if (!cuda_q8_audit_enabled()) return;
+    cuda_q8_audit_record r = {};
+    r.sequence = g_q8_audit_sequence++;
+    r.offset = offset;
+    r.weight_bytes = weight_bytes;
+    r.fp16_bytes = in_dim != 0u && out_dim <= UINT64_MAX / in_dim / sizeof(__half)
+        ? in_dim * out_dim * sizeof(__half) : 0u;
+    r.cache_bytes_after = g_q8_f16_bytes;
+    r.in_dim = in_dim;
+    r.out_dim = out_dim;
+    r.layer = g_q8_audit_layer;
+    r.token_offset = g_q8_audit_token_offset;
+    r.physical_device = physical_device;
+    cuda_q8_audit_copy(r.module, sizeof(r.module),
+                       g_q8_audit_module[0] ? g_q8_audit_module : label);
+    cuda_q8_audit_copy(r.label, sizeof(r.label), label);
+    cuda_q8_audit_copy(r.result, sizeof(r.result), result);
+    cuda_q8_audit_copy(r.reason, sizeof(r.reason), reason);
+    g_q8_audit_records.push_back(r);
+}
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -1125,13 +1194,20 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
+    auto audit_return = [&](const __half *ptr,
+                            const char *result,
+                            const char *reason) -> const __half * {
+        cuda_q8_audit_record_result(offset, weight_bytes, in_dim, out_dim,
+                                    expected_device, label, result, reason);
+        return ptr;
+    };
     if (g_n_gpus <= 1) {
         auto exact = g_q8_f16_by_offset.find(offset);
         if (exact != g_q8_f16_by_offset.end()) {
             const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
             if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
                 r.in_dim == in_dim && r.out_dim == out_dim) {
-                return r.device_ptr;
+                return audit_return(r.device_ptr, "f16_hit", "resident");
             }
         }
     } else {
@@ -1142,11 +1218,19 @@ static const __half *cuda_q8_f16_ptr(
                 r.in_dim == in_dim &&
                 r.out_dim == out_dim &&
                 r.device_id == expected_device) {
-                return r.device_ptr;
+                return audit_return(r.device_ptr, "f16_hit", "resident");
             }
         }
     }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) {
+        const char *reason = "ineligible_shape_or_label";
+        if (g_quality_mode) reason = "quality_mode";
+        else if (g_q8_cache_suppressed) reason = "pipeline_suppressed";
+        else if (g_q8_f16_disabled_after_oom) reason = "disabled_after_failure";
+        else if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) reason = "disabled_by_env";
+        else if (cuda_q8_f16_cache_limit_bytes() == 0u) reason = "zero_limit";
+        return audit_return(NULL, "native_q8", reason);
+    }
 
     /* Source Q8 bytes:
      *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr — preserves the
@@ -1167,15 +1251,17 @@ static const __half *cuda_q8_f16_ptr(
                 "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
                 (unsigned long long)offset, (unsigned long long)weight_bytes,
                 expected_device, label ? label : "?");
-            return NULL;
+            return audit_return(NULL, "native_q8", "selective_cache_miss");
         }
         q8 = (const char *)strict_ptr;
     }
-    if (!q8) return NULL;
+    if (!q8) return audit_return(NULL, "native_q8", "source_unavailable");
 
-    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half))
+        return audit_return(NULL, "native_q8", "size_overflow");
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
-    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, label))
+        return audit_return(NULL, "native_q8", "budget_or_limit");
 
     int prev = -1;
     if (g_n_gpus > 1) {
@@ -1184,7 +1270,7 @@ static const __half *cuda_q8_f16_ptr(
             fprintf(stderr, "ds4: cudaGetDevice failed before q8 fp16 alloc on device %d: %s\n",
                     expected_device, cudaGetErrorString(derr));
             (void)cudaGetLastError();
-            return NULL;
+            return audit_return(NULL, "native_q8", "get_device_failed");
         }
         derr = cudaSetDevice(expected_device);
         if (derr != cudaSuccess) {
@@ -1192,7 +1278,7 @@ static const __half *cuda_q8_f16_ptr(
                     expected_device, cudaGetErrorString(derr));
             (void)cudaGetLastError();
             if (prev >= 0) (void)cudaSetDevice(prev);
-            return NULL;
+            return audit_return(NULL, "native_q8", "set_device_failed");
         }
     }
     __half *dev = NULL;
@@ -1202,7 +1288,7 @@ static const __half *cuda_q8_f16_ptr(
                 expected_device, (double)out_bytes / 1048576.0, cudaGetErrorString(err));
         cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-        return NULL;
+        return audit_return(NULL, "native_q8", "allocation_failed");
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
@@ -1215,7 +1301,7 @@ static const __half *cuda_q8_f16_ptr(
         (void)cudaFree(dev);
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-        return NULL;
+        return audit_return(NULL, "native_q8", "dequant_failed");
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev, expected_device});
     if (g_n_gpus <= 1) {
@@ -1228,7 +1314,7 @@ static const __half *cuda_q8_f16_ptr(
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
     if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
-    return dev;
+    return audit_return(dev, "f16_fill", "allocated");
 }
 
 /* Per-device dequantized fp32 cache. Same conventions as cuda_q8_f16_ptr. */
@@ -3165,6 +3251,54 @@ extern "C" int ds4_gpu_profiler_start(void) {
 
 extern "C" int ds4_gpu_profiler_stop(void) {
     return cuda_ok(cudaProfilerStop(), "cudaProfilerStop");
+}
+
+extern "C" void ds4_gpu_q8_audit_set_context(
+        const char *module,
+        uint32_t layer,
+        uint32_t token_offset) {
+    cuda_q8_audit_copy(g_q8_audit_module, sizeof(g_q8_audit_module), module);
+    g_q8_audit_layer = layer;
+    g_q8_audit_token_offset = token_offset;
+}
+
+extern "C" void ds4_gpu_q8_audit_clear_context(void) {
+    g_q8_audit_module[0] = '\0';
+    g_q8_audit_layer = UINT32_MAX;
+    g_q8_audit_token_offset = UINT32_MAX;
+}
+
+extern "C" int ds4_gpu_q8_audit_write_csv(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot create CUDA Q8 cache audit CSV %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    fprintf(fp,
+            "sequence,module,label,layer,token_offset,physical_device,"
+            "weight_offset,weight_bytes,in_dim,out_dim,fp16_bytes,"
+            "result,reason,cache_bytes_after\n");
+    for (const cuda_q8_audit_record &r : g_q8_audit_records) {
+        fprintf(fp, "%llu,%s,%s,",
+                (unsigned long long)r.sequence, r.module, r.label);
+        if (r.layer != UINT32_MAX) fprintf(fp, "%u", r.layer);
+        fputc(',', fp);
+        if (r.token_offset != UINT32_MAX) fprintf(fp, "%u", r.token_offset);
+        fprintf(fp, ",%d,%llu,%llu,%llu,%llu,%llu,%s,%s,%llu\n",
+                r.physical_device,
+                (unsigned long long)r.offset,
+                (unsigned long long)r.weight_bytes,
+                (unsigned long long)r.in_dim,
+                (unsigned long long)r.out_dim,
+                (unsigned long long)r.fp16_bytes,
+                r.result,
+                r.reason,
+                (unsigned long long)r.cache_bytes_after);
+    }
+    const int ok = fclose(fp) == 0;
+    return ok;
 }
 
 static size_t cuda_moe_tile_audit_bytes(uint32_t capacity) {

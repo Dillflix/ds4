@@ -704,6 +704,9 @@ int main(int argc, char **argv) {
     const char *tile_audit_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_PREFILL_TILE_AUDIT_CSV") : NULL;
     bool tile_audit_done = false;
+    const char *q8_cache_audit_csv = cfg.backend == DS4_BACKEND_CUDA
+        ? getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV") : NULL;
+    bool q8_cache_audit_done = false;
 #endif
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
@@ -774,6 +777,19 @@ int main(int argc, char **argv) {
             tile_audit_done = true;
             fprintf(stderr, "ds4-bench: wrote CUDA tile audit %s\n",
                     tile_audit_csv);
+        }
+        if (q8_cache_audit_csv && q8_cache_audit_csv[0] &&
+            !q8_cache_audit_done) {
+            if (!ds4_gpu_q8_audit_write_csv(q8_cache_audit_csv)) {
+                fprintf(stderr,
+                        "ds4-bench: failed to write CUDA Q8 cache audit %s\n",
+                        q8_cache_audit_csv);
+                rc = 1;
+                break;
+            }
+            q8_cache_audit_done = true;
+            fprintf(stderr, "ds4-bench: wrote CUDA Q8 cache audit %s\n",
+                    q8_cache_audit_csv);
         }
 #endif
         const double prefill_sec = prefill_t1 - prefill_t0;

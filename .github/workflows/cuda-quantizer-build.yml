@@ -12,6 +12,8 @@ on:
       - "Makefile"
       - "speed-bench/cuda-prefill-audit.sh"
       - "speed-bench/cuda-prefill-deep-audit.sh"
+      - "speed-bench/cuda-q4-prefill-evidence.sh"
+      - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-prefill-placement.py"
       - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
@@ -44,6 +46,8 @@ jobs:
           bash -n compare-q2-hybrid-q4.sh
           bash -n speed-bench/cuda-prefill-audit.sh
           bash -n speed-bench/cuda-prefill-deep-audit.sh
+          bash -n speed-bench/cuda-q4-prefill-evidence.sh
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py
+          python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py

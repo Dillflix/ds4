@@ -99,6 +99,38 @@ SKIP_BUILD=1 SKIP_PLACEMENT=1 SKIP_TILE=1 \
 If the system restricts counters to administrators, set `NCU_USE_SUDO=1` for
 the resume run or change the NVIDIA driver profiling-permission policy.
 
+### Full-Q4 SM75 evidence pass
+
+`cuda-q4-prefill-evidence.sh` keeps measurement and diagnostics separate. It
+runs the fixed prompt suite once on the untouched 22/21 production path, then
+uses independent processes for Q8-cache coverage, Nsight Systems runtime
+branch coverage, and Nsight Compute replay. The Q8 audit records every
+Q8-to-F16 cache attempt, including the layer/module context, device, hit/fill
+or native-Q8 result, reason, and cache high-water mark. It then selects two
+actual native-Q8 projections as the dense-kernel profiler targets; launch
+indices are not guessed.
+
+The Q4 gate/up captures are scoped by layer and token offset through the CUDA
+profiler API and filtered to the SM75 tile8 kernel. The dense-Q8 captures use
+the same scope plus the audit-selected module and verify that the projection
+was still uncached in the profiling process.
+
+```bash
+cd ~/ds4-iq2-q4
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+./speed-bench/cuda-q4-prefill-evidence.sh
+```
+
+Replace the example `MODEL` value with the exact full-Q4 file on the machine.
+The script rejects a missing model rather than searching for one implicitly.
+Set `PROMPT_MANIFEST` to reuse the fixed multi-prompt suite. Set
+`NCU_USE_SUDO=1` if performance counters require administrative access. As
+with the deep audit, partial results are archived on failure; set
+`Q4_EVIDENCE_DIR`, `SKIP_BUILD=1`, `SKIP_BASELINE=1`, and `SKIP_COVERAGE=1`
+to resume only the profiler captures.
+
 ### SM80 to SM75 dispatch and resource audit
 
 [`CUDA_SM80_TO_SM75_DISPATCH_MATRIX.md`](../CUDA_SM80_TO_SM75_DISPATCH_MATRIX.md)

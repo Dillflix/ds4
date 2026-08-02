@@ -25024,6 +25024,49 @@ static bool metal_graph_attention_output_dense_quant_batch(
     return ok;
 }
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int metal_graph_cuda_target_profile_begin(
+        const char *module,
+        uint32_t    il,
+        uint32_t    pos0) {
+    const char *target_module = getenv("DS4_CUDA_NCU_TARGET_MODULE");
+    const char *target_layer = getenv("DS4_CUDA_NCU_TARGET_LAYER");
+    if (!target_module || !target_module[0] ||
+        strcmp(target_module, module) != 0 ||
+        !target_layer || !target_layer[0]) {
+        return 0;
+    }
+    char *end = NULL;
+    const unsigned long v = strtoul(target_layer, &end, 10);
+    if (end == target_layer || *end != '\0' || v != il) return 0;
+    const char *target_pos = getenv("DS4_CUDA_NCU_TARGET_POS");
+    unsigned long wanted_pos = 0u;
+    if (target_pos && target_pos[0]) {
+        end = NULL;
+        wanted_pos = strtoul(target_pos, &end, 10);
+        if (end == target_pos || *end != '\0') return 0;
+    }
+    if (wanted_pos != pos0) return 0;
+    fprintf(stderr,
+            "ds4: starting targeted CUDA profile module=%s layer=%u pos=%u\n",
+            module, il, pos0);
+    return ds4_gpu_profiler_start() ? 1 : -1;
+}
+
+static bool metal_graph_cuda_target_profile_end(
+        int         scope,
+        const char *module,
+        uint32_t    il,
+        uint32_t    pos0) {
+    if (scope <= 0) return scope == 0;
+    if (!ds4_gpu_profiler_stop()) return false;
+    fprintf(stderr,
+            "ds4: stopped targeted CUDA profile module=%s layer=%u pos=%u\n",
+            module, il, pos0);
+    return true;
+}
+#endif
+
 static bool metal_graph_matmul_q8_0_named_tensor(
         const char             *module,
         uint32_t                il,
@@ -25035,16 +25078,25 @@ static bool metal_graph_matmul_q8_0_named_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    (void)module;
-    (void)il;
-    (void)pos0;
-    return metal_graph_matmul_dense_quant_tensor(out,
-                                                model,
-                                                w,
-                                                in_dim,
-                                                out_dim,
-                                                x,
-                                                n_tok);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    const int profile_scope =
+        metal_graph_cuda_target_profile_begin(module, il, pos0);
+    if (profile_scope < 0) return false;
+    ds4_gpu_q8_audit_set_context(module, il, pos0);
+#endif
+    bool ok = metal_graph_matmul_dense_quant_tensor(out,
+                                                    model,
+                                                    w,
+                                                    in_dim,
+                                                    out_dim,
+                                                    x,
+                                                    n_tok);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_q8_audit_clear_context();
+    if (!metal_graph_cuda_target_profile_end(
+            profile_scope, module, il, pos0)) return false;
+#endif
+    return ok;
 }
 
 static bool metal_graph_encode_output_head_mtp(
@@ -27241,6 +27293,9 @@ static bool metal_graph_encode_layer_attention_batch(
         (!tp_q || !tp_q_half || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
         ok = false;
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_q8_audit_set_context("attn_q_b", il, pos0);
+#endif
     bool q_b_f16_out = false;
     if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
@@ -27320,6 +27375,9 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_q8_audit_clear_context();
+#endif
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
@@ -28620,6 +28678,9 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool attn_out_debug =
         metal_graph_debug_wants("attn_low", il, pos0) ||
         metal_graph_debug_wants("attn_out", il, pos0);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_q8_audit_set_context("attention_output", il, pos0);
+#endif
     bool attn_out_f16 = false;
     bool cuda_tp_attn_output_done = false;
     if (ok && cuda_tp_prefill_heads_done) {
@@ -28741,6 +28802,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
         }
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_q8_audit_clear_context();
+#endif
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
     if (ok && tp_row_split_attn) {
         /* Release point for the pipelined row swaps of batch_attn_out: both
@@ -29217,6 +29281,11 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_batch_out && g->tp_batch_in;
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    int routed_profile_scope = ok
+        ? metal_graph_cuda_target_profile_begin("routed_moe", il, pos0) : 0;
+    if (routed_profile_scope < 0) ok = false;
+#endif
     if (ok && cuda_tp_owned_batch_moe) {
         ok = metal_graph_encode_mixed_routed_rows(
                 g, decode_items, decode_count, model, layer, il, n_tokens);
@@ -29310,6 +29379,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                &g->batch_routed_mid_is_f16,
                                                false) != 0;
     }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!metal_graph_cuda_target_profile_end(
+            routed_profile_scope, "routed_moe", il, pos0)) ok = false;
+#endif
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);

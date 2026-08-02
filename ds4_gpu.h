@@ -98,6 +98,11 @@ int ds4_gpu_synchronize(void);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 int ds4_gpu_profiler_start(void);
 int ds4_gpu_profiler_stop(void);
+void ds4_gpu_q8_audit_set_context(const char *module,
+                                  uint32_t layer,
+                                  uint32_t token_offset);
+void ds4_gpu_q8_audit_clear_context(void);
+int ds4_gpu_q8_audit_write_csv(const char *path);
 int ds4_gpu_prefill_tile_audit_begin(uint32_t capacity_per_device);
 int ds4_gpu_prefill_tile_audit_write_csv(const char *path);
 void ds4_gpu_prefill_tile_audit_end(void);
