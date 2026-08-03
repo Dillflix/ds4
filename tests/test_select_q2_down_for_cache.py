@@ -57,6 +57,42 @@ class SelectQ2DownForCacheTests(unittest.TestCase):
             [36, 3, 4, 5],
         )
 
+    def test_down_only_plan_when_it_fits(self):
+        q2, iq2, reclaim = SELECTOR.select_stage_recipe(
+            required_bytes=721 * SELECTOR.MIB,
+            q2_candidates=[3, 4, 5, 6],
+            iq2_candidates=[3, 4, 5, 6],
+            q2_saving_bytes=240 * SELECTOR.MIB,
+            iq2_pair_saving_bytes=624 * SELECTOR.MIB,
+        )
+        self.assertEqual(q2, [3, 4, 5, 6])
+        self.assertEqual(iq2, [])
+        self.assertEqual(reclaim, 960 * SELECTOR.MIB)
+
+    def test_minimum_iq2_pairs_then_minimum_q2_down(self):
+        q2, iq2, reclaim = SELECTOR.select_stage_recipe(
+            required_bytes=6001 * SELECTOR.MIB,
+            q2_candidates=list(range(3, 22)),
+            iq2_candidates=list(range(10, 22)) + list(range(3, 10)),
+            q2_saving_bytes=240 * SELECTOR.MIB,
+            iq2_pair_saving_bytes=624 * SELECTOR.MIB,
+        )
+        self.assertEqual(len(iq2), 3)
+        self.assertEqual(iq2, [10, 11, 12])
+        self.assertEqual(len(q2), 18)
+        self.assertGreaterEqual(reclaim, 6001 * SELECTOR.MIB)
+        self.assertLess(reclaim, (6001 + 240) * SELECTOR.MIB)
+
+    def test_infeasible_even_with_every_iq2_pair(self):
+        with self.assertRaisesRegex(SystemExit, "maximum=1728 MiB"):
+            SELECTOR.select_stage_recipe(
+                required_bytes=2000 * SELECTOR.MIB,
+                q2_candidates=[3, 4],
+                iq2_candidates=[3, 4],
+                q2_saving_bytes=240 * SELECTOR.MIB,
+                iq2_pair_saving_bytes=624 * SELECTOR.MIB,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

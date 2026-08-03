@@ -3,9 +3,10 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Generate and benchmark a DeepSeek-V4-Flash model with Q4_K routed gate/up and
-the minimum number of Q2_K routed-down tensors needed to make the dense Q8
-FP16 cache fully resident at the requested maximum context plus safety reserve.
+Generate and benchmark a DeepSeek-V4-Flash Q4-first model with the minimum
+number of Q2_K routed-down tensors needed to make the dense Q8 FP16 cache fully
+resident. If down-only conversion is impossible for a stage, add the minimum
+number of matched IQ2_XXS routed gate/up layer pairs needed to close the gap.
 
 Usage:
   bash produce-benchmark-q4-selective-q2-down.sh \
@@ -26,9 +27,11 @@ Defaults:
   CACHE_ALL_Q8=1
   CACHE_EXTRA_HEADROOM_MIB=512
   Q2_DOWN_LAYER_ORDER=3-42
+  IQ2_GATE_UP_LAYER_ORDER=Q2_DOWN_LAYER_ORDER
 
 Q2_DOWN_LAYER_ORDER is a preference order, not merely a set. Replace it with a
 quality-ranked layer order when the fixed quality suite supplies one.
+IQ2_GATE_UP_LAYER_ORDER independently controls the IQ2 pair preference.
 EOF
 }
 
@@ -74,6 +77,7 @@ gen_tokens=${GEN_TOKENS:-128}
 extra_headroom=${CACHE_EXTRA_HEADROOM_MIB:-512}
 cache_all_q8=${CACHE_ALL_Q8:-1}
 layer_order=${Q2_DOWN_LAYER_ORDER:-3-42}
+iq2_layer_order=${IQ2_GATE_UP_LAYER_ORDER:-$layer_order}
 if [[ -n ${PROMPT_FILE:-} ]]; then
     prompt=$(realpath "$PROMPT_FILE")
 else
@@ -122,9 +126,11 @@ selection=$(python3 speed-bench/select-q2-down-for-cache.py \
     --layout-log "$baseline_log" \
     --gpu-devices "$gpu_devices" \
     --extra-headroom-mib "$extra_headroom" \
-    --layer-order "$layer_order")
-IFS=$'\t' read -r q2_layers tensor_overrides <<< "$selection"
-[[ -n $q2_layers && -n $tensor_overrides ]] || die "empty selective-Q2 plan"
+    --layer-order "$layer_order" \
+    --iq2-layer-order "$iq2_layer_order")
+IFS=$'\t' read -r q2_layers iq2_gate_up_layers tensor_overrides <<< "$selection"
+[[ -n $q2_layers && -n $iq2_gate_up_layers && -n $tensor_overrides ]] || \
+    die "empty selective quant plan"
 
 {
     printf 'full_q4=%s\n' "$(realpath "$full_q4")"
@@ -135,7 +141,9 @@ IFS=$'\t' read -r q2_layers tensor_overrides <<< "$selection"
     printf 'cache_all_q8=%s\n' "$cache_all_q8"
     printf 'cache_extra_headroom_mib=%s\n' "$extra_headroom"
     printf 'q2_down_layer_order=%s\n' "$layer_order"
+    printf 'iq2_gate_up_layer_order=%s\n' "$iq2_layer_order"
     printf 'q2_down_layers=%s\n' "$q2_layers"
+    printf 'iq2_gate_up_layers=%s\n' "$iq2_gate_up_layers"
     printf 'tensor_type_overrides=%s\n' "$tensor_overrides"
 } | tee "$selection_manifest"
 
@@ -143,8 +151,8 @@ export ROUTED_W1=q4_k
 export ROUTED_W2=q4_k
 export ROUTED_W3=q4_k
 export TENSOR_TYPE_OVERRIDES="$tensor_overrides"
-export QUANT_RECIPE="gate:q4_k,up:q4_k,down:q4_k;q2_down_layers:$q2_layers"
-export PLOT_TITLE="RTX 8000 2x2 TP - Q4 gate/up, selective Q2 down"
+export QUANT_RECIPE="base:gate=q4_k,up=q4_k,down=q4_k;q2_down_layers:$q2_layers;iq2_gate_up_layers:$iq2_gate_up_layers"
+export PLOT_TITLE="RTX 8000 2x2 TP - Q4-first selective Q2 down + IQ2 gate/up"
 export DS4_CUDA_Q8_CACHE_AUDIT_CSV="$verification_audit"
 
 bash "$script_dir/produce-benchmark-iq2-iq2-q4.sh" "$hf_dir" "$out" "$csv"
@@ -152,5 +160,5 @@ bash "$script_dir/produce-benchmark-iq2-iq2-q4.sh" "$hf_dir" "$out" "$csv"
 python3 speed-bench/select-q2-down-for-cache.py \
     --audit "$verification_audit" --verify-only
 
-printf '\nSelective-Q2 model verified.\nModel:     %s\nLayers:    %s\nSelection: %s\nAudit:     %s\n' \
-    "$out" "$q2_layers" "$selection_manifest" "$verification_audit"
+printf '\nSelective model verified.\nModel:          %s\nQ2 down layers: %s\nIQ2 G/U layers: %s\nSelection:      %s\nAudit:          %s\n' \
+    "$out" "$q2_layers" "$iq2_gate_up_layers" "$selection_manifest" "$verification_audit"
