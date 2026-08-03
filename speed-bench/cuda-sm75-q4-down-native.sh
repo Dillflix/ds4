@@ -16,10 +16,13 @@ Optional environment:
   RUN_SANITIZER=1          run memcheck when compute-sanitizer is installed
   RUN_NCU=1
   NCU_USE_SUDO=0           use sudo -E for metric discovery and collection
+  RESUME_NCU=0             reuse a completed failed run and run only NCU
   Q4_DOWN_NATIVE_DIR=/absolute/output/directory
 
 The harness is synthetic and never opens a model. An archive is created on
 success, failure, or interruption after the output directory is initialized.
+RESUME_NCU=1 requires an existing explicit Q4_DOWN_NATIVE_DIR whose original
+run reached the Nsight phase. Completed evidence is validated, never replaced.
 EOF
 }
 
@@ -70,7 +73,9 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
-OUTPUT_DIR=${Q4_DOWN_NATIVE_DIR:-$repo_dir/sm75-q4-down-native-$(date -u +%Y%m%dT%H%M%SZ)}
+RESUME_NCU=${RESUME_NCU:-0}
+RUN_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUTPUT_DIR=${Q4_DOWN_NATIVE_DIR:-$repo_dir/sm75-q4-down-native-$RUN_STAMP}
 
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be a physical GPU index"
 [[ $CUDA_ARCH == sm_75 ]] || die "CUDA_ARCH must be exactly sm_75"
@@ -80,16 +85,22 @@ OUTPUT_DIR=${Q4_DOWN_NATIVE_DIR:-$repo_dir/sm75-q4-down-native-$(date -u +%Y%m%d
 [[ $BENCH_LAUNCHES =~ ^[1-9][0-9]*$ ]] || die "BENCH_LAUNCHES must be a positive integer"
 [[ $PROFILE_SCENARIO == early || $PROFILE_SCENARIO == late ]] ||
     die "PROFILE_SCENARIO must be early or late"
-for value_name in SKIP_BUILD RUN_SANITIZER RUN_NCU NCU_USE_SUDO; do
+for value_name in SKIP_BUILD RUN_SANITIZER RUN_NCU NCU_USE_SUDO RESUME_NCU; do
     value=${!value_name}
     [[ $value == 0 || $value == 1 ]] || die "$value_name must be 0 or 1"
 done
 [[ $OUTPUT_DIR == /* ]] || die "Q4_DOWN_NATIVE_DIR must be an absolute path"
+if [[ $RESUME_NCU == 1 ]]; then
+    [[ -n ${Q4_DOWN_NATIVE_DIR:-} ]] ||
+        die "RESUME_NCU=1 requires an explicit Q4_DOWN_NATIVE_DIR"
+    [[ $RUN_NCU == 1 ]] || die "RESUME_NCU=1 requires RUN_NCU=1"
+fi
 
 command -v tar >/dev/null 2>&1 || die "tar not found; archiving is mandatory"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
 command -v stat >/dev/null 2>&1 || die "stat not found"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
+command -v cmp >/dev/null 2>&1 || die "cmp not found"
 [[ -f $source_rel ]] || die "$source_rel not found"
 [[ -f $makefile_rel ]] || die "$makefile_rel not found"
 [[ -f $engine_rel ]] || die "$engine_rel not found"
@@ -97,16 +108,27 @@ command -v python3 >/dev/null 2>&1 || die "python3 not found"
 [[ -f $readme_rel ]] || die "$readme_rel not found"
 [[ -f $validator_rel ]] || die "$validator_rel not found"
 [[ -x $script_rel ]] || die "$script_rel is not executable; commit it with mode 100755"
-[[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
-ARCHIVE_PATH=$OUTPUT_DIR.tar.gz
-[[ ! -e $ARCHIVE_PATH ]] || die "archive path already exists: $ARCHIVE_PATH"
-
 git_status_before=$(git status --short --untracked-files=all)
-mkdir -p "$OUTPUT_DIR/provenance" "$OUTPUT_DIR/sass-kernels" "$OUTPUT_DIR/ncu"
-OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
-ARCHIVE_PATH=$OUTPUT_DIR.tar.gz
+if [[ $RESUME_NCU == 1 ]]; then
+    [[ -d $OUTPUT_DIR ]] || die "resume output directory not found: $OUTPUT_DIR"
+    OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+    RUN_DIR=$OUTPUT_DIR/resume-$RUN_STAMP
+    [[ ! -e $RUN_DIR ]] || die "resume evidence path already exists: $RUN_DIR"
+    ARCHIVE_PATH=$OUTPUT_DIR.resume-$RUN_STAMP.tar.gz
+    [[ ! -e $ARCHIVE_PATH ]] || die "resume archive path already exists: $ARCHIVE_PATH"
+    mkdir -p "$RUN_DIR/provenance" "$RUN_DIR/ncu"
+else
+    [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+    ARCHIVE_PATH=$OUTPUT_DIR.tar.gz
+    [[ ! -e $ARCHIVE_PATH ]] || die "archive path already exists: $ARCHIVE_PATH"
+    mkdir -p "$OUTPUT_DIR/provenance" "$OUTPUT_DIR/sass-kernels" "$OUTPUT_DIR/ncu"
+    OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+    RUN_DIR=$OUTPUT_DIR
+    ARCHIVE_PATH=$OUTPUT_DIR.tar.gz
+fi
+NCU_DIR=$RUN_DIR/ncu
 
-current_phase=initialization
+current_phase=$([[ $RESUME_NCU == 1 ]] && printf resume-initialization || printf initialization)
 caught_signal=
 benchmark_telemetry_pid=
 
@@ -136,7 +158,7 @@ start_benchmark_telemetry() {
 
 take_output_ownership() {
     if [[ $NCU_USE_SUDO == 1 ]] && command -v sudo >/dev/null 2>&1; then
-        sudo -n chown -R -- "$(id -u):$(id -g)" "$OUTPUT_DIR" \
+        sudo -n chown -R -- "$(id -u):$(id -g)" "$RUN_DIR" \
             >/dev/null 2>&1 || true
     fi
 }
@@ -146,14 +168,14 @@ write_run_status() {
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\nsignal=%s\narchive_status=%s\ndate_utc=%s\n' \
         "$state" "$status" "$current_phase" "${caught_signal:-none}" \
         "$archive_status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        >"$OUTPUT_DIR/run-status.txt"
+        >"$RUN_DIR/run-status.txt"
 }
 
 finalize() {
     local status=$?
     trap - EXIT INT TERM HUP
     stop_benchmark_telemetry
-    if [[ -d $OUTPUT_DIR ]]; then
+    if [[ -d $RUN_DIR ]]; then
         take_output_ownership
         local state=failed
         if [[ -n $caught_signal ]]; then
@@ -184,21 +206,21 @@ trap 'caught_signal=TERM; exit 143' TERM
 trap 'caught_signal=HUP; exit 129' HUP
 
 cp -- "$script_rel" "$source_rel" "$makefile_rel" "$engine_rel" \
-    "$workflow_rel" "$readme_rel" "$validator_rel" "$OUTPUT_DIR/provenance/"
+    "$workflow_rel" "$readme_rel" "$validator_rel" "$RUN_DIR/provenance/"
 sha256sum "$script_rel" "$source_rel" "$makefile_rel" "$engine_rel" \
     "$workflow_rel" "$readme_rel" "$validator_rel" \
-    >"$OUTPUT_DIR/provenance/source-sha256.txt"
+    >"$RUN_DIR/provenance/source-sha256.txt"
 git diff --no-ext-diff --binary HEAD -- \
     "$script_rel" "$source_rel" "$makefile_rel" "$engine_rel" \
     "$workflow_rel" "$readme_rel" "$validator_rel" \
-    >"$OUTPUT_DIR/provenance/tracked-working-tree.patch" || true
+    >"$RUN_DIR/provenance/tracked-working-tree.patch" || true
 git diff --no-ext-diff --no-index /dev/null "$script_rel" \
-    >"$OUTPUT_DIR/provenance/untracked-script.patch" 2>/dev/null || true
+    >"$RUN_DIR/provenance/untracked-script.patch" 2>/dev/null || true
 git diff --no-ext-diff --no-index /dev/null "$source_rel" \
-    >"$OUTPUT_DIR/provenance/untracked-source.patch" 2>/dev/null || true
+    >"$RUN_DIR/provenance/untracked-source.patch" 2>/dev/null || true
 
-gpu_state_log=$OUTPUT_DIR/gpu-state.log
-gpu_state_error_log=$OUTPUT_DIR/gpu-state-errors.log
+gpu_state_log=$RUN_DIR/gpu-state.log
+gpu_state_error_log=$RUN_DIR/gpu-state-errors.log
 capture_gpu_state() {
     local label=$1
     {
@@ -237,18 +259,86 @@ compute_cap=$(nvidia-smi -i "$PROFILE_GPU" --query-gpu=compute_cap \
         --query-gpu=index,name,pci.bus_id,memory.total,memory.free,ecc.mode.current,driver_version \
         --format=csv
     printf '\n[git status before output creation]\n%s\n' "${git_status_before:-clean}"
-    printf '\n[source sha256]\n'; cat "$OUTPUT_DIR/provenance/source-sha256.txt"
+    printf '\n[source sha256]\n'; cat "$RUN_DIR/provenance/source-sha256.txt"
     printf '\n[toolchain]\n'
     command -v nvcc || true
     nvcc --version 2>/dev/null || true
     cuobjdump --version 2>/dev/null || true
     ncu --version 2>/dev/null || true
     compute-sanitizer --version 2>/dev/null || true
-} >"$OUTPUT_DIR/manifest.txt"
+    if [[ $RESUME_NCU == 1 ]]; then
+        printf '\n[resume]\nresume_ncu=true\noriginal_output=%s\nresume_output=%s\n' \
+            "$OUTPUT_DIR" "$RUN_DIR"
+    fi
+} >"$RUN_DIR/manifest.txt"
 capture_gpu_state preflight
 
-current_phase=build
-if [[ $SKIP_BUILD == 0 ]]; then
+manifest_value() {
+    local file=$1 key=$2
+    awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+verify_recorded_hash() {
+    local hash_file=$1 path=$2 label=$3
+    local expected actual
+    expected=$(awk -v wanted="$path" '$2 == wanted { print $1; exit }' "$hash_file")
+    [[ $expected =~ ^[[:xdigit:]]{64}$ ]] ||
+        die "resume evidence has no recorded $label hash for $path"
+    actual=$(sha256sum "$path" | awk '{ print $1 }')
+    [[ $actual == "$expected" ]] ||
+        die "resume rejected changed $label: $path"
+    printf '%s_sha256=%s\n' "$label" "$actual"
+}
+
+if [[ $RESUME_NCU == 1 ]]; then
+    current_phase=resume-validation-header
+    original_status=$OUTPUT_DIR/run-status.txt
+    original_manifest=$OUTPUT_DIR/manifest.txt
+    original_source_hashes=$OUTPUT_DIR/provenance/source-sha256.txt
+    original_binary_hashes=$OUTPUT_DIR/provenance/binary-sha256.txt
+    for required_file in "$original_status" "$original_manifest" \
+            "$original_source_hashes" "$original_binary_hashes"; do
+        [[ -s $required_file ]] || die "resume evidence is missing: $required_file"
+    done
+    [[ $(manifest_value "$original_status" state) == failed ]] ||
+        die "resume requires an original failed run"
+    original_phase=$(manifest_value "$original_status" last_phase)
+    [[ $original_phase == nsight-preflight || $original_phase == nsight ]] ||
+        die "resume requires an original failure in nsight-preflight or nsight, found: ${original_phase:-unknown}"
+    [[ $(manifest_value "$original_manifest" profile_gpu_physical) == "$PROFILE_GPU" ]] ||
+        die "resume PROFILE_GPU differs from the original run"
+    [[ $(manifest_value "$original_manifest" cuda_arch) == "$CUDA_ARCH" ]] ||
+        die "resume CUDA_ARCH differs from the original run"
+    [[ $(manifest_value "$original_manifest" compute_capability) == "$compute_cap" ]] ||
+        die "resume compute capability differs from the original run"
+    [[ $(manifest_value "$original_manifest" bench_rounds) == "$BENCH_ROUNDS" ]] ||
+        die "resume BENCH_ROUNDS differs from the original run"
+    [[ $(manifest_value "$original_manifest" bench_launches) == "$BENCH_LAUNCHES" ]] ||
+        die "resume BENCH_LAUNCHES differs from the original run"
+    [[ $(manifest_value "$original_manifest" profile_scenario) == "$PROFILE_SCENARIO" ]] ||
+        die "resume PROFILE_SCENARIO differs from the original run"
+    {
+        printf 'original_state=failed\noriginal_last_phase=%s\n' "$original_phase"
+        verify_recorded_hash "$original_source_hashes" "$source_rel" source
+        verify_recorded_hash "$original_source_hashes" "$makefile_rel" makefile
+        verify_recorded_hash "$original_binary_hashes" "$binary_rel" binary
+    } >"$RUN_DIR/resume-validation.log"
+    set +e
+    make -q "$binary_rel" CUDA_ARCH="$CUDA_ARCH" \
+        >>"$RUN_DIR/resume-validation.log" 2>&1
+    make_query_rc=$?
+    set -e
+    [[ $make_query_rc == 0 ]] ||
+        die "resume rejected a stale or invalid harness build (make -q exit $make_query_rc)"
+    [[ -x $binary_rel && $binary_rel -nt $source_rel && $binary_rel -nt $makefile_rel ]] ||
+        die "resume rejected a missing or stale harness binary"
+    printf 'build_freshness=validated\n' >>"$RUN_DIR/resume-validation.log"
+fi
+
+current_phase=$([[ $RESUME_NCU == 1 ]] && printf resume-validation-build || printf build)
+if [[ $RESUME_NCU == 1 ]]; then
+    :
+elif [[ $SKIP_BUILD == 0 ]]; then
     make -B "$binary_rel" CUDA_ARCH="$CUDA_ARCH" \
         >"$OUTPUT_DIR/build.log" 2>&1 || {
             tail -n 120 "$OUTPUT_DIR/build.log" >&2 || true
@@ -271,24 +361,69 @@ else
         >>"$OUTPUT_DIR/build.log"
 fi
 [[ -x $binary_rel ]] || die "$binary_rel is missing; rerun with SKIP_BUILD=0"
-sha256sum "$binary_rel" >"$OUTPUT_DIR/provenance/binary-sha256.txt"
+sha256sum "$binary_rel" >"$RUN_DIR/provenance/binary-sha256.txt"
 {
     printf '\n[binary]\n'
-    cat "$OUTPUT_DIR/provenance/binary-sha256.txt"
+    cat "$RUN_DIR/provenance/binary-sha256.txt"
     stat -c 'mode=%a size=%s mtime=%y file=%n' "$binary_rel"
-} >>"$OUTPUT_DIR/manifest.txt"
+} >>"$RUN_DIR/manifest.txt"
 
-current_phase=sass
-cuobjdump --list-elf "$binary_rel" >"$OUTPUT_DIR/elf-list.txt" 2>&1
-grep -Eq '\.sm_75\.cubin([[:space:]]|$)' "$OUTPUT_DIR/elf-list.txt" ||
-    die "harness binary does not contain an sm_75 cubin"
-cuobjdump --dump-resource-usage "$binary_rel" \
-    >"$OUTPUT_DIR/resource-usage.txt" 2>&1 || true
-cuobjdump --dump-sass "$binary_rel" >"$OUTPUT_DIR/sass.txt" 2>&1
-printf 'label,kernel,total_imma,imma_8816,imma_8832,s4_u4,u4_u4,lop3,prmt,shf,bfe,iadd3,ldg,stg,ldl,stl\n' \
-    >"$OUTPUT_DIR/sass-summary.csv"
-: >"$OUTPUT_DIR/sass-relevant.txt"
-for i in "${!sass_labels[@]}"; do
+current_phase=$([[ $RESUME_NCU == 1 ]] && printf resume-validation-sass || printf sass)
+if [[ $RESUME_NCU == 1 ]]; then
+    for required_file in "$OUTPUT_DIR/elf-list.txt" "$OUTPUT_DIR/sass.txt" \
+            "$OUTPUT_DIR/sass-summary.csv" "$OUTPUT_DIR/sass-relevant.txt"; do
+        [[ -s $required_file ]] || die "resume SASS evidence is missing: $required_file"
+    done
+    grep -Eq '\.sm_75\.cubin([[:space:]]|$)' "$OUTPUT_DIR/elf-list.txt" ||
+        die "resume SASS evidence has no sm_75 cubin"
+    for i in "${!sass_labels[@]}"; do
+        label=${sass_labels[$i]}
+        kernel=${sass_kernels[$i]}
+        kernel_sass=$OUTPUT_DIR/sass-kernels/$label.sass.txt
+        [[ -s $kernel_sass ]] || die "resume SASS evidence is missing: $kernel_sass"
+        grep -Fq "Function : $kernel" "$kernel_sass" ||
+            die "resume SASS evidence does not contain $kernel"
+    done
+    python3 - "$OUTPUT_DIR/sass-summary.csv" <<'PY'
+import csv
+import sys
+
+path = sys.argv[1]
+with open(path, newline="", encoding="utf-8-sig") as handle:
+    rows = {row["label"]: row for row in csv.DictReader(handle)}
+required = {"standard", "native-w", "native-aw", "pack-a", "pack-w"}
+if set(rows) != required:
+    raise SystemExit(f"unexpected SASS summary labels: {sorted(rows)}")
+
+def count(label, field):
+    try:
+        return int(rows[label][field])
+    except (KeyError, ValueError) as error:
+        raise SystemExit(f"invalid SASS summary {label}/{field}: {error}")
+
+if count("standard", "imma_8816") <= 0:
+    raise SystemExit("standard kernel has no recorded m8n8k16 IMMA")
+for label in ("native-w", "native-aw"):
+    if count(label, "imma_8832") <= 0:
+        raise SystemExit(f"{label} has no recorded m8n8k32 IMMA")
+    if count(label, "s4_u4") <= 0 or count(label, "u4_u4") <= 0:
+        raise SystemExit(f"{label} is missing a packed INT4 operand form")
+for label in ("standard", "native-w", "native-aw"):
+    if count(label, "ldl") != 0 or count(label, "stl") != 0:
+        raise SystemExit(f"{label} has recorded local-memory traffic")
+PY
+    printf 'sass_evidence=validated\n' >>"$RUN_DIR/resume-validation.log"
+else
+    cuobjdump --list-elf "$binary_rel" >"$OUTPUT_DIR/elf-list.txt" 2>&1
+    grep -Eq '\.sm_75\.cubin([[:space:]]|$)' "$OUTPUT_DIR/elf-list.txt" ||
+        die "harness binary does not contain an sm_75 cubin"
+    cuobjdump --dump-resource-usage "$binary_rel" \
+        >"$OUTPUT_DIR/resource-usage.txt" 2>&1 || true
+    cuobjdump --dump-sass "$binary_rel" >"$OUTPUT_DIR/sass.txt" 2>&1
+    printf 'label,kernel,total_imma,imma_8816,imma_8832,s4_u4,u4_u4,lop3,prmt,shf,bfe,iadd3,ldg,stg,ldl,stl\n' \
+        >"$OUTPUT_DIR/sass-summary.csv"
+    : >"$OUTPUT_DIR/sass-relevant.txt"
+    for i in "${!sass_labels[@]}"; do
     label=${sass_labels[$i]}
     kernel=${sass_kernels[$i]}
     kernel_sass=$OUTPUT_DIR/sass-kernels/$label.sass.txt
@@ -338,28 +473,48 @@ for i in "${!sass_labels[@]}"; do
     if [[ $label == standard || $label == native-w || $label == native-aw ]]; then
         (( ldl == 0 && stl == 0 )) ||
             die "$kernel contains local-memory load/store spill indicators"
-    fi
-done
+        fi
+    done
+fi
 
-current_phase=correctness
-capture_gpu_state pre-correctness
-env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-    ./tests/cuda_sm75_q4_down_native --device 0 --correctness-only \
-        >"$OUTPUT_DIR/correctness.log" 2>&1 || {
-            cat "$OUTPUT_DIR/correctness.log" >&2 || true
-            die "Q4-down native correctness failed"
-        }
+current_phase=$([[ $RESUME_NCU == 1 ]] && printf resume-validation-correctness || printf correctness)
+if [[ $RESUME_NCU == 0 ]]; then
+    capture_gpu_state pre-correctness
+    env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+        ./tests/cuda_sm75_q4_down_native --device 0 --correctness-only \
+            >"$OUTPUT_DIR/correctness.log" 2>&1 || {
+                cat "$OUTPUT_DIR/correctness.log" >&2 || true
+                die "Q4-down native correctness failed"
+            }
+fi
+[[ -s $OUTPUT_DIR/correctness.log ]] || die "correctness evidence is missing"
 for marker in activation_pack_validation=exact output_validation=bit_exact \
         unowned_output_poison_validation=exact correctness_status=ok \
         harness_status=ok; do
     grep -Fxq "$marker" "$OUTPUT_DIR/correctness.log" ||
         die "correctness harness omitted required marker: $marker"
 done
-capture_gpu_state post-correctness
+if [[ $RESUME_NCU == 0 ]]; then
+    capture_gpu_state post-correctness
+else
+    printf 'correctness_evidence=validated\n' >>"$RUN_DIR/resume-validation.log"
+fi
 
-current_phase=sanitizer
-capture_gpu_state pre-sanitizer
-if [[ $RUN_SANITIZER == 1 ]] && command -v compute-sanitizer >/dev/null 2>&1; then
+current_phase=$([[ $RESUME_NCU == 1 ]] && printf resume-validation-sanitizer || printf sanitizer)
+if [[ $RESUME_NCU == 1 ]]; then
+    [[ -s $OUTPUT_DIR/memcheck.log ]] || die "sanitizer evidence is missing"
+    if grep -Fq 'ERROR SUMMARY: 0 errors' "$OUTPUT_DIR/memcheck.log"; then
+        printf 'sanitizer_evidence=clean\n' >>"$RUN_DIR/resume-validation.log"
+    elif grep -Eq '^skipped: RUN_SANITIZER=(0|1) compute-sanitizer=' \
+            "$OUTPUT_DIR/memcheck.log"; then
+        printf 'sanitizer_evidence=explicitly_skipped\n' \
+            >>"$RUN_DIR/resume-validation.log"
+    else
+        die "resume sanitizer evidence is neither clean nor explicitly skipped"
+    fi
+else
+    capture_gpu_state pre-sanitizer
+    if [[ $RUN_SANITIZER == 1 ]] && command -v compute-sanitizer >/dev/null 2>&1; then
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         compute-sanitizer --tool memcheck --error-exitcode 3 \
             ./tests/cuda_sm75_q4_down_native --device 0 --correctness-only \
@@ -369,12 +524,13 @@ if [[ $RUN_SANITIZER == 1 ]] && command -v compute-sanitizer >/dev/null 2>&1; th
             }
     grep -Fq 'ERROR SUMMARY: 0 errors' "$OUTPUT_DIR/memcheck.log" ||
         die "compute-sanitizer did not report a clean error summary"
-else
-    printf 'skipped: RUN_SANITIZER=%s compute-sanitizer=%s\n' \
-        "$RUN_SANITIZER" "$(command -v compute-sanitizer || true)" \
-        >"$OUTPUT_DIR/memcheck.log"
+    else
+        printf 'skipped: RUN_SANITIZER=%s compute-sanitizer=%s\n' \
+            "$RUN_SANITIZER" "$(command -v compute-sanitizer || true)" \
+            >"$OUTPUT_DIR/memcheck.log"
+    fi
+    capture_gpu_state post-sanitizer
 fi
-capture_gpu_state post-sanitizer
 
 validate_benchmark() {
     local scenario=$1 log=$2 samples=$3 summary=$4
@@ -501,27 +657,53 @@ PY
 }
 
 for scenario in early late; do
-    current_phase=benchmark-$scenario
-    capture_gpu_state pre-benchmark-$scenario
+    current_phase=$([[ $RESUME_NCU == 1 ]] && printf 'resume-validation-benchmark-%s' "$scenario" || printf 'benchmark-%s' "$scenario")
     log=$OUTPUT_DIR/benchmark-$scenario.log
-    start_benchmark_telemetry "$scenario"
-    benchmark_rc=0
-    env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-        ./tests/cuda_sm75_q4_down_native --device 0 --benchmark-only \
-            --scenario "$scenario" --rounds "$BENCH_ROUNDS" \
-            --launches "$BENCH_LAUNCHES" >"$log" 2>&1 || benchmark_rc=$?
-    stop_benchmark_telemetry
-    if (( benchmark_rc != 0 )); then
-        cat "$log" >&2 || true
-        die "$scenario randomized/rotated benchmark failed (exit $benchmark_rc)"
+    if [[ $RESUME_NCU == 1 ]]; then
+        [[ -s $log ]] || die "$scenario benchmark log is missing"
+        [[ -s $OUTPUT_DIR/benchmark-$scenario-samples.csv ]] ||
+            die "$scenario benchmark sample CSV is missing"
+        [[ -s $OUTPUT_DIR/benchmark-$scenario-summary.csv ]] ||
+            die "$scenario benchmark summary CSV is missing"
+        validate_benchmark "$scenario" "$log" \
+            "$RUN_DIR/benchmark-$scenario-revalidated-samples.csv" \
+            "$RUN_DIR/benchmark-$scenario-revalidated-summary.csv"
+        cmp -s "$OUTPUT_DIR/benchmark-$scenario-samples.csv" \
+            "$RUN_DIR/benchmark-$scenario-revalidated-samples.csv" ||
+            die "$scenario recorded sample CSV differs from its benchmark log"
+        cmp -s "$OUTPUT_DIR/benchmark-$scenario-summary.csv" \
+            "$RUN_DIR/benchmark-$scenario-revalidated-summary.csv" ||
+            die "$scenario recorded summary CSV differs from its benchmark log"
+        [[ -s $OUTPUT_DIR/benchmark-$scenario-telemetry.csv ]] ||
+            die "$scenario benchmark telemetry is missing"
+        [[ $(wc -l <"$OUTPUT_DIR/benchmark-$scenario-telemetry.csv") -ge 2 ]] ||
+            die "$scenario benchmark telemetry contains no samples"
+        printf 'benchmark_%s_evidence=validated\n' "$scenario" \
+            >>"$RUN_DIR/resume-validation.log"
+    else
+        capture_gpu_state pre-benchmark-$scenario
+        start_benchmark_telemetry "$scenario"
+        benchmark_rc=0
+        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+            ./tests/cuda_sm75_q4_down_native --device 0 --benchmark-only \
+                --scenario "$scenario" --rounds "$BENCH_ROUNDS" \
+                --launches "$BENCH_LAUNCHES" >"$log" 2>&1 || benchmark_rc=$?
+        stop_benchmark_telemetry
+        if (( benchmark_rc != 0 )); then
+            cat "$log" >&2 || true
+            die "$scenario randomized/rotated benchmark failed (exit $benchmark_rc)"
+        fi
+        [[ $(wc -l <"$OUTPUT_DIR/benchmark-$scenario-telemetry.csv") -ge 2 ]] ||
+            die "$scenario benchmark telemetry contains no samples"
+        validate_benchmark "$scenario" "$log" \
+            "$OUTPUT_DIR/benchmark-$scenario-samples.csv" \
+            "$OUTPUT_DIR/benchmark-$scenario-summary.csv"
+        capture_gpu_state post-benchmark-$scenario
     fi
-    [[ $(wc -l <"$OUTPUT_DIR/benchmark-$scenario-telemetry.csv") -ge 2 ]] ||
-        die "$scenario benchmark telemetry contains no samples"
-    validate_benchmark "$scenario" "$log" \
-        "$OUTPUT_DIR/benchmark-$scenario-samples.csv" \
-        "$OUTPUT_DIR/benchmark-$scenario-summary.csv"
-    capture_gpu_state post-benchmark-$scenario
 done
+if [[ $RESUME_NCU == 1 ]]; then
+    printf 'resume_validation_status=ok\n' >>"$RUN_DIR/resume-validation.log"
+fi
 
 if [[ $RUN_NCU == 1 ]]; then
     current_phase=nsight-preflight
@@ -579,39 +761,19 @@ if [[ $RUN_NCU == 1 ]]; then
         smsp__sass_thread_inst_executed_op_memory_pred_on.sum
     )
 
-    available_metrics_raw=$OUTPUT_DIR/ncu/available-metrics.raw.txt
-    available_metrics=$OUTPUT_DIR/ncu/available-metric-names.txt
-    available_metrics_log=$OUTPUT_DIR/ncu/available-metrics-query.log
-    query_args=(--config-file off --devices 0 --query-metrics)
-    if "$ncu_bin" --help 2>/dev/null | grep -q -- '--query-metrics-mode'; then
-        query_args+=(--query-metrics-mode all)
-    fi
-    # Metric discovery intentionally uses the identical sudo/non-sudo command
-    # as collection so restricted-counter hosts see one consistent privilege path.
-    env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-        "${ncu_command[@]}" "${query_args[@]}" >"$available_metrics_raw" \
-        2>"$available_metrics_log" || {
-            tail -n 100 "$available_metrics_log" >&2 || true
-            die "Nsight Compute metric discovery failed"
-        }
-    take_output_ownership
-    grep -Eo '[[:alnum:]_]+__[[:alnum:]_.]+' "$available_metrics_raw" |
-        sort -u >"$available_metrics" || true
-    [[ -s $available_metrics ]] || die "Nsight Compute returned no metric names"
-
-    selected_metric_names=()
-    : >"$OUTPUT_DIR/ncu/metrics-unavailable.txt"
-    for metric in "${desired_metric_names[@]}"; do
-        if grep -Fxq -- "$metric" "$available_metrics"; then
-            selected_metric_names+=("$metric")
-        else
-            printf '%s\n' "$metric" >>"$OUTPUT_DIR/ncu/metrics-unavailable.txt"
-        fi
-    done
-    required_selected=(
+    # These metrics are known to be collectable on the target Turing setup and
+    # are validated from the imported report below.  Do not use
+    # --query-metrics as an availability oracle for them: depending on the NCU
+    # version, its default collection omits tool-generated gpu__/launch__
+    # metrics even though --metrics can collect them.
+    required_metric_names=(
         gpu__time_duration.sum
         launch__registers_per_thread
         launch__shared_mem_per_block
+        launch__occupancy_limit_blocks
+        launch__occupancy_limit_registers
+        launch__occupancy_limit_shared_mem
+        launch__occupancy_limit_warps
         sm__warps_active.avg.pct_of_peak_sustained_active
         sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_elapsed
         l1tex__t_sector_hit_rate.pct
@@ -620,12 +782,61 @@ if [[ $RUN_NCU == 1 ]]; then
         smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio
         smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio
     )
-    for metric in "${required_selected[@]}"; do
-        printf '%s\n' "${selected_metric_names[@]}" | grep -Fxq -- "$metric" ||
-            die "required Nsight metric is unavailable: $metric"
+    available_metrics_raw=$NCU_DIR/available-metrics.raw.txt
+    available_metrics=$NCU_DIR/available-metric-names.txt
+    available_metrics_log=$NCU_DIR/available-metrics-query.log
+    query_args=(--config-file off --devices 0 --query-metrics)
+    # Capture help before testing it.  With pipefail, `ncu --help | grep -q`
+    # can report false when grep exits at the match and ncu receives SIGPIPE.
+    ncu_help=$("$ncu_bin" --help 2>/dev/null || true)
+    if grep -Fq -- '--query-metrics-mode' <<<"$ncu_help"; then
+        query_args+=(--query-metrics-mode all)
+    fi
+    # Metric discovery intentionally uses the identical sudo/non-sudo command
+    # as collection so restricted-counter hosts see one consistent privilege path.
+    metric_query_rc=0
+    env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+        "${ncu_command[@]}" "${query_args[@]}" >"$available_metrics_raw" \
+        2>"$available_metrics_log" || metric_query_rc=$?
+    take_output_ownership
+    if (( metric_query_rc == 0 )); then
+        grep -Eo '[[:alnum:]_]+__[[:alnum:]_.]+' "$available_metrics_raw" |
+            sort -u >"$available_metrics" || true
+    else
+        : >"$available_metrics"
+        printf 'optional metric discovery failed with exit %s; collecting required metrics only\n' \
+            "$metric_query_rc" >>"$available_metrics_log"
+    fi
+
+    selected_metric_names=("${required_metric_names[@]}")
+    optional_selected_metric_names=()
+    : >"$NCU_DIR/metrics-unavailable.txt"
+    for metric in "${desired_metric_names[@]}"; do
+        metric_is_required=0
+        for required_metric in "${required_metric_names[@]}"; do
+            if [[ $metric == "$required_metric" ]]; then
+                metric_is_required=1
+                break
+            fi
+        done
+        if (( metric_is_required == 1 )); then
+            continue
+        fi
+        if grep -Fxq -- "$metric" "$available_metrics"; then
+            selected_metric_names+=("$metric")
+            optional_selected_metric_names+=("$metric")
+        else
+            printf '%s\n' "$metric" >>"$NCU_DIR/metrics-unavailable.txt"
+        fi
     done
-    printf '%s\n' "${desired_metric_names[@]}" >"$OUTPUT_DIR/ncu/metrics-desired.txt"
-    printf '%s\n' "${selected_metric_names[@]}" >"$OUTPUT_DIR/ncu/metrics-selected.txt"
+    printf '%s\n' "${desired_metric_names[@]}" >"$NCU_DIR/metrics-desired.txt"
+    printf '%s\n' "${required_metric_names[@]}" >"$NCU_DIR/metrics-required.txt"
+    : >"$NCU_DIR/metrics-optional-selected.txt"
+    if (( ${#optional_selected_metric_names[@]} > 0 )); then
+        printf '%s\n' "${optional_selected_metric_names[@]}" \
+            >"$NCU_DIR/metrics-optional-selected.txt"
+    fi
+    printf '%s\n' "${selected_metric_names[@]}" >"$NCU_DIR/metrics-selected.txt"
     metrics=$(IFS=,; printf '%s' "${selected_metric_names[*]}")
 
     validate_ncu_metric_value() {
@@ -674,7 +885,7 @@ PY
         label=${profile_labels[$i]}
         kernel=${profile_kernels[$i]}
         launch_skip=${profile_launch_skips[$i]}
-        base=$OUTPUT_DIR/ncu/$PROFILE_SCENARIO-$label
+        base=$NCU_DIR/$PROFILE_SCENARIO-$label
         printf 'Nsight Compute: %s %s...\n' "$PROFILE_SCENARIO" "$label"
         rc=0
         env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
@@ -714,7 +925,7 @@ PY
                 cat "$base-validation.txt" >&2 || true
                 die "Nsight capture identity validation failed for $label"
             }
-        for metric in "${required_selected[@]}"; do
+        for metric in "${required_metric_names[@]}"; do
             validate_ncu_metric_value "$base.csv" "$metric" ||
                 die "Nsight report has no value for required metric $metric ($label)"
         done

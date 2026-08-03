@@ -284,6 +284,28 @@ No `MODEL` variable is needed and no GGUF is opened. Return the generated
 failure or interruption as well as on success. The result is an implementation
 audit, not by itself evidence for changing production dispatch.
 
+If the initial run completed its build, SASS, correctness, sanitizer, and both
+benchmarks but failed in Nsight preflight or capture, resume only the Nsight
+phase against the still-present output directory. For example:
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+Q4_DOWN_NATIVE_DIR="$PWD/sm75-q4-down-native-20260803T180034Z" \
+RESUME_NCU=1 \
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-q4-down-native.sh
+```
+
+Resume mode rejects any run that did not fail in an Nsight phase and validates
+the recorded source, Makefile, binary, SASS, correctness, sanitizer, benchmark,
+and telemetry evidence before skipping it. It never overwrites the original
+evidence or failure archive: new provenance, status, and Nsight files go under
+`resume-<timestamp>/`, and the resulting archive is named
+`sm75-q4-down-native-<original-timestamp>.resume-<timestamp>.tar.gz`.
+
 ### Comprehensive stock-Q2 and remaining-kernel pass
 
 `cuda-sm75-comprehensive-audit.sh` combines the full stock-Q2 production pass
