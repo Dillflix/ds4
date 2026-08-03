@@ -317,18 +317,28 @@ the late layer-36 shape has 2,186 pairs, 76 active experts, and 331 tile8
 records. Both use 512 tokens, six selected experts per token, a 4,096-wide
 input, and a 2,048-wide gate/up result.
 
-The ten benchmark variants are `standard`, `standard-warp16`, `native-w`,
-`native-aw-consumer`, `native-aw-warp16-consumer`,
-`native-aw-stage7-consumer`, `native-aw-combined`,
-`native-aw-warp16-combined`, `native-aw-stage7-combined`, and `pack-a`.
-Consumer variants exclude the already-completed activation transform;
-combined variants charge activation packing plus the matching consumer, and
-`pack-a` isolates that transform. Native weight packing is an offline layout
-operation and is excluded from timed consumer work. By default, 20 rounds
-rotate all ten variants evenly through every sample position twice. Each
-sample requests at least 20 launches and may automatically use more to reach
-a stable 100 ms consumer timing window; both requested and effective launch
-counts are recorded and validated.
+The fourteen benchmark variants retain all controls and add scalar-register
+experiments for the stage7 and warp16 native-A/W consumers. The complete set is
+`standard`, `standard-warp16`, `native-w`, `native-aw-consumer`,
+`native-aw-warp16-consumer`, `native-aw-stage7-consumer`,
+`native-aw-combined`, `native-aw-warp16-combined`,
+`native-aw-stage7-combined`, `native-aw-stage7-scalar-consumer`,
+`native-aw-warp16-scalar-consumer`, `native-aw-stage7-scalar-combined`,
+`native-aw-warp16-scalar-combined`, and `pack-a`. Consumer variants exclude
+the already-completed activation transform; combined variants charge
+activation packing plus the matching consumer, and `pack-a` isolates that
+transform. Native weight packing is an offline layout operation and is
+excluded from timed consumer work. By default, 28 rounds rotate all fourteen
+variants evenly through every sample position twice. Each sample requests at
+least 20 launches and may automatically use more to reach a stable 100 ms
+consumer timing window; both requested and effective launch counts are
+recorded and validated.
+
+For each scenario, `benchmark-*-scalar-comparison.csv` pairs scalar only with
+its matching base stage7 or warp16 variant, separately for consumer and
+combined timing. It records median time, delta, speedup, sample coefficient of
+variation and median absolute deviation, plus the independently timed pack-A
+share. This avoids cross-shape or cross-scenario comparisons.
 
 Correctness requires exact activation and weight packing, bit-exact owned
 outputs against the harness's standard path, and untouched poison in every
@@ -337,11 +347,23 @@ unowned output. The gate/up target deliberately keeps the shipping
 `expf` operations; the bit-exact claim is therefore an intra-binary comparison
 with the harness's own standard path, not an external production reference.
 SASS validation requires the expected m8n8k16 or m8n8k32 packed-INT4 forms.
-Local-memory instructions are recorded per consumer without aborting the
-experiment. `LDL`/`STL` alone do not distinguish register spills from explicit
-thread-local stack traffic, so interpret them together with the PTXAS
-stack/spill report. Nsight captures
-cover all six distinct consumer kernels plus activation packing. The script
+The evidence deliberately keeps three different concepts separate:
+`sass-summary.csv` counts `LDL`/`STL` instructions,
+`ptxas-resource-summary.csv` reports compiler stack-frame and spill bytes, and
+`scalar-resource-comparison.csv` reports CUDA `localSizeBytes`, raw and
+Turing-allocation-rounded registers, shared memory, blocks, warps, and
+occupancy. `scalar-local-memory-comparison.csv` and
+`scalar-acceptance-summary.csv` compare each scalar kernel directly with its
+base. A scalar candidate passes only when its SASS local instructions, PTXAS
+stack/spill bytes, CUDA local bytes, register ceiling, and exact occupancy gate
+all pass. A missed experimental gate is recorded and warned about but does not
+discard the timing and profiling evidence; it is not an eligibility or
+production-dispatch claim.
+
+Nsight produces eleven focused reports: standard, base stage7, scalar stage7,
+base warp16, and scalar warp16 for both early and late, plus one early pack-A
+capture. Optional discovered metrics include local-load/store sectors and
+bytes so base-versus-scalar local traffic can be measured directly. The script
 only observes clocks and uses Nsight's `--clock-control none`; it never changes
 GPU clocks or power settings.
 
@@ -370,8 +392,9 @@ NCU_USE_SUDO=1 \
 ./speed-bench/cuda-sm75-q4-gate-up-native.sh
 ```
 
-Resume mode revalidates provenance, build freshness, SASS and spill-status
-evidence, correctness, sanitizer, both balanced benchmarks, and telemetry.
+Resume mode revalidates provenance, build freshness, separate SASS/PTXAS/CUDA
+resource evidence and scalar acceptance classifications, correctness,
+sanitizer, both balanced benchmarks and their pair tables, and telemetry.
 New files go under `resume-<timestamp>/`; the resulting archive is named
 `sm75-q4-gate-up-native-<original-timestamp>.resume-<timestamp>.tar.gz`.
 

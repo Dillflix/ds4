@@ -48,7 +48,12 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+      - name: Build SM75 Q4 gate/up with PTXAS evidence
+        run: |
+          set -o pipefail
+          make -B tests/cuda_sm75_q4_gate_up_native CUDA_ARCH=sm_75 2>&1 \
+            | tee /tmp/sm75-q4-gate-up-build.log
       - name: Verify packed-INT4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_sm75_int4_mma | grep -Eqi 'sm_?75'
@@ -89,6 +94,8 @@ jobs:
             sm75_q4_gate_up_native_aw_kernel \
             sm75_q4_gate_up_native_aw_warp16_kernel \
             sm75_q4_gate_up_native_aw_stage7_kernel \
+            sm75_q4_gate_up_native_aw_stage7_scalar_kernel \
+            sm75_q4_gate_up_native_aw_warp16_scalar_kernel \
             sm75_q4_gate_up_pack_a_kernel \
             sm75_q4_gate_up_pack_w_kernel; do
             grep -Fq "Function : $kernel" /tmp/sm75-q4-gate-up-native.sass
@@ -110,27 +117,89 @@ jobs:
           extract_sass native-aw sm75_q4_gate_up_native_aw_kernel
           extract_sass native-aw-warp16 sm75_q4_gate_up_native_aw_warp16_kernel
           extract_sass native-aw-stage7 sm75_q4_gate_up_native_aw_stage7_kernel
+          extract_sass native-aw-stage7-scalar sm75_q4_gate_up_native_aw_stage7_scalar_kernel
+          extract_sass native-aw-warp16-scalar sm75_q4_gate_up_native_aw_warp16_scalar_kernel
           for label in standard standard-warp16; do
             grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' "/tmp/sm75-q4-gate-up-$label.sass"
           done
-          for label in native-w native-aw native-aw-warp16 native-aw-stage7; do
+          for label in native-w native-aw native-aw-warp16 native-aw-stage7 \
+              native-aw-stage7-scalar native-aw-warp16-scalar; do
             grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' "/tmp/sm75-q4-gate-up-$label.sass"
             grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
             grep -Eq 'IMMA\.8832\.U4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
           done
-          printf 'label,ldl,stl,local_memory_free\n' > /tmp/sm75-q4-gate-up-eligibility.csv
-          for label in standard standard-warp16 native-w native-aw native-aw-warp16 native-aw-stage7; do
+          printf 'label,ldl_instructions,stl_instructions,scalar_local_instruction_gate\n' \
+            > /tmp/sm75-q4-gate-up-local-instructions.csv
+          for label in standard standard-warp16 native-w native-aw \
+              native-aw-warp16 native-aw-stage7 native-aw-stage7-scalar \
+              native-aw-warp16-scalar; do
             ldl=$(grep -Ec '(^|[[:space:]])LDL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
             stl=$(grep -Ec '(^|[[:space:]])STL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
-            local_memory_free=true
-            if (( ldl != 0 || stl != 0 )); then
-              local_memory_free=false
-              echo "warning: $label has LDL=$ldl STL=$stl static local-memory instructions; PTXAS decides whether these are spills or explicit stack traffic"
+            scalar_gate=not-applicable
+            if [[ $label == native-aw-stage7-scalar || \
+                  $label == native-aw-warp16-scalar ]]; then
+              scalar_gate=pass
+              if (( ldl != 0 || stl != 0 )); then
+                scalar_gate=fail
+              fi
             fi
-            printf '%s,%s,%s,%s\n' "$label" "$ldl" "$stl" "$local_memory_free" \
-              >> /tmp/sm75-q4-gate-up-eligibility.csv
+            printf '%s,%s,%s,%s\n' "$label" "$ldl" "$stl" "$scalar_gate" \
+              >> /tmp/sm75-q4-gate-up-local-instructions.csv
           done
-          cat /tmp/sm75-q4-gate-up-eligibility.csv
+          awk -F, 'NR == 1 || $1 ~ /-scalar$/ { print }' \
+            /tmp/sm75-q4-gate-up-local-instructions.csv
+          ! grep -Eq '^native-aw-(stage7|warp16)-scalar,[^,]+,[^,]+,fail$' \
+            /tmp/sm75-q4-gate-up-local-instructions.csv
+          python3 - /tmp/sm75-q4-gate-up-build.log <<'PY'
+          import re
+          import sys
+
+          wanted = (
+              "sm75_q4_gate_up_native_aw_stage7_scalar_kernel",
+              "sm75_q4_gate_up_native_aw_warp16_scalar_kernel",
+          )
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+              lines = handle.readlines()
+          resources = {}
+          current = None
+          for line in lines:
+              match = re.search(r"Function properties for\s+(\S+)", line)
+              if match:
+                  current = match.group(1)
+                  resources.setdefault(current, {})
+                  continue
+              stack = re.search(
+                  r"(\d+) bytes stack frame,\s*(\d+) bytes spill stores,\s*"
+                  r"(\d+) bytes spill loads",
+                  line,
+              )
+              if current is not None and stack:
+                  resources[current]["stack"], resources[current]["stores"], resources[current]["loads"] = (
+                      int(value) for value in stack.groups()
+                  )
+                  continue
+              registers = re.search(r"Used\s+(\d+) registers", line)
+              if current is not None and registers:
+                  resources[current]["raw_registers"] = int(registers.group(1))
+                  current = None
+          print("kernel,raw_registers,allocated_registers,stack_frame_bytes,spill_store_bytes,spill_load_bytes")
+          for kernel in wanted:
+              row = resources.get(kernel, {})
+              missing = {"raw_registers", "stack", "stores", "loads"} - row.keys()
+              if missing:
+                  raise SystemExit(f"missing PTXAS evidence for {kernel}: {sorted(missing)}")
+              allocated = ((row["raw_registers"] + 7) // 8) * 8
+              print(
+                  f'{kernel},{row["raw_registers"]},{allocated},{row["stack"]},'
+                  f'{row["stores"]},{row["loads"]}'
+              )
+              if row["raw_registers"] > 128 or allocated > 128:
+                  raise SystemExit(f"{kernel} exceeds the 128-register gate")
+              if row["stack"] != 0:
+                  raise SystemExit(f"{kernel} retains a PTXAS stack frame")
+              if row["stores"] != 0 or row["loads"] != 0:
+                  raise SystemExit(f"{kernel} has PTXAS spill traffic")
+          PY
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools

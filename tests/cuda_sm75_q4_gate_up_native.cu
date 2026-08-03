@@ -69,6 +69,10 @@ enum GuVariant {
     GU_NATIVE_AW_COMBINED,
     GU_NATIVE_AW_WARP16_COMBINED,
     GU_NATIVE_AW_STAGE7_COMBINED,
+    GU_NATIVE_AW_STAGE7_SCALAR_CONSUMER,
+    GU_NATIVE_AW_WARP16_SCALAR_CONSUMER,
+    GU_NATIVE_AW_STAGE7_SCALAR_COMBINED,
+    GU_NATIVE_AW_WARP16_SCALAR_COMBINED,
     GU_PACK_A,
     GU_VARIANT_COUNT,
 };
@@ -83,6 +87,10 @@ static const char *const gu_variant_names[GU_VARIANT_COUNT] = {
     "native-aw-combined",
     "native-aw-warp16-combined",
     "native-aw-stage7-combined",
+    "native-aw-stage7-scalar-consumer",
+    "native-aw-warp16-scalar-consumer",
+    "native-aw-stage7-scalar-combined",
+    "native-aw-warp16-scalar-combined",
     "pack-a",
 };
 
@@ -450,6 +458,128 @@ __device__ __forceinline__ static void gu_gate_up_pass(
     up[1] = (a0 + a2) + (a1 + a3);
 }
 
+/* Experimental packed-A/W pass with no dynamically indexed float arrays.
+ * b is warp-uniform, so every lane takes the same slot switch case.  Each
+ * scalar retains the shipping slot=b&7 update order and final grouping. */
+template <uint32_t STAGED_ROWS>
+__device__ __forceinline__ static void gu_gate_up_pass_scalar(
+        const NativeWeightTileBlock *native_gate_w,
+        const NativeWeightTileBlock *native_up_w,
+        const NativeQ8K *native_a,
+        const NativeQ8K *staged_native,
+        const uint32_t *tokens,
+        uint32_t np, uint32_t expert, uint32_t row0, uint32_t lane,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        float gate[2], float up[2]) {
+    const uint32_t mtok = lane >> 2u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const NativeQ8K *na = xq_blocks <= GU_IN_BLOCKS && mtok < STAGED_ROWS
+        ? staged_native + (uint64_t)mtok * GU_IN_BLOCKS
+        : (mtok < np
+           ? native_a + (uint64_t)tokens[mtok] * xq_blocks
+           : staged_native);
+    const uint64_t native_tile =
+        (uint64_t)expert * (expert_mid_dim / GU_OUT_TILE) +
+        row0 / GU_OUT_TILE;
+#define GU_SCALAR_SLOT_DECL(S) \
+    float sg0_##S = 0.0f, sg1_##S = 0.0f; \
+    float su0_##S = 0.0f, su1_##S = 0.0f
+    GU_SCALAR_SLOT_DECL(0);
+    GU_SCALAR_SLOT_DECL(1);
+    GU_SCALAR_SLOT_DECL(2);
+    GU_SCALAR_SLOT_DECL(3);
+    GU_SCALAR_SLOT_DECL(4);
+    GU_SCALAR_SLOT_DECL(5);
+    GU_SCALAR_SLOT_DECL(6);
+    GU_SCALAR_SLOT_DECL(7);
+#undef GU_SCALAR_SLOT_DECL
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        const NativeWeightTileBlock *ng = native_gate_w +
+            native_tile * xq_blocks + b;
+        const NativeWeightTileBlock *nu = native_up_w +
+            native_tile * xq_blocks + b;
+        const uint4 gh0 = ng->hdr[n0];
+        const uint4 gh1 = ng->hdr[n0 + 1u];
+        const uint4 uh0 = nu->hdr[n0];
+        const uint4 uh1 = nu->hdr[n0 + 1u];
+        int gi0 = 0, gi1 = 0, gm0 = 0, gm1 = 0;
+        int ui0 = 0, ui1 = 0, um0 = 0, um1 = 0;
+#pragma unroll
+        for (uint32_t j = 0; j < Q4_GROUPS; j++) {
+            const uint32_t al = na[b].low[j][lane & 3u];
+            const uint32_t ah = na[b].high_signed[j][lane & 3u];
+            const uint32_t gb = ng->b[j][lane];
+            const uint32_t ub = nu->b[j][lane];
+            int32_t glo0 = 0, glo1 = 0, ghi0 = 0, ghi1 = 0;
+            int32_t ulo0 = 0, ulo1 = 0, uhi0 = 0, uhi1 = 0;
+            mma_m8n8k32_u4_u4(glo0, glo1, al, gb);
+            mma_m8n8k32_s4_u4(ghi0, ghi1, ah, gb);
+            mma_m8n8k32_u4_u4(ulo0, ulo1, al, ub);
+            mma_m8n8k32_s4_u4(uhi0, uhi1, ah, ub);
+            const int32_t gc0 = glo0 + 16 * ghi0;
+            const int32_t gc1 = glo1 + 16 * ghi1;
+            const int32_t uc0 = ulo0 + 16 * uhi0;
+            const int32_t uc1 = ulo1 + 16 * uhi1;
+            uint8_t sc, mn;
+            q4_get_scale_min(j, (const uint8_t *)&gh0.y, &sc, &mn);
+            gi0 += (int)sc * gc0;
+            const int bsum = (int)na[b].bsums[2u * j] +
+                             (int)na[b].bsums[2u * j + 1u];
+            gm0 += (int)mn * bsum;
+            q4_get_scale_min(j, (const uint8_t *)&gh1.y, &sc, &mn);
+            gi1 += (int)sc * gc1;
+            gm1 += (int)mn * bsum;
+            q4_get_scale_min(j, (const uint8_t *)&uh0.y, &sc, &mn);
+            ui0 += (int)sc * uc0;
+            um0 += (int)mn * bsum;
+            q4_get_scale_min(j, (const uint8_t *)&uh1.y, &sc, &mn);
+            ui1 += (int)sc * uc1;
+            um1 += (int)mn * bsum;
+        }
+        const float yd = na[b].d;
+        const float vg0 =
+            yd * f16_to_f32((uint16_t)(gh0.x & 0xffffu)) * (float)gi0 -
+            yd * f16_to_f32((uint16_t)(gh0.x >> 16u)) * (float)gm0;
+        const float vg1 =
+            yd * f16_to_f32((uint16_t)(gh1.x & 0xffffu)) * (float)gi1 -
+            yd * f16_to_f32((uint16_t)(gh1.x >> 16u)) * (float)gm1;
+        const float vu0 =
+            yd * f16_to_f32((uint16_t)(uh0.x & 0xffffu)) * (float)ui0 -
+            yd * f16_to_f32((uint16_t)(uh0.x >> 16u)) * (float)um0;
+        const float vu1 =
+            yd * f16_to_f32((uint16_t)(uh1.x & 0xffffu)) * (float)ui1 -
+            yd * f16_to_f32((uint16_t)(uh1.x >> 16u)) * (float)um1;
+#define GU_SCALAR_SLOT_CASE(S) \
+        case S: \
+            sg0_##S += vg0; sg1_##S += vg1; \
+            su0_##S += vu0; su1_##S += vu1; \
+            break
+        switch (b & 7u) {
+            GU_SCALAR_SLOT_CASE(0);
+            GU_SCALAR_SLOT_CASE(1);
+            GU_SCALAR_SLOT_CASE(2);
+            GU_SCALAR_SLOT_CASE(3);
+            GU_SCALAR_SLOT_CASE(4);
+            GU_SCALAR_SLOT_CASE(5);
+            GU_SCALAR_SLOT_CASE(6);
+            GU_SCALAR_SLOT_CASE(7);
+        }
+#undef GU_SCALAR_SLOT_CASE
+    }
+    float a0 = sg0_0 + sg0_4, a1 = sg0_1 + sg0_5;
+    float a2 = sg0_2 + sg0_6, a3 = sg0_3 + sg0_7;
+    gate[0] = (a0 + a2) + (a1 + a3);
+    a0 = sg1_0 + sg1_4; a1 = sg1_1 + sg1_5;
+    a2 = sg1_2 + sg1_6; a3 = sg1_3 + sg1_7;
+    gate[1] = (a0 + a2) + (a1 + a3);
+    a0 = su0_0 + su0_4; a1 = su0_1 + su0_5;
+    a2 = su0_2 + su0_6; a3 = su0_3 + su0_7;
+    up[0] = (a0 + a2) + (a1 + a3);
+    a0 = su1_0 + su1_4; a1 = su1_1 + su1_5;
+    a2 = su1_2 + su1_6; a3 = su1_3 + su1_7;
+    up[1] = (a0 + a2) + (a1 + a3);
+}
+
 #define GU_KERNEL_ARGS \
     float *gate_out, float *up_out, float *mid_out, \
     const BlockQ4K *standard_gate_w, const BlockQ4K *standard_up_w, \
@@ -464,7 +594,7 @@ __device__ __forceinline__ static void gu_gate_up_pass(
     uint32_t n_expert, uint32_t write_aux, float clamp
 
 template <bool NATIVE_W, bool NATIVE_A, uint32_t STAGED_ROWS,
-          uint32_t THREADS, bool SHIPPING_ROUTE>
+          uint32_t THREADS, bool SHIPPING_ROUTE, bool SCALAR_SLOTS>
 __device__ __forceinline__ static void gu_consumer_body(
         unsigned char *shared, GU_KERNEL_ARGS) {
     const uint32_t tile = blockIdx.y;
@@ -535,13 +665,20 @@ __device__ __forceinline__ static void gu_consumer_body(
             rr * rows_per_iteration + warp * GU_OUT_TILE;
         if (row0 >= expert_mid_dim) continue;
         float gate[2], up[2];
-        gu_gate_up_pass<NATIVE_W, NATIVE_A, STAGED_ROWS>(
-            standard_gate_w, standard_up_w, native_gate_w, native_up_w,
-            standard_a, native_a,
-            staged_standard, staged_native, s_tok, active_np,
-            expert, row0, lane,
-            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim,
-            gate, up);
+        if (SCALAR_SLOTS) {
+            gu_gate_up_pass_scalar<STAGED_ROWS>(
+                native_gate_w, native_up_w, native_a, staged_native,
+                s_tok, active_np, expert, row0, lane,
+                xq_blocks, expert_mid_dim, gate, up);
+        } else {
+            gu_gate_up_pass<NATIVE_W, NATIVE_A, STAGED_ROWS>(
+                standard_gate_w, standard_up_w, native_gate_w, native_up_w,
+                standard_a, native_a,
+                staged_standard, staged_native, s_tok, active_np,
+                expert, row0, lane,
+                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim,
+                gate, up);
+        }
         const uint32_t p = lane >> 2u;
         if (p >= active_np) continue;
 #pragma unroll
@@ -569,10 +706,10 @@ __device__ __forceinline__ static void gu_consumer_body(
     }
 }
 
-#define DEFINE_GU_KERNEL(NAME, NW, NA, STAGED, THREADS, SHIPPING_ROUTE) \
+#define DEFINE_GU_KERNEL(NAME, NW, NA, STAGED, THREADS, SHIPPING_ROUTE, SCALAR) \
 extern "C" __global__ void NAME(GU_KERNEL_ARGS) { \
     extern __shared__ __align__(16) unsigned char shared[]; \
-    gu_consumer_body<NW, NA, STAGED, THREADS, SHIPPING_ROUTE>( \
+    gu_consumer_body<NW, NA, STAGED, THREADS, SHIPPING_ROUTE, SCALAR>( \
         shared, gate_out, up_out, \
         mid_out, standard_gate_w, standard_up_w, native_gate_w, native_up_w, \
         standard_a, native_a, sorted_pairs, offsets, counts, tile_total, \
@@ -582,17 +719,21 @@ extern "C" __global__ void NAME(GU_KERNEL_ARGS) { \
 }
 
 DEFINE_GU_KERNEL(sm75_q4_gate_up_standard_kernel,
-                 false, false, 8, 256, true)
+                 false, false, 8, 256, true, false)
 DEFINE_GU_KERNEL(sm75_q4_gate_up_standard_warp16_kernel,
-                 false, false, 8, 512, true)
+                 false, false, 8, 512, true, false)
 DEFINE_GU_KERNEL(sm75_q4_gate_up_native_w_kernel,
-                 true, false, 8, 256, true)
+                 true, false, 8, 256, true, false)
 DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_kernel,
-                 true, true, 8, 256, true)
+                 true, true, 8, 256, true, false)
 DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_warp16_kernel,
-                 true, true, 8, 512, true)
+                 true, true, 8, 512, true, false)
 DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_stage7_kernel,
-                 true, true, 7, 256, false)
+                 true, true, 7, 256, false, false)
+DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_stage7_scalar_kernel,
+                 true, true, 7, 256, false, true)
+DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_warp16_scalar_kernel,
+                 true, true, 8, 512, true, true)
 
 #undef DEFINE_GU_KERNEL
 #undef GU_KERNEL_ARGS
@@ -931,7 +1072,9 @@ done:
 static int gu_is_combined(GuVariant variant) {
     return variant == GU_NATIVE_AW_COMBINED ||
            variant == GU_NATIVE_AW_WARP16_COMBINED ||
-           variant == GU_NATIVE_AW_STAGE7_COMBINED;
+           variant == GU_NATIVE_AW_STAGE7_COMBINED ||
+           variant == GU_NATIVE_AW_STAGE7_SCALAR_COMBINED ||
+           variant == GU_NATIVE_AW_WARP16_SCALAR_COMBINED;
 }
 
 static GuVariant gu_consumer_variant(GuVariant variant) {
@@ -941,6 +1084,10 @@ static GuVariant gu_consumer_variant(GuVariant variant) {
             return GU_NATIVE_AW_WARP16_CONSUMER;
         case GU_NATIVE_AW_STAGE7_COMBINED:
             return GU_NATIVE_AW_STAGE7_CONSUMER;
+        case GU_NATIVE_AW_STAGE7_SCALAR_COMBINED:
+            return GU_NATIVE_AW_STAGE7_SCALAR_CONSUMER;
+        case GU_NATIVE_AW_WARP16_SCALAR_COMBINED:
+            return GU_NATIVE_AW_WARP16_SCALAR_CONSUMER;
         default: return variant;
     }
 }
@@ -995,6 +1142,14 @@ static void gu_launch(const GuData *d, GuVariant requested, uint32_t write_aux) 
         case GU_NATIVE_AW_STAGE7_CONSUMER:
             sm75_q4_gate_up_native_aw_stage7_kernel<<<
                 grid, 256, gu_shared_bytes(1, 7)>>>(GU_LAUNCH_ARGS);
+            break;
+        case GU_NATIVE_AW_STAGE7_SCALAR_CONSUMER:
+            sm75_q4_gate_up_native_aw_stage7_scalar_kernel<<<
+                grid, 256, gu_shared_bytes(1, 7)>>>(GU_LAUNCH_ARGS);
+            break;
+        case GU_NATIVE_AW_WARP16_SCALAR_CONSUMER:
+            sm75_q4_gate_up_native_aw_warp16_scalar_kernel<<<
+                grid, 512, gu_shared_bytes(1, 8, 1)>>>(GU_LAUNCH_ARGS);
             break;
         default:
             fprintf(stderr, "error: variant has no consumer: %s\n",
@@ -1098,6 +1253,10 @@ static int gu_run_correctness(GuData *d) {
         GU_NATIVE_AW_COMBINED,
         GU_NATIVE_AW_WARP16_COMBINED,
         GU_NATIVE_AW_STAGE7_COMBINED,
+        GU_NATIVE_AW_STAGE7_SCALAR_CONSUMER,
+        GU_NATIVE_AW_WARP16_SCALAR_CONSUMER,
+        GU_NATIVE_AW_STAGE7_SCALAR_COMBINED,
+        GU_NATIVE_AW_WARP16_SCALAR_COMBINED,
     };
     for (uint32_t v = 0; v < sizeof(checked) / sizeof(checked[0]); v++) {
         gu_poison_outputs(d);
@@ -1185,6 +1344,12 @@ static void gu_print_resources(void) {
         gu_shared_bytes(1, 8, 1));
     gu_print_resource("native_aw_stage7",
         sm75_q4_gate_up_native_aw_stage7_kernel, 256, gu_shared_bytes(1, 7));
+    gu_print_resource("native_aw_stage7_scalar",
+        sm75_q4_gate_up_native_aw_stage7_scalar_kernel, 256,
+        gu_shared_bytes(1, 7));
+    gu_print_resource("native_aw_warp16_scalar",
+        sm75_q4_gate_up_native_aw_warp16_scalar_kernel, 512,
+        gu_shared_bytes(1, 8, 1));
     gu_print_resource("pack_a", sm75_q4_gate_up_pack_a_kernel, 256, 0u);
     gu_print_resource("pack_w", sm75_q4_gate_up_pack_w_kernel, 256, 0u);
     printf("resource_standard_binary_identity=false\n"
