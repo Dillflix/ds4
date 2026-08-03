@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 Run the remaining SM75 evidence pass in one command:
   - full stock-Q2 fixed-suite benchmark, tile/cache coverage, and Nsys trace;
-  - bounded NCU captures for early/late Q2_K down and Q8 T32/T256.
+  - bounded NCU captures for early/late Q2_K down and all four Q8 templates.
 
 Required environment:
   MODEL_Q2=/absolute/path/to/stock-Q2.gguf
@@ -23,8 +23,8 @@ Common optional environment:
   AUDIT_ROOT=/absolute/output/directory
 
 PROFILE_SET=all repeats every routed-expert family and all four native-Q8
-templates under the current build. The default 'remaining' captures only the
-gaps left by the prior IQ2/Q4/Q8-T64/Q8-T128 evidence.
+templates under the current build. The default 'remaining' captures Q2_K down
+and all four Q8 templates without repeating Q4/IQ2 expert reports.
 EOF
 }
 

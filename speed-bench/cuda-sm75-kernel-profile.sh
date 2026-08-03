@@ -22,7 +22,7 @@ Optional environment:
   NCU_USE_SUDO=0            use sudo -E for restricted performance counters
   NCU_SET=focused           focused, targeted, or full
   PROFILE_SET=all           all, remaining, experts, or q8
-                            remaining = Q2_K down plus Q8 T32/T256
+                            remaining = Q2_K down plus every Q8 template
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   PROFILE_DIR=/absolute/output/directory
@@ -123,7 +123,8 @@ trap finalize EXIT
 case "$PROFILE_SET" in
     all) scenarios=(q4-early q4-late q2-early q2-late
                     q8-q-b q8-shared q8-attn q8-out-b) ;;
-    remaining) scenarios=(q2-early q2-late q8-q-b q8-out-b) ;;
+    remaining) scenarios=(q2-early q2-late
+                          q8-q-b q8-shared q8-attn q8-out-b) ;;
     experts) scenarios=(q4-early q4-late q2-early q2-late) ;;
     q8) scenarios=(q8-q-b q8-shared q8-attn q8-out-b) ;;
 esac
@@ -267,23 +268,21 @@ fi
 if [[ $PROFILE_SET == all || $PROFILE_SET == experts ||
       $PROFILE_SET == remaining ]]; then
     profile_one early-layer3-q2-down-tile16 q2-early \
-        'regex:moe_down_expert_tile16_rowspan_kernel.*512.*'
+        'regex:moe_down_expert_tile16_rowspan_kernel.*'
     profile_one late-layer36-q2-down-tile16 q2-late \
-        'regex:moe_down_expert_tile16_rowspan_kernel.*512.*'
+        'regex:moe_down_expert_tile16_rowspan_kernel.*'
 fi
 if [[ $PROFILE_SET == all || $PROFILE_SET == q8 ||
       $PROFILE_SET == remaining ]]; then
     profile_one attention-q-b-layer9-dense-q8-t32 q8-q-b \
         'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
         'matmul_q8_0_mma_sm75_exact_kernel.*32'
-    if [[ $PROFILE_SET != remaining ]]; then
-        profile_one shared-layer8-dense-q8-t64 q8-shared \
-            'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
-            'matmul_q8_0_mma_sm75_exact_kernel.*64'
-        profile_one attention-layer9-dense-q8-t128 q8-attn \
-            'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
-            'matmul_q8_0_mma_sm75_exact_kernel.*128'
-    fi
+    profile_one shared-layer8-dense-q8-t64 q8-shared \
+        'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+        'matmul_q8_0_mma_sm75_exact_kernel.*64'
+    profile_one attention-layer9-dense-q8-t128 q8-attn \
+        'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+        'matmul_q8_0_mma_sm75_exact_kernel.*128'
     profile_one attention-output-b-layer9-dense-q8-t256 q8-out-b \
         'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
         'matmul_q8_0_mma_sm75_exact_kernel.*256'

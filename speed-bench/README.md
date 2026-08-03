@@ -149,9 +149,10 @@ NCU_USE_SUDO=1 \
 Set `PROFILE_GPU` to choose the physical SM75 device. The script exposes only
 that GPU to the harness, where it becomes logical device zero, and validates
 every report against the harness process, device, kernel name, and positive
-duration. `PROFILE_SET=remaining` captures only the previously missing Q2_K
-down and Q8 T32/T256 reports. `NCU_SET=targeted` or `NCU_SET=full` are slower
-opt-ins.
+duration. `PROFILE_SET=remaining` captures Q2_K down and all four dense-Q8
+templates. It deliberately repeats T64/T128 because changes to the common Q8
+loader can change every template's memory instruction stream.
+`NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
 
 ### Comprehensive stock-Q2 and remaining-kernel pass
 
@@ -159,7 +160,7 @@ opt-ins.
 with the bounded missing-kernel captures. The production half runs the fixed
 prompt suite, records routed tile occupancy and every Q8-to-F16 cache decision,
 and generates an Nsight Systems kernel-time distribution. The NCU half opens no
-GGUF and profiles early/late Q2_K down plus the Q8 T32/T256 shapes. Partial
+GGUF and profiles early/late Q2_K down plus all four dense-Q8 templates. Partial
 results are archived if either half fails.
 
 ```bash
