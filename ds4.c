@@ -49810,6 +49810,22 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     return 0;
 }
 
+void ds4_engine_log_routed_quant_audit(ds4_engine *e) {
+    if (!e) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        const ds4_tensor *gate = layer->ffn_gate_exps;
+        const ds4_tensor *up = layer->ffn_up_exps;
+        const ds4_tensor *down = layer->ffn_down_exps;
+        fprintf(stderr,
+                "ds4: routed-quant-audit layer=%u gate=%s up=%s down=%s\n",
+                il,
+                gate ? tensor_type_name(gate->type) : "missing",
+                up ? tensor_type_name(up->type) : "missing",
+                down ? tensor_type_name(down->type) : "missing");
+    }
+}
+
 bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }

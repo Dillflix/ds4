@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -123,6 +124,46 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
+
+enum cuda_sm75_scalar_audit_kind {
+    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8 = 0,
+    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16 = 1,
+    CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE16 = 2,
+    CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8 = 3,
+};
+
+/* A host-side launch marker for untimed evidence runs.  One relaxed atomic bit
+ * per device/path/specialization/layer suppresses repeated chunk launches
+ * without a device synchronization or instrumentation in the CUDA kernel. */
+static std::atomic<uint64_t>
+    g_sm75_scalar_audit_seen[DS4_MAX_GPUS + 1][4][2] = {};
+
+static void cuda_sm75_scalar_audit_launch(
+        cuda_sm75_scalar_audit_kind kind,
+        const char                 *path,
+        int                         scalar,
+        int                         device,
+        uint32_t                    layer,
+        uint32_t                    row_span,
+        uint32_t                    stage_rows) {
+    static const bool enabled = [] {
+        const char *value = getenv("DS4_CUDA_MOE_SCALAR_AUDIT");
+        return value && value[0] && strcmp(value, "0") != 0;
+    }();
+    if (!enabled) return;
+    const int slot = device >= 0 && device < DS4_MAX_GPUS
+        ? device : DS4_MAX_GPUS;
+    if (layer >= 64u) return;
+    const uint64_t bit = 1ull << layer;
+    const uint64_t prior =
+        g_sm75_scalar_audit_seen[slot][kind][scalar ? 1 : 0].fetch_or(
+            bit, std::memory_order_relaxed);
+    if (prior & bit) return;
+    fprintf(stderr,
+            "ds4: sm75-scalar-dispatch path=%s scalar=%d device=%d "
+            "layer=%u row_span=%u stage_rows=%u\n",
+            path, scalar ? 1 : 0, device, layer, row_span, stage_rows);
+}
 
 typedef struct {
     int valid;
@@ -466,16 +507,14 @@ static uint64_t g_q8_audit_sequence;
 static char g_q8_audit_module[40];
 static uint32_t g_q8_audit_layer = UINT32_MAX;
 static uint32_t g_q8_audit_token_offset = UINT32_MAX;
+static int g_q8_audit_active = -1;
 
 static int cuda_q8_audit_enabled(void) {
-    static int initialized = 0;
-    static int enabled = 0;
-    if (!initialized) {
+    if (g_q8_audit_active < 0) {
         const char *path = getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV");
-        enabled = path && path[0];
-        initialized = 1;
+        g_q8_audit_active = path && path[0] ? 1 : 0;
     }
-    return enabled;
+    return g_q8_audit_active;
 }
 
 static void cuda_q8_audit_copy(char *dst, size_t cap, const char *src) {
@@ -3412,6 +3451,60 @@ extern "C" int ds4_gpu_q8_audit_write_csv(const char *path) {
                 (unsigned long long)r.cache_bytes_after);
     }
     const int ok = fclose(fp) == 0;
+    return ok;
+}
+
+extern "C" void ds4_gpu_q8_audit_end(void) {
+    g_q8_audit_active = 0;
+}
+
+extern "C" int ds4_gpu_q8_cache_state_write_csv(const char *path) {
+    if (!path || !path[0]) return 0;
+
+    /* The benchmark produces this snapshot only at synchronized,
+     * out-of-timing boundaries.  It reads existing host metadata and adds no
+     * instrumentation to the timed Q8 lookup/dispatch path. */
+    std::vector<cuda_q8_f16_range> ranges = g_q8_f16_ranges;
+    std::sort(ranges.begin(), ranges.end(),
+              [](const cuda_q8_f16_range &a,
+                 const cuda_q8_f16_range &b) {
+        if (a.device_id != b.device_id) return a.device_id < b.device_id;
+        if (a.offset != b.offset) return a.offset < b.offset;
+        if (a.weight_bytes != b.weight_bytes)
+            return a.weight_bytes < b.weight_bytes;
+        if (a.in_dim != b.in_dim) return a.in_dim < b.in_dim;
+        return a.out_dim < b.out_dim;
+    });
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot create CUDA Q8 cache-state CSV %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    int ok = fprintf(fp,
+            "physical_device,weight_offset,weight_bytes,in_dim,out_dim,fp16_bytes\n")
+        >= 0;
+    for (const cuda_q8_f16_range &r : ranges) {
+        const uint64_t fp16_bytes =
+            r.in_dim != 0u && r.out_dim <= UINT64_MAX / r.in_dim / sizeof(__half)
+            ? r.in_dim * r.out_dim * sizeof(__half) : 0u;
+        if (fprintf(fp, "%d,%llu,%llu,%llu,%llu,%llu\n",
+                    r.device_id,
+                    (unsigned long long)r.offset,
+                    (unsigned long long)r.weight_bytes,
+                    (unsigned long long)r.in_dim,
+                    (unsigned long long)r.out_dim,
+                    (unsigned long long)fp16_bytes) < 0) {
+            ok = 0;
+            break;
+        }
+    }
+    if (fclose(fp) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to write CUDA Q8 cache-state CSV %s\n",
+                path);
+    }
     return ok;
 }
 
@@ -23334,6 +23427,9 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
+    const int scalar_audit_device =
+        logical_tier >= 0 && logical_tier < g_n_gpus
+            ? g_gpu[logical_tier].device_id : -1;
     const int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
@@ -23851,6 +23947,10 @@ static int routed_moe_launch(
                     } else if (use_q4_mma && use_gate_row2048) {
 #define DS4_Q4_GATE_T8_SCALAR_LAUNCH(RS, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                "q4-gate-tile8", use_q4_gate_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, 0u); \
                             if (use_q4_gate_scalar_sm75) { \
                                 moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -23922,6 +24022,10 @@ static int routed_moe_launch(
                             getenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75") != NULL;
 #define DS4_IQ2_GATE_SM75_T16_INVOKE(RS, STAGE, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE16, \
+                                "iq2-gate-tile16", use_iq2_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, STAGE); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -23970,6 +24074,10 @@ static int routed_moe_launch(
                     } else if (!use_gate_row2048) {
 #define DS4_IQ2_GATE_SM75_T8_LAUNCH(RS, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
+                                "iq2-gate-tile8", use_iq2_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, 0u); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24052,6 +24160,10 @@ static int routed_moe_launch(
                     if (gate_q4k) {
 #define DS4_Q4_GATE_TAIL8_LAUNCH(RS, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                "q4-gate-tile8", use_q4_gate_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, 0u); \
                             if (use_q4_gate_scalar_sm75) { \
                                 moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24096,6 +24208,10 @@ static int routed_moe_launch(
                     } else {
 #define DS4_IQ2_GATE_TAIL8_LAUNCH(RS, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
+                                "iq2-gate-tile8", use_iq2_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, 0u); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24483,6 +24599,10 @@ static int routed_moe_launch(
                     if (use_q4_down_t16_sm75 && use_q4_down_rowspan) {
 #define DS4_Q4_DOWN_SM75_T16_LAUNCH(RS, GRID) \
                         do { \
+                            cuda_sm75_scalar_audit_launch( \
+                                CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                "q4-down-tile16", use_q4_down_scalar_sm75, \
+                                scalar_audit_device, layer_index, RS, 0u); \
                             if (use_q4_down_scalar_sm75) { \
                                 moe_down_q4K_tile16_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)down->ptr, down_w, midq, sorted_pairs, \

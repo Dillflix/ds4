@@ -6,9 +6,11 @@ on:
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
+      - "ds4.h"
       - "ds4_bench.c"
       - "ds4_cuda.cu"
       - "ds4_gpu.h"
+      - "ds4_help.c"
       - "Makefile"
       - "speed-bench/cuda-prefill-audit.sh"
       - "speed-bench/cuda-prefill-deep-audit.sh"
@@ -18,6 +20,7 @@ on:
       - "speed-bench/cuda-sm75-q4-down-native.sh"
       - "speed-bench/cuda-sm75-q4-gate-up-native.sh"
       - "speed-bench/cuda-sm75-production-scalar.sh"
+      - "speed-bench/cuda-sm75-production-scalar-e2e.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -218,6 +221,15 @@ jobs:
           bash -n speed-bench/cuda-sm75-q4-gate-up-native.sh
           test -x speed-bench/cuda-sm75-production-scalar.sh
           bash -n speed-bench/cuda-sm75-production-scalar.sh
+          test -x speed-bench/cuda-sm75-production-scalar-e2e.sh
+          bash -n speed-bench/cuda-sm75-production-scalar-e2e.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
+          start = source.index("<<'PY'\n") + len("<<'PY'\n")
+          end = source.index("\nPY\n", start)
+          compile(source[start:end], "<scalar-e2e-summary>", "exec")
+          PY
           bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py

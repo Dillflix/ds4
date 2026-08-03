@@ -38,6 +38,38 @@ median absolute deviation, and coefficient of variation. Successful, failed,
 and interrupted runs archive all evidence collected so far unless
 `CREATE_ARCHIVE=0` is set.
 
+`cuda-sm75-production-scalar-e2e.sh` is the next decision boundary after the
+model-free evidence passes. It performs a balanced, fixed-frontier four-GPU
+full-model A/B with only the validated scalar switches changed. For the
+IQ2/IQ2/Q4 hybrid it jointly tests IQ2 gate/up plus Q4 down using the measured
+25/18 pipeline split. For full Q4 it jointly tests Q4 gate/up plus Q4 down
+using the memory-safe 22/21 split. It writes every raw CSV/log, a paired
+frontier summary, GPU telemetry, model/binary/prompt provenance, and a
+returnable archive. Two audited full sweeps run first and equally precondition
+host page-cache/system state. They verify all 43 routed-layer quant recipes, every
+expected layer/device dispatch, exact placement cardinality, all 344 dense-Q8
+weight slices (including the exact eight tensor identities per layer), cache
+decisions, and bit-exact raw FP32 full-vocabulary logits at every frontier. Any
+mismatch stops before repeated timing. The timed AB/BA processes contain no
+dispatch audit, Q8 lookup audit, or inter-frontier logit I/O. Instead, each
+process first runs an untimed `CTX_START` prefill, recreates an empty session,
+records the resulting Q8 cache ranges, and then starts measured frontiers. It
+records those ranges again after the final synchronized frontier. The
+runner requires exact pre/post, base/scalar, and validation/timed cache-state
+equality. Thus every measured Q8 lookup starts from the same proven resident
+set and no cache admission occurs during a timed sweep. The default two
+repeats are explicitly a pilot; set `REPEATS=6` for a replicated measurement.
+The script does not change production defaults.
+
+```bash
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf"
+export RECIPE=hybrid
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,2,1,3 GPU_VRAM=auto REPEATS=2 \
+  ./speed-bench/cuda-sm75-production-scalar-e2e.sh
+```
+
 Exact per-kernel NCU capture is opt-in:
 
 ```bash

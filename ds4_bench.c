@@ -430,6 +430,16 @@ static int write_frontier_logits_json(
         free(logits);
         return 1;
     }
+    for (int i = 0; i < vocab; i++) {
+        if (!isfinite(logits[i])) {
+            fprintf(stderr,
+                    "ds4-bench: non-finite frontier logit at %d (vocab index %d)\n",
+                    frontier,
+                    i);
+            free(logits);
+            return 1;
+        }
+    }
 
     char path[PATH_MAX];
     const int n = snprintf(path,
@@ -478,6 +488,33 @@ static int write_frontier_logits_json(
     fputs("\n  ]\n}\n", fp);
     if (fclose(fp) != 0) {
         fprintf(stderr, "ds4-bench: failed to close %s\n", path);
+        free(logits);
+        return 1;
+    }
+
+    char raw_path[PATH_MAX];
+    const int raw_n = snprintf(raw_path,
+                               sizeof(raw_path),
+                               "%s/frontier_%06d.logits.f32",
+                               cfg->dump_frontier_logits_dir,
+                               frontier);
+    if (raw_n <= 0 || (size_t)raw_n >= sizeof(raw_path)) {
+        fprintf(stderr, "ds4-bench: raw frontier logits path is too long\n");
+        free(logits);
+        return 1;
+    }
+    fp = fopen(raw_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                raw_path, strerror(errno));
+        free(logits);
+        return 1;
+    }
+    const size_t raw_written =
+        fwrite(logits, sizeof(logits[0]), (size_t)vocab, fp);
+    const int raw_close = fclose(fp);
+    if (raw_written != (size_t)vocab || raw_close != 0) {
+        fprintf(stderr, "ds4-bench: failed to write %s\n", raw_path);
         free(logits);
         return 1;
     }
@@ -591,6 +628,40 @@ int main(int argc, char **argv) {
         cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
     }
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    int untimed_warmup_tokens = 0;
+    const char *q8_cache_pretiming_state_csv =
+        getenv("DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV");
+    const char *warmup_env = getenv("DS4_BENCH_UNTIMED_WARMUP_TOKENS");
+    if (warmup_env && warmup_env[0]) {
+        errno = 0;
+        char *end = NULL;
+        const long parsed = strtol(warmup_env, &end, 10);
+        if (errno != 0 || end == warmup_env || *end != '\0' ||
+            parsed <= 0 || parsed > cfg.ctx_max || parsed >= cfg.ctx_alloc) {
+            fprintf(stderr,
+                    "ds4-bench: invalid DS4_BENCH_UNTIMED_WARMUP_TOKENS=%s\n",
+                    warmup_env);
+            return 2;
+        }
+        if (cfg.backend != DS4_BACKEND_CUDA ||
+            cfg.dist.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4-bench: untimed prefill warm-up requires local CUDA\n");
+            return 2;
+        }
+        untimed_warmup_tokens = (int)parsed;
+    }
+    if (q8_cache_pretiming_state_csv &&
+        q8_cache_pretiming_state_csv[0] &&
+        untimed_warmup_tokens == 0) {
+        fprintf(stderr,
+                "ds4-bench: DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV "
+                "requires DS4_BENCH_UNTIMED_WARMUP_TOKENS\n");
+        return 2;
+    }
+#endif
+
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
@@ -633,6 +704,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    if (getenv("DS4_BENCH_ROUTED_QUANT_AUDIT") != NULL) {
+        ds4_engine_log_routed_quant_audit(engine);
+    }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
@@ -672,6 +746,58 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (untimed_warmup_tokens > 0) {
+        ds4_tokens warmup_prefix = {
+            .v = prompt.v,
+            .len = untimed_warmup_tokens,
+            .cap = untimed_warmup_tokens,
+        };
+        char warmup_err[256];
+        fprintf(stderr,
+                "ds4-bench: starting untimed CUDA warm-up frontier %d\n",
+                untimed_warmup_tokens);
+        if (ds4_session_sync(session, &warmup_prefix,
+                             warmup_err, sizeof(warmup_err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: untimed CUDA warm-up failed: %s\n",
+                    warmup_err);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4-bench: completed untimed CUDA warm-up frontier %d\n",
+                untimed_warmup_tokens);
+
+        /* Recreate the session so every reported frontier starts from the
+         * same empty sequence state while retaining the engine-owned Q8
+         * cache populated by the untimed pass. */
+        ds4_session_free(session);
+        session = NULL;
+        if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to recreate session after warm-up\n");
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (q8_cache_pretiming_state_csv &&
+            q8_cache_pretiming_state_csv[0] &&
+            !ds4_gpu_q8_cache_state_write_csv(
+                q8_cache_pretiming_state_csv)) {
+            fprintf(stderr,
+                    "ds4-bench: failed to write pre-timing CUDA Q8 cache state %s\n",
+                    q8_cache_pretiming_state_csv);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+#endif
     maybe_warn_distributed_step_shape(&cfg, session);
 
     FILE *out = stdout;
@@ -707,6 +833,8 @@ int main(int argc, char **argv) {
     const char *q8_cache_audit_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV") : NULL;
     bool q8_cache_audit_done = false;
+    const char *q8_cache_state_csv = cfg.backend == DS4_BACKEND_CUDA
+        ? getenv("DS4_CUDA_Q8_CACHE_STATE_CSV") : NULL;
 #endif
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
@@ -787,6 +915,7 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            ds4_gpu_q8_audit_end();
             q8_cache_audit_done = true;
             fprintf(stderr, "ds4-bench: wrote CUDA Q8 cache audit %s\n",
                     q8_cache_audit_csv);
@@ -910,6 +1039,20 @@ int main(int argc, char **argv) {
         previous = frontier;
         if (frontier >= cfg.ctx_max) break;
     }
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (rc == 0 && q8_cache_state_csv && q8_cache_state_csv[0]) {
+        if (!ds4_gpu_q8_cache_state_write_csv(q8_cache_state_csv)) {
+            fprintf(stderr,
+                    "ds4-bench: failed to write CUDA Q8 cache state %s\n",
+                    q8_cache_state_csv);
+            rc = 1;
+        } else {
+            fprintf(stderr, "ds4-bench: wrote CUDA Q8 cache state %s\n",
+                    q8_cache_state_csv);
+        }
+    }
+#endif
 
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
