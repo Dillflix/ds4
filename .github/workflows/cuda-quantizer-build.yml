@@ -85,6 +85,7 @@ jobs:
           ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-w.sass
           ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-aw.sass
       - name: Verify production-shaped SM75 Q4 gate/up instructions
+        shell: bash
         run: |
           cuobjdump --list-elf tests/cuda_sm75_q4_gate_up_native | grep -Eq '\.sm_75\.cubin([[:space:]]|$)'
           cuobjdump --dump-sass tests/cuda_sm75_q4_gate_up_native > /tmp/sm75-q4-gate-up-native.sass
