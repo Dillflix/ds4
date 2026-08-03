@@ -24766,7 +24766,18 @@ static int routed_moe_launch(
      * recipe. Returning failure is safer than silently interpreting Q4 blocks
      * as IQ2/Q2 if a future graph is allocated without the Q8_K scratch used
      * by every optimized Q4 or hybrid path. */
-    if (!gate_iq2 || !down_q2k) return 0;
+    if (!gate_iq2 || !down_q2k) {
+        fprintf(stderr,
+                "ds4: CUDA routed-MoE scratch too small "
+                "(down=%llu need_xq=%llu gate=%llu need_midq=%llu, "
+                "gate_type=%u down_type=%u)\n",
+                (unsigned long long)down->bytes,
+                (unsigned long long)xq_bytes,
+                (unsigned long long)gate->bytes,
+                (unsigned long long)midq_bytes,
+                gate_type, down_type);
+        return 0;
+    }
     if (ok) {
         dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
         moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(

@@ -146,6 +146,13 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     const uint64_t mid_count = pair_count * mid_dim;
     const uint64_t x_count = (uint64_t)n_tokens * in_dim;
     const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    /* routed_moe_launch aliases down as the Q8_K input scratch when that is
+     * larger than the per-pair down output.  Float input bytes are a simple,
+     * type-independent upper bound for the packed Q8_K scratch. */
+    const uint64_t down_output_bytes = pair_count * out_dim * sizeof(float);
+    const uint64_t x_scratch_bound = x_count * sizeof(float);
+    const uint64_t down_storage_bytes =
+        down_output_bytes > x_scratch_bound ? down_output_bytes : x_scratch_bound;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_bytes);
     float *x_host = (float *)malloc((size_t)x_count * sizeof(float));
     int32_t *selected_host = (int32_t *)malloc((size_t)pair_count * sizeof(int32_t));
@@ -161,7 +168,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
-    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(pair_count * out_dim * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(down_storage_bytes);
     int rc = 1;
     if (!model || !x_host || !selected_host || !weights_host ||
         !reference || !candidate || !down_reference || !down_candidate ||
@@ -587,6 +594,10 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
     const uint64_t x_count = (uint64_t)n_tokens * in_dim;
     const uint64_t mid_count = pair_count * mid_dim;
     const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t down_output_bytes = pair_count * out_dim * sizeof(float);
+    const uint64_t x_scratch_bound = x_count * sizeof(float);
+    const uint64_t down_storage_bytes =
+        down_output_bytes > x_scratch_bound ? down_output_bytes : x_scratch_bound;
     unsigned char *model = (unsigned char *)calloc(1, (size_t)model_bytes);
     float *x_host = (float *)malloc((size_t)x_count * sizeof(float));
     int32_t *selected_host = (int32_t *)malloc((size_t)pair_count * sizeof(int32_t));
@@ -602,7 +613,7 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
     ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
-    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(pair_count * out_dim * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(down_storage_bytes);
     int rc = 1;
     if (!model || !x_host || !selected_host || !weights_host ||
         !mid_reference || !mid_candidate || !out_reference || !out_candidate ||
@@ -973,6 +984,7 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_SORTED");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");

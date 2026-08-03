@@ -726,6 +726,7 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_SORTED");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
