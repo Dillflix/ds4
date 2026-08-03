@@ -113,7 +113,10 @@ indices are not guessed.
 The Q4 gate/up captures are scoped by layer and token offset through the CUDA
 profiler API and filtered to the SM75 tile8 kernel. The dense-Q8 captures use
 the same scope plus the audit-selected module and verify that the projection
-was still uncached in the profiling process.
+was still uncached in the profiling process. Each targeted scope verifies that
+the graph is already on the requested physical GPU and synchronizes that
+context before closing, so an asynchronously queued kernel cannot fall outside
+the profiler range.
 
 Nsight Compute uses **application replay**, a file-backed replay buffer, and a
 focused metric list by default. It never uses kernel replay for this model.
@@ -124,6 +127,13 @@ focused set records duration, launch resources, achieved occupancy, eligible
 warps, IMMA utilization, DRAM/L1/L2 activity and hit rates, and the relevant
 scoreboard/MIO stalls. `NCU_SET=targeted` and `NCU_SET=full` remain explicit,
 slower opt-ins, but also use application replay.
+
+The profiler follows child processes explicitly and filters them back to
+`ds4-bench`; this is required by Nsight Compute's Linux launcher behavior on
+the target host. Hidden Nsight configuration is disabled. Every capture must
+also contain the DS4 start/stop markers and exactly one raw report row matching
+the requested kernel, physical device, process, and duration metric. A
+zero-kernel warning or header-only report is a hard failure.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -147,7 +157,7 @@ export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Inde
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export Q4_EVIDENCE_DIR="$PWD/q4-prefill-evidence-20260803T005438Z"
 
-SKIP_BUILD=1 \
+SKIP_BUILD=0 \
 SKIP_BASELINE=1 \
 SKIP_COVERAGE=1 \
 RUN_NSYS=0 \

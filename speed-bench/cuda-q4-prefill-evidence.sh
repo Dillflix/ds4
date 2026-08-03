@@ -168,6 +168,7 @@ unset DS4_METAL_LAYER_STAGE_PROFILE DS4_METAL_GRAPH_PREFILL_PROFILE
 unset DS4_CUDA_PREFILL_PIPELINE_SEQUENTIAL DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY
 unset DS4_CUDA_PREFILL_TILE_AUDIT_CSV DS4_CUDA_Q8_CACHE_AUDIT_CSV
 unset DS4_CUDA_NCU_TARGET_MODULE DS4_CUDA_NCU_TARGET_LAYER DS4_CUDA_NCU_TARGET_POS
+unset DS4_CUDA_NCU_TARGET_DEVICE
 unset DS4_NSYS_CAPTURE_PREFILL
 unset DS4_CUDA_NO_Q8_F16_CACHE DS4_CUDA_Q8_F32_ALL DS4_CUDA_Q8_F32_LARGE
 unset DS4_CUDA_ATTN_Q_B_F32_CACHE DS4_CUDA_Q8_F32_PRELOAD
@@ -254,6 +255,8 @@ fi
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$PROFILE_TOKENS"
     printf 'ncu_set=%s\nncu_replay_mode=application\nncu_app_replay_buffer=file\n' "$NCU_SET"
     printf 'ncu_app_replay_match=grid\nncu_app_replay_mode=balanced\n'
+    printf 'ncu_target_processes=all\nncu_target_process_filter=ds4-bench\n'
+    printf 'ncu_config_file=off\nncu_scope_device_verified=true\n'
     printf '\n[prompts]\n'
     for i in "${!prompt_paths[@]}"; do
         printf '%s\t%s\n' "${prompt_labels[$i]}" "${prompt_paths[$i]}"
@@ -393,9 +396,11 @@ ncu_capture() {
     printf '  Nsight will relaunch ds4-bench for each metric pass; details: %s.log\n' "$base"
     local rc=0
     DS4_CUDA_NCU_TARGET_MODULE="$module" DS4_CUDA_NCU_TARGET_LAYER="$layer" \
-    DS4_CUDA_NCU_TARGET_POS="$pos" \
+    DS4_CUDA_NCU_TARGET_POS="$pos" DS4_CUDA_NCU_TARGET_DEVICE="$device" \
     DS4_CUDA_Q8_CACHE_AUDIT_CSV="$base-cache.csv" DS4_LOCK_FILE="$ncu_lock_file" \
-        "${ncu_command[@]}" --target-processes application-only --devices "$device" \
+        "${ncu_command[@]}" --config-file off --verbose \
+            --target-processes all --target-processes-filter ds4-bench \
+            --devices "$device" \
             --filter-mode per-gpu --profile-from-start off \
             --kernel-name-base function --kernel-name "$kernel" \
             --launch-count 1 --replay-mode application \
@@ -413,13 +418,41 @@ ncu_capture() {
             "$name" "$rc" "$base" >&2
         grep -q ERR_NVGPUCTRPERM "$base.log" &&
             printf 'error: rerun with NCU_USE_SUDO=1 for restricted counters\n' >&2 || true
+        tail -n 80 "$base.log" >&2 || true
         return "$rc"
     fi
-    [[ -f $base.ncu-rep ]] || die "Nsight Compute did not produce $base.ncu-rep"
-    ncu --import "$base.ncu-rep" --csv --page raw \
+    if grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
+            "$base.log"; then
+        tail -n 80 "$base.log" >&2 || true
+        die "Nsight Compute reported a zero-kernel or failed capture for $name"
+    fi
+    local start_marker="ds4: starting targeted CUDA profile module=$module layer=$layer pos=$pos"
+    local stop_marker="ds4: stopped targeted CUDA profile module=$module layer=$layer pos=$pos"
+    local device_marker="ds4: CUDA profiler scope active on physical device $device (explicit=true)"
+    grep -Fq "$start_marker" "$base.log" || {
+        tail -n 80 "$base.log" >&2 || true
+        die "targeted profiler start marker is missing for $name"
+    }
+    grep -Fq "$device_marker" "$base.log" || {
+        tail -n 80 "$base.log" >&2 || true
+        die "targeted profiler device marker is missing for $name"
+    }
+    grep -Fq "$stop_marker" "$base.log" || {
+        tail -n 80 "$base.log" >&2 || true
+        die "targeted profiler stop marker is missing for $name"
+    }
+    [[ -s $base.ncu-rep ]] || die "Nsight Compute did not produce a nonempty $base.ncu-rep"
+    "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
         >"$base.csv" 2>"$base-import.log" ||
         die "failed to import Nsight Compute report: $base.ncu-rep"
     [[ -s $base.csv ]] || die "Nsight Compute import produced an empty CSV: $base.csv"
+    python3 speed-bench/validate-ncu-capture.py \
+        "$base.csv" "${kernel#regex:}" "$device" \
+        >"$base-validation.txt" 2>&1 || {
+            cat "$base-validation.txt" >&2 || true
+            die "Nsight Compute report validation failed for $name"
+        }
+    cat "$base-validation.txt"
 }
 
 if [[ $RUN_NCU == 1 ]]; then

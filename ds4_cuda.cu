@@ -3245,12 +3245,125 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 
+static thread_local int g_cuda_profiler_device = -1;
+static thread_local int g_cuda_profiler_device_explicit = 0;
+static thread_local int g_cuda_profiler_scope_active = 0;
+
+static int cuda_profiler_target_device(
+        int current_device,
+        int *target_device,
+        int *is_explicit) {
+    if (!target_device || !is_explicit) return 0;
+    *target_device = current_device;
+    *is_explicit = 0;
+
+    const char *value = getenv("DS4_CUDA_NCU_TARGET_DEVICE");
+    if (!value || !value[0]) return 1;
+
+    errno = 0;
+    char *end = NULL;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || !end || end[0] != '\0' ||
+        parsed < 0 || parsed > INT_MAX) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_NCU_TARGET_DEVICE value: %s\n",
+                value);
+        return 0;
+    }
+    *target_device = (int)parsed;
+    *is_explicit = 1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_profiler_start(void) {
-    return cuda_ok(cudaProfilerStart(), "cudaProfilerStart");
+    if (g_cuda_profiler_scope_active) {
+        fprintf(stderr, "ds4: nested CUDA profiler scope is not supported\n");
+        return 0;
+    }
+
+    int current_device = -1;
+    if (!cuda_ok(cudaGetDevice(&current_device),
+                 "cudaGetDevice before profiler start")) return 0;
+
+    int target_device = current_device;
+    int target_is_explicit = 0;
+    if (!cuda_profiler_target_device(
+            current_device, &target_device, &target_is_explicit)) return 0;
+    /* The graph must already be executing on the requested device.  Switching
+     * here would make its device-resident tensor pointers invalid and would
+     * also desynchronize DS4's cached logical tier from CUDA's current device. */
+    if (target_is_explicit && target_device != current_device) {
+        fprintf(stderr,
+                "ds4: targeted profiler device mismatch: requested physical "
+                "device %d, graph is on physical device %d\n",
+                target_device, current_device);
+        return 0;
+    }
+
+    if (!cuda_ok(cudaProfilerStart(), "cudaProfilerStart")) return 0;
+
+    g_cuda_profiler_device = target_device;
+    g_cuda_profiler_device_explicit = target_is_explicit;
+    g_cuda_profiler_scope_active = 1;
+    fprintf(stderr,
+            "ds4: CUDA profiler scope active on physical device %d "
+            "(explicit=%s)\n",
+            target_device, target_is_explicit ? "true" : "false");
+    return 1;
 }
 
 extern "C" int ds4_gpu_profiler_stop(void) {
-    return cuda_ok(cudaProfilerStop(), "cudaProfilerStop");
+    if (!g_cuda_profiler_scope_active) {
+        fprintf(stderr, "ds4: CUDA profiler stop requested without an active scope\n");
+        return 0;
+    }
+
+    const int target_device = g_cuda_profiler_device;
+    const int target_is_explicit = g_cuda_profiler_device_explicit;
+    int current_device = -1;
+    int ok = cuda_ok(cudaGetDevice(&current_device),
+                     "cudaGetDevice before profiler stop");
+    const int context_matches = ok && current_device == target_device;
+    int switched_for_close = 0;
+    if (ok && !context_matches) {
+        fprintf(stderr,
+                "ds4: profiler scope device changed before stop: started on "
+                "physical device %d, current physical device is %d\n",
+                target_device, current_device);
+        if (cuda_ok(cudaSetDevice(target_device),
+                    "cudaSetDevice to close profiler scope")) {
+            /* Raw physical-device switches bypass ds4_gpu_set_current_device.
+             * Invalidate its cache before any later engine operation. */
+            g_current_logical_tier = -1;
+            switched_for_close = 1;
+        } else {
+            ok = 0;
+        }
+    }
+
+    /* CUDA launches are asynchronous.  Keep the selected operation inside the
+     * profiler API range until every kernel queued on its context has actually
+     * completed.  This path is entered only for explicit Nsight capture. */
+    if (ok) {
+        ok = cuda_ok(cudaDeviceSynchronize(),
+                     "targeted profiler scope synchronize");
+    }
+    const int stop_ok = cuda_ok(cudaProfilerStop(), "cudaProfilerStop");
+    int restore_ok = 1;
+    if (switched_for_close) {
+        restore_ok = cuda_ok(cudaSetDevice(current_device),
+                             "cudaSetDevice after closing profiler scope");
+        g_current_logical_tier = -1;
+    }
+
+    g_cuda_profiler_device = -1;
+    g_cuda_profiler_device_explicit = 0;
+    g_cuda_profiler_scope_active = 0;
+    fprintf(stderr,
+            "ds4: CUDA profiler scope stopped on physical device %d\n",
+            target_device);
+    return ok && stop_ok && restore_ok &&
+        (!target_is_explicit || context_matches);
 }
 
 extern "C" void ds4_gpu_q8_audit_set_context(
