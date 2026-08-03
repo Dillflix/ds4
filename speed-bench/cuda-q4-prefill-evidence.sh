@@ -237,13 +237,6 @@ if [[ $SKIP_BASELINE == 1 ]]; then
             die "SKIP_BASELINE=1 but runtime/$label.csv is missing or empty"
     done
 fi
-if [[ $resume_evidence == 1 && $RUN_NSYS == 0 ]]; then
-    for reused in full-q4-prefill.nsys-rep cuda_gpu_kern_sum.csv cuda_gpu_trace.csv; do
-        [[ -s $EVIDENCE_DIR/nsys/$reused ]] ||
-            die "RUN_NSYS=0 on resume but nsys/$reused is missing or empty"
-    done
-fi
-
 manifest_out="$initial_manifest"
 if [[ $resume_evidence == 1 ]]; then
     manifest_out="$EVIDENCE_DIR/resume-manifest-$(date -u +%Y%m%dT%H%M%SZ).txt"
@@ -401,7 +394,10 @@ ncu_capture() {
         sections=(--metrics "$focused_metrics" --disable-extra-suffixes)
     fi
     if [[ $scope_mode == ungated ]]; then
-        profiler_args=(--profile-from-start on --disable-profiler-start-stop)
+        # Nsight treats --profile-from-start and
+        # --disable-profiler-start-stop as mutually exclusive. The latter
+        # ignores application Start/Stop calls and profiles from launch.
+        profiler_args=(--disable-profiler-start-stop)
         target_env=(env
             -u DS4_CUDA_NCU_TARGET_MODULE
             -u DS4_CUDA_NCU_TARGET_LAYER

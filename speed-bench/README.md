@@ -134,8 +134,8 @@ include short-lived replay processes that terminate before a CUDA call. It
 does not apply a positive process-name filter. Hidden Nsight configuration is
 disabled. Before collecting
 the full metric set, two one-duration-metric early-Q4 preflights isolate the
-instrumentation boundary. The first starts profiling from process launch and
-ignores profiler Start/Stop calls; it proves that application replay can attach
+instrumentation boundary. The first disables profiler Start/Stop handling,
+which profiles from process launch; it proves that application replay can attach
 and capture the first matching Q4 gate/up kernel. The second uses the production
 targeted API range and additionally proves range entry and exit plus
 physical-device selection. Every full capture must then contain the same DS4
@@ -180,7 +180,9 @@ settings, and profiler frontier against the original `manifest.txt`. It keeps
 that file intact, writes a timestamped resume manifest for the new commit, and
 atomically marks `run-status.txt` as `state=running` before profiling. Only
 `state=finished`, `exit_status=0`, and `last_phase=complete` together indicate
-a complete archive.
+a complete archive. `RUN_NSYS=0` skips the Systems phase independently; it does
+not require a report from an earlier attempt when only Compute capture is being
+resumed.
 
 ### SM80 to SM75 dispatch and resource audit
 
