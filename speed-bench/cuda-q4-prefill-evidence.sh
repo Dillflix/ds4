@@ -259,8 +259,8 @@ fi
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$PROFILE_TOKENS"
     printf 'ncu_set=%s\nncu_replay_mode=application\nncu_app_replay_buffer=file\n' "$NCU_SET"
     printf 'ncu_app_replay_match=grid\nncu_app_replay_mode=balanced\n'
-    printf 'ncu_target_processes=all\nncu_target_process_filter=none\n'
-    printf 'ncu_preflight=early_q4_duration_only\n'
+    printf 'ncu_target_processes=application-only\nncu_target_process_filter=none\n'
+    printf 'ncu_preflight=early_q4_ungated_then_gated_duration_only\n'
     printf 'ncu_config_file=off\nncu_scope_device_verified=true\n'
     printf '\n[prompts]\n'
     for i in "${!prompt_paths[@]}"; do
@@ -352,8 +352,9 @@ fi
 ncu_capture() {
     local name=$1 device=$2 module=$3 layer=$4 pos=$5 kernel=$6
     local capture_set=${7:-$NCU_SET}
+    local scope_mode=${8:-targeted}
     local base="$EVIDENCE_DIR/ncu/$name"
-    local -a sections
+    local -a sections profiler_args target_env
     if [[ $capture_set == preflight ]]; then
         sections=(--metrics gpu__time_duration.sum --disable-extra-suffixes)
     elif [[ $capture_set == full ]]; then
@@ -399,17 +400,35 @@ ncu_capture() {
         focused_metrics="${focused_metric_names[*]}"
         sections=(--metrics "$focused_metrics" --disable-extra-suffixes)
     fi
-    printf 'Nsight Compute: %s (module=%s layer=%s pos=%s device=%s; application replay)...\n' \
-        "$name" "$module" "$layer" "$pos" "$device"
+    if [[ $scope_mode == ungated ]]; then
+        profiler_args=(--profile-from-start on --disable-profiler-start-stop)
+        target_env=(env
+            -u DS4_CUDA_NCU_TARGET_MODULE
+            -u DS4_CUDA_NCU_TARGET_LAYER
+            -u DS4_CUDA_NCU_TARGET_POS
+            -u DS4_CUDA_NCU_TARGET_DEVICE
+            "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$base-cache.csv"
+            "DS4_LOCK_FILE=$ncu_lock_file")
+    elif [[ $scope_mode == targeted ]]; then
+        profiler_args=(--profile-from-start off)
+        target_env=(env
+            "DS4_CUDA_NCU_TARGET_MODULE=$module"
+            "DS4_CUDA_NCU_TARGET_LAYER=$layer"
+            "DS4_CUDA_NCU_TARGET_POS=$pos"
+            "DS4_CUDA_NCU_TARGET_DEVICE=$device"
+            "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$base-cache.csv"
+            "DS4_LOCK_FILE=$ncu_lock_file")
+    else
+        die "invalid internal NCU scope mode: $scope_mode"
+    fi
+    printf 'Nsight Compute: %s (scope=%s module=%s layer=%s pos=%s device=%s; application replay)...\n' \
+        "$name" "$scope_mode" "$module" "$layer" "$pos" "$device"
     printf '  Nsight will relaunch ds4-bench for each metric pass; details: %s.log\n' "$base"
     local rc=0
-    DS4_CUDA_NCU_TARGET_MODULE="$module" DS4_CUDA_NCU_TARGET_LAYER="$layer" \
-    DS4_CUDA_NCU_TARGET_POS="$pos" DS4_CUDA_NCU_TARGET_DEVICE="$device" \
-    DS4_CUDA_Q8_CACHE_AUDIT_CSV="$base-cache.csv" DS4_LOCK_FILE="$ncu_lock_file" \
-        "${ncu_command[@]}" --config-file off --verbose \
-            --target-processes all \
+    "${target_env[@]}" "${ncu_command[@]}" --config-file off --verbose \
+            --target-processes application-only \
             --devices "$device" \
-            --filter-mode per-gpu --profile-from-start off \
+            --filter-mode per-gpu "${profiler_args[@]}" \
             --kernel-name-base function --kernel-name "$kernel" \
             --launch-count 1 --replay-mode application \
             --app-replay-buffer file --app-replay-match grid \
@@ -424,6 +443,13 @@ ncu_capture() {
     if (( rc != 0 )); then
         printf 'error: Nsight Compute capture %s failed (exit %s); see %s.log\n' \
             "$name" "$rc" "$base" >&2
+        if [[ $scope_mode == ungated ]]; then
+            printf '%s\n' \
+                'error: boundary=application-replay-root-attachment (DS4 profiler Start/Stop was disabled)' >&2
+        else
+            printf '%s\n' \
+                'error: boundary=targeted-profiler-range (the ungated root-attachment preflight already passed)' >&2
+        fi
         grep -q ERR_NVGPUCTRPERM "$base.log" &&
             printf 'error: rerun with NCU_USE_SUDO=1 for restricted counters\n' >&2 || true
         tail -n 80 "$base.log" >&2 || true
@@ -432,23 +458,32 @@ ncu_capture() {
     if grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
             "$base.log"; then
         tail -n 80 "$base.log" >&2 || true
+        if [[ $scope_mode == ungated ]]; then
+            printf '%s\n' \
+                'error: boundary=application-replay-root-attachment (DS4 profiler Start/Stop was disabled)' >&2
+        else
+            printf '%s\n' \
+                'error: boundary=targeted-profiler-range (the ungated root-attachment preflight already passed)' >&2
+        fi
         die "Nsight Compute reported a zero-kernel or failed capture for $name"
     fi
-    local start_marker="ds4: starting targeted CUDA profile module=$module layer=$layer pos=$pos"
-    local stop_marker="ds4: stopped targeted CUDA profile module=$module layer=$layer pos=$pos"
-    local device_marker="ds4: CUDA profiler scope active on physical device $device (explicit=true)"
-    grep -Fq "$start_marker" "$base.log" || {
-        tail -n 80 "$base.log" >&2 || true
-        die "targeted profiler start marker is missing for $name"
-    }
-    grep -Fq "$device_marker" "$base.log" || {
-        tail -n 80 "$base.log" >&2 || true
-        die "targeted profiler device marker is missing for $name"
-    }
-    grep -Fq "$stop_marker" "$base.log" || {
-        tail -n 80 "$base.log" >&2 || true
-        die "targeted profiler stop marker is missing for $name"
-    }
+    if [[ $scope_mode == targeted ]]; then
+        local start_marker="ds4: starting targeted CUDA profile module=$module layer=$layer pos=$pos"
+        local stop_marker="ds4: stopped targeted CUDA profile module=$module layer=$layer pos=$pos"
+        local device_marker="ds4: CUDA profiler scope active on physical device $device (explicit=true)"
+        grep -Fq "$start_marker" "$base.log" || {
+            tail -n 80 "$base.log" >&2 || true
+            die "targeted profiler start marker is missing for $name"
+        }
+        grep -Fq "$device_marker" "$base.log" || {
+            tail -n 80 "$base.log" >&2 || true
+            die "targeted profiler device marker is missing for $name"
+        }
+        grep -Fq "$stop_marker" "$base.log" || {
+            tail -n 80 "$base.log" >&2 || true
+            die "targeted profiler stop marker is missing for $name"
+        }
+    fi
     [[ -s $base.ncu-rep ]] || die "Nsight Compute did not produce a nonempty $base.ncu-rep"
     "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
         >"$base.csv" 2>"$base-import.log" ||
@@ -477,10 +512,15 @@ if [[ $RUN_NCU == 1 ]]; then
         ncu_command=(sudo -E "$ncu_bin")
     fi
 
-    printf 'Nsight Compute attachment preflight (one duration metric)...\n'
-    ncu_capture "preflight-early-layer${EARLY_LAYER}-q4-gate-up-tile8" \
+    printf 'Nsight Compute ungated attachment preflight (one duration metric)...\n'
+    ncu_capture "preflight-ungated-first-q4-gate-up-tile8" \
         "${gpu_devices[0]}" routed_moe "$EARLY_LAYER" 0 \
-        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*' preflight
+        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*' preflight ungated
+
+    printf 'Nsight Compute targeted-range preflight (one duration metric)...\n'
+    ncu_capture "preflight-targeted-early-layer${EARLY_LAYER}-q4-gate-up-tile8" \
+        "${gpu_devices[0]}" routed_moe "$EARLY_LAYER" 0 \
+        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*' preflight targeted
 
     ncu_capture "early-layer${EARLY_LAYER}-q4-gate-up-tile8" \
         "${gpu_devices[0]}" routed_moe "$EARLY_LAYER" 0 \

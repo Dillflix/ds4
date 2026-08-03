@@ -128,13 +128,17 @@ warps, IMMA utilization, DRAM/L1/L2 activity and hit rates, and the relevant
 scoreboard/MIO stalls. `NCU_SET=targeted` and `NCU_SET=full` remain explicit,
 slower opt-ins, but also use application replay.
 
-The profiler follows the complete application-replay process tree. It does not
-apply a positive process-name filter: the installed Nsight Compute build can
-place the replaying CUDA process below a short-lived process with the same
-executable name. Hidden Nsight configuration is disabled. Before collecting
-the full metric set, a one-duration-metric early-Q4 preflight must prove
-process attachment, profiler-range entry and exit, physical device selection,
-and the expected kernel. Every full capture must then contain the same DS4
+The profiler targets the root `ds4-bench` application. DS4 does not launch a
+child process, so following the full process tree is unnecessary and can
+include short-lived replay processes that terminate before a CUDA call. It
+does not apply a positive process-name filter. Hidden Nsight configuration is
+disabled. Before collecting
+the full metric set, two one-duration-metric early-Q4 preflights isolate the
+instrumentation boundary. The first starts profiling from process launch and
+ignores profiler Start/Stop calls; it proves that application replay can attach
+and capture the first matching Q4 gate/up kernel. The second uses the production
+targeted API range and additionally proves range entry and exit plus
+physical-device selection. Every full capture must then contain the same DS4
 markers and exactly one raw report row matching the requested kernel, physical
 device, process, and duration metric. A zero-kernel warning or header-only
 report is a hard failure.
