@@ -32,7 +32,7 @@ Optional environment:
   PROFILE_TOKENS=2048
   EARLY_LAYER=3
   LATE_LAYER=36
-  NCU_SET=targeted          targeted or full
+  NCU_SET=focused           focused, targeted, or full
   NCU_USE_SUDO=0            run ncu through sudo -E
   RUN_NSYS=1
   RUN_NCU=1
@@ -63,7 +63,7 @@ PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
 EARLY_LAYER=${EARLY_LAYER:-3}
 LATE_LAYER=${LATE_LAYER:-36}
-NCU_SET=${NCU_SET:-targeted}
+NCU_SET=${NCU_SET:-focused}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 RUN_NSYS=${RUN_NSYS:-1}
 RUN_NCU=${RUN_NCU:-1}
@@ -82,7 +82,8 @@ done
     die "invalid context/profile range"
 (( EARLY_LAYER < 22 && LATE_LAYER >= 22 && LATE_LAYER < 43 )) ||
     die "EARLY_LAYER/LATE_LAYER must straddle the forced 22/21 split"
-[[ $NCU_SET == targeted || $NCU_SET == full ]] || die "NCU_SET must be targeted or full"
+[[ $NCU_SET == focused || $NCU_SET == targeted || $NCU_SET == full ]] ||
+    die "NCU_SET must be focused, targeted, or full"
 for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD SKIP_BASELINE SKIP_COVERAGE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -114,10 +115,11 @@ finalize() {
     local status=$?
     trap - EXIT
     if [[ $archive_ready == 1 && -d ${EVIDENCE_DIR:-} ]]; then
-        {
-            printf 'exit_status=%s\nlast_phase=%s\n' "$status" "$current_phase"
-            printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        } >"$EVIDENCE_DIR/run-status.txt"
+        local status_tmp="$EVIDENCE_DIR/run-status.txt.tmp"
+        printf 'state=finished\nexit_status=%s\nlast_phase=%s\ndate_utc=%s\n' \
+            "$status" "$current_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            >"$status_tmp"
+        mv -f "$status_tmp" "$EVIDENCE_DIR/run-status.txt"
         local archive="$EVIDENCE_DIR.tar.gz"
         if tar -C "$(dirname "$EVIDENCE_DIR")" -czf "$archive" \
                 "$(basename "$EVIDENCE_DIR")"; then
@@ -134,6 +136,23 @@ mkdir -p "$EVIDENCE_DIR" "$EVIDENCE_DIR/runtime" "$EVIDENCE_DIR/coverage" \
          "$EVIDENCE_DIR/nsys" "$EVIDENCE_DIR/ncu"
 EVIDENCE_DIR=$(cd "$EVIDENCE_DIR" && pwd)
 archive_ready=1
+
+initial_manifest="$EVIDENCE_DIR/manifest.txt"
+resume_evidence=0
+if [[ $SKIP_BASELINE == 1 || $SKIP_COVERAGE == 1 ]]; then
+    [[ -f $initial_manifest ]] ||
+        die "resume requested but initial manifest is missing: $initial_manifest"
+    resume_evidence=1
+elif [[ -e $initial_manifest ]]; then
+    die "output directory already has a manifest; choose a new Q4_EVIDENCE_DIR or use resume flags"
+fi
+
+# A hard reset must not leave an earlier status looking like the result of the
+# current resume.  Publish the running marker atomically before doing work.
+status_tmp="$EVIDENCE_DIR/run-status.txt.tmp"
+printf 'state=running\nlast_phase=%s\ndate_utc=%s\n' \
+    "$current_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$status_tmp"
+mv -f "$status_tmp" "$EVIDENCE_DIR/run-status.txt"
 
 if [[ $SKIP_BUILD == 0 ]]; then
     current_phase=build
@@ -164,14 +183,77 @@ bench_common=(
     --gpu-vram "$GPU_VRAM" --cuda-tensor-parallel --gen-tokens 0
 )
 
+# Preserve the initial manifest on a resume and reject configuration mixing.
+# The commit may legitimately change to contain a profiler-script fix, so it is
+# recorded in a separate resume manifest rather than treated as run identity.
+model_bytes=$(stat -c %s "$MODEL")
+if [[ $resume_evidence == 1 ]]; then
+    manifest_value() {
+        local key=$1
+        awk -F= -v wanted="$key" '
+            $1 == wanted { print substr($0, index($0, "=") + 1); exit }
+        ' "$initial_manifest"
+    }
+    require_manifest_value() {
+        local key=$1 expected=$2 actual
+        actual=$(manifest_value "$key")
+        [[ -n $actual ]] || die "initial manifest has no $key value"
+        [[ $actual == "$expected" ]] ||
+            die "resume mismatch for $key: initial=$actual current=$expected"
+    }
+    require_manifest_value model "$MODEL"
+    require_manifest_value model_bytes "$model_bytes"
+    require_manifest_value gpu_devices "$GPU_DEVICES"
+    require_manifest_value gpu_vram "$GPU_VRAM"
+    require_manifest_value cuda_arch "$CUDA_ARCH"
+    require_manifest_value split 22/21
+    require_manifest_value ctx_start "$CTX_START"
+    require_manifest_value ctx_max "$CTX_MAX"
+    require_manifest_value step_mul "$STEP_MUL"
+    require_manifest_value prefill_chunk "$PREFILL_CHUNK"
+    require_manifest_value profile_tokens "$PROFILE_TOKENS"
+    mapfile -t manifest_prompt_rows < <(awk '
+        /^\[prompts\]$/ { in_prompts=1; next }
+        /^\[/ && in_prompts { exit }
+        in_prompts && NF { print }
+    ' "$initial_manifest")
+    (( ${#manifest_prompt_rows[@]} == ${#prompt_paths[@]} )) ||
+        die "resume prompt count differs from initial manifest"
+    for i in "${!prompt_paths[@]}"; do
+        prompt_row=$(printf '%s\t%s' "${prompt_labels[$i]}" "${prompt_paths[$i]}")
+        [[ ${manifest_prompt_rows[$i]} == "$prompt_row" ]] ||
+            die "resume prompt order/path differs at index $i: ${prompt_labels[$i]}"
+    done
+fi
+
+if [[ $SKIP_BASELINE == 1 ]]; then
+    for label in "${prompt_labels[@]}"; do
+        [[ -s $EVIDENCE_DIR/runtime/$label.csv ]] ||
+            die "SKIP_BASELINE=1 but runtime/$label.csv is missing or empty"
+    done
+fi
+if [[ $resume_evidence == 1 && $RUN_NSYS == 0 ]]; then
+    for reused in full-q4-prefill.nsys-rep cuda_gpu_kern_sum.csv cuda_gpu_trace.csv; do
+        [[ -s $EVIDENCE_DIR/nsys/$reused ]] ||
+            die "RUN_NSYS=0 on resume but nsys/$reused is missing or empty"
+    done
+fi
+
+manifest_out="$initial_manifest"
+if [[ $resume_evidence == 1 ]]; then
+    manifest_out="$EVIDENCE_DIR/resume-manifest-$(date -u +%Y%m%dT%H%M%SZ).txt"
+fi
 {
+    [[ $resume_evidence == 0 ]] || printf 'resume_of=%s\n' "$initial_manifest"
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
     printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
-    printf 'model=%s\nmodel_bytes=%s\n' "$MODEL" "$(stat -c %s "$MODEL")"
+    printf 'model=%s\nmodel_bytes=%s\n' "$MODEL" "$model_bytes"
     printf 'gpu_devices=%s\ngpu_vram=%s\ncuda_arch=%s\nsplit=22/21\n' \
         "$GPU_DEVICES" "$GPU_VRAM" "$CUDA_ARCH"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nprefill_chunk=%s\nprofile_tokens=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$PROFILE_TOKENS"
+    printf 'ncu_set=%s\nncu_replay_mode=application\nncu_app_replay_buffer=file\n' "$NCU_SET"
+    printf 'ncu_app_replay_match=grid\nncu_app_replay_mode=balanced\n'
     printf '\n[prompts]\n'
     for i in "${!prompt_paths[@]}"; do
         printf '%s\t%s\n' "${prompt_labels[$i]}" "${prompt_paths[$i]}"
@@ -183,7 +265,7 @@ bench_common=(
     printf '\n[nvcc]\n'; nvcc --version 2>&1 || true
     printf '\n[ncu]\n'; ncu --version 2>&1 || true
     printf '\n[nsys]\n'; nsys --version 2>&1 || true
-} >"$EVIDENCE_DIR/manifest.txt"
+} >"$manifest_out"
 
 if [[ $SKIP_BASELINE == 0 ]]; then
     current_phase=production-baseline
@@ -216,8 +298,15 @@ if [[ $SKIP_COVERAGE == 0 ]]; then
         "$EVIDENCE_DIR/coverage/native-q8-targets.tsv" \
         | tee "$EVIDENCE_DIR/coverage/q8-cache-summary.txt"
 else
-    [[ -f $EVIDENCE_DIR/coverage/native-q8-targets.tsv ]] ||
-        die "SKIP_COVERAGE=1 but native-q8-targets.tsv is missing"
+    for reused in q8-cache.csv q8-cache-summary.csv q8-cache-summary.txt \
+                  native-q8-targets.tsv; do
+        [[ -s $EVIDENCE_DIR/coverage/$reused ]] ||
+            die "SKIP_COVERAGE=1 but coverage/$reused is missing or empty"
+    done
+    native_target_count=$(awk 'NR > 1 && NF { n++ } END { print n + 0 }' \
+        "$EVIDENCE_DIR/coverage/native-q8-targets.tsv")
+    (( native_target_count >= 2 )) ||
+        die "reused coverage has fewer than two native-Q8 profiler targets"
 fi
 
 if [[ $RUN_NSYS == 1 ]]; then
@@ -256,21 +345,63 @@ ncu_capture() {
     local name=$1 device=$2 module=$3 layer=$4 pos=$5 kernel=$6
     local base="$EVIDENCE_DIR/ncu/$name"
     local -a sections
-    if [[ $NCU_SET == full ]]; then sections=(--set full); else
+    if [[ $NCU_SET == full ]]; then
+        sections=(--set full)
+    elif [[ $NCU_SET == targeted ]]; then
         sections=(--section SpeedOfLight --section LaunchStats --section Occupancy
                   --section SchedulerStats --section WarpStateStats
                   --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
+    else
+        # These are the exact questions this pass must answer.  Keeping the
+        # list narrow avoids the 14 replay passes required by the previous
+        # broad section set.  Every metric below was present in the prior
+        # TU102 report generated by the same installed Nsight Compute build.
+        local -a focused_metric_names=(
+            gpu__time_duration.sum
+            launch__registers_per_thread
+            launch__shared_mem_per_block
+            launch__occupancy_limit_blocks
+            launch__occupancy_limit_registers
+            launch__occupancy_limit_shared_mem
+            launch__occupancy_limit_warps
+            launch__occupancy_per_shared_mem_size
+            sm__warps_active.avg.pct_of_peak_sustained_active
+            smsp__warps_eligible.avg.per_cycle_active
+            sm__inst_issued.avg.per_cycle_active
+            sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_active
+            sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_elapsed
+            dram__bytes.sum.per_second
+            dram__cycles_active.avg.pct_of_peak_sustained_elapsed
+            l1tex__throughput.avg.pct_of_peak_sustained_active
+            l1tex__m_xbar2l1tex_read_sectors.avg.pct_of_peak_sustained_elapsed
+            l1tex__t_sector_hit_rate.pct
+            lts__throughput.avg.pct_of_peak_sustained_elapsed
+            lts__t_sectors.avg.pct_of_peak_sustained_elapsed
+            lts__t_sector_hit_rate.pct
+            lts__t_sectors_lookup_miss.sum
+            smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio
+            smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio
+            smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio
+        )
+        local focused_metrics
+        local IFS=,
+        focused_metrics="${focused_metric_names[*]}"
+        sections=(--metrics "$focused_metrics" --disable-extra-suffixes)
     fi
-    printf 'Nsight Compute: %s (module=%s layer=%s pos=%s device=%s)...\n' \
+    printf 'Nsight Compute: %s (module=%s layer=%s pos=%s device=%s; application replay)...\n' \
         "$name" "$module" "$layer" "$pos" "$device"
+    printf '  Nsight will relaunch ds4-bench for each metric pass; details: %s.log\n' "$base"
     local rc=0
     DS4_CUDA_NCU_TARGET_MODULE="$module" DS4_CUDA_NCU_TARGET_LAYER="$layer" \
     DS4_CUDA_NCU_TARGET_POS="$pos" \
     DS4_CUDA_Q8_CACHE_AUDIT_CSV="$base-cache.csv" DS4_LOCK_FILE="$ncu_lock_file" \
-        "${ncu_command[@]}" --target-processes all --devices "$device" \
+        "${ncu_command[@]}" --target-processes application-only --devices "$device" \
             --filter-mode per-gpu --profile-from-start off \
             --kernel-name-base function --kernel-name "$kernel" \
-            --launch-count 1 --replay-mode kernel --clock-control none \
+            --launch-count 1 --replay-mode application \
+            --app-replay-buffer file --app-replay-match grid \
+            --app-replay-mode balanced --cache-control none \
+            --clock-control none --forward-signals true \
             --force-overwrite --export "$base" "${sections[@]}" \
             ./ds4-bench "${bench_common[@]}" --prompt-file "$audit_prompt" \
                 --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
@@ -285,7 +416,10 @@ ncu_capture() {
         return "$rc"
     fi
     [[ -f $base.ncu-rep ]] || die "Nsight Compute did not produce $base.ncu-rep"
-    ncu --import "$base.ncu-rep" --csv --page raw >"$base.csv" 2>"$base-import.log" || true
+    ncu --import "$base.ncu-rep" --csv --page raw \
+        >"$base.csv" 2>"$base-import.log" ||
+        die "failed to import Nsight Compute report: $base.ncu-rep"
+    [[ -s $base.csv ]] || die "Nsight Compute import produced an empty CSV: $base.csv"
 }
 
 if [[ $RUN_NCU == 1 ]]; then

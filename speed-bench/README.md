@@ -115,6 +115,16 @@ profiler API and filtered to the SM75 tile8 kernel. The dense-Q8 captures use
 the same scope plus the audit-selected module and verify that the projection
 was still uncached in the profiling process.
 
+Nsight Compute uses **application replay**, a file-backed replay buffer, and a
+focused metric list by default. It never uses kernel replay for this model.
+Kernel replay snapshots every allocation accessible to the selected kernel;
+with a fully resident 153 GiB model that can spill tens of GiB per pass into
+host memory and make Linux unresponsive without producing an OOM kill. The
+focused set records duration, launch resources, achieved occupancy, eligible
+warps, IMMA utilization, DRAM/L1/L2 activity and hit rates, and the relevant
+scoreboard/MIO stalls. `NCU_SET=targeted` and `NCU_SET=full` remain explicit,
+slower opt-ins, but also use application replay.
+
 ```bash
 cd ~/ds4-iq2-q4
 export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -127,9 +137,32 @@ Replace the example `MODEL` value with the exact full-Q4 file on the machine.
 The script rejects a missing model rather than searching for one implicitly.
 Set `PROMPT_MANIFEST` to reuse the fixed multi-prompt suite. Set
 `NCU_USE_SUDO=1` if performance counters require administrative access. As
-with the deep audit, partial results are archived on failure; set
-`Q4_EVIDENCE_DIR`, `SKIP_BUILD=1`, `SKIP_BASELINE=1`, and `SKIP_COVERAGE=1`
-to resume only the profiler captures.
+with the deep audit, partial results are archived on failure. Resume only the
+Compute captures while preserving the completed benchmark, cache audit, and
+Systems trace with:
+
+```bash
+cd ~/ds4-iq2-q4
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export Q4_EVIDENCE_DIR="$PWD/q4-prefill-evidence-20260803T005438Z"
+
+SKIP_BUILD=1 \
+SKIP_BASELINE=1 \
+SKIP_COVERAGE=1 \
+RUN_NSYS=0 \
+RUN_NCU=1 \
+NCU_SET=focused \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-q4-prefill-evidence.sh
+```
+
+On resume, the script validates the model, prompt suite, device order, context
+settings, and profiler frontier against the original `manifest.txt`. It keeps
+that file intact, writes a timestamped resume manifest for the new commit, and
+atomically marks `run-status.txt` as `state=running` before profiling. Only
+`state=finished`, `exit_status=0`, and `last_phase=complete` together indicate
+a complete archive.
 
 ### SM80 to SM75 dispatch and resource audit
 
