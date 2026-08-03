@@ -5654,8 +5654,15 @@ __device__ __forceinline__ static uint32_t ldu32_unaligned(const uint8_t *p) {
     const uintptr_t addr = (uintptr_t)p;
     const uint32_t *base = (const uint32_t *)(addr & ~(uintptr_t)3);
     const uint32_t lo = base[0];
+    /* Do not issue the second word load for an already aligned address.
+     * Apart from wasting a transaction, base[1] is four bytes beyond the
+     * Q8 tensor when p names its final aligned word.  Small allocations can
+     * hide that over-read in allocator padding; the 34 MiB attn_q_b tensor
+     * ends exactly on a CUDA allocation boundary and faults. */
+    const uint32_t byte_offset = (uint32_t)(addr & 3u);
+    if (byte_offset == 0u) return lo;
     const uint32_t hi = base[1];
-    return __funnelshift_r(lo, hi, (uint32_t)(addr & 3u) * 8u);
+    return __funnelshift_r(lo, hi, byte_offset * 8u);
 }
 
 __device__ __forceinline__ static void mma_m16n8k32_s8(

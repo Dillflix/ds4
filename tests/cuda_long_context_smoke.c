@@ -33,8 +33,13 @@ static double getenv_seconds(const char *name, double fallback) {
 }
 
 static int check_sm75_q8_mma_exact(void) {
-    const uint32_t in_dim = 512;
-    const uint32_t out_dim = 64;
+    /* 1024 inputs produce 32 Q8 blocks (1088 bytes/row), while 1024 rows
+     * make the weight allocation exactly 17 * 64 KiB.  That page-aligned
+     * end catches an aligned final-word over-read that allocator padding in
+     * the former 512x64 fixture concealed.  It also exercises the T32 path
+     * used by the production 1024->32768 attention q_b projection. */
+    const uint32_t in_dim = 1024;
+    const uint32_t out_dim = 1024;
     const uint32_t n_tokens = 17;
     const uint32_t blocks = in_dim / 32u;
     const size_t weight_bytes = (size_t)out_dim * blocks * 34u;
