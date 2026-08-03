@@ -337,9 +337,10 @@ unowned output. The gate/up target deliberately keeps the shipping
 `expf` operations; the bit-exact claim is therefore an intra-binary comparison
 with the harness's own standard path, not an external production reference.
 SASS validation requires the expected m8n8k16 or m8n8k32 packed-INT4 forms.
-Local-memory traffic is recorded per consumer as an eligibility diagnostic
-rather than aborting the experiment, so an occupancy
-candidate that spills can still be benchmarked and profiled. Nsight captures
+Local-memory instructions are recorded per consumer without aborting the
+experiment. `LDL`/`STL` alone do not distinguish register spills from explicit
+thread-local stack traffic, so interpret them together with the PTXAS
+stack/spill report. Nsight captures
 cover all six distinct consumer kernels plus activation packing. The script
 only observes clocks and uses Nsight's `--clock-control none`; it never changes
 GPU clocks or power settings.

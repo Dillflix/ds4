@@ -575,7 +575,7 @@ else
         local_memory_free=true
         if (( ldl != 0 || stl != 0 )); then
             local_memory_free=false
-            warning="warning: $kernel has LDL=$ldl STL=$stl; retaining it as a measured candidate, not a spill-free dispatch candidate"
+            warning="warning: $kernel has LDL=$ldl STL=$stl static local-memory instructions; consult the PTXAS stack/spill report before classifying them"
             printf '%s\n' "$warning" >>"$OUTPUT_DIR/sass-warnings.log"
             printf '%s\n' "$warning" >&2
         fi

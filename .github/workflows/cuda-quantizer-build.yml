@@ -125,7 +125,7 @@ jobs:
             local_memory_free=true
             if (( ldl != 0 || stl != 0 )); then
               local_memory_free=false
-              echo "warning: $label has LDL=$ldl STL=$stl; it remains a measured candidate"
+              echo "warning: $label has LDL=$ldl STL=$stl static local-memory instructions; PTXAS decides whether these are spills or explicit stack traffic"
             fi
             printf '%s,%s,%s,%s\n' "$label" "$ldl" "$stl" "$local_memory_free" \
               >> /tmp/sm75-q4-gate-up-eligibility.csv
