@@ -14,6 +14,7 @@ on:
       - "speed-bench/cuda-prefill-deep-audit.sh"
       - "speed-bench/cuda-q4-prefill-evidence.sh"
       - "speed-bench/cuda-sm75-kernel-profile.sh"
+      - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-prefill-placement.py"
@@ -51,6 +52,7 @@ jobs:
           bash -n speed-bench/cuda-prefill-deep-audit.sh
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
+          bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py

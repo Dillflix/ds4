@@ -24,13 +24,19 @@ fields = [
     "samples",
     "pairs_mean",
     "tiles_mean",
+    "slots_mean",
     "active_experts_mean",
     "padded_slots_mean",
     "tile_fill_pct_mean",
 ]
 rows = []
 for (layer, ownership), samples in sorted(groups.items()):
-    mean = lambda field: statistics.fmean(float(row[field]) for row in samples)
+    def value(row: dict[str, str], field: str) -> float:
+        if field == "slot_count" and not row.get(field):
+            return float(row["tile_count"]) * 16.0
+        return float(row[field])
+
+    mean = lambda field: statistics.fmean(value(row, field) for row in samples)
     rows.append(
         {
             "layer": layer,
@@ -38,6 +44,7 @@ for (layer, ownership), samples in sorted(groups.items()):
             "samples": len(samples),
             "pairs_mean": f"{mean('pair_count'):.3f}",
             "tiles_mean": f"{mean('tile_count'):.3f}",
+            "slots_mean": f"{mean('slot_count'):.3f}",
             "active_experts_mean": f"{mean('active_experts'):.3f}",
             "padded_slots_mean": f"{mean('padded_slots'):.3f}",
             "tile_fill_pct_mean": f"{mean('tile_fill_pct'):.3f}",

@@ -1,5 +1,35 @@
 ## Benchmarking
 
+### SM75 next-target A/B suite
+
+`cuda-sm75-next-targets.sh` builds the CUDA regression binary, verifies every
+new path against the retained baseline, and benchmarks one change at a time
+before the combined configuration. New paths remain opt-in until the real
+four-GPU suite demonstrates a win.
+
+```bash
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf"
+export RECIPE=hybrid
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+./speed-bench/cuda-sm75-next-targets.sh
+```
+
+Use `RECIPE=full-q4` with the stock Q4 model to test dense-Q8 token16 reuse
+and compact Q4 gate/up tile16. Use `RECIPE=stock-q2` with the stock Q2 model
+to test Q2_K-down IMMA. `PROMPT_MANIFEST` applies the same variants to a
+tab-separated fixed prompt suite.
+
+The individual production switches are:
+
+- `DS4_CUDA_Q8_MMA_SM75_TOK16=1`
+- `DS4_CUDA_MOE_Q4_GATE_TILE16_SM75=1`
+- `DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75=1` (stage6 is the tile16 default)
+- `DS4_CUDA_MOE_IQ2_STAGE6_SM75=1`
+- `DS4_CUDA_MOE_IQ2_STAGE4_SM75=1`
+- `DS4_CUDA_MOE_MIXED_TAIL_TILES=1`
+- `DS4_CUDA_MOE_Q2_DOWN_MMA_SM75=1`
+
 Here we collect prefill and generation speed obtained with different hardware.
 
 Run `ds4-bench` as:

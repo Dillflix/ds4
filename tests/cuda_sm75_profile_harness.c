@@ -265,17 +265,17 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec) {
 
     unsigned logical = 0, physical = 0, sequence = 0, layer = 0;
     unsigned token_offset = 0, n_tokens = 0, owner_base = 0, owner_count = 0;
-    unsigned selected_slots = 0, pair_count = 0, tile_count = 0;
+    unsigned selected_slots = 0, pair_count = 0, tile_count = 0, slot_count = 0;
     unsigned active_experts = 0, padded_slots = 0;
     char ownership[32];
     double fill = 0.0;
     const int fields = sscanf(
         line,
-        "%u,%u,%u,%u,%u,%u,%31[^,],%u,%u,%u,%u,%u,%u,%u,%lf",
+        "%u,%u,%u,%u,%u,%u,%31[^,],%u,%u,%u,%u,%u,%u,%u,%u,%lf",
         &logical, &physical, &sequence, &layer, &token_offset, &n_tokens,
         ownership, &owner_base, &owner_count, &selected_slots, &pair_count,
-        &tile_count, &active_experts, &padded_slots, &fill);
-    if (fields != 15) {
+        &tile_count, &slot_count, &active_experts, &padded_slots, &fill);
+    if (fields != 16) {
         fprintf(stderr, "error: malformed tile-audit row: %s", line);
         return 0;
     }
@@ -283,6 +283,7 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec) {
     if (layer != spec->layer || token_offset != 0u || n_tokens != 512u ||
         owner_base != 0u || owner_count != 128u ||
         pair_count != spec->owned_pairs || tile_count != spec->tile16_count ||
+        slot_count != spec->tile16_count * 16u ||
         active_experts != spec->active_experts || padded_slots != expected_padding) {
         fprintf(stderr,
                 "error: tile audit mismatch layer=%u tokens=%u pairs=%u "
@@ -579,12 +580,19 @@ int main(int argc, char **argv) {
     (void)setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 1);
     (void)unsetenv("DS4_CUDA_NO_Q8_MMA");
     (void)unsetenv("DS4_CUDA_NO_Q8_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_Q8_MMA_SM75_TOK16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_EXPERT_TILES");
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
     (void)unsetenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
     (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW2048");
