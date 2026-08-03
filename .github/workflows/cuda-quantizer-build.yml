@@ -13,11 +13,13 @@ on:
       - "speed-bench/cuda-prefill-audit.sh"
       - "speed-bench/cuda-prefill-deep-audit.sh"
       - "speed-bench/cuda-q4-prefill-evidence.sh"
+      - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-prefill-placement.py"
       - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
+      - "tests/cuda_sm75_profile_harness.c"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
@@ -39,7 +41,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools
@@ -48,6 +50,7 @@ jobs:
           bash -n speed-bench/cuda-prefill-audit.sh
           bash -n speed-bench/cuda-prefill-deep-audit.sh
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
+          bash -n speed-bench/cuda-sm75-kernel-profile.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py

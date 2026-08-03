@@ -101,46 +101,12 @@ the resume run or change the NVIDIA driver profiling-permission policy.
 
 ### Full-Q4 SM75 evidence pass
 
-`cuda-q4-prefill-evidence.sh` keeps measurement and diagnostics separate. It
-runs the fixed prompt suite once on the untouched 22/21 production path, then
-uses independent processes for Q8-cache coverage, Nsight Systems runtime
-branch coverage, and Nsight Compute replay. The Q8 audit records every
-Q8-to-F16 cache attempt, including the layer/module context, device, hit/fill
-or native-Q8 result, reason, and cache high-water mark. It then selects two
-actual native-Q8 projections as the dense-kernel profiler targets; launch
-indices are not guessed.
-
-The Q4 gate/up captures are scoped by layer and token offset through the CUDA
-profiler API and filtered to the SM75 tile8 kernel. The dense-Q8 captures use
-the same scope plus the audit-selected module and verify that the projection
-was still uncached in the profiling process. Each targeted scope verifies that
-the graph is already on the requested physical GPU and synchronizes that
-context before closing, so an asynchronously queued kernel cannot fall outside
-the profiler range.
-
-Nsight Compute uses **application replay**, a file-backed replay buffer, and a
-focused metric list by default. It never uses kernel replay for this model.
-Kernel replay snapshots every allocation accessible to the selected kernel;
-with a fully resident 153 GiB model that can spill tens of GiB per pass into
-host memory and make Linux unresponsive without producing an OOM kill. The
-focused set records duration, launch resources, achieved occupancy, eligible
-warps, IMMA utilization, DRAM/L1/L2 activity and hit rates, and the relevant
-scoreboard/MIO stalls. `NCU_SET=targeted` and `NCU_SET=full` remain explicit,
-slower opt-ins, but also use application replay.
-
-The profiler follows the full application-replay process tree. Although DS4
-does not fork, Nsight reports at runtime that the CUDA kernels were launched by
-a child process when `application-only` is selected on this system. No positive
-process-name filter is applied. Hidden Nsight configuration is disabled. Before
-collecting the full metric set, two one-duration-metric early-Q4 preflights isolate the
-instrumentation boundary. The first disables profiler Start/Stop handling,
-which profiles from process launch; it proves that application replay can attach
-and capture the first matching Q4 gate/up kernel. The second uses the production
-targeted API range and additionally proves range entry and exit plus
-physical-device selection. Every full capture must then contain the same DS4
-markers and exactly one raw report row matching the requested kernel, physical
-device, process, and duration metric. A zero-kernel warning or header-only
-report is a hard failure.
+`cuda-q4-prefill-evidence.sh` runs the fixed prompt suite on the untouched
+22/21 production path, records every Q8-to-F16 cache decision, and captures an
+Nsight Systems runtime trace. Full-model Nsight Compute is disabled: replaying
+the 153.33 GiB four-GPU process either requires an unsafe kernel checkpoint or
+relaunches a heavyweight application whose attachment boundary was not
+reliable on the test system.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -152,36 +118,36 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 Replace the example `MODEL` value with the exact full-Q4 file on the machine.
 The script rejects a missing model rather than searching for one implicitly.
-Set `PROMPT_MANIFEST` to reuse the fixed multi-prompt suite. Set
-`NCU_USE_SUDO=1` if performance counters require administrative access. As
-with the deep audit, partial results are archived on failure. Resume only the
-Compute captures while preserving the completed benchmark, cache audit, and
-Systems trace with:
+Set `PROMPT_MANIFEST` to reuse the fixed multi-prompt suite. Partial results
+are archived on failure. `RUN_NCU` must remain zero.
+
+Use `cuda-sm75-kernel-profile.sh` for Nsight Compute. It links only the CUDA
+backend, opens no model file, launches no helper processes, and has no DS4 CLI
+instance lock. Its Q4 scenarios allocate exactly 128 resident experts at the
+production 4096->2048->4096 dimensions. The harness hard-caps predicted device
+state at 3 GiB and confirms the 1.69 GiB Q4 weights were copied into VRAM. The
+early and late synthetic assignments reproduce the recorded pair count,
+active-expert count, and tile16 count; the generated per-expert histogram is
+explicitly synthetic because the prior audit did not retain that histogram.
+
+The dense-Q8 scenarios use the two native production shapes selected by the
+full-Q4 cache audit: attention 4096x1024 and shared-down 2048x4096, both at the
+512-token runtime microchunk. A small Q8 kernel-replay capture validates
+counter permissions, attachment, kernel filtering, and report export before
+either Q4 capture begins. The focused metric set records duration, launch
+resources, achieved occupancy, eligible warps, IMMA utilization, DRAM/L1/L2
+activity and hit rates, and long-scoreboard/MIO stalls.
 
 ```bash
 cd ~/ds4-iq2-q4
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
-export Q4_EVIDENCE_DIR="$PWD/q4-prefill-evidence-20260803T005438Z"
-
-SKIP_BUILD=0 \
-SKIP_BASELINE=1 \
-SKIP_COVERAGE=1 \
-RUN_NSYS=0 \
-RUN_NCU=1 \
-NCU_SET=focused \
 NCU_USE_SUDO=1 \
-./speed-bench/cuda-q4-prefill-evidence.sh
+./speed-bench/cuda-sm75-kernel-profile.sh
 ```
 
-On resume, the script validates the model, prompt suite, device order, context
-settings, and profiler frontier against the original `manifest.txt`. It keeps
-that file intact, writes a timestamped resume manifest for the new commit, and
-atomically marks `run-status.txt` as `state=running` before profiling. Only
-`state=finished`, `exit_status=0`, and `last_phase=complete` together indicate
-a complete archive. `RUN_NSYS=0` skips the Systems phase independently; it does
-not require a report from an earlier attempt when only Compute capture is being
-resumed.
+Set `PROFILE_GPU` to choose the physical SM75 device. The script exposes only
+that GPU to the harness, where it becomes logical device zero, and validates
+every report against the harness process, device, kernel name, and positive
+duration. `NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
 
 ### SM80 to SM75 dispatch and resource audit
 

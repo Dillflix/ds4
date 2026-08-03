@@ -7,10 +7,11 @@ Capture the next full-Q4 SM75 evidence pass without changing production
 dispatch:
   1. fixed production prefill benchmark and Nsight Systems branch trace;
   2. complete Q8->F16 cache decision coverage for the first frontier;
-  3. Nsight Compute on early/late Q4 gate/up tile8;
-  4. Nsight Compute on two proven-uncached dense-Q8 projections selected
-     from the cache audit (one attention and one shared projection when
-     available).
+  3. Nsight Systems branch coverage.
+
+Full-model Nsight Compute replay is intentionally disabled. Use
+speed-bench/cuda-sm75-kernel-profile.sh, which profiles the same production
+kernels through a bounded single-GPU harness without loading the GGUF.
 
 Required environment:
   MODEL=/absolute/path/to/full-Q4.gguf
@@ -35,7 +36,7 @@ Optional environment:
   NCU_SET=focused           focused, targeted, or full
   NCU_USE_SUDO=0            run ncu through sudo -E
   RUN_NSYS=1
-  RUN_NCU=1
+  RUN_NCU=0                  must remain 0; use the bounded kernel harness
   SKIP_BUILD=0
   SKIP_BASELINE=0
   SKIP_COVERAGE=0           reuse coverage files in Q4_EVIDENCE_DIR
@@ -66,7 +67,7 @@ LATE_LAYER=${LATE_LAYER:-36}
 NCU_SET=${NCU_SET:-focused}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 RUN_NSYS=${RUN_NSYS:-1}
-RUN_NCU=${RUN_NCU:-1}
+RUN_NCU=${RUN_NCU:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 SKIP_BASELINE=${SKIP_BASELINE:-0}
 SKIP_COVERAGE=${SKIP_COVERAGE:-0}
@@ -88,6 +89,8 @@ for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD SKIP_BASELINE SKIP_COVERAGE
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+[[ $RUN_NCU == 0 ]] ||
+    die "full-model Nsight Compute is disabled; run speed-bench/cuda-sm75-kernel-profile.sh"
 IFS=',' read -r -a gpu_devices <<<"$GPU_DEVICES"
 (( ${#gpu_devices[@]} == 4 )) || die "this evidence pass requires four GPU devices"
 
