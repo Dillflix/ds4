@@ -160,6 +160,10 @@ if [[ $SKIP_BUILD == 0 ]]; then
     ./tests/test_engine_mgpu_placement
 fi
 [[ -x ./ds4-bench ]] || die "ds4-bench is missing"
+if [[ $RUN_NCU == 1 ]] &&
+   ! LC_ALL=C grep -aFq 'DS4_CUDA_NCU_TARGET_DEVICE' ./ds4-bench; then
+    die "ds4-bench lacks the targeted CUDA profiler support; rerun with SKIP_BUILD=0"
+fi
 
 # Presence-based debug flags must be absent. The cache and 22/21 placement are
 # the production configuration being measured.
@@ -255,7 +259,8 @@ fi
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$PROFILE_TOKENS"
     printf 'ncu_set=%s\nncu_replay_mode=application\nncu_app_replay_buffer=file\n' "$NCU_SET"
     printf 'ncu_app_replay_match=grid\nncu_app_replay_mode=balanced\n'
-    printf 'ncu_target_processes=all\nncu_target_process_filter=ds4-bench\n'
+    printf 'ncu_target_processes=all\nncu_target_process_filter=none\n'
+    printf 'ncu_preflight=early_q4_duration_only\n'
     printf 'ncu_config_file=off\nncu_scope_device_verified=true\n'
     printf '\n[prompts]\n'
     for i in "${!prompt_paths[@]}"; do
@@ -346,11 +351,14 @@ fi
 
 ncu_capture() {
     local name=$1 device=$2 module=$3 layer=$4 pos=$5 kernel=$6
+    local capture_set=${7:-$NCU_SET}
     local base="$EVIDENCE_DIR/ncu/$name"
     local -a sections
-    if [[ $NCU_SET == full ]]; then
+    if [[ $capture_set == preflight ]]; then
+        sections=(--metrics gpu__time_duration.sum --disable-extra-suffixes)
+    elif [[ $capture_set == full ]]; then
         sections=(--set full)
-    elif [[ $NCU_SET == targeted ]]; then
+    elif [[ $capture_set == targeted ]]; then
         sections=(--section SpeedOfLight --section LaunchStats --section Occupancy
                   --section SchedulerStats --section WarpStateStats
                   --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
@@ -399,7 +407,7 @@ ncu_capture() {
     DS4_CUDA_NCU_TARGET_POS="$pos" DS4_CUDA_NCU_TARGET_DEVICE="$device" \
     DS4_CUDA_Q8_CACHE_AUDIT_CSV="$base-cache.csv" DS4_LOCK_FILE="$ncu_lock_file" \
         "${ncu_command[@]}" --config-file off --verbose \
-            --target-processes all --target-processes-filter ds4-bench \
+            --target-processes all \
             --devices "$device" \
             --filter-mode per-gpu --profile-from-start off \
             --kernel-name-base function --kernel-name "$kernel" \
@@ -468,6 +476,11 @@ if [[ $RUN_NCU == 1 ]]; then
         sudo -v
         ncu_command=(sudo -E "$ncu_bin")
     fi
+
+    printf 'Nsight Compute attachment preflight (one duration metric)...\n'
+    ncu_capture "preflight-early-layer${EARLY_LAYER}-q4-gate-up-tile8" \
+        "${gpu_devices[0]}" routed_moe "$EARLY_LAYER" 0 \
+        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*' preflight
 
     ncu_capture "early-layer${EARLY_LAYER}-q4-gate-up-tile8" \
         "${gpu_devices[0]}" routed_moe "$EARLY_LAYER" 0 \
