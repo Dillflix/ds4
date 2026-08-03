@@ -14,6 +14,7 @@ on:
       - "speed-bench/cuda-prefill-deep-audit.sh"
       - "speed-bench/cuda-q4-prefill-evidence.sh"
       - "speed-bench/cuda-sm75-kernel-profile.sh"
+      - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -21,6 +22,7 @@ on:
       - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
       - "tests/cuda_sm75_profile_harness.c"
+      - "tests/cuda_sm75_int4_mma.cu"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
@@ -42,7 +44,15 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+      - name: Verify packed-INT4 SM75 instructions
+        run: |
+          cuobjdump --list-elf tests/cuda_sm75_int4_mma | grep -Eqi 'sm_?75'
+          cuobjdump --dump-sass tests/cuda_sm75_int4_mma > /tmp/sm75-int4.sass
+          grep -q 'Function : sm75_q4_i8_standard_kernel' /tmp/sm75-int4.sass
+          grep -q 'Function : sm75_q4_i4_mixed_standard_kernel' /tmp/sm75-int4.sass
+          grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' /tmp/sm75-int4.sass
+          grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' /tmp/sm75-int4.sass
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools
@@ -52,6 +62,7 @@ jobs:
           bash -n speed-bench/cuda-prefill-deep-audit.sh
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
+          bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
           bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py

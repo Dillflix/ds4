@@ -184,6 +184,63 @@ templates. It deliberately repeats T64/T128 because changes to the common Q8
 loader can change every template's memory instruction stream.
 `NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
 
+### SM75 packed-INT4 Q4 experiment
+
+`cuda-sm75-int4-mma-experiment.sh` is a bounded, model-free screening
+experiment for the current Q4 nibble-to-INT8 path. Each warp computes a
+16-token by 8-output tile over K=256, reusing each B fragment across two
+8-token MMA tiles; eight independent warps run in each 256-thread CTA. It
+compares six alternatives:
+
+- the shipping-style two-`m8n8k16` INT8 baseline;
+- direct `m8n8k32` INT4 with runtime packing from standard Q8/Q4 bytes;
+- standard Q8 with a same-row, block-local `group32` Q4 layout;
+- an MMA-native, size-neutral Q4 code-payload layout;
+- size-neutral MMA-native Q8/Q4 value payloads (an idealized upper bound);
+- an all-u4 correction formulation retained as a measured reference.
+
+The preferred decomposition is `a_s8 = low_u4 + 16*high_s4`, so it uses one
+`u4 x u4` and one `s4 x u4` MMA without introducing another zero-point term.
+The harness proves only the scaled integer component
+`sum_j scale_j * sum_k(a_k * q_k)`. It does not exercise Q4_K `d`, `dmin`,
+packed scale/min decoding, the Q8_K scale and `bsums`, the minimum correction,
+or the production floating-point accumulation order.
+
+The measurements screen three narrower questions: hot-cache instruction
+economics, streaming/layout economics, and whether a native packing is worth a
+production-shaped prototype. The script runs both a 16-weight-case hot test and
+a 16,384-weight-case streaming-size test (more than 17 MiB of uniquely touched
+Q4 payload/scale data, versus the RTX 8000's 6 MiB L2) while keeping
+activations in an independent 16-case hot set. Variant order is rotated and
+reversed across nine rounds; the summary reports the median and range rather
+than a single fixed-order sample.
+Native-Q8 (`native-A`) results are an optimistic upper bound because the
+benchmark starts after the 16-token transpose and nibble-plane transformation;
+that recurring transformation cost is excluded.
+The all-u4 alternative also needs one 16-bit weight sum per 32-value subgroup,
+increasing a full Q4_K block from 144 to 160 bytes (+11.1%) unless those sums
+are recomputed at runtime.
+
+The experiment confirms emitted 8x8x32 IMMA instructions, runs Compute
+Sanitizer when installed, benchmarks every layout, and captures focused Nsight
+metrics. It never opens a GGUF or changes production dispatch. Before any
+dispatch change, the winning idea still requires production-shaped gate/up and
+down prototypes plus a full, bitwise Q4_K x Q8_K regression covering headers,
+minimum correction, multiple blocks, and the production float reduction order.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-int4-mma-experiment.sh
+```
+
+Return the generated `sm75-int4-mma-<timestamp>.tar.gz`. These results can
+reject unattractive layouts, but cannot by themselves justify production
+dispatch.
+
 ### Comprehensive stock-Q2 and remaining-kernel pass
 
 `cuda-sm75-comprehensive-audit.sh` combines the full stock-Q2 production pass
