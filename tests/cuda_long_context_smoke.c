@@ -89,7 +89,7 @@ static int check_sm75_q8_mma_exact_case(uint32_t in_dim,
             first++;
         }
         fprintf(stderr,
-                "sm75 q8 mma mismatch at %zu: reference=%g candidate=%g\n",
+                "sm75 q8 mma mismatch at %zu: reference=%a candidate=%a\n",
                 first, (double)reference[first], (double)candidate[first]);
         goto cleanup;
     }
@@ -278,7 +278,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
             first++;
         }
         fprintf(stderr,
-                "sm75 iq2 moe mma mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 iq2 moe mma mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
@@ -309,7 +309,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                    memcmp(reference + first, candidate + first,
                           sizeof(float)) == 0) first++;
             fprintf(stderr,
-                    "sm75 iq2 %s mismatch at %llu: reference=%g candidate=%g\n",
+                    "sm75 iq2 %s mismatch at %llu: reference=%a candidate=%a\n",
                     stage_name[variant], (unsigned long long)first,
                     (double)reference[first], (double)candidate[first]);
             goto cleanup;
@@ -337,7 +337,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                    memcmp(reference + first, candidate + first,
                           sizeof(float)) == 0) first++;
             fprintf(stderr,
-                    "sm75 iq2 %s scalar mismatch at %llu: reference=%g candidate=%g\n",
+                    "sm75 iq2 %s scalar mismatch at %llu: reference=%a candidate=%a\n",
                     stage_name[variant], (unsigned long long)first,
                     (double)reference[first], (double)candidate[first]);
             goto cleanup;
@@ -364,7 +364,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                memcmp(reference + first, candidate + first,
                       sizeof(float)) == 0) first++;
         fprintf(stderr,
-                "sm75 iq2 tile16 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 iq2 tile16 scalar mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
@@ -391,7 +391,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                memcmp(reference + first, candidate + first,
                       sizeof(float)) == 0) first++;
         fprintf(stderr,
-                "sm75 iq2 tile8 mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 iq2 tile8 mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
@@ -417,7 +417,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                memcmp(reference + first, candidate + first,
                       sizeof(float)) == 0) first++;
         fprintf(stderr,
-                "sm75 iq2 tile8 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 iq2 tile8 scalar mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
@@ -448,7 +448,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                memcmp(reference + first, candidate + first,
                       sizeof(float)) == 0) first++;
         fprintf(stderr,
-                "sm75 iq2 mixed-tail scalar mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 iq2 mixed-tail scalar mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)reference[first], (double)candidate[first]);
         goto cleanup;
@@ -490,7 +490,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
             first++;
         }
         fprintf(stderr,
-                "sm75 q4 down tile16 mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 q4 down tile16 mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)down_reference[first],
                 (double)down_candidate[first]);
@@ -518,7 +518,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                memcmp(down_candidate + first, down_reference + first,
                       sizeof(float)) == 0) first++;
         fprintf(stderr,
-                "sm75 q4 down tile16 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                "sm75 q4 down tile16 scalar mismatch at %llu: reference=%a candidate=%a\n",
                 (unsigned long long)first,
                 (double)down_candidate[first],
                 (double)down_reference[first]);
@@ -568,7 +568,7 @@ static int compare_exact_f32(const char *label, const float *reference,
     while (first < count &&
            memcmp(reference + first, candidate + first,
                   sizeof(float)) == 0) first++;
-    fprintf(stderr, "%s mismatch at %llu: reference=%g candidate=%g\n",
+    fprintf(stderr, "%s mismatch at %llu: reference=%a candidate=%a\n",
             label, (unsigned long long)first,
             (double)reference[first], (double)candidate[first]);
     return 0;

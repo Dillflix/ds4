@@ -20,7 +20,8 @@ bash speed-bench/cuda-sm75-production-scalar.sh
 
 The default run rebuilds both harnesses with verbose PTXAS diagnostics,
 requires scalar kernels to have zero stack and spill bytes and no SASS
-`LDL`/`STL`, runs bitwise base-versus-scalar CUDA smoke checks, runs memcheck
+`LDL`/`STL`, preserves nonzero IMMA and the IQ2 fused slot updates, runs
+bitwise base-versus-scalar CUDA smoke checks, runs memcheck
 when available, and records two position-balanced samples for each early/late
 Q4 gate, Q4 down,
 IQ2 tile16, and IQ2 tile8 target. Each sample times ten production calls inside

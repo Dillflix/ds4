@@ -185,6 +185,7 @@ for target, variant, pattern in specs:
         body = "".join(text)
         sass_rows.append({"target": target, "variant": variant, "kernel": name,
                           "imma": len(re.findall(r"\bIMMA(?:\.|\b)", body)),
+                          "ffma": len(re.findall(r"\bFFMA\.FTZ(?:\.|\b)", body)),
                           "ldl": len(re.findall(r"\bLDL(?:\.|\b)", body)),
                           "stl": len(re.findall(r"\bSTL(?:\.|\b)", body))})
 with open(sass_out, "w", newline="", encoding="utf-8") as handle:
@@ -234,6 +235,18 @@ for target in names:
         failures.append(f"{target}: expected nonzero IMMA instructions (base={base_imma}, scalar={scalar_imma})")
     if base_imma != scalar_imma:
         failures.append(f"{target}: aggregate IMMA count differs")
+    if target.startswith("iq2-"):
+        base_ffma = sum(row["ffma"] for row in base)
+        scalar_ffma = sum(row["ffma"] for row in scalar)
+        missing_ffma = [row["kernel"] for row in scalar if row["ffma"] == 0]
+        if missing_ffma:
+            failures.extend(
+                f"{kernel}: scalar IQ2 specialization has no FFMA.FTZ"
+                for kernel in missing_ffma)
+        if base_ffma == 0 or scalar_ffma < base_ffma:
+            failures.append(
+                f"{target}: fused slot updates missing "
+                f"(base FFMA.FTZ={base_ffma}, scalar FFMA.FTZ={scalar_ffma})")
 if failures: raise SystemExit("scalar structural gate failed:\n  " + "\n  ".join(failures))
 print(f"validated {len(sass_rows)} SASS and {len(ptxas_rows)} PTXAS records")
 PY

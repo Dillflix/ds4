@@ -20988,6 +20988,39 @@ __device__ __forceinline__ static int32_t iq2_group_scale(
         } \
     } while (0)
 
+/* IQ2 array slots let nvcc contract the final scale multiplication and slot
+ * update into FFMA.FTZ.  Supplying the two factors separately preserves that
+ * exact rounding point after scalarization instead of emitting FMUL+FADD. */
+#define DS4_MOE_SCALAR_SLOT8X4_FMA(SLOT, P0, P1, P2, P3, A0, B0, A1, B1, A2, B2, A3, B3) \
+    do { \
+        switch (SLOT) { \
+        case 0: \
+            P0##0 = fmaf((A0), (B0), P0##0); P1##0 = fmaf((A1), (B1), P1##0); \
+            P2##0 = fmaf((A2), (B2), P2##0); P3##0 = fmaf((A3), (B3), P3##0); break; \
+        case 1: \
+            P0##1 = fmaf((A0), (B0), P0##1); P1##1 = fmaf((A1), (B1), P1##1); \
+            P2##1 = fmaf((A2), (B2), P2##1); P3##1 = fmaf((A3), (B3), P3##1); break; \
+        case 2: \
+            P0##2 = fmaf((A0), (B0), P0##2); P1##2 = fmaf((A1), (B1), P1##2); \
+            P2##2 = fmaf((A2), (B2), P2##2); P3##2 = fmaf((A3), (B3), P3##2); break; \
+        case 3: \
+            P0##3 = fmaf((A0), (B0), P0##3); P1##3 = fmaf((A1), (B1), P1##3); \
+            P2##3 = fmaf((A2), (B2), P2##3); P3##3 = fmaf((A3), (B3), P3##3); break; \
+        case 4: \
+            P0##4 = fmaf((A0), (B0), P0##4); P1##4 = fmaf((A1), (B1), P1##4); \
+            P2##4 = fmaf((A2), (B2), P2##4); P3##4 = fmaf((A3), (B3), P3##4); break; \
+        case 5: \
+            P0##5 = fmaf((A0), (B0), P0##5); P1##5 = fmaf((A1), (B1), P1##5); \
+            P2##5 = fmaf((A2), (B2), P2##5); P3##5 = fmaf((A3), (B3), P3##5); break; \
+        case 6: \
+            P0##6 = fmaf((A0), (B0), P0##6); P1##6 = fmaf((A1), (B1), P1##6); \
+            P2##6 = fmaf((A2), (B2), P2##6); P3##6 = fmaf((A3), (B3), P3##6); break; \
+        default: \
+            P0##7 = fmaf((A0), (B0), P0##7); P1##7 = fmaf((A1), (B1), P1##7); \
+            P2##7 = fmaf((A2), (B2), P2##7); P3##7 = fmaf((A3), (B3), P3##7); break; \
+        } \
+    } while (0)
+
 #define DS4_MOE_SCALAR_SLOT8_REDUCE(P, OUT) \
     do { \
         const float ds4_s0 = P##0 + P##4; \
@@ -21117,18 +21150,24 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
                 ui0 += iq2_group_scale(u0, j) * uc0;
                 ui1 += iq2_group_scale(u1, j) * uc1;
             }
-            const float vg0 = 0.125f * dev_f16_to_f32(g0->d) *
-                              sxq[mtok][b].d * (float)gi0;
-            const float vg1 = 0.125f * dev_f16_to_f32(g1->d) *
-                              sxq[mtok][b].d * (float)gi1;
-            const float vu0 = 0.125f * dev_f16_to_f32(u0->d) *
-                              sxq[mtok][b].d * (float)ui0;
-            const float vu1 = 0.125f * dev_f16_to_f32(u1->d) *
-                              sxq[mtok][b].d * (float)ui1;
             if (SCALAR_SLOTS) {
-                DS4_MOE_SCALAR_SLOT8X4_ADD(
-                    b & 7u, cg0, cg1, cu0, cu1, vg0, vg1, vu0, vu1);
+                const float ag0 = 0.125f * dev_f16_to_f32(g0->d) * sxq[mtok][b].d;
+                const float ag1 = 0.125f * dev_f16_to_f32(g1->d) * sxq[mtok][b].d;
+                const float au0 = 0.125f * dev_f16_to_f32(u0->d) * sxq[mtok][b].d;
+                const float au1 = 0.125f * dev_f16_to_f32(u1->d) * sxq[mtok][b].d;
+                DS4_MOE_SCALAR_SLOT8X4_FMA(
+                    b & 7u, cg0, cg1, cu0, cu1,
+                    ag0, (float)gi0, ag1, (float)gi1,
+                    au0, (float)ui0, au1, (float)ui1);
             } else {
+                const float vg0 = 0.125f * dev_f16_to_f32(g0->d) *
+                                  sxq[mtok][b].d * (float)gi0;
+                const float vg1 = 0.125f * dev_f16_to_f32(g1->d) *
+                                  sxq[mtok][b].d * (float)gi1;
+                const float vu0 = 0.125f * dev_f16_to_f32(u0->d) *
+                                  sxq[mtok][b].d * (float)ui0;
+                const float vu1 = 0.125f * dev_f16_to_f32(u1->d) *
+                                  sxq[mtok][b].d * (float)ui1;
                 const uint32_t sl = b & 7u;
                 sg0[sl] += vg0; sg1[sl] += vg1;
                 su0[sl] += vu0; su1[sl] += vu1;
@@ -21254,14 +21293,20 @@ __device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
         const float yd_b = have_b ? xb->d : 0.0f;
         const float wd0 = 0.125f * dev_f16_to_f32(w0->d);
         const float wd1 = 0.125f * dev_f16_to_f32(w1->d);
-        const float v0 = wd0 * yd_a * (float)ia0;
-        const float v1 = wd1 * yd_a * (float)ia1;
-        const float v2 = wd0 * yd_b * (float)ib0;
-        const float v3 = wd1 * yd_b * (float)ib1;
         if (SCALAR_SLOTS) {
-            DS4_MOE_SCALAR_SLOT8X4_ADD(
-                b & 7u, c0, c1, c2, c3, v0, v1, v2, v3);
+            const float a0 = wd0 * yd_a;
+            const float a1 = wd1 * yd_a;
+            const float a2 = wd0 * yd_b;
+            const float a3 = wd1 * yd_b;
+            DS4_MOE_SCALAR_SLOT8X4_FMA(
+                b & 7u, c0, c1, c2, c3,
+                a0, (float)ia0, a1, (float)ia1,
+                a2, (float)ib0, a3, (float)ib1);
         } else {
+            const float v0 = wd0 * yd_a * (float)ia0;
+            const float v1 = wd1 * yd_a * (float)ia1;
+            const float v2 = wd0 * yd_b * (float)ib0;
+            const float v3 = wd1 * yd_b * (float)ib1;
             const uint32_t sl = b & 7u;
             s0[sl] += v0; s1[sl] += v1;
             s2[sl] += v2; s3[sl] += v3;
@@ -22059,6 +22104,7 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
 }
 
 #undef DS4_MOE_SCALAR_SLOT8_REDUCE
+#undef DS4_MOE_SCALAR_SLOT8X4_FMA
 #undef DS4_MOE_SCALAR_SLOT8X4_ADD
 #undef DS4_MOE_SCALAR_SLOT8X4_DECLARE
 
