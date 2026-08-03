@@ -226,7 +226,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
         const int v = (int)((i * 23u + (i >> 5u) * 17u) % 257u) - 128;
         x_host[i] = (float)v / 133.0f;
     }
-    /* Counts 25,25,20,20,19,19: two true tile8 tails and four tile4 tails. */
+    /* Counts 25,25,20,20,19,19: two true tile8 tails and six tile4 tails. */
     const uint32_t cuts[6] = {25u, 50u, 70u, 90u, 109u, 128u};
     for (uint32_t t = 0; t < n_tokens; t++) {
         uint32_t e = 0u;
