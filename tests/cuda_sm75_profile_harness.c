@@ -13,10 +13,14 @@
 #define PROFILE_SAFETY_RESERVE (256ull * 1024ull * 1024ull)
 
 typedef enum {
-    SCENARIO_Q4_EARLY,
-    SCENARIO_Q4_LATE,
+    SCENARIO_MOE_Q4_EARLY,
+    SCENARIO_MOE_Q4_LATE,
+    SCENARIO_MOE_Q2_EARLY,
+    SCENARIO_MOE_Q2_LATE,
+    SCENARIO_Q8_Q_B,
     SCENARIO_Q8_ATTN,
     SCENARIO_Q8_SHARED,
+    SCENARIO_Q8_OUT_B,
 } scenario_kind;
 
 typedef struct {
@@ -32,12 +36,24 @@ typedef struct {
 
 static const scenario_spec scenarios[] = {
     {
-        "q4-early", SCENARIO_Q4_EARLY, 3u,
+        "q4-early", SCENARIO_MOE_Q4_EARLY, 3u,
         1879u, 99u, 183u, 4096u, 4096u,
     },
     {
-        "q4-late", SCENARIO_Q4_LATE, 36u,
+        "q4-late", SCENARIO_MOE_Q4_LATE, 36u,
         2186u, 76u, 189u, 4096u, 4096u,
+    },
+    {
+        "q2-early", SCENARIO_MOE_Q2_EARLY, 3u,
+        1879u, 99u, 183u, 4096u, 4096u,
+    },
+    {
+        "q2-late", SCENARIO_MOE_Q2_LATE, 36u,
+        2186u, 76u, 189u, 4096u, 4096u,
+    },
+    {
+        "q8-q-b", SCENARIO_Q8_Q_B, 9u,
+        0u, 0u, 0u, 1024u, 32768u,
     },
     {
         "q8-attn", SCENARIO_Q8_ATTN, 9u,
@@ -47,6 +63,10 @@ static const scenario_spec scenarios[] = {
         "q8-shared", SCENARIO_Q8_SHARED, 8u,
         0u, 0u, 0u, 2048u, 4096u,
     },
+    {
+        "q8-out-b", SCENARIO_Q8_OUT_B, 9u,
+        0u, 0u, 0u, 8192u, 4096u,
+    },
 };
 
 /* The host mapping must outlive ds4_gpu_cleanup even when a requested device
@@ -55,11 +75,12 @@ static unsigned char *model_storage;
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "Usage: %s q4-early|q4-late|q8-attn|q8-shared\n"
+            "Usage: %s q4-early|q4-late|q2-early|q2-late|"
+            "q8-q-b|q8-attn|q8-shared|q8-out-b\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
-            "DS4_PROFILE_AUDIT_CSV to preserve a Q4 tile-audit CSV.\n",
+            "DS4_PROFILE_AUDIT_CSV to preserve a routed-MoE tile-audit CSV.\n",
             argv0);
 }
 
@@ -131,7 +152,7 @@ static int build_owned_assignment(const scenario_spec *spec,
     }
     if (minimum_pairs > spec->owned_pairs ||
         spec->owned_pairs > spec->tile16_count * 16u) {
-        fprintf(stderr, "error: impossible Q4 aggregate constraints\n");
+        fprintf(stderr, "error: impossible routed-MoE aggregate constraints\n");
         free(fills); free(tile_units); free(counts);
         return 0;
     }
@@ -295,7 +316,7 @@ static int confirm_device_copy(uint64_t free_before, uint64_t free_after,
     return 1;
 }
 
-static int run_q4(const scenario_spec *spec) {
+static int run_moe(const scenario_spec *spec, int q2_recipe) {
     const uint32_t n_tokens = 512u;
     const uint32_t n_expert = 6u;
     const uint32_t n_total_expert = 256u;
@@ -303,9 +324,15 @@ static int run_q4(const scenario_spec *spec) {
     const uint32_t in_dim = 4096u;
     const uint32_t mid_dim = 2048u;
     const uint32_t out_dim = 4096u;
-    const uint64_t gate_row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+    const uint32_t gate_type = q2_recipe ? 16u : 12u;
+    const uint32_t down_type = q2_recipe ? 10u : 12u;
+    const uint64_t gate_block_bytes = q2_recipe ? 66u : 144u;
+    const uint64_t down_block_bytes = q2_recipe ? 84u : 144u;
+    const uint64_t gate_row_bytes =
+        (uint64_t)(in_dim / 256u) * gate_block_bytes;
     const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = (uint64_t)(mid_dim / 256u) * 144u;
+    const uint64_t down_row_bytes =
+        (uint64_t)(mid_dim / 256u) * down_block_bytes;
     const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
     const uint64_t gate_offset = 0u;
     const uint64_t up_offset = gate_expert_bytes * resident_experts;
@@ -323,21 +350,27 @@ static int run_q4(const scenario_spec *spec) {
         !checked_add(&tensor_bytes, out_count * sizeof(float)) ||
         !checked_add(&tensor_bytes, mid_count * sizeof(float) * 3u) ||
         !checked_add(&tensor_bytes, down_count * sizeof(float))) {
-        fprintf(stderr, "error: Q4 tensor byte accounting overflow\n");
+        fprintf(stderr, "error: routed-MoE tensor byte accounting overflow\n");
         return 0;
     }
     const uint64_t predicted = model_bytes + tensor_bytes + PROFILE_SAFETY_RESERVE;
-    printf("scenario=%s\nprofile_kind=q4_gate_up_tile8\n"
+    printf("scenario=%s\nprofile_kind=%s\n"
+           "gate_type=%s\ndown_type=%s\n"
            "layer=%u\nn_tokens=%u\nresident_experts=%u\n"
            "model_bytes=%llu\ntensor_bytes=%llu\n"
            "predicted_device_bytes=%llu\ndevice_limit_bytes=%llu\n",
-           spec->name, spec->layer, n_tokens, resident_experts,
+           spec->name,
+           q2_recipe ? "iq2_gate_up_q2_down" : "q4_gate_up_q4_down",
+           q2_recipe ? "iq2_xxs" : "q4_k",
+           q2_recipe ? "q2_k" : "q4_k",
+           spec->layer, n_tokens, resident_experts,
            (unsigned long long)model_bytes,
            (unsigned long long)tensor_bytes,
            (unsigned long long)predicted,
            (unsigned long long)PROFILE_DEVICE_LIMIT);
     if (predicted > PROFILE_DEVICE_LIMIT) {
-        fprintf(stderr, "error: predicted Q4 state exceeds the 3 GiB ceiling\n");
+        fprintf(stderr,
+                "error: predicted routed-MoE state exceeds the 3 GiB ceiling\n");
         return 0;
     }
 
@@ -362,7 +395,7 @@ static int run_q4(const scenario_spec *spec) {
         remove_audit = 1;
     }
     if (!model || !x_host || !selected_host || !weights_host || !out_host) {
-        fprintf(stderr, "error: host allocation failed for Q4 harness\n");
+        fprintf(stderr, "error: host allocation failed for routed-MoE harness\n");
         goto cleanup;
     }
     for (uint64_t i = 0; i < x_count; i++) {
@@ -387,7 +420,8 @@ static int run_q4(const scenario_spec *spec) {
     mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     down = ds4_gpu_tensor_alloc(down_count * sizeof(float));
     if (!x || !selected || !weights || !out || !gate || !up || !mid || !down) {
-        fprintf(stderr, "error: device tensor allocation failed for Q4 harness\n");
+        fprintf(stderr,
+                "error: device tensor allocation failed for routed-MoE harness\n");
         goto cleanup;
     }
     if (!ds4_gpu_tensor_write(x, 0, x_host, x_count * sizeof(float)) ||
@@ -395,25 +429,25 @@ static int run_q4(const scenario_spec *spec) {
                               pair_count * sizeof(int32_t)) ||
         !ds4_gpu_tensor_write(weights, 0, weights_host,
                               pair_count * sizeof(float))) {
-        fprintf(stderr, "error: Q4 input upload failed\n");
+        fprintf(stderr, "error: routed-MoE input upload failed\n");
         goto cleanup;
     }
     const uint64_t free_before = ds4_gpu_tier_free_vram(0);
     if (!ds4_gpu_set_model_map(model, model_bytes) || !ds4_gpu_synchronize()) {
-        fprintf(stderr, "error: Q4 model device copy failed\n");
+        fprintf(stderr, "error: routed-MoE model device copy failed\n");
         goto cleanup;
     }
     const uint64_t free_after = ds4_gpu_tier_free_vram(0);
     if (!confirm_device_copy(free_before, free_after, model_bytes)) goto cleanup;
     if (!ds4_gpu_prefill_tile_audit_begin(8u)) {
-        fprintf(stderr, "error: could not start Q4 tile audit\n");
+        fprintf(stderr, "error: could not start routed-MoE tile audit\n");
         goto cleanup;
     }
     audit_started = 1;
     bool mid_is_f16 = false;
     if (!ds4_gpu_routed_moe_batch_owned_tensor(
             out, gate, up, mid, down, model, model_bytes,
-            gate_offset, up_offset, down_offset, 12u, 12u,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
             gate_expert_bytes, gate_row_bytes,
             down_expert_bytes, down_row_bytes,
             in_dim, mid_dim, out_dim,
@@ -421,7 +455,7 @@ static int run_q4(const scenario_spec *spec) {
             0u, resident_experts, 10.0f, x,
             spec->layer, n_tokens, 0u, &mid_is_f16) ||
         mid_is_f16 || !ds4_gpu_synchronize()) {
-        fprintf(stderr, "error: Q4 production kernel launch failed\n");
+        fprintf(stderr, "error: routed-MoE production kernel launch failed\n");
         goto cleanup;
     }
     if (!ds4_gpu_prefill_tile_audit_write_csv(audit_path) ||
@@ -549,6 +583,13 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_EXPERT_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_TILE16");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW1024");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW2048");
     (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW2048");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW1024");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW2048");
@@ -569,10 +610,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const int ok = (spec->kind == SCENARIO_Q4_EARLY ||
-                    spec->kind == SCENARIO_Q4_LATE)
-                       ? run_q4(spec)
-                       : run_q8(spec);
+    const int q4_moe = spec->kind == SCENARIO_MOE_Q4_EARLY ||
+                       spec->kind == SCENARIO_MOE_Q4_LATE;
+    const int q2_moe = spec->kind == SCENARIO_MOE_Q2_EARLY ||
+                       spec->kind == SCENARIO_MOE_Q2_LATE;
+    const int ok = q4_moe ? run_moe(spec, 0) :
+                   (q2_moe ? run_moe(spec, 1) : run_q8(spec));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;

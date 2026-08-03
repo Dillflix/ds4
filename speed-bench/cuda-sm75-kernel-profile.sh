@@ -3,21 +3,28 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Profile the exact SM75 Q4 gate/up and native dense-Q8 kernels through a
-bounded, single-GPU synthetic harness. No GGUF is opened.
+Profile the routed-expert and native dense-Q8 SM75 kernels through a bounded,
+single-GPU synthetic harness. No GGUF is opened.
 
-The four production-shape captures are:
+The production-shape scenarios are:
   q4-early   layer-3 aggregate: 1879 pairs, 99 active experts, 183 tile16
   q4-late    layer-36 aggregate: 2186 pairs, 76 active experts, 189 tile16
-  q8-attn    512 x (4096 -> 1024), native Q8 attention projection
-  q8-shared  512 x (2048 -> 4096), native Q8 shared-down projection
+  q2-early   same layer-3 routing, IQ2_XXS gate/up plus Q2_K down
+  q2-late    same layer-36 routing, IQ2_XXS gate/up plus Q2_K down
+  q8-q-b     T32:  512 x (1024 -> 32768), attention q_b
+  q8-shared  T64:  512 x (2048 -> 4096), shared down
+  q8-attn    T128: 512 x (4096 -> 1024), attention q_a
+  q8-out-b   T256: 512 x (8192 -> 4096), attention output b
 
 Optional environment:
   PROFILE_GPU=0             physical GPU to expose as logical device 0
   CUDA_ARCH=sm_75
   NCU_USE_SUDO=0            use sudo -E for restricted performance counters
   NCU_SET=focused           focused, targeted, or full
+  PROFILE_SET=all           all, remaining, experts, or q8
+                            remaining = Q2_K down plus Q8 T32/T256
   SKIP_BUILD=0
+  CREATE_ARCHIVE=1
   PROFILE_DIR=/absolute/output/directory
 EOF
 }
@@ -33,14 +40,20 @@ PROFILE_GPU=${PROFILE_GPU:-0}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 NCU_SET=${NCU_SET:-focused}
+PROFILE_SET=${PROFILE_SET:-all}
 SKIP_BUILD=${SKIP_BUILD:-0}
+CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 OUTPUT_DIR=${PROFILE_DIR:-$repo_dir/sm75-kernel-profile-$(date -u +%Y%m%dT%H%M%SZ)}
 
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be a physical GPU index"
 [[ $NCU_USE_SUDO == 0 || $NCU_USE_SUDO == 1 ]] || die "NCU_USE_SUDO must be 0 or 1"
 [[ $SKIP_BUILD == 0 || $SKIP_BUILD == 1 ]] || die "SKIP_BUILD must be 0 or 1"
+[[ $CREATE_ARCHIVE == 0 || $CREATE_ARCHIVE == 1 ]] || die "CREATE_ARCHIVE must be 0 or 1"
 [[ $NCU_SET == focused || $NCU_SET == targeted || $NCU_SET == full ]] ||
     die "NCU_SET must be focused, targeted, or full"
+[[ $PROFILE_SET == all || $PROFILE_SET == remaining ||
+   $PROFILE_SET == experts || $PROFILE_SET == q8 ]] ||
+    die "PROFILE_SET must be all, remaining, experts, or q8"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
 command -v ncu >/dev/null 2>&1 || die "Nsight Compute CLI (ncu) not found"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
@@ -75,12 +88,14 @@ finalize() {
         printf 'state=finished\nexit_status=%s\nlast_phase=%s\ndate_utc=%s\n' \
             "$status" "$current_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             >"$OUTPUT_DIR/run-status.txt"
-        local archive="$OUTPUT_DIR.tar.gz"
-        if tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
-                "$(basename "$OUTPUT_DIR")"; then
-            printf 'Archive to return: %s\n' "$archive"
-        else
-            status=1
+        if [[ $CREATE_ARCHIVE == 1 ]]; then
+            local archive="$OUTPUT_DIR.tar.gz"
+            if tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
+                    "$(basename "$OUTPUT_DIR")"; then
+                printf 'Archive to return: %s\n' "$archive"
+            else
+                status=1
+            fi
         fi
     fi
     exit "$status"
@@ -93,7 +108,8 @@ trap finalize EXIT
     printf 'profile_gpu_physical=%s\nprofile_gpu_logical=0\n' "$PROFILE_GPU"
     printf 'cuda_arch=%s\ncompute_capability=%s\nfree_mib_at_preflight=%s\n' \
         "$CUDA_ARCH" "$compute_cap" "$free_mib"
-    printf 'ncu_set=%s\nncu_replay_mode=kernel\n' "$NCU_SET"
+    printf 'ncu_set=%s\nncu_replay_mode=kernel\nprofile_set=%s\n' \
+        "$NCU_SET" "$PROFILE_SET"
     printf 'harness_device_limit_bytes=3221225472\nfull_model_loaded=false\n'
     printf 'ds4_cli_lock_linked=false\nhelper_processes=false\n'
     printf '\n[gpu]\n'
@@ -104,12 +120,18 @@ trap finalize EXIT
     printf '\n[git status]\n'; git status --short
 } >"$OUTPUT_DIR/manifest.txt"
 
-scenarios=(q4-early q4-late q8-attn q8-shared)
+case "$PROFILE_SET" in
+    all) scenarios=(q4-early q4-late q2-early q2-late
+                    q8-q-b q8-shared q8-attn q8-out-b) ;;
+    remaining) scenarios=(q2-early q2-late q8-q-b q8-out-b) ;;
+    experts) scenarios=(q4-early q4-late q2-early q2-late) ;;
+    q8) scenarios=(q8-q-b q8-shared q8-attn q8-out-b) ;;
+esac
 current_phase=harness-smoke
 for scenario in "${scenarios[@]}"; do
     printf 'Harness smoke: %s...\n' "$scenario"
     audit_env=()
-    if [[ $scenario == q4-* ]]; then
+    if [[ $scenario == q4-* || $scenario == q2-* ]]; then
         audit_env=("DS4_PROFILE_AUDIT_CSV=$OUTPUT_DIR/smoke/$scenario-tile-audit.csv")
     fi
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${audit_env[@]}" \
@@ -145,6 +167,8 @@ focused_metric_names=(
     sm__inst_issued.avg.per_cycle_active
     sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_active
     sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_elapsed
+    sm__inst_executed_pipe_ipa.avg.pct_of_peak_sustained_elapsed
+    sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_elapsed
     dram__bytes.sum.per_second
     dram__cycles_active.avg.pct_of_peak_sustained_elapsed
     l1tex__throughput.avg.pct_of_peak_sustained_active
@@ -154,6 +178,7 @@ focused_metric_names=(
     lts__t_sectors.avg.pct_of_peak_sustained_elapsed
     lts__t_sector_hit_rate.pct
     lts__t_sectors_lookup_miss.sum
+    lts__d_atomic_input_cycles_active.avg.pct_of_peak_sustained_elapsed
     smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio
     smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio
     smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio
@@ -162,6 +187,7 @@ focused_metrics=$(IFS=,; printf '%s' "${focused_metric_names[*]}")
 
 profile_one() {
     local name=$1 scenario=$2 kernel_regex=$3 capture_set=${4:-$NCU_SET}
+    local validation_regex=${5:-${kernel_regex#regex:}}
     local base="$OUTPUT_DIR/ncu/$name"
     local -a collection
     if [[ $capture_set == preflight ]]; then
@@ -207,7 +233,7 @@ profile_one() {
         die "could not import Nsight report: $base.ncu-rep"
     [[ -s $base.csv ]] || die "empty Nsight CSV: $base.csv"
     python3 speed-bench/validate-ncu-capture.py \
-        "$base.csv" "${kernel_regex#regex:}" 0 \
+        "$base.csv" "$validation_regex" 0 \
         --process cuda_sm75_profile_harness \
         >"$base-validation.txt" 2>&1 || {
             cat "$base-validation.txt" >&2 || true
@@ -220,17 +246,48 @@ profile_one() {
 # ~20 MiB q8-shared model/tensor state before any Q4 allocation is profiled.
 current_phase=nsight-preflight
 profile_one preflight-q8-shared q8-shared \
-    'regex:matmul_q8_0_mma_sm75_exact_kernel.*' preflight
+    'regex:matmul_q8_0_mma_sm75_exact_kernel.*' preflight \
+    'matmul_q8_0_mma_sm75_exact_kernel.*64'
 
 current_phase=nsight-focused
-profile_one early-layer3-q4-gate-up-tile8 q4-early \
-    'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*'
-profile_one late-layer36-q4-gate-up-tile8 q4-late \
-    'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*'
-profile_one attention-layer9-dense-q8 q8-attn \
-    'regex:matmul_q8_0_mma_sm75_exact_kernel.*'
-profile_one shared-layer8-dense-q8 q8-shared \
-    'regex:matmul_q8_0_mma_sm75_exact_kernel.*'
+if [[ $PROFILE_SET == all || $PROFILE_SET == experts ]]; then
+    profile_one early-layer3-q4-gate-up-tile8 q4-early \
+        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*'
+    profile_one late-layer36-q4-gate-up-tile8 q4-late \
+        'regex:moe_gate_up_mid_q4K_tile8_mma_kernel.*'
+    profile_one early-layer3-q4-down-tile16 q4-early \
+        'regex:moe_down_q4K_tile16_mma_sm75_kernel.*'
+    profile_one late-layer36-q4-down-tile16 q4-late \
+        'regex:moe_down_q4K_tile16_mma_sm75_kernel.*'
+    profile_one early-layer3-iq2-gate-up-tile16 q2-early \
+        'regex:moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*'
+    profile_one late-layer36-iq2-gate-up-tile16 q2-late \
+        'regex:moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*'
+fi
+if [[ $PROFILE_SET == all || $PROFILE_SET == experts ||
+      $PROFILE_SET == remaining ]]; then
+    profile_one early-layer3-q2-down-tile16 q2-early \
+        'regex:moe_down_expert_tile16_rowspan_kernel.*512.*'
+    profile_one late-layer36-q2-down-tile16 q2-late \
+        'regex:moe_down_expert_tile16_rowspan_kernel.*512.*'
+fi
+if [[ $PROFILE_SET == all || $PROFILE_SET == q8 ||
+      $PROFILE_SET == remaining ]]; then
+    profile_one attention-q-b-layer9-dense-q8-t32 q8-q-b \
+        'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+        'matmul_q8_0_mma_sm75_exact_kernel.*32'
+    if [[ $PROFILE_SET != remaining ]]; then
+        profile_one shared-layer8-dense-q8-t64 q8-shared \
+            'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+            'matmul_q8_0_mma_sm75_exact_kernel.*64'
+        profile_one attention-layer9-dense-q8-t128 q8-attn \
+            'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+            'matmul_q8_0_mma_sm75_exact_kernel.*128'
+    fi
+    profile_one attention-output-b-layer9-dense-q8-t256 q8-out-b \
+        'regex:matmul_q8_0_mma_sm75_exact_kernel.*' "$NCU_SET" \
+        'matmul_q8_0_mma_sm75_exact_kernel.*256'
+fi
 
 current_phase=complete
 printf 'Bounded SM75 kernel profile complete: %s\n' "$OUTPUT_DIR"

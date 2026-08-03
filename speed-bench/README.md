@@ -123,20 +123,22 @@ are archived on failure. `RUN_NCU` must remain zero.
 
 Use `cuda-sm75-kernel-profile.sh` for Nsight Compute. It links only the CUDA
 backend, opens no model file, launches no helper processes, and has no DS4 CLI
-instance lock. Its Q4 scenarios allocate exactly 128 resident experts at the
-production 4096->2048->4096 dimensions. The harness hard-caps predicted device
-state at 3 GiB and confirms the 1.69 GiB Q4 weights were copied into VRAM. The
-early and late synthetic assignments reproduce the recorded pair count,
-active-expert count, and tile16 count; the generated per-expert histogram is
-explicitly synthetic because the prior audit did not retain that histogram.
+instance lock. Its routed-expert scenarios allocate exactly 128 resident
+experts at the production 4096->2048->4096 dimensions. They cover Q4 gate/up,
+Q4 down, IQ2_XXS gate/up, and Q2_K down. The harness hard-caps predicted device
+state at 3 GiB and confirms the synthetic weight mapping was copied into VRAM.
+The early and late assignments reproduce the recorded pair count,
+active-expert count, and tile16 count; their per-expert histogram is explicitly
+synthetic because the prior audit did not retain that histogram.
 
-The dense-Q8 scenarios use the two native production shapes selected by the
-full-Q4 cache audit: attention 4096x1024 and shared-down 2048x4096, both at the
-512-token runtime microchunk. A small Q8 kernel-replay capture validates
+The dense-Q8 scenarios cover every production reduction template and the
+corresponding dominant shape: attention q_b T32 (1024x32768), shared-down T64
+(2048x4096), attention q_a T128 (4096x1024), and attention-output-b T256
+(8192x4096), all at the 512-token runtime microchunk. A small Q8 kernel-replay capture validates
 counter permissions, attachment, kernel filtering, and report export before
-either Q4 capture begins. The focused metric set records duration, launch
-resources, achieved occupancy, eligible warps, IMMA utilization, DRAM/L1/L2
-activity and hit rates, and long-scoreboard/MIO stalls.
+the main captures begin. The focused metric set records duration, launch
+resources, achieved occupancy, eligible warps, IMMA and integer-pipe activity,
+DRAM/L1/L2 activity and hit rates, atomic activity, and scoreboard/MIO stalls.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -147,7 +149,35 @@ NCU_USE_SUDO=1 \
 Set `PROFILE_GPU` to choose the physical SM75 device. The script exposes only
 that GPU to the harness, where it becomes logical device zero, and validates
 every report against the harness process, device, kernel name, and positive
-duration. `NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
+duration. `PROFILE_SET=remaining` captures only the previously missing Q2_K
+down and Q8 T32/T256 reports. `NCU_SET=targeted` or `NCU_SET=full` are slower
+opt-ins.
+
+### Comprehensive stock-Q2 and remaining-kernel pass
+
+`cuda-sm75-comprehensive-audit.sh` combines the full stock-Q2 production pass
+with the bounded missing-kernel captures. The production half runs the fixed
+prompt suite, records routed tile occupancy and every Q8-to-F16 cache decision,
+and generates an Nsight Systems kernel-time distribution. The NCU half opens no
+GGUF and profiles early/late Q2_K down plus the Q8 T32/T256 shapes. Partial
+results are archived if either half fails.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL_Q2="$PWD/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-comprehensive-audit.sh
+```
+
+The command deliberately names and exports the actual stock-Q2 file; neither
+script searches for a model or inherits the unrelated `MODEL` variable.
+Set `PROMPT_MANIFEST` for the fixed multi-prompt suite. Set `PROFILE_SET=all`
+to repeat all four routed-expert kernel families and all four native-Q8
+templates under one build instead of capturing only the remaining gaps.
 
 ### SM80 to SM75 dispatch and resource audit
 

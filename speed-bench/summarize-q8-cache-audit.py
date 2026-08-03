@@ -12,6 +12,13 @@ def main() -> int:
     parser.add_argument("input_csv", type=Path)
     parser.add_argument("summary_csv", type=Path)
     parser.add_argument("targets_tsv", type=Path)
+    parser.add_argument(
+        "--min-targets",
+        type=int,
+        choices=(0, 1, 2),
+        default=2,
+        help="minimum native-Q8 profiler targets required (default: 2)",
+    )
     args = parser.parse_args()
 
     with args.input_csv.open(newline="", encoding="utf-8") as handle:
@@ -80,8 +87,11 @@ def main() -> int:
             already.add(key)
             if len(selected) == 2:
                 break
-    if len(selected) < 2:
-        raise SystemExit("fewer than two profiled native-Q8 projection targets were found")
+    if len(selected) < args.min_targets:
+        raise SystemExit(
+            f"fewer than {args.min_targets} profiled native-Q8 projection "
+            "targets were found"
+        )
 
     with args.targets_tsv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
