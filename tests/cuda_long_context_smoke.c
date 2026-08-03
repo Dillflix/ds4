@@ -122,10 +122,15 @@ static int check_sm75_q8_mma_exact(void) {
 
 static int check_sm75_iq2_moe_mma_exact(void) {
     const uint32_t n_total_expert = 8;
-    const uint32_t n_expert = 6;
+    /* One selected expert per token isolates every final-output write.  The
+     * uneven populations below exercise full tile16 work plus tile8/tile4
+     * tails without introducing atomic-order ambiguity. */
+    const uint32_t n_expert = 1;
     const uint32_t n_tokens = 128;
     const uint32_t in_dim = 4096;
-    const uint32_t mid_dim = 256;
+    /* Production-width routed intermediate: eight Q4_K down blocks exercise
+     * every b&7 accumulator slot in both the array and scalar tile16 paths. */
+    const uint32_t mid_dim = 2048;
     const uint32_t out_dim = 256;
     const uint32_t gate_blocks = in_dim / 256u;
     const uint32_t down_blocks = mid_dim / 256u;
@@ -221,13 +226,13 @@ static int check_sm75_iq2_moe_mma_exact(void) {
         const int v = (int)((i * 23u + (i >> 5u) * 17u) % 257u) - 128;
         x_host[i] = (float)v / 133.0f;
     }
+    /* Counts 25,25,20,20,19,19: two true tile8 tails and four tile4 tails. */
+    const uint32_t cuts[6] = {25u, 50u, 70u, 90u, 109u, 128u};
     for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t s = 0; s < n_expert; s++) {
-            selected_host[(uint64_t)t * n_expert + s] =
-                (int32_t)((t * 3u + s) % n_total_expert);
-            weights_host[(uint64_t)t * n_expert + s] =
-                (float)(s + 1u) / 21.0f;
-        }
+        uint32_t e = 0u;
+        while (e < 5u && t >= cuts[e]) e++;
+        selected_host[t] = (int32_t)e;
+        weights_host[t] = (float)((t % 7u) + 1u) / 8.0f;
     }
     if (!ds4_gpu_tensor_write(x, 0, x_host, x_count * sizeof(float)) ||
         !ds4_gpu_tensor_write(selected, 0, selected_host,
@@ -291,7 +296,6 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                 &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(mid, 0, candidate,
                                  mid_count * sizeof(float))) goto cleanup;
-        (void)unsetenv(stage_env[variant]);
         if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
             uint64_t first = 0;
             while (first < mid_count &&
@@ -306,7 +310,147 @@ static int check_sm75_iq2_moe_mma_exact(void) {
         fprintf(stderr,
                 "cuda-regression: sm75 iq2 moe %s exact (%llu values)\n",
                 stage_name[variant], (unsigned long long)mid_count);
+
+        (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+        if (!ds4_gpu_routed_moe_batch_tensor(
+                out, gate, up, mid, down, model, model_bytes,
+                gate_offset, up_offset, down_offset, 16u, 12u,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+                &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(mid, 0, candidate,
+                                 mid_count * sizeof(float))) goto cleanup;
+        (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+        (void)unsetenv(stage_env[variant]);
+        if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
+            uint64_t first = 0;
+            while (first < mid_count &&
+                   memcmp(reference + first, candidate + first,
+                          sizeof(float)) == 0) first++;
+            fprintf(stderr,
+                    "sm75 iq2 %s scalar mismatch at %llu: reference=%g candidate=%g\n",
+                    stage_name[variant], (unsigned long long)first,
+                    (double)reference[first], (double)candidate[first]);
+            goto cleanup;
+        }
+        fprintf(stderr,
+                "cuda-regression: sm75 iq2 moe %s scalar exact (%llu values)\n",
+                stage_name[variant], (unsigned long long)mid_count);
     }
+
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(mid, 0, candidate,
+                             mid_count * sizeof(float))) goto cleanup;
+    if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < mid_count &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "sm75 iq2 tile16 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 iq2 moe tile16 scalar exact (%llu values)\n",
+            (unsigned long long)mid_count);
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+
+    (void)setenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(mid, 0, candidate,
+                             mid_count * sizeof(float))) goto cleanup;
+    if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < mid_count &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "sm75 iq2 tile8 mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 iq2 moe tile8 exact (%llu values)\n",
+            (unsigned long long)mid_count);
+
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(mid, 0, candidate,
+                             mid_count * sizeof(float))) goto cleanup;
+    if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < mid_count &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "sm75 iq2 tile8 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 iq2 moe tile8 scalar exact (%llu values)\n",
+            (unsigned long long)mid_count);
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
+
+    /* The mixed-tail tile16 route invokes the scalar tile8 specialization on
+     * the true 8-slot remainders and the existing tile4 kernel thereafter. */
+    (void)setenv("DS4_CUDA_MOE_MIXED_TAIL_TILES", "1", 1);
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(mid, 0, candidate,
+                             mid_count * sizeof(float))) goto cleanup;
+    if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < mid_count &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "sm75 iq2 mixed-tail scalar mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 iq2 moe mixed-tail tile8 scalar exact (%llu values)\n",
+            (unsigned long long)mid_count);
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
 
     (void)setenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75", "1", 1);
     if (!ds4_gpu_routed_moe_batch_tensor(
@@ -348,6 +492,36 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     fprintf(stderr,
             "cuda-regression: sm75 q4 down tile16 exact (%llu values)\n",
             (unsigned long long)out_count);
+
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, down, model, model_bytes,
+            gate_offset, up_offset, down_offset, 16u, 12u,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, 10.0f, x, 0u, n_tokens,
+            &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, down_reference,
+                             out_count * sizeof(float))) goto cleanup;
+    if (memcmp(down_candidate, down_reference,
+               out_count * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < out_count &&
+               memcmp(down_candidate + first, down_reference + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "sm75 q4 down tile16 scalar mismatch at %llu: reference=%g candidate=%g\n",
+                (unsigned long long)first,
+                (double)down_candidate[first],
+                (double)down_reference[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: sm75 q4 down tile16 scalar exact (%llu values)\n",
+            (unsigned long long)out_count);
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
     rc = 0;
 
 cleanup:
@@ -356,7 +530,9 @@ cleanup:
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -502,6 +678,15 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
      ds4_gpu_tensor_read(out, 0, OUT_DST, out_count * sizeof(float)))
 
     if (!RUN_Q4_Q2_TARGET(mid_reference, out_reference)) goto cleanup;
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "1", 1);
+    if (!RUN_Q4_Q2_TARGET(mid_candidate, out_candidate) ||
+        !compare_exact_f32("sm75 q4 gate tile8 scalar", mid_reference,
+                           mid_candidate, mid_count) ||
+        !compare_exact_f32("sm75 q4 gate tile8 scalar output", out_reference,
+                           out_candidate, out_count)) goto cleanup;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    fprintf(stderr, "cuda-regression: sm75 q4 gate tile8 scalar exact\n");
+
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75", "1", 1);
     if (!RUN_Q4_Q2_TARGET(mid_candidate, out_candidate) ||
         !compare_exact_f32("sm75 q4 gate stage6", mid_reference,
@@ -530,11 +715,24 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
         !compare_exact_f32("sm75 mixed tails output", out_reference,
                            out_candidate, out_count)) goto cleanup;
     fprintf(stderr, "cuda-regression: sm75 expert 16/8/4 tails exact\n");
+
+    /* With Q4 tile16 and mixed tails held fixed, this flag changes only the
+     * standard-layout Q4 tile8 specialization used for true 8-slot tails. */
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "1", 1);
+    if (!RUN_Q4_Q2_TARGET(mid_candidate, out_candidate) ||
+        !compare_exact_f32("sm75 q4 mixed-tail scalar", mid_reference,
+                           mid_candidate, mid_count) ||
+        !compare_exact_f32("sm75 q4 mixed-tail scalar output", out_reference,
+                           out_candidate, out_count)) goto cleanup;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    fprintf(stderr,
+            "cuda-regression: sm75 q4 mixed-tail tile8 scalar exact\n");
     rc = 0;
 #undef RUN_Q4_Q2_TARGET
 
 cleanup:
     if (model && !retire_temporary_model_map()) rc = 1;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
@@ -769,6 +967,50 @@ cleanup:
 }
 
 int main(void) {
+    /* The regression owns the path and both halves of each new A/B.  Do not
+     * let a debug shell silently change tile width, row span, MMA eligibility,
+     * staging, or turn an array baseline into a scalar/scalar comparison. */
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_GATE_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_EXPERT_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_TILE4");
+    (void)unsetenv("DS4_CUDA_MOE_TILE8");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q2_DOWN_MMA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN");
+    (void)unsetenv("DS4_CUDA_MOE_ATOMIC_DOWN");
+    (void)unsetenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_TILE16");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW64");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW512");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW1024");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW64");
+    (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW1024");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
     if (!ds4_gpu_init()) {

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GIB (1024ull * 1024ull * 1024ull)
@@ -22,6 +23,14 @@ typedef enum {
     SCENARIO_Q8_SHARED,
     SCENARIO_Q8_OUT_B,
 } scenario_kind;
+
+typedef enum {
+    SCALAR_TARGET_NONE,
+    SCALAR_TARGET_Q4_GATE,
+    SCALAR_TARGET_Q4_DOWN,
+    SCALAR_TARGET_IQ2_TILE16,
+    SCALAR_TARGET_IQ2_TILE8,
+} scalar_target_kind;
 
 typedef struct {
     const char *name;
@@ -80,8 +89,70 @@ static void usage(const char *argv0) {
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
-            "DS4_PROFILE_AUDIT_CSV to preserve a routed-MoE tile-audit CSV.\n",
+            "DS4_PROFILE_AUDIT_CSV to preserve a routed-MoE tile-audit CSV.\n"
+            "Set DS4_PROFILE_SCALAR_TARGET to one of none, q4-gate, q4-down,\n"
+            "iq2-tile16, or iq2-tile8 to hold the production path fixed.\n"
+            "DS4_PROFILE_SCALAR=1 selects its scalar candidate; 0 selects\n"
+            "the array baseline. DS4_PROFILE_REPEATS times additional calls\n"
+            "after correctness/audit warmup (default 0, maximum 100).\n",
             argv0);
+}
+
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static int parse_env_u32(const char *name, uint32_t fallback,
+                         uint32_t maximum, uint32_t *value_out) {
+    const char *text = getenv(name);
+    if (!text || !text[0]) {
+        *value_out = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(text, &end, 10);
+    if (errno || end == text || *end != '\0' || value > maximum) return 0;
+    *value_out = (uint32_t)value;
+    return 1;
+}
+
+static int parse_scalar_target(const char *value,
+                               scalar_target_kind *target_out) {
+    if (!value || !value[0] || strcmp(value, "none") == 0) {
+        *target_out = SCALAR_TARGET_NONE;
+        return 1;
+    }
+    if (strcmp(value, "q4-gate") == 0) {
+        *target_out = SCALAR_TARGET_Q4_GATE;
+        return 1;
+    }
+    if (strcmp(value, "q4-down") == 0) {
+        *target_out = SCALAR_TARGET_Q4_DOWN;
+        return 1;
+    }
+    if (strcmp(value, "iq2-tile16") == 0) {
+        *target_out = SCALAR_TARGET_IQ2_TILE16;
+        return 1;
+    }
+    if (strcmp(value, "iq2-tile8") == 0) {
+        *target_out = SCALAR_TARGET_IQ2_TILE8;
+        return 1;
+    }
+    return 0;
+}
+
+static const char *scalar_target_name(scalar_target_kind target) {
+    switch (target) {
+        case SCALAR_TARGET_Q4_GATE: return "q4-gate";
+        case SCALAR_TARGET_Q4_DOWN: return "q4-down";
+        case SCALAR_TARGET_IQ2_TILE16: return "iq2-tile16";
+        case SCALAR_TARGET_IQ2_TILE8: return "iq2-tile8";
+        case SCALAR_TARGET_NONE: return "none";
+    }
+    return "invalid";
 }
 
 static const scenario_spec *find_scenario(const char *name) {
@@ -317,7 +388,8 @@ static int confirm_device_copy(uint64_t free_before, uint64_t free_after,
     return 1;
 }
 
-static int run_moe(const scenario_spec *spec, int q2_recipe) {
+static int run_moe(const scenario_spec *spec, int q2_recipe,
+                   uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint32_t n_expert = 6u;
     const uint32_t n_total_expert = 256u;
@@ -469,6 +541,37 @@ static int run_moe(const scenario_spec *spec, int q2_recipe) {
     }
     printf("output_values_checked=%llu\noutput_validation=exact-zero\n",
            (unsigned long long)out_count);
+    if (timed_repeats > 0u) {
+        ds4_gpu_prefill_tile_audit_end();
+        audit_started = 0;
+        const double start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (!ds4_gpu_routed_moe_batch_owned_tensor(
+                    out, gate, up, mid, down, model, model_bytes,
+                    gate_offset, up_offset, down_offset, gate_type, down_type,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    in_dim, mid_dim, out_dim,
+                    selected, weights, n_total_expert, n_expert,
+                    0u, resident_experts, 10.0f, x,
+                    spec->layer, n_tokens, 0u, &mid_is_f16) ||
+                mid_is_f16) {
+                fprintf(stderr,
+                        "error: routed-MoE timed production launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: routed-MoE timed synchronization failed\n");
+            goto cleanup;
+        }
+        const double elapsed_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        printf("timed_repeats=%u\ntimed_total_ms=%.6f\n"
+               "timed_per_call_ms=%.6f\n",
+               timed_repeats, elapsed_ms,
+               elapsed_ms / (double)timed_repeats);
+    }
     ok = 1;
 
 cleanup:
@@ -573,6 +676,45 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    scalar_target_kind scalar_target = SCALAR_TARGET_NONE;
+    const char *scalar_target_env = getenv("DS4_PROFILE_SCALAR_TARGET");
+    if (!parse_scalar_target(scalar_target_env, &scalar_target)) {
+        fprintf(stderr,
+                "error: invalid DS4_PROFILE_SCALAR_TARGET=%s; expected "
+                "none, q4-gate, q4-down, iq2-tile16, or iq2-tile8\n",
+                scalar_target_env ? scalar_target_env : "");
+        return 2;
+    }
+    uint32_t scalar_enabled = 0u, timed_repeats = 0u;
+    if (!parse_env_u32("DS4_PROFILE_SCALAR", 0u, 1u, &scalar_enabled)) {
+        fprintf(stderr, "error: DS4_PROFILE_SCALAR must be 0 or 1\n");
+        return 2;
+    }
+    if (!parse_env_u32("DS4_PROFILE_REPEATS", 0u, 100u,
+                       &timed_repeats)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_REPEATS must be an integer from 0 to 100\n");
+        return 2;
+    }
+    if (scalar_enabled && scalar_target == SCALAR_TARGET_NONE) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_SCALAR=1 requires a non-none target\n");
+        return 2;
+    }
+    const int q4_moe = spec->kind == SCENARIO_MOE_Q4_EARLY ||
+                       spec->kind == SCENARIO_MOE_Q4_LATE;
+    const int q2_moe = spec->kind == SCENARIO_MOE_Q2_EARLY ||
+                       spec->kind == SCENARIO_MOE_Q2_LATE;
+    const int scalar_q4 = scalar_target == SCALAR_TARGET_Q4_GATE ||
+                          scalar_target == SCALAR_TARGET_Q4_DOWN;
+    const int scalar_iq2 = scalar_target == SCALAR_TARGET_IQ2_TILE16 ||
+                           scalar_target == SCALAR_TARGET_IQ2_TILE8;
+    if ((scalar_q4 && !q4_moe) || (scalar_iq2 && !q2_moe)) {
+        fprintf(stderr,
+                "error: scalar target %s is incompatible with scenario %s\n",
+                scalar_target_name(scalar_target), spec->name);
+        return 2;
+    }
 
     /* Presence-based production switches are normalized inside the harness so
      * an inherited debug shell cannot silently select a different kernel. */
@@ -585,23 +727,65 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_EXPERT_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_TILE4");
+    (void)unsetenv("DS4_CUDA_MOE_TILE8");
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES");
+    (void)unsetenv("DS4_CUDA_MOE_NO_Q4_DOWN_ROWSPAN");
     (void)unsetenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
     (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_TILE16");
     (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_NO_DOWN_ROW64");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW512");
     (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW1024");
     (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW128");
+    (void)unsetenv("DS4_CUDA_MOE_DOWN_ROW64");
     (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_NO_GATE_ROW128");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW1024");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW2048");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW256");
+    (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    switch (scalar_target) {
+        case SCALAR_TARGET_Q4_GATE:
+            if (scalar_enabled)
+                (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "1", 1);
+            break;
+        case SCALAR_TARGET_Q4_DOWN:
+            if (scalar_enabled)
+                (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "1", 1);
+            break;
+        case SCALAR_TARGET_IQ2_TILE16:
+            if (scalar_enabled)
+                (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+            break;
+        case SCALAR_TARGET_IQ2_TILE8:
+            if (scalar_enabled)
+                (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "1", 1);
+            (void)setenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75", "1", 1);
+            break;
+        case SCALAR_TARGET_NONE:
+            break;
+    }
+    printf("scalar_target=%s\nscalar_enabled=%u\ntimed_repeats=%u\n",
+           scalar_target_name(scalar_target), scalar_enabled, timed_repeats);
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");
@@ -618,12 +802,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const int q4_moe = spec->kind == SCENARIO_MOE_Q4_EARLY ||
-                       spec->kind == SCENARIO_MOE_Q4_LATE;
-    const int q2_moe = spec->kind == SCENARIO_MOE_Q2_EARLY ||
-                       spec->kind == SCENARIO_MOE_Q2_LATE;
-    const int ok = q4_moe ? run_moe(spec, 0) :
-                   (q2_moe ? run_moe(spec, 1) : run_q8(spec));
+    const int ok = q4_moe ? run_moe(spec, 0, timed_repeats) :
+                   (q2_moe ? run_moe(spec, 1, timed_repeats) : run_q8(spec));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;

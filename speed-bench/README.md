@@ -1,5 +1,49 @@
 ## Benchmarking
 
+### Production scalar-slot evidence
+
+`cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver
+for scalar accumulator versions of the production SM75 Q4 gate/up, Q4 down,
+and IQ2 gate/up kernels. It reuses `cuda_long_context_smoke` for nonzero
+production correctness and `cuda_sm75_profile_harness` for the recorded layer-3
+and layer-36 routing shapes; it never opens a GGUF.
+
+The Q4 gate/up candidate deliberately consumes the existing standard GGUF
+layout.  That isolates the scalar-accumulator effect from native-weight
+packing, can be deployed without requantizing or transforming a model, and
+provides the production baseline needed to decide whether an offline native
+layout adds enough further benefit to justify its compatibility cost.
+
+```bash
+bash speed-bench/cuda-sm75-production-scalar.sh
+```
+
+The default run rebuilds both harnesses with verbose PTXAS diagnostics,
+requires scalar kernels to have zero stack and spill bytes and no SASS
+`LDL`/`STL`, runs bitwise base-versus-scalar CUDA smoke checks, runs memcheck
+when available, and records two position-balanced samples for each early/late
+Q4 gate, Q4 down,
+IQ2 tile16, and IQ2 tile8 target. Each sample times ten production calls inside
+the harness after an untimed correctness/audit warmup, excluding process setup.
+IQ2 tile8 remains selected in both halves of its A/B so only the scalar
+implementation changes. Set `TIMING_REPEATS` from 1 through 100 to change the
+bounded calls per sample.
+
+The default `TIMING_ROUNDS=2` is a quick, position-balanced pilot with two
+samples per variant, not enough evidence for a production acceptance decision.
+Increase it to a larger even value (for example `TIMING_ROUNDS=6`) for the
+acceptance run. The summary reports median scalar/base speedup, percent change,
+median absolute deviation, and coefficient of variation. Successful, failed,
+and interrupted runs archive all evidence collected so far unless
+`CREATE_ARCHIVE=0` is set.
+
+Exact per-kernel NCU capture is opt-in:
+
+```bash
+RUN_NCU=1 NCU_USE_SUDO=1 \
+  bash speed-bench/cuda-sm75-production-scalar.sh
+```
+
 ### SM75 next-target A/B suite
 
 `cuda-sm75-next-targets.sh` builds the CUDA regression binary, verifies every

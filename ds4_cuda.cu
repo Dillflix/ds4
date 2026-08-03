@@ -20959,12 +20959,50 @@ __device__ __forceinline__ static int32_t iq2_group_scale(
     return (int32_t)(2u * (aux1 >> 28u) + 1u);
 }
 
+/* Dynamically indexing eight float accumulation slots makes nvcc materialize
+ * the slots in thread-local memory on sm_75.  The scalar candidates below
+ * expand the same state into named registers and use a uniform switch.  The
+ * final reduction deliberately preserves quarter_warp_sum_f32's exact tree.
+ * These macros expand at the call site: no accumulator address can escape. */
+#define DS4_MOE_SCALAR_SLOT8X4_DECLARE(P0, P1, P2, P3) \
+    float P0##0 = 0.0f, P0##1 = 0.0f, P0##2 = 0.0f, P0##3 = 0.0f; \
+    float P0##4 = 0.0f, P0##5 = 0.0f, P0##6 = 0.0f, P0##7 = 0.0f; \
+    float P1##0 = 0.0f, P1##1 = 0.0f, P1##2 = 0.0f, P1##3 = 0.0f; \
+    float P1##4 = 0.0f, P1##5 = 0.0f, P1##6 = 0.0f, P1##7 = 0.0f; \
+    float P2##0 = 0.0f, P2##1 = 0.0f, P2##2 = 0.0f, P2##3 = 0.0f; \
+    float P2##4 = 0.0f, P2##5 = 0.0f, P2##6 = 0.0f, P2##7 = 0.0f; \
+    float P3##0 = 0.0f, P3##1 = 0.0f, P3##2 = 0.0f, P3##3 = 0.0f; \
+    float P3##4 = 0.0f, P3##5 = 0.0f, P3##6 = 0.0f, P3##7 = 0.0f
+
+#define DS4_MOE_SCALAR_SLOT8X4_ADD(SLOT, P0, P1, P2, P3, V0, V1, V2, V3) \
+    do { \
+        switch (SLOT) { \
+        case 0: P0##0 += (V0); P1##0 += (V1); P2##0 += (V2); P3##0 += (V3); break; \
+        case 1: P0##1 += (V0); P1##1 += (V1); P2##1 += (V2); P3##1 += (V3); break; \
+        case 2: P0##2 += (V0); P1##2 += (V1); P2##2 += (V2); P3##2 += (V3); break; \
+        case 3: P0##3 += (V0); P1##3 += (V1); P2##3 += (V2); P3##3 += (V3); break; \
+        case 4: P0##4 += (V0); P1##4 += (V1); P2##4 += (V2); P3##4 += (V3); break; \
+        case 5: P0##5 += (V0); P1##5 += (V1); P2##5 += (V2); P3##5 += (V3); break; \
+        case 6: P0##6 += (V0); P1##6 += (V1); P2##6 += (V2); P3##6 += (V3); break; \
+        default: P0##7 += (V0); P1##7 += (V1); P2##7 += (V2); P3##7 += (V3); break; \
+        } \
+    } while (0)
+
+#define DS4_MOE_SCALAR_SLOT8_REDUCE(P, OUT) \
+    do { \
+        const float ds4_s0 = P##0 + P##4; \
+        const float ds4_s1 = P##1 + P##5; \
+        const float ds4_s2 = P##2 + P##6; \
+        const float ds4_s3 = P##3 + P##7; \
+        (OUT) = (ds4_s0 + ds4_s2) + (ds4_s1 + ds4_s3); \
+    } while (0)
+
 /* SM75 IQ2_XXS gate/up prefill. Each warp computes an 8-token x 8-row
  * tile. IQ2 codebook values remain signed int8 MMA operands; the per-32
  * odd scale is applied to the integer result, before the block's float
  * scale, exactly as in dev_dot_iq2_xxs_q8_K_block8_deq_lut. The eight
  * float slots reproduce the scalar quarter-warp reduction order. */
-template <uint32_t ROW_SPAN>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
 __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
         float *gate_out,
         float *up_out,
@@ -21041,6 +21079,7 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
         float sg1[8] = {0,0,0,0,0,0,0,0};
         float su0[8] = {0,0,0,0,0,0,0,0};
         float su1[8] = {0,0,0,0,0,0,0,0};
+        DS4_MOE_SCALAR_SLOT8X4_DECLARE(cg0, cg1, cu0, cu1);
         for (uint32_t b = 0; b < xq_blocks; b++) {
             const cuda_block_iq2_xxs *g0 =
                 (const cuda_block_iq2_xxs *)(grow + (uint64_t)n0 * gate_row_bytes) + b;
@@ -21078,33 +21117,47 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
                 ui0 += iq2_group_scale(u0, j) * uc0;
                 ui1 += iq2_group_scale(u1, j) * uc1;
             }
-            const uint32_t sl = b & 7u;
-            sg0[sl] += 0.125f * dev_f16_to_f32(g0->d) *
-                       sxq[mtok][b].d * (float)gi0;
-            sg1[sl] += 0.125f * dev_f16_to_f32(g1->d) *
-                       sxq[mtok][b].d * (float)gi1;
-            su0[sl] += 0.125f * dev_f16_to_f32(u0->d) *
-                       sxq[mtok][b].d * (float)ui0;
-            su1[sl] += 0.125f * dev_f16_to_f32(u1->d) *
-                       sxq[mtok][b].d * (float)ui1;
+            const float vg0 = 0.125f * dev_f16_to_f32(g0->d) *
+                              sxq[mtok][b].d * (float)gi0;
+            const float vg1 = 0.125f * dev_f16_to_f32(g1->d) *
+                              sxq[mtok][b].d * (float)gi1;
+            const float vu0 = 0.125f * dev_f16_to_f32(u0->d) *
+                              sxq[mtok][b].d * (float)ui0;
+            const float vu1 = 0.125f * dev_f16_to_f32(u1->d) *
+                              sxq[mtok][b].d * (float)ui1;
+            if (SCALAR_SLOTS) {
+                DS4_MOE_SCALAR_SLOT8X4_ADD(
+                    b & 7u, cg0, cg1, cu0, cu1, vg0, vg1, vu0, vu1);
+            } else {
+                const uint32_t sl = b & 7u;
+                sg0[sl] += vg0; sg1[sl] += vg1;
+                su0[sl] += vu0; su1[sl] += vu1;
+            }
         }
         const uint32_t p = mtok;
         if (p < np) {
             const uint32_t rowa = row0 + n0;
             const uint32_t rowb = rowa + 1u;
             float gate2[2], up2[2];
-            float a0 = sg0[0] + sg0[4], a1 = sg0[1] + sg0[5];
-            float a2 = sg0[2] + sg0[6], a3 = sg0[3] + sg0[7];
-            gate2[0] = (a0 + a2) + (a1 + a3);
-            a0 = sg1[0] + sg1[4]; a1 = sg1[1] + sg1[5];
-            a2 = sg1[2] + sg1[6]; a3 = sg1[3] + sg1[7];
-            gate2[1] = (a0 + a2) + (a1 + a3);
-            a0 = su0[0] + su0[4]; a1 = su0[1] + su0[5];
-            a2 = su0[2] + su0[6]; a3 = su0[3] + su0[7];
-            up2[0] = (a0 + a2) + (a1 + a3);
-            a0 = su1[0] + su1[4]; a1 = su1[1] + su1[5];
-            a2 = su1[2] + su1[6]; a3 = su1[3] + su1[7];
-            up2[1] = (a0 + a2) + (a1 + a3);
+            if (SCALAR_SLOTS) {
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cg0, gate2[0]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cg1, gate2[1]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cu0, up2[0]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cu1, up2[1]);
+            } else {
+                float a0 = sg0[0] + sg0[4], a1 = sg0[1] + sg0[5];
+                float a2 = sg0[2] + sg0[6], a3 = sg0[3] + sg0[7];
+                gate2[0] = (a0 + a2) + (a1 + a3);
+                a0 = sg1[0] + sg1[4]; a1 = sg1[1] + sg1[5];
+                a2 = sg1[2] + sg1[6]; a3 = sg1[3] + sg1[7];
+                gate2[1] = (a0 + a2) + (a1 + a3);
+                a0 = su0[0] + su0[4]; a1 = su0[1] + su0[5];
+                a2 = su0[2] + su0[6]; a3 = su0[3] + su0[7];
+                up2[0] = (a0 + a2) + (a1 + a3);
+                a0 = su1[0] + su1[4]; a1 = su1[1] + su1[5];
+                a2 = su1[2] + su1[6]; a3 = su1[3] + su1[7];
+                up2[1] = (a0 + a2) + (a1 + a3);
+            }
 #pragma unroll
             for (uint32_t e = 0; e < 2u; e++) {
                 const uint32_t row = e ? rowb : rowa;
@@ -21133,7 +21186,7 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
  * path while the decoded IQ2 fragment is live.  Six rows plus the lookup
  * tables fit below 32 KiB, allowing two CTAs/SM; four rows are retained as a
  * separately selectable occupancy/traffic experiment. */
-template <uint32_t STAGED_ROWS>
+template <uint32_t STAGED_ROWS, bool SCALAR_SLOTS = false>
 __device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
         const char *wrow,
         uint64_t row_bytes,
@@ -21155,6 +21208,7 @@ __device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
     float s1[8] = {0,0,0,0,0,0,0,0};
     float s2[8] = {0,0,0,0,0,0,0,0};
     float s3[8] = {0,0,0,0,0,0,0,0};
+    DS4_MOE_SCALAR_SLOT8X4_DECLARE(c0, c1, c2, c3);
     for (uint32_t b = 0; b < xq_blocks; b++) {
         const cuda_block_iq2_xxs *w0 =
             (const cuda_block_iq2_xxs *)(wrow + (uint64_t)n0 * row_bytes) + b;
@@ -21200,27 +21254,42 @@ __device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
         const float yd_b = have_b ? xb->d : 0.0f;
         const float wd0 = 0.125f * dev_f16_to_f32(w0->d);
         const float wd1 = 0.125f * dev_f16_to_f32(w1->d);
-        const uint32_t sl = b & 7u;
-        s0[sl] += wd0 * yd_a * (float)ia0;
-        s1[sl] += wd1 * yd_a * (float)ia1;
-        s2[sl] += wd0 * yd_b * (float)ib0;
-        s3[sl] += wd1 * yd_b * (float)ib1;
+        const float v0 = wd0 * yd_a * (float)ia0;
+        const float v1 = wd1 * yd_a * (float)ia1;
+        const float v2 = wd0 * yd_b * (float)ib0;
+        const float v3 = wd1 * yd_b * (float)ib1;
+        if (SCALAR_SLOTS) {
+            DS4_MOE_SCALAR_SLOT8X4_ADD(
+                b & 7u, c0, c1, c2, c3, v0, v1, v2, v3);
+        } else {
+            const uint32_t sl = b & 7u;
+            s0[sl] += v0; s1[sl] += v1;
+            s2[sl] += v2; s3[sl] += v3;
+        }
     }
-    float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
-    float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
-    r[0] = (a0 + a2) + (a1 + a3);
-    a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
-    a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
-    r[1] = (a0 + a2) + (a1 + a3);
-    a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
-    a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
-    r[2] = (a0 + a2) + (a1 + a3);
-    a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
-    a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
-    r[3] = (a0 + a2) + (a1 + a3);
+    if (SCALAR_SLOTS) {
+        DS4_MOE_SCALAR_SLOT8_REDUCE(c0, r[0]);
+        DS4_MOE_SCALAR_SLOT8_REDUCE(c1, r[1]);
+        DS4_MOE_SCALAR_SLOT8_REDUCE(c2, r[2]);
+        DS4_MOE_SCALAR_SLOT8_REDUCE(c3, r[3]);
+    } else {
+        float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
+        float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
+        r[0] = (a0 + a2) + (a1 + a3);
+        a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
+        a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
+        r[1] = (a0 + a2) + (a1 + a3);
+        a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
+        a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
+        r[2] = (a0 + a2) + (a1 + a3);
+        a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
+        a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
+        r[3] = (a0 + a2) + (a1 + a3);
+    }
 }
 
-template <uint32_t ROW_SPAN, uint32_t STAGED_ROWS>
+template <uint32_t ROW_SPAN, uint32_t STAGED_ROWS,
+          bool SCALAR_SLOTS = false>
 __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
         float *gate_out,
         float *up_out,
@@ -21297,10 +21366,10 @@ __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
             (uint64_t)expert * gate_expert_bytes +
             (uint64_t)row0 * gate_row_bytes;
         float gr[4], ur[4];
-        moe_iq2_tile16_mma_sm75_pass<STAGED_ROWS>(
+        moe_iq2_tile16_mma_sm75_pass<STAGED_ROWS, SCALAR_SLOTS>(
             grow, gate_row_bytes, &sxq[0][0], xq, s_tok, np, xq_blocks,
             lane, s_iq2_grid, s_iq2_signs, gr);
-        moe_iq2_tile16_mma_sm75_pass<STAGED_ROWS>(
+        moe_iq2_tile16_mma_sm75_pass<STAGED_ROWS, SCALAR_SLOTS>(
             urow, gate_row_bytes, &sxq[0][0], xq, s_tok, np, xq_blocks,
             lane, s_iq2_grid, s_iq2_signs, ur);
 #pragma unroll
@@ -21336,7 +21405,7 @@ __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
  * scalar expert-tile kernels (fuzz-verified). Requires sm_75+, 16B-aligned
  * expert tensors, and the staged activation-block counts (<=16 gate/up,
  * <=8 down). Rollback: DS4_CUDA_MOE_NO_Q4_MMA=1. */
-template <uint32_t ROW_SPAN>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
 __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
         float *gate_out,
         float *up_out,
@@ -21403,6 +21472,7 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
         /* per-element slot accumulators (2 elements x 8 slots) */
         float sg0[8] = {0,0,0,0,0,0,0,0}, sg1[8] = {0,0,0,0,0,0,0,0};
         float su0[8] = {0,0,0,0,0,0,0,0}, su1[8] = {0,0,0,0,0,0,0,0};
+        DS4_MOE_SCALAR_SLOT8X4_DECLARE(cg0, cg1, cu0, cu1);
         for (uint32_t b = 0; b < xq_blocks; b++) {
             /* headers for this thread's two C columns */
             const uint4 ghdr0 = *(const uint4 *)((const cuda_block_q4_K *)(grow + (uint64_t)n0 * gate_row_bytes) + b);
@@ -21456,15 +21526,26 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
             }
             /* float finish, exact dev_dot_q4_K_q8_K_block8 expression */
             const float yd = sxq[mtok][b].d;
-            const uint32_t sl = b & 7u;
-            sg0[sl] += yd * dev_f16_to_f32((uint16_t)(ghdr0.x & 0xffffu)) * (float)gi0 -
-                       yd * dev_f16_to_f32((uint16_t)(ghdr0.x >> 16u)) * (float)gs0;
-            sg1[sl] += yd * dev_f16_to_f32((uint16_t)(ghdr1.x & 0xffffu)) * (float)gi1 -
-                       yd * dev_f16_to_f32((uint16_t)(ghdr1.x >> 16u)) * (float)gs1;
-            su0[sl] += yd * dev_f16_to_f32((uint16_t)(uhdr0.x & 0xffffu)) * (float)ui0 -
-                       yd * dev_f16_to_f32((uint16_t)(uhdr0.x >> 16u)) * (float)us0;
-            su1[sl] += yd * dev_f16_to_f32((uint16_t)(uhdr1.x & 0xffffu)) * (float)ui1 -
-                       yd * dev_f16_to_f32((uint16_t)(uhdr1.x >> 16u)) * (float)us1;
+            const float vg0 =
+                yd * dev_f16_to_f32((uint16_t)(ghdr0.x & 0xffffu)) * (float)gi0 -
+                yd * dev_f16_to_f32((uint16_t)(ghdr0.x >> 16u)) * (float)gs0;
+            const float vg1 =
+                yd * dev_f16_to_f32((uint16_t)(ghdr1.x & 0xffffu)) * (float)gi1 -
+                yd * dev_f16_to_f32((uint16_t)(ghdr1.x >> 16u)) * (float)gs1;
+            const float vu0 =
+                yd * dev_f16_to_f32((uint16_t)(uhdr0.x & 0xffffu)) * (float)ui0 -
+                yd * dev_f16_to_f32((uint16_t)(uhdr0.x >> 16u)) * (float)us0;
+            const float vu1 =
+                yd * dev_f16_to_f32((uint16_t)(uhdr1.x & 0xffffu)) * (float)ui1 -
+                yd * dev_f16_to_f32((uint16_t)(uhdr1.x >> 16u)) * (float)us1;
+            if (SCALAR_SLOTS) {
+                DS4_MOE_SCALAR_SLOT8X4_ADD(
+                    b & 7u, cg0, cg1, cu0, cu1, vg0, vg1, vu0, vu1);
+            } else {
+                const uint32_t sl = b & 7u;
+                sg0[sl] += vg0; sg1[sl] += vg1;
+                su0[sl] += vu0; su1[sl] += vu1;
+            }
         }
         /* quarter_warp_sum_f32 order: ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)) */
         const uint32_t p = mtok;
@@ -21472,7 +21553,12 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
             const uint32_t rowa = row0 + n0;
             const uint32_t rowb = row0 + n0 + 1u;
             float gate2[2], up2[2];
-            {
+            if (SCALAR_SLOTS) {
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cg0, gate2[0]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cg1, gate2[1]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cu0, up2[0]);
+                DS4_MOE_SCALAR_SLOT8_REDUCE(cu1, up2[1]);
+            } else {
                 float a0 = sg0[0] + sg0[4], a1 = sg0[1] + sg0[5], a2 = sg0[2] + sg0[6], a3 = sg0[3] + sg0[7];
                 gate2[0] = (a0 + a2) + (a1 + a3);
                 a0 = sg1[0] + sg1[4]; a1 = sg1[1] + sg1[5]; a2 = sg1[2] + sg1[6]; a3 = sg1[3] + sg1[7];
@@ -21797,7 +21883,7 @@ __global__ static void moe_gate_up_mid_q4K_tile16_mma_sm75_kernel(
  * exact m8n8k16 operations for each 8-token half.  All 16 Q8_K activation
  * rows fit in shared memory for the shipping 2048-wide expert down input
  * (16 * 8 * 292 = 37,376 bytes). */
-template <uint32_t ROW_SPAN>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
 __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
         float *down_out,
         const char *down_base,
@@ -21861,6 +21947,7 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
         float s1[8] = {0,0,0,0,0,0,0,0};
         float s2[8] = {0,0,0,0,0,0,0,0};
         float s3[8] = {0,0,0,0,0,0,0,0};
+        DS4_MOE_SCALAR_SLOT8X4_DECLARE(c0, c1, c2, c3);
         for (uint32_t b = 0; b < midq_blocks; b++) {
             const uint4 hdr0 = *(const uint4 *)(
                 (const cuda_block_q4_K *)(wrow +
@@ -21924,29 +22011,43 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
                 dev_f16_to_f32((uint16_t)(hdr1.x & 0xffffu));
             const float m1 =
                 dev_f16_to_f32((uint16_t)(hdr1.x >> 16u));
-            const uint32_t sl = b & 7u;
-            s0[sl] += yd_a * d0 * (float)ia0 -
-                      yd_a * m0 * (float)ma0;
-            s1[sl] += yd_a * d1 * (float)ia1 -
-                      yd_a * m1 * (float)ma1;
-            s2[sl] += yd_b * d0 * (float)ib0 -
-                      yd_b * m0 * (float)mb0;
-            s3[sl] += yd_b * d1 * (float)ib1 -
-                      yd_b * m1 * (float)mb1;
+            const float v0 = yd_a * d0 * (float)ia0 -
+                             yd_a * m0 * (float)ma0;
+            const float v1 = yd_a * d1 * (float)ia1 -
+                             yd_a * m1 * (float)ma1;
+            const float v2 = yd_b * d0 * (float)ib0 -
+                             yd_b * m0 * (float)mb0;
+            const float v3 = yd_b * d1 * (float)ib1 -
+                             yd_b * m1 * (float)mb1;
+            if (SCALAR_SLOTS) {
+                DS4_MOE_SCALAR_SLOT8X4_ADD(
+                    b & 7u, c0, c1, c2, c3, v0, v1, v2, v3);
+            } else {
+                const uint32_t sl = b & 7u;
+                s0[sl] += v0; s1[sl] += v1;
+                s2[sl] += v2; s3[sl] += v3;
+            }
         }
         float out4[4];
-        float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
-        float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
-        out4[0] = (a0 + a2) + (a1 + a3);
-        a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
-        a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
-        out4[1] = (a0 + a2) + (a1 + a3);
-        a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
-        a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
-        out4[2] = (a0 + a2) + (a1 + a3);
-        a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
-        a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
-        out4[3] = (a0 + a2) + (a1 + a3);
+        if (SCALAR_SLOTS) {
+            DS4_MOE_SCALAR_SLOT8_REDUCE(c0, out4[0]);
+            DS4_MOE_SCALAR_SLOT8_REDUCE(c1, out4[1]);
+            DS4_MOE_SCALAR_SLOT8_REDUCE(c2, out4[2]);
+            DS4_MOE_SCALAR_SLOT8_REDUCE(c3, out4[3]);
+        } else {
+            float a0 = s0[0] + s0[4], a1 = s0[1] + s0[5];
+            float a2 = s0[2] + s0[6], a3 = s0[3] + s0[7];
+            out4[0] = (a0 + a2) + (a1 + a3);
+            a0 = s1[0] + s1[4]; a1 = s1[1] + s1[5];
+            a2 = s1[2] + s1[6]; a3 = s1[3] + s1[7];
+            out4[1] = (a0 + a2) + (a1 + a3);
+            a0 = s2[0] + s2[4]; a1 = s2[1] + s2[5];
+            a2 = s2[2] + s2[6]; a3 = s2[3] + s2[7];
+            out4[2] = (a0 + a2) + (a1 + a3);
+            a0 = s3[0] + s3[4]; a1 = s3[1] + s3[5];
+            a2 = s3[2] + s3[6]; a3 = s3[3] + s3[7];
+            out4[3] = (a0 + a2) + (a1 + a3);
+        }
 #pragma unroll
         for (uint32_t e = 0; e < 4u; e++) {
             const uint32_t p = e < 2u ? mtok_a : mtok_b;
@@ -21956,6 +22057,10 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
         }
     }
 }
+
+#undef DS4_MOE_SCALAR_SLOT8_REDUCE
+#undef DS4_MOE_SCALAR_SLOT8X4_ADD
+#undef DS4_MOE_SCALAR_SLOT8X4_DECLARE
 
 /* 16-pair MoE expert tile kernels on sm_80+ m16n8k32 INT8 tensor cores.
  *
@@ -23313,6 +23418,18 @@ static int routed_moe_launch(
             (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75") == NULL;
+        /* Evidence-gated scalar-slot candidates.  They select distinct
+         * compile-time kernel specializations and remain default-off until
+         * the production correctness/resource/timing suite passes. */
+        const uint32_t use_q4_gate_scalar_sm75 =
+            cuda_sm75_mma_ok() &&
+            getenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75") != NULL;
+        const uint32_t use_q4_down_scalar_sm75 =
+            cuda_sm75_mma_ok() &&
+            getenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75") != NULL;
+        const uint32_t use_iq2_scalar_sm75 =
+            cuda_sm75_mma_ok() &&
+            getenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75") != NULL;
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_q2_down_mma_sm75_tile16 =
@@ -23686,31 +23803,35 @@ static int routed_moe_launch(
                                 write_gate_up, clamp);
                         }
                     } else if (use_q4_mma && use_gate_row2048) {
+#define DS4_Q4_GATE_T8_SCALAR_LAUNCH(RS, GRID) \
+                        do { \
+                            if (use_q4_gate_scalar_sm75) { \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, \
+                                    write_gate_up, clamp); \
+                            } else { \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, false><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, \
+                                    write_gate_up, clamp); \
+                            } \
+                        } while (0)
                         if (gate_row_span == 512u) {
                             dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
-                            moe_gate_up_mid_q4K_tile8_mma_kernel<512><<<tgrid, 256>>>(
-                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                write_gate_up, clamp);
+                            DS4_Q4_GATE_T8_SCALAR_LAUNCH(512, tgrid);
                         } else if (gate_row_span == 1024u) {
                             dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                            moe_gate_up_mid_q4K_tile8_mma_kernel<1024><<<tgrid, 256>>>(
-                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                write_gate_up, clamp);
+                            DS4_Q4_GATE_T8_SCALAR_LAUNCH(1024, tgrid);
                         } else {
                             dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
-                            moe_gate_up_mid_q4K_tile8_mma_kernel<2048><<<tgrid, 256>>>(
-                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                write_gate_up, clamp);
+                            DS4_Q4_GATE_T8_SCALAR_LAUNCH(2048, tgrid);
                         }
+#undef DS4_Q4_GATE_T8_SCALAR_LAUNCH
                     } else if (use_gate_row2048) {
                         if (gate_row_span == 512u) {
                             dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
@@ -23753,29 +23874,32 @@ static int routed_moe_launch(
                             getenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75") != NULL;
                         const int iq2_stage6 = !iq2_stage4 &&
                             getenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75") != NULL;
-#define DS4_IQ2_GATE_SM75_T16_LAUNCH(RS, GRID) \
+#define DS4_IQ2_GATE_SM75_T16_INVOKE(RS, STAGE, GRID) \
                         do { \
-                            if (iq2_stage4) { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, 4><<<GRID, 256>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tile16_total, tile16_experts, tile16_starts, \
-                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
-                            } else if (iq2_stage6) { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, 6><<<GRID, 256>>>( \
+                            if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile16_total, tile16_experts, tile16_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
                             } else { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, 8><<<GRID, 256>>>( \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, false><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile16_total, tile16_experts, tile16_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } \
+                        } while (0)
+#define DS4_IQ2_GATE_SM75_T16_LAUNCH(RS, GRID) \
+                        do { \
+                            if (iq2_stage4) { \
+                                DS4_IQ2_GATE_SM75_T16_INVOKE(RS, 4, GRID); \
+                            } else if (iq2_stage6) { \
+                                DS4_IQ2_GATE_SM75_T16_INVOKE(RS, 6, GRID); \
+                            } else { \
+                                DS4_IQ2_GATE_SM75_T16_INVOKE(RS, 8, GRID); \
                             } \
                         } while (0)
                         if (!use_gate_row2048) {
@@ -23796,51 +23920,43 @@ static int routed_moe_launch(
                             DS4_IQ2_GATE_SM75_T16_LAUNCH(2048, tgrid);
                         }
 #undef DS4_IQ2_GATE_SM75_T16_LAUNCH
+#undef DS4_IQ2_GATE_SM75_T16_INVOKE
                     } else if (!use_gate_row2048) {
+#define DS4_IQ2_GATE_SM75_T8_LAUNCH(RS, GRID) \
+                        do { \
+                            if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
+                                    n_expert, write_gate_up, clamp); \
+                            } else { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
+                                    n_expert, write_gate_up, clamp); \
+                            } \
+                        } while (0)
                         dim3 tgrid((expert_mid_dim + 63u) / 64u,
                                    tile_capacity, 1);
-                        moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<64><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr,
-                            (float *)mid->ptr, gate_w, up_w, xq,
-                            sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks,
-                            expert_mid_dim, n_expert, write_gate_up, clamp);
+                        DS4_IQ2_GATE_SM75_T8_LAUNCH(64, tgrid);
                     } else if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u,
                                    tile_capacity, 1);
-                        moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr,
-                            (float *)mid->ptr, gate_w, up_w, xq,
-                            sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks,
-                            expert_mid_dim, n_expert, write_gate_up, clamp);
+                        DS4_IQ2_GATE_SM75_T8_LAUNCH(512, tgrid);
                     } else if (gate_row_span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u,
                                    tile_capacity, 1);
-                        moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<1024><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr,
-                            (float *)mid->ptr, gate_w, up_w, xq,
-                            sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks,
-                            expert_mid_dim, n_expert, write_gate_up, clamp);
+                        DS4_IQ2_GATE_SM75_T8_LAUNCH(1024, tgrid);
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u,
                                    tile_capacity, 1);
-                        moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<2048><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr,
-                            (float *)mid->ptr, gate_w, up_w, xq,
-                            sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts,
-                            (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks,
-                            expert_mid_dim, n_expert, write_gate_up, clamp);
+                        DS4_IQ2_GATE_SM75_T8_LAUNCH(2048, tgrid);
                     }
+#undef DS4_IQ2_GATE_SM75_T8_LAUNCH
                 } else if (use_gate_row2048) {
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
@@ -23886,15 +24002,26 @@ static int routed_moe_launch(
                 }
                 if (use_mixed_tail_tiles && tail8_total && tail4_total &&
                     ((gate_q4k && use_q4_gate_mma_sm75_tile16) ||
-                     (gate_iq2 && use_iq2_mma_sm75_tile16))) {
+                    (gate_iq2 && use_iq2_mma_sm75_tile16))) {
                     if (gate_q4k) {
 #define DS4_Q4_GATE_TAIL8_LAUNCH(RS, GRID) \
-                        moe_gate_up_mid_q4K_tile8_mma_kernel<RS><<<GRID, 256>>>( \
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                            tail8_total, tail8_experts, tail8_starts, \
-                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp)
+                        do { \
+                            if (use_q4_gate_scalar_sm75) { \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else { \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, false><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } \
+                        } while (0)
 #define DS4_Q4_GATE_TAIL4_LAUNCH(RS, GRID) \
                         moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel<RS><<<GRID, 256>>>( \
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -23922,12 +24049,23 @@ static int routed_moe_launch(
 #undef DS4_Q4_GATE_TAIL8_LAUNCH
                     } else {
 #define DS4_IQ2_GATE_TAIL8_LAUNCH(RS, GRID) \
-                        moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS><<<GRID, 256>>>( \
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                            tail8_total, tail8_experts, tail8_starts, \
-                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp)
+                        do { \
+                            if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } \
+                        } while (0)
                         if (gate_row_span == 512u) {
                             dim3 g8((expert_mid_dim + 511u) / 512u, tail8_capacity, 1);
                             DS4_IQ2_GATE_TAIL8_LAUNCH(512, g8);
@@ -24297,31 +24435,33 @@ static int routed_moe_launch(
                         tile16_total && tile16_experts && tile16_starts &&
                         midq_blocks <= 16u && cuda_q4_mma_tile16_shmem_ok(1);
                     if (use_q4_down_t16_sm75 && use_q4_down_rowspan) {
+#define DS4_Q4_DOWN_SM75_T16_LAUNCH(RS, GRID) \
+                        do { \
+                            if (use_q4_down_scalar_sm75) { \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                                    (float *)down->ptr, down_w, midq, sorted_pairs, \
+                                    sorted_offsets, sorted_counts, tile16_total, \
+                                    tile16_experts, tile16_starts, down_expert_bytes, \
+                                    down_row_bytes, midq_blocks, out_dim, n_expert); \
+                            } else { \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
+                                    (float *)down->ptr, down_w, midq, sorted_pairs, \
+                                    sorted_offsets, sorted_counts, tile16_total, \
+                                    tile16_experts, tile16_starts, down_expert_bytes, \
+                                    down_row_bytes, midq_blocks, out_dim, n_expert); \
+                            } \
+                        } while (0)
                         if (down_row_span == 512u) {
                             dim3 tgrid((out_dim + 511u) / 512u, tile16_capacity, 1);
-                            moe_down_q4K_tile16_mma_sm75_kernel<512><<<tgrid, 256>>>(
-                                (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile16_total, tile16_experts, tile16_starts,
-                                down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert);
+                            DS4_Q4_DOWN_SM75_T16_LAUNCH(512, tgrid);
                         } else if (down_row_span == 1024u) {
                             dim3 tgrid((out_dim + 1023u) / 1024u, tile16_capacity, 1);
-                            moe_down_q4K_tile16_mma_sm75_kernel<1024><<<tgrid, 256>>>(
-                                (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile16_total, tile16_experts, tile16_starts,
-                                down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert);
+                            DS4_Q4_DOWN_SM75_T16_LAUNCH(1024, tgrid);
                         } else {
                             dim3 tgrid((out_dim + 2047u) / 2048u, tile16_capacity, 1);
-                            moe_down_q4K_tile16_mma_sm75_kernel<2048><<<tgrid, 256>>>(
-                                (float *)down->ptr,
-                                down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                                tile16_total, tile16_experts, tile16_starts,
-                                down_expert_bytes, down_row_bytes,
-                                midq_blocks, out_dim, n_expert);
+                            DS4_Q4_DOWN_SM75_T16_LAUNCH(2048, tgrid);
                         }
+#undef DS4_Q4_DOWN_SM75_T16_LAUNCH
                     } else if (use_q4_down_t16_sm80 && use_q4_down_rowspan) {
                         const unsigned t16cap = (unsigned)((pair_count + 15u) / 16u + n_total_expert);
                         const size_t dt16sh = 16u * (size_t)midq_blocks * sizeof(cuda_block_q8_K);
