@@ -252,7 +252,7 @@ fi
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$PROFILE_TOKENS"
     printf 'ncu_set=%s\nncu_replay_mode=application\nncu_app_replay_buffer=file\n' "$NCU_SET"
     printf 'ncu_app_replay_match=grid\nncu_app_replay_mode=balanced\n'
-    printf 'ncu_target_processes=application-only\nncu_target_process_filter=none\n'
+    printf 'ncu_target_processes=all\nncu_target_process_filter=none\n'
     printf 'ncu_preflight=early_q4_ungated_then_gated_duration_only\n'
     printf 'ncu_config_file=off\nncu_scope_device_verified=true\n'
     printf '\n[prompts]\n'
@@ -422,7 +422,7 @@ ncu_capture() {
     printf '  Nsight will relaunch ds4-bench for each metric pass; details: %s.log\n' "$base"
     local rc=0
     "${target_env[@]}" "${ncu_command[@]}" --config-file off --verbose \
-            --target-processes application-only \
+            --target-processes all \
             --devices "$device" \
             --filter-mode per-gpu "${profiler_args[@]}" \
             --kernel-name-base function --kernel-name "$kernel" \

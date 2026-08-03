@@ -128,12 +128,11 @@ warps, IMMA utilization, DRAM/L1/L2 activity and hit rates, and the relevant
 scoreboard/MIO stalls. `NCU_SET=targeted` and `NCU_SET=full` remain explicit,
 slower opt-ins, but also use application replay.
 
-The profiler targets the root `ds4-bench` application. DS4 does not launch a
-child process, so following the full process tree is unnecessary and can
-include short-lived replay processes that terminate before a CUDA call. It
-does not apply a positive process-name filter. Hidden Nsight configuration is
-disabled. Before collecting
-the full metric set, two one-duration-metric early-Q4 preflights isolate the
+The profiler follows the full application-replay process tree. Although DS4
+does not fork, Nsight reports at runtime that the CUDA kernels were launched by
+a child process when `application-only` is selected on this system. No positive
+process-name filter is applied. Hidden Nsight configuration is disabled. Before
+collecting the full metric set, two one-duration-metric early-Q4 preflights isolate the
 instrumentation boundary. The first disables profiler Start/Stop handling,
 which profiles from process launch; it proves that application replay can attach
 and capture the first matching Q4 gate/up kernel. The second uses the production
