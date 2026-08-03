@@ -178,6 +178,28 @@ supplied Hugging Face directory. Set `DS4_TEMPLATE_GGUF`, `DS4_IMATRIX`, or
 `DS4_ASSET_CACHE` to override those assets. The original explicit four-path
 interface remains available for fully offline runs.
 
+For a cache-constrained Q4-first recipe, provide the already-downloaded full-Q4
+GGUF as the calibration model:
+
+```sh
+bash produce-benchmark-q4-selective-q2-down.sh \
+  /models/DeepSeek-V4-Flash-0731-HF \
+  /models/DeepSeek-V4-Flash-Q4KExperts.gguf \
+  /models/DeepSeek-V4-Flash-Q4GateUp-SelectiveQ2Down.gguf
+```
+
+This allocates the final requested context against the full-Q4 model, records
+the actual per-device dense-Q8 FP16 cache deficit, and selects only enough
+`ffn_down_exps` tensors for `q2_K` to cover that deficit plus
+`CACHE_EXTRA_HEADROOM_MIB` (512 MiB per constrained stage by default). The
+generated model is then benchmarked with a second cache audit; the command
+fails rather than claiming success if any eligible Q8 tensor still falls back
+because of cache budget. `CACHE_ALL_Q8=1` is the default, so every dense Q8
+weight consulted by an FP16-capable runtime path is eligible, not only DS4's
+normal shape/label allow-list. `Q2_DOWN_LAYER_ORDER` controls the layer
+preference order and should be replaced with the fixed quality suite's ranking
+when that data is available.
+
 The script builds the CUDA quantizer and an `sm_75` CUDA benchmark, verifies the
 routed-format CPU/CUDA byte checks and the
 routed-MoE matrix classification test, writes the GGUF through an atomic

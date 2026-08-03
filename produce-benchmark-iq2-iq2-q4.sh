@@ -33,6 +33,14 @@ Optional asset overrides:
   DS4_IMATRIX=/path/to/routed-moe-imatrix.dat
   DS4_ASSET_CACHE=/path/to/cache
 
+Advanced recipe overrides (used by the selective-Q2 wrapper):
+  ROUTED_W1=iq2_xxs
+  ROUTED_W2=q4_k
+  ROUTED_W3=iq2_xxs
+  TENSOR_TYPE_OVERRIDES='blk.3.ffn_down_exps.weight=q2_k,...'
+  QUANT_RECIPE='gate:iq2_xxs,up:iq2_xxs,down:q4_k'
+  PLOT_TITLE='RTX 8000 2x2 TP - IQ2 gate/up, Q4 down'
+
 Override any default as an environment variable, for example:
   GPU_DEVICES=0,4,1,5 CTX_MAX=32768 bash produce-benchmark-iq2-iq2-q4.sh ...
 
@@ -127,6 +135,12 @@ ctx_start=${CTX_START:-2048}
 ctx_max=${CTX_MAX:-65536}
 step_incr=${STEP_INCR:-2048}
 gen_tokens=${GEN_TOKENS:-128}
+routed_w1=${ROUTED_W1:-iq2_xxs}
+routed_w2=${ROUTED_W2:-q4_k}
+routed_w3=${ROUTED_W3:-iq2_xxs}
+quant_recipe=${QUANT_RECIPE:-gate:$routed_w1,up:$routed_w3,down:$routed_w2}
+plot_title=${PLOT_TITLE:-RTX 8000 2x2 TP - IQ2 gate/up, Q4 down}
+tensor_type_overrides=${TENSOR_TYPE_OVERRIDES:-}
 prompt_arg=${PROMPT_FILE:-$script_dir/speed-bench/promessi_sposi.txt}
 [[ -f $prompt_arg ]] || die "benchmark prompt not found: $prompt_arg"
 prompt=$(realpath "$prompt_arg")
@@ -173,9 +187,9 @@ template_is_valid() {
     "$quantizer" \
         --hf "$hf_dir" \
         --template "$candidate" \
-        --routed-w1 iq2_xxs \
-        --routed-w3 iq2_xxs \
-        --routed-w2 q4_k \
+        --routed-w1 "$routed_w1" \
+        --routed-w3 "$routed_w3" \
+        --routed-w2 "$routed_w2" \
         --dry-run >/dev/null 2>&1
 }
 
@@ -260,13 +274,20 @@ quant_args=(
     --hf "$hf_dir"
     --template "$template"
     --imatrix "$imatrix"
-    --routed-w1 iq2_xxs
-    --routed-w3 iq2_xxs
-    --routed-w2 q4_k
+    --routed-w1 "$routed_w1"
+    --routed-w3 "$routed_w3"
+    --routed-w2 "$routed_w2"
     --threads "$quant_threads"
     --quant-backend cuda
     --quant-gpu-devices "$gpu_devices"
 )
+if [[ -n $tensor_type_overrides ]]; then
+    IFS=',' read -r -a override_list <<< "$tensor_type_overrides"
+    for override in "${override_list[@]}"; do
+        [[ $override == *=* ]] || die "bad TENSOR_TYPE_OVERRIDES entry: $override"
+        quant_args+=(--tensor-type "$override")
+    done
+fi
 
 partial=
 cleanup() {
@@ -279,7 +300,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if [[ $reuse_model != 1 ]]; then
-    printf 'Validating the IQ2/IQ2/Q4 quantization plan...\n'
+    printf 'Validating the %s quantization plan...\n' "$quant_recipe"
     "$quantizer" "${quant_args[@]}" --dry-run 2>&1 | tee "$plan_log"
 
     planned_bytes=$(awk -F: '/^approx_file_bytes:/ {
@@ -310,7 +331,8 @@ pair1="${gpu_list[1]}<->${gpu_list[3]}"
 {
     printf 'model=%s\n' "$out"
     printf 'model_bytes=%s\n' "$(stat -c %s "$out")"
-    printf 'quant=gate:iq2_xxs,up:iq2_xxs,down:q4_k\n'
+    printf 'quant=%s\n' "$quant_recipe"
+    printf 'tensor_type_overrides=%s\n' "$tensor_type_overrides"
     printf 'quant_backend=cuda\n'
     printf 'quant_gpu_devices=%s\n' "$gpu_devices"
     printf 'template=%s\n' "$template"
@@ -364,7 +386,7 @@ printf 'Benchmarking with TP pairs %s and %s...\n' "$pair0" "$pair1"
 if command -v python3 >/dev/null 2>&1; then
     python3 speed-bench/plot_speed.py "$csv" \
         --output "$svg" \
-        --title "RTX 8000 2x2 TP - IQ2 gate/up, Q4 down"
+        --title "$plot_title"
 fi
 
 printf '\nDone.\nModel:    %s\nCSV:      %s\nMetadata: %s\nLog:      %s\n' \
