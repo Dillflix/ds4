@@ -16,6 +16,7 @@ on:
       - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
       - "speed-bench/cuda-sm75-q4-down-native.sh"
+      - "speed-bench/cuda-sm75-q4-gate-up-native.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -25,6 +26,7 @@ on:
       - "tests/cuda_sm75_profile_harness.c"
       - "tests/cuda_sm75_int4_mma.cu"
       - "tests/cuda_sm75_q4_down_native.cu"
+      - "tests/cuda_sm75_q4_gate_up_native.cu"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
@@ -46,7 +48,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
       - name: Verify packed-INT4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_sm75_int4_mma | grep -Eqi 'sm_?75'
@@ -76,6 +78,59 @@ jobs:
           ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-standard.sass
           ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-w.sass
           ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-aw.sass
+      - name: Verify production-shaped SM75 Q4 gate/up instructions
+        run: |
+          cuobjdump --list-elf tests/cuda_sm75_q4_gate_up_native | grep -Eq '\.sm_75\.cubin([[:space:]]|$)'
+          cuobjdump --dump-sass tests/cuda_sm75_q4_gate_up_native > /tmp/sm75-q4-gate-up-native.sass
+          for kernel in \
+            sm75_q4_gate_up_standard_kernel \
+            sm75_q4_gate_up_standard_warp16_kernel \
+            sm75_q4_gate_up_native_w_kernel \
+            sm75_q4_gate_up_native_aw_kernel \
+            sm75_q4_gate_up_native_aw_warp16_kernel \
+            sm75_q4_gate_up_native_aw_stage7_kernel \
+            sm75_q4_gate_up_pack_a_kernel \
+            sm75_q4_gate_up_pack_w_kernel; do
+            grep -Fq "Function : $kernel" /tmp/sm75-q4-gate-up-native.sass
+          done
+          extract_sass() {
+            awk -v wanted="$2" '
+              /Function : / {
+                current = $0
+                sub(/^.*Function :[[:space:]]*/, "", current)
+                sub(/[[:space:]]*$/, "", current)
+                emit = current == wanted
+              }
+              emit { print }
+            ' /tmp/sm75-q4-gate-up-native.sass > "/tmp/sm75-q4-gate-up-$1.sass"
+          }
+          extract_sass standard sm75_q4_gate_up_standard_kernel
+          extract_sass standard-warp16 sm75_q4_gate_up_standard_warp16_kernel
+          extract_sass native-w sm75_q4_gate_up_native_w_kernel
+          extract_sass native-aw sm75_q4_gate_up_native_aw_kernel
+          extract_sass native-aw-warp16 sm75_q4_gate_up_native_aw_warp16_kernel
+          extract_sass native-aw-stage7 sm75_q4_gate_up_native_aw_stage7_kernel
+          for label in standard standard-warp16; do
+            grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' "/tmp/sm75-q4-gate-up-$label.sass"
+          done
+          for label in native-w native-aw native-aw-warp16 native-aw-stage7; do
+            grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' "/tmp/sm75-q4-gate-up-$label.sass"
+            grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
+            grep -Eq 'IMMA\.8832\.U4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
+          done
+          printf 'label,ldl,stl,local_memory_free\n' > /tmp/sm75-q4-gate-up-eligibility.csv
+          for label in standard standard-warp16 native-w native-aw native-aw-warp16 native-aw-stage7; do
+            ldl=$(grep -Ec '(^|[[:space:]])LDL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
+            stl=$(grep -Ec '(^|[[:space:]])STL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
+            local_memory_free=true
+            if (( ldl != 0 || stl != 0 )); then
+              local_memory_free=false
+              echo "warning: $label has LDL=$ldl STL=$stl; it remains a measured candidate"
+            fi
+            printf '%s,%s,%s,%s\n' "$label" "$ldl" "$stl" "$local_memory_free" \
+              >> /tmp/sm75-q4-gate-up-eligibility.csv
+          done
+          cat /tmp/sm75-q4-gate-up-eligibility.csv
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools
@@ -87,6 +142,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
           bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
           bash -n speed-bench/cuda-sm75-q4-down-native.sh
+          test -x speed-bench/cuda-sm75-q4-gate-up-native.sh
+          bash -n speed-bench/cuda-sm75-q4-gate-up-native.sh
           bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py

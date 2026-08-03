@@ -306,6 +306,74 @@ evidence or failure archive: new provenance, status, and Nsight files go under
 `resume-<timestamp>/`, and the resulting archive is named
 `sm75-q4-down-native-<original-timestamp>.resume-<timestamp>.tar.gz`.
 
+### SM75 production-shaped Q4 gate/up native-packing audit
+
+`cuda-sm75-q4-gate-up-native.sh` is the standalone, model-free gate/up
+follow-up. It runs exact pack and output correctness, Compute Sanitizer when
+available, balanced early/late benchmarks, GPU telemetry, SASS inspection,
+and focused Nsight Compute captures in one command. The early layer-3 shape
+has 1,879 routed pairs, 99 active experts, and 282 synthetic tile8 records;
+the late layer-36 shape has 2,186 pairs, 76 active experts, and 331 tile8
+records. Both use 512 tokens, six selected experts per token, a 4,096-wide
+input, and a 2,048-wide gate/up result.
+
+The ten benchmark variants are `standard`, `standard-warp16`, `native-w`,
+`native-aw-consumer`, `native-aw-warp16-consumer`,
+`native-aw-stage7-consumer`, `native-aw-combined`,
+`native-aw-warp16-combined`, `native-aw-stage7-combined`, and `pack-a`.
+Consumer variants exclude the already-completed activation transform;
+combined variants charge activation packing plus the matching consumer, and
+`pack-a` isolates that transform. Native weight packing is an offline layout
+operation and is excluded from timed consumer work. By default, 20 rounds
+rotate all ten variants evenly through every sample position twice. Each
+sample requests at least 20 launches and may automatically use more to reach
+a stable 100 ms consumer timing window; both requested and effective launch
+counts are recorded and validated.
+
+Correctness requires exact activation and weight packing, bit-exact owned
+outputs against the harness's standard path, and untouched poison in every
+unowned output. The gate/up target deliberately keeps the shipping
+`--use_fast_math` compilation mode because its epilogue executes millions of
+`expf` operations; the bit-exact claim is therefore an intra-binary comparison
+with the harness's own standard path, not an external production reference.
+SASS validation requires the expected m8n8k16 or m8n8k32 packed-INT4 forms.
+Local-memory traffic is recorded per consumer as an eligibility diagnostic
+rather than aborting the experiment, so an occupancy
+candidate that spills can still be benchmarked and profiled. Nsight captures
+cover all six distinct consumer kernels plus activation packing. The script
+only observes clocks and uses Nsight's `--clock-control none`; it never changes
+GPU clocks or power settings.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-q4-gate-up-native.sh
+```
+
+No `MODEL` variable is needed and no GGUF is opened. Return
+`sm75-q4-gate-up-native-<timestamp>.tar.gz`; the script also archives partial
+evidence on failure or interruption. This is an implementation audit and does
+not enable or alter production dispatch.
+
+If a completed build/SASS/correctness/sanitizer/benchmark pass fails only in
+the Nsight phase, resume it without replacing the original evidence:
+
+```bash
+Q4_GATE_UP_NATIVE_DIR="$PWD/sm75-q4-gate-up-native-YYYYMMDDTHHMMSSZ" \
+RESUME_NCU=1 \
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-q4-gate-up-native.sh
+```
+
+Resume mode revalidates provenance, build freshness, SASS and spill-status
+evidence, correctness, sanitizer, both balanced benchmarks, and telemetry.
+New files go under `resume-<timestamp>/`; the resulting archive is named
+`sm75-q4-gate-up-native-<original-timestamp>.resume-<timestamp>.tar.gz`.
+
 ### Comprehensive stock-Q2 and remaining-kernel pass
 
 `cuda-sm75-comprehensive-audit.sh` combines the full stock-Q2 production pass

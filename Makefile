@@ -270,6 +270,9 @@ tests/cuda_sm75_int4_mma: tests/cuda_sm75_int4_mma.cu
 tests/cuda_sm75_q4_down_native: tests/cuda_sm75_q4_down_native.cu
 	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
 
+tests/cuda_sm75_q4_gate_up_native: tests/cuda_sm75_q4_gate_up_native.cu tests/cuda_sm75_q4_down_native.cu
+	$(NVCC) $(NVCCFLAGS) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
+
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -414,4 +417,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
