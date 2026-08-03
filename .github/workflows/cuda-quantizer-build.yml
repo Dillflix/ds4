@@ -15,6 +15,7 @@ on:
       - "speed-bench/cuda-q4-prefill-evidence.sh"
       - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
+      - "speed-bench/cuda-sm75-q4-down-native.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -23,6 +24,7 @@ on:
       - "tests/cuda_long_context_smoke.c"
       - "tests/cuda_sm75_profile_harness.c"
       - "tests/cuda_sm75_int4_mma.cu"
+      - "tests/cuda_sm75_q4_down_native.cu"
       - "tests/test_engine_mgpu_placement.c"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
@@ -44,7 +46,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
       - name: Verify packed-INT4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_sm75_int4_mma | grep -Eqi 'sm_?75'
@@ -53,6 +55,27 @@ jobs:
           grep -q 'Function : sm75_q4_i4_mixed_standard_kernel' /tmp/sm75-int4.sass
           grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' /tmp/sm75-int4.sass
           grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' /tmp/sm75-int4.sass
+      - name: Verify production-shaped SM75 Q4-down instructions
+        run: |
+          cuobjdump --list-elf tests/cuda_sm75_q4_down_native | grep -Eq '\.sm_75\.cubin([[:space:]]|$)'
+          cuobjdump --dump-sass tests/cuda_sm75_q4_down_native > /tmp/sm75-q4-down-native.sass
+          grep -q 'Function : sm75_q4_down_standard_kernel' /tmp/sm75-q4-down-native.sass
+          grep -q 'Function : sm75_q4_down_native_w_kernel' /tmp/sm75-q4-down-native.sass
+          grep -q 'Function : sm75_q4_down_native_aw_kernel' /tmp/sm75-q4-down-native.sass
+          awk '/Function : sm75_q4_down_standard_kernel/{emit=1; next} /Function : /{emit=0} emit' \
+            /tmp/sm75-q4-down-native.sass > /tmp/sm75-q4-down-standard.sass
+          awk '/Function : sm75_q4_down_native_w_kernel/{emit=1; next} /Function : /{emit=0} emit' \
+            /tmp/sm75-q4-down-native.sass > /tmp/sm75-q4-down-native-w.sass
+          awk '/Function : sm75_q4_down_native_aw_kernel/{emit=1; next} /Function : /{emit=0} emit' \
+            /tmp/sm75-q4-down-native.sass > /tmp/sm75-q4-down-native-aw.sass
+          grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' /tmp/sm75-q4-down-standard.sass
+          grep -Eq 'IMMA\.8832\.U4\.U4' /tmp/sm75-q4-down-native-w.sass
+          grep -Eq 'IMMA\.8832\.S4\.U4' /tmp/sm75-q4-down-native-w.sass
+          grep -Eq 'IMMA\.8832\.U4\.U4' /tmp/sm75-q4-down-native-aw.sass
+          grep -Eq 'IMMA\.8832\.S4\.U4' /tmp/sm75-q4-down-native-aw.sass
+          ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-standard.sass
+          ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-w.sass
+          ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' /tmp/sm75-q4-down-native-aw.sass
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools
@@ -63,6 +86,7 @@ jobs:
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
           bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
+          bash -n speed-bench/cuda-sm75-q4-down-native.sh
           bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py

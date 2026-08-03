@@ -241,6 +241,49 @@ Return the generated `sm75-int4-mma-<timestamp>.tar.gz`. These results can
 reject unattractive layouts, but cannot by themselves justify production
 dispatch.
 
+### SM75 production-shaped Q4 down native-packing audit
+
+`cuda-sm75-q4-down-native.sh` exercises the model-free, production-shaped
+Q4_K down-projection follow-up. It compares the standard layout with native-W,
+prepacked native-A/W consumption, and the combined activation-pack plus
+native-A/W path. `native-aw-consumer` measures only the consumer after native-A
+packing is complete; `native-aw-combined` charges the activation transform to
+the timed result, while `pack-a` reports that transform separately. Ten rounds
+balance every one of the five variants across every sample position. The early
+layer-3 shape has 1,879 routed token/expert pairs,
+99 active experts, 183 tile16 launches, and 1,049 padded slots. The late
+layer-36 shape has 2,186 pairs, 76 active experts, 189 tile16 launches, and 838
+padded slots. Both use the full 3,072-row production token/slot surface with
+the owned pair IDs scattered through it. The harness validates activation
+packing exactly, requires initialized owned outputs to be bit-exact against
+its own standard-path reference, and verifies that every unowned output stays
+poisoned before running the randomized, position-rotated benchmark rounds for
+both recorded shapes. This is not a claim of bit-exact agreement with the
+production kernel, which is built under a different compiler mode.
+
+The script builds only an `sm_75` cubin, rejects any GPU other than compute
+capability 7.5, runs Compute Sanitizer when available, and checks the emitted
+standard/native kernels with `cuobjdump`. Focused Nsight Compute captures cover
+one representative standard, native-W, and native-A/W consumer kernel, plus
+the activation-pack transform that the combined result charges. Captures cover
+launch resources, occupancy, IMMA utilization, memory behavior, and scheduler
+stall metrics. Set `NCU_USE_SUDO=1` on systems with restricted performance
+counters; the same `sudo -E` command is used for metric discovery and capture.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-q4-down-native.sh
+```
+
+No `MODEL` variable is needed and no GGUF is opened. Return the generated
+`sm75-q4-down-native-<timestamp>.tar.gz`; partial evidence is archived on
+failure or interruption as well as on success. The result is an implementation
+audit, not by itself evidence for changing production dispatch.
+
 ### Comprehensive stock-Q2 and remaining-kernel pass
 
 `cuda-sm75-comprehensive-audit.sh` combines the full stock-Q2 production pass
