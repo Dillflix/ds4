@@ -476,13 +476,25 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
     }
 }
 
-/* One packed-Q4 block for two m8 token halves.  The activation records are
- * already in shared memory, so the loaded weight fragment feeds low8 and
- * high8 without the rejected kernel's per-warp global activation reads. */
+/* Only these 256 bytes feed MMA. Keeping d/bsums on the read-only path lets
+ * the next designs stage more useful activation payload below 32 KiB. */
+typedef struct {
+    uint32_t low[8][4];
+    uint32_t high_signed[8][4];
+} cuda_sm75_native_q8_payload;
+static_assert(sizeof(cuda_sm75_native_q8_payload) == 256u,
+              "unexpected native Q8 MMA payload size");
+
+/* One packed-Q4 block for two m8 token halves. A single loaded weight
+ * fragment feeds low8 and high8; metadata can remain in L1/read-only cache. */
 __device__ __forceinline__ static void
-moe_sm75_native_q4_kstage_block(
-        const char *base, const cuda_sm75_native_q8_K *a0,
-        const cuda_sm75_native_q8_K *a1, uint32_t b,
+moe_sm75_native_q4_pair_block(
+        const char *base,
+        const uint32_t (*low0)[4], const uint32_t (*high0)[4],
+        const uint32_t (*low1)[4], const uint32_t (*high1)[4],
+        const cuda_sm75_native_q8_K *meta0,
+        const cuda_sm75_native_q8_K *meta1,
+        bool have0, bool have1, uint32_t b,
         uint32_t xq_blocks, uint32_t expert, uint32_t matrix_rows,
         uint32_t row0, uint32_t lane,
         float &v00, float &v01, float &v10, float &v11) {
@@ -498,14 +510,20 @@ moe_sm75_native_q4_kstage_block(
     for (uint32_t j=0;j<8u;j++) {
         const uint32_t wf=w->b[j][lane];
         int32_t l00=0,l01=0,h00=0,h01=0,l10=0,l11=0,h10=0,h11=0;
-        mma_m8n8k32_u4_u4(l00,l01,a0->low[j][lane&3u],wf);
-        mma_m8n8k32_s4_u4(h00,h01,a0->high_signed[j][lane&3u],wf);
-        mma_m8n8k32_u4_u4(l10,l11,a1->low[j][lane&3u],wf);
-        mma_m8n8k32_s4_u4(h10,h11,a1->high_signed[j][lane&3u],wf);
+        const uint32_t al0=have0?low0[j][lane&3u]:0u;
+        const uint32_t ah0=have0?high0[j][lane&3u]:0u;
+        const uint32_t al1=have1?low1[j][lane&3u]:0u;
+        const uint32_t ah1=have1?high1[j][lane&3u]:0u;
+        mma_m8n8k32_u4_u4(l00,l01,al0,wf);
+        mma_m8n8k32_s4_u4(h00,h01,ah0,wf);
+        mma_m8n8k32_u4_u4(l10,l11,al1,wf);
+        mma_m8n8k32_s4_u4(h10,h11,ah1,wf);
         const int c00=l00+16*h00,c01=l01+16*h01;
         const int c10=l10+16*h10,c11=l11+16*h11;
-        const int bs0=(int)a0->bsums[2u*j]+(int)a0->bsums[2u*j+1u];
-        const int bs1=(int)a1->bsums[2u*j]+(int)a1->bsums[2u*j+1u];
+        const int bs0=have0?
+            (int)meta0->bsums[2u*j]+(int)meta0->bsums[2u*j+1u]:0;
+        const int bs1=have1?
+            (int)meta1->bsums[2u*j]+(int)meta1->bsums[2u*j+1u]:0;
         uint8_t sc0,mn0,sc1,mn1;
         dev_q4_K_get_scale_min(j,(const uint8_t *)&h0.y,&sc0,&mn0);
         dev_q4_K_get_scale_min(j,(const uint8_t *)&h1.y,&sc1,&mn1);
@@ -518,19 +536,67 @@ moe_sm75_native_q4_kstage_block(
     const float z0=dev_f16_to_f32((uint16_t)(h0.x>>16u));
     const float d1=dev_f16_to_f32((uint16_t)h1.x);
     const float z1=dev_f16_to_f32((uint16_t)(h1.x>>16u));
-    v00=a0->d*d0*(float)i00-a0->d*z0*(float)m00;
-    v01=a0->d*d1*(float)i01-a0->d*z1*(float)m01;
-    v10=a1->d*d0*(float)i10-a1->d*z0*(float)m10;
-    v11=a1->d*d1*(float)i11-a1->d*z1*(float)m11;
+    const float yd0=have0?meta0->d:0.0f;
+    const float yd1=have1?meta1->d:0.0f;
+    v00=yd0*d0*(float)i00-yd0*z0*(float)m00;
+    v01=yd0*d1*(float)i01-yd0*z1*(float)m01;
+    v10=yd1*d0*(float)i10-yd1*z0*(float)m10;
+    v11=yd1*d1*(float)i11-yd1*z1*(float)m11;
 }
 
-/* K-stage4 replacement for the rejected six-row gate kernel.  Four K blocks
- * for all 16 pairs occupy 18,688 bytes. Gate scratch and metadata bring the
- * CTA to 22,992 bytes, admitting two CTAs/SM without any global activation
- * reads from the compute warps. Gate and up remain separate phases to bound
- * registers; each phase preserves the scalar-slot reduction order. */
+template <uint32_t STAGED_ROWS>
+__device__ __forceinline__ static void
+moe_sm75_native_q4_stream_matrix(
+        const char *base, const cuda_sm75_native_q8_payload *staged,
+        const cuda_sm75_native_q8_K *xq, const uint32_t *tok,
+        uint32_t np, uint32_t xq_blocks, uint32_t expert,
+        uint32_t matrix_rows, uint32_t row0, uint32_t lane,
+        float &r0, float &r1, float &r2, float &r3) {
+    const uint32_t p0=lane>>2u,p1=p0+8u;
+    const bool have0=p0<np,have1=p1<np;
+    DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
+    DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
+    DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
+    DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
+    for (uint32_t b=0;b<xq_blocks;b++) {
+        const cuda_sm75_native_q8_K *m0=have0?
+            xq+(uint64_t)tok[p0]*xq_blocks+b:xq;
+        const cuda_sm75_native_q8_K *m1=have1?
+            xq+(uint64_t)tok[p1]*xq_blocks+b:xq;
+        const cuda_sm75_native_q8_payload *a0=p0<STAGED_ROWS?
+            staged+p0*16u+b:NULL;
+        const cuda_sm75_native_q8_payload *a1=p1<STAGED_ROWS?
+            staged+p1*16u+b:NULL;
+        const uint32_t (*low0)[4]=a0?a0->low:m0->low;
+        const uint32_t (*high0)[4]=a0?a0->high_signed:m0->high_signed;
+        const uint32_t (*low1)[4]=a1?a1->low:m1->low;
+        const uint32_t (*high1)[4]=a1?a1->high_signed:m1->high_signed;
+        float v00,v01,v10,v11;
+        moe_sm75_native_q4_pair_block(
+            base,low0,high0,low1,high1,m0,m1,have0,have1,b,
+            xq_blocks,expert,matrix_rows,row0,lane,v00,v01,v10,v11);
+        switch(b&7u) {
+            DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
+            DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
+        }
+    }
+    DS4_SM75_NATIVE_REDUCE(s0,r0);DS4_SM75_NATIVE_REDUCE(s1,r1);
+    DS4_SM75_NATIVE_REDUCE(s2,r2);DS4_SM75_NATIVE_REDUCE(s3,r3);
+}
+
+/* Streamed tile16 replacement for the rejected six-row gate kernel. Seven
+ * complete MMA payload rows stay shared across every output-row group; the
+ * remaining rows and the small d/bsums metadata use the read-only path. Gate
+ * scratch uses the existing gate tensor, leaving declared shared memory below
+ * 32 KiB while each packed weight fragment feeds both 8-pair halves. */
 template <uint32_t ROW_SPAN>
-__global__ static void moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel(
+__global__ static void moe_gate_up_mid_sm75_native_q4_tile16_stream7_kernel(
         float *gate_out, float *up_out, float *mid_out,
         const char *gate_base, const char *up_base,
         const cuda_sm75_native_q8_K *xq,
@@ -540,18 +606,16 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel(
         const float *weights, uint32_t xq_blocks,
         uint32_t expert_mid_dim, uint32_t n_expert,
         uint32_t write_aux, float clamp) {
-    static_assert(16u * 4u * sizeof(cuda_sm75_native_q8_K) +
-                      16u * 64u * sizeof(float) +
+    static_assert(7u * 16u * sizeof(cuda_sm75_native_q8_payload) +
                       3u * 16u * sizeof(uint32_t) + sizeof(uint32_t) <
-                  32768u, "native Q4 gate kstage4 must stay below 32 KiB");
+                  32768u, "native Q4 gate stream7 must stay below 32 KiB");
     const uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t expert = tile_experts[tile];
     const uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_sm75_native_q8_K sxq[16][4];
-    __shared__ float s_gate[16][64];
+    __shared__ cuda_sm75_native_q8_payload sxq[7][16];
     __shared__ uint32_t s_pair[16], s_tok[16], s_slot[16], s_np;
     if (threadIdx.x == 0u) {
         uint32_t np = 0u;
@@ -567,126 +631,69 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel(
     }
     __syncthreads();
     const uint32_t np = s_np;
+    const uint32_t staged_rows=np<7u?np:7u;
+    for (uint32_t i=threadIdx.x;i<staged_rows*xq_blocks*64u;
+         i+=blockDim.x) {
+        const uint32_t p=i/(xq_blocks*64u);
+        const uint32_t q=i-p*xq_blocks*64u;
+        const uint32_t b=q/64u,w=q-b*64u;
+        const cuda_sm75_native_q8_K *src=
+            xq+(uint64_t)s_tok[p]*xq_blocks+b;
+        ((uint32_t *)&sxq[p][b])[w]=w<32u?
+            ((const uint32_t *)src->low)[w]:
+            ((const uint32_t *)src->high_signed)[w-32u];
+    }
+    __syncthreads();
     const uint32_t mtok_a = lane >> 2u;
     const uint32_t mtok_b = mtok_a + 8u;
     const uint32_t n0 = (lane & 3u) * 2u;
-    const uint32_t words=(uint32_t)(sizeof(cuda_sm75_native_q8_K)/4u);
     for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
         const uint32_t row0 = blockIdx.x * ROW_SPAN +
             rr * 64u + warp * 8u;
-        /* Every thread must reach both barriers even for a partial final row
+        /* Every thread must reach the phase barrier even for a partial row
          * group. Inactive warps compute against row zero and discard it. */
         const bool row_group_active = row0 < expert_mid_dim;
         const uint32_t compute_row0 = row_group_active ? row0 : 0u;
         {
-        DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
-        DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
-        DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
-        DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
-        for (uint32_t base_b=0;base_b<xq_blocks;base_b+=4u) {
-            const uint32_t nb=xq_blocks-base_b<4u?xq_blocks-base_b:4u;
-            for (uint32_t i=threadIdx.x;i<16u*nb*words;i+=blockDim.x) {
-                const uint32_t p=i/(nb*words),q=i-p*nb*words;
-                const uint32_t bb=q/words,w=q-bb*words;
-                ((uint32_t *)&sxq[p][bb])[w]=p<np?
-                    ((const uint32_t *)(xq+(uint64_t)s_tok[p]*xq_blocks+
-                                        base_b+bb))[w]:0u;
-            }
-            __syncthreads();
-            for (uint32_t bb=0;bb<nb;bb++) {
-                const uint32_t b=base_b+bb;
-                float v00,v01,v10,v11;
-                moe_sm75_native_q4_kstage_block(
-                    gate_base,&sxq[mtok_a][bb],&sxq[mtok_b][bb],b,
-                    xq_blocks,expert,expert_mid_dim,compute_row0,lane,
-                    v00,v01,v10,v11);
-                switch(b&7u) {
-                    DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
-                }
-            }
-            __syncthreads();
-        }
-        float gr[4];
-        DS4_SM75_NATIVE_REDUCE(s0,gr[0]);DS4_SM75_NATIVE_REDUCE(s1,gr[1]);
-        DS4_SM75_NATIVE_REDUCE(s2,gr[2]);DS4_SM75_NATIVE_REDUCE(s3,gr[3]);
+        float g0,g1,g2,g3;
+        moe_sm75_native_q4_stream_matrix<7u>(
+            gate_base,&sxq[0][0],xq,s_tok,np,xq_blocks,expert,
+            expert_mid_dim,compute_row0,lane,g0,g1,g2,g3);
 #pragma unroll
         for (uint32_t e = 0; e < 4u; e++) {
             const uint32_t p = e < 2u ? mtok_a : mtok_b;
             const uint32_t row_delta = n0 + (e & 1u);
             const uint32_t row = row0 + row_delta;
             if (!row_group_active || p >= np || row >= expert_mid_dim) continue;
-            float gate = gr[e];
+            float gate=e==0u?g0:(e==1u?g1:(e==2u?g2:g3));
             if (clamp > 1.0e-6f && gate > clamp) gate = clamp;
-            s_gate[p][warp * 8u + row_delta] = gate;
-            if (write_aux)
-                gate_out[(uint64_t)s_pair[p] * expert_mid_dim + row] = gate;
+            gate_out[(uint64_t)s_pair[p] * expert_mid_dim + row] = gate;
+        }
         }
         __syncthreads();
-        }
         {
-        DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
-        DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
-        DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
-        DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
-        for (uint32_t base_b=0;base_b<xq_blocks;base_b+=4u) {
-            const uint32_t nb=xq_blocks-base_b<4u?xq_blocks-base_b:4u;
-            for (uint32_t i=threadIdx.x;i<16u*nb*words;i+=blockDim.x) {
-                const uint32_t p=i/(nb*words),q=i-p*nb*words;
-                const uint32_t bb=q/words,w=q-bb*words;
-                ((uint32_t *)&sxq[p][bb])[w]=p<np?
-                    ((const uint32_t *)(xq+(uint64_t)s_tok[p]*xq_blocks+
-                                        base_b+bb))[w]:0u;
-            }
-            __syncthreads();
-            for (uint32_t bb=0;bb<nb;bb++) {
-                const uint32_t b=base_b+bb;
-                float v00,v01,v10,v11;
-                moe_sm75_native_q4_kstage_block(
-                    up_base,&sxq[mtok_a][bb],&sxq[mtok_b][bb],b,
-                    xq_blocks,expert,expert_mid_dim,compute_row0,lane,
-                    v00,v01,v10,v11);
-                switch(b&7u) {
-                    DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
-                }
-            }
-            __syncthreads();
-        }
-        float ur[4];
-        DS4_SM75_NATIVE_REDUCE(s0,ur[0]);DS4_SM75_NATIVE_REDUCE(s1,ur[1]);
-        DS4_SM75_NATIVE_REDUCE(s2,ur[2]);DS4_SM75_NATIVE_REDUCE(s3,ur[3]);
+        float u0,u1,u2,u3;
+        moe_sm75_native_q4_stream_matrix<7u>(
+            up_base,&sxq[0][0],xq,s_tok,np,xq_blocks,expert,
+            expert_mid_dim,compute_row0,lane,u0,u1,u2,u3);
 #pragma unroll
         for (uint32_t e = 0; e < 4u; e++) {
             const uint32_t p = e < 2u ? mtok_a : mtok_b;
             const uint32_t row_delta = n0 + (e & 1u);
             const uint32_t row = row0 + row_delta;
             if (!row_group_active || p >= np || row >= expert_mid_dim) continue;
-            const float gate = s_gate[p][warp * 8u + row_delta];
-            float up = ur[e];
+            const uint64_t off =
+                (uint64_t)s_pair[p] * expert_mid_dim + row;
+            const float gate = gate_out[off];
+            float up=e==0u?u0:(e==1u?u1:(e==2u?u2:u3));
             if (clamp > 1.0e-6f) {
                 if (up > clamp) up = clamp;
                 if (up < -clamp) up = -clamp;
             }
-            const uint64_t off =
-                (uint64_t)s_pair[p] * expert_mid_dim + row;
             if (write_aux) up_out[off] = up;
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up *
                 weights[(uint64_t)s_tok[p] * n_expert + s_slot[p]];
         }
-        __syncthreads();
         }
     }
 }
@@ -817,31 +824,28 @@ __global__ static void moe_down_sm75_native_q4_tile_kernel(
     }
 }
 
-/* Tile16 down with four K blocks resident at a time.  The production full-stage
- * kernel keeps all eight K blocks for 16 pairs in shared memory (37,376 bytes),
- * which limits Turing to one CTA/SM.  This design keeps the same 16-pair weight
- * reuse and exact eight-slot accumulation order while cutting activation shared
- * memory in half.  Unlike the rejected stage8 experiment, activations are
- * loaded cooperatively once per CTA/window; compute warps never reread them
- * from global memory. */
+/* Compact tile16 down stages the MMA payload for seven of eight K blocks once
+ * per CTA (28 KiB). The final block and all d/bsums metadata use the read-only
+ * path. This preserves low8/high8 weight reuse and exact slot order without
+ * either the rejected half-row global traffic or per-row-group restaging. */
 template <uint32_t ROW_SPAN>
-__global__ static void moe_down_sm75_native_q4_tile16_kstage4_kernel(
+__global__ static void moe_down_sm75_native_q4_tile16_compact7_kernel(
         float *down_out, const char *down_base,
         const cuda_sm75_native_q8_K *midq,
         const uint32_t *sorted_pairs, const uint32_t *offsets,
         const uint32_t *counts, const uint32_t *tile_total,
         const uint32_t *tile_experts, const uint32_t *tile_starts,
         uint32_t midq_blocks, uint32_t out_dim) {
-    static_assert(16u * 4u * sizeof(cuda_sm75_native_q8_K) +
+    static_assert(16u * 7u * sizeof(cuda_sm75_native_q8_payload) +
                       16u * sizeof(uint32_t) + sizeof(uint32_t) < 32768u,
-                  "native Q4 down kstage4 must stay below 32 KiB");
+                  "native Q4 down compact7 must stay below 32 KiB");
     const uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t expert = tile_experts[tile];
     const uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_sm75_native_q8_K sxq[16][4];
+    __shared__ cuda_sm75_native_q8_payload sxq[16][7];
     __shared__ uint32_t s_pair[16], s_np;
     if (threadIdx.x == 0u) {
         uint32_t np = 0u;
@@ -854,11 +858,22 @@ __global__ static void moe_down_sm75_native_q4_tile16_kstage4_kernel(
     }
     __syncthreads();
     const uint32_t np = s_np;
+    const uint32_t staged_blocks=midq_blocks<7u?midq_blocks:7u;
+    for (uint32_t i=threadIdx.x;i<16u*staged_blocks*64u;
+         i+=blockDim.x) {
+        const uint32_t p=i/(staged_blocks*64u);
+        const uint32_t q=i-p*staged_blocks*64u;
+        const uint32_t b=q/64u,w=q-b*64u;
+        const cuda_sm75_native_q8_K *src=p<np?
+            midq+(uint64_t)s_pair[p]*midq_blocks+b:midq;
+        ((uint32_t *)&sxq[p][b])[w]=p<np?(w<32u?
+            ((const uint32_t *)src->low)[w]:
+            ((const uint32_t *)src->high_signed)[w-32u]):0u;
+    }
+    __syncthreads();
     const uint32_t p0 = lane >> 2u;
     const uint32_t p1 = p0 + 8u;
     const uint32_t n0 = (lane & 3u) * 2u;
-    const uint32_t words =
-        (uint32_t)(sizeof(cuda_sm75_native_q8_K) / sizeof(uint32_t));
     for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
         const uint32_t row0 = blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
         const bool row_group_active = row0 < out_dim;
@@ -867,40 +882,35 @@ __global__ static void moe_down_sm75_native_q4_tile16_kstage4_kernel(
         DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
         DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
         DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
-        for (uint32_t base_b = 0; base_b < midq_blocks; base_b += 4u) {
-            const uint32_t nb = midq_blocks - base_b < 4u ?
-                midq_blocks - base_b : 4u;
-            for (uint32_t i = threadIdx.x; i < 16u * nb * words;
-                 i += blockDim.x) {
-                const uint32_t p = i / (nb * words);
-                const uint32_t q = i - p * nb * words;
-                const uint32_t bb = q / words;
-                const uint32_t w = q - bb * words;
-                ((uint32_t *)&sxq[p][bb])[w] = p < np ?
-                    ((const uint32_t *)(midq +
-                        (uint64_t)s_pair[p] * midq_blocks + base_b + bb))[w] :
-                    0u;
+        for (uint32_t b=0;b<midq_blocks;b++) {
+            const bool have0=p0<np,have1=p1<np;
+            const cuda_sm75_native_q8_K *m0=have0?
+                midq+(uint64_t)s_pair[p0]*midq_blocks+b:midq;
+            const cuda_sm75_native_q8_K *m1=have1?
+                midq+(uint64_t)s_pair[p1]*midq_blocks+b:midq;
+            const cuda_sm75_native_q8_payload *a0=b<staged_blocks?
+                &sxq[p0][b]:NULL;
+            const cuda_sm75_native_q8_payload *a1=b<staged_blocks?
+                &sxq[p1][b]:NULL;
+            const uint32_t (*low0)[4]=a0?a0->low:m0->low;
+            const uint32_t (*high0)[4]=a0?a0->high_signed:m0->high_signed;
+            const uint32_t (*low1)[4]=a1?a1->low:m1->low;
+            const uint32_t (*high1)[4]=a1?a1->high_signed:m1->high_signed;
+            float v00,v01,v10,v11;
+            moe_sm75_native_q4_pair_block(
+                down_base,low0,high0,low1,high1,m0,m1,have0,have1,b,
+                midq_blocks,expert,out_dim,compute_row0,lane,
+                v00,v01,v10,v11);
+            switch (b & 7u) {
+                DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
+                DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
             }
-            __syncthreads();
-            for (uint32_t bb = 0; bb < nb; bb++) {
-                const uint32_t b = base_b + bb;
-                float v00, v01, v10, v11;
-                moe_sm75_native_q4_kstage_block(
-                    down_base, &sxq[p0][bb], &sxq[p1][bb], b,
-                    midq_blocks, expert, out_dim, compute_row0, lane,
-                    v00, v01, v10, v11);
-                switch (b & 7u) {
-                    DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
-                    DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
-                }
-            }
-            __syncthreads();
         }
         float o0, o1, o2, o3;
         DS4_SM75_NATIVE_REDUCE(s0,o0); DS4_SM75_NATIVE_REDUCE(s1,o1);

@@ -874,8 +874,8 @@ static int check_sm75_native_q4_layout_exact(void) {
      * The legacy planner and new K-window kernels remain explicit diagnostics
      * until their exactness and end-to-end transfer are measured. */
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7");
     fill_q4_tensor(standard + gate_off, 0u, n_total, mid_dim, in_blocks);
     fill_q4_tensor(standard + up_off, 1u, n_total, mid_dim, in_blocks);
     fill_q4_tensor(standard + down_off, 2u, n_total, out_dim, mid_blocks);
@@ -934,17 +934,17 @@ static int check_sm75_native_q4_layout_exact(void) {
         const char *down;
     } optimized_cases[] = {
         {"legacy-planner diagnostic", "1", "0", "0"},
-        {"gate-kstage4", "0", "1", "0"},
-        {"down-kstage4", "0", "0", "1"},
-        {"gate/down-kstage4", "0", "1", "1"},
+        {"gate-stream7", "0", "1", "0"},
+        {"down-compact7", "0", "0", "1"},
+        {"gate-stream7/down-compact7", "0", "1", "1"},
     };
     for (uint32_t c = 0;
          c < sizeof(optimized_cases) / sizeof(optimized_cases[0]); c++) {
         if (setenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES",
                    optimized_cases[c].legacy, 1) != 0 ||
-            setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4",
+            setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7",
                    optimized_cases[c].gate, 1) != 0 ||
-            setenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4",
+            setenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7",
                    optimized_cases[c].down, 1) != 0) {
             fprintf(stderr,
                     "cuda-regression: could not select native Q4 next paths\n");
@@ -960,8 +960,8 @@ static int check_sm75_native_q4_layout_exact(void) {
                 optimized_cases[c].name);
     }
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7");
 
     for (uint32_t s = 0; s < 6u; s++) {
         selh[s] = (int32_t)s;
@@ -982,8 +982,8 @@ static int check_sm75_native_q4_layout_exact(void) {
 
 cleanup:
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7");
     ds4_gpu_set_routed_q4_layout(0u);
     if ((standard || native) && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);

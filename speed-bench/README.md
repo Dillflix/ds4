@@ -28,7 +28,7 @@ NCU_USE_SUDO=1 \
 
 Use `REPEATS=6` for replicated timing after the two-repeat pilot succeeds.
 
-### Cost-planner default and K-stage4 native-Q4 A/B
+### Cost-planner default and next native-Q4 A/B
 
 The cost-aware residual planner is now the tagged native-Q4 production default:
 `1..4 -> tile4`, `5..8 -> tile8`, and `9..15 -> tile16`. Set
@@ -36,13 +36,13 @@ The cost-aware residual planner is now the tagged native-Q4 production default:
 the old minimum-active-tile planner.
 
 The previously measured gate fused16 and down stage8 candidates were removed:
-both regressed production throughput. Their replacements retain all 16 pair
-activations in shared memory but stage four K blocks at a time. This keeps each
-loaded packed-Q4 weight fragment shared by the low8 and high8 pair halves while
-reducing declared activation shared memory from roughly 36.5 KiB to 18.3 KiB.
-Gate/up uses a separate 4 KiB gate scratch and bounded matrix phases; down uses
-the same K-window without the rejected candidate's per-warp global activation
-rereads.
+both regressed production throughput. The replacements stage only the 256-byte
+MMA payload; Q8 scales and correction sums remain on the read-only path. Gate
+`stream7` keeps seven complete token rows resident across all output-row groups
+and uses the existing gate tensor for its bounded gate/up phases. Down
+`compact7` stages seven of eight K blocks for all 16 pairs once per CTA, leaving
+only one block on the read-only path. Both preserve low8/high8 weight reuse,
+avoid per-row-group restaging, and compile below 32 KiB declared shared memory.
 
 `cuda-sm75-native-q4-next-ab.sh` tests `baseline`, `down`, `gate`, and `both`
 in alternating order at placement `0,3,1,2` and split 22/21. Before loading the

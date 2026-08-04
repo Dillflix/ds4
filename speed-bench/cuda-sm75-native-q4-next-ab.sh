@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run an isolated production A/B of the K-stage4 SM75 native-Q4 designs against
+Run an isolated production A/B of the stream7/compact7 SM75 native-Q4 designs against
 the cost-planner production path. No model conversion or hashing occurs.
 
 Required environment:
@@ -28,9 +28,9 @@ Optional environment:
 Variants:
   baseline   cost planner + production gate tile8/down full-stage
   legacy     legacy residual planner (diagnostic only)
-  down       baseline + down tile16 K-stage4
-  gate       baseline + gate/up tile16 K-stage4
-  both       baseline + both K-stage4 designs
+  down       baseline + down tile16 compact7
+  gate       baseline + gate/up tile16 stream7
+  both       baseline + both next designs
 
 The production placement is fixed to GPUs 0,3,1,2 and a 22/21 stage split.
 EOF
@@ -177,8 +177,8 @@ run_variant() {
     read -r legacy gate down < <(variant_flags "$variant")
     "${clean_prefix[@]}" "${production_prefix[@]}" \
         "DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES=$legacy" \
-        "DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4=$gate" \
-        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4=$down" \
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7=$gate" \
+        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7=$down" \
         "$@"
 }
 
@@ -190,8 +190,8 @@ validate_log() {
         die "$variant did not use split 22/21"
     grep -Fq '4 devices [0,3,1,2] requested' "$log" ||
         die "$variant did not use GPU order 0,3,1,2"
-    gate_name=tile8; [[ $gate == 0 ]] || gate_name=kstage4
-    down_name=full-stage; [[ $down == 0 ]] || down_name=kstage4
+    gate_name=tile8; [[ $gate == 0 ]] || gate_name=stream7
+    down_name=full-stage; [[ $down == 0 ]] || down_name=compact7
     grep -Fq "packed A/W, planner=$planner, gate=$gate_name, down=$down_name" \
         "$log" || die "$variant did not select the requested native-Q4 paths"
 }
@@ -216,13 +216,13 @@ cuobjdump --dump-resource-usage ./ds4-bench \
 c++filt <"$OUTPUT_DIR/provenance/resource-usage.txt" \
     >"$OUTPUT_DIR/provenance/resource-usage.demangled.txt"
 python3 - "$OUTPUT_DIR/provenance/resource-usage.demangled.txt" \
-        "$OUTPUT_DIR/provenance/kstage-resource-gate.csv" <<'PY'
+        "$OUTPUT_DIR/provenance/next-resource-gate.csv" <<'PY'
 import csv, re, sys
 
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
 targets = {
-    "gate-kstage4": "moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel",
-    "down-kstage4": "moe_down_sm75_native_q4_tile16_kstage4_kernel",
+    "gate-stream7": "moe_gate_up_mid_sm75_native_q4_tile16_stream7_kernel",
+    "down-compact7": "moe_down_sm75_native_q4_tile16_compact7_kernel",
 }
 records = []
 for index, line in enumerate(text):
@@ -259,7 +259,7 @@ with open(sys.argv[2], "w", newline="", encoding="utf-8") as stream:
     writer = csv.DictWriter(stream,
         fieldnames=("design", "kernel", "REG", "STACK", "SHARED", "LOCAL"))
     writer.writeheader(); writer.writerows(records)
-print("validated K-stage4 kernels: no spills, shared <32KiB, registers <=128")
+print("validated stream7/compact7: no spills, shared <32KiB, registers <=128")
 PY
 
 current_phase=api-exactness
@@ -271,9 +271,9 @@ current_phase=api-exactness
 for marker in \
     'tagged SM75 native Q4 cost-planner default exact' \
     'tagged SM75 native Q4 legacy-planner diagnostic exact' \
-    'tagged SM75 native Q4 gate-kstage4 exact' \
-    'tagged SM75 native Q4 down-kstage4 exact' \
-    'tagged SM75 native Q4 gate/down-kstage4 exact' \
+    'tagged SM75 native Q4 gate-stream7 exact' \
+    'tagged SM75 native Q4 down-compact7 exact' \
+    'tagged SM75 native Q4 gate-stream7/down-compact7 exact' \
     'cuda long-context regression: OK'; do
     grep -Fq "$marker" "$OUTPUT_DIR/validation/cuda-exact.log" ||
         die "exact-output marker missing: $marker"
