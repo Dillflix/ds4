@@ -1,5 +1,33 @@
 ## Benchmarking
 
+### Tagged SM75-native full-Q4 production A/B
+
+`cuda-sm75-native-q4-production.sh` is the acceptance runner for the packed
+INT4 production layout. It losslessly repacks a stock full-Q4 model when the
+native output does not already exist, requires the production API's standard
+and native results to be exact for tile16 plus real 8/4 tails and decode, and
+then requires bit-identical full-vocabulary logits from the two complete GGUFs.
+
+The timed comparison is fixed to the measured 22/21 split and device order
+`0,3,1,2`; process order alternates between standard and native. It also
+captures an actual four-GPU Nsight Systems trace and bounded Nsight Compute
+reports for native gate/up tile8 and down tile16/8/4. No model hash is taken.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export NATIVE_MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+REPEATS=2 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-native-q4-production.sh
+```
+
+Use `REPEATS=6` for replicated timing after the two-repeat pilot succeeds.
+
 ### Exact production Q4 expert histogram
 
 `cuda-q4-real-histogram.sh` captures the actual per-expert routed-pair counts

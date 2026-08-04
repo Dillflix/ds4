@@ -758,6 +758,196 @@ cleanup:
     return rc;
 }
 
+static void pack_sm75_native_q4_tensor(unsigned char *dst,
+                                        const unsigned char *src,
+                                        uint32_t n_experts,
+                                        uint32_t n_rows,
+                                        uint32_t n_blocks) {
+    const uint64_t row_bytes = (uint64_t)n_blocks * 144u;
+    const uint64_t expert_bytes = (uint64_t)n_rows * row_bytes;
+    for (uint32_t expert = 0; expert < n_experts; expert++) {
+        for (uint32_t tile = 0; tile < n_rows / 8u; tile++) {
+            for (uint32_t block = 0; block < n_blocks; block++) {
+                unsigned char *record = dst +
+                    (uint64_t)expert * expert_bytes +
+                    ((uint64_t)tile * n_blocks + block) * 8u * 144u;
+                for (uint32_t row = 0; row < 8u; row++) {
+                    const unsigned char *q4 = src +
+                        (uint64_t)expert * expert_bytes +
+                        (uint64_t)(tile * 8u + row) * row_bytes +
+                        (uint64_t)block * 144u;
+                    memcpy(record + row * 16u, q4, 16u);
+                }
+                uint32_t *mma = (uint32_t *)(record + 8u * 16u);
+                for (uint32_t lane = 0; lane < 32u; lane++) {
+                    const uint32_t row = lane >> 2u;
+                    const uint32_t lane4 = lane & 3u;
+                    const unsigned char *qs = src +
+                        (uint64_t)expert * expert_bytes +
+                        (uint64_t)(tile * 8u + row) * row_bytes +
+                        (uint64_t)block * 144u + 16u;
+                    for (uint32_t group = 0; group < 8u; group++) {
+                        const uint32_t off = (group >> 1u) * 32u + lane4 * 8u;
+                        const uint32_t shift = (group & 1u) ? 4u : 0u;
+                        uint32_t packed = 0u;
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            packed |= ((uint32_t)((qs[off + i] >> shift) & 15u))
+                                << (4u * i);
+                            packed |= ((uint32_t)((qs[off + 4u + i] >> shift) & 15u))
+                                << (4u * (i + 4u));
+                        }
+                        mma[group * 32u + lane] = packed;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void fill_q4_tensor(unsigned char *base, uint32_t matrix,
+                           uint32_t n_experts, uint32_t n_rows,
+                           uint32_t n_blocks) {
+    const uint64_t row_bytes = (uint64_t)n_blocks * 144u;
+    const uint64_t expert_bytes = (uint64_t)n_rows * row_bytes;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            for (uint32_t b = 0; b < n_blocks; b++) {
+                unsigned char *blk = base + (uint64_t)e * expert_bytes +
+                    (uint64_t)row * row_bytes + (uint64_t)b * 144u;
+                const uint16_t d = 0x2000u, dmin = 0x1800u;
+                memcpy(blk, &d, 2u); memcpy(blk + 2u, &dmin, 2u);
+                for (uint32_t i = 0; i < 12u; i++)
+                    blk[4u + i] = (unsigned char)(e * 29u + row * 11u +
+                        b * 7u + i * 13u + matrix * 17u);
+                for (uint32_t i = 0; i < 128u; i++)
+                    blk[16u + i] = (unsigned char)(e * 17u + row * 23u +
+                        b * 31u + i * 5u + matrix * 19u);
+            }
+        }
+    }
+}
+
+/* This is the production API, not an isolated microkernel comparison.  It
+ * proves exact standard-vs-tagged output for a prefill histogram containing
+ * full 16s plus true 8/4 tails and for the direct six-expert decode route. */
+static int check_sm75_native_q4_layout_exact(void) {
+    const uint32_t n_total = 8u, in_dim = 4096u, mid_dim = 256u,
+                   out_dim = 256u, in_blocks = 16u, mid_blocks = 1u;
+    const uint32_t n_tokens = 128u, n_expert = 1u;
+    const uint64_t gate_row = (uint64_t)in_blocks * 144u;
+    const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
+    const uint64_t down_row = (uint64_t)mid_blocks * 144u;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    const uint64_t gate_off = 0u;
+    const uint64_t up_off = gate_expert * n_total;
+    const uint64_t down_off = up_off + gate_expert * n_total;
+    const uint64_t model_bytes = down_off + down_expert * n_total;
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    const uint64_t x_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t mid_count = pairs * mid_dim;
+    const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t down_bytes = x_count * sizeof(float) >
+        out_count * sizeof(float) ? x_count * sizeof(float) :
+                                   out_count * sizeof(float);
+    unsigned char *standard = (unsigned char *)calloc(1, (size_t)model_bytes);
+    unsigned char *native = (unsigned char *)malloc((size_t)model_bytes);
+    float *xh = (float *)malloc((size_t)x_count * sizeof(float));
+    int32_t *selh = (int32_t *)malloc((size_t)pairs * sizeof(int32_t));
+    float *wh = (float *)malloc((size_t)pairs * sizeof(float));
+    float *mid_ref = (float *)malloc((size_t)mid_count * sizeof(float));
+    float *mid_got = (float *)malloc((size_t)mid_count * sizeof(float));
+    float *out_ref = (float *)malloc((size_t)out_count * sizeof(float));
+    float *out_got = (float *)malloc((size_t)out_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_count * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(pairs * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(pairs * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(down_bytes);
+    int rc = 1;
+    if (!standard || !native || !xh || !selh || !wh || !mid_ref || !mid_got ||
+        !out_ref || !out_got || !x || !selected || !weights || !out ||
+        !gate || !up || !mid || !down) goto cleanup;
+    fill_q4_tensor(standard + gate_off, 0u, n_total, mid_dim, in_blocks);
+    fill_q4_tensor(standard + up_off, 1u, n_total, mid_dim, in_blocks);
+    fill_q4_tensor(standard + down_off, 2u, n_total, out_dim, mid_blocks);
+    memcpy(native, standard, (size_t)model_bytes);
+    pack_sm75_native_q4_tensor(native + gate_off, standard + gate_off,
+                               n_total, mid_dim, in_blocks);
+    pack_sm75_native_q4_tensor(native + up_off, standard + up_off,
+                               n_total, mid_dim, in_blocks);
+    pack_sm75_native_q4_tensor(native + down_off, standard + down_off,
+                               n_total, out_dim, mid_blocks);
+    for (uint64_t i = 0; i < x_count; i++)
+        xh[i] = (float)((int)((i * 23u + (i >> 5u) * 17u) % 257u) - 128) /
+            133.0f;
+    const uint32_t cuts[6] = {25u, 50u, 70u, 90u, 109u, 128u};
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t e = 0u;
+        while (e < 5u && t >= cuts[e]) e++;
+        selh[t] = (int32_t)e;
+        wh[t] = (float)((t % 7u) + 1u) / 8.0f;
+    }
+    if (!ds4_gpu_tensor_write(x, 0, xh, x_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(selected, 0, selh, pairs * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(weights, 0, wh, pairs * sizeof(float))) goto cleanup;
+    bool mid_is_f16 = false;
+#define RUN_NATIVE_Q4(MODEL, LAYOUT, NTOK, NEXP, MID_DST, OUT_DST) \
+    (ds4_gpu_set_routed_q4_layout(LAYOUT), \
+     ds4_gpu_set_model_map((MODEL), model_bytes) && \
+     ds4_gpu_routed_moe_batch_tensor( \
+        out, gate, up, mid, down, (MODEL), model_bytes, \
+        gate_off, up_off, down_off, 12u, 12u, \
+        gate_expert, gate_row, down_expert, down_row, \
+        in_dim, mid_dim, out_dim, selected, weights, n_total, (NEXP), \
+        10.0f, x, 0u, (NTOK), &mid_is_f16, true) && !mid_is_f16 && \
+     ds4_gpu_synchronize() && \
+     ds4_gpu_tensor_read(mid, 0, (MID_DST), \
+                         (uint64_t)(NTOK) * (NEXP) * mid_dim * sizeof(float)) && \
+     ds4_gpu_tensor_read(out, 0, (OUT_DST), \
+                         (uint64_t)(NTOK) * out_dim * sizeof(float)))
+    if (!RUN_NATIVE_Q4(standard, 0u, n_tokens, n_expert,
+                       mid_ref, out_ref) ||
+        !RUN_NATIVE_Q4(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
+                       n_tokens, n_expert, mid_got, out_got) ||
+        !compare_exact_f32("sm75 native q4 prefill mid", mid_ref, mid_got,
+                           mid_count) ||
+        !compare_exact_f32("sm75 native q4 prefill output", out_ref, out_got,
+                           out_count)) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: tagged SM75 native Q4 prefill 16/8/4 exact\n");
+
+    for (uint32_t s = 0; s < 6u; s++) {
+        selh[s] = (int32_t)s;
+        wh[s] = (float)(s + 1u) / 8.0f;
+    }
+    if (!ds4_gpu_tensor_write(selected, 0, selh, 6u * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(weights, 0, wh, 6u * sizeof(float)) ||
+        !RUN_NATIVE_Q4(standard, 0u, 1u, 6u, mid_ref, out_ref) ||
+        !RUN_NATIVE_Q4(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
+                       1u, 6u, mid_got, out_got) ||
+        !compare_exact_f32("sm75 native q4 decode mid", mid_ref, mid_got,
+                           6ull * mid_dim) ||
+        !compare_exact_f32("sm75 native q4 decode output", out_ref, out_got,
+                           out_dim)) goto cleanup;
+    fprintf(stderr, "cuda-regression: tagged SM75 native Q4 decode exact\n");
+    rc = 0;
+#undef RUN_NATIVE_Q4
+
+cleanup:
+    ds4_gpu_set_routed_q4_layout(0u);
+    if ((standard || native) && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
+    free(out_got); free(out_ref); free(mid_got); free(mid_ref);
+    free(wh); free(selh); free(xh); free(native); free(standard);
+    return rc;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -1037,6 +1227,7 @@ int main(void) {
     int rc = check_sm75_q8_mma_exact();
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
+    if (check_sm75_native_q4_layout_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;

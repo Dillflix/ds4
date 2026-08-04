@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #if defined(_WIN32)
@@ -49,6 +50,9 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
+#define DS4_KV_Q4_ROUTED_LAYOUT            "ds4.routed_expert.q4.layout"
+#define DS4_KV_Q4_ROUTED_LAYOUT_VERSION    "ds4.routed_expert.q4.layout_version"
+#define DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE   "sm75_m8n8k32_native_aw_v1"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
 
 typedef enum {
@@ -1373,9 +1377,73 @@ static void *expert_worker(void *arg) {
     return NULL;
 }
 
+static void repack_sm75_native_q4_bytes(byte_buf *buf,
+                                        int64_t ncols,
+                                        int64_t nrows,
+                                        int n_experts) {
+    enum { QK_K = 256, Q4_BLOCK_BYTES = 144, Q4_HEADER_BYTES = 16,
+           OUT_TILE = 8, GROUPS = 8, LANES = 32 };
+    if (!buf || !buf->data || ncols <= 0 || nrows <= 0 || n_experts <= 0 ||
+        ncols % QK_K != 0 || nrows % OUT_TILE != 0) {
+        die("SM75 native Q4 routed tensor shape is not tile-aligned");
+    }
+    const size_t in_blocks = (size_t)ncols / QK_K;
+    const size_t row_bytes = in_blocks * Q4_BLOCK_BYTES;
+    const size_t expert_bytes = (size_t)nrows * row_bytes;
+    if (expert_bytes > SIZE_MAX / (size_t)n_experts ||
+        buf->size != expert_bytes * (size_t)n_experts) {
+        die("SM75 native Q4 routed tensor byte size is inconsistent");
+    }
+    uint8_t *native = xmalloc(buf->size);
+    for (int expert = 0; expert < n_experts; expert++) {
+        const uint8_t *expert_src =
+            buf->data + (size_t)expert * expert_bytes;
+        uint8_t *expert_dst = native + (size_t)expert * expert_bytes;
+        for (size_t tile = 0; tile < (size_t)nrows / OUT_TILE; tile++) {
+            for (size_t block = 0; block < in_blocks; block++) {
+                uint8_t *record = expert_dst +
+                    (tile * in_blocks + block) * OUT_TILE * Q4_BLOCK_BYTES;
+                uint8_t *headers = record;
+                uint32_t *mma_b = (uint32_t *)(record +
+                    OUT_TILE * Q4_HEADER_BYTES);
+                for (size_t row = 0; row < OUT_TILE; row++) {
+                    const uint8_t *src = expert_src +
+                        (tile * OUT_TILE + row) * row_bytes +
+                        block * Q4_BLOCK_BYTES;
+                    memcpy(headers + row * Q4_HEADER_BYTES,
+                           src, Q4_HEADER_BYTES);
+                }
+                for (size_t lane = 0; lane < LANES; lane++) {
+                    const size_t row = lane >> 2;
+                    const size_t lane4 = lane & 3;
+                    const uint8_t *src = expert_src +
+                        (tile * OUT_TILE + row) * row_bytes +
+                        block * Q4_BLOCK_BYTES;
+                    const uint8_t *qs = src + Q4_HEADER_BYTES;
+                    for (size_t group = 0; group < GROUPS; group++) {
+                        const size_t off = (group >> 1) * 32 + lane4 * 8;
+                        uint32_t packed = 0;
+                        const unsigned shift = (group & 1) ? 4u : 0u;
+                        for (size_t i = 0; i < 4; i++) {
+                            packed |= ((uint32_t)((qs[off + i] >> shift) & 15u))
+                                      << (4u * i);
+                            packed |= ((uint32_t)((qs[off + 4 + i] >> shift) & 15u))
+                                      << (4u * (i + 4));
+                        }
+                        mma_b[group * LANES + lane] = packed;
+                    }
+                }
+            }
+        }
+    }
+    free(buf->data);
+    buf->data = native;
+}
+
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix,
+                                bool sm75_native_q4) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
@@ -1417,14 +1485,19 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     pthread_mutex_destroy(&job.lock);
     free(threads);
     free(workers);
+
+    if (sm75_native_q4 && target == DS4Q_TYPE_Q4_K)
+        repack_sm75_native_q4_bytes(&out, ncols, nrows, n_experts);
     return out;
 }
 
 static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix,
+                                bool sm75_native_q4) {
     if (parse_expert_tensor(name).is_expert) {
-        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
+        return generate_expert(db, name, tmpl, target, n_experts, n_threads,
+                               imatrix, sm75_native_q4);
     }
     return generate_regular(db, name, tmpl, target, imatrix);
 }
@@ -1451,6 +1524,7 @@ typedef struct {
     size_t kv_raw_len;
     size_t alignment;
     int n_experts;
+    bool sm75_native_q4;
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
@@ -1543,6 +1617,32 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
+static bool is_q4_layout_kv_key(const char *key) {
+    return strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT) == 0 ||
+           strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT_VERSION) == 0;
+}
+
+static size_t extra_q4_layout_kv_size(bool enabled) {
+    if (!enabled) return 0;
+    return gguf_string_size(DS4_KV_Q4_ROUTED_LAYOUT) + 4 +
+               gguf_string_size(DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE) +
+           gguf_string_size(DS4_KV_Q4_ROUTED_LAYOUT_VERSION) + 4 + 4;
+}
+
+static uint64_t extra_q4_layout_kv_count(bool enabled) {
+    return enabled ? 2u : 0u;
+}
+
+static void write_q4_layout_kvs(FILE *fp, bool enabled) {
+    if (!enabled) return;
+    write_gguf_string(fp, DS4_KV_Q4_ROUTED_LAYOUT);
+    write_u32(fp, GGUF_TYPE_STRING);
+    write_gguf_string(fp, DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE);
+    write_gguf_string(fp, DS4_KV_Q4_ROUTED_LAYOUT_VERSION);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u32(fp, 1u);
+}
+
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
@@ -1595,6 +1695,8 @@ static gguf_file load_gguf_metadata(const char *path) {
     g.alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
     byte_span *kv_keep = xcalloc((size_t)g.n_kv, sizeof(kv_keep[0]));
     uint64_t n_kv_keep = 0;
+    bool q4_layout_seen = false;
+    bool q4_layout_version_seen = false;
 
     off_t kv_start = ftello(fp);
     if (kv_start < 0) die("GGUF ftell failed");
@@ -1612,6 +1714,21 @@ static gguf_file load_gguf_metadata(const char *path) {
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT64) {
             uint64_t n = read_u64_le_fp(fp, "GGUF expert count");
             if (n <= (uint64_t)INT_MAX) g.n_experts = (int)n;
+        } else if (strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT) == 0) {
+            if (type != GGUF_TYPE_STRING) die("bad routed-Q4 layout metadata type");
+            char *layout = read_gguf_string_fp(fp);
+            if (strcmp(layout, DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE) != 0) {
+                fprintf(stderr, "error: unsupported routed-Q4 layout: %s\n", layout);
+                free(layout);
+                exit(1);
+            }
+            free(layout);
+            q4_layout_seen = true;
+        } else if (strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT_VERSION) == 0) {
+            if (type != GGUF_TYPE_UINT32) die("bad routed-Q4 layout-version metadata type");
+            uint32_t version = read_u32_le_fp(fp, "routed-Q4 layout version");
+            if (version != 1u) die("unsupported routed-Q4 layout version");
+            q4_layout_version_seen = true;
         } else {
             skip_gguf_value_fp(fp, type);
         }
@@ -1624,7 +1741,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) && !is_q4_layout_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1632,6 +1749,10 @@ static gguf_file load_gguf_metadata(const char *path) {
         }
         free(key);
     }
+    if (q4_layout_seen != q4_layout_version_seen) {
+        die("incomplete routed-Q4 layout metadata");
+    }
+    g.sm75_native_q4 = q4_layout_seen;
     off_t tensor_start = ftello(fp);
     if (tensor_start < 0 || tensor_start < kv_start) die("GGUF ftell failed");
     size_t kv_full_len = (size_t)(tensor_start - kv_start);
@@ -1699,10 +1820,14 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
+static output_context build_output_context(const gguf_file *tmpl,
+                                           const quant_policy *policy,
+                                           const imatrix_store *im,
+                                           bool sm75_native_q4) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = extra_imatrix_kv_count(im) +
+                     extra_q4_layout_kv_count(sm75_native_q4);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1714,6 +1839,20 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
+        if (sm75_native_q4 && parse_expert_tensor(src->name).is_expert) {
+            if (type != DS4Q_TYPE_Q4_K) {
+                fprintf(stderr,
+                        "error: --sm75-native-q4 routed tensor %s resolves to %s\n",
+                        src->name, ds4q_type_name(type));
+                exit(1);
+            }
+            if (src->ne[0] % 256 != 0 || src->ne[1] % 8 != 0) {
+                fprintf(stderr,
+                        "error: --sm75-native-q4 tensor %s is not tile-aligned\n",
+                        src->name);
+                exit(1);
+            }
+        }
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
         if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
         dst->type = type;
@@ -1723,7 +1862,9 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
+                    extra_imatrix_kv_size(im) +
+                    extra_q4_layout_kv_size(sm75_native_q4) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1739,7 +1880,8 @@ static void write_padding(FILE *fp, size_t n) {
 
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix,
+                            bool sm75_native_q4) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1748,6 +1890,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
+    write_q4_layout_kvs(fp, sm75_native_q4);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1767,7 +1910,8 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
         const double started = monotonic_seconds();
         byte_buf data = generate_tensor(db, dst->name, src, dst->type,
-                                        n_experts, n_threads, imatrix);
+                                        n_experts, n_threads, imatrix,
+                                        sm75_native_q4);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1783,6 +1927,136 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         free(data.data);
     }
     fclose(fp);
+}
+
+static output_context build_sm75_q4_repack_context(const gguf_file *src) {
+    output_context out = {0};
+    out.n_tensors = src->n_tensors;
+    out.n_kv_extra = extra_q4_layout_kv_count(true);
+    out.alignment = src->alignment;
+    out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
+    size_t tensor_info = 0;
+    size_t off = 0;
+    uint64_t routed = 0;
+    for (uint64_t i = 0; i < out.n_tensors; i++) {
+        const tensor_meta *st = &src->tensors[i];
+        tensor_meta *dt = &out.tensors[i];
+        *dt = *st;
+        dt->name = st->name;
+        dt->new_offset = off;
+        off += ds4q_pad(dt->size, out.alignment);
+        tensor_info += gguf_string_size(dt->name) + 4 +
+                       (size_t)dt->n_dims * 8 + 4 + 8;
+        if (parse_expert_tensor(st->name).is_expert) {
+            routed++;
+            if (st->type != DS4Q_TYPE_Q4_K) {
+                fprintf(stderr,
+                        "error: routed tensor %s is %s, not Q4_K\n",
+                        st->name, ds4q_type_name(st->type));
+                exit(1);
+            }
+            if (st->n_dims < 3 || st->ne[2] != src->n_experts) {
+                fprintf(stderr,
+                        "error: routed tensor %s does not contain %d experts\n",
+                        st->name, src->n_experts);
+                exit(1);
+            }
+        }
+    }
+    if (!routed) die("source GGUF contains no routed expert tensors");
+    out.tensor_bytes = off;
+    out.meta_size = 4 + 4 + 8 + 8 + src->kv_raw_len +
+                    extra_q4_layout_kv_size(true) + tensor_info;
+    out.data_offset = ds4q_pad(out.meta_size, out.alignment);
+    return out;
+}
+
+static void copy_exact_bytes(FILE *src, FILE *dst, size_t n,
+                             uint8_t *scratch, size_t scratch_size,
+                             const char *path) {
+    while (n) {
+        const size_t chunk = n < scratch_size ? n : scratch_size;
+        if (fread(scratch, 1, chunk, src) != chunk) {
+            die_errno("read GGUF tensor", path);
+        }
+        if (fwrite(scratch, 1, chunk, dst) != chunk) {
+            die_errno("write GGUF tensor", path);
+        }
+        n -= chunk;
+    }
+}
+
+static void write_sm75_q4_repack(const gguf_file *src,
+                                 const output_context *out_ctx,
+                                 const char *out_path) {
+    enum { COPY_CHUNK = 16 * 1024 * 1024 };
+    FILE *in = fopen(src->path, "rb");
+    if (!in) die_errno("open source GGUF", src->path);
+    FILE *out = fopen(out_path, "wb");
+    if (!out) die_errno("open output", out_path);
+    if (fwrite("GGUF", 1, 4, out) != 4) die("write GGUF magic failed");
+    write_u32(out, src->version);
+    write_u64(out, src->n_tensors);
+    write_u64(out, src->n_kv + out_ctx->n_kv_extra);
+    if (fwrite(src->kv_raw, 1, src->kv_raw_len, out) != src->kv_raw_len) {
+        die("write GGUF KV failed");
+    }
+    write_q4_layout_kvs(out, true);
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        const tensor_meta *t = &out_ctx->tensors[i];
+        write_gguf_string(out, t->name);
+        write_u32(out, (uint32_t)t->n_dims);
+        for (int j = 0; j < t->n_dims; j++) write_u64(out, (uint64_t)t->ne[j]);
+        write_u32(out, (uint32_t)t->type);
+        write_u64(out, t->new_offset);
+    }
+    off_t pos = ftello(out);
+    if (pos < 0 || (size_t)pos > out_ctx->data_offset) {
+        die("repacked GGUF metadata larger than planned");
+    }
+    write_padding(out, out_ctx->data_offset - (size_t)pos);
+
+    uint8_t *scratch = xmalloc(COPY_CHUNK);
+    for (uint64_t i = 0; i < src->n_tensors; i++) {
+        const tensor_meta *st = &src->tensors[i];
+        const tensor_meta *dt = &out_ctx->tensors[i];
+        const bool routed = parse_expert_tensor(st->name).is_expert;
+        fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s %s\n",
+                i + 1, src->n_tensors, st->name,
+                routed ? "-> sm75-native-q4" : "-> verbatim");
+        const double started = monotonic_seconds();
+        if (fseeko(in, (off_t)(src->data_offset + st->old_offset), SEEK_SET) != 0) {
+            die_errno("seek source GGUF", src->path);
+        }
+        if (routed) {
+            const size_t expert_bytes = st->size / (size_t)src->n_experts;
+            if (!expert_bytes || expert_bytes * (size_t)src->n_experts != st->size) {
+                die("routed tensor byte size is not divisible by expert count");
+            }
+            for (int expert = 0; expert < src->n_experts; expert++) {
+                byte_buf one = { .size = expert_bytes, .data = xmalloc(expert_bytes) };
+                if (fread(one.data, 1, one.size, in) != one.size) {
+                    die_errno("read routed expert", src->path);
+                }
+                repack_sm75_native_q4_bytes(&one, st->ne[0], st->ne[1], 1);
+                if (fwrite(one.data, 1, one.size, out) != one.size) {
+                    die_errno("write routed expert", out_path);
+                }
+                free(one.data);
+            }
+        } else {
+            copy_exact_bytes(in, out, st->size, scratch, COPY_CHUNK, src->path);
+        }
+        const size_t padded = ds4q_pad(dt->size, out_ctx->alignment);
+        write_padding(out, padded - dt->size);
+        const double elapsed = monotonic_seconds() - started;
+        const double mib = (double)dt->size / 1048576.0;
+        fprintf(stderr, "       wrote %.2f MiB in %.2fs (%.2f MiB/s)\n",
+                mib, elapsed, elapsed > 0.0 ? mib / elapsed : 0.0);
+    }
+    free(scratch);
+    if (fclose(in) != 0) die_errno("close source GGUF", src->path);
+    if (fclose(out) != 0) die_errno("close output GGUF", out_path);
 }
 
 static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
@@ -1835,6 +2109,7 @@ static void dspark_support_defaults(dspark_support_options *o) {
 typedef struct {
     char *hf_dir;
     char *template_gguf;
+    char *repack_sm75_q4;
     char *out_gguf;
     char *compare_gguf;
     char *compare_tensor;
@@ -1847,6 +2122,7 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    bool sm75_native_q4;
     bool dspark_manifest;
     bool dspark_support;
     dspark_support_options dspark;
@@ -2460,7 +2736,8 @@ static byte_buf generate_dspark_tensor(st_db *db, const dspark_tensor_plan *tp,
                                tp->meta.type,
                                tp->n_experts,
                                n_threads,
-                               imatrix);
+                               imatrix,
+                               false);
     }
     return generate_regular_hf(db,
                                tp->meta.name,
@@ -2542,10 +2819,12 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
 
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("       %s --repack-sm75-native-q4 MODEL.gguf --out OUT.gguf\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
+    printf("  --repack-sm75-native-q4 FILE  losslessly repack an all-Q4 routed model; no HF input/hash\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, checksum, optionally byte-compare, and exit\n");
@@ -2574,6 +2853,7 @@ static void usage(const char *argv0) {
     printf("  --threads N            expert worker count, default 8\n");
     printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
     printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
+    printf("  --sm75-native-q4      store routed Q4_K tensors in tagged Turing MMA-native A/W layout\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
@@ -2646,6 +2926,8 @@ static params parse_args(int argc, char **argv) {
             p.hf_dir = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--repack-sm75-native-q4") == 0) {
+            p.repack_sm75_q4 = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
             p.out_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--compare-gguf") == 0) {
@@ -2708,10 +2990,46 @@ static params parse_args(int argc, char **argv) {
             p.quant_backend = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--quant-gpu-devices") == 0) {
             p.quant_gpu_devices = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--sm75-native-q4") == 0) {
+            p.sm75_native_q4 = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
         }
+    }
+    if (p.repack_sm75_q4) {
+        if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
+            p.imatrix_file || p.dspark_manifest || p.dspark_support ||
+            p.imatrix_strict || p.sm75_native_q4 || p.quant_backend ||
+            p.quant_gpu_devices || p.n_experts != 0 || p.policy.n_overrides ||
+            p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
+            p.policy.attention_proj != DS4Q_TYPE_COUNT ||
+            p.policy.attention != DS4Q_TYPE_COUNT ||
+            p.policy.shared != DS4Q_TYPE_COUNT ||
+            p.policy.embedding != DS4Q_TYPE_COUNT ||
+            p.policy.output != DS4Q_TYPE_COUNT ||
+            p.policy.dense != DS4Q_TYPE_COUNT) {
+            die("--repack-sm75-native-q4 cannot be combined with quantization options");
+        }
+        if (!p.dry_run && !p.out_gguf) die("--out is required unless --dry-run is used");
+        if (p.out_gguf && strcmp(p.repack_sm75_q4, p.out_gguf) == 0) {
+            die("SM75 Q4 repack input and output must be different files");
+        }
+        if (p.out_gguf && file_exists(p.out_gguf)) {
+            struct stat in_stat, out_stat;
+            if (stat(p.repack_sm75_q4, &in_stat) == 0 &&
+                stat(p.out_gguf, &out_stat) == 0 &&
+                in_stat.st_dev == out_stat.st_dev &&
+                in_stat.st_ino == out_stat.st_ino) {
+                die("SM75 Q4 repack output aliases the input file");
+            }
+        }
+        if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) {
+            die("output exists; use --overwrite");
+        }
+        return p;
     }
     if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
@@ -2726,6 +3044,12 @@ static params parse_args(int argc, char **argv) {
         return p;
     }
     if (!p.template_gguf) die("--template is required");
+    if (p.sm75_native_q4 &&
+        (p.policy.routed_w1 != DS4Q_TYPE_Q4_K ||
+         p.policy.routed_w2 != DS4Q_TYPE_Q4_K ||
+         p.policy.routed_w3 != DS4Q_TYPE_Q4_K)) {
+        die("--sm75-native-q4 requires explicit Q4_K routed gate/down/up types");
+    }
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
@@ -2833,7 +3157,9 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts,
+                                         p->n_threads, imatrix,
+                                         p->sm75_native_q4);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -2894,6 +3220,27 @@ static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *
 
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
+    if (p.repack_sm75_q4) {
+        gguf_file src = load_gguf_metadata(p.repack_sm75_q4);
+        if (src.sm75_native_q4) {
+            die("source GGUF is already tagged with the SM75-native Q4 layout");
+        }
+        if (src.n_experts <= 0) {
+            die("source GGUF has no routed expert-count metadata");
+        }
+        output_context out_ctx = build_sm75_q4_repack_context(&src);
+        print_plan(&src, &out_ctx);
+        printf("repack: standard-q4 -> %s\n", DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE);
+        printf("routed_experts: %d\n", src.n_experts);
+        printf("tensor_hashing: disabled\n");
+        if (!p.dry_run) {
+            write_sm75_q4_repack(&src, &out_ctx, p.out_gguf);
+            fprintf(stderr, "wrote %s\n", p.out_gguf);
+        }
+        free_gguf_file(&src);
+        free(out_ctx.tensors);
+        return 0;
+    }
     if (p.dspark_manifest) {
         print_dspark_manifest(p.hf_dir);
         for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
@@ -2944,7 +3291,8 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
+    output_context out_ctx = build_output_context(
+        &tmpl, &p.policy, &imatrix, p.sm75_native_q4);
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
 
@@ -2958,7 +3306,8 @@ int main(int argc, char **argv) {
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts,
+                    p.n_threads, &imatrix, p.sm75_native_q4);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

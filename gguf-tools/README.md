@@ -107,6 +107,35 @@ You can override tensor families:
 --output q8_0
 ```
 
+For Turing-only deployment, the quantizer can write the routed Q4 tensors in
+DS4's size-neutral `sm75_m8n8k32_native_aw_v1` lane order. The GGUF retains
+the ordinary `Q4_K` tensor type and adds explicit layout/version metadata, so
+the runtime never guesses from a filename or silently reinterprets an
+ordinary Q4 file:
+
+```sh
+gguf-tools/deepseek4-quantize-cuda \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash \
+  --template FULL-Q4-TEMPLATE.gguf \
+  --out FULL-Q4-SM75-NATIVE.gguf \
+  --experts q4_k --sm75-native-q4 \
+  --quant-backend cuda --quant-gpu-devices 0,2,1,3
+```
+
+An existing all-Q4 routed GGUF can be transformed without requantization.
+This mode copies every non-routed tensor byte-for-byte, repacks one routed
+expert at a time, does not read Hugging Face weights, and does not hash the
+model:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --repack-sm75-native-q4 FULL-Q4-STANDARD.gguf \
+  --out FULL-Q4-SM75-NATIVE.gguf
+```
+
+Tagged files are deliberately accepted only by the SM75 CUDA path. Untagged
+Q4_K files retain the existing CUDA/Metal/CPU/ROCm implementations.
+
 The CUDA routed-MoE path supports the full gate/up-by-down matrix below. Gate
 and up must use the same type because they are fused; down is selected
 independently.

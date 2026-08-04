@@ -2091,6 +2091,7 @@ typedef struct {
     uint64_t alignment;
     uint64_t tensor_data_pos;
     uint64_t max_tensor_bytes;
+    uint32_t q4_routed_layout;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
@@ -2481,6 +2482,20 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+
+    ds4_str q4_layout = {0};
+    uint32_t q4_layout_version = 0;
+    if (model_get_string(m, "ds4.routed_expert.q4.layout", &q4_layout)) {
+        if (!ds4_streq(q4_layout, "sm75_m8n8k32_native_aw_v1") ||
+            !model_get_u32(m, "ds4.routed_expert.q4.layout_version",
+                           &q4_layout_version) ||
+            q4_layout_version != 1u) {
+            ds4_die("unsupported routed Q4 tensor layout metadata");
+        }
+        m->q4_routed_layout = DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
+    } else if (model_find_kv(m, "ds4.routed_expert.q4.layout_version")) {
+        ds4_die("routed Q4 layout version exists without a layout tag");
+    }
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -56127,6 +56142,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (e->model.q4_routed_layout != 0u &&
+        opt->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr,
+                "ds4: this GGUF stores routed Q4 tensors in the tagged "
+                "SM75-native layout and requires --cuda on Turing; ordinary "
+                "Q4_K GGUFs remain portable\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (opt->backend == DS4_BACKEND_CUDA) {
+        ds4_gpu_set_routed_q4_layout(e->model.q4_routed_layout);
+    }
+#endif
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
         if (normal_layers == 0) {

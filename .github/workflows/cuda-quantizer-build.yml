@@ -9,6 +9,7 @@ on:
       - "ds4.h"
       - "ds4_bench.c"
       - "ds4_cuda.cu"
+      - "ds4_cuda_sm75_q4_native.inc.cu"
       - "ds4_gpu.h"
       - "ds4_help.c"
       - "Makefile"
@@ -23,6 +24,7 @@ on:
       - "speed-bench/cuda-sm75-production-scalar.sh"
       - "speed-bench/cuda-sm75-production-scalar-e2e.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
+      - "speed-bench/cuda-sm75-native-q4-production.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-q4-real-histogram.py"
@@ -56,6 +58,23 @@ jobs:
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
         run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+      - name: Verify production tagged-Q4 SM75 instructions
+        run: |
+          cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'
+          cuobjdump --dump-sass tests/cuda_long_context_smoke > /tmp/ds4-sm75.sass
+          for kernel in \
+            moe_gate_up_mid_sm75_native_q4_tile8_kernel \
+            moe_down_sm75_native_q4_tile_kernel; do
+            grep -Fq "$kernel" /tmp/ds4-sm75.sass
+            awk -v wanted="$kernel" '
+              /Function : / { emit = index($0, wanted) != 0 }
+              emit { print }
+            ' /tmp/ds4-sm75.sass > "/tmp/$kernel.sass"
+            grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' "/tmp/$kernel.sass"
+            grep -Eq 'IMMA\.8832\.U4\.U4' "/tmp/$kernel.sass"
+            grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/$kernel.sass"
+            ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' "/tmp/$kernel.sass"
+          done
       - name: Build SM75 Q4 gate/up with PTXAS evidence
         shell: bash
         run: |
@@ -232,6 +251,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-production-scalar.sh
           test -x speed-bench/cuda-sm75-production-scalar-e2e.sh
           bash -n speed-bench/cuda-sm75-production-scalar-e2e.sh
+          test -x speed-bench/cuda-sm75-native-q4-production.sh
+          bash -n speed-bench/cuda-sm75-native-q4-production.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
