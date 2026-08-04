@@ -93,7 +93,10 @@ static void usage(const char *argv0) {
             "Set DS4_PROFILE_SCALAR_TARGET to one of none, q4-gate, q4-down,\n"
             "iq2-tile16, or iq2-tile8 to hold the production path fixed.\n"
             "DS4_PROFILE_SCALAR=1 selects its scalar candidate; 0 selects\n"
-            "the array baseline. DS4_PROFILE_REPEATS times additional calls\n"
+            "the array baseline. DS4_PROFILE_Q4_GATE_CTA_THREADS accepts\n"
+            "256, 384, or 512; DS4_PROFILE_Q4_DOWN_CTA_THREADS accepts\n"
+            "256, 384, 512, or 640. Non-256 widths require the matching\n"
+            "scalar target. DS4_PROFILE_REPEATS times additional calls\n"
             "after correctness/audit warmup (default 0, maximum 100).\n",
             argv0);
 }
@@ -686,6 +689,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     uint32_t scalar_enabled = 0u, timed_repeats = 0u;
+    uint32_t q4_gate_cta_threads = 256u, q4_down_cta_threads = 256u;
     if (!parse_env_u32("DS4_PROFILE_SCALAR", 0u, 1u, &scalar_enabled)) {
         fprintf(stderr, "error: DS4_PROFILE_SCALAR must be 0 or 1\n");
         return 2;
@@ -694,6 +698,24 @@ int main(int argc, char **argv) {
                        &timed_repeats)) {
         fprintf(stderr,
                 "error: DS4_PROFILE_REPEATS must be an integer from 0 to 100\n");
+        return 2;
+    }
+    if (!parse_env_u32("DS4_PROFILE_Q4_GATE_CTA_THREADS", 256u, 512u,
+                       &q4_gate_cta_threads) ||
+        (q4_gate_cta_threads != 256u && q4_gate_cta_threads != 384u &&
+         q4_gate_cta_threads != 512u)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_Q4_GATE_CTA_THREADS must be 256, 384, "
+                "or 512\n");
+        return 2;
+    }
+    if (!parse_env_u32("DS4_PROFILE_Q4_DOWN_CTA_THREADS", 256u, 640u,
+                       &q4_down_cta_threads) ||
+        (q4_down_cta_threads != 256u && q4_down_cta_threads != 384u &&
+         q4_down_cta_threads != 512u && q4_down_cta_threads != 640u)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_Q4_DOWN_CTA_THREADS must be 256, 384, "
+                "512, or 640\n");
         return 2;
     }
     if (scalar_enabled && scalar_target == SCALAR_TARGET_NONE) {
@@ -713,6 +735,22 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "error: scalar target %s is incompatible with scenario %s\n",
                 scalar_target_name(scalar_target), spec->name);
+        return 2;
+    }
+    if (q4_gate_cta_threads != 256u &&
+        (!scalar_enabled || scalar_target != SCALAR_TARGET_Q4_GATE)) {
+        fprintf(stderr,
+                "error: non-256 gate CTA width requires "
+                "DS4_PROFILE_SCALAR_TARGET=q4-gate and "
+                "DS4_PROFILE_SCALAR=1\n");
+        return 2;
+    }
+    if (q4_down_cta_threads != 256u &&
+        (!scalar_enabled || scalar_target != SCALAR_TARGET_Q4_DOWN)) {
+        fprintf(stderr,
+                "error: non-256 down CTA width requires "
+                "DS4_PROFILE_SCALAR_TARGET=q4-down and "
+                "DS4_PROFILE_SCALAR=1\n");
         return 2;
     }
 
@@ -763,7 +801,18 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    char q4_gate_cta_text[16], q4_down_cta_text[16];
+    (void)snprintf(q4_gate_cta_text, sizeof(q4_gate_cta_text), "%u",
+                   q4_gate_cta_threads);
+    (void)snprintf(q4_down_cta_text, sizeof(q4_down_cta_text), "%u",
+                   q4_down_cta_threads);
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75",
+                 q4_gate_cta_text, 1);
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75",
+                 q4_down_cta_text, 1);
     switch (scalar_target) {
         case SCALAR_TARGET_Q4_GATE:
             if (scalar_enabled)
@@ -785,8 +834,11 @@ int main(int argc, char **argv) {
         case SCALAR_TARGET_NONE:
             break;
     }
-    printf("scalar_target=%s\nscalar_enabled=%u\ntimed_repeats=%u\n",
-           scalar_target_name(scalar_target), scalar_enabled, timed_repeats);
+    printf("scalar_target=%s\nscalar_enabled=%u\n"
+           "q4_gate_cta_threads=%u\nq4_down_cta_threads=%u\n"
+           "timed_repeats=%u\n",
+           scalar_target_name(scalar_target), scalar_enabled,
+           q4_gate_cta_threads, q4_down_cta_threads, timed_repeats);
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");

@@ -77,6 +77,60 @@ RUN_NCU=1 NCU_USE_SUDO=1 \
   bash speed-bench/cuda-sm75-production-scalar.sh
 ```
 
+### SM75 wide-CTA resource and timing evidence
+
+`cuda-sm75-wide-cta.sh` is the model-free decision gate for making the single
+resident Q4 CTA wider on Turing. It evaluates the production scalar Q4 gate/up
+kernel at 256, 384, and 512 threads and the production scalar Q4-down kernel at
+256, 384, 512, and 640 threads. It does not open a GGUF, change the production
+default, alter clocks, or modify git state.
+
+```bash
+cd ~/ds4-iq2-q4
+
+PROFILE_GPU=0 \
+TIMING_POSITION_CYCLES=2 \
+TIMING_REPEATS=10 \
+bash speed-bench/cuda-sm75-wide-cta.sh
+```
+
+Every invocation forcibly rebuilds the three bounded harnesses for exactly
+`sm_75` with verbose PTXAS output. The structural gate merges runtime CUDA
+function attributes with PTXAS and cuobjdump SASS evidence for all 21
+family/row-span/width specializations. It records stack frames, spill bytes,
+runtime local memory, and SASS `LDL`/`STL` as candidate observations rather
+than suppressing the rest of the experiment. It rejects missing SM75 cubins,
+absent IMMA, register-report disagreement, or a width that cannot reside or
+exceeds the compiled kernel limit.
+
+The correctness harness then checks all widths at dimensions 504, 520, and
+4096, with and without auxiliary output. The two tail dimensions exercise the
+512-row specialization; the 4096-row case separately exercises the 512-,
+1024-, and 2048-row specializations. Its launch-adjacent audit markers must
+prove every family/row-span/width combination rather than merely echoing the
+requested selector. The same complete matrix must pass Compute Sanitizer in
+this order: memcheck, racecheck, and synccheck. These are mandatory gates; a
+missing tool, timeout, non-clean summary, or incomplete dispatch coverage
+fails the run.
+
+Timing is isolated by family. While gate/up width varies, Q4-down is pinned at
+256; while Q4-down varies, gate/up is pinned at 256. Early and late production
+routing shapes run in complete Latin rotations, so every width occupies every
+sample position once per cycle. A fresh process records each sample after an
+untimed dispatch/correctness warmup, and its dispatch log must prove the
+requested CTA width. The summary reports dispersion plus paired median and
+geometric-mean speedups against width 256, with a deterministic bootstrap 95%
+confidence interval. The default two position cycles are an evidence pilot;
+increase `TIMING_POSITION_CYCLES` for a final acceptance decision.
+
+Successful, failed, and interrupted runs are archived under
+`speed-bench/local-runs/sm75-wide-cta-<timestamp>.tar.gz`. Set
+`WIDE_CTA_DIR` to a new absolute path to place one run elsewhere, and
+`SANITIZER_TIMEOUT_SECONDS` to adjust each sanitizer's outer timeout. This
+isolated kernel-stage evidence can select a promising width, but that width
+must still pass the fixed four-GPU full-model suite before becoming a
+production default.
+
 ### SM75 next-target A/B suite
 
 `cuda-sm75-next-targets.sh` builds the CUDA regression binary, verifies every

@@ -47,9 +47,9 @@ OUTPUT_DIR=${SCALAR_SLOTS_DIR:-$repo_dir/sm75-production-scalar-$run_stamp}
 # renamed function. cuobjdump prints Lb0E/Lb1E in mangled names while NCU's
 # demangled name prints false/true, so each regex deliberately accepts both.
 Q4_GATE_BASE_REGEX='moe_gate_up_mid_q4K_tile8_mma_kernel.*(Lb0E|false)'
-Q4_GATE_SCALAR_REGEX='moe_gate_up_mid_q4K_tile8_mma_kernel.*(Lb1E|true)'
+Q4_GATE_SCALAR_REGEX='moe_gate_up_mid_q4K_tile8_mma_kernel.*(Lb1ELj256E|true[^>]*256)'
 Q4_DOWN_BASE_REGEX='moe_down_q4K_tile16_mma_sm75_kernel.*(Lb0E|false)'
-Q4_DOWN_SCALAR_REGEX='moe_down_q4K_tile16_mma_sm75_kernel.*(Lb1E|true)'
+Q4_DOWN_SCALAR_REGEX='moe_down_q4K_tile16_mma_sm75_kernel.*(Lb1ELj256E|true[^>]*256)'
 IQ2_TILE8_BASE_REGEX='moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*(Lb0E|false)'
 IQ2_TILE8_SCALAR_REGEX='moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*(Lb1E|true)'
 IQ2_TILE16_BASE_REGEX='moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*(Lb0E|false)'
@@ -253,11 +253,15 @@ PY
 
 scalar_envs=(DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75
              DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75
+             DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75
+             DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75
              DS4_CUDA_MOE_IQ2_SCALAR_SM75)
 run_clean() {
     local -a command=(env)
     for name in "${scalar_envs[@]}"; do command+=(-u "$name"); done
     command+=(-u DS4_PROFILE_SCALAR_TARGET -u DS4_PROFILE_SCALAR
+              -u DS4_PROFILE_Q4_GATE_CTA_THREADS
+              -u DS4_PROFILE_Q4_DOWN_CTA_THREADS
               -u DS4_PROFILE_REPEATS CUDA_VISIBLE_DEVICES="$PROFILE_GPU")
     "${command[@]}" "$@"
 }
@@ -271,6 +275,8 @@ run_profile_variant() {
     for name in "${scalar_envs[@]}"; do command+=(-u "$name"); done
     command+=(-u DS4_PROFILE_SCALAR_TARGET
               -u DS4_PROFILE_SCALAR
+              -u DS4_PROFILE_Q4_GATE_CTA_THREADS
+              -u DS4_PROFILE_Q4_DOWN_CTA_THREADS
               -u DS4_PROFILE_REPEATS
               CUDA_VISIBLE_DEVICES="$PROFILE_GPU"
               DS4_PROFILE_SCALAR_TARGET="$target"

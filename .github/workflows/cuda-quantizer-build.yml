@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4]
+    branches: [agent/iq2-iq2-q4, agent/sm75-wide-cta-matrix]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -21,6 +21,8 @@ on:
       - "speed-bench/cuda-sm75-q4-gate-up-native.sh"
       - "speed-bench/cuda-sm75-production-scalar.sh"
       - "speed-bench/cuda-sm75-production-scalar-e2e.sh"
+      - "speed-bench/cuda-sm75-wide-cta.sh"
+      - "speed-bench/summarize-sm75-wide-cta.py"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -28,6 +30,8 @@ on:
       - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
       - "tests/cuda_sm75_profile_harness.c"
+      - "tests/cuda_sm75_wide_cta_correctness.c"
+      - "tests/cuda_sm75_wide_cta_resources.c"
       - "tests/cuda_sm75_int4_mma.cu"
       - "tests/cuda_sm75_q4_down_native.cu"
       - "tests/cuda_sm75_q4_gate_up_native.cu"
@@ -52,7 +56,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_wide_cta_resources tests/cuda_sm75_wide_cta_correctness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement CUDA_ARCH=sm_75
       - name: Build SM75 Q4 gate/up with PTXAS evidence
         shell: bash
         run: |
@@ -223,6 +227,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-production-scalar.sh
           test -x speed-bench/cuda-sm75-production-scalar-e2e.sh
           bash -n speed-bench/cuda-sm75-production-scalar-e2e.sh
+          test -x speed-bench/cuda-sm75-wide-cta.sh
+          bash -n speed-bench/cuda-sm75-wide-cta.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
@@ -235,4 +241,5 @@ jobs:
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
+          python3 -m py_compile speed-bench/summarize-sm75-wide-cta.py
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py

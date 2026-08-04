@@ -26,6 +26,9 @@
 /tests/test_metal_session_batch
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/cuda_sm75_wide_cta_correctness
+/tests/cuda_sm75_wide_cta_resources
+/speed-bench/local-runs/
 *.o
 *.dSYM/
 __pycache__/

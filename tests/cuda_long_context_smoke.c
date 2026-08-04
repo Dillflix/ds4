@@ -1022,6 +1022,8 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;

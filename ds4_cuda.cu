@@ -136,7 +136,25 @@ enum cuda_sm75_scalar_audit_kind {
  * per device/path/specialization/layer suppresses repeated chunk launches
  * without a device synchronization or instrumentation in the CUDA kernel. */
 static std::atomic<uint64_t>
-    g_sm75_scalar_audit_seen[DS4_MAX_GPUS + 1][4][2] = {};
+    g_sm75_scalar_audit_seen[DS4_MAX_GPUS + 1][4][2][12] = {};
+
+static uint32_t cuda_sm75_scalar_audit_specialization_slot(
+        cuda_sm75_scalar_audit_kind kind,
+        uint32_t row_span,
+        uint32_t cta_threads) {
+    uint32_t width_slot = 0u;
+    if (kind == CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8) {
+        width_slot = cta_threads == 384u ? 1u :
+                     cta_threads == 512u ? 2u : 0u;
+    } else if (kind == CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16) {
+        width_slot = cta_threads == 384u ? 1u :
+                     cta_threads == 512u ? 2u :
+                     cta_threads == 640u ? 3u : 0u;
+    }
+    const uint32_t span_slot = row_span == 1024u ? 1u :
+                               row_span == 2048u ? 2u : 0u;
+    return width_slot * 3u + span_slot;
+}
 
 static void cuda_sm75_scalar_audit_launch(
         cuda_sm75_scalar_audit_kind kind,
@@ -145,6 +163,7 @@ static void cuda_sm75_scalar_audit_launch(
         int                         device,
         uint32_t                    layer,
         uint32_t                    row_span,
+        uint32_t                    cta_threads,
         uint32_t                    stage_rows) {
     static const bool enabled = [] {
         const char *value = getenv("DS4_CUDA_MOE_SCALAR_AUDIT");
@@ -154,15 +173,19 @@ static void cuda_sm75_scalar_audit_launch(
     const int slot = device >= 0 && device < DS4_MAX_GPUS
         ? device : DS4_MAX_GPUS;
     if (layer >= 64u) return;
+    const uint32_t specialization =
+        cuda_sm75_scalar_audit_specialization_slot(
+            kind, row_span, cta_threads);
     const uint64_t bit = 1ull << layer;
     const uint64_t prior =
-        g_sm75_scalar_audit_seen[slot][kind][scalar ? 1 : 0].fetch_or(
-            bit, std::memory_order_relaxed);
+        g_sm75_scalar_audit_seen[slot][kind][scalar ? 1 : 0]
+            [specialization].fetch_or(bit, std::memory_order_relaxed);
     if (prior & bit) return;
     fprintf(stderr,
             "ds4: sm75-scalar-dispatch path=%s scalar=%d device=%d "
-            "layer=%u row_span=%u stage_rows=%u\n",
-            path, scalar ? 1 : 0, device, layer, row_span, stage_rows);
+            "layer=%u row_span=%u cta_threads=%u stage_rows=%u\n",
+            path, scalar ? 1 : 0, device, layer, row_span, cta_threads,
+            stage_rows);
 }
 
 typedef struct {
@@ -983,6 +1006,29 @@ static uint32_t cuda_parse_u32_env_clamped(const char *name, uint32_t fallback,
     if (v < min_value) return min_value;
     if (v > max_value) return max_value;
     return (uint32_t)v;
+}
+
+static int cuda_parse_u32_env_choices(const char *name, uint32_t fallback,
+                                      const uint32_t *choices,
+                                      size_t choice_count,
+                                      uint32_t *value_out) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) {
+        *value_out = fallback;
+        return 1;
+    }
+    errno = 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value > UINT32_MAX)
+        return 0;
+    for (size_t i = 0; i < choice_count; i++) {
+        if (value == choices[i]) {
+            *value_out = (uint32_t)value;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int cuda_env_flag_enabled(const char *name, int fallback) {
@@ -21543,7 +21589,8 @@ __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
  * scalar expert-tile kernels (fuzz-verified). Requires sm_75+, 16B-aligned
  * expert tensors, and the staged activation-block counts (<=16 gate/up,
  * <=8 down). Rollback: DS4_CUDA_MOE_NO_Q4_MMA=1. */
-template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false,
+          uint32_t CTA_THREADS = 256>
 __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
         float *gate_out,
         float *up_out,
@@ -21565,6 +21612,13 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
         uint32_t n_expert,
         uint32_t write_aux,
         float clamp) {
+    static_assert(CTA_THREADS == 256u || CTA_THREADS == 384u ||
+                  CTA_THREADS == 512u,
+                  "unsupported SM75 Q4 gate/up CTA width");
+    static_assert((ROW_SPAN & 7u) == 0u,
+                  "Q4 gate/up row span must contain complete MMA rows");
+    constexpr uint32_t CTA_WARPS = CTA_THREADS / 32u;
+    constexpr uint32_t ROW_TILES = ROW_SPAN / 8u;
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -21601,9 +21655,11 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
     }
     const uint32_t mtok = lane >> 2u;      /* token row of this thread's C elems */
     const uint32_t n0 = (lane & 3u) * 2u;  /* first C column (weight row) */
-    /* 8 warps x 8 rows = 64 rows per pass */
-    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
-        const uint32_t row0 = blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+    /* One warp owns one 8-row MMA tile.  Striding by the compile-time CTA
+     * width preserves the 256-thread mapping while making wider diagnostic
+     * specializations disjoint for partial and multi-span row ranges. */
+    for (uint32_t rt = warp; rt < ROW_TILES; rt += CTA_WARPS) {
+        const uint32_t row0 = blockIdx.x * ROW_SPAN + rt * 8u;
         if (row0 >= expert_mid_dim) continue;
         const char *grow = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row0 * gate_row_bytes;
         const char *urow = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row0 * gate_row_bytes;
@@ -22021,7 +22077,8 @@ __global__ static void moe_gate_up_mid_q4K_tile16_mma_sm75_kernel(
  * exact m8n8k16 operations for each 8-token half.  All 16 Q8_K activation
  * rows fit in shared memory for the shipping 2048-wide expert down input
  * (16 * 8 * 292 = 37,376 bytes). */
-template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false,
+          uint32_t CTA_THREADS = 256>
 __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
         float *down_out,
         const char *down_base,
@@ -22037,6 +22094,13 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim,
         uint32_t n_expert) {
+    static_assert(CTA_THREADS == 256u || CTA_THREADS == 384u ||
+                  CTA_THREADS == 512u || CTA_THREADS == 640u,
+                  "unsupported SM75 Q4 down CTA width");
+    static_assert((ROW_SPAN & 7u) == 0u,
+                  "Q4 down row span must contain complete MMA rows");
+    constexpr uint32_t CTA_WARPS = CTA_THREADS / 32u;
+    constexpr uint32_t ROW_TILES = ROW_SPAN / 8u;
     const uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t lane = threadIdx.x & 31u;
@@ -22074,9 +22138,8 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
     const uint32_t mtok_a = lane >> 2u;
     const uint32_t mtok_b = mtok_a + 8u;
     const uint32_t n0 = (lane & 3u) * 2u;
-    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
-        const uint32_t row0 =
-            blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+    for (uint32_t rt = warp; rt < ROW_TILES; rt += CTA_WARPS) {
+        const uint32_t row0 = blockIdx.x * ROW_SPAN + rt * 8u;
         if (row0 >= out_dim) continue;
         const char *wrow = down_base +
             (uint64_t)expert * down_expert_bytes +
@@ -22200,6 +22263,123 @@ __global__ static void moe_down_q4K_tile16_mma_sm75_kernel(
 #undef DS4_MOE_SCALAR_SLOT8X4_FMA
 #undef DS4_MOE_SCALAR_SLOT8X4_ADD
 #undef DS4_MOE_SCALAR_SLOT8X4_DECLARE
+
+/* Compile/runtime resource inventory for the isolated SM75 wide-CTA pass.
+ * cudaFuncGetAttributes and the occupancy API inspect the exact production
+ * specializations but do not launch them. PTXAS stack/spill records and SASS
+ * LDL/STL counts are merged by the evidence script because the runtime API
+ * cannot expose those compiler artifacts. */
+extern "C" int ds4_cuda_sm75_wide_cta_resource_matrix(void) {
+    int device = 0;
+    cudaDeviceProp prop;
+    cudaError_t rc = cudaGetDevice(&device);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA resource query get-device failed: %s\n",
+                cudaGetErrorString(rc));
+        return 0;
+    }
+    rc = cudaGetDeviceProperties(&prop, device);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA resource query properties failed: %s\n",
+                cudaGetErrorString(rc));
+        return 0;
+    }
+    if (prop.major != 7 || prop.minor != 5) {
+        fprintf(stderr,
+                "ds4: SM75 wide-CTA resource matrix requires compute 7.5 "
+                "(device %d is %d.%d)\n",
+                device, prop.major, prop.minor);
+        return 0;
+    }
+
+    printf("family,row_span,cta_threads,warps,raw_registers_per_thread,"
+           "allocated_registers_per_thread,allocated_registers_per_warp,"
+           "allocated_registers_per_block,max_threads_per_block,"
+           "local_bytes_per_thread,static_shared_bytes,"
+           "allocated_shared_bytes,active_blocks_per_sm,"
+           "active_warps_per_sm,occupancy_pct,binary_version,ptx_version\n");
+
+#define DS4_SM75_REPORT_RESOURCE(FAMILY, RS, CTA, KERNEL) \
+    do { \
+        cudaFuncAttributes attr; \
+        int active_blocks = 0; \
+        rc = cudaFuncGetAttributes(&attr, KERNEL); \
+        if (rc != cudaSuccess) { \
+            fprintf(stderr, \
+                    "ds4: CUDA resource attributes failed for %s/%u/%u: %s\n", \
+                    FAMILY, (unsigned)(RS), (unsigned)(CTA), \
+                    cudaGetErrorString(rc)); \
+            return 0; \
+        } \
+        rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor( \
+            &active_blocks, KERNEL, (int)(CTA), 0); \
+        if (rc != cudaSuccess) { \
+            fprintf(stderr, \
+                    "ds4: CUDA occupancy query failed for %s/%u/%u: %s\n", \
+                    FAMILY, (unsigned)(RS), (unsigned)(CTA), \
+                    cudaGetErrorString(rc)); \
+            return 0; \
+        } \
+        const uint64_t raw_warp_regs = (uint64_t)attr.numRegs * 32u; \
+        const uint64_t alloc_warp_regs = \
+            ((raw_warp_regs + 255u) / 256u) * 256u; \
+        const uint64_t alloc_thread_regs = alloc_warp_regs / 32u; \
+        const uint64_t alloc_block_regs = \
+            alloc_warp_regs * ((uint32_t)(CTA) / 32u); \
+        const uint64_t alloc_shared = \
+            ((uint64_t)attr.sharedSizeBytes + 255u) & ~255ull; \
+        const int active_warps = active_blocks * ((int)(CTA) / 32); \
+        const double occupancy = 100.0 * (double)(active_warps * 32) / \
+            (double)prop.maxThreadsPerMultiProcessor; \
+        printf("%s,%u,%u,%u,%d,%llu,%llu,%llu,%d,%llu,%llu,%llu,%d,%d,%.2f,%d,%d\n", \
+               FAMILY, (unsigned)(RS), (unsigned)(CTA), \
+               (unsigned)((CTA) / 32u), attr.numRegs, \
+               (unsigned long long)alloc_thread_regs, \
+               (unsigned long long)alloc_warp_regs, \
+               (unsigned long long)alloc_block_regs, \
+               attr.maxThreadsPerBlock, \
+               (unsigned long long)attr.localSizeBytes, \
+               (unsigned long long)attr.sharedSizeBytes, \
+               (unsigned long long)alloc_shared, active_blocks, active_warps, \
+               occupancy, attr.binaryVersion, attr.ptxVersion); \
+    } while (0)
+
+#define DS4_SM75_REPORT_GATE(RS, CTA) \
+    DS4_SM75_REPORT_RESOURCE( \
+        "gate", RS, CTA, \
+        (moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, CTA>))
+#define DS4_SM75_REPORT_DOWN(RS, CTA) \
+    DS4_SM75_REPORT_RESOURCE( \
+        "down", RS, CTA, \
+        (moe_down_q4K_tile16_mma_sm75_kernel<RS, true, CTA>))
+#define DS4_SM75_REPORT_GATE_SPAN(RS) \
+    do { \
+        DS4_SM75_REPORT_GATE(RS, 256); \
+        DS4_SM75_REPORT_GATE(RS, 384); \
+        DS4_SM75_REPORT_GATE(RS, 512); \
+    } while (0)
+#define DS4_SM75_REPORT_DOWN_SPAN(RS) \
+    do { \
+        DS4_SM75_REPORT_DOWN(RS, 256); \
+        DS4_SM75_REPORT_DOWN(RS, 384); \
+        DS4_SM75_REPORT_DOWN(RS, 512); \
+        DS4_SM75_REPORT_DOWN(RS, 640); \
+    } while (0)
+
+    DS4_SM75_REPORT_GATE_SPAN(512);
+    DS4_SM75_REPORT_GATE_SPAN(1024);
+    DS4_SM75_REPORT_GATE_SPAN(2048);
+    DS4_SM75_REPORT_DOWN_SPAN(512);
+    DS4_SM75_REPORT_DOWN_SPAN(1024);
+    DS4_SM75_REPORT_DOWN_SPAN(2048);
+
+#undef DS4_SM75_REPORT_DOWN_SPAN
+#undef DS4_SM75_REPORT_GATE_SPAN
+#undef DS4_SM75_REPORT_DOWN
+#undef DS4_SM75_REPORT_GATE
+#undef DS4_SM75_REPORT_RESOURCE
+    return 1;
+}
 
 /* 16-pair MoE expert tile kernels on sm_80+ m16n8k32 INT8 tensor cores.
  *
@@ -23572,6 +23752,45 @@ static int routed_moe_launch(
         const uint32_t use_iq2_scalar_sm75 =
             cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75") != NULL;
+        static const uint32_t q4_gate_cta_choices[] = {256u, 384u, 512u};
+        static const uint32_t q4_down_cta_choices[] =
+            {256u, 384u, 512u, 640u};
+        uint32_t q4_gate_cta_threads = 256u;
+        uint32_t q4_down_cta_threads = 256u;
+        if (gate_q4k && !cuda_parse_u32_env_choices(
+                "DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75", 256u,
+                q4_gate_cta_choices,
+                sizeof(q4_gate_cta_choices) / sizeof(q4_gate_cta_choices[0]),
+                &q4_gate_cta_threads)) {
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_MOE_Q4_GATE_SCALAR_CTA_SM75 must be "
+                    "256, 384, or 512\n");
+            return 0;
+        }
+        if (down_q4k && !cuda_parse_u32_env_choices(
+                "DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75", 256u,
+                q4_down_cta_choices,
+                sizeof(q4_down_cta_choices) / sizeof(q4_down_cta_choices[0]),
+                &q4_down_cta_threads)) {
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_MOE_Q4_DOWN_SCALAR_CTA_SM75 must be "
+                    "256, 384, 512, or 640\n");
+            return 0;
+        }
+        if (gate_q4k && q4_gate_cta_threads != 256u &&
+            !use_q4_gate_scalar_sm75) {
+            fprintf(stderr,
+                    "ds4: a non-default Q4 gate CTA requires "
+                    "DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75=1\n");
+            return 0;
+        }
+        if (down_q4k && q4_down_cta_threads != 256u &&
+            !use_q4_down_scalar_sm75) {
+            fprintf(stderr,
+                    "ds4: a non-default Q4 down CTA requires "
+                    "DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75=1\n");
+            return 0;
+        }
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_q2_down_mma_sm75_tile16 =
@@ -23947,18 +24166,44 @@ static int routed_moe_launch(
                     } else if (use_q4_mma && use_gate_row2048) {
 #define DS4_Q4_GATE_T8_SCALAR_LAUNCH(RS, GRID) \
                         do { \
-                            cuda_sm75_scalar_audit_launch( \
-                                CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
-                                "q4-gate-tile8", use_q4_gate_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_q4_gate_scalar_sm75) { \
-                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
+                            if (use_q4_gate_scalar_sm75 && q4_gate_cta_threads == 512u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 512u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 512><<<GRID, 512>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, \
+                                    write_gate_up, clamp); \
+                            } else if (use_q4_gate_scalar_sm75 && q4_gate_cta_threads == 384u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 384u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 384><<<GRID, 384>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, \
+                                    write_gate_up, clamp); \
+                            } else if (use_q4_gate_scalar_sm75) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 256><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
                                     gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, \
                                     write_gate_up, clamp); \
                             } else { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 0, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
                                 moe_gate_up_mid_q4K_tile8_mma_kernel<RS, false><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
@@ -24025,7 +24270,7 @@ static int routed_moe_launch(
                             cuda_sm75_scalar_audit_launch( \
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE16, \
                                 "iq2-gate-tile16", use_iq2_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, STAGE); \
+                                scalar_audit_device, layer_index, RS, 256u, STAGE); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24077,7 +24322,7 @@ static int routed_moe_launch(
                             cuda_sm75_scalar_audit_launch( \
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, 0u); \
+                                scalar_audit_device, layer_index, RS, 256u, 0u); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24160,18 +24405,44 @@ static int routed_moe_launch(
                     if (gate_q4k) {
 #define DS4_Q4_GATE_TAIL8_LAUNCH(RS, GRID) \
                         do { \
-                            cuda_sm75_scalar_audit_launch( \
-                                CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
-                                "q4-gate-tile8", use_q4_gate_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_q4_gate_scalar_sm75) { \
-                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true><<<GRID, 256>>>( \
+                            if (use_q4_gate_scalar_sm75 && q4_gate_cta_threads == 512u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 512u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 512><<<GRID, 512>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_q4_gate_scalar_sm75 && q4_gate_cta_threads == 384u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 384u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 384><<<GRID, 384>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tail8_total, tail8_experts, tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_q4_gate_scalar_sm75) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 1, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
+                                moe_gate_up_mid_q4K_tile8_mma_kernel<RS, true, 256><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tail8_total, tail8_experts, tail8_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
                             } else { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_GATE_TILE8, \
+                                    "q4-gate-tile8", 0, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
                                 moe_gate_up_mid_q4K_tile8_mma_kernel<RS, false><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
@@ -24211,7 +24482,7 @@ static int routed_moe_launch(
                             cuda_sm75_scalar_audit_launch( \
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, 0u); \
+                                scalar_audit_device, layer_index, RS, 256u, 0u); \
                             if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
@@ -24599,17 +24870,51 @@ static int routed_moe_launch(
                     if (use_q4_down_t16_sm75 && use_q4_down_rowspan) {
 #define DS4_Q4_DOWN_SM75_T16_LAUNCH(RS, GRID) \
                         do { \
-                            cuda_sm75_scalar_audit_launch( \
-                                CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
-                                "q4-down-tile16", use_q4_down_scalar_sm75, \
-                                scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_q4_down_scalar_sm75) { \
-                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                            if (use_q4_down_scalar_sm75 && q4_down_cta_threads == 640u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                    "q4-down-tile16", 1, scalar_audit_device, \
+                                    layer_index, RS, 640u, 0u); \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true, 640><<<GRID, 640>>>( \
+                                    (float *)down->ptr, down_w, midq, sorted_pairs, \
+                                    sorted_offsets, sorted_counts, tile16_total, \
+                                    tile16_experts, tile16_starts, down_expert_bytes, \
+                                    down_row_bytes, midq_blocks, out_dim, n_expert); \
+                            } else if (use_q4_down_scalar_sm75 && q4_down_cta_threads == 512u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                    "q4-down-tile16", 1, scalar_audit_device, \
+                                    layer_index, RS, 512u, 0u); \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true, 512><<<GRID, 512>>>( \
+                                    (float *)down->ptr, down_w, midq, sorted_pairs, \
+                                    sorted_offsets, sorted_counts, tile16_total, \
+                                    tile16_experts, tile16_starts, down_expert_bytes, \
+                                    down_row_bytes, midq_blocks, out_dim, n_expert); \
+                            } else if (use_q4_down_scalar_sm75 && q4_down_cta_threads == 384u) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                    "q4-down-tile16", 1, scalar_audit_device, \
+                                    layer_index, RS, 384u, 0u); \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true, 384><<<GRID, 384>>>( \
+                                    (float *)down->ptr, down_w, midq, sorted_pairs, \
+                                    sorted_offsets, sorted_counts, tile16_total, \
+                                    tile16_experts, tile16_starts, down_expert_bytes, \
+                                    down_row_bytes, midq_blocks, out_dim, n_expert); \
+                            } else if (use_q4_down_scalar_sm75) { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                    "q4-down-tile16", 1, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
+                                moe_down_q4K_tile16_mma_sm75_kernel<RS, true, 256><<<GRID, 256>>>( \
                                     (float *)down->ptr, down_w, midq, sorted_pairs, \
                                     sorted_offsets, sorted_counts, tile16_total, \
                                     tile16_experts, tile16_starts, down_expert_bytes, \
                                     down_row_bytes, midq_blocks, out_dim, n_expert); \
                             } else { \
+                                cuda_sm75_scalar_audit_launch( \
+                                    CUDA_SM75_SCALAR_AUDIT_Q4_DOWN_TILE16, \
+                                    "q4-down-tile16", 0, scalar_audit_device, \
+                                    layer_index, RS, 256u, 0u); \
                                 moe_down_q4K_tile16_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
                                     (float *)down->ptr, down_w, midq, sorted_pairs, \
                                     sorted_offsets, sorted_counts, tile16_total, \
