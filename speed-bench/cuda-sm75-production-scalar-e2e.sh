@@ -624,7 +624,7 @@ for prompt in prompts:
                     f'missing run: prompt={prompt} repeat={repeat} variant={variant}'
                 )
 
-def critical_layout_signature(path):
+def critical_layout_signature(path, expected_session_initializations):
     categories = Counter()
     kept = []
     with open(path, encoding="utf-8", errors="replace") as handle:
@@ -652,8 +652,8 @@ def critical_layout_signature(path):
         "scratch": 1,
         "peer_matrix": 1,
         "output_tp": 1,
-        "ownership": 1,
-        "decode_tp": 1,
+        "ownership": expected_session_initializations,
+        "decode_tp": expected_session_initializations,
         "context_buffers": 1,
         "selective_tier": 4,
     }
@@ -824,8 +824,8 @@ for prompt in prompts:
     base_validation = validation_index[(prompt, "base")]
     scalar_validation = validation_index[(prompt, "scalar")]
     validation_layout_match = (
-        critical_layout_signature(base_validation["log"])
-        == critical_layout_signature(scalar_validation["log"])
+        critical_layout_signature(base_validation["log"], 1)
+        == critical_layout_signature(scalar_validation["log"], 1)
     )
     base_q8 = q8_profile(base_validation["q8_audit"])
     scalar_q8 = q8_profile(scalar_validation["q8_audit"])
@@ -905,8 +905,8 @@ for prompt in prompts:
         base_run = run_index[(prompt, repeat, "base")]
         scalar_run = run_index[(prompt, repeat, "scalar")]
         layout_match = (
-            critical_layout_signature(base_run["log"])
-            == critical_layout_signature(scalar_run["log"])
+            critical_layout_signature(base_run["log"], 2)
+            == critical_layout_signature(scalar_run["log"], 2)
         )
         base_timed_q8_before = q8_cache_state_profile(
             base_run["q8_cache_state_before"]
