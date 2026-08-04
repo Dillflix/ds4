@@ -2841,6 +2841,156 @@ static ds4_support_kind support_model_detect(
     return DS4_SUPPORT_NONE;
 }
 
+/* Q8->F16 cache admission is planned from the complete tensor directory.
+ * `benefit_units` is a deliberately coarse ordering weight seeded by measured
+ * SM75 native-kernel penalties; it is not a literal saved-time or throughput
+ * prediction. T32 q_b and T256 output_b each cost roughly 20 ms in the bounded
+ * native-Q8 profiles, while the already-efficient T64/T128 paths have much
+ * smaller cache benefit. */
+enum accelerator_q8_cache_class {
+    ACCEL_Q8_CACHE_NONE = 0,
+    ACCEL_Q8_CACHE_T32_Q_B,
+    ACCEL_Q8_CACHE_T256_OUTPUT_B,
+    ACCEL_Q8_CACHE_OUTPUT_A,
+    ACCEL_Q8_CACHE_SHARED_DOWN,
+    ACCEL_Q8_CACHE_SHARED_GATE_UP,
+    ACCEL_Q8_CACHE_OTHER_ATTN,
+};
+
+typedef struct {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t fp16_bytes;
+    uint32_t benefit_units;
+    uint32_t path_class;
+    uint32_t layer;
+    int physical_device;
+    char label[128];
+} accelerator_q8_cache_candidate;
+
+static bool ds4_str_contains_lit(ds4_str s, const char *lit) {
+    const size_t n = lit ? strlen(lit) : 0u;
+    if (!s.ptr || n == 0u || s.len < n) return false;
+    for (uint64_t i = 0; i + n <= s.len; i++) {
+        if (memcmp(s.ptr + i, lit, n) == 0) return true;
+    }
+    return false;
+}
+
+static uint32_t accelerator_q8_cache_classify(ds4_str name) {
+    if (!name.ptr || name.len < 4u || memcmp(name.ptr, "blk.", 4u) != 0)
+        return ACCEL_Q8_CACHE_NONE;
+    if (ds4_str_contains_lit(name, ".attn_output_b.weight"))
+        return ACCEL_Q8_CACHE_T256_OUTPUT_B;
+    if (ds4_str_contains_lit(name, ".attn_q_b.weight"))
+        return ACCEL_Q8_CACHE_T32_Q_B;
+    if (ds4_str_contains_lit(name, ".attn_output_a.weight"))
+        return ACCEL_Q8_CACHE_OUTPUT_A;
+    if (ds4_str_contains_lit(name, ".ffn_down_shexp.weight"))
+        return ACCEL_Q8_CACHE_SHARED_DOWN;
+    if (ds4_str_contains_lit(name, ".ffn_gate_shexp.weight") ||
+        ds4_str_contains_lit(name, ".ffn_up_shexp.weight"))
+        return ACCEL_Q8_CACHE_SHARED_GATE_UP;
+    if (ds4_str_contains_lit(name, ".attn_q_a.weight") ||
+        ds4_str_contains_lit(name, ".attn_kv.weight"))
+        return ACCEL_Q8_CACHE_OTHER_ATTN;
+    return ACCEL_Q8_CACHE_NONE;
+}
+
+static uint32_t accelerator_q8_cache_layer(ds4_str name) {
+    if (!name.ptr || name.len < 5u || memcmp(name.ptr, "blk.", 4u) != 0)
+        return UINT32_MAX;
+    uint64_t pos = 4u;
+    uint32_t layer = 0u;
+    bool have_digit = false;
+    while (pos < name.len && name.ptr[pos] >= '0' && name.ptr[pos] <= '9') {
+        have_digit = true;
+        const uint32_t digit = (uint32_t)(name.ptr[pos] - '0');
+        if (layer > (UINT32_MAX - digit) / 10u) return UINT32_MAX;
+        layer = layer * 10u + digit;
+        pos++;
+    }
+    return have_digit && pos < name.len && name.ptr[pos] == '.' ? layer : UINT32_MAX;
+}
+
+static uint32_t accelerator_q8_cache_benefit_units(uint32_t path_class) {
+    switch (path_class) {
+    case ACCEL_Q8_CACHE_T256_OUTPUT_B:  return 19000u;
+    case ACCEL_Q8_CACHE_T32_Q_B:       return 19000u;
+    case ACCEL_Q8_CACHE_OUTPUT_A:      return 800u;
+    case ACCEL_Q8_CACHE_SHARED_DOWN:   return 800u;
+    case ACCEL_Q8_CACHE_SHARED_GATE_UP:return 200u;
+    case ACCEL_Q8_CACHE_OTHER_ATTN:    return 100u;
+    default:                           return 0u;
+    }
+}
+
+static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
+    const accelerator_q8_cache_candidate *a = va;
+    const accelerator_q8_cache_candidate *b = vb;
+    /* Sort descending by benefit / expanded-F16 byte without floating point. */
+    const uint64_t lhs = (uint64_t)a->benefit_units * b->fp16_bytes;
+    const uint64_t rhs = (uint64_t)b->benefit_units * a->fp16_bytes;
+    if (lhs > rhs) return -1;
+    if (lhs < rhs) return 1;
+    if (a->benefit_units > b->benefit_units) return -1;
+    if (a->benefit_units < b->benefit_units) return 1;
+    if (a->physical_device < b->physical_device) return -1;
+    if (a->physical_device > b->physical_device) return 1;
+    if (a->layer < b->layer) return -1;
+    if (a->layer > b->layer) return 1;
+    if (a->path_class < b->path_class) return -1;
+    if (a->path_class > b->path_class) return 1;
+    if (a->offset < b->offset) return -1;
+    if (a->offset > b->offset) return 1;
+    return 0;
+}
+
+static bool accelerator_q8_cache_candidate_append(
+        accelerator_q8_cache_candidate **items,
+        uint64_t *count, uint64_t *capacity,
+        const ds4_model *m, const ds4_tensor *t,
+        uint64_t offset, uint64_t weight_bytes,
+        uint64_t in_dim, uint64_t out_dim,
+        int physical_device, uint32_t path_class) {
+    if (!items || !count || !capacity || !m || !t || path_class == ACCEL_Q8_CACHE_NONE ||
+        in_dim == 0u || out_dim == 0u || in_dim > UINT64_MAX / out_dim / 2u) return false;
+    for (uint64_t i = 0; i < *count; i++) {
+        const accelerator_q8_cache_candidate *c = &(*items)[i];
+        if (c->model_map == m->map && c->offset == offset &&
+            c->weight_bytes == weight_bytes && c->in_dim == in_dim &&
+            c->out_dim == out_dim && c->physical_device == physical_device) return true;
+    }
+    if (*count == *capacity) {
+        uint64_t next = *capacity ? *capacity * 2u : 128u;
+        if (next < *capacity || next > SIZE_MAX / sizeof(**items)) return false;
+        void *grown = realloc(*items, (size_t)next * sizeof(**items));
+        if (!grown) return false;
+        *items = grown;
+        *capacity = next;
+    }
+    accelerator_q8_cache_candidate *c = &(*items)[(*count)++];
+    memset(c, 0, sizeof(*c));
+    c->model_map = m->map;
+    c->model_size = m->size;
+    c->offset = offset;
+    c->weight_bytes = weight_bytes;
+    c->in_dim = in_dim;
+    c->out_dim = out_dim;
+    c->fp16_bytes = in_dim * out_dim * 2u;
+    c->benefit_units = accelerator_q8_cache_benefit_units(path_class);
+    c->path_class = path_class;
+    c->layer = accelerator_q8_cache_layer(t->name);
+    c->physical_device = physical_device;
+    snprintf(c->label, sizeof(c->label), "tensor:%.*s",
+             (int)(t->name.len < 110u ? t->name.len : 110u), t->name.ptr);
+    return true;
+}
+
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
 typedef struct {
@@ -3003,27 +3153,83 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
 }
 
 static bool accelerator_cache_q8_tensors(const ds4_model *m,
-                                         const uint64_t *span_offsets,
-                                         const uint64_t *span_sizes,
-                                         uint32_t span_count) {
+                                          const uint64_t *span_offsets,
+                                          const uint64_t *span_sizes,
+                                          uint32_t span_count) {
+#ifdef DS4_ROCM_BUILD
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
+        if (t->bytes == 0u) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
         if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
-                                              span_offsets, span_sizes, span_count)) {
-            continue;
-        }
+                                               span_offsets, span_sizes, span_count)) continue;
         char label[128];
         snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
         if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-            ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-            fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                    (int)t->name.len, t->name.ptr);
-            return false;
-        }
+            ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes,
+                                        t->dim[0], t->dim[1], label) == 0) return false;
     }
     return true;
+#else
+    if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0u) continue;
+            if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                                   span_offsets, span_sizes, span_count)) continue;
+            char label[128];
+            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+            (void)ds4_gpu_cache_q8_f16_range(
+                m->map, m->size, t->abs_offset, t->bytes,
+                t->dim[0], t->dim[1], label);
+        }
+        return true;
+    }
+    if (getenv("DS4_CUDA_Q8_F16_FIRST_USE") != NULL) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 planner disabled; using legacy first-use admission\n");
+        return true;
+    }
+    accelerator_q8_cache_candidate *plan = NULL;
+    uint64_t plan_count = 0;
+    uint64_t plan_capacity = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
+            free(plan);
+            return false;
+        }
+        if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                               span_offsets, span_sizes, span_count)) {
+            continue;
+        }
+        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2) {
+            const uint32_t path_class = accelerator_q8_cache_classify(t->name);
+            if (path_class != ACCEL_Q8_CACHE_NONE &&
+                !accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, m, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    0, path_class)) {
+                free(plan);
+                return false;
+            }
+        }
+    }
+    if (plan_count != 0u) {
+        qsort(plan, (size_t)plan_count, sizeof(plan[0]),
+              accelerator_q8_cache_candidate_cmp);
+        ds4_gpu_q8_f16_plan_begin();
+        for (uint64_t i = 0; i < plan_count; i++) {
+            const accelerator_q8_cache_candidate *c = &plan[i];
+            (void)ds4_gpu_cache_q8_f16_range_on_device(
+                c->model_map, c->model_size, c->offset, c->weight_bytes,
+                c->in_dim, c->out_dim, c->physical_device, c->label);
+        }
+        ds4_gpu_q8_f16_plan_end();
+    }
+    free(plan);
+    return true;
+#endif
 }
 
 static bool accelerator_cache_model_tensors(ds4_backend backend,
@@ -55360,6 +55566,132 @@ static int engine_append_device_cache_range(
                                            t->abs_offset, t->bytes);
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
+    if (!e || !e->model.map || e->model.n_tensors == 0u) return 0;
+    if (getenv("DS4_CUDA_Q8_F16_FIRST_USE") != NULL) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 planner disabled; using legacy first-use admission\n");
+        return 0;
+    }
+
+    accelerator_q8_cache_candidate *plan = NULL;
+    uint64_t plan_count = 0;
+    uint64_t plan_capacity = 0;
+    uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
+    const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
+    const bool split_attn_output =
+        cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
+    const bool split_attn_heads =
+        split_attn_output && metal_graph_cuda_tp_prefill_attn_heads_requested();
+
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0u) continue;
+        const uint32_t path_class = accelerator_q8_cache_classify(t->name);
+        if (path_class == ACCEL_Q8_CACHE_NONE) continue;
+        int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 1 || entry > (int)DS4_N_LAYER) continue;
+        const int home_tier = e->placement[entry];
+        if (home_tier < 0 || home_tier >= e->gpu_cfg.n_gpus) continue;
+        const int home_device = g_gpu[home_tier].device_id;
+        const int partner_tier = cuda_tp_decode ? home_tier + tp_half : -1;
+        const int partner_device = partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus
+            ? g_gpu[partner_tier].device_id : -1;
+        const uint64_t row_bytes = ((t->dim[0] + 31u) / 32u) * 34u;
+        bool ok = true;
+
+        if (path_class == ACCEL_Q8_CACHE_OUTPUT_A && split_attn_output &&
+            partner_device >= 0 && (t->dim[1] & 1u) == 0u &&
+            row_bytes <= UINT64_MAX / t->dim[1] &&
+            row_bytes * t->dim[1] == t->bytes) {
+            /* Production TP output uses one contiguous group/row half on each
+             * member of the NVLink pair. Plan the exact slices looked up by
+             * cuda_q8_f16_ptr; a full-tensor entry would never hit them. */
+            const uint64_t half_rows = t->dim[1] / 2u;
+            const uint64_t half_bytes = half_rows * row_bytes;
+            ok = accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, half_bytes, t->dim[0], half_rows,
+                    home_device, path_class) &&
+                 accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
+                    partner_device, path_class) &&
+                 accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    home_device, path_class);
+        } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B && split_attn_heads &&
+                   partner_device >= 0 && (t->dim[1] & 1u) == 0u &&
+                   row_bytes <= UINT64_MAX / t->dim[1] &&
+                   row_bytes * t->dim[1] == t->bytes) {
+            const uint64_t half_rows = t->dim[1] / 2u;
+            const uint64_t half_bytes = half_rows * row_bytes;
+            ok = accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, half_bytes, t->dim[0], half_rows,
+                    home_device, path_class) &&
+                 accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
+                    partner_device, path_class) &&
+                 accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    home_device, path_class);
+        } else {
+            ok = accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    home_device, path_class);
+            if (ok && path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
+                split_attn_output && partner_device >= 0) {
+                ok = accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    partner_device, path_class);
+            }
+        }
+        if (!ok) {
+            free(plan);
+            fprintf(stderr, "ds4: failed to build CUDA q8 fp16 benefit plan\n");
+            return -1;
+        }
+    }
+
+    qsort(plan, (size_t)plan_count, sizeof(plan[0]),
+          accelerator_q8_cache_candidate_cmp);
+    for (uint64_t i = 0; i < plan_count; i++) class_count[plan[i].path_class]++;
+    fprintf(stderr,
+            "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
+            "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu other=%llu\n",
+            (unsigned long long)plan_count,
+            (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
+            (unsigned long long)class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
+            (unsigned long long)class_count[ACCEL_Q8_CACHE_OUTPUT_A],
+            (unsigned long long)class_count[ACCEL_Q8_CACHE_SHARED_DOWN],
+            (unsigned long long)(class_count[ACCEL_Q8_CACHE_SHARED_GATE_UP] +
+                                 class_count[ACCEL_Q8_CACHE_OTHER_ATTN]));
+
+    ds4_gpu_q8_f16_plan_begin();
+    for (uint64_t i = 0; i < plan_count; i++) {
+        const accelerator_q8_cache_candidate *c = &plan[i];
+        (void)ds4_gpu_cache_q8_f16_range_on_device(
+            c->model_map, c->model_size, c->offset, c->weight_bytes,
+            c->in_dim, c->out_dim, c->physical_device, c->label);
+    }
+    ds4_gpu_q8_f16_plan_end();
+    free(plan);
+    return 0;
+}
+#else
+static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
+    (void)e;
+    (void)cuda_tp_decode;
+    return 0;
+}
+#endif
+
 /* Install per-device selective caches for GPU-placed tensors. Skips any
  * tensor whose entry is placed on CPU — that case must be rejected at a
  * higher level for this PR (execution wiring not yet shipped). */
@@ -55544,6 +55876,7 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             goto cleanup;
         }
     }
+    if (engine_plan_q8_f16_cache(e, cuda_tp_decode) != 0) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -55802,6 +56135,28 @@ typedef struct {
     const char *name;
     uint64_t bytes;
 } ds4_test_fake_tensor;
+
+uint32_t ds4_test_q8_cache_class(const char *name) {
+    ds4_str s = {name, name ? strlen(name) : 0u};
+    return accelerator_q8_cache_classify(s);
+}
+
+int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
+                              const char *name_b, uint64_t fp16_bytes_b) {
+    ds4_str sa = {name_a, name_a ? strlen(name_a) : 0u};
+    ds4_str sb = {name_b, name_b ? strlen(name_b) : 0u};
+    accelerator_q8_cache_candidate a;
+    accelerator_q8_cache_candidate b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    a.path_class = accelerator_q8_cache_classify(sa);
+    b.path_class = accelerator_q8_cache_classify(sb);
+    a.benefit_units = accelerator_q8_cache_benefit_units(a.path_class);
+    b.benefit_units = accelerator_q8_cache_benefit_units(b.path_class);
+    a.fp16_bytes = fp16_bytes_a;
+    b.fp16_bytes = fp16_bytes_b;
+    return accelerator_q8_cache_candidate_cmp(&a, &b);
+}
 
 bool ds4_test_cuda_routed_moe_quant_types_supported(
         uint32_t gate_type,

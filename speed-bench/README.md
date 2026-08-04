@@ -127,6 +127,38 @@ Return `q4-layout-cache-ab-<timestamp>.tar.gz`. Its summaries include paired
 throughput ratios and the exact cached F16 slice count and bytes on each stage
 home GPU.
 
+### Q8 F16 benefit-plan A/B
+
+`cuda-q8-cache-benefit-ab.sh` holds the selected full-Q4 placement fixed at
+22/21 and `0,3,1,2`, then compares the default benefit-per-expanded-byte plan
+with the former first-use admission policy. The startup plan is deterministic
+and gives the measured SM75 T32 `attn_q_b` and T256 `attn_output_b` paths first
+claim on each device's live cache headroom. It registers exact per-device keys
+at engine creation and defers allocation/dequantization until the untimed
+warm-up, after graph/context buffers exist; measured frontiers therefore
+exclude one-time materialization and cannot admit extra tensors by traversal
+order. `DS4_CUDA_Q8_F16_FIRST_USE=1` is retained only as the A/B escape hatch.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=4 \
+./speed-bench/cuda-q8-cache-benefit-ab.sh
+```
+
+Return `q8-cache-benefit-ab-<timestamp>.tar.gz`. The runner requires nonzero
+T32/T256 planned coverage, freezes the cache before timing, alternates process
+order, and reports paired planner/first-use throughput ratios per frontier.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver

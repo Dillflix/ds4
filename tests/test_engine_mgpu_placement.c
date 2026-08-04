@@ -41,6 +41,9 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
+uint32_t ds4_test_q8_cache_class(const char *name);
+int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
+                              const char *name_b, uint64_t fp16_bytes_b);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -133,6 +136,34 @@ static void test_cuda_routed_moe_quant_matrix(void) {
                   DS4_TENSOR_Q4_K_LOCAL,
                   DS4_TENSOR_IQ2_XXS_LOCAL),
           "unsupported down type remains rejected");
+}
+
+static void test_q8_cache_benefit_order(void) {
+    fprintf(stderr, "RUN: test_q8_cache_benefit_order\n");
+    const char *q_b = "blk.3.attn_q_b.weight";
+    const char *out_b = "blk.3.attn_output_b.weight";
+    const char *out_a = "blk.3.attn_output_a.weight";
+    const char *shared_down = "blk.3.ffn_down_shexp.weight";
+    const char *shared_gate = "blk.3.ffn_gate_shexp.weight";
+
+    CHECK(ds4_test_q8_cache_class(q_b) != 0u, "T32 q_b is cache-plannable");
+    CHECK(ds4_test_q8_cache_class(out_b) != 0u, "T256 output_b is cache-plannable");
+    CHECK(ds4_test_q8_cache_class("blk.3.attn_norm.weight") == 0u,
+          "non-Q8 projection is not cache-plannable");
+
+    /* Both expensive paths expand to 64 MiB in DeepSeek V4 Flash. */
+    CHECK(ds4_test_q8_cache_compare(q_b, 64ull << 20,
+                                    shared_down, 16ull << 20) < 0,
+          "T32 q_b benefit/byte ranks before shared down");
+    CHECK(ds4_test_q8_cache_compare(out_b, 64ull << 20,
+                                    out_a, 32ull << 20) < 0,
+          "T256 output_b benefit/byte ranks before output_a");
+    CHECK(ds4_test_q8_cache_compare(q_b, 64ull << 20,
+                                    out_a, 32ull << 20) < 0,
+          "T32 q_b benefit/byte ranks before output_a");
+    CHECK(ds4_test_q8_cache_compare(shared_down, 16ull << 20,
+                                    shared_gate, 16ull << 20) < 0,
+          "shared down ranks before already-efficient shared gate/up");
 }
 
 static void test_tensor_to_entry(void) {
@@ -756,6 +787,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 
 int main(void) {
     test_cuda_routed_moe_quant_matrix();
+    test_q8_cache_benefit_order();
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();

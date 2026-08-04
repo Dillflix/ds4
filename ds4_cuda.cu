@@ -505,6 +505,17 @@ struct cuda_q8_f32_range {
     int device_id;          /* physical CUDA device id; 0 in single-tier */
 };
 
+struct cuda_q8_f16_plan_candidate {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    int physical_device;
+    char label[128];
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -518,6 +529,13 @@ static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
+static int g_q8_f16_plan_active;
+static int g_q8_f16_plan_finalized;
+static int g_q8_f16_plan_materializing;
+static int g_q8_f16_plan_materialized;
+static uint64_t g_q8_f16_plan_candidates;
+static uint64_t g_q8_f16_plan_admitted;
+static std::vector<cuda_q8_f16_plan_candidate> g_q8_f16_plan;
 
 struct cuda_q8_audit_record {
     uint64_t sequence;
@@ -565,7 +583,7 @@ static void cuda_q8_audit_record_result(
         const char *label,
         const char *result,
         const char *reason) {
-    if (!cuda_q8_audit_enabled()) return;
+    if (g_q8_f16_plan_materializing || !cuda_q8_audit_enabled()) return;
     cuda_q8_audit_record r = {};
     r.sequence = g_q8_audit_sequence++;
     r.offset = offset;
@@ -1247,6 +1265,8 @@ static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_
            in_dim == 1024u && out_dim == 32768u;
 }
 
+static void cuda_q8_f16_plan_materialize(void);
+
 /* Look up a per-device dequantized fp16 slice of the Q8_0 weight at
  * (model_map, offset, weight_bytes, in_dim, out_dim). expected_device is a
  * PHYSICAL CUDA device id (0 in single-tier; g_gpu[logical_tier].device_id in
@@ -1268,6 +1288,10 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t out_dim,
         int expected_device,
         const char *label) {
+    if (g_q8_f16_plan_finalized && !g_q8_f16_plan_materialized &&
+        !g_q8_f16_plan_materializing) {
+        cuda_q8_f16_plan_materialize();
+    }
     auto audit_return = [&](const __half *ptr,
                             const char *result,
                             const char *reason) -> const __half * {
@@ -1304,6 +1328,14 @@ static const __half *cuda_q8_f16_ptr(
         else if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) reason = "disabled_by_env";
         else if (cuda_q8_f16_cache_limit_bytes() == 0u) reason = "zero_limit";
         return audit_return(NULL, "native_q8", reason);
+    }
+    /* Once startup has seen and ranked the complete candidate set, a cache
+     * miss is a deliberate planner decision.  Do not let execution order turn
+     * that miss back into first-use admission and consume space reserved for a
+     * later, higher-benefit tensor.  Engines which do not run the planner keep
+     * the legacy lazy behavior because plan_finalized remains false. */
+    if (g_q8_f16_plan_finalized && !g_q8_f16_plan_active) {
+        return audit_return(NULL, "native_q8", "not_admitted_by_plan");
     }
 
     /* Source Q8 bytes:
@@ -1389,6 +1421,61 @@ static const __half *cuda_q8_f16_ptr(
     }
     if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
     return audit_return(dev, "f16_fill", "allocated");
+}
+
+static void cuda_q8_f16_plan_materialize(void) {
+    if (!g_q8_f16_plan_finalized || g_q8_f16_plan_materialized ||
+        g_q8_f16_plan_materializing) return;
+    g_q8_f16_plan_materializing = 1;
+    g_q8_f16_plan_active = 1;
+    g_q8_f16_plan_admitted = 0;
+    uint64_t t32_total = 0, t32_admitted = 0;
+    uint64_t t256_total = 0, t256_admitted = 0;
+    int saved_device = -1;
+    (void)cudaGetDevice(&saved_device);
+
+    for (const cuda_q8_f16_plan_candidate &c : g_q8_f16_plan) {
+        const bool is_t32 = strstr(c.label, ".attn_q_b.weight") != NULL;
+        const bool is_t256 = strstr(c.label, ".attn_output_b.weight") != NULL;
+        if (is_t32) t32_total++;
+        if (is_t256) t256_total++;
+        if (cudaSetDevice(c.physical_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        const __half *ptr = cuda_q8_f16_ptr(
+            c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
+            c.physical_device, c.label);
+        if (ptr) {
+            g_q8_f16_plan_admitted++;
+            if (is_t32) t32_admitted++;
+            if (is_t256) t256_admitted++;
+        }
+    }
+
+    /* Dequantization was enqueued on each target device's default stream.
+     * Finish it once here so later per-tier graph streams see immutable F16
+     * weights without inserting synchronization into measured execution. */
+    for (size_t i = 0; i < g_q8_f16_plan.size(); i++) {
+        const int dev = g_q8_f16_plan[i].physical_device;
+        bool seen = false;
+        for (size_t j = 0; j < i; j++) {
+            if (g_q8_f16_plan[j].physical_device == dev) { seen = true; break; }
+        }
+        if (!seen && cudaSetDevice(dev) == cudaSuccess) (void)cudaDeviceSynchronize();
+    }
+    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    g_q8_f16_plan_active = 0;
+    g_q8_f16_plan_materializing = 0;
+    g_q8_f16_plan_materialized = 1;
+    fprintf(stderr,
+            "ds4: CUDA q8 fp16 benefit plan materialized %llu/%llu candidates "
+            "(%.2f GiB); T32-q_b=%llu/%llu T256-output_b=%llu/%llu\n",
+            (unsigned long long)g_q8_f16_plan_admitted,
+            (unsigned long long)g_q8_f16_plan_candidates,
+            (double)g_q8_f16_bytes / 1073741824.0,
+            (unsigned long long)t32_admitted, (unsigned long long)t32_total,
+            (unsigned long long)t256_admitted, (unsigned long long)t256_total);
 }
 
 /* Per-device dequantized fp32 cache. Same conventions as cuda_q8_f16_ptr. */
@@ -4329,8 +4416,6 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    static int optional_q8_preload_disabled = 0;
-    if (optional_q8_preload_disabled) return 1;
     const char *cache_label = label ? label : "q8_0";
     /* Preload runs before any multi-tier dispatch. The cache entries it creates
      * are device-0 by construction; multi-tier callers in kernel wrappers will
@@ -4339,13 +4424,66 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
         cuda_q8_f32_cache_allowed(cache_label, in_dim, out_dim)) {
         if (cuda_q8_f32_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label)) return 1;
-        optional_q8_preload_disabled = 1;
         return 1;
     }
     if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
-    if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label)) return 1;
-    optional_q8_preload_disabled = 1;
+    (void)cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label);
     return 1;
+}
+
+extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
+    g_q8_f16_plan_active = 1;
+    g_q8_f16_plan_finalized = 0;
+    g_q8_f16_plan_materializing = 0;
+    g_q8_f16_plan_materialized = 0;
+    g_q8_f16_plan_candidates = 0;
+    g_q8_f16_plan_admitted = 0;
+    g_q8_f16_plan.clear();
+}
+
+extern "C" int ds4_gpu_cache_q8_f16_range_on_device(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes,
+        uint64_t in_dim, uint64_t out_dim,
+        int physical_device, const char *label) {
+    if (!model_map || bytes == 0u || in_dim == 0u || out_dim == 0u) return 0;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    if (physical_device < 0) return 0;
+
+    const char *cache_label = label ? label : "q8_0";
+    if (g_q8_f16_plan_active && !g_q8_f16_plan_materializing) {
+        cuda_q8_f16_plan_candidate c = {};
+        c.model_map = model_map;
+        c.model_size = model_size;
+        c.offset = offset;
+        c.weight_bytes = bytes;
+        c.in_dim = in_dim;
+        c.out_dim = out_dim;
+        c.physical_device = physical_device;
+        snprintf(c.label, sizeof(c.label), "%s", cache_label);
+        g_q8_f16_plan.push_back(c);
+        g_q8_f16_plan_candidates++;
+        return 1;
+    }
+
+    int prev = -1;
+    cudaError_t err = cudaGetDevice(&prev);
+    if (err != cudaSuccess || cudaSetDevice(physical_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const __half *ptr = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim,
+                                         physical_device, cache_label);
+    if (prev >= 0 && prev != physical_device) (void)cudaSetDevice(prev);
+    return ptr != NULL;
+}
+
+extern "C" void ds4_gpu_q8_f16_plan_end(void) {
+    g_q8_f16_plan_active = 0;
+    g_q8_f16_plan_finalized = 1;
+    fprintf(stderr,
+            "ds4: CUDA q8 fp16 benefit plan registered %llu candidates for deferred materialization\n",
+            (unsigned long long)g_q8_f16_plan_candidates);
 }
 
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
