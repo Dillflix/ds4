@@ -31,6 +31,39 @@ The returnable archive contains the raw wide audit, an exact record-level tile
 plan, a long per-expert table, a count-frequency table, the benchmark result,
 and runtime provenance.
 
+### Post-scalar full-Q4 kernel trace
+
+`cuda-q4-post-scalar-trace.sh` re-establishes the current full-Q4 kernel-time
+distribution after the production SM75 scalar-slot changes. It first runs one
+audited process and requires all 43 routed layers to be Q4/Q4/Q4 plus exactly
+172 scalar gate/down device-layer dispatch markers. A second clean process is
+then traced only across its timed 2K prefill. The runner forces the 22/21 split,
+prefill pipeline, Q8-to-F16 cache, and both Q4 scalar specializations instead
+of relying on inherited settings or defaults.
+
+The output includes the raw Nsight Systems report and CSV exports, grouped
+kernel shares, and the exact two production Q4 rows with their specialization
+and launch cardinality. It requires 344 gate/up and 344 down calls and rejects
+a trace whose demangled kernel identity is not the scalar specialization. It
+does not invoke Nsight Compute and does not hash the 153 GiB model.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,2,1,3 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+./speed-bench/cuda-q4-post-scalar-trace.sh
+```
+
+Return `q4-post-scalar-trace-<timestamp>.tar.gz`. This pass updates the Amdahl
+weights used to rank persistent exact-grid work queues and native A/W kernels;
+it does not itself change production dispatch.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver
