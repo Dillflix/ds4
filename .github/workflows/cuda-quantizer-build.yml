@@ -26,6 +26,7 @@ on:
       - "speed-bench/cuda-sm75-production-scalar-e2e.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/cuda-sm75-native-q4-production.sh"
+      - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-q4-real-histogram.py"
@@ -65,6 +66,7 @@ jobs:
           cuobjdump --dump-sass tests/cuda_long_context_smoke > /tmp/ds4-sm75.sass
           for kernel in \
             moe_gate_up_mid_sm75_native_q4_tile8_kernel \
+            moe_gate_up_mid_sm75_native_q4_tile16_fused_kernel \
             moe_down_sm75_native_q4_tile_kernel; do
             grep -Fq "$kernel" /tmp/ds4-sm75.sass
             awk -v wanted="$kernel" '
@@ -254,6 +256,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-production-scalar-e2e.sh
           test -x speed-bench/cuda-sm75-native-q4-production.sh
           bash -n speed-bench/cuda-sm75-native-q4-production.sh
+          test -x speed-bench/cuda-sm75-native-q4-next-ab.sh
+          bash -n speed-bench/cuda-sm75-native-q4-next-ab.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
