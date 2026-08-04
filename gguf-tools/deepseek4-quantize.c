@@ -41,6 +41,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"

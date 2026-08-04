@@ -36,7 +36,7 @@ LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -ldl -lpthread
 endif
 
-CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
+CFLAGS ?= -O3 -Wall -Wextra -Werror=implicit-function-declaration -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score quality-llama-score
