@@ -28,6 +28,7 @@ Optional environment:
   RUN_NCU=1
   SKIP_BUILD=0
   SKIP_E2E_EXACT=0          # 1 only when prior full-model exact evidence exists
+  SKIP_BENCHMARK=0          # 1 to resume only the profiler phase
   CREATE_ARCHIVE=1
   NATIVE_Q4_DIR=...
 
@@ -69,6 +70,7 @@ RUN_NSYS=${RUN_NSYS:-1}
 RUN_NCU=${RUN_NCU:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 SKIP_E2E_EXACT=${SKIP_E2E_EXACT:-0}
+SKIP_BENCHMARK=${SKIP_BENCHMARK:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CUDA_ARCH=sm_75
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -84,7 +86,7 @@ for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
             "PROFILE_GPU:$PROFILE_GPU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
             "RUN_NSYS:$RUN_NSYS" "RUN_NCU:$RUN_NCU" \
             "SKIP_BUILD:$SKIP_BUILD" "SKIP_E2E_EXACT:$SKIP_E2E_EXACT" \
-            "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BENCHMARK:$SKIP_BENCHMARK" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -92,7 +94,8 @@ done
    PREFILL_CHUNK > 0 && REPEATS > 0 && REPEATS % 2 == 0 &&
    REPACK_THREADS > 0 &&
    PROFILE_TOKENS > 0 )) || die "invalid benchmark/profile shape"
-for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD SKIP_E2E_EXACT CREATE_ARCHIVE; do
+for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD SKIP_E2E_EXACT \
+            SKIP_BENCHMARK CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
@@ -248,7 +251,8 @@ current_phase=manifest
     printf 'model_hashing=disabled\ngpu_devices=%s\nstage_split=22/21\n' "$GPU_DEVICES"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$REPEATS"
-    printf 'exact_api_required=true\nexact_e2e_logits_skipped=%s\n' "$SKIP_E2E_EXACT"
+    printf 'exact_api_required=true\nexact_e2e_logits_skipped=%s\nbenchmark_skipped=%s\n' \
+        "$SKIP_E2E_EXACT" "$SKIP_BENCHMARK"
     printf '\n[gpu]\n'; nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,driver_version --format=csv
     printf '\n[topology]\n%s\n' "$gpu_topology"
     printf '\n[git status]\n'; git status --short
@@ -331,32 +335,33 @@ else
         >"$OUTPUT_DIR/validation/exact-status.txt"
 fi
 
-current_phase=balanced-ab
-printf 'repeat\tslot\tvariant\tcsv\tlog\n' >"$OUTPUT_DIR/runs.tsv"
-for ((repeat=1; repeat<=REPEATS; repeat++)); do
-    if (( repeat % 2 == 1 )); then variants=(standard native); else variants=(native standard); fi
-    slot=0
-    for variant in "${variants[@]}"; do
-        slot=$((slot + 1))
-        if [[ $variant == standard ]]; then run_model=$MODEL; else run_model=$NATIVE_MODEL; fi
-        stem="$variant-r$repeat"
-        printf 'Benchmarking %s repeat=%d/%d slot=%d...\n' "$variant" "$repeat" "$REPEATS" "$slot"
-        "${production_prefix[@]}" "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START" \
-            ./ds4-bench "${common[@]}" --model "$run_model" \
-            --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
-            --ctx-alloc "$((CTX_MAX + 1))" --step-mul "$STEP_MUL" \
-            --csv "$OUTPUT_DIR/runs/$stem.csv" \
-            >"$OUTPUT_DIR/runs/$stem.log" 2>&1
-        [[ -s $OUTPUT_DIR/runs/$stem.csv ]] || die "empty benchmark CSV: $stem"
-        validate_log "$variant" "$OUTPUT_DIR/runs/$stem.log"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$repeat" "$slot" "$variant" \
-            "$OUTPUT_DIR/runs/$stem.csv" "$OUTPUT_DIR/runs/$stem.log" \
-            >>"$OUTPUT_DIR/runs.tsv"
-        cat "$OUTPUT_DIR/runs/$stem.csv"
+if [[ $SKIP_BENCHMARK == 0 ]]; then
+    current_phase=balanced-ab
+    printf 'repeat\tslot\tvariant\tcsv\tlog\n' >"$OUTPUT_DIR/runs.tsv"
+    for ((repeat=1; repeat<=REPEATS; repeat++)); do
+        if (( repeat % 2 == 1 )); then variants=(standard native); else variants=(native standard); fi
+        slot=0
+        for variant in "${variants[@]}"; do
+            slot=$((slot + 1))
+            if [[ $variant == standard ]]; then run_model=$MODEL; else run_model=$NATIVE_MODEL; fi
+            stem="$variant-r$repeat"
+            printf 'Benchmarking %s repeat=%d/%d slot=%d...\n' "$variant" "$repeat" "$REPEATS" "$slot"
+            "${production_prefix[@]}" "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START" \
+                ./ds4-bench "${common[@]}" --model "$run_model" \
+                --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
+                --ctx-alloc "$((CTX_MAX + 1))" --step-mul "$STEP_MUL" \
+                --csv "$OUTPUT_DIR/runs/$stem.csv" \
+                >"$OUTPUT_DIR/runs/$stem.log" 2>&1
+            [[ -s $OUTPUT_DIR/runs/$stem.csv ]] || die "empty benchmark CSV: $stem"
+            validate_log "$variant" "$OUTPUT_DIR/runs/$stem.log"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$repeat" "$slot" "$variant" \
+                "$OUTPUT_DIR/runs/$stem.csv" "$OUTPUT_DIR/runs/$stem.log" \
+                >>"$OUTPUT_DIR/runs.tsv"
+            cat "$OUTPUT_DIR/runs/$stem.csv"
+        done
     done
-done
 
-python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/ab-summary.csv" <<'PY'
+    python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/ab-summary.csv" <<'PY'
 import csv, math, statistics, sys
 records=[]
 with open(sys.argv[1], encoding='utf-8', newline='') as f:
@@ -382,6 +387,11 @@ for ctx in sorted({r['ctx_tokens'] for r in records}):
     med=statistics.median(ratios)
     print(f'{ctx},{med:.6f},{(med-1)*100:.3f}')
 PY
+else
+    current_phase=balanced-ab-skipped
+    printf 'benchmark_skipped=true\nevidence=previous-archived-run\n' \
+        >"$OUTPUT_DIR/benchmark-status.txt"
+fi
 
 if [[ $RUN_NSYS == 1 ]]; then
     current_phase=nsight-systems
@@ -412,12 +422,19 @@ if [[ $RUN_NCU == 1 ]]; then
               --section SchedulerStats --section WarpStateStats
               --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
     profile_kernel() {
-        local name=$1 regex=$2 base="$OUTPUT_DIR/ncu/$name" rc=0
+        local name regex launch_skip expected base rc
+        name=$1
+        regex=$2
+        launch_skip=$3
+        expected=$4
+        base="$OUTPUT_DIR/ncu/$name"
+        rc=0
         printf 'Nsight Compute: %s...\n' "$name"
         env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${ncu_cmd[@]}" --config-file off \
             --target-processes application-only --devices 0 \
             --kernel-name-base function --kernel-name "regex:$regex" \
-            --launch-count 1 --replay-mode kernel --cache-control none \
+            --launch-skip "$launch_skip" --launch-count 1 \
+            --replay-mode kernel --cache-control none \
             --clock-control none --force-overwrite --export "$base" \
             "${sections[@]}" ./tests/cuda_long_context_smoke \
             >"$base.log" 2>&1 || rc=$?
@@ -426,12 +443,21 @@ if [[ $RUN_NCU == 1 ]]; then
         if [[ $NCU_USE_SUDO == 1 ]]; then sudo chown -- "$(id -u):$(id -g)" "$base.ncu-rep"; fi
         "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
             >"$base.csv" 2>"$base-import.log"
-        grep -Fq 'moe_' "$base.csv" || die "ncu captured no requested production kernel: $name"
+        grep -Eq "$expected" "$base.csv" ||
+            die "ncu captured the wrong production specialization: $name"
     }
-    profile_kernel gate-up-tile8 'moe_gate_up_mid_sm75_native_q4_tile8_kernel.*'
-    profile_kernel down-tile16 'moe_down_sm75_native_q4_tile_kernel.*512.*16.*'
-    profile_kernel down-tail8 'moe_down_sm75_native_q4_tile_kernel.*512.*8.*'
-    profile_kernel down-tail4 'moe_down_sm75_native_q4_tile_kernel.*512.*4.*'
+    profile_kernel gate-up-tile8 \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 0 \
+        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*0>'
+    profile_kernel down-tile16 \
+        '^moe_down_sm75_native_q4_tile_kernel$' 0 \
+        'moe_down_sm75_native_q4_tile_kernel<.*512.*16>'
+    profile_kernel down-tail8 \
+        '^moe_down_sm75_native_q4_tile_kernel$' 1 \
+        'moe_down_sm75_native_q4_tile_kernel<.*512.*8>'
+    profile_kernel down-tail4 \
+        '^moe_down_sm75_native_q4_tile_kernel$' 2 \
+        'moe_down_sm75_native_q4_tile_kernel<.*512.*4>'
 fi
 
 current_phase=complete
