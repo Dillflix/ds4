@@ -172,16 +172,19 @@ production_prefix=("${clean_prefix[@]}"
 if [[ $SKIP_BUILD == 0 ]]; then
     current_phase=build
     make -B -j"$(nproc)" ds4-bench tests/cuda_long_context_smoke \
+        tests/cuda_sm75_profile_harness \
         CUDA_ARCH="$CUDA_ARCH" 2>&1 | tee "$OUTPUT_DIR/build.log"
     make -C gguf-tools deepseek4-quantize-cuda test-quants-cuda \
         CUDA_ARCH="$CUDA_ARCH" 2>&1 | tee "$OUTPUT_DIR/quantizer-build.log"
 else
     for binary in ./ds4-bench ./tests/cuda_long_context_smoke \
+                  ./tests/cuda_sm75_profile_harness \
                   ./gguf-tools/deepseek4-quantize-cuda \
                   ./gguf-tools/test-quants-cuda; do
         [[ -x $binary ]] || die "SKIP_BUILD=1 but $binary is missing"
     done
-    make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH="$CUDA_ARCH" ||
+    make -q ds4-bench tests/cuda_long_context_smoke \
+        tests/cuda_sm75_profile_harness CUDA_ARCH="$CUDA_ARCH" ||
         die "SKIP_BUILD=1 found stale CUDA targets"
     make -C gguf-tools -q deepseek4-quantize-cuda test-quants-cuda \
         CUDA_ARCH="$CUDA_ARCH" ||
@@ -411,6 +414,18 @@ if [[ $RUN_NSYS == 1 ]]; then
 fi
 
 if [[ $RUN_NCU == 1 ]]; then
+    current_phase=native-profile-harness-smoke
+    for scenario in native-q4-early native-q4-late; do
+        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+            ./tests/cuda_sm75_profile_harness "$scenario" \
+            >"$OUTPUT_DIR/validation/$scenario-profile-harness.log" 2>&1 || {
+            tail -n 120 "$OUTPUT_DIR/validation/$scenario-profile-harness.log" >&2 || true
+            die "production-shaped native-Q4 profile harness failed: $scenario"
+        }
+        grep -Fq 'harness_status=ok' \
+            "$OUTPUT_DIR/validation/$scenario-profile-harness.log" ||
+            die "production-shaped native-Q4 harness omitted success: $scenario"
+    done
     current_phase=nsight-compute
     ncu_bin=$(command -v ncu)
     ncu_cmd=("$ncu_bin")
@@ -422,11 +437,12 @@ if [[ $RUN_NCU == 1 ]]; then
               --section SchedulerStats --section WarpStateStats
               --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
     profile_kernel() {
-        local name regex launch_skip expected base rc
+        local name scenario regex launch_skip expected base rc
         name=$1
-        regex=$2
-        launch_skip=$3
-        expected=$4
+        scenario=$2
+        regex=$3
+        launch_skip=$4
+        expected=$5
         base="$OUTPUT_DIR/ncu/$name"
         rc=0
         printf 'Nsight Compute: %s...\n' "$name"
@@ -436,7 +452,7 @@ if [[ $RUN_NCU == 1 ]]; then
             --launch-skip "$launch_skip" --launch-count 1 \
             --replay-mode kernel --cache-control none \
             --clock-control none --force-overwrite --export "$base" \
-            "${sections[@]}" ./tests/cuda_long_context_smoke \
+            "${sections[@]}" ./tests/cuda_sm75_profile_harness "$scenario" \
             >"$base.log" 2>&1 || rc=$?
         (( rc == 0 )) || { tail -n 100 "$base.log" >&2 || true; die "ncu failed: $name"; }
         [[ -s $base.ncu-rep ]] || die "missing ncu report: $name"
@@ -446,18 +462,34 @@ if [[ $RUN_NCU == 1 ]]; then
         grep -Eq "$expected" "$base.csv" ||
             die "ncu captured the wrong production specialization: $name"
     }
-    profile_kernel gate-up-tile8 \
-        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 0 \
-        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*0>'
-    profile_kernel down-tile16 \
-        '^moe_down_sm75_native_q4_tile_kernel$' 0 \
-        'moe_down_sm75_native_q4_tile_kernel<.*512.*16>'
-    profile_kernel down-tail8 \
-        '^moe_down_sm75_native_q4_tile_kernel$' 1 \
-        'moe_down_sm75_native_q4_tile_kernel<.*512.*8>'
-    profile_kernel down-tail4 \
-        '^moe_down_sm75_native_q4_tile_kernel$' 2 \
-        'moe_down_sm75_native_q4_tile_kernel<.*512.*4>'
+    profile_histogram() {
+        local label scenario
+        label=$1
+        scenario=$2
+        profile_kernel "$label-gate-tile16-low8" "$scenario" \
+            '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 0 \
+            'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*0>'
+        profile_kernel "$label-gate-tile16-high8" "$scenario" \
+            '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 1 \
+            'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*8>'
+        profile_kernel "$label-gate-tail8" "$scenario" \
+            '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 2 \
+            'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*0>'
+        profile_kernel "$label-gate-tail4" "$scenario" \
+            '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' 3 \
+            'moe_gate_up_mid_sm75_native_q4_tile8_kernel<.*512.*0>'
+        profile_kernel "$label-down-tile16" "$scenario" \
+            '^moe_down_sm75_native_q4_tile_kernel$' 0 \
+            'moe_down_sm75_native_q4_tile_kernel<.*512.*16>'
+        profile_kernel "$label-down-tail8" "$scenario" \
+            '^moe_down_sm75_native_q4_tile_kernel$' 1 \
+            'moe_down_sm75_native_q4_tile_kernel<.*512.*8>'
+        profile_kernel "$label-down-tail4" "$scenario" \
+            '^moe_down_sm75_native_q4_tile_kernel$' 2 \
+            'moe_down_sm75_native_q4_tile_kernel<.*512.*4>'
+    }
+    profile_histogram early native-q4-early
+    profile_histogram late native-q4-late
 fi
 
 current_phase=complete

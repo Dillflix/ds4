@@ -16,6 +16,8 @@
 typedef enum {
     SCENARIO_MOE_Q4_EARLY,
     SCENARIO_MOE_Q4_LATE,
+    SCENARIO_MOE_NATIVE_Q4_EARLY,
+    SCENARIO_MOE_NATIVE_Q4_LATE,
     SCENARIO_MOE_Q2_EARLY,
     SCENARIO_MOE_Q2_LATE,
     SCENARIO_Q8_Q_B,
@@ -41,7 +43,48 @@ typedef struct {
     uint32_t tile16_count;
     uint32_t in_dim;
     uint32_t out_dim;
+    const uint16_t *expert_counts;
 } scenario_spec;
+
+/* Exact home-half expert histograms from the fixed full-Q4 512-token prompt
+ * capture.  Native layout changes are bit-exact, so routing is unchanged. */
+static const uint16_t native_q4_early_counts[128] = {
+    18u, 16u, 0u, 3u, 3u, 5u, 15u, 0u,
+    0u, 0u, 2u, 10u, 2u, 4u, 5u, 1u,
+    19u, 26u, 12u, 6u, 15u, 10u, 1u, 35u,
+    4u, 8u, 28u, 17u, 3u, 0u, 2u, 2u,
+    0u, 0u, 4u, 4u, 1u, 22u, 0u, 0u,
+    8u, 8u, 1u, 0u, 5u, 12u, 8u, 0u,
+    6u, 0u, 0u, 0u, 0u, 2u, 19u, 6u,
+    1u, 7u, 0u, 0u, 478u, 18u, 1u, 0u,
+    2u, 3u, 6u, 0u, 4u, 27u, 4u, 15u,
+    0u, 24u, 449u, 11u, 0u, 2u, 3u, 7u,
+    3u, 12u, 0u, 6u, 24u, 24u, 13u, 34u,
+    0u, 3u, 4u, 3u, 1u, 20u, 2u, 0u,
+    2u, 3u, 0u, 9u, 54u, 0u, 2u, 9u,
+    4u, 20u, 2u, 10u, 6u, 3u, 0u, 32u,
+    1u, 21u, 13u, 33u, 6u, 52u, 3u, 0u,
+    3u, 0u, 5u, 12u, 0u, 0u, 0u, 0u,
+};
+
+static const uint16_t native_q4_late_counts[128] = {
+    0u, 4u, 122u, 0u, 3u, 13u, 0u, 3u,
+    1u, 0u, 0u, 0u, 1u, 4u, 0u, 0u,
+    498u, 0u, 0u, 11u, 0u, 0u, 0u, 96u,
+    1u, 466u, 4u, 0u, 0u, 2u, 7u, 22u,
+    0u, 0u, 1u, 2u, 0u, 0u, 13u, 0u,
+    1u, 1u, 28u, 2u, 1u, 0u, 0u, 0u,
+    13u, 8u, 0u, 0u, 3u, 0u, 0u, 1u,
+    2u, 9u, 0u, 6u, 6u, 1u, 5u, 5u,
+    11u, 0u, 0u, 1u, 5u, 0u, 2u, 0u,
+    0u, 1u, 0u, 0u, 0u, 4u, 1u, 0u,
+    0u, 0u, 14u, 11u, 0u, 1u, 0u, 0u,
+    0u, 5u, 2u, 1u, 0u, 0u, 9u, 141u,
+    2u, 6u, 0u, 0u, 2u, 1u, 1u, 1u,
+    3u, 3u, 2u, 87u, 22u, 0u, 0u, 0u,
+    0u, 301u, 0u, 14u, 15u, 1u, 8u, 4u,
+    0u, 1u, 34u, 39u, 3u, 0u, 0u, 1u,
+};
 
 static const scenario_spec scenarios[] = {
     {
@@ -51,6 +94,14 @@ static const scenario_spec scenarios[] = {
     {
         "q4-late", SCENARIO_MOE_Q4_LATE, 36u,
         2186u, 76u, 189u, 4096u, 4096u,
+    },
+    {
+        "native-q4-early", SCENARIO_MOE_NATIVE_Q4_EARLY, 3u,
+        1894u, 95u, 180u, 4096u, 4096u, native_q4_early_counts,
+    },
+    {
+        "native-q4-late", SCENARIO_MOE_NATIVE_Q4_LATE, 36u,
+        2126u, 73u, 183u, 4096u, 4096u, native_q4_late_counts,
     },
     {
         "q2-early", SCENARIO_MOE_Q2_EARLY, 3u,
@@ -84,7 +135,8 @@ static unsigned char *model_storage;
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "Usage: %s q4-early|q4-late|q2-early|q2-late|"
+            "Usage: %s q4-early|q4-late|native-q4-early|native-q4-late|"
+            "q2-early|q2-late|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
@@ -191,10 +243,9 @@ static int token_has_expert(const int32_t *selected, uint32_t token,
     return 0;
 }
 
-/* Build a deterministic synthetic top-6 assignment whose owned half matches
- * the aggregate production evidence exactly. The per-expert histogram is not
- * claimed to be the original router histogram: only pair count, active expert
- * count, and tile16 count are constrained by the recorded audit. */
+/* Reproduce an exact recorded per-expert histogram when one is attached to
+ * the scenario. Other scenarios retain the deterministic aggregate-matched
+ * assignment used by the original audit harness. */
 static int build_owned_assignment(const scenario_spec *spec,
                                   int32_t *selected,
                                   float *weights,
@@ -202,49 +253,55 @@ static int build_owned_assignment(const scenario_spec *spec,
     const uint32_t n_tokens = 512u;
     const uint32_t n_slots = 6u;
     const uint32_t active = spec->active_experts;
-    uint32_t *counts = (uint32_t *)calloc(active, sizeof(uint32_t));
-    uint32_t *tile_units = (uint32_t *)calloc(active, sizeof(uint32_t));
+    const uint32_t expert_limit = spec->expert_counts ? 128u : active;
+    uint32_t *counts = (uint32_t *)calloc(expert_limit, sizeof(uint32_t));
+    uint32_t *tile_units = (uint32_t *)calloc(expert_limit, sizeof(uint32_t));
     uint32_t *fills = (uint32_t *)calloc(n_tokens, sizeof(uint32_t));
     if (!counts || !tile_units || !fills) {
         free(fills); free(tile_units); free(counts);
         return 0;
     }
 
-    for (uint32_t e = 0; e < active; e++) tile_units[e] = 1u;
-    uint32_t extra_tiles = spec->tile16_count - active;
-    for (uint32_t i = 0; i < extra_tiles; i++) {
-        tile_units[(i * 37u + 11u) % active]++;
-    }
-
-    uint32_t minimum_pairs = 0u;
-    for (uint32_t e = 0; e < active; e++) {
-        counts[e] = (tile_units[e] - 1u) * 16u + 1u;
-        minimum_pairs += counts[e];
-    }
-    if (minimum_pairs > spec->owned_pairs ||
-        spec->owned_pairs > spec->tile16_count * 16u) {
-        fprintf(stderr, "error: impossible routed-MoE aggregate constraints\n");
-        free(fills); free(tile_units); free(counts);
-        return 0;
-    }
-    uint32_t remaining = spec->owned_pairs - minimum_pairs;
-    uint32_t count_cursor = 0u;
-    while (remaining > 0u) {
-        uint32_t best = UINT32_MAX;
-        for (uint32_t k = 0; k < active; k++) {
-            const uint32_t e = (count_cursor + k) % active;
-            const uint32_t ceiling = tile_units[e] * 16u;
-            if (counts[e] >= ceiling) continue;
-            if (best == UINT32_MAX || counts[e] < counts[best]) best = e;
+    if (spec->expert_counts) {
+        for (uint32_t e = 0; e < expert_limit; e++)
+            counts[e] = spec->expert_counts[e];
+    } else {
+        for (uint32_t e = 0; e < active; e++) tile_units[e] = 1u;
+        uint32_t extra_tiles = spec->tile16_count - active;
+        for (uint32_t i = 0; i < extra_tiles; i++) {
+            tile_units[(i * 37u + 11u) % active]++;
         }
-        if (best == UINT32_MAX) {
-            fprintf(stderr, "error: aggregate count ceilings exhausted\n");
+
+        uint32_t minimum_pairs = 0u;
+        for (uint32_t e = 0; e < active; e++) {
+            counts[e] = (tile_units[e] - 1u) * 16u + 1u;
+            minimum_pairs += counts[e];
+        }
+        if (minimum_pairs > spec->owned_pairs ||
+            spec->owned_pairs > spec->tile16_count * 16u) {
+            fprintf(stderr, "error: impossible routed-MoE aggregate constraints\n");
             free(fills); free(tile_units); free(counts);
             return 0;
         }
-        counts[best]++;
-        remaining--;
-        count_cursor = (best + 1u) % active;
+        uint32_t remaining = spec->owned_pairs - minimum_pairs;
+        uint32_t count_cursor = 0u;
+        while (remaining > 0u) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t k = 0; k < active; k++) {
+                const uint32_t e = (count_cursor + k) % active;
+                const uint32_t ceiling = tile_units[e] * 16u;
+                if (counts[e] >= ceiling) continue;
+                if (best == UINT32_MAX || counts[e] < counts[best]) best = e;
+            }
+            if (best == UINT32_MAX) {
+                fprintf(stderr, "error: aggregate count ceilings exhausted\n");
+                free(fills); free(tile_units); free(counts);
+                return 0;
+            }
+            counts[best]++;
+            remaining--;
+            count_cursor = (best + 1u) % active;
+        }
     }
 
     for (uint64_t i = 0; i < (uint64_t)n_tokens * n_slots; i++) {
@@ -253,7 +310,7 @@ static int build_owned_assignment(const scenario_spec *spec,
     }
 
     uint32_t cursor = 0u;
-    for (uint32_t e = 0; e < active; e++) {
+    for (uint32_t e = 0; e < expert_limit; e++) {
         for (uint32_t occurrence = 0; occurrence < counts[e]; occurrence++) {
             uint32_t best = UINT32_MAX;
             uint32_t best_fill = n_slots + 1u;
@@ -301,7 +358,7 @@ static int build_owned_assignment(const scenario_spec *spec,
     }
 
     uint32_t pairs = 0u, active_check = 0u, tile16 = 0u, tile8 = 0u;
-    for (uint32_t e = 0; e < active; e++) {
+    for (uint32_t e = 0; e < expert_limit; e++) {
         if (counts[e]) active_check++;
         pairs += counts[e];
         tile16 += (counts[e] + 15u) / 16u;
@@ -319,7 +376,8 @@ static int build_owned_assignment(const scenario_spec *spec,
     return 1;
 }
 
-static int verify_tile_audit(const char *path, const scenario_spec *spec) {
+static int verify_tile_audit(const char *path, const scenario_spec *spec,
+                             int native_q4) {
     FILE *fp = fopen(path, "r");
     if (!fp) {
         fprintf(stderr, "error: cannot read tile audit %s: %s\n",
@@ -353,9 +411,13 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec) {
     const uint32_t expected_padding = spec->tile16_count * 16u - spec->owned_pairs;
     if (layer != spec->layer || token_offset != 0u || n_tokens != 512u ||
         owner_base != 0u || owner_count != 128u ||
-        pair_count != spec->owned_pairs || tile_count != spec->tile16_count ||
-        slot_count != spec->tile16_count * 16u ||
-        active_experts != spec->active_experts || padded_slots != expected_padding) {
+        pair_count != spec->owned_pairs || active_experts != spec->active_experts ||
+        (!native_q4 && (tile_count != spec->tile16_count ||
+                        slot_count != spec->tile16_count * 16u ||
+                        padded_slots != expected_padding)) ||
+        (native_q4 && (slot_count < pair_count ||
+                       padded_slots != slot_count - pair_count ||
+                       padded_slots > 3u * active_experts))) {
         fprintf(stderr,
                 "error: tile audit mismatch layer=%u tokens=%u pairs=%u "
                 "tile16=%u active=%u padded=%u\n",
@@ -388,7 +450,7 @@ static int confirm_device_copy(uint64_t free_before, uint64_t free_after,
     return 1;
 }
 
-static int run_moe(const scenario_spec *spec, int q2_recipe,
+static int run_moe(const scenario_spec *spec, int q2_recipe, int native_q4,
                    uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint32_t n_expert = 6u;
@@ -433,7 +495,9 @@ static int run_moe(const scenario_spec *spec, int q2_recipe,
            "model_bytes=%llu\ntensor_bytes=%llu\n"
            "predicted_device_bytes=%llu\ndevice_limit_bytes=%llu\n",
            spec->name,
-           q2_recipe ? "iq2_gate_up_q2_down" : "q4_gate_up_q4_down",
+           q2_recipe ? "iq2_gate_up_q2_down" :
+               (native_q4 ? "native_q4_gate_up_q4_down" :
+                            "q4_gate_up_q4_down"),
            q2_recipe ? "iq2_xxs" : "q4_k",
            q2_recipe ? "q2_k" : "q4_k",
            spec->layer, n_tokens, resident_experts,
@@ -505,6 +569,8 @@ static int run_moe(const scenario_spec *spec, int q2_recipe,
         fprintf(stderr, "error: routed-MoE input upload failed\n");
         goto cleanup;
     }
+    ds4_gpu_set_routed_q4_layout(
+        native_q4 ? DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4 : 0u);
     const uint64_t free_before = ds4_gpu_tier_free_vram(0);
     if (!ds4_gpu_set_model_map(model, model_bytes) || !ds4_gpu_synchronize()) {
         fprintf(stderr, "error: routed-MoE model device copy failed\n");
@@ -532,7 +598,7 @@ static int run_moe(const scenario_spec *spec, int q2_recipe,
         goto cleanup;
     }
     if (!ds4_gpu_prefill_tile_audit_write_csv(audit_path) ||
-        !verify_tile_audit(audit_path, spec)) {
+        !verify_tile_audit(audit_path, spec, native_q4)) {
         goto cleanup;
     }
     if (!ds4_gpu_tensor_read(out, 0, out_host, out_count * sizeof(float)) ||
@@ -575,6 +641,7 @@ static int run_moe(const scenario_spec *spec, int q2_recipe,
     ok = 1;
 
 cleanup:
+    ds4_gpu_set_routed_q4_layout(0u);
     if (audit_started) ds4_gpu_prefill_tile_audit_end();
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -701,15 +768,18 @@ int main(int argc, char **argv) {
                 "error: DS4_PROFILE_SCALAR=1 requires a non-none target\n");
         return 2;
     }
-    const int q4_moe = spec->kind == SCENARIO_MOE_Q4_EARLY ||
-                       spec->kind == SCENARIO_MOE_Q4_LATE;
+    const int standard_q4_moe = spec->kind == SCENARIO_MOE_Q4_EARLY ||
+                                spec->kind == SCENARIO_MOE_Q4_LATE;
+    const int native_q4_moe = spec->kind == SCENARIO_MOE_NATIVE_Q4_EARLY ||
+                              spec->kind == SCENARIO_MOE_NATIVE_Q4_LATE;
+    const int q4_moe = standard_q4_moe || native_q4_moe;
     const int q2_moe = spec->kind == SCENARIO_MOE_Q2_EARLY ||
                        spec->kind == SCENARIO_MOE_Q2_LATE;
     const int scalar_q4 = scalar_target == SCALAR_TARGET_Q4_GATE ||
                           scalar_target == SCALAR_TARGET_Q4_DOWN;
     const int scalar_iq2 = scalar_target == SCALAR_TARGET_IQ2_TILE16 ||
                            scalar_target == SCALAR_TARGET_IQ2_TILE8;
-    if ((scalar_q4 && !q4_moe) || (scalar_iq2 && !q2_moe)) {
+    if ((scalar_q4 && !standard_q4_moe) || (scalar_iq2 && !q2_moe)) {
         fprintf(stderr,
                 "error: scalar target %s is incompatible with scenario %s\n",
                 scalar_target_name(scalar_target), spec->name);
@@ -803,8 +873,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const int ok = q4_moe ? run_moe(spec, 0, timed_repeats) :
-                   (q2_moe ? run_moe(spec, 1, timed_repeats) : run_q8(spec));
+    const int ok = q4_moe ? run_moe(spec, 0, native_q4_moe, timed_repeats) :
+                   (q2_moe ? run_moe(spec, 1, 0, timed_repeats) : run_q8(spec));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;
