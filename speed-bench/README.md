@@ -11,7 +11,9 @@ synchronization.
 
 Gate/up and down use the same router assignment. One capture therefore derives
 both the shipping gate/up tile8 plan and the down tile16 plan, as well as
-counterfactual gate 8/4 and down 16/8/4 tail plans. The runner refuses a model
+minimum-active-tile gate 8/4 and down 16/8/4 tail plans. It also reports the
+production grid-capacity entries that return early because the actual tile
+count remains on-device. The runner refuses a model
 unless all 43 routed layers report Q4 gate, Q4 up, and Q4 down. Model hashing is
 omitted.
 

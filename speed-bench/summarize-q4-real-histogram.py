@@ -21,6 +21,15 @@ BASE_ID = (
     "owner_count",
 )
 
+GRID_FIELDS = (
+    "gate_grid_tile_capacity",
+    "gate_grid_inactive_tiles",
+    "gate_grid_active_pct",
+    "down_grid_tile_capacity",
+    "down_grid_inactive_tiles",
+    "down_grid_active_pct",
+)
+
 
 def die(message: str) -> "None":
     raise SystemExit(message)
@@ -34,19 +43,32 @@ def tile_plans(counts: list[int]) -> dict[str, int | float]:
     pairs = sum(counts)
     gate_t8 = sum(ceil_div(count, 8) for count in counts if count)
     gate_full8 = sum(count // 8 for count in counts)
-    gate_tail4 = sum(ceil_div(count % 8, 4) for count in counts if count % 8)
-    gate_adaptive_slots = gate_full8 * 8 + gate_tail4 * 4
+    gate_tail8 = 0
+    gate_tail4 = 0
+    for count in counts:
+        remainder = count % 8
+        if 1 <= remainder <= 4:
+            gate_tail4 += 1
+        elif remainder:
+            gate_tail8 += 1
+    gate_adaptive_slots = (
+        (gate_full8 + gate_tail8) * 8 + gate_tail4 * 4
+    )
     down_t16 = sum(ceil_div(count, 16) for count in counts if count)
     down_full16 = sum(count // 16 for count in counts)
     down_tail8 = 0
     down_tail4 = 0
     for count in counts:
         remainder = count % 16
-        if remainder >= 8:
+        if 1 <= remainder <= 4:
+            down_tail4 += 1
+        elif remainder <= 8 and remainder:
             down_tail8 += 1
-            remainder -= 8
-        if remainder:
-            down_tail4 += ceil_div(remainder, 4)
+        elif remainder <= 12 and remainder:
+            down_tail8 += 1
+            down_tail4 += 1
+        elif remainder:
+            down_tail8 += 2
     down_adaptive_slots = down_full16 * 16 + down_tail8 * 8 + down_tail4 * 4
     gate_slots = gate_t8 * 8
     down_slots = down_t16 * 16
@@ -58,6 +80,7 @@ def tile_plans(counts: list[int]) -> dict[str, int | float]:
         "gate_tile8_padded_slots": gate_slots - pairs,
         "gate_tile8_fill_pct": 100.0 * pairs / gate_slots if gate_slots else 0.0,
         "gate_adaptive_full8_count": gate_full8,
+        "gate_adaptive_tail8_count": gate_tail8,
         "gate_adaptive_tail4_count": gate_tail4,
         "gate_adaptive_slots": gate_adaptive_slots,
         "gate_adaptive_padded_slots": gate_adaptive_slots - pairs,
@@ -134,6 +157,36 @@ def main() -> None:
                 f"active-expert mismatch at layer={raw['layer']} "
                 f"tier={raw['logical_tier']}"
             )
+        selected_slots = int(raw["selected_slots"])
+        gate_capacity = ceil_div(selected_slots, 8) + total
+        down_capacity = ceil_div(selected_slots, 16) + total
+        if gate_capacity < int(plans["gate_tile8_count"]) or (
+            down_capacity < int(plans["down_tile16_count"])
+        ):
+            die(
+                f"production grid capacity is smaller than active tiles at "
+                f"layer={raw['layer']} tier={raw['logical_tier']}"
+            )
+        plans.update(
+            {
+                "gate_grid_tile_capacity": gate_capacity,
+                "gate_grid_inactive_tiles": (
+                    gate_capacity - int(plans["gate_tile8_count"])
+                ),
+                "gate_grid_active_pct": (
+                    100.0 * int(plans["gate_tile8_count"]) / gate_capacity
+                    if gate_capacity else 0.0
+                ),
+                "down_grid_tile_capacity": down_capacity,
+                "down_grid_inactive_tiles": (
+                    down_capacity - int(plans["down_tile16_count"])
+                ),
+                "down_grid_active_pct": (
+                    100.0 * int(plans["down_tile16_count"]) / down_capacity
+                    if down_capacity else 0.0
+                ),
+            }
+        )
         identity = {field: raw[field] for field in BASE_ID}
         plan_rows.append({**identity, **plans})
 
@@ -155,7 +208,7 @@ def main() -> None:
             )
             frequency[(int(raw["layer"]), raw["ownership"], count)] += 1
 
-    plan_fields = list(BASE_ID) + list(tile_plans([]).keys())
+    plan_fields = list(BASE_ID) + list(tile_plans([]).keys()) + list(GRID_FIELDS)
     expert_fields_out = list(BASE_ID) + [
         "captured_index",
         "global_expert",
@@ -185,12 +238,44 @@ def main() -> None:
     gate_slots = sum(int(row["gate_tile8_slots"]) for row in plan_rows)
     down_slots = sum(int(row["down_tile16_slots"]) for row in plan_rows)
     mixed_slots = sum(int(row["down_adaptive_slots"]) for row in plan_rows)
+    gate_mixed_slots = sum(
+        int(row["gate_adaptive_slots"]) for row in plan_rows
+    )
+    gate_tiles = sum(int(row["gate_tile8_count"]) for row in plan_rows)
+    gate_mixed_tiles = sum(
+        int(row["gate_adaptive_full8_count"])
+        + int(row["gate_adaptive_tail8_count"])
+        + int(row["gate_adaptive_tail4_count"])
+        for row in plan_rows
+    )
+    down_tiles = sum(int(row["down_tile16_count"]) for row in plan_rows)
+    down_mixed_tiles = sum(
+        int(row["down_adaptive_full16_count"])
+        + int(row["down_adaptive_tail8_count"])
+        + int(row["down_adaptive_tail4_count"])
+        for row in plan_rows
+    )
+    gate_grid_capacity = sum(
+        int(row["gate_grid_tile_capacity"]) for row in plan_rows
+    )
+    down_grid_capacity = sum(
+        int(row["down_grid_tile_capacity"]) for row in plan_rows
+    )
     print(f"records={len(plan_rows)}")
     print(f"expert_rows={len(expert_rows)}")
     print(f"pair_slots={pairs}")
     print(f"gate_tile8_fill_pct={100.0 * pairs / gate_slots:.6f}")
+    print(f"gate_adaptive_8_4_fill_pct={100.0 * pairs / gate_mixed_slots:.6f}")
+    print(f"gate_tile8_active_tiles={gate_tiles}")
+    print(f"gate_adaptive_8_4_active_tiles={gate_mixed_tiles}")
+    print(f"gate_grid_tile_capacity={gate_grid_capacity}")
+    print(f"gate_grid_active_pct={100.0 * gate_tiles / gate_grid_capacity:.6f}")
     print(f"down_tile16_fill_pct={100.0 * pairs / down_slots:.6f}")
     print(f"down_adaptive_16_8_4_fill_pct={100.0 * pairs / mixed_slots:.6f}")
+    print(f"down_tile16_active_tiles={down_tiles}")
+    print(f"down_adaptive_16_8_4_active_tiles={down_mixed_tiles}")
+    print(f"down_grid_tile_capacity={down_grid_capacity}")
+    print(f"down_grid_active_pct={100.0 * down_tiles / down_grid_capacity:.6f}")
 
 
 if __name__ == "__main__":
