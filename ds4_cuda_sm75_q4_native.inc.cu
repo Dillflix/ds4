@@ -525,6 +525,8 @@ __global__ static void moe_down_sm75_native_q4_tile_kernel(
         if (row0 >= out_dim) continue;
         DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
         DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
+        DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
+        DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
         const uint64_t native_tile =
             (uint64_t)expert * (out_dim / 8u) + row0 / 8u;
 #pragma unroll

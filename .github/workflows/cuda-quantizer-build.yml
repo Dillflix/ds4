@@ -11,6 +11,7 @@ on:
       - "ds4_cuda.cu"
       - "ds4_cuda_sm75_q4_native.inc.cu"
       - "ds4_gpu.h"
+      - "ds4_tensor_layout.h"
       - "ds4_help.c"
       - "Makefile"
       - "speed-bench/cuda-prefill-audit.sh"
