@@ -27,6 +27,7 @@ Optional environment:
   RUN_NSYS=1
   RUN_NCU=1
   SKIP_BUILD=0
+  SKIP_E2E_EXACT=0          # 1 only when prior full-model exact evidence exists
   CREATE_ARCHIVE=1
   NATIVE_Q4_DIR=...
 
@@ -67,6 +68,7 @@ NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 RUN_NSYS=${RUN_NSYS:-1}
 RUN_NCU=${RUN_NCU:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
+SKIP_E2E_EXACT=${SKIP_E2E_EXACT:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CUDA_ARCH=sm_75
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -81,7 +83,8 @@ for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
             "PROFILE_TOKENS:$PROFILE_TOKENS" \
             "PROFILE_GPU:$PROFILE_GPU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
             "RUN_NSYS:$RUN_NSYS" "RUN_NCU:$RUN_NCU" \
-            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BUILD:$SKIP_BUILD" "SKIP_E2E_EXACT:$SKIP_E2E_EXACT" \
+            "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -89,7 +92,7 @@ done
    PREFILL_CHUNK > 0 && REPEATS > 0 && REPEATS % 2 == 0 &&
    REPACK_THREADS > 0 &&
    PROFILE_TOKENS > 0 )) || die "invalid benchmark/profile shape"
-for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD CREATE_ARCHIVE; do
+for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD SKIP_E2E_EXACT CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
@@ -245,7 +248,7 @@ current_phase=manifest
     printf 'model_hashing=disabled\ngpu_devices=%s\nstage_split=22/21\n' "$GPU_DEVICES"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$REPEATS"
-    printf 'exact_api_required=true\nexact_e2e_logits_required=true\n'
+    printf 'exact_api_required=true\nexact_e2e_logits_skipped=%s\n' "$SKIP_E2E_EXACT"
     printf '\n[gpu]\n'; nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,driver_version --format=csv
     printf '\n[topology]\n%s\n' "$gpu_topology"
     printf '\n[git status]\n'; git status --short
@@ -268,33 +271,34 @@ validate_log() {
     fi
 }
 
-current_phase=end-to-end-exact-output
-for variant in standard native; do
-    if [[ $variant == standard ]]; then run_model=$MODEL; else run_model=$NATIVE_MODEL; fi
-    mkdir -p "$OUTPUT_DIR/validation/$variant-logits"
-    "${production_prefix[@]}" DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
-        ./ds4-bench "${common[@]}" --model "$run_model" \
-        --ctx-start "$CTX_START" --ctx-max "$CTX_START" \
-        --ctx-alloc "$((CTX_START + 1))" --step-incr "$CTX_START" \
-        --dump-frontier-logits-dir "$OUTPUT_DIR/validation/$variant-logits" \
-        --csv "$OUTPUT_DIR/validation/$variant.csv" \
-        >"$OUTPUT_DIR/validation/$variant.log" 2>&1
-    validate_log "$variant" "$OUTPUT_DIR/validation/$variant.log"
-    count=$(grep -Ec '^ds4: routed-quant-audit layer=[0-9]+ gate=q4_k up=q4_k down=q4_k$' \
-        "$OUTPUT_DIR/validation/$variant.log" || true)
-    [[ $count == 43 ]] || die "$variant is not an exact 43-layer full-Q4 model"
-done
-raw=$(printf 'frontier_%06d.logits.f32' "$CTX_START")
-json=$(printf 'frontier_%06d.logits.json' "$CTX_START")
-a="$OUTPUT_DIR/validation/standard-logits/$raw"
-b="$OUTPUT_DIR/validation/native-logits/$raw"
-[[ -s $a && -s $b ]] || die "missing end-to-end logits: $raw"
-cmp -s "$a" "$b" || die "standard/native raw logits are not bit-exact: $raw"
+if [[ $SKIP_E2E_EXACT == 0 ]]; then
+    current_phase=end-to-end-exact-output
+    for variant in standard native; do
+        if [[ $variant == standard ]]; then run_model=$MODEL; else run_model=$NATIVE_MODEL; fi
+        mkdir -p "$OUTPUT_DIR/validation/$variant-logits"
+        "${production_prefix[@]}" DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
+            ./ds4-bench "${common[@]}" --model "$run_model" \
+            --ctx-start "$CTX_START" --ctx-max "$CTX_START" \
+            --ctx-alloc "$((CTX_START + 1))" --step-incr "$CTX_START" \
+            --dump-frontier-logits-dir "$OUTPUT_DIR/validation/$variant-logits" \
+            --csv "$OUTPUT_DIR/validation/$variant.csv" \
+            >"$OUTPUT_DIR/validation/$variant.log" 2>&1
+        validate_log "$variant" "$OUTPUT_DIR/validation/$variant.log"
+        count=$(grep -Ec '^ds4: routed-quant-audit layer=[0-9]+ gate=q4_k up=q4_k down=q4_k$' \
+            "$OUTPUT_DIR/validation/$variant.log" || true)
+        [[ $count == 43 ]] || die "$variant is not an exact 43-layer full-Q4 model"
+    done
+    raw=$(printf 'frontier_%06d.logits.f32' "$CTX_START")
+    json=$(printf 'frontier_%06d.logits.json' "$CTX_START")
+    a="$OUTPUT_DIR/validation/standard-logits/$raw"
+    b="$OUTPUT_DIR/validation/native-logits/$raw"
+    [[ -s $a && -s $b ]] || die "missing end-to-end logits: $raw"
+    cmp -s "$a" "$b" || die "standard/native raw logits are not bit-exact: $raw"
 
-a="$OUTPUT_DIR/validation/standard-logits/$json"
-b="$OUTPUT_DIR/validation/native-logits/$json"
-[[ -s $a && -s $b ]] || die "missing end-to-end logits: $json"
-python3 - "$a" "$b" <<'PY'
+    a="$OUTPUT_DIR/validation/standard-logits/$json"
+    b="$OUTPUT_DIR/validation/native-logits/$json"
+    [[ -s $a && -s $b ]] || die "missing end-to-end logits: $json"
+    python3 - "$a" "$b" <<'PY'
 import json
 import sys
 
@@ -319,8 +323,13 @@ if standard != native:
     )
     raise SystemExit(1)
 PY
-printf 'api_exact=true\ne2e_full_vocab_raw_logits_bit_exact=true\ne2e_logits_json_semantic_exact=true\n' \
-    >"$OUTPUT_DIR/validation/exact-status.txt"
+    printf 'api_exact=true\ne2e_full_vocab_raw_logits_bit_exact=true\ne2e_logits_json_semantic_exact=true\n' \
+        >"$OUTPUT_DIR/validation/exact-status.txt"
+else
+    current_phase=end-to-end-exact-output-skipped
+    printf 'api_exact=true\ne2e_exact_skipped=true\ne2e_exact_evidence=previous-archived-run\n' \
+        >"$OUTPUT_DIR/validation/exact-status.txt"
+fi
 
 current_phase=balanced-ab
 printf 'repeat\tslot\tvariant\tcsv\tlog\n' >"$OUTPUT_DIR/runs.tsv"
