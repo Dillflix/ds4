@@ -64,6 +64,41 @@ Return `q4-post-scalar-trace-<timestamp>.tar.gz`. This pass updates the Amdahl
 weights used to rank persistent exact-grid work queues and native A/W kernels;
 it does not itself change production dispatch.
 
+### Full-Q4 placement and cuBLAS-cache A/B
+
+`cuda-q4-layout-cache-ab.sh` tests the cache/pipeline imbalance exposed by the
+post-scalar trace. It compares three fixed configurations:
+
+- `baseline-22x21`: split 22/21 with devices `0,2,1,3`;
+- `split-21x22`: split 21/22 with devices `0,2,1,3`;
+- `swap-22x21`: split 22/21 with devices `0,3,1,2`.
+
+Each process first runs an untimed 2K warm-up so every admitted Q8 weight has
+already been expanded to F16 for the measured cuBLAS path. It snapshots the
+per-device cache before and after the timed sweep and rejects any run whose
+cache changes. Three rotated repeats place every variant in every process
+position once. The default 2K/4K/8K sweep is a bounded placement decision;
+increase `CTX_MAX` only after selecting the winner. No model hash or Nsight
+capture is performed.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_VRAM=auto \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=3 \
+./speed-bench/cuda-q4-layout-cache-ab.sh
+```
+
+Return `q4-layout-cache-ab-<timestamp>.tar.gz`. Its summaries include paired
+throughput ratios and the exact cached F16 slice count and bytes on each stage
+home GPU.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver

@@ -221,6 +221,8 @@ jobs:
           bash -n speed-bench/cuda-q4-real-histogram.sh
           test -x speed-bench/cuda-q4-post-scalar-trace.sh
           bash -n speed-bench/cuda-q4-post-scalar-trace.sh
+          test -x speed-bench/cuda-q4-layout-cache-ab.sh
+          bash -n speed-bench/cuda-q4-layout-cache-ab.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
           bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
           bash -n speed-bench/cuda-sm75-q4-down-native.sh
@@ -246,4 +248,6 @@ jobs:
           python3 tests/test_summarize_q4_real_histogram.py
           python3 -m py_compile speed-bench/summarize-q4-post-scalar-trace.py
           python3 tests/test_summarize_q4_post_scalar_trace.py
+          python3 -m py_compile speed-bench/summarize-q4-layout-cache-ab.py
+          python3 tests/test_summarize_q4_layout_cache_ab.py
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py
