@@ -126,8 +126,12 @@ if [[ $SKIP_BUILD == 0 ]]; then
     current_phase=build
     make -B -j"$(nproc)" ds4-bench CUDA_ARCH="$CUDA_ARCH" \
         2>&1 | tee "$OUTPUT_DIR/build.log"
+elif ! make -q ds4-bench CUDA_ARCH="$CUDA_ARCH"; then
+    die "SKIP_BUILD=1 rejected a stale ds4-bench; rerun with SKIP_BUILD=0"
 fi
 [[ -x ./ds4-bench ]] || die "ds4-bench is missing or not executable"
+grep -aFq 'n_total_expert,captured_experts' ./ds4-bench ||
+    die "ds4-bench lacks exact-histogram support; rerun with SKIP_BUILD=0"
 
 current_phase=manifest
 {
@@ -140,6 +144,7 @@ current_phase=manifest
         "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT"
     printf 'ctx_tokens=%s\nprefill_chunk=%s\naudit_capacity=%s\n' \
         "$CTX_TOKENS" "$PREFILL_CHUNK" "$AUDIT_CAPACITY"
+    printf 'skip_build=%s\n' "$SKIP_BUILD"
     printf 'model_hashing=disabled\n'
     printf '\n[gpu]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,ecc.mode.current,driver_version \
@@ -186,7 +191,7 @@ python3 speed-bench/summarize-q4-real-histogram.py \
     "$OUTPUT_DIR/tile-plan.csv" \
     "$OUTPUT_DIR/expert-counts.csv" \
     "$OUTPUT_DIR/expert-count-frequency.csv" \
-    | tee "$OUTPUT_DIR/summary.txt"
+    2>&1 | tee "$OUTPUT_DIR/summary.txt"
 for required in tile-plan.csv expert-counts.csv expert-count-frequency.csv; do
     [[ -s $OUTPUT_DIR/$required ]] || die "missing summary: $required"
 done
