@@ -23560,18 +23560,19 @@ static int routed_moe_launch(
             (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75") == NULL;
-        /* Evidence-gated scalar-slot candidates.  They select distinct
-         * compile-time kernel specializations and remain default-off until
-         * the production correctness/resource/timing suite passes. */
+        /* The production correctness/resource suite and balanced full-model
+         * timing gate passed on SM75.  Keep the array specializations as
+         * explicit =0 rollback paths while selecting scalar slots by default
+         * only on the Turing MMA dispatch. */
         const uint32_t use_q4_gate_scalar_sm75 =
             cuda_sm75_mma_ok() &&
-            getenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75") != NULL;
+            cuda_env_flag_enabled("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", 1);
         const uint32_t use_q4_down_scalar_sm75 =
             cuda_sm75_mma_ok() &&
-            getenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75") != NULL;
+            cuda_env_flag_enabled("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", 1);
         const uint32_t use_iq2_scalar_sm75 =
             cuda_sm75_mma_ok() &&
-            getenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75") != NULL;
+            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_SCALAR_SM75", 1);
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_q2_down_mma_sm75_tile16 =

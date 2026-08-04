@@ -329,7 +329,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
                 &mid_is_f16, true) || mid_is_f16 || !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(mid, 0, candidate,
                                  mid_count * sizeof(float))) goto cleanup;
-        (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+        (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
         (void)unsetenv(stage_env[variant]);
         if (memcmp(reference, candidate, mid_count * sizeof(float)) != 0) {
             uint64_t first = 0;
@@ -372,7 +372,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     fprintf(stderr,
             "cuda-regression: sm75 iq2 moe tile16 scalar exact (%llu values)\n",
             (unsigned long long)mid_count);
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
 
     (void)setenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75", "1", 1);
     if (!ds4_gpu_routed_moe_batch_tensor(
@@ -425,7 +425,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     fprintf(stderr,
             "cuda-regression: sm75 iq2 moe tile8 scalar exact (%llu values)\n",
             (unsigned long long)mid_count);
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
 
     /* The mixed-tail tile16 route invokes the scalar tile8 specialization on
@@ -456,7 +456,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     fprintf(stderr,
             "cuda-regression: sm75 iq2 moe mixed-tail tile8 scalar exact (%llu values)\n",
             (unsigned long long)mid_count);
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
 
     (void)setenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75", "1", 1);
@@ -527,7 +527,7 @@ static int check_sm75_iq2_moe_mma_exact(void) {
     fprintf(stderr,
             "cuda-regression: sm75 q4 down tile16 scalar exact (%llu values)\n",
             (unsigned long long)out_count);
-    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
     rc = 0;
 
@@ -537,9 +537,9 @@ cleanup:
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -695,7 +695,7 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
                            mid_candidate, mid_count) ||
         !compare_exact_f32("sm75 q4 gate tile8 scalar output", out_reference,
                            out_candidate, out_count)) goto cleanup;
-    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     fprintf(stderr, "cuda-regression: sm75 q4 gate tile8 scalar exact\n");
 
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75", "1", 1);
@@ -735,7 +735,7 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
                            mid_candidate, mid_count) ||
         !compare_exact_f32("sm75 q4 mixed-tail scalar output", out_reference,
                            out_candidate, out_count)) goto cleanup;
-    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     fprintf(stderr,
             "cuda-regression: sm75 q4 mixed-tail tile8 scalar exact\n");
     rc = 0;
@@ -743,7 +743,7 @@ static int check_sm75_q4_q2_next_targets_exact(void) {
 
 cleanup:
     if (model && !retire_temporary_model_map()) rc = 1;
-    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_STAGE4_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
@@ -1020,9 +1020,9 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW2048");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW256");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
     if (!ds4_gpu_init()) {

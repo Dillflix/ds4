@@ -59,7 +59,15 @@ runner requires exact pre/post, base/scalar, and validation/timed cache-state
 equality. Thus every measured Q8 lookup starts from the same proven resident
 set and no cache admission occurs during a timed sweep. The default two
 repeats are explicitly a pilot; set `REPEATS=6` for a replicated measurement.
-The script does not change production defaults.
+Production now selects the scalar specializations by default on SM75. The
+runner still produces a controlled A/B: it explicitly sets all three scalar
+switches to `0` for the base arm, then enables only the recipe-relevant paths
+for the scalar arm. Set any of the following to `0` to roll back an individual
+production path:
+
+- `DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75=0`
+- `DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75=0`
+- `DS4_CUDA_MOE_IQ2_SCALAR_SM75=0`
 
 ```bash
 export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf"

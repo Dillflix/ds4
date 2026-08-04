@@ -29,7 +29,8 @@ Optional environment:
 
 The hybrid candidate jointly enables IQ2 gate/up and Q4 down scalar slots.
 The full-q4 candidate jointly enables Q4 gate/up and Q4 down scalar slots.
-No scalar candidate is enabled by default by this script's source revision.
+Production enables all three on SM75. This runner explicitly sets them to 0
+for its base arm and to 1 only for the recipe-relevant scalar arm.
 EOF
 }
 
@@ -201,7 +202,10 @@ mapfile -t inherited_ds4_envs < <(
 clean_prefix=(env)
 for name in "${inherited_ds4_envs[@]}"; do clean_prefix+=(-u "$name"); done
 base_prefix=("${clean_prefix[@]}"
-             "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT")
+             "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT"
+             DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75=0
+             DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75=0
+             DS4_CUDA_MOE_IQ2_SCALAR_SM75=0)
 scalar_prefix=("${base_prefix[@]}")
 if [[ $RECIPE == hybrid ]]; then
     scalar_prefix+=(DS4_CUDA_MOE_IQ2_SCALAR_SM75=1
@@ -266,7 +270,8 @@ current_phase=manifest
         "$(git branch --show-current 2>/dev/null || printf unknown)"
     printf 'model=%s\nmodel_bytes=%s\nrecipe=%s\ncandidate_components=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$RECIPE" "$candidate_components"
-    printf 'base_scalar_environment=none\n'
+    printf 'base_scalar_environment=%s\n' \
+        'DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75=0 DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75=0 DS4_CUDA_MOE_IQ2_SCALAR_SM75=0'
     if [[ $RECIPE == hybrid ]]; then
         printf 'candidate_scalar_environment=%s\n' \
             'DS4_CUDA_MOE_IQ2_SCALAR_SM75=1 DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75=1'

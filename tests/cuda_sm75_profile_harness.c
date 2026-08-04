@@ -761,9 +761,9 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW256");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75");
+    (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
     switch (scalar_target) {
         case SCALAR_TARGET_Q4_GATE:
             if (scalar_enabled)
