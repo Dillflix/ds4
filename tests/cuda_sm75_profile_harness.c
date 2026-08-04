@@ -89,11 +89,11 @@ static const uint16_t native_q4_late_counts[128] = {
 static const scenario_spec scenarios[] = {
     {
         "q4-early", SCENARIO_MOE_Q4_EARLY, 3u,
-        1879u, 99u, 183u, 4096u, 4096u,
+        1879u, 99u, 183u, 4096u, 4096u, NULL,
     },
     {
         "q4-late", SCENARIO_MOE_Q4_LATE, 36u,
-        2186u, 76u, 189u, 4096u, 4096u,
+        2186u, 76u, 189u, 4096u, 4096u, NULL,
     },
     {
         "native-q4-early", SCENARIO_MOE_NATIVE_Q4_EARLY, 3u,
@@ -105,27 +105,27 @@ static const scenario_spec scenarios[] = {
     },
     {
         "q2-early", SCENARIO_MOE_Q2_EARLY, 3u,
-        1879u, 99u, 183u, 4096u, 4096u,
+        1879u, 99u, 183u, 4096u, 4096u, NULL,
     },
     {
         "q2-late", SCENARIO_MOE_Q2_LATE, 36u,
-        2186u, 76u, 189u, 4096u, 4096u,
+        2186u, 76u, 189u, 4096u, 4096u, NULL,
     },
     {
         "q8-q-b", SCENARIO_Q8_Q_B, 9u,
-        0u, 0u, 0u, 1024u, 32768u,
+        0u, 0u, 0u, 1024u, 32768u, NULL,
     },
     {
         "q8-attn", SCENARIO_Q8_ATTN, 9u,
-        0u, 0u, 0u, 4096u, 1024u,
+        0u, 0u, 0u, 4096u, 1024u, NULL,
     },
     {
         "q8-shared", SCENARIO_Q8_SHARED, 8u,
-        0u, 0u, 0u, 2048u, 4096u,
+        0u, 0u, 0u, 2048u, 4096u, NULL,
     },
     {
         "q8-out-b", SCENARIO_Q8_OUT_B, 9u,
-        0u, 0u, 0u, 8192u, 4096u,
+        0u, 0u, 0u, 8192u, 4096u, NULL,
     },
 };
 
@@ -384,9 +384,12 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
                 path, strerror(errno));
         return 0;
     }
-    char line[1024];
-    if (!fgets(line, sizeof(line), fp) || !fgets(line, sizeof(line), fp)) {
+    char *line = NULL;
+    size_t line_capacity = 0u;
+    if (getline(&line, &line_capacity, fp) < 0 ||
+        getline(&line, &line_capacity, fp) < 0) {
         fprintf(stderr, "error: tile audit has no data row: %s\n", path);
+        free(line);
         fclose(fp);
         return 0;
     }
@@ -406,6 +409,7 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
         &tile_count, &slot_count, &active_experts, &padded_slots, &fill);
     if (fields != 16) {
         fprintf(stderr, "error: malformed tile-audit row: %s", line);
+        free(line);
         return 0;
     }
     const uint32_t expected_padding = spec->tile16_count * 16u - spec->owned_pairs;
@@ -423,6 +427,7 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
                 "tile16=%u active=%u padded=%u\n",
                 layer, n_tokens, pair_count, tile_count, active_experts,
                 padded_slots);
+        free(line);
         return 0;
     }
     printf("audit_logical_device=%u\naudit_physical_device=%u\n"
@@ -431,6 +436,7 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
            "audit_fill_pct=%.6f\n",
            logical, physical, pair_count, tile_count, active_experts,
            padded_slots, fill);
+    free(line);
     return 1;
 }
 
