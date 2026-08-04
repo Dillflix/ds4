@@ -28,6 +28,46 @@ NCU_USE_SUDO=1 \
 
 Use `REPEATS=6` for replicated timing after the two-repeat pilot succeeds.
 
+### Cost-aware/fused native-Q4 production A/B
+
+`cuda-sm75-native-q4-next-ab.sh` isolates three opt-in changes against the
+existing tagged native-Q4 path, without repacking or hashing the model:
+
+- a residual planner that minimizes native kernel weight traversals
+  (`1..4 -> tile4`, `5..8 -> tile8`, `9..15 -> tile16`);
+- a Q4-down tile16 specialization that stages eight activation rows (about
+  18.3 KiB) while one loaded weight fragment feeds both 8-pair halves;
+- a 256-thread streaming gate/up tile16 specialization that stages six rows,
+  stays below 32 KiB declared shared memory, and feeds low8 plus high8 from
+  each loaded gate or up weight fragment.
+
+The default five variants (`legacy`, `cost`, `down`, `gate`, and `optimized`)
+run in alternating order at the fixed measured placement `0,3,1,2` and split
+22/21. The runner also accepts `cost-down`, `cost-gate`, and `gate-down` so a
+subsequent full-factorial pass can quantify interactions without code changes.
+The runner first requires exact production-API output for each isolated path
+and a device-side audit of the cost planner, then requires bit-identical
+end-to-end raw logits for every variant. It records compiled CUDA resource
+usage and produces median prefill throughput and gain relative to legacy at
+every context frontier. `RUN_NSYS=1` captures matching legacy and optimized
+kernel traces rather than an optimized-only trace.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+REPEATS=2 \
+RUN_NSYS=1 \
+./speed-bench/cuda-sm75-native-q4-next-ab.sh
+```
+
+The script never modifies `NATIVE_MODEL`. Use `RUN_E2E_EXACT=0` only when
+rerunning timing after the same binary/model combination has already passed
+the raw-logit comparison.
+
 ### Exact production Q4 expert histogram
 
 `cuda-q4-real-histogram.sh` captures the actual per-expert routed-pair counts

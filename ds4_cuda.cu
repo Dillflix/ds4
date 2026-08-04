@@ -18975,7 +18975,8 @@ __global__ static void moe_build_expert_mixed_tail_tiles_kernel(
         uint32_t n_tokens,
         uint32_t owner_base,
         uint32_t owner_count,
-        uint32_t selected_slots) {
+        uint32_t selected_slots,
+        uint32_t cost_aware_residuals) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     uint32_t n16 = 0u, n8 = 0u, n4 = 0u;
     uint32_t pair_sum = 0u, active_experts = 0u, slot_sum = 0u;
@@ -18991,7 +18992,23 @@ __global__ static void moe_build_expert_mixed_tail_tiles_kernel(
         }
         uint32_t start = full * 16u;
         uint32_t rem = count - start;
-        if (rem >= 8u) {
+        /* SM75 native Q4 has nearly the same weight-traversal cost for any
+         * active 4- or 8-pair tail tile.  Its fused tile16 traverses each
+         * fragment once for both 8-pair halves.  Minimize those traversals,
+         * not padded slots: 1..4 -> 4, 5..8 -> 8, and 9..15 -> 16.  The
+         * legacy minimum-padding plan remains selectable for controlled A/B
+         * and is retained for every non-native layout. */
+        if (cost_aware_residuals && rem > 8u) {
+            tile16_experts[n16] = e;
+            tile16_starts[n16++] = start;
+            slot_sum += 16u;
+            rem = 0u;
+        } else if (cost_aware_residuals && rem > 4u) {
+            tail8_experts[n8] = e;
+            tail8_starts[n8++] = start;
+            slot_sum += 8u;
+            rem = 0u;
+        } else if (rem >= 8u) {
             tail8_experts[n8] = e;
             tail8_starts[n8++] = start;
             start += 8u;
@@ -23619,6 +23636,12 @@ static int routed_moe_launch(
     const int all_q4k = gate_q4k && down_q4k;
     const int native_q4 =
         g_cuda_routed_q4_layout == DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
+    const uint32_t use_native_q4_cost_tiles = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES", 0);
+    const uint32_t use_native_q4_gate_fused16 = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16", 0);
+    const uint32_t use_native_q4_down_stage8 = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8", 0);
     if (g_cuda_routed_q4_layout != 0u && !native_q4) {
         fprintf(stderr, "ds4: unsupported CUDA routed-Q4 layout 0x%08x\n",
                 g_cuda_routed_q4_layout);
@@ -23639,7 +23662,11 @@ static int routed_moe_launch(
             true, std::memory_order_relaxed)) {
         fprintf(stderr,
                 "ds4: SM75 native routed-Q4 layout enabled "
-                "(packed A/W, gate/up tile8, down 16/8/4)\n");
+                "(packed A/W, cost-tiles=%u, gate-fused16=%u, "
+                "down-stage8=%u)\n",
+                use_native_q4_cost_tiles,
+                use_native_q4_gate_fused16,
+                use_native_q4_down_stage8);
     }
     if ((!gate_q4k && !gate_iq2) || (!down_q4k && !down_q2k)) return 0;
     /* Routed-MoE dispatch supports the full matrix of IQ2_XXS/Q4_K gate+up
@@ -24105,7 +24132,8 @@ static int routed_moe_launch(
                         counts, n_total_expert, audit,
                         (uint32_t)logical_tier, audit_physical_device,
                         layer_index, audit_token_offset, n_tokens,
-                        audit_owner_base, audit_owner_count, pair_count);
+                        audit_owner_base, audit_owner_count, pair_count,
+                        use_native_q4_cost_tiles);
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe mixed tail tile launch");
                 }
@@ -24138,14 +24166,32 @@ static int routed_moe_launch(
                                     (const float *)weights->ptr, xq_blocks, \
                                     expert_mid_dim, n_expert, write_gate_up, clamp); \
                         } while (0)
+#define DS4_NATIVE_Q4_GATE_FUSED16(RS) \
+                        do { \
+                            dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
+                                    tile16_capacity, 1u); \
+                            moe_gate_up_mid_sm75_native_q4_tile16_fused_kernel<RS, 6> \
+                                <<<ng, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, \
+                                    (float *)mid->ptr, gate_w, up_w, \
+                                    (const cuda_sm75_native_q8_K *)xq, \
+                                    sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    (const float *)weights->ptr, xq_blocks, \
+                                    expert_mid_dim, n_expert, write_gate_up, clamp); \
+                        } while (0)
 #define DS4_NATIVE_Q4_GATE_ALL(RS) \
                         do { \
-                            DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
-                                tile16_experts, tile16_starts, \
-                                tile16_capacity, 0); \
-                            DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
-                                tile16_experts, tile16_starts, \
-                                tile16_capacity, 8); \
+                            if (use_native_q4_gate_fused16) { \
+                                DS4_NATIVE_Q4_GATE_FUSED16(RS); \
+                            } else { \
+                                DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
+                                    tile16_experts, tile16_starts, \
+                                    tile16_capacity, 0); \
+                                DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
+                                    tile16_experts, tile16_starts, \
+                                    tile16_capacity, 8); \
+                            } \
                             DS4_NATIVE_Q4_GATE_LIST(RS, tail8_total, \
                                 tail8_experts, tail8_starts, \
                                 tail8_capacity, 0); \
@@ -24163,6 +24209,7 @@ static int routed_moe_launch(
                             DS4_NATIVE_Q4_GATE_ALL(512);
                         }
 #undef DS4_NATIVE_Q4_GATE_ALL
+#undef DS4_NATIVE_Q4_GATE_FUSED16
 #undef DS4_NATIVE_Q4_GATE_LIST
                     } else {
                     const int use_q4_mma = cuda_q4_mma_ok() &&
@@ -24909,10 +24956,10 @@ static int routed_moe_launch(
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (down_q4k) {
                     if (native_q4) {
-#define DS4_NATIVE_Q4_DOWN_LIST(RS, TP, TOTAL, EXPERTS, STARTS, CAP) \
+#define DS4_NATIVE_Q4_DOWN_LIST(RS, TP, SR, TOTAL, EXPERTS, STARTS, CAP) \
                         do { \
                             dim3 ng((out_dim + (RS) - 1u) / (RS), (CAP), 1u); \
-                            moe_down_sm75_native_q4_tile_kernel<RS, TP> \
+                            moe_down_sm75_native_q4_tile_kernel<RS, TP, SR> \
                                 <<<ng, 256>>>( \
                                     (float *)down->ptr, down_w, \
                                     (const cuda_sm75_native_q8_K *)midq, \
@@ -24922,11 +24969,16 @@ static int routed_moe_launch(
                         } while (0)
 #define DS4_NATIVE_Q4_DOWN_ALL(RS) \
                         do { \
-                            DS4_NATIVE_Q4_DOWN_LIST(RS, 16, tile16_total, \
-                                tile16_experts, tile16_starts, tile16_capacity); \
-                            DS4_NATIVE_Q4_DOWN_LIST(RS, 8, tail8_total, \
+                            if (use_native_q4_down_stage8) { \
+                                DS4_NATIVE_Q4_DOWN_LIST(RS, 16, 8, tile16_total, \
+                                    tile16_experts, tile16_starts, tile16_capacity); \
+                            } else { \
+                                DS4_NATIVE_Q4_DOWN_LIST(RS, 16, 16, tile16_total, \
+                                    tile16_experts, tile16_starts, tile16_capacity); \
+                            } \
+                            DS4_NATIVE_Q4_DOWN_LIST(RS, 8, 8, tail8_total, \
                                 tail8_experts, tail8_starts, tail8_capacity); \
-                            DS4_NATIVE_Q4_DOWN_LIST(RS, 4, tail4_total, \
+                            DS4_NATIVE_Q4_DOWN_LIST(RS, 4, 4, tail4_total, \
                                 tail4_experts, tail4_starts, tail4_capacity); \
                         } while (0)
                         if (!tile16_total || !tail8_total || !tail4_total) {

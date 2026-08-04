@@ -413,15 +413,47 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
         return 0;
     }
     const uint32_t expected_padding = spec->tile16_count * 16u - spec->owned_pairs;
+    uint32_t cost_tile_count = 0u, cost_slot_count = 0u;
+    const char *cost_env = getenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES");
+    const int cost_aware = native_q4 && cost_env && cost_env[0] &&
+        strcmp(cost_env, "0") != 0;
+    if (cost_aware && spec->expert_counts) {
+        for (uint32_t e = 0; e < 128u; e++) {
+            const uint32_t count = spec->expert_counts[e];
+            const uint32_t full = count / 16u;
+            uint32_t rem = count - full * 16u;
+            cost_tile_count += full;
+            cost_slot_count += full * 16u;
+            if (rem > 8u) {
+                cost_tile_count++;
+                cost_slot_count += 16u;
+                rem = 0u;
+            } else if (rem > 4u) {
+                cost_tile_count++;
+                cost_slot_count += 8u;
+                rem = 0u;
+            }
+            while (rem != 0u) {
+                cost_tile_count++;
+                cost_slot_count += 4u;
+                rem = rem > 4u ? rem - 4u : 0u;
+            }
+        }
+    }
     if (layer != spec->layer || token_offset != 0u || n_tokens != 512u ||
         owner_base != 0u || owner_count != 128u ||
         pair_count != spec->owned_pairs || active_experts != spec->active_experts ||
         (!native_q4 && (tile_count != spec->tile16_count ||
                         slot_count != spec->tile16_count * 16u ||
                         padded_slots != expected_padding)) ||
-        (native_q4 && (slot_count < pair_count ||
-                       padded_slots != slot_count - pair_count ||
-                       padded_slots > 3u * active_experts))) {
+        (native_q4 && !cost_aware &&
+            (slot_count < pair_count ||
+             padded_slots != slot_count - pair_count ||
+             padded_slots > 3u * active_experts)) ||
+        (native_q4 && cost_aware &&
+            (tile_count != cost_tile_count ||
+             slot_count != cost_slot_count ||
+             padded_slots != cost_slot_count - pair_count))) {
         fprintf(stderr,
                 "error: tile audit mismatch layer=%u tokens=%u pairs=%u "
                 "tile16=%u active=%u padded=%u\n",
