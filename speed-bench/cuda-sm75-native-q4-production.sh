@@ -286,13 +286,40 @@ for variant in standard native; do
 done
 raw=$(printf 'frontier_%06d.logits.f32' "$CTX_START")
 json=$(printf 'frontier_%06d.logits.json' "$CTX_START")
-for file in "$raw" "$json"; do
-    a="$OUTPUT_DIR/validation/standard-logits/$file"
-    b="$OUTPUT_DIR/validation/native-logits/$file"
-    [[ -s $a && -s $b ]] || die "missing end-to-end logits: $file"
-    cmp -s "$a" "$b" || die "standard/native logits are not bit-exact: $file"
-done
-printf 'api_exact=true\ne2e_full_vocab_logits_bit_exact=true\n' \
+a="$OUTPUT_DIR/validation/standard-logits/$raw"
+b="$OUTPUT_DIR/validation/native-logits/$raw"
+[[ -s $a && -s $b ]] || die "missing end-to-end logits: $raw"
+cmp -s "$a" "$b" || die "standard/native raw logits are not bit-exact: $raw"
+
+a="$OUTPUT_DIR/validation/standard-logits/$json"
+b="$OUTPUT_DIR/validation/native-logits/$json"
+[[ -s $a && -s $b ]] || die "missing end-to-end logits: $json"
+python3 - "$a" "$b" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    standard = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    native = json.load(stream)
+
+# The model pathname is provenance, not an inference result.  It must differ
+# when the standard and tagged-native GGUFs are separate files.
+standard.pop("model", None)
+native.pop("model", None)
+if standard != native:
+    differing = sorted(
+        key for key in standard.keys() | native.keys()
+        if standard.get(key) != native.get(key)
+    )
+    print(
+        "error: standard/native semantic logits JSON differs in: "
+        + ", ".join(differing),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+printf 'api_exact=true\ne2e_full_vocab_raw_logits_bit_exact=true\ne2e_logits_json_semantic_exact=true\n' \
     >"$OUTPUT_DIR/validation/exact-status.txt"
 
 current_phase=balanced-ab
