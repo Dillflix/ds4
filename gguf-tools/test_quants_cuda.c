@@ -72,6 +72,66 @@ static int test_type(ds4q_type type, int device,
     return 0;
 }
 
+static void reference_sm75_q4_repack(uint8_t *dst, const uint8_t *src,
+                                      int64_t nrows, int64_t ncols) {
+    const size_t blocks = (size_t)ncols / 256u;
+    const size_t row_bytes = blocks * 144u;
+    for (size_t tile = 0; tile < (size_t)nrows / 8u; tile++) {
+        for (size_t block = 0; block < blocks; block++) {
+            uint8_t *record = dst + (tile * blocks + block) * 8u * 144u;
+            for (size_t row = 0; row < 8u; row++) {
+                const uint8_t *q4 = src + (tile * 8u + row) * row_bytes +
+                    block * 144u;
+                memcpy(record + row * 16u, q4, 16u);
+            }
+            uint32_t *mma = (uint32_t *)(record + 8u * 16u);
+            for (size_t lane = 0; lane < 32u; lane++) {
+                const size_t row = lane >> 2u, lane4 = lane & 3u;
+                const uint8_t *qs = src + (tile * 8u + row) * row_bytes +
+                    block * 144u + 16u;
+                for (size_t group = 0; group < 8u; group++) {
+                    const size_t off = (group >> 1u) * 32u + lane4 * 8u;
+                    const unsigned shift = (group & 1u) ? 4u : 0u;
+                    uint32_t packed = 0u;
+                    for (size_t i = 0; i < 4u; i++) {
+                        packed |= ((uint32_t)((qs[off + i] >> shift) & 15u))
+                                  << (4u * i);
+                        packed |= ((uint32_t)((qs[off + 4u + i] >> shift) & 15u))
+                                  << (4u * (i + 4u));
+                    }
+                    mma[group * 32u + lane] = packed;
+                }
+            }
+        }
+    }
+}
+
+static int test_sm75_q4_repack(int device) {
+    const int64_t nrows = 16, ncols = 512;
+    const size_t bytes = (size_t)nrows * (size_t)(ncols / 256) * 144u;
+    uint8_t *src = malloc(bytes), *cpu = malloc(bytes), *gpu = malloc(bytes);
+    if (!src || !cpu || !gpu) {
+        free(gpu); free(cpu); free(src);
+        return 1;
+    }
+    for (size_t i = 0; i < bytes; i++)
+        src[i] = (uint8_t)(i * 73u + (i >> 4u) * 19u + 11u);
+    reference_sm75_q4_repack(cpu, src, nrows, ncols);
+    char error[256] = {0};
+    const size_t wrote = ds4q_cuda_repack_sm75_native_q4(
+        src, gpu, nrows, ncols, device, error, sizeof(error));
+    if (wrote != bytes || memcmp(cpu, gpu, bytes) != 0) {
+        fprintf(stderr, "device %d SM75 Q4 repack mismatch (%s)\n",
+                device, error[0] ? error : "byte comparison failed");
+        free(gpu); free(cpu); free(src);
+        return 1;
+    }
+    fprintf(stderr, "device %d SM75 Q4 repack byte check: OK (%zu bytes)\n",
+            device, bytes);
+    free(gpu); free(cpu); free(src);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s CUDA_DEVICE_CSV\n", argv[0]);
@@ -103,6 +163,7 @@ int main(int argc, char **argv) {
                             src, weights, nrows, ncols);
         failed |= test_type(DS4Q_TYPE_Q2_K, (int)device,
                             src, weights, nrows, ncols);
+        failed |= test_sm75_q4_repack((int)device);
     }
     ds4q_cuda_thread_shutdown();
     free(list);

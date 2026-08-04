@@ -476,8 +476,9 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
     }
 }
 
-/* Native down consumer.  TILE_PAIRS is instantiated as 16, 8, and 4 so no
- * tail launch stages or computes padded pairs. */
+/* Native down consumer.  TILE_PAIRS is instantiated as 16, 8, and 4.  The
+ * 8/4 specializations compile out the second eight-row MMA half; m8 is the
+ * hardware minimum, so a four-pair tail uses four real and four inert rows. */
 template <uint32_t ROW_SPAN, uint32_t TILE_PAIRS>
 __global__ static void moe_down_sm75_native_q4_tile_kernel(
         float *down_out, const char *down_base,
@@ -539,7 +540,7 @@ __global__ static void moe_down_sm75_native_q4_tile_kernel(
             const cuda_sm75_native_q8_K *a0 =
                 p0 < TILE_PAIRS ? &sxq[p0][b] : &sxq[0][b];
             const cuda_sm75_native_q8_K *a1 =
-                p1 < TILE_PAIRS ? &sxq[p1][b] : &sxq[0][b];
+                TILE_PAIRS > 8u ? &sxq[p1][b] : a0;
             int i00 = 0, i01 = 0, i10 = 0, i11 = 0;
             int m00 = 0, m01 = 0, m10 = 0, m11 = 0;
 #pragma unroll
@@ -549,12 +550,15 @@ __global__ static void moe_down_sm75_native_q4_tile_kernel(
                 int32_t l10=0,l11=0,h10=0,h11=0;
                 mma_m8n8k32_u4_u4(l00,l01,a0->low[j][lane&3u],wf);
                 mma_m8n8k32_s4_u4(h00,h01,a0->high_signed[j][lane&3u],wf);
-                mma_m8n8k32_u4_u4(l10,l11,a1->low[j][lane&3u],wf);
-                mma_m8n8k32_s4_u4(h10,h11,a1->high_signed[j][lane&3u],wf);
+                if (TILE_PAIRS > 8u) {
+                    mma_m8n8k32_u4_u4(l10,l11,a1->low[j][lane&3u],wf);
+                    mma_m8n8k32_s4_u4(h10,h11,a1->high_signed[j][lane&3u],wf);
+                }
                 const int c00=l00+16*h00, c01=l01+16*h01;
                 const int c10=l10+16*h10, c11=l11+16*h11;
                 const int bs0=(int)a0->bsums[2u*j]+(int)a0->bsums[2u*j+1u];
-                const int bs1=(int)a1->bsums[2u*j]+(int)a1->bsums[2u*j+1u];
+                const int bs1=TILE_PAIRS > 8u ?
+                    (int)a1->bsums[2u*j]+(int)a1->bsums[2u*j+1u] : 0;
                 uint8_t sc0,mn0,sc1,mn1;
                 dev_q4_K_get_scale_min(j,(const uint8_t *)&h0.y,&sc0,&mn0);
                 dev_q4_K_get_scale_min(j,(const uint8_t *)&h1.y,&sc1,&mn1);
@@ -569,8 +573,10 @@ __global__ static void moe_down_sm75_native_q4_tile_kernel(
             const float z1=dev_f16_to_f32((uint16_t)(h1.x>>16u));
             const float v00=a0->d*d0*(float)i00-a0->d*z0*(float)m00;
             const float v01=a0->d*d1*(float)i01-a0->d*z1*(float)m01;
-            const float v10=a1->d*d0*(float)i10-a1->d*z0*(float)m10;
-            const float v11=a1->d*d1*(float)i11-a1->d*z1*(float)m11;
+            const float v10=TILE_PAIRS > 8u ?
+                a1->d*d0*(float)i10-a1->d*z0*(float)m10 : 0.0f;
+            const float v11=TILE_PAIRS > 8u ?
+                a1->d*d1*(float)i11-a1->d*z1*(float)m11 : 0.0f;
             switch (b) {
                 DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
                 DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);

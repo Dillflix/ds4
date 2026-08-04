@@ -1986,9 +1986,143 @@ static void copy_exact_bytes(FILE *src, FILE *dst, size_t n,
     }
 }
 
+#ifdef DS4Q_USE_CUDA
+typedef struct {
+    int fd;
+    off_t tensor_offset;
+    size_t expert_bytes;
+    int64_t nrows;
+    int64_t ncols;
+    int n_experts;
+    int next;
+    int done;
+    int failed;
+    uint8_t *native;
+    pthread_mutex_t lock;
+    char error[256];
+} sm75_cuda_repack_job;
+
+typedef struct {
+    sm75_cuda_repack_job *job;
+    int worker_id;
+} sm75_cuda_repack_worker;
+
+static bool pread_exact(int fd, void *dst, size_t bytes, off_t offset,
+                        char *error, size_t error_cap) {
+    uint8_t *p = dst;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t got = pread(fd, p + done, bytes - done, offset + (off_t)done);
+        if (got > 0) {
+            done += (size_t)got;
+            continue;
+        }
+        if (got < 0 && errno == EINTR) continue;
+        snprintf(error, error_cap, "pread failed: %s",
+                 got == 0 ? "unexpected EOF" : strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void *sm75_cuda_repack_worker_main(void *opaque) {
+    sm75_cuda_repack_worker *worker = opaque;
+    sm75_cuda_repack_job *job = worker->job;
+    const int device = quant_cuda_device_for_worker(worker->worker_id);
+    uint8_t *standard = xmalloc(job->expert_bytes);
+    for (;;) {
+        pthread_mutex_lock(&job->lock);
+        const int expert = job->failed ? job->n_experts : job->next++;
+        pthread_mutex_unlock(&job->lock);
+        if (expert >= job->n_experts) break;
+        char error[256] = {0};
+        const off_t offset = job->tensor_offset +
+            (off_t)((size_t)expert * job->expert_bytes);
+        bool ok = pread_exact(job->fd, standard, job->expert_bytes, offset,
+                              error, sizeof(error));
+        size_t wrote = 0;
+        if (ok) {
+            wrote = ds4q_cuda_repack_sm75_native_q4(
+                standard, job->native + (size_t)expert * job->expert_bytes,
+                job->nrows, job->ncols, device, error, sizeof(error));
+            ok = wrote == job->expert_bytes;
+            if (!ok && !error[0])
+                snprintf(error, sizeof(error),
+                         "CUDA repack wrote %zu of %zu bytes",
+                         wrote, job->expert_bytes);
+        }
+        pthread_mutex_lock(&job->lock);
+        if (!ok && !job->failed) {
+            job->failed = 1;
+            snprintf(job->error, sizeof(job->error),
+                     "expert %d on device %d: %s", expert, device, error);
+        } else if (ok) {
+            job->done++;
+            if (job->done % 32 == 0 || job->done == job->n_experts) {
+                fprintf(stderr, "repack_sm75_native_q4: %d/%d experts\n",
+                        job->done, job->n_experts);
+            }
+        }
+        pthread_mutex_unlock(&job->lock);
+    }
+    free(standard);
+    ds4q_cuda_thread_shutdown();
+    return NULL;
+}
+
+static byte_buf repack_sm75_native_q4_cuda(FILE *in,
+                                           const gguf_file *src,
+                                           const tensor_meta *tensor,
+                                           int n_threads) {
+    const size_t expert_bytes = tensor->size / (size_t)src->n_experts;
+    if (!expert_bytes || expert_bytes * (size_t)src->n_experts != tensor->size)
+        die("routed tensor byte size is not divisible by expert count");
+    int worker_count = n_threads > 0 ? n_threads : 8;
+    if (worker_count < g_quant_cuda.n_devices)
+        worker_count = g_quant_cuda.n_devices;
+    if (worker_count > src->n_experts) worker_count = src->n_experts;
+    byte_buf native = { .size = tensor->size, .data = xmalloc(tensor->size) };
+    sm75_cuda_repack_job job = {
+        .fd = fileno(in),
+        .tensor_offset = (off_t)(src->data_offset + tensor->old_offset),
+        .expert_bytes = expert_bytes,
+        .nrows = tensor->ne[1],
+        .ncols = tensor->ne[0],
+        .n_experts = src->n_experts,
+        .native = native.data,
+    };
+    pthread_mutex_init(&job.lock, NULL);
+    pthread_t *threads = xcalloc((size_t)worker_count, sizeof(threads[0]));
+    sm75_cuda_repack_worker *workers =
+        xcalloc((size_t)worker_count, sizeof(workers[0]));
+    fprintf(stderr, "repack_sm75_native_q4: using %d workers across %d CUDA devices\n",
+            worker_count, g_quant_cuda.n_devices);
+    for (int i = 0; i < worker_count; i++) {
+        workers[i].job = &job;
+        workers[i].worker_id = i;
+    }
+    for (int i = 1; i < worker_count; i++)
+        pthread_create(&threads[i], NULL, sm75_cuda_repack_worker_main,
+                       &workers[i]);
+    sm75_cuda_repack_worker_main(&workers[0]);
+    for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
+    pthread_mutex_destroy(&job.lock);
+    free(workers);
+    free(threads);
+    if (job.failed) {
+        fprintf(stderr, "error: SM75 CUDA repack failed: %s\n", job.error);
+        free(native.data);
+        exit(1);
+    }
+    return native;
+}
+#endif
+
 static void write_sm75_q4_repack(const gguf_file *src,
                                  const output_context *out_ctx,
-                                 const char *out_path) {
+                                 const char *out_path,
+                                 int n_threads) {
+    (void)n_threads;
     enum { COPY_CHUNK = 16 * 1024 * 1024 };
     FILE *in = fopen(src->path, "rb");
     if (!in) die_errno("open source GGUF", src->path);
@@ -2029,6 +2163,16 @@ static void write_sm75_q4_repack(const gguf_file *src,
             die_errno("seek source GGUF", src->path);
         }
         if (routed) {
+#ifdef DS4Q_USE_CUDA
+            if (g_quant_cuda.enabled) {
+                byte_buf native = repack_sm75_native_q4_cuda(
+                    in, src, st, n_threads);
+                if (fwrite(native.data, 1, native.size, out) != native.size)
+                    die_errno("write routed expert tensor", out_path);
+                free(native.data);
+            } else
+#endif
+            {
             const size_t expert_bytes = st->size / (size_t)src->n_experts;
             if (!expert_bytes || expert_bytes * (size_t)src->n_experts != st->size) {
                 die("routed tensor byte size is not divisible by expert count");
@@ -2043,6 +2187,7 @@ static void write_sm75_q4_repack(const gguf_file *src,
                     die_errno("write routed expert", out_path);
                 }
                 free(one.data);
+            }
             }
         } else {
             copy_exact_bytes(in, out, st->size, scratch, COPY_CHUNK, src->path);
@@ -3000,8 +3145,8 @@ static params parse_args(int argc, char **argv) {
     if (p.repack_sm75_q4) {
         if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
             p.imatrix_file || p.dspark_manifest || p.dspark_support ||
-            p.imatrix_strict || p.sm75_native_q4 || p.quant_backend ||
-            p.quant_gpu_devices || p.n_experts != 0 || p.policy.n_overrides ||
+            p.imatrix_strict || p.sm75_native_q4 || p.n_experts != 0 ||
+            p.policy.n_overrides ||
             p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
             p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
             p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
@@ -3221,6 +3366,7 @@ static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     if (p.repack_sm75_q4) {
+        configure_quant_backend(&p);
         gguf_file src = load_gguf_metadata(p.repack_sm75_q4);
         if (src.sm75_native_q4) {
             die("source GGUF is already tagged with the SM75-native Q4 layout");
@@ -3234,7 +3380,7 @@ int main(int argc, char **argv) {
         printf("routed_experts: %d\n", src.n_experts);
         printf("tensor_hashing: disabled\n");
         if (!p.dry_run) {
-            write_sm75_q4_repack(&src, &out_ctx, p.out_gguf);
+            write_sm75_q4_repack(&src, &out_ctx, p.out_gguf, p.n_threads);
             fprintf(stderr, "wrote %s\n", p.out_gguf);
         }
         free_gguf_file(&src);

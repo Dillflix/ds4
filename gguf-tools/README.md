@@ -133,6 +133,23 @@ gguf-tools/deepseek4-quantize \
   --out FULL-Q4-SM75-NATIVE.gguf
 ```
 
+For a full Flash checkpoint, use the lossless four-GPU CUDA repacker rather
+than the CPU byte permutation:
+
+```sh
+make -C gguf-tools deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
+gguf-tools/test-quants-cuda 0,1,2,3
+gguf-tools/deepseek4-quantize-cuda \
+  --repack-sm75-native-q4 FULL-Q4-STANDARD.gguf \
+  --out FULL-Q4-SM75-NATIVE.gguf \
+  --quant-backend cuda --quant-gpu-devices 0,1,2,3 --threads 8
+```
+
+The CUDA and CPU repackers are required to produce identical bytes. The
+production A/B runner writes to a temporary file, verifies the planned final
+size, and renames atomically; it removes a size-mismatched interrupted output
+before retrying. No model hash is calculated.
+
 Tagged files are deliberately accepted only by the SM75 CUDA path. Untagged
 Q4_K files retain the existing CUDA/Metal/CPU/ROCm implementations.
 

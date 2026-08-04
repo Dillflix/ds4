@@ -25,6 +25,16 @@ size_t ds4q_cuda_quantize_chunk(ds4q_type type,
                                 char *error,
                                 size_t error_cap);
 
+/* Losslessly permute one expert's ordinary row-major Q4_K bytes into the
+ * tagged SM75 m8n8k32 native-A/W record order. Returns bytes written. */
+size_t ds4q_cuda_repack_sm75_native_q4(const void *src,
+                                       void *dst,
+                                       int64_t nrows,
+                                       int64_t ncols,
+                                       int device,
+                                       char *error,
+                                       size_t error_cap);
+
 /* Releases buffers and the stream cached by the calling host thread. */
 void ds4q_cuda_thread_shutdown(void);
 

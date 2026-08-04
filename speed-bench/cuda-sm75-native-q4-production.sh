@@ -12,6 +12,8 @@ Required environment:
 
 Optional environment:
   NATIVE_MODEL=/absolute/path/to/output-native.gguf
+  QUANT_GPU_DEVICES=0,1,2,3
+  REPACK_THREADS=8
   PROMPT=/absolute/path/prompt.txt
   GPU_VRAM=auto
   CTX_START=2048
@@ -48,6 +50,8 @@ cd "$repo_dir"
 [[ $MODEL == *.gguf ]] || die "MODEL must end in .gguf"
 
 NATIVE_MODEL=${NATIVE_MODEL:-${MODEL%.gguf}-SM75-native-Q4.gguf}
+QUANT_GPU_DEVICES=${QUANT_GPU_DEVICES:-0,1,2,3}
+REPACK_THREADS=${REPACK_THREADS:-8}
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=0,3,1,2
 GPU_VRAM=${GPU_VRAM:-auto}
@@ -73,7 +77,8 @@ OUTPUT_DIR=${NATIVE_Q4_DIR:-$repo_dir/sm75-native-q4-production-$run_stamp}
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
             "STEP_MUL:$STEP_MUL" "PREFILL_CHUNK:$PREFILL_CHUNK" \
-            "REPEATS:$REPEATS" "PROFILE_TOKENS:$PROFILE_TOKENS" \
+            "REPEATS:$REPEATS" "REPACK_THREADS:$REPACK_THREADS" \
+            "PROFILE_TOKENS:$PROFILE_TOKENS" \
             "PROFILE_GPU:$PROFILE_GPU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
             "RUN_NSYS:$RUN_NSYS" "RUN_NCU:$RUN_NCU" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
@@ -82,6 +87,7 @@ for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
 done
 (( CTX_START > 0 && CTX_MAX >= CTX_START && STEP_MUL >= 2 &&
    PREFILL_CHUNK > 0 && REPEATS > 0 && REPEATS % 2 == 0 &&
+   REPACK_THREADS > 0 &&
    PROFILE_TOKENS > 0 )) || die "invalid benchmark/profile shape"
 for flag in NCU_USE_SUDO RUN_NSYS RUN_NCU SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -89,7 +95,7 @@ done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
 for tool in awk cmp date env git grep make mkdir mv nproc nvidia-smi \
-            python3 sort stat tail tar tee tr; do
+            python3 rm sort stat tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
 (( RUN_NSYS == 0 )) || command -v nsys >/dev/null 2>&1 || die "nsys not found"
@@ -122,9 +128,11 @@ fi
 mkdir -p "$OUTPUT_DIR"/{validation,runs,nsys,ncu,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 current_phase=initialization
+native_tmp=
 finalize() {
     local status=$? archive="$OUTPUT_DIR.tar.gz" partial="$OUTPUT_DIR.tar.gz.partial.$$"
     trap - EXIT INT TERM HUP
+    if [[ -n $native_tmp && -e $native_tmp ]]; then rm -f -- "$native_tmp"; fi
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\ndate_utc=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
         "$status" "$current_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -159,17 +167,27 @@ if [[ $SKIP_BUILD == 0 ]]; then
     current_phase=build
     make -B -j"$(nproc)" ds4-bench tests/cuda_long_context_smoke \
         CUDA_ARCH="$CUDA_ARCH" 2>&1 | tee "$OUTPUT_DIR/build.log"
-    make -C gguf-tools deepseek4-quantize 2>&1 | tee "$OUTPUT_DIR/quantizer-build.log"
+    make -C gguf-tools deepseek4-quantize-cuda test-quants-cuda \
+        CUDA_ARCH="$CUDA_ARCH" 2>&1 | tee "$OUTPUT_DIR/quantizer-build.log"
 else
     for binary in ./ds4-bench ./tests/cuda_long_context_smoke \
-                  ./gguf-tools/deepseek4-quantize; do
+                  ./gguf-tools/deepseek4-quantize-cuda \
+                  ./gguf-tools/test-quants-cuda; do
         [[ -x $binary ]] || die "SKIP_BUILD=1 but $binary is missing"
     done
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH="$CUDA_ARCH" ||
         die "SKIP_BUILD=1 found stale CUDA targets"
-    make -C gguf-tools -q deepseek4-quantize ||
+    make -C gguf-tools -q deepseek4-quantize-cuda test-quants-cuda \
+        CUDA_ARCH="$CUDA_ARCH" ||
         die "SKIP_BUILD=1 found a stale quantizer"
 fi
+
+current_phase=cuda-repack-byte-exact
+./gguf-tools/test-quants-cuda "$QUANT_GPU_DEVICES" \
+    >"$OUTPUT_DIR/validation/cuda-quantizer-exact.log" 2>&1 || {
+    tail -n 100 "$OUTPUT_DIR/validation/cuda-quantizer-exact.log" >&2 || true
+    die "CUDA quantizer/repack byte-exact suite failed"
+}
 
 current_phase=exact-api-correctness
 "${clean_prefix[@]}" ./tests/cuda_long_context_smoke \
@@ -185,12 +203,30 @@ for marker in \
         die "exact-output marker missing: $marker"
 done
 
+expected_native_bytes=$(./gguf-tools/deepseek4-quantize-cuda \
+    --repack-sm75-native-q4 "$MODEL" --dry-run 2>/dev/null |
+    awk -F': ' '$1 == "approx_file_bytes" {print $2}')
+[[ $expected_native_bytes =~ ^[0-9]+$ ]] ||
+    die "could not determine complete native-model size"
+if [[ -e $NATIVE_MODEL && $(stat -c %s "$NATIVE_MODEL") != "$expected_native_bytes" ]]; then
+    printf 'Removing incomplete native model (%s of %s bytes): %s\n' \
+        "$(stat -c %s "$NATIVE_MODEL")" "$expected_native_bytes" "$NATIVE_MODEL"
+    rm -f -- "$NATIVE_MODEL"
+fi
 if [[ ! -e $NATIVE_MODEL ]]; then
     current_phase=lossless-repack
-    printf 'Creating tagged SM75-native model (no quantization or hashing)...\n'
-    ./gguf-tools/deepseek4-quantize \
-        --repack-sm75-native-q4 "$MODEL" --out "$NATIVE_MODEL" \
+    native_tmp="${NATIVE_MODEL}.partial.$$"
+    printf 'Creating tagged SM75-native model on CUDA devices %s (no quantization or hashing)...\n' \
+        "$QUANT_GPU_DEVICES"
+    ./gguf-tools/deepseek4-quantize-cuda \
+        --repack-sm75-native-q4 "$MODEL" --out "$native_tmp" \
+        --quant-backend cuda --quant-gpu-devices "$QUANT_GPU_DEVICES" \
+        --threads "$REPACK_THREADS" \
         2>&1 | tee "$OUTPUT_DIR/repack.log"
+    [[ -s $native_tmp && $(stat -c %s "$native_tmp") == "$expected_native_bytes" ]] ||
+        die "CUDA repack output is incomplete"
+    mv -- "$native_tmp" "$NATIVE_MODEL"
+    native_tmp=
 else
     printf 'Reusing existing NATIVE_MODEL: %s\n' "$NATIVE_MODEL"
     printf 'reused=%s\n' "$NATIVE_MODEL" >"$OUTPUT_DIR/repack.log"

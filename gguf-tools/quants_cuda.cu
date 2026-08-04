@@ -524,6 +524,41 @@ static __global__ __launch_bounds__(64) void iq2_xxs_kernel(
                      grid, map, neighbours);
 }
 
+/* One CTA transforms one eight-row by one-Q4-block record. The first warp
+ * copies the eight 16-byte headers; all eight warps emit one packed m8n8k32
+ * B-fragment word apiece. */
+static __global__ __launch_bounds__(256) void repack_sm75_native_q4_kernel(
+        const uint8_t *src, uint8_t *dst,
+        uint64_t records, uint32_t blocks_per_row) {
+    const uint64_t record = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (record >= records) return;
+    const uint64_t tile = record / blocks_per_row;
+    const uint32_t block = (uint32_t)(record - tile * blocks_per_row);
+    const uint32_t group = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint64_t src_block =
+        ((tile * 8u + row) * blocks_per_row + block) * 144u;
+    uint8_t *record_dst = dst + record * (8u * 144u);
+    if (tid < 32u) {
+        ((uint32_t *)record_dst)[tid] =
+            ((const uint32_t *)(src + src_block))[tid & 3u];
+    }
+    const uint8_t *qs = src + src_block + 16u;
+    const uint32_t off = (group >> 1u) * 32u + lane4 * 8u;
+    const uint32_t shift = (group & 1u) ? 4u : 0u;
+    uint32_t packed = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+        packed |= ((uint32_t)((qs[off + i] >> shift) & 15u)) << (4u * i);
+        packed |= ((uint32_t)((qs[off + 4u + i] >> shift) & 15u))
+                  << (4u * (i + 4u));
+    }
+    ((uint32_t *)(record_dst + 8u * 16u))[group * 32u + lane] = packed;
+}
+
 struct cuda_thread_state {
     int device;
     cudaStream_t stream;
@@ -710,6 +745,51 @@ size_t ds4q_cuda_quantize_chunk(ds4q_type type,
         return 0;
     }
     return dst_bytes;
+}
+
+size_t ds4q_cuda_repack_sm75_native_q4(const void *src,
+                                       void *dst,
+                                       int64_t nrows,
+                                       int64_t ncols,
+                                       int device,
+                                       char *error,
+                                       size_t error_cap) {
+    if (error && error_cap) error[0] = '\0';
+    if (!src || !dst || nrows <= 0 || ncols <= 0 ||
+        nrows % 8 != 0 || ncols % QK_K != 0) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "invalid CUDA SM75-Q4 repack request");
+        return 0;
+    }
+    if (!ensure_device(device, false, error, error_cap)) return 0;
+    const uint32_t blocks_per_row = (uint32_t)(ncols / QK_K);
+    const uint64_t records = (uint64_t)(nrows / 8) * blocks_per_row;
+    const size_t bytes = (size_t)nrows * blocks_per_row * 144u;
+    if (!ensure_allocation((void **)&tls.src, &tls.src_cap, bytes,
+                           error, error_cap) ||
+        !ensure_allocation((void **)&tls.dst, &tls.dst_cap, bytes,
+                           error, error_cap)) {
+        return 0;
+    }
+    cudaError_t st = cudaMemcpyAsync(tls.src, src, bytes,
+                                     cudaMemcpyHostToDevice, tls.stream);
+    if (st == cudaSuccess) {
+        repack_sm75_native_q4_kernel<<<
+            (unsigned)records, 256, 0, tls.stream>>>(
+                (const uint8_t *)tls.src, tls.dst,
+                records, blocks_per_row);
+        st = cudaGetLastError();
+    }
+    if (st == cudaSuccess) {
+        st = cudaMemcpyAsync(dst, tls.dst, bytes,
+                             cudaMemcpyDeviceToHost, tls.stream);
+    }
+    if (st == cudaSuccess) st = cudaStreamSynchronize(tls.stream);
+    if (st != cudaSuccess) {
+        set_cuda_error(error, error_cap, "CUDA SM75-Q4 repack", st);
+        return 0;
+    }
+    return bytes;
 }
 
 void ds4q_cuda_thread_shutdown(void) {
