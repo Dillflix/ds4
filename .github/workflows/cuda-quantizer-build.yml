@@ -15,6 +15,7 @@ on:
       - "speed-bench/cuda-prefill-audit.sh"
       - "speed-bench/cuda-prefill-deep-audit.sh"
       - "speed-bench/cuda-q4-prefill-evidence.sh"
+      - "speed-bench/cuda-q4-real-histogram.sh"
       - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
       - "speed-bench/cuda-sm75-q4-down-native.sh"
@@ -24,6 +25,7 @@ on:
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
+      - "speed-bench/summarize-q4-real-histogram.py"
       - "speed-bench/summarize-prefill-placement.py"
       - "speed-bench/summarize-tile-audit.py"
       - "tests/cuda_long_context_smoke.c"
@@ -32,6 +34,7 @@ on:
       - "tests/cuda_sm75_q4_down_native.cu"
       - "tests/cuda_sm75_q4_gate_up_native.cu"
       - "tests/test_engine_mgpu_placement.c"
+      - "tests/test_summarize_q4_real_histogram.py"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
       - "compare-q2-hybrid-q4.sh"
@@ -214,6 +217,8 @@ jobs:
           bash -n speed-bench/cuda-prefill-audit.sh
           bash -n speed-bench/cuda-prefill-deep-audit.sh
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
+          test -x speed-bench/cuda-q4-real-histogram.sh
+          bash -n speed-bench/cuda-q4-real-histogram.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
           bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
           bash -n speed-bench/cuda-sm75-q4-down-native.sh
@@ -235,4 +240,6 @@ jobs:
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
+          python3 -m py_compile speed-bench/summarize-q4-real-histogram.py
+          python3 tests/test_summarize_q4_real_histogram.py
           python3 -m py_compile gguf-tools/quality-testing/summarize_three_model_suite.py

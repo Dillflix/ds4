@@ -48,6 +48,8 @@ enum {
  * the device-aware CUDA PR). Field layout includes the new device_id
  * tag and is read by the WITH_DEVICE-wrapped tensor APIs below. */
 
+enum { CUDA_MOE_TILE_AUDIT_MAX_EXPERTS = 384 };
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -313,6 +315,9 @@ typedef struct {
     uint32_t slot_count;
     uint32_t active_experts;
     uint32_t padded_slots;
+    uint32_t n_total_expert;
+    uint32_t captured_experts;
+    uint32_t expert_counts[CUDA_MOE_TILE_AUDIT_MAX_EXPERTS];
 } cuda_moe_tile_audit_record;
 
 typedef struct {
@@ -3570,7 +3575,13 @@ extern "C" int ds4_gpu_prefill_tile_audit_write_csv(const char *path) {
     fprintf(fp,
             "logical_tier,physical_device,sequence,layer,token_offset,n_tokens,"
             "ownership,owner_base,owner_count,selected_slots,pair_count,"
-            "tile_count,slot_count,active_experts,padded_slots,tile_fill_pct\n");
+            "tile_count,slot_count,active_experts,padded_slots,tile_fill_pct,"
+            "n_total_expert,captured_experts");
+    for (uint32_t expert = 0;
+         expert < CUDA_MOE_TILE_AUDIT_MAX_EXPERTS; expert++) {
+        fprintf(fp, ",expert_%03u_pairs", expert);
+    }
+    fputc('\n', fp);
     int ok = 1;
     for (int tier = 0; tier < g_n_gpus && ok; tier++) {
         const cuda_moe_tile_audit_state *state = &g_moe_tile_audit[tier];
@@ -3607,17 +3618,23 @@ extern "C" int ds4_gpu_prefill_tile_audit_write_csv(const char *path) {
         for (uint32_t i = 0; i < count; i++) {
             const cuda_moe_tile_audit_record *r = &buffer->records[i];
             const char *ownership = r->owner_base == 0u ? "home" : "partner";
-        const double fill = r->slot_count != 0u
-            ? 100.0 * (double)r->pair_count /
-                    (double)r->slot_count
+            const double fill = r->slot_count != 0u
+                ? 100.0 * (double)r->pair_count /
+                        (double)r->slot_count
                 : 0.0;
             fprintf(fp,
-                    "%u,%u,%u,%u,%u,%u,%s,%u,%u,%u,%u,%u,%u,%u,%u,%.6f\n",
+                    "%u,%u,%u,%u,%u,%u,%s,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%u,%u",
                     r->logical_tier, r->physical_device, r->sequence,
                     r->layer, r->token_offset, r->n_tokens, ownership,
                     r->owner_base, r->owner_count, r->selected_slots,
                     r->pair_count, r->tile_count, r->slot_count, r->active_experts,
-                    r->padded_slots, fill);
+                    r->padded_slots, fill, r->n_total_expert,
+                    r->captured_experts);
+            for (uint32_t expert = 0;
+                 expert < CUDA_MOE_TILE_AUDIT_MAX_EXPERTS; expert++) {
+                fprintf(fp, ",%u", r->expert_counts[expert]);
+            }
+            fputc('\n', fp);
         }
     }
     if (fclose(fp) != 0) ok = 0;
@@ -18717,6 +18734,13 @@ __global__ static void moe_build_expert_tile_offsets_kernel(
                 r->slot_count = sum * 16u;
                 r->active_experts = active_experts;
                 r->padded_slots = sum * 16u - pair_sum;
+                r->n_total_expert = n_total_expert;
+                r->captured_experts =
+                    n_total_expert < CUDA_MOE_TILE_AUDIT_MAX_EXPERTS
+                        ? n_total_expert : CUDA_MOE_TILE_AUDIT_MAX_EXPERTS;
+                for (uint32_t e = 0; e < r->captured_experts; e++) {
+                    r->expert_counts[e] = counts[e];
+                }
             } else {
                 atomicAdd(&audit->overflow, 1u);
             }
@@ -18816,6 +18840,13 @@ __global__ static void moe_build_expert_mixed_tail_tiles_kernel(
             r->slot_count = slot_sum;
             r->active_experts = active_experts;
             r->padded_slots = slot_sum - pair_sum;
+            r->n_total_expert = n_total_expert;
+            r->captured_experts =
+                n_total_expert < CUDA_MOE_TILE_AUDIT_MAX_EXPERTS
+                    ? n_total_expert : CUDA_MOE_TILE_AUDIT_MAX_EXPERTS;
+            for (uint32_t e = 0; e < r->captured_experts; e++) {
+                r->expert_counts[e] = counts[e];
+            }
         } else {
             atomicAdd(&audit->overflow, 1u);
         }

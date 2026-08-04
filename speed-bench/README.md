@@ -1,5 +1,34 @@
 ## Benchmarking
 
+### Exact production Q4 expert histogram
+
+`cuda-q4-real-histogram.sh` captures the actual per-expert routed-pair counts
+from one production full-Q4 prefill. The counts are appended by the existing
+device metadata kernel to a preallocated device audit buffer. There is no new
+kernel launch, timing event, synchronization, or host read inside the measured
+prefill; each GPU buffer is copied once after the existing final
+synchronization.
+
+Gate/up and down use the same router assignment. One capture therefore derives
+both the shipping gate/up tile8 plan and the down tile16 plan, as well as
+counterfactual gate 8/4 and down 16/8/4 tail plans. The runner refuses a model
+unless all 43 routed layers report Q4 gate, Q4 up, and Q4 down. Model hashing is
+omitted.
+
+```bash
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,2,1,3 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+./speed-bench/cuda-q4-real-histogram.sh
+```
+
+The returnable archive contains the raw wide audit, an exact record-level tile
+plan, a long per-expert table, a count-frequency table, the benchmark result,
+and runtime provenance.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver
