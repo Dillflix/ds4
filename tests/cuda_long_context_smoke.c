@@ -870,11 +870,12 @@ static int check_sm75_native_q4_layout_exact(void) {
     if (!standard || !native || !xh || !selh || !wh || !mid_ref || !mid_got ||
         !out_ref || !out_got || !x || !selected || !weights || !out ||
         !gate || !up || !mid || !down) goto cleanup;
-    /* The first tagged run is the production legacy baseline regardless of
-     * the invoking shell; later cases enable one diagnostic candidate each. */
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8");
+    /* Cost-aware residual tiles are the tagged-layout production default.
+     * The legacy planner and new K-window kernels remain explicit diagnostics
+     * until their exactness and end-to-end transfer are measured. */
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
     fill_q4_tensor(standard + gate_off, 0u, n_total, mid_dim, in_blocks);
     fill_q4_tensor(standard + up_off, 1u, n_total, mid_dim, in_blocks);
     fill_q4_tensor(standard + down_off, 2u, n_total, out_dim, mid_blocks);
@@ -924,26 +925,26 @@ static int check_sm75_native_q4_layout_exact(void) {
         !compare_exact_f32("sm75 native q4 prefill output", out_ref, out_got,
                            out_count)) goto cleanup;
     fprintf(stderr,
-            "cuda-regression: tagged SM75 native Q4 prefill 16/8/4 exact\n");
+            "cuda-regression: tagged SM75 native Q4 cost-planner default exact\n");
 
     static const struct {
         const char *name;
-        const char *cost;
+        const char *legacy;
         const char *gate;
         const char *down;
     } optimized_cases[] = {
-        {"cost-tiles", "1", "0", "0"},
-        {"gate-fused16", "0", "1", "0"},
-        {"down-stage8", "0", "0", "1"},
-        {"cost/fused/stage8", "1", "1", "1"},
+        {"legacy-planner diagnostic", "1", "0", "0"},
+        {"gate-kstage4", "0", "1", "0"},
+        {"down-kstage4", "0", "0", "1"},
+        {"gate/down-kstage4", "0", "1", "1"},
     };
     for (uint32_t c = 0;
          c < sizeof(optimized_cases) / sizeof(optimized_cases[0]); c++) {
-        if (setenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES",
-                   optimized_cases[c].cost, 1) != 0 ||
-            setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16",
+        if (setenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES",
+                   optimized_cases[c].legacy, 1) != 0 ||
+            setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4",
                    optimized_cases[c].gate, 1) != 0 ||
-            setenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8",
+            setenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4",
                    optimized_cases[c].down, 1) != 0) {
             fprintf(stderr,
                     "cuda-regression: could not select native Q4 next paths\n");
@@ -958,9 +959,9 @@ static int check_sm75_native_q4_layout_exact(void) {
         fprintf(stderr, "cuda-regression: tagged SM75 native Q4 %s exact\n",
                 optimized_cases[c].name);
     }
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
 
     for (uint32_t s = 0; s < 6u; s++) {
         selh[s] = (int32_t)s;
@@ -980,9 +981,9 @@ static int check_sm75_native_q4_layout_exact(void) {
 #undef RUN_NATIVE_Q4
 
 cleanup:
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16");
-    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4");
+    unsetenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4");
     ds4_gpu_set_routed_q4_layout(0u);
     if ((standard || native) && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);

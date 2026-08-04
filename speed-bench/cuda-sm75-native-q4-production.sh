@@ -205,7 +205,7 @@ current_phase=exact-api-correctness
     die "CUDA exact-output suite failed"
 }
 for marker in \
-    'tagged SM75 native Q4 prefill 16/8/4 exact' \
+    'tagged SM75 native Q4 cost-planner default exact' \
     'tagged SM75 native Q4 decode exact' \
     'cuda long-context regression: OK'; do
     grep -Fq "$marker" "$OUTPUT_DIR/validation/cuda-exact.log" ||

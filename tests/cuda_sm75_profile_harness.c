@@ -414,9 +414,10 @@ static int verify_tile_audit(const char *path, const scenario_spec *spec,
     }
     const uint32_t expected_padding = spec->tile16_count * 16u - spec->owned_pairs;
     uint32_t cost_tile_count = 0u, cost_slot_count = 0u;
-    const char *cost_env = getenv("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES");
-    const int cost_aware = native_q4 && cost_env && cost_env[0] &&
-        strcmp(cost_env, "0") != 0;
+    const char *legacy_env = getenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
+    const int legacy_tiles = legacy_env && legacy_env[0] &&
+        strcmp(legacy_env, "0") != 0;
+    const int cost_aware = native_q4 && !legacy_tiles;
     if (cost_aware && spec->expert_counts) {
         for (uint32_t e = 0; e < 128u; e++) {
             const uint32_t count = spec->expert_counts[e];

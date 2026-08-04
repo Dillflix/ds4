@@ -3,15 +3,15 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run an isolated production A/B of the next SM75 native-Q4 changes against
-the existing tagged-native kernel path. No model conversion or hashing occurs.
+Run an isolated production A/B of the K-stage4 SM75 native-Q4 designs against
+the cost-planner production path. No model conversion or hashing occurs.
 
 Required environment:
   NATIVE_MODEL=/absolute/path/to/SM75-native-Q4.gguf
 
 Optional environment:
   PROMPT=...                  Default: speed-bench/promessi_sposi.txt
-  AB_VARIANTS=legacy,cost,down,gate,optimized
+  AB_VARIANTS=baseline,down,gate,both
   REPEATS=2                  Each variant runs this many times
   CTX_START=2048
   CTX_MAX=65536
@@ -19,21 +19,18 @@ Optional environment:
   PREFILL_CHUNK=2048
   GPU_VRAM=auto
   RUN_E2E_EXACT=1            Compare every variant's raw logits at CTX_START
-  RUN_NSYS=0                 Capture legacy and optimized at PROFILE_TOKENS
+  RUN_NSYS=0                 Capture baseline and both at PROFILE_TOKENS
   PROFILE_TOKENS=2048
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   NATIVE_Q4_NEXT_DIR=...
 
 Variants:
-  legacy     cost=0 gate-fused16=0 down-stage8=0
-  cost       cost=1 gate-fused16=0 down-stage8=0
-  down       cost=0 gate-fused16=0 down-stage8=1
-  gate       cost=0 gate-fused16=1 down-stage8=0
-  cost-down  cost=1 gate-fused16=0 down-stage8=1
-  cost-gate  cost=1 gate-fused16=1 down-stage8=0
-  gate-down  cost=0 gate-fused16=1 down-stage8=1
-  optimized  cost=1 gate-fused16=1 down-stage8=1
+  baseline   cost planner + production gate tile8/down full-stage
+  legacy     legacy residual planner (diagnostic only)
+  down       baseline + down tile16 K-stage4
+  gate       baseline + gate/up tile16 K-stage4
+  both       baseline + both K-stage4 designs
 
 The production placement is fixed to GPUs 0,3,1,2 and a 22/21 stage split.
 EOF
@@ -50,7 +47,7 @@ cd "$repo_dir"
     die "NATIVE_MODEL must be an existing non-empty absolute path"
 
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
-AB_VARIANTS=${AB_VARIANTS:-legacy,cost,down,gate,optimized}
+AB_VARIANTS=${AB_VARIANTS:-baseline,down,gate,both}
 REPEATS=${REPEATS:-2}
 CTX_START=${CTX_START:-2048}
 CTX_MAX=${CTX_MAX:-65536}
@@ -92,14 +89,14 @@ IFS=, read -r -a variants <<<"$AB_VARIANTS"
 declare -A seen=()
 for variant in "${variants[@]}"; do
     case "$variant" in
-        legacy|cost|down|gate|cost-down|cost-gate|gate-down|optimized) ;; *)
+        baseline|legacy|down|gate|both) ;; *)
         die "unknown AB variant: $variant";; esac
     [[ -z ${seen[$variant]:-} ]] || die "duplicate AB variant: $variant"
     seen[$variant]=1
 done
-[[ -n ${seen[legacy]:-} ]] || die "AB_VARIANTS must include legacy"
+[[ -n ${seen[baseline]:-} ]] || die "AB_VARIANTS must include baseline"
 
-for tool in awk cmp cuobjdump date env git grep make mkdir mv nproc nvidia-smi \
+for tool in awk cmp cuobjdump c++filt date env git grep make mkdir mv nproc nvidia-smi \
             python3 sort stat tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -166,36 +163,36 @@ production_prefix=(
 
 variant_flags() {
     case "$1" in
-        legacy)    printf '0 0 0\n' ;;
-        cost)      printf '1 0 0\n' ;;
-        down)      printf '0 0 1\n' ;;
-        gate)      printf '0 1 0\n' ;;
-        cost-down) printf '1 0 1\n' ;;
-        cost-gate) printf '1 1 0\n' ;;
-        gate-down) printf '0 1 1\n' ;;
-        optimized) printf '1 1 1\n' ;;
+        baseline) printf '0 0 0\n' ;;
+        legacy)   printf '1 0 0\n' ;;
+        down)     printf '0 0 1\n' ;;
+        gate)     printf '0 1 0\n' ;;
+        both)     printf '0 1 1\n' ;;
     esac
 }
 
 run_variant() {
     local variant=$1; shift
-    local cost gate down
-    read -r cost gate down < <(variant_flags "$variant")
+    local legacy gate down
+    read -r legacy gate down < <(variant_flags "$variant")
     "${clean_prefix[@]}" "${production_prefix[@]}" \
-        "DS4_CUDA_MOE_NATIVE_Q4_COST_TILES=$cost" \
-        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16=$gate" \
-        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8=$down" \
+        "DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES=$legacy" \
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4=$gate" \
+        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4=$down" \
         "$@"
 }
 
 validate_log() {
-    local variant=$1 log=$2 cost gate down
-    read -r cost gate down < <(variant_flags "$variant")
+    local variant=$1 log=$2 legacy gate down planner gate_name down_name
+    read -r legacy gate down < <(variant_flags "$variant")
+    planner=cost; [[ $legacy == 0 ]] || planner=legacy
     grep -Fq 'ds4: CUDA EP forced pipeline split 22/21' "$log" ||
         die "$variant did not use split 22/21"
     grep -Fq '4 devices [0,3,1,2] requested' "$log" ||
         die "$variant did not use GPU order 0,3,1,2"
-    grep -Fq "packed A/W, cost-tiles=$cost, gate-fused16=$gate, down-stage8=$down" \
+    gate_name=tile8; [[ $gate == 0 ]] || gate_name=kstage4
+    down_name=full-stage; [[ $down == 0 ]] || down_name=kstage4
+    grep -Fq "packed A/W, planner=$planner, gate=$gate_name, down=$down_name" \
         "$log" || die "$variant did not select the requested native-Q4 paths"
 }
 
@@ -216,6 +213,54 @@ fi
 cuobjdump --dump-resource-usage ./ds4-bench \
     >"$OUTPUT_DIR/provenance/resource-usage.txt" 2>&1 ||
     die "could not record CUDA kernel resource usage"
+c++filt <"$OUTPUT_DIR/provenance/resource-usage.txt" \
+    >"$OUTPUT_DIR/provenance/resource-usage.demangled.txt"
+python3 - "$OUTPUT_DIR/provenance/resource-usage.demangled.txt" \
+        "$OUTPUT_DIR/provenance/kstage-resource-gate.csv" <<'PY'
+import csv, re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+targets = {
+    "gate-kstage4": "moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel",
+    "down-kstage4": "moe_down_sm75_native_q4_tile16_kstage4_kernel",
+}
+records = []
+for index, line in enumerate(text):
+    if not re.match(r"\s*Function\s*:?\s*", line):
+        continue
+    name = re.sub(r"^\s*Function\s*:?\s*", "", line).rstrip(":")
+    resource = ""
+    for candidate in text[index + 1:index + 8]:
+        if re.match(r"\s*REG:", candidate):
+            resource = candidate
+            break
+    for label, needle in targets.items():
+        if needle not in name or not resource:
+            continue
+        values = {key: int(value) for key, value in
+                  re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", resource)}
+        missing = {"REG", "STACK", "SHARED", "LOCAL"} - values.keys()
+        if missing:
+            raise SystemExit(f"missing resource fields for {label}: {resource}")
+        records.append({"design": label, "kernel": name, **values})
+for label in targets:
+    matches = [row for row in records if row["design"] == label]
+    if not matches:
+        raise SystemExit(f"resource gate found no {label} instantiation")
+    for row in matches:
+        if row["STACK"] or row["LOCAL"]:
+            raise SystemExit(
+                f'{label} spills: STACK={row["STACK"]} LOCAL={row["LOCAL"]}')
+        if row["SHARED"] >= 32768:
+            raise SystemExit(f'{label} shared memory is {row["SHARED"]}, not <32768')
+        if row["REG"] > 128:
+            raise SystemExit(f'{label} uses {row["REG"]} registers, not <=128')
+with open(sys.argv[2], "w", newline="", encoding="utf-8") as stream:
+    writer = csv.DictWriter(stream,
+        fieldnames=("design", "kernel", "REG", "STACK", "SHARED", "LOCAL"))
+    writer.writeheader(); writer.writerows(records)
+print("validated K-stage4 kernels: no spills, shared <32KiB, registers <=128")
+PY
 
 current_phase=api-exactness
 "${clean_prefix[@]}" ./tests/cuda_long_context_smoke \
@@ -224,17 +269,18 @@ current_phase=api-exactness
     die "CUDA exact-output suite failed"
 }
 for marker in \
-    'tagged SM75 native Q4 cost-tiles exact' \
-    'tagged SM75 native Q4 gate-fused16 exact' \
-    'tagged SM75 native Q4 down-stage8 exact' \
-    'tagged SM75 native Q4 cost/fused/stage8 exact' \
+    'tagged SM75 native Q4 cost-planner default exact' \
+    'tagged SM75 native Q4 legacy-planner diagnostic exact' \
+    'tagged SM75 native Q4 gate-kstage4 exact' \
+    'tagged SM75 native Q4 down-kstage4 exact' \
+    'tagged SM75 native Q4 gate/down-kstage4 exact' \
     'cuda long-context regression: OK'; do
     grep -Fq "$marker" "$OUTPUT_DIR/validation/cuda-exact.log" ||
         die "exact-output marker missing: $marker"
 done
 
 current_phase=cost-planner-audit
-"${clean_prefix[@]}" DS4_CUDA_MOE_NATIVE_Q4_COST_TILES=1 \
+"${clean_prefix[@]}" \
     ./tests/cuda_sm75_profile_harness native-q4-early \
     >"$OUTPUT_DIR/validation/cost-planner-audit.log" 2>&1 || {
     tail -n 180 "$OUTPUT_DIR/validation/cost-planner-audit.log" >&2 || true
@@ -280,7 +326,7 @@ if [[ $RUN_E2E_EXACT == 1 ]]; then
         [[ -s $raw ]] || die "missing raw logits for $variant"
         if [[ -z $reference ]]; then reference=$raw; else
             cmp -s "$reference" "$raw" ||
-                die "legacy/$variant raw logits are not bit-exact"
+                die "baseline/$variant raw logits are not bit-exact"
         fi
     done
     printf 'api_exact=true\ne2e_all_variants_raw_logits_bit_exact=true\n' \
@@ -333,10 +379,10 @@ for run in runs:
         if repeat_key in by_repeat:
             raise SystemExit(f"duplicate run value: {repeat_key}")
         by_repeat[repeat_key] = value
-contexts = sorted(ctx for variant, ctx in values if variant == "legacy")
+contexts = sorted(ctx for variant, ctx in values if variant == "baseline")
 records = []
 for ctx in contexts:
-    baseline = statistics.median(values[("legacy", ctx)])
+    baseline = statistics.median(values[("baseline", ctx)])
     for variant in sorted({variant for variant, _ in values}):
         samples = values.get((variant, ctx))
         if not samples:
@@ -346,8 +392,8 @@ for ctx in contexts:
         if not math.isfinite(ratio):
             raise SystemExit("non-finite A/B ratio")
         paired = []
-        for repeat in range(1, len(values[("legacy", ctx)]) + 1):
-            base_key = (repeat, "legacy", ctx)
+        for repeat in range(1, len(values[("baseline", ctx)]) + 1):
+            base_key = (repeat, "baseline", ctx)
             variant_key = (repeat, variant, ctx)
             if base_key not in by_repeat or variant_key not in by_repeat:
                 raise SystemExit(
@@ -358,13 +404,13 @@ for ctx in contexts:
         records.append({"ctx_tokens": ctx, "variant": variant,
                         "samples": len(samples),
                         "median_prefill_tps": f"{median:.6f}",
-                        "median_over_legacy": f"{ratio:.6f}",
+                        "median_over_baseline": f"{ratio:.6f}",
                         "median_gain_pct": f"{(ratio-1)*100:.3f}"})
         records[-1].update({
-            "paired_median_over_legacy": f"{paired_median:.6f}",
+            "paired_median_over_baseline": f"{paired_median:.6f}",
             "paired_median_gain_pct": f"{(paired_median-1)*100:.3f}",
-            "paired_min_over_legacy": f"{min(paired):.6f}",
-            "paired_max_over_legacy": f"{max(paired):.6f}",
+            "paired_min_over_baseline": f"{min(paired):.6f}",
+            "paired_max_over_baseline": f"{max(paired):.6f}",
         })
 with open(sys.argv[2], "w", encoding="utf-8", newline="") as stream:
     writer = csv.DictWriter(stream, fieldnames=records[0].keys())
@@ -378,7 +424,7 @@ PY
 
 if [[ $RUN_NSYS == 1 ]]; then
     current_phase=nsight-systems-ab
-    for variant in legacy optimized; do
+    for variant in baseline both; do
         run_variant "$variant" DS4_NSYS_CAPTURE_PREFILL=1 \
             nsys profile --force-overwrite=true --sample=none \
             --trace=cuda,nvtx,osrt,cublas --capture-range=cudaProfilerApi \

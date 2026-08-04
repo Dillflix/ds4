@@ -23637,11 +23637,11 @@ static int routed_moe_launch(
     const int native_q4 =
         g_cuda_routed_q4_layout == DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
     const uint32_t use_native_q4_cost_tiles = native_q4 &&
-        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_COST_TILES", 0);
-    const uint32_t use_native_q4_gate_fused16 = native_q4 &&
-        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FUSED16", 0);
-    const uint32_t use_native_q4_down_stage8 = native_q4 &&
-        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_STAGE8", 0);
+        !cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES", 0);
+    const uint32_t use_native_q4_gate_kstage4 = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_KSTAGE4", 0);
+    const uint32_t use_native_q4_down_kstage4 = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_KSTAGE4", 0);
     if (g_cuda_routed_q4_layout != 0u && !native_q4) {
         fprintf(stderr, "ds4: unsupported CUDA routed-Q4 layout 0x%08x\n",
                 g_cuda_routed_q4_layout);
@@ -23662,11 +23662,10 @@ static int routed_moe_launch(
             true, std::memory_order_relaxed)) {
         fprintf(stderr,
                 "ds4: SM75 native routed-Q4 layout enabled "
-                "(packed A/W, cost-tiles=%u, gate-fused16=%u, "
-                "down-stage8=%u)\n",
-                use_native_q4_cost_tiles,
-                use_native_q4_gate_fused16,
-                use_native_q4_down_stage8);
+                "(packed A/W, planner=%s, gate=%s, down=%s)\n",
+                use_native_q4_cost_tiles ? "cost" : "legacy",
+                use_native_q4_gate_kstage4 ? "kstage4" : "tile8",
+                use_native_q4_down_kstage4 ? "kstage4" : "full-stage");
     }
     if ((!gate_q4k && !gate_iq2) || (!down_q4k && !down_q2k)) return 0;
     /* Routed-MoE dispatch supports the full matrix of IQ2_XXS/Q4_K gate+up
@@ -24166,11 +24165,11 @@ static int routed_moe_launch(
                                     (const float *)weights->ptr, xq_blocks, \
                                     expert_mid_dim, n_expert, write_gate_up, clamp); \
                         } while (0)
-#define DS4_NATIVE_Q4_GATE_FUSED16(RS) \
+#define DS4_NATIVE_Q4_GATE_KSTAGE4(RS) \
                         do { \
                             dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
                                     tile16_capacity, 1u); \
-                            moe_gate_up_mid_sm75_native_q4_tile16_fused_kernel<RS, 6> \
+                            moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel<RS> \
                                 <<<ng, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, \
                                     (float *)mid->ptr, gate_w, up_w, \
@@ -24182,8 +24181,8 @@ static int routed_moe_launch(
                         } while (0)
 #define DS4_NATIVE_Q4_GATE_ALL(RS) \
                         do { \
-                            if (use_native_q4_gate_fused16) { \
-                                DS4_NATIVE_Q4_GATE_FUSED16(RS); \
+                            if (use_native_q4_gate_kstage4) { \
+                                DS4_NATIVE_Q4_GATE_KSTAGE4(RS); \
                             } else { \
                                 DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
                                     tile16_experts, tile16_starts, \
@@ -24209,7 +24208,7 @@ static int routed_moe_launch(
                             DS4_NATIVE_Q4_GATE_ALL(512);
                         }
 #undef DS4_NATIVE_Q4_GATE_ALL
-#undef DS4_NATIVE_Q4_GATE_FUSED16
+#undef DS4_NATIVE_Q4_GATE_KSTAGE4
 #undef DS4_NATIVE_Q4_GATE_LIST
                     } else {
                     const int use_q4_mma = cuda_q4_mma_ok() &&
@@ -24967,18 +24966,29 @@ static int routed_moe_launch(
                                     (TOTAL), (EXPERTS), (STARTS), \
                                     midq_blocks, out_dim); \
                         } while (0)
+#define DS4_NATIVE_Q4_DOWN_KSTAGE4(RS) \
+                        do { \
+                            dim3 ng((out_dim + (RS) - 1u) / (RS), \
+                                    tile16_capacity, 1u); \
+                            moe_down_sm75_native_q4_tile16_kstage4_kernel<RS> \
+                                <<<ng, 256>>>( \
+                                    (float *)down->ptr, down_w, \
+                                    (const cuda_sm75_native_q8_K *)midq, \
+                                    sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    midq_blocks, out_dim); \
+                        } while (0)
 #define DS4_NATIVE_Q4_DOWN_ALL(RS) \
                         do { \
-                            if (use_native_q4_down_stage8) { \
-                                DS4_NATIVE_Q4_DOWN_LIST(RS, 16, 8, tile16_total, \
-                                    tile16_experts, tile16_starts, tile16_capacity); \
+                            if (use_native_q4_down_kstage4) { \
+                                DS4_NATIVE_Q4_DOWN_KSTAGE4(RS); \
                             } else { \
-                                DS4_NATIVE_Q4_DOWN_LIST(RS, 16, 16, tile16_total, \
+                                DS4_NATIVE_Q4_DOWN_LIST(RS, 16, tile16_total, \
                                     tile16_experts, tile16_starts, tile16_capacity); \
                             } \
-                            DS4_NATIVE_Q4_DOWN_LIST(RS, 8, 8, tail8_total, \
+                            DS4_NATIVE_Q4_DOWN_LIST(RS, 8, tail8_total, \
                                 tail8_experts, tail8_starts, tail8_capacity); \
-                            DS4_NATIVE_Q4_DOWN_LIST(RS, 4, 4, tail4_total, \
+                            DS4_NATIVE_Q4_DOWN_LIST(RS, 4, tail4_total, \
                                 tail4_experts, tail4_starts, tail4_capacity); \
                         } while (0)
                         if (!tile16_total || !tail8_total || !tail4_total) {
@@ -24991,6 +25001,7 @@ static int routed_moe_launch(
                             DS4_NATIVE_Q4_DOWN_ALL(512);
                         }
 #undef DS4_NATIVE_Q4_DOWN_ALL
+#undef DS4_NATIVE_Q4_DOWN_KSTAGE4
 #undef DS4_NATIVE_Q4_DOWN_LIST
                     } else {
                     const int use_q4_down_mma = cuda_q4_mma_ok() &&

@@ -66,8 +66,9 @@ jobs:
           cuobjdump --dump-sass tests/cuda_long_context_smoke > /tmp/ds4-sm75.sass
           for kernel in \
             moe_gate_up_mid_sm75_native_q4_tile8_kernel \
-            moe_gate_up_mid_sm75_native_q4_tile16_fused_kernel \
-            moe_down_sm75_native_q4_tile_kernel; do
+            moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel \
+            moe_down_sm75_native_q4_tile_kernel \
+            moe_down_sm75_native_q4_tile16_kstage4_kernel; do
             grep -Fq "$kernel" /tmp/ds4-sm75.sass
             awk -v wanted="$kernel" '
               /Function : / { emit = index($0, wanted) != 0 }
@@ -78,6 +79,36 @@ jobs:
             grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/$kernel.sass"
             ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' "/tmp/$kernel.sass"
           done
+          cuobjdump --dump-resource-usage tests/cuda_long_context_smoke \
+            | c++filt > /tmp/ds4-sm75.resources
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          lines = Path("/tmp/ds4-sm75.resources").read_text(errors="replace").splitlines()
+          targets = (
+              "moe_gate_up_mid_sm75_native_q4_tile16_kstage4_kernel",
+              "moe_down_sm75_native_q4_tile16_kstage4_kernel",
+          )
+          found = {target: 0 for target in targets}
+          for index, line in enumerate(lines):
+              for target in targets:
+                  if "Function" not in line or target not in line:
+                      continue
+                  record = next((item for item in lines[index + 1:index + 8]
+                                 if re.match(r"\s*REG:", item)), "")
+                  values = {key: int(value) for key, value in
+                            re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", record)}
+                  if set(values) != {"REG", "STACK", "SHARED", "LOCAL"}:
+                      raise SystemExit(f"missing resource fields for {target}: {record}")
+                  if values["STACK"] or values["LOCAL"]:
+                      raise SystemExit(f"{target} has local-memory traffic: {values}")
+                  if values["SHARED"] >= 32768 or values["REG"] > 128:
+                      raise SystemExit(f"{target} cannot admit two 256-thread CTAs: {values}")
+                  found[target] += 1
+          if any(count == 0 for count in found.values()):
+              raise SystemExit(f"missing K-stage4 resource records: {found}")
+          print("validated K-stage4 resource ceilings", found)
+          PY
       - name: Build SM75 Q4 gate/up with PTXAS evidence
         shell: bash
         run: |
