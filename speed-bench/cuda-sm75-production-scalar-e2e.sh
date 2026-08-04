@@ -23,7 +23,7 @@ Optional environment:
   REPEATS=2              # even pilot; use 6 for replicated measurement
   CUDA_ARCH=sm_75
   SKIP_BUILD=0
-  HASH_MODEL=1           # full SHA-256 provenance; set 0 only for a quick pilot
+  HASH_MODEL=0           # set 1 to opt into a full model SHA-256 pass
   CREATE_ARCHIVE=1
   SCALAR_E2E_DIR=...     # new output directory
 
@@ -56,7 +56,7 @@ PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 REPEATS=${REPEATS:-2}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
 SKIP_BUILD=${SKIP_BUILD:-0}
-HASH_MODEL=${HASH_MODEL:-1}
+HASH_MODEL=${HASH_MODEL:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${SCALAR_E2E_DIR:-$repo_dir/sm75-production-scalar-e2e-$RECIPE-$run_stamp}
