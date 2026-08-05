@@ -28,21 +28,19 @@ NCU_USE_SUDO=1 \
 
 Use `REPEATS=6` for replicated timing after the two-repeat pilot succeeds.
 
-### Cost-planner default and next native-Q4 A/B
+### Cost-planner default and rejected K-stage A/B
 
 The cost-aware residual planner is now the tagged native-Q4 production default:
 `1..4 -> tile4`, `5..8 -> tile8`, and `9..15 -> tile16`. Set
 `DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES=1` only for a diagnostic comparison with
 the old minimum-active-tile planner.
 
-The previously measured gate fused16 and down stage8 candidates were removed:
-both regressed production throughput. The replacements stage only the 256-byte
-MMA payload; Q8 scales and correction sums remain on the read-only path. Gate
-`stream7` keeps seven complete token rows resident across all output-row groups
-and uses the existing gate tensor for its bounded gate/up phases. Down
-`compact7` stages seven of eight K blocks for all 16 pairs once per CTA, leaving
-only one block on the read-only path. Both preserve low8/high8 weight reuse,
-avoid per-row-group restaging, and compile below 32 KiB declared shared memory.
+The diagnostic `stream7` gate and `compact7` down candidates compile below
+32 KiB declared shared memory, but both are rejected. Moving activation
+payload and metadata reads into the repeated output-row loop raised LG
+throttle and made both kernels more than three times slower in representative
+Nsight Compute captures. They remain selectable only to reproduce the failure
+audit; neither is a production candidate.
 
 `cuda-sm75-native-q4-next-ab.sh` tests `baseline`, `down`, `gate`, and `both`
 in alternating order at placement `0,3,1,2` and split 22/21. Before loading the
@@ -67,6 +65,42 @@ RUN_NSYS=1 \
 The script never modifies `NATIVE_MODEL`. Use `RUN_E2E_EXACT=0` only when
 rerunning timing after the same binary/model combination has already passed
 the raw-logit comparison.
+
+### Full-hot gate and wide-CTA down A/B
+
+`cuda-sm75-native-q4-wide-hot-ab.sh` tests the two designs derived from that
+failure evidence without placing activation payload loads in the hot loop:
+
+- `down-wide512` retains the complete 37.5 KiB shared tile16 and remaps the
+  existing 512-row span over one 512-thread CTA. Its 16 resident warps replace
+  the baseline's eight without changing arithmetic, weight reuse, or staging.
+- `gate-full64` opts into Turing's 65,536-byte per-block limit and uses all of
+  it for the complete 16-token by 16-block packed activation payload. Gate and
+  up run as bounded phases so each Q4 fragment feeds both token halves without
+  keeping both matrices' accumulator sets live simultaneously.
+
+Before loading the model, the runner rejects local-memory traffic or more than
+128 registers. It runs the production exact-output smoke, optional bit-exact
+full-model logits, an alternating four-variant prefill A/B, matching Nsight
+Systems traces, and bounded early/late Nsight Compute captures. Model hashing
+and conversion are deliberately absent.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+REPEATS=2 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+RUN_E2E_EXACT=1 \
+RUN_NSYS=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+./speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
+```
 
 ### Exact production Q4 expert histogram
 
