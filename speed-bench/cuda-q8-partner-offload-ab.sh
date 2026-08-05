@@ -23,10 +23,29 @@ PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
 SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_GPU_TEST=${RUN_GPU_TEST:-1}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+REUSE_T32_DIR=${REUSE_T32_DIR:-}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${Q8_PARTNER_AB_DIR:-$repo_dir/q8-partner-offload-ab-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
+if [[ -n $REUSE_T32_DIR ]]; then
+    [[ $REUSE_T32_DIR == /* && -d $REUSE_T32_DIR ]] ||
+        die "REUSE_T32_DIR must name an existing absolute T32 A/B directory"
+    REUSE_T32_DIR=$(cd "$REUSE_T32_DIR" && pwd)
+    [[ -s $REUSE_T32_DIR/manifest.txt && -s $REUSE_T32_DIR/runs.tsv ]] ||
+        die "REUSE_T32_DIR lacks manifest.txt or runs.tsv"
+    grep -Fqx -- "model=$MODEL" "$REUSE_T32_DIR/manifest.txt" ||
+        die "REUSE_T32_DIR used a different model"
+    grep -Fqx -- "gpu_devices=$GPU_DEVICES" "$REUSE_T32_DIR/manifest.txt" ||
+        die "REUSE_T32_DIR used different GPU devices"
+    grep -Fqx -- "stage_split=$STAGE_SPLIT/$((43-STAGE_SPLIT))" \
+        "$REUSE_T32_DIR/manifest.txt" ||
+        die "REUSE_T32_DIR used a different stage split"
+    reused_repeats=$(awk -F= '$1 == "repeats" { print $2; exit }' \
+        "$REUSE_T32_DIR/manifest.txt")
+    [[ $reused_repeats =~ ^[0-9]+$ ]] && (( reused_repeats >= REPEATS )) ||
+        die "REUSE_T32_DIR has fewer than $REPEATS repeats"
+fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
             "CTX_MAX:$CTX_MAX" "STEP_MUL:$STEP_MUL" \
             "PREFILL_CHUNK:$PREFILL_CHUNK" "REPEATS:$REPEATS" \
@@ -70,7 +89,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{runs,nsys,provenance,telemetry}
+mkdir -p "$OUTPUT_DIR"/{runs,logits,nsys,provenance,telemetry}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -172,13 +191,18 @@ phase=manifest
         "$REPEATS" "$VARIANTS"
     printf 'run_nsys=%s\nnsys_variants=%s\nprofile_tokens=%s\nmodel_hashing=disabled\n' \
         "$RUN_NSYS" "$NSYS_VARIANTS" "$PROFILE_TOKENS"
+    printf 'reuse_t32_dir=%s\n' "${REUSE_T32_DIR:-none}"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free \
         --format=csv
     nvidia-smi topo -m
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
-printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tcache_before\tcache_after\n' \
+if [[ -n $REUSE_T32_DIR ]]; then
+    cp "$REUSE_T32_DIR/manifest.txt" \
+        "$OUTPUT_DIR/provenance/reused-t32-manifest.txt"
+fi
+printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tcache_before\tcache_after\tlogits\n' \
     >"$OUTPUT_DIR/runs.tsv"
 : >"$OUTPUT_DIR/validation-failures.txt"
 
@@ -199,8 +223,46 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         audit="$OUTPUT_DIR/runs/$stem.q8-audit.csv"
         before="$OUTPUT_DIR/runs/$stem.cache-before.csv"
         after="$OUTPUT_DIR/runs/$stem.cache-after.csv"
+        logits="$OUTPUT_DIR/logits/$stem"
         telemetry_before="$OUTPUT_DIR/telemetry/$stem.before.csv"
         telemetry_after="$OUTPUT_DIR/telemetry/$stem.after.csv"
+        mkdir -p "$logits"
+
+        if [[ -n $REUSE_T32_DIR &&
+              ( $variant == local || $variant == t32 ) ]]; then
+            if [[ $variant == local ]]; then
+                reused_variant=old_local
+            else
+                reused_variant=old_partner
+            fi
+            source_stem="$REUSE_T32_DIR/runs/$reused_variant-r$repeat"
+            source_logits="$REUSE_T32_DIR/logits/$reused_variant-r$repeat"
+            for suffix in csv log q8-audit.csv cache-before.csv cache-after.csv; do
+                [[ -s $source_stem.$suffix ]] ||
+                    die "reused T32 result is missing $source_stem.$suffix"
+            done
+            [[ -d $source_logits ]] ||
+                die "reused T32 logits are missing: $source_logits"
+            printf 'Reusing %s as %s repeat=%d/%d...\n' \
+                "$reused_variant" "$variant" "$repeat" "$REPEATS"
+            cp "$source_stem.csv" "$csv"
+            cp "$source_stem.log" "$log"
+            cp "$source_stem.q8-audit.csv" "$audit"
+            cp "$source_stem.cache-before.csv" "$before"
+            cp "$source_stem.cache-after.csv" "$after"
+            cp -a "$source_logits/." "$logits/"
+            cmp -s "$before" "$after" ||
+                die "$stem changed the F16 cache during timed frontiers"
+            if ! validate_audit "$variant" "$audit"; then
+                printf 'reused benchmark repeat=%s variant=%s has invalid class evidence\n' \
+                    "$repeat" "$variant" >>"$OUTPUT_DIR/validation-failures.txt"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$repeat" "$((slot+1))" "$variant" "$csv" "$log" "$audit" \
+                "$before" "$after" "$logits" >>"$OUTPUT_DIR/runs.tsv"
+            cat "$csv"
+            continue
+        fi
 
         nvidia-smi --query-gpu=index,memory.used,memory.free \
             --format=csv >"$telemetry_before"
@@ -221,6 +283,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
                 --ctx-alloc "$((CTX_MAX+1))" --step-mul "$STEP_MUL" \
                 --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 --csv "$csv" \
+                --dump-frontier-logits-dir "$logits" \
                 >"$log" 2>&1 || {
                     tail -n 180 "$log" >&2
                     die "$stem failed"
@@ -243,9 +306,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             printf 'benchmark repeat=%s variant=%s did not execute only the requested class\n' \
                 "$repeat" "$variant" >>"$OUTPUT_DIR/validation-failures.txt"
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repeat" "$((slot+1))" "$variant" "$csv" "$log" "$audit" \
-            "$before" "$after" >>"$OUTPUT_DIR/runs.tsv"
+            "$before" "$after" "$logits" >>"$OUTPUT_DIR/runs.tsv"
         cat "$csv"
     done
 done
@@ -254,15 +317,41 @@ phase=summarize
 python3 speed-bench/summarize-q8-partner-offload-ab.py \
     "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR" | tee "$OUTPUT_DIR/summary-stdout.txt"
 [[ -s $OUTPUT_DIR/paired-samples.csv && -s $OUTPUT_DIR/class-evidence.csv &&
+   -s $OUTPUT_DIR/logit-comparison.csv &&
+   -s $OUTPUT_DIR/logit-determinism.csv &&
    -s $OUTPUT_DIR/summary.txt ]] || die "summary missing"
 awk -F, 'NR > 1 && $3 != "ok" {
     printf "summary repeat=%s variant=%s evidence_status=%s\n", $1, $2, $3
 }' "$OUTPUT_DIR/class-evidence.csv" >>"$OUTPUT_DIR/validation-failures.txt"
+awk -F, 'NR > 1 && $4 != 1 {
+    printf "logits repeat=%s variant=%s frontier=%s is nondeterministic\n", $1, $2, $3
+}' "$OUTPUT_DIR/logit-determinism.csv" >>"$OUTPUT_DIR/validation-failures.txt"
 
 if [[ $RUN_NSYS == 1 ]]; then
     phase=nsight-systems
     command -v nsys >/dev/null 2>&1 || die "Nsight Systems CLI (nsys) not found"
     for variant in "${nsys_variants[@]}"; do
+        if [[ -n $REUSE_T32_DIR && $variant == t32 ]]; then
+            printf 'Reusing old_partner Nsight Systems trace as t32...\n'
+            copied=0
+            for source in "$REUSE_T32_DIR"/nsys/old_partner*; do
+                [[ -e $source ]] || continue
+                target_name=${source##*/}
+                target_name=${target_name/#old_partner/t32}
+                cp -a "$source" "$OUTPUT_DIR/nsys/$target_name"
+                copied=$((copied + 1))
+            done
+            (( copied > 0 )) || die "REUSE_T32_DIR lacks old_partner Nsight evidence"
+            [[ -s $OUTPUT_DIR/nsys/t32.nsys-rep &&
+               -s $OUTPUT_DIR/nsys/t32.q8-audit.csv &&
+               -s $OUTPUT_DIR/nsys/t32.log ]] ||
+                die "reused t32 Nsight evidence is incomplete"
+            if ! validate_audit t32 "$OUTPUT_DIR/nsys/t32.q8-audit.csv"; then
+                printf 'reused nsys variant=t32 has invalid class evidence\n' \
+                    >>"$OUTPUT_DIR/validation-failures.txt"
+            fi
+            continue
+        fi
         set_variant_extra "$variant"
         base="$OUTPUT_DIR/nsys/$variant"
         audit="$base.q8-audit.csv"

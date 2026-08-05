@@ -335,11 +335,15 @@ reorder any home or fixed partner cache candidates.
 The runner requires all four logical home/partner routes to be validated
 `DIRECT`, proves that every candidate run executed only its requested class,
 freezes cache state before timed frontiers, rotates process order, and reports
-every candidate/local throughput ratio. The GPU regression deliberately fills
-a home device's per-device F16 cap and proves bit-exact partner execution for
-the production T32, T256, and shared-down shapes. By default it also captures
-one short, measured-prefill Nsight Systems report for each isolated class so
-transfer, cuBLAS, synchronization, and partner contention can be evaluated.
+every candidate/local throughput ratio. The device audit is bounded, so its
+class-pure sample may be smaller than the uncapped runtime call counter without
+invalidating the run. Full-logit output records numerical drift and top-token
+agreement for every class, while within-variant repeat determinism remains an
+acceptance condition. The GPU regression deliberately fills a home device's
+per-device F16 cap and proves bit-exact partner execution for the production
+T32, T256, and shared-down shapes. By default it also captures one short,
+measured-prefill Nsight Systems report for each isolated class so transfer,
+cuBLAS, synchronization, and partner contention can be evaluated.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -363,6 +367,20 @@ only after all three exactness cases have passed for the current binary.
 variants. Return `q8-partner-offload-ab-<timestamp>.tar.gz`; its
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
+The completed T32 fusion A/B can eliminate redundant local and T32 runs:
+
+```bash
+REUSE_T32_DIR="$PWD/q8-t32-fused-ab-20260805T052315Z" \
+SKIP_BUILD=1 \
+RUN_GPU_TEST=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=3 \
+bash ./speed-bench/cuda-q8-partner-offload-ab.sh
+```
 
 ### T32 FP16-output fusion and partner-transfer A/B
 
@@ -373,6 +391,13 @@ local weights, FP16-output plus fused RMS/RoPE on local weights, established
 FP32-output T32 with partner overflow, and FP16-output/fused T32 with partner
 overflow. The last variant returns an FP16 intermediate over NVLink, halving
 the T32 result transfer before postprocessing on the home GPU.
+
+On the fixed full-Q4 22/21 A/B, T32 partner execution with the established
+FP32 result improved prefill by 12.2--13.5% over local execution and preserved
+the top token at all nine measured frontiers. FP16-output fusion added only
+0.5--1.0% over that partner path, while changing the top token at the 4096
+frontier in every repeat. It therefore remains an opt-in diagnostic and is not
+a production default.
 
 The GPU regression first proves that local and partner FP16 intermediates are
 bit-exact, their final FP32 outputs are bit-exact, the backend-owned scratch

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import json
 import re
 import statistics
 import sys
@@ -35,6 +36,7 @@ runs_path = Path(sys.argv[1])
 out_dir = Path(sys.argv[2])
 samples: dict[tuple[int, str], dict[int, float]] = {}
 evidence: dict[tuple[int, str], dict[str, object]] = {}
+logits_dirs: dict[tuple[int, str], Path] = {}
 with runs_path.open(newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
         repeat = int(row["repeat"])
@@ -45,6 +47,7 @@ with runs_path.open(newline="") as handle:
                 for item in csv.DictReader(csv_file)
             }
         samples[(repeat, variant)] = values
+        logits_dirs[(repeat, variant)] = Path(row["logits"])
 
         calls = 0
         activation_gib = 0.0
@@ -108,8 +111,10 @@ for repeat in repeats:
             status_reasons.append("not_exercised")
         elif not valid:
             status_reasons.append("contaminated")
-        if item["summary_calls"] != item["audit_calls"]:
-            status_reasons.append("count_mismatch")
+        if item["summary_calls"] <= 0:
+            status_reasons.append("missing_runtime_count")
+        if item["audit_calls"] > item["summary_calls"]:
+            status_reasons.append("audit_exceeds_runtime")
         status = "+".join(status_reasons) if status_reasons else "ok"
         class_rows.append(
             {
@@ -118,6 +123,10 @@ for repeat in repeats:
                 "evidence_status": status,
                 "summary_calls": item["summary_calls"],
                 "audit_calls": item["audit_calls"],
+                "audit_coverage": (
+                    float(item["audit_calls"]) / int(item["summary_calls"])
+                    if int(item["summary_calls"]) > 0 else 1.0
+                ),
                 "t32_calls": classes["t32"],
                 "t256_calls": classes["t256"],
                 "shared_down_calls": classes["shared_down"],
@@ -150,6 +159,75 @@ with (out_dir / "class-evidence.csv").open("w", newline="") as handle:
     writer.writeheader()
     writer.writerows(class_rows)
 
+
+def load_logits(directory: Path) -> dict[str, list[float]]:
+    result: dict[str, list[float]] = {}
+    for path in sorted(directory.glob("frontier_*.logits.json")):
+        payload = json.loads(path.read_text())
+        values = payload.get("logits")
+        if not isinstance(values, list):
+            fail(f"missing logits array: {path}")
+        result[path.name] = [float(value) for value in values]
+    if not result:
+        fail(f"no frontier logits in {directory}")
+    return result
+
+
+loaded_logits = {
+    key: load_logits(directory) for key, directory in logits_dirs.items()
+}
+logit_rows: list[dict[str, object]] = []
+for repeat in repeats:
+    local = loaded_logits[(repeat, "local")]
+    for variant in variants:
+        candidate = loaded_logits[(repeat, variant)]
+        if set(candidate) != set(local):
+            fail(f"repeat {repeat} has mismatched {variant}/local logit frontiers")
+        for filename in sorted(local):
+            lhs = candidate[filename]
+            rhs = local[filename]
+            if len(lhs) != len(rhs):
+                fail(f"logit length mismatch: repeat {repeat} {variant} {filename}")
+            deltas = [abs(a - b) for a, b in zip(lhs, rhs)]
+            logit_rows.append({
+                "repeat": repeat,
+                "variant": variant,
+                "frontier": filename,
+                "exact": int(lhs == rhs),
+                "max_abs": max(deltas, default=0.0),
+                "mean_abs": statistics.fmean(deltas) if deltas else 0.0,
+                "top1_equal": int(
+                    max(range(len(lhs)), key=lhs.__getitem__) ==
+                    max(range(len(rhs)), key=rhs.__getitem__)
+                ),
+            })
+
+determinism_rows: list[dict[str, object]] = []
+reference_repeat = repeats[0]
+for repeat in repeats[1:]:
+    for variant in ("local", *variants):
+        reference = loaded_logits[(reference_repeat, variant)]
+        current = loaded_logits[(repeat, variant)]
+        if set(current) != set(reference):
+            fail(f"repeat {repeat} has mismatched {variant} logit frontiers")
+        for filename in sorted(reference):
+            exact = current[filename] == reference[filename]
+            determinism_rows.append({
+                "repeat": repeat,
+                "variant": variant,
+                "frontier": filename,
+                "exact": int(exact),
+            })
+
+with (out_dir / "logit-comparison.csv").open("w", newline="") as handle:
+    writer = csv.DictWriter(handle, fieldnames=list(logit_rows[0]))
+    writer.writeheader()
+    writer.writerows(logit_rows)
+with (out_dir / "logit-determinism.csv").open("w", newline="") as handle:
+    writer = csv.DictWriter(handle, fieldnames=list(determinism_rows[0]))
+    writer.writeheader()
+    writer.writerows(determinism_rows)
+
 lines: list[str] = []
 for variant in variants:
     lines.append(f"[{variant}]")
@@ -172,6 +250,12 @@ for variant in variants:
             f"{class_name}_calls median={statistics.median(values):.1f} "
             f"min={min(values)} max={max(values)}"
         )
+    drift = [row for row in logit_rows if row["variant"] == variant]
+    lines.append(
+        f"logits max_abs={max(float(row['max_abs']) for row in drift):.9g} "
+        f"max_mean_abs={max(float(row['mean_abs']) for row in drift):.9g} "
+        f"top1_equal={sum(int(row['top1_equal']) for row in drift)}/{len(drift)}"
+    )
     lines.append("")
 
 (out_dir / "summary.txt").write_text("\n".join(lines).rstrip() + "\n")

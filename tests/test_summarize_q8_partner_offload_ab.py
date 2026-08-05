@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import json
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,8 @@ def main() -> None:
                 csv_path = stem.with_suffix(".csv")
                 log_path = stem.with_suffix(".log")
                 audit_path = stem.with_suffix(".audit.csv")
+                logits_dir = tmp / f"{variant}-r{repeat}-logits"
+                logits_dir.mkdir()
                 with csv_path.open("w", newline="") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(["ctx_tokens", "prefill_tps"])
@@ -53,15 +56,25 @@ def main() -> None:
                     writer.writerow([8192, 300 + variant_index * 10 + repeat])
                 rows = audit_rows(variant)
                 calls = len(rows)
+                runtime_calls = 5 if variant == "t32" and repeat == 1 else calls
                 log_path.write_text(
                     "" if calls == 0 else
-                    f"ds4: CUDA q8 fp16 partner summary: calls={calls} "
+                    f"ds4: CUDA q8 fp16 partner summary: calls={runtime_calls} "
                     "activation=0.01 GiB result=0.02 GiB\n"
                 )
                 with audit_path.open("w", newline="") as handle:
                     writer = csv.writer(handle)
                     writer.writerow(AUDIT_HEADER)
                     writer.writerows(rows)
+                for frontier in (2048, 8192):
+                    values = [
+                        0.25 + 0.001 * variant_index,
+                        -0.5,
+                        1.0,
+                    ]
+                    (logits_dir / f"frontier_{frontier:06d}.logits.json").write_text(
+                        json.dumps({"ctx_tokens": frontier, "logits": values})
+                    )
                 records.append({
                     "repeat": repeat,
                     "slot": variant_index + 1,
@@ -71,6 +84,7 @@ def main() -> None:
                     "audit": audit_path,
                     "cache_before": "unused",
                     "cache_after": "unused",
+                    "logits": logits_dir,
                 })
         runs = tmp / "runs.tsv"
         with runs.open("w", newline="") as handle:
@@ -86,10 +100,16 @@ def main() -> None:
         )
         paired = list(csv.DictReader((out / "paired-samples.csv").open()))
         evidence = list(csv.DictReader((out / "class-evidence.csv").open()))
+        logits = list(csv.DictReader((out / "logit-comparison.csv").open()))
+        determinism = list(csv.DictReader((out / "logit-determinism.csv").open()))
         assert len(paired) == 2 * 4 * 2
         assert len(evidence) == 2 * 4
+        assert len(logits) == 2 * 4 * 2
+        assert len(determinism) == 5 * 2
+        assert all(row["exact"] == "1" for row in determinism)
         t32 = next(row for row in evidence if row["variant"] == "t32")
         assert t32["evidence_status"] == "ok"
+        assert t32["summary_calls"] == "5" and t32["audit_calls"] == "1"
         assert t32["t32_calls"] == "1" and t32["t256_calls"] == "0"
         legacy = next(row for row in evidence if row["variant"] == "legacy")
         assert legacy["t32_calls"] == "1" and legacy["t256_calls"] == "1"
