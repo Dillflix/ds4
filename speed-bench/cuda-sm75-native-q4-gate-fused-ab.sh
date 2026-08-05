@@ -26,6 +26,7 @@ Optional environment:
   PROFILE_GPU=0
   NCU_USE_SUDO=1
   SKIP_BUILD=0
+  RESUME_NCU_ONLY=0          Reuse GATE_FUSED_DIR; skip build/exact/timing
   CREATE_ARCHIVE=1
   GATE_FUSED_DIR=/absolute/output/directory
 
@@ -60,6 +61,7 @@ PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
 PROFILE_GPU=${PROFILE_GPU:-0}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME_NCU_ONLY=${RESUME_NCU_ONLY:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 GPU_DEVICES=0,3,1,2
 CUDA_ARCH=sm_75
@@ -74,14 +76,16 @@ for item in "HARNESS_REPEATS:$HARNESS_REPEATS" \
             "RUN_E2E_EXACT:$RUN_E2E_EXACT" "RUN_NSYS:$RUN_NSYS" \
             "RUN_NCU:$RUN_NCU" "PROFILE_TOKENS:$PROFILE_TOKENS" \
             "PROFILE_GPU:$PROFILE_GPU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
-            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BUILD:$SKIP_BUILD" "RESUME_NCU_ONLY:$RESUME_NCU_ONLY" \
+            "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( HARNESS_REPEATS > 0 && REPEATS > 0 && CTX_START > 0 && CTX_MAX >= CTX_START &&
    STEP_MUL >= 2 && PREFILL_CHUNK > 0 && PROFILE_TOKENS > 0 )) ||
     die "invalid benchmark shape"
-for flag in RUN_FULL_MODEL RUN_E2E_EXACT RUN_NSYS RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_FULL_MODEL RUN_E2E_EXACT RUN_NSYS RUN_NCU NCU_USE_SUDO \
+            SKIP_BUILD RESUME_NCU_ONLY CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
@@ -111,8 +115,16 @@ for gpu in 0 1 2 3; do
     [[ $cap == 7.5 ]] || die "GPU $gpu is not SM75 (${cap:-unknown})"
 done
 
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
+if [[ $RESUME_NCU_ONLY == 1 ]]; then
+    [[ -n ${GATE_FUSED_DIR:-} && -d $OUTPUT_DIR ]] ||
+        die "RESUME_NCU_ONLY=1 requires an existing GATE_FUSED_DIR"
+    [[ $SKIP_BUILD == 1 && $RUN_NCU == 1 && $RUN_FULL_MODEL == 0 &&
+       $RUN_NSYS == 0 ]] ||
+        die "NCU resume requires SKIP_BUILD=1 RUN_NCU=1 RUN_FULL_MODEL=0 RUN_NSYS=0"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+fi
 mkdir -p "$OUTPUT_DIR"/{validation,screen,runs,nsys,ncu,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 current_phase=initialization
@@ -199,6 +211,7 @@ validate_log() {
         "$log" || die "$variant did not select the requested candidates"
 }
 
+if [[ $RESUME_NCU_ONLY == 0 ]]; then
 if [[ $SKIP_BUILD == 0 ]]; then
     current_phase=build
     make -B -j"$(nproc)" ds4-bench tests/cuda_long_context_smoke \
@@ -571,6 +584,7 @@ for variant in ("baseline", "fixed", "fused"):
 PY
 fi
 fi
+fi
 
 if [[ $RUN_NCU == 1 ]]; then
     current_phase=nsight-compute
@@ -588,8 +602,9 @@ if [[ $RUN_NCU == 1 ]]; then
         local static_kib=$6 dynamic_kib=$7 grid_size=$8
         local base="$OUTPUT_DIR/ncu/$name" rc=0
         printf 'Nsight Compute: %s...\n' "$name"
-        run_harness "$variant" "${ncu_command[@]}" --config-file off \
-            --target-processes application-only --devices 0 \
+        run_harness "$variant" "${ncu_command[@]}" --config-file off --verbose \
+            --target-processes all \
+            --target-processes-filter cuda_sm75_profile_harness --devices 0 \
             --kernel-name-base function --kernel-name "regex:$kernel" \
             --launch-count 1 --replay-mode kernel --cache-control none \
             --clock-control none --force-overwrite --export "$base" \

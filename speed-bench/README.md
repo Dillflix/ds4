@@ -90,6 +90,12 @@ captured early/late production histograms, and records bounded Nsight Compute
 reports. That bounded Gate-only screen is the default (`RUN_FULL_MODEL=0`).
 Model hashing and conversion are deliberately absent.
 
+If only Nsight Compute failed after the bounded screen, set
+`GATE_FUSED_DIR` to that existing result directory and rerun with
+`RESUME_NCU_ONLY=1 SKIP_BUILD=1 RUN_FULL_MODEL=0 RUN_NSYS=0 RUN_NCU=1`.
+The resume profiles all descendants but filters by the exact harness process
+name, avoiding wrapper-process captures without repeating exactness or timing.
+
 Only after the bounded evidence is viable, rerun with `RUN_FULL_MODEL=1`. That
 mode additionally compares raw full-model logits, alternates
 baseline/fixed/fused prefill runs, verifies placement and Q8-cache equivalence,
