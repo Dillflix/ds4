@@ -1996,6 +1996,8 @@ static int run_q8_partner_projection_case(
         ds4_gpu_tensor partner_half; memset(&partner_half, 0, sizeof(partner_half));
         ds4_gpu_tensor local_fused; memset(&local_fused, 0, sizeof(local_fused));
         ds4_gpu_tensor partner_fused; memset(&partner_fused, 0, sizeof(partner_fused));
+        ds4_gpu_tensor local_scratch; memset(&local_scratch, 0, sizeof(local_scratch));
+        ds4_gpu_tensor partner_scratch; memset(&partner_scratch, 0, sizeof(partner_scratch));
         ds4_gpu_tensor reference; memset(&reference, 0, sizeof(reference));
         CHECK(ds4_gpu_tensor_alloc_on(&local_half, 0, half_bytes) == 0 &&
               ds4_gpu_tensor_alloc_on(&partner_half, 0, half_bytes) == 0 &&
@@ -2003,6 +2005,10 @@ static int run_q8_partner_projection_case(
                   &local_fused, 0, output_count * sizeof(float)) == 0 &&
               ds4_gpu_tensor_alloc_on(
                   &partner_fused, 0, output_count * sizeof(float)) == 0 &&
+              ds4_gpu_tensor_alloc_on(
+                  &local_scratch, 0, output_count * sizeof(float)) == 0 &&
+              ds4_gpu_tensor_alloc_on(
+                  &partner_scratch, 0, output_count * sizeof(float)) == 0 &&
               ds4_gpu_tensor_alloc_on(
                   &reference, 0, output_count * sizeof(float)) == 0,
               "T32 fused device allocations");
@@ -2086,10 +2092,46 @@ static int run_q8_partner_projection_case(
                      (size_t)output_count * sizeof(float)) == 0,
               "T32 half-input fused postprocess matches FP32 reference");
 
+        /* Production CUDA graphs do not own Apple's persistent q_half
+         * tensor.  A null intermediate must therefore select the backend's
+         * per-tier scratch without changing either local or partner output. */
+        CHECK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                  &local_scratch, NULL,
+                  model, model_size, 0u, in_dim, out_dim, &input,
+                  (uint32_t)n_tok, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 local fused projection with backend scratch");
+        CHECK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                  &partner_scratch, NULL,
+                  model, model_size, weight_bytes, in_dim, out_dim, &input,
+                  (uint32_t)n_tok, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 partner fused projection with backend scratch");
+        CHECK(ds4_gpu_tensor_read(
+                  &local_scratch, 0, host_local_fused,
+                  output_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  &partner_scratch, 0, host_partner_fused,
+                  output_count * sizeof(float)),
+              "T32 backend-scratch fused output read");
+        CHECK(memcmp(host_local_fused, host_reference,
+                     (size_t)output_count * sizeof(float)) == 0 &&
+              memcmp(host_partner_fused, host_reference,
+                     (size_t)output_count * sizeof(float)) == 0,
+              "T32 backend-scratch local/partner outputs are exact");
+        CHECK(ds4_gpu_q8_f16_partner_offload_count() == 3u,
+              "T32 backend-scratch helper executed once on the partner");
+
         ds4_gpu_tensor_free_in_place(&local_half);
         ds4_gpu_tensor_free_in_place(&partner_half);
         ds4_gpu_tensor_free_in_place(&local_fused);
         ds4_gpu_tensor_free_in_place(&partner_fused);
+        ds4_gpu_tensor_free_in_place(&local_scratch);
+        ds4_gpu_tensor_free_in_place(&partner_scratch);
         ds4_gpu_tensor_free_in_place(&reference);
         free(host_local_half);
         free(host_partner_half);

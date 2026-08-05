@@ -17,7 +17,12 @@ STEP_MUL=${STEP_MUL:-2}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 REPEATS=${REPEATS:-3}
 RUN_NSYS=${RUN_NSYS:-1}
-NSYS_VARIANTS=${NSYS_VARIANTS:-old_local,new_local,old_partner,new_partner}
+REUSE_OLD_DIR=${REUSE_OLD_DIR:-}
+if [[ -n $REUSE_OLD_DIR ]]; then
+    NSYS_VARIANTS=${NSYS_VARIANTS:-new_local,new_partner}
+else
+    NSYS_VARIANTS=${NSYS_VARIANTS:-old_local,new_local,old_partner,new_partner}
+fi
 PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
 SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_GPU_TEST=${RUN_GPU_TEST:-1}
@@ -27,6 +32,24 @@ OUTPUT_DIR=${T32_FUSED_AB_DIR:-$repo_dir/q8-t32-fused-ab-$stamp}
 variants=(old_local new_local old_partner new_partner)
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
+if [[ -n $REUSE_OLD_DIR ]]; then
+    [[ $REUSE_OLD_DIR == /* && -d $REUSE_OLD_DIR ]] ||
+        die "REUSE_OLD_DIR must name an existing absolute result directory"
+    REUSE_OLD_DIR=$(cd "$REUSE_OLD_DIR" && pwd)
+    [[ -s $REUSE_OLD_DIR/manifest.txt && -s $REUSE_OLD_DIR/runs.tsv ]] ||
+        die "REUSE_OLD_DIR lacks manifest.txt or runs.tsv"
+    grep -Fqx -- "model=$MODEL" "$REUSE_OLD_DIR/manifest.txt" ||
+        die "REUSE_OLD_DIR used a different model"
+    grep -Fqx -- "gpu_devices=$GPU_DEVICES" "$REUSE_OLD_DIR/manifest.txt" ||
+        die "REUSE_OLD_DIR used different GPU devices"
+    grep -Fqx -- "stage_split=$STAGE_SPLIT/$((43-STAGE_SPLIT))" \
+        "$REUSE_OLD_DIR/manifest.txt" ||
+        die "REUSE_OLD_DIR used a different stage split"
+    reused_repeats=$(awk -F= '$1 == "repeats" { print $2; exit }' \
+        "$REUSE_OLD_DIR/manifest.txt")
+    [[ $reused_repeats =~ ^[0-9]+$ ]] && (( reused_repeats >= REPEATS )) ||
+        die "REUSE_OLD_DIR has fewer than $REPEATS repeats"
+fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
             "CTX_MAX:$CTX_MAX" "STEP_MUL:$STEP_MUL" \
             "PREFILL_CHUNK:$PREFILL_CHUNK" "REPEATS:$REPEATS" \
@@ -129,10 +152,10 @@ validate_variant() {
             (( total == 0 && fused_local > 0 && fused_partner == 0 && partner_calls == 0 )) ;;
         old_partner)
             (( t32 > 0 && other == 0 && fused_local == 0 && fused_partner == 0 &&
-               partner_calls == t32 && f16_calls == 0 )) ;;
+               partner_calls > 0 && f16_calls == 0 )) ;;
         new_partner)
             (( t32 > 0 && other == 0 && fused_local > 0 && fused_partner > 0 &&
-               partner_calls == t32 && f16_calls == partner_calls &&
+               partner_calls > 0 && f16_calls == partner_calls &&
                fused_partner == partner_calls )) ;;
     esac
 }
@@ -164,12 +187,17 @@ phase=manifest
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
     printf 'gpu_devices=%s\nstage_split=%s/%s\nrepeats=%s\nmodel_hashing=disabled\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$REPEATS"
+    printf 'reuse_old_dir=%s\n' "${REUSE_OLD_DIR:-none}"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free \
         --format=csv
     nvidia-smi topo -m
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+if [[ -n $REUSE_OLD_DIR ]]; then
+    cp "$REUSE_OLD_DIR/manifest.txt" \
+        "$OUTPUT_DIR/provenance/reused-old-manifest.txt"
+fi
 printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tcache_before\tcache_after\tlogits\n' \
     >"$OUTPUT_DIR/runs.tsv"
 : >"$OUTPUT_DIR/validation-failures.txt"
@@ -190,6 +218,31 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         mkdir -p "$logits"
         printf 'Benchmarking %s repeat=%d/%d slot=%d/4...\n' \
             "$variant" "$repeat" "$REPEATS" "$((slot+1))"
+        if [[ -n $REUSE_OLD_DIR && $variant == old_* ]]; then
+            source_stem="$REUSE_OLD_DIR/runs/$stem"
+            for suffix in csv log q8-audit.csv cache-before.csv cache-after.csv; do
+                [[ -s $source_stem.$suffix ]] ||
+                    die "reused result is missing $source_stem.$suffix"
+            done
+            source_logits="$REUSE_OLD_DIR/logits/$stem"
+            [[ -d $source_logits ]] || die "reused logits are missing: $source_logits"
+            cp "$source_stem.csv" "$csv"
+            cp "$source_stem.log" "$log"
+            cp "$source_stem.q8-audit.csv" "$audit"
+            cp "$source_stem.cache-before.csv" "$before"
+            cp "$source_stem.cache-after.csv" "$after"
+            cp -a "$source_logits/." "$logits/"
+            cmp -s "$before" "$after" || die "$stem changed cache during timing"
+            if ! validate_variant "$variant" "$audit" "$log"; then
+                printf 'reused benchmark repeat=%s variant=%s failed path validation\n' \
+                    "$repeat" "$variant" >>"$OUTPUT_DIR/validation-failures.txt"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$repeat" "$((slot+1))" "$variant" "$csv" "$log" "$audit" \
+                "$before" "$after" "$logits" >>"$OUTPUT_DIR/runs.tsv"
+            cat "$csv"
+            continue
+        fi
         "${clean[@]}" "${variant_env[@]}" \
             "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT" \
             DS4_CUDA_PREFILL_PIPELINE=1 DS4_CUDA_PREFILL_PIPELINE_MB=512 \
@@ -236,6 +289,14 @@ awk -F, 'NR > 1 && $4 == 1 && $5 != 1 {
 if [[ $RUN_NSYS == 1 ]]; then
     phase=nsight-systems
     command -v nsys >/dev/null 2>&1 || die "Nsight Systems CLI not found"
+    if [[ -n $REUSE_OLD_DIR && -d $REUSE_OLD_DIR/nsys ]]; then
+        for variant in old_local old_partner; do
+            for source in "$REUSE_OLD_DIR"/nsys/"$variant"*; do
+                [[ -e $source ]] || continue
+                cp -a "$source" "$OUTPUT_DIR/nsys/"
+            done
+        done
+    fi
     for variant in "${nsys_variants[@]}"; do
         set_variant_env "$variant"
         base="$OUTPUT_DIR/nsys/$variant"; audit="$base.q8-audit.csv"

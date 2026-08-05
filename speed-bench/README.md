@@ -375,13 +375,14 @@ overflow. The last variant returns an FP16 intermediate over NVLink, halving
 the T32 result transfer before postprocessing on the home GPU.
 
 The GPU regression first proves that local and partner FP16 intermediates are
-bit-exact, their final FP32 outputs are bit-exact, and the new half-input
-RMS/RoPE kernel is bit-exact with the established combined FP32 kernel after
-the same FP16 rounding. The end-to-end runner requires old local/partner and
-new local/partner logits to match within each arithmetic policy. It records,
-but does not require, bit identity between the old and new policies because
-the new cuBLAS output is deliberately rounded to FP16. All four short Nsight
-Systems traces are enabled by default.
+bit-exact, their final FP32 outputs are bit-exact, the backend-owned scratch
+path used by CUDA graphs is exact, and the new half-input RMS/RoPE kernel is
+bit-exact with the established combined FP32 kernel after the same FP16
+rounding. End-to-end cross-policy logits are reported rather than required to
+match: partner VRAM changes which Q8 tensors receive cached FP16 weights, and
+the fused helper deliberately changes its projection-output boundary from
+FP32 to FP16. The runner instead requires exact repeat determinism within each
+variant. All four short Nsight Systems traces are enabled by default.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -401,6 +402,22 @@ bash ./speed-bench/cuda-q8-t32-fused-ab.sh
 
 Return `q8-t32-fused-ab-<timestamp>.tar.gz`. Set `RUN_NSYS=0` only for a
 throughput-only rerun after the execution-path validations have passed.
+After a complete four-variant run, a code-only fused-path correction can reuse
+the unaffected old variants and capture only the new variants:
+
+```bash
+REUSE_OLD_DIR="$PWD/q8-t32-fused-ab-<old-timestamp>" \
+NSYS_VARIANTS=new_local,new_partner \
+SKIP_BUILD=0 \
+RUN_GPU_TEST=1 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=3 \
+bash ./speed-bench/cuda-q8-t32-fused-ab.sh
+```
 
 ### Production scalar-slot evidence
 

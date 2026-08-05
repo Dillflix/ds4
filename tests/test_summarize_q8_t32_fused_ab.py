@@ -63,9 +63,18 @@ def main() -> None:
         paired = list(csv.DictReader((out / "paired-samples.csv").open()))
         logits = list(csv.DictReader((out / "logit-comparison.csv").open()))
         assert len(paired) == 2 * 5 * 2
-        assert len(logits) == 2 * 3 * 2
+        # Four cross-policy comparisons per repeat/frontier, plus one
+        # repeat-determinism comparison per variant/frontier.
+        assert len(logits) == (2 * 4 * 2) + (4 * 2)
         required = [row for row in logits if row["required_exact"] == "1"]
         assert required and all(row["exact"] == "1" for row in required)
+        assert all("_r2_vs_r1" in row["comparison"] for row in required)
+        cross_policy = [
+            row for row in logits if "_r2_vs_r1" not in row["comparison"]
+        ]
+        assert cross_policy and all(
+            row["required_exact"] == "0" for row in cross_policy
+        )
         drift = [
             row for row in logits
             if row["comparison"] == "new_local_vs_old_local"

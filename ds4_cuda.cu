@@ -31733,7 +31733,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     const char *fused_env = getenv("DS4_CUDA_T32_F16_FUSED");
     if (!fused_env || !fused_env[0] || strcmp(fused_env, "0") == 0 ||
         getenv("DS4_CUDA_NO_T32_F16_FUSED") != NULL ||
-        !g_cublas_ready || !out || !q_half || !x || !model_map ||
+        !g_cublas_ready || !out || !x || !model_map ||
         n_tok <= 1u || n_head == 0u || head_dim == 0u ||
         in_dim == 0u || out_dim == 0u ||
         in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
@@ -31745,14 +31745,16 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         (uint64_t)n_tok > UINT64_MAX / out_dim ||
         (uint64_t)n_tok * out_dim > UINT64_MAX / sizeof(float) ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
-        q_half->bytes < (uint64_t)n_tok * out_dim * sizeof(__half)) {
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
     if (logical_tier < 0 || logical_tier >= g_n_gpus ||
-        ds4_tensor_device_idx(q_half) != logical_tier ||
         ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const uint64_t qh_count = (uint64_t)n_tok * out_dim;
+    const uint64_t qh_bytes = qh_count * sizeof(__half);
+    if (q_half && (q_half->bytes < qh_bytes ||
+                   ds4_tensor_device_idx(q_half) != logical_tier)) return 0;
     const int physical_device = g_n_gpus > 1
         ? g_gpu[logical_tier].device_id : 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;
@@ -31765,14 +31767,32 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
     int projected = 0;
     int partner_projected = 0;
+    ds4_gpu_tensor scratch_q_half = {};
+    ds4_gpu_tensor *q_half_eff = q_half;
     const __half *w_f16 = cuda_q8_f16_ptr(
         model_map, weight_offset, weight_bytes, in_dim, out_dim,
         physical_device, "attn_q_b");
     if (w_f16) {
         const uint64_t xh_count = (uint64_t)n_tok * in_dim;
-        __half *xh = (__half *)cuda_tmp_alloc_on(
-            logical_tier, xh_count * sizeof(__half),
-            "attn q_b f16 activations");
+        const uint64_t xh_bytes = xh_count * sizeof(__half);
+        __half *xh = NULL;
+        if (!q_half_eff) {
+            const uint64_t xh_offset = (qh_bytes + 255u) & ~UINT64_C(255);
+            if (xh_offset > UINT64_MAX - xh_bytes) return 0;
+            unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
+                logical_tier, xh_offset + xh_bytes,
+                "attn q_b f16 output and activations");
+            if (!scratch) return 0;
+            scratch_q_half.ptr = scratch;
+            scratch_q_half.bytes = qh_bytes;
+            scratch_q_half.owner = 0;
+            scratch_q_half.device_id = logical_tier;
+            q_half_eff = &scratch_q_half;
+            xh = (__half *)(scratch + xh_offset);
+        } else {
+            xh = (__half *)cuda_tmp_alloc_on(
+                logical_tier, xh_bytes, "attn q_b f16 activations");
+        }
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
             xh, (const float *)x->ptr, xh_count);
@@ -31788,7 +31808,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
             w_f16, CUDA_R_16F, (int)in_dim,
             xh, CUDA_R_16F, (int)in_dim,
             &beta,
-            q_half->ptr, CUDA_R_16F, (int)out_dim,
+            q_half_eff->ptr, CUDA_R_16F, (int)out_dim,
             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
         if (st != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr,
@@ -31799,8 +31819,18 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         }
         projected = 1;
     } else {
+        if (!q_half_eff) {
+            void *scratch = cuda_tmp_alloc_on(
+                logical_tier, qh_bytes, "attn q_b partner f16 output");
+            if (!scratch) return 0;
+            scratch_q_half.ptr = scratch;
+            scratch_q_half.bytes = qh_bytes;
+            scratch_q_half.owner = 0;
+            scratch_q_half.device_id = logical_tier;
+            q_half_eff = &scratch_q_half;
+        }
         partner_projected = cuda_q8_f16_partner_matmul_impl(
-            q_half, x, model_map, weight_offset, weight_bytes,
+            q_half_eff, x, model_map, weight_offset, weight_bytes,
             in_dim, out_dim, n_tok, logical_tier, physical_device,
             "attn_q_b", 1);
         projected = partner_projected;
@@ -31809,7 +31839,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
     const uint32_t postprocess_rows = (uint32_t)((uint64_t)n_tok * n_head);
     head_rms_norm_rope_tail_from_half_kernel<<<postprocess_rows, 256>>>(
-        (float *)out->ptr, (const __half *)q_half->ptr,
+        (float *)out->ptr, (const __half *)q_half_eff->ptr,
         n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
         inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
         attn_factor, beta_fast, beta_slow, eps);

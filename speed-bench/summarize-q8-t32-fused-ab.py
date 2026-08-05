@@ -78,18 +78,22 @@ def load_logits(directory: Path) -> dict[str, list[float]]:
 
 
 logit_rows: list[dict[str, object]] = []
+loaded_by_run: dict[tuple[int, str], dict[str, list[float]]] = {}
 for repeat in repeats:
     loaded = {
         variant: load_logits(logits_dirs[(repeat, variant)])
         for variant in variants
     }
+    for variant, values in loaded.items():
+        loaded_by_run[(repeat, variant)] = values
     files = set(loaded["old_local"])
     if any(set(loaded[variant]) != files for variant in variants[1:]):
         fail(f"repeat {repeat} has mismatched logit frontiers")
     for name, lhs_name, rhs_name, require_exact in (
-        ("old_partner_vs_old_local", "old_partner", "old_local", True),
-        ("new_partner_vs_new_local", "new_partner", "new_local", True),
+        ("old_partner_vs_old_local", "old_partner", "old_local", False),
+        ("new_partner_vs_new_local", "new_partner", "new_local", False),
         ("new_local_vs_old_local", "new_local", "old_local", False),
+        ("new_partner_vs_old_partner", "new_partner", "old_partner", False),
     ):
         for filename in sorted(files):
             lhs = loaded[lhs_name][filename]
@@ -108,6 +112,40 @@ for repeat in repeats:
                 "mean_abs": statistics.fmean(deltas) if deltas else 0.0,
                 "top1_equal": int(max(range(len(lhs)), key=lhs.__getitem__) ==
                                   max(range(len(rhs)), key=rhs.__getitem__)),
+            })
+
+# Cross-policy comparisons above deliberately report drift without demanding
+# bit identity: partner VRAM changes Q8->F16 cache coverage, and the fused path
+# changes the projection output boundary from FP32 to FP16.  Exact output is
+# enforced by the synthetic same-weight GPU regression.  Here, the meaningful
+# end-to-end exactness condition is repeat determinism within each policy.
+reference_repeat = repeats[0]
+for repeat in repeats[1:]:
+    for variant in variants:
+        reference = loaded_by_run[(reference_repeat, variant)]
+        current = loaded_by_run[(repeat, variant)]
+        if set(current) != set(reference):
+            fail(f"repeat {repeat} has mismatched {variant} logit frontiers")
+        for filename in sorted(reference):
+            lhs = current[filename]
+            rhs = reference[filename]
+            if len(lhs) != len(rhs):
+                fail(f"logit length mismatch: {variant} repeat {repeat} {filename}")
+            deltas = [abs(a - b) for a, b in zip(lhs, rhs)]
+            logit_rows.append({
+                "repeat": repeat,
+                "comparison": (
+                    f"{variant}_r{repeat}_vs_r{reference_repeat}"
+                ),
+                "frontier": filename,
+                "required_exact": 1,
+                "exact": int(lhs == rhs),
+                "max_abs": max(deltas, default=0.0),
+                "mean_abs": statistics.fmean(deltas) if deltas else 0.0,
+                "top1_equal": int(
+                    max(range(len(lhs)), key=lhs.__getitem__) ==
+                    max(range(len(rhs)), key=rhs.__getitem__)
+                ),
             })
 
 with (out_dir / "logit-comparison.csv").open("w", newline="") as handle:
@@ -133,13 +171,21 @@ for name, _, _ in comparisons:
             f"min={min(ratios):.5f} max={max(ratios):.5f} n={len(ratios)}"
         )
     lines.append("")
-drift = [
-    row for row in logit_rows
-    if row["comparison"] == "new_local_vs_old_local"
-]
-lines.append("[new-local numerical drift versus old-local]")
-lines.append(f"max_abs={max(float(row['max_abs']) for row in drift):.9g}")
-lines.append(f"max_mean_abs={max(float(row['mean_abs']) for row in drift):.9g}")
-lines.append(f"top1_equal={sum(int(row['top1_equal']) for row in drift)}/{len(drift)}")
+for comparison, heading in (
+    ("new_local_vs_old_local", "new-local numerical drift versus old-local"),
+    ("old_partner_vs_old_local", "old-partner numerical drift versus old-local"),
+    ("new_partner_vs_new_local", "new-partner numerical drift versus new-local"),
+    ("new_partner_vs_old_partner", "new-partner numerical drift versus old-partner"),
+):
+    drift = [
+        row for row in logit_rows
+        if row["comparison"] == comparison
+    ]
+    lines.append(f"[{heading}]")
+    lines.append(f"max_abs={max(float(row['max_abs']) for row in drift):.9g}")
+    lines.append(f"max_mean_abs={max(float(row['mean_abs']) for row in drift):.9g}")
+    lines.append(
+        f"top1_equal={sum(int(row['top1_equal']) for row in drift)}/{len(drift)}"
+    )
 (out_dir / "summary.txt").write_text("\n".join(lines) + "\n")
 print("\n".join(lines))
