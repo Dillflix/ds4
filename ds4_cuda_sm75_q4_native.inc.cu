@@ -330,7 +330,7 @@ __global__ static void moe_down_sm75_native_q4_owned_packed_kernel(
 
 /* Packed-A/W, scalar-slot, 16-warp gate/up tile8.  TILE_DELTA is 0 or 8
  * when a real tile16 entry is consumed and 0 for a real tail entry. */
-template <uint32_t ROW_SPAN, uint32_t TILE_DELTA>
+template <uint32_t ROW_SPAN, uint32_t TILE_DELTA, uint32_t FIXED_XQ_BLOCKS>
 __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
         float *gate_out, float *up_out, float *mid_out,
         const char *gate_base, const char *up_base,
@@ -341,8 +341,12 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
         const float *weights, uint32_t xq_blocks,
         uint32_t expert_mid_dim, uint32_t n_expert,
         uint32_t write_aux, float clamp) {
+    static_assert(FIXED_XQ_BLOCKS == 0u || FIXED_XQ_BLOCKS == 16u,
+                  "native Q4 tile8 supports dynamic K or fixed K16");
+    const uint32_t k_blocks = FIXED_XQ_BLOCKS ? FIXED_XQ_BLOCKS : xq_blocks;
     const uint32_t tile = blockIdx.y;
-    if (tile >= *tile_total) return;
+    if (tile >= *tile_total ||
+        (FIXED_XQ_BLOCKS && xq_blocks != FIXED_XQ_BLOCKS)) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t expert = tile_experts[tile];
@@ -364,14 +368,14 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
     __syncthreads();
     const uint32_t np = s_np;
     const uint32_t words = (uint32_t)(sizeof(cuda_sm75_native_q8_K) / 4u);
-    const uint32_t words_per_tok = xq_blocks * words;
+    const uint32_t words_per_tok = k_blocks * words;
     for (uint32_t i = threadIdx.x; i < 8u * words_per_tok;
          i += blockDim.x) {
         const uint32_t p = i / words_per_tok;
         const uint32_t w = i - p * words_per_tok;
         ((uint32_t *)sxq[p])[w] = p < np ?
             ((const uint32_t *)(xq +
-                (uint64_t)s_tok[p] * xq_blocks))[w] : 0u;
+                (uint64_t)s_tok[p] * k_blocks))[w] : 0u;
     }
     __syncthreads();
     const uint32_t mtok = lane >> 2u;
@@ -387,13 +391,13 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile8_kernel(
         const uint64_t native_tile =
             (uint64_t)expert * (expert_mid_dim / 8u) + row0 / 8u;
         const cuda_sm75_native_q8_K *a = &sxq[mtok][0];
-        for (uint32_t b = 0; b < xq_blocks; b++) {
+        for (uint32_t b = 0; b < k_blocks; b++) {
             const cuda_sm75_native_q4_tile *gw =
                 (const cuda_sm75_native_q4_tile *)gate_base +
-                native_tile * xq_blocks + b;
+                native_tile * k_blocks + b;
             const cuda_sm75_native_q4_tile *uw =
                 (const cuda_sm75_native_q4_tile *)up_base +
-                native_tile * xq_blocks + b;
+                native_tile * k_blocks + b;
             const uint4 gh0 = gw->hdr[n0], gh1 = gw->hdr[n0 + 1u];
             const uint4 uh0 = uw->hdr[n0], uh1 = uw->hdr[n0 + 1u];
             int gi0 = 0, gi1 = 0, gm0 = 0, gm1 = 0;
@@ -698,20 +702,20 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_stream7_kernel(
     }
 }
 
-/* Full-resident native-Q4 tile16 for SM75.  Turing can opt a block into
+/* Full-resident, per-row fused native-Q4 tile16 for SM75.  Turing can opt a block into
  * exactly 64 KiB of shared memory.  That is enough for the complete packed
  * MMA payload of 16 activation rows x 16 Q8_K blocks, but not for the small
  * d/bsums metadata.  Keeping every low/high fragment resident is the
  * important boundary: metadata remains on the read-only path while no
  * activation payload load appears in the repeated output-row loop.
  *
- * Gate and up execute as two phases.  This holds the live accumulator set to
- * one matrix at a time, while every Q4 fragment is still shared by the low8
- * and high8 token halves.  gate_out is valid scratch even when write_aux is
- * false, and the phase barrier prevents the compiler from extending the gate
- * accumulator lifetime through the up phase. */
+ * Each output-row group completes Gate and then Up before moving to the next
+ * row group.  Only the four reduced Gate scalars remain live through the Up
+ * dot product; Gate's 32 scalar-slot accumulators die in their lexical scope.
+ * This preserves low8/high8 weight reuse without the rejected full64 kernel's
+ * global Gate scratch, CTA barrier, or second pass over every output row. */
 template <uint32_t ROW_SPAN>
-__global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel(
+__global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel(
         float *gate_out, float *up_out, float *mid_out,
         const char *gate_base, const char *up_base,
         const cuda_sm75_native_q8_K *xq,
@@ -777,127 +781,99 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel(
     const uint32_t n0 = (lane & 3u) * 2u;
     const uint32_t row_stride = (blockDim.x >> 5u) * 8u;
 
-    /* Gate phase. */
     for (uint32_t base = 0; base < ROW_SPAN; base += row_stride) {
         const uint32_t row0 = blockIdx.x * ROW_SPAN + base + warp * 8u;
         const bool active = base + warp * 8u < ROW_SPAN &&
                             row0 < expert_mid_dim;
         const uint32_t compute_row0 = active ? row0 : 0u;
-        DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
-        DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
-        DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
-        DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
-        for (uint32_t b = 0; b < 16u; b++) {
-            float v00, v01, v10, v11;
-            moe_sm75_native_q4_pair_block(
-                gate_base,
-                sxq[p0 * 16u + b].low,
-                sxq[p0 * 16u + b].high_signed,
-                sxq[p1 * 16u + b].low,
-                sxq[p1 * 16u + b].high_signed,
-                meta0 + b, meta1 + b, have0, have1, b, 16u,
-                expert, expert_mid_dim, compute_row0, lane,
-                v00, v01, v10, v11);
-            switch (b & 7u) {
-                DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
-            }
-        }
         float g0, g1, g2, g3;
-        DS4_SM75_NATIVE_REDUCE(s0,g0); DS4_SM75_NATIVE_REDUCE(s1,g1);
-        DS4_SM75_NATIVE_REDUCE(s2,g2); DS4_SM75_NATIVE_REDUCE(s3,g3);
-        if (active) {
-            if (have0) {
-                const uint32_t r0 = row0 + n0, r1 = r0 + 1u;
-                if (clamp > 1.0e-6f) {
-                    if (g0 > clamp) g0 = clamp;
-                    if (g1 > clamp) g1 = clamp;
+        {
+            DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
+            DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
+            DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
+            DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
+            for (uint32_t b = 0; b < 16u; b++) {
+                float v00, v01, v10, v11;
+                moe_sm75_native_q4_pair_block(
+                    gate_base,
+                    sxq[p0 * 16u + b].low,
+                    sxq[p0 * 16u + b].high_signed,
+                    sxq[p1 * 16u + b].low,
+                    sxq[p1 * 16u + b].high_signed,
+                    meta0 + b, meta1 + b, have0, have1, b, 16u,
+                    expert, expert_mid_dim, compute_row0, lane,
+                    v00, v01, v10, v11);
+                switch (b & 7u) {
+                    DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
                 }
-                if (r0 < expert_mid_dim)
-                    gate_out[(uint64_t)pair0 * expert_mid_dim + r0] = g0;
-                if (r1 < expert_mid_dim)
-                    gate_out[(uint64_t)pair0 * expert_mid_dim + r1] = g1;
             }
-            if (have1) {
-                const uint32_t r0 = row0 + n0, r1 = r0 + 1u;
-                if (clamp > 1.0e-6f) {
-                    if (g2 > clamp) g2 = clamp;
-                    if (g3 > clamp) g3 = clamp;
-                }
-                if (r0 < expert_mid_dim)
-                    gate_out[(uint64_t)pair1 * expert_mid_dim + r0] = g2;
-                if (r1 < expert_mid_dim)
-                    gate_out[(uint64_t)pair1 * expert_mid_dim + r1] = g3;
-            }
-        }
-    }
-    __syncthreads();
-
-    /* Up phase and fused SiLU/product epilogue. */
-    for (uint32_t base = 0; base < ROW_SPAN; base += row_stride) {
-        const uint32_t row0 = blockIdx.x * ROW_SPAN + base + warp * 8u;
-        const bool active = base + warp * 8u < ROW_SPAN &&
-                            row0 < expert_mid_dim;
-        const uint32_t compute_row0 = active ? row0 : 0u;
-        DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
-        DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
-        DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
-        DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
-        for (uint32_t b = 0; b < 16u; b++) {
-            float v00, v01, v10, v11;
-            moe_sm75_native_q4_pair_block(
-                up_base,
-                sxq[p0 * 16u + b].low,
-                sxq[p0 * 16u + b].high_signed,
-                sxq[p1 * 16u + b].low,
-                sxq[p1 * 16u + b].high_signed,
-                meta0 + b, meta1 + b, have0, have1, b, 16u,
-                expert, expert_mid_dim, compute_row0, lane,
-                v00, v01, v10, v11);
-            switch (b & 7u) {
-                DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
-                DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
-            }
+            DS4_SM75_NATIVE_REDUCE(s0,g0); DS4_SM75_NATIVE_REDUCE(s1,g1);
+            DS4_SM75_NATIVE_REDUCE(s2,g2); DS4_SM75_NATIVE_REDUCE(s3,g3);
         }
         float u0, u1, u2, u3;
-        DS4_SM75_NATIVE_REDUCE(s0,u0); DS4_SM75_NATIVE_REDUCE(s1,u1);
-        DS4_SM75_NATIVE_REDUCE(s2,u2); DS4_SM75_NATIVE_REDUCE(s3,u3);
+        {
+            DS4_SM75_NATIVE_SLOT4_DECL(0); DS4_SM75_NATIVE_SLOT4_DECL(1);
+            DS4_SM75_NATIVE_SLOT4_DECL(2); DS4_SM75_NATIVE_SLOT4_DECL(3);
+            DS4_SM75_NATIVE_SLOT4_DECL(4); DS4_SM75_NATIVE_SLOT4_DECL(5);
+            DS4_SM75_NATIVE_SLOT4_DECL(6); DS4_SM75_NATIVE_SLOT4_DECL(7);
+            for (uint32_t b = 0; b < 16u; b++) {
+                float v00, v01, v10, v11;
+                moe_sm75_native_q4_pair_block(
+                    up_base,
+                    sxq[p0 * 16u + b].low,
+                    sxq[p0 * 16u + b].high_signed,
+                    sxq[p1 * 16u + b].low,
+                    sxq[p1 * 16u + b].high_signed,
+                    meta0 + b, meta1 + b, have0, have1, b, 16u,
+                    expert, expert_mid_dim, compute_row0, lane,
+                    v00, v01, v10, v11);
+                switch (b & 7u) {
+                    DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(3,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(4,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(5,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(6,v00,v01,v10,v11);
+                    DS4_SM75_NATIVE_SLOT4_ADD(7,v00,v01,v10,v11);
+                }
+            }
+            DS4_SM75_NATIVE_REDUCE(s0,u0); DS4_SM75_NATIVE_REDUCE(s1,u1);
+            DS4_SM75_NATIVE_REDUCE(s2,u2); DS4_SM75_NATIVE_REDUCE(s3,u3);
+        }
         if (active) {
             if (have0) {
                 const uint32_t r0 = row0 + n0, r1 = r0 + 1u;
                 const float scale = weights[(uint64_t)tok0 * n_expert + slot0];
                 if (r0 < expert_mid_dim) {
+                    float g = g0;
                     float u = u0;
                     if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
                         if (u > clamp) u = clamp;
                         if (u < -clamp) u = -clamp;
                     }
                     const uint64_t off = (uint64_t)pair0 * expert_mid_dim + r0;
-                    const float g = gate_out[off];
-                    if (write_aux) up_out[off] = u;
+                    if (write_aux) { gate_out[off] = g; up_out[off] = u; }
                     mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
                 }
                 if (r1 < expert_mid_dim) {
+                    float g = g1;
                     float u = u1;
                     if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
                         if (u > clamp) u = clamp;
                         if (u < -clamp) u = -clamp;
                     }
                     const uint64_t off = (uint64_t)pair0 * expert_mid_dim + r1;
-                    const float g = gate_out[off];
-                    if (write_aux) up_out[off] = u;
+                    if (write_aux) { gate_out[off] = g; up_out[off] = u; }
                     mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
                 }
             }
@@ -905,25 +881,27 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel(
                 const uint32_t r0 = row0 + n0, r1 = r0 + 1u;
                 const float scale = weights[(uint64_t)tok1 * n_expert + slot1];
                 if (r0 < expert_mid_dim) {
+                    float g = g2;
                     float u = u2;
                     if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
                         if (u > clamp) u = clamp;
                         if (u < -clamp) u = -clamp;
                     }
                     const uint64_t off = (uint64_t)pair1 * expert_mid_dim + r0;
-                    const float g = gate_out[off];
-                    if (write_aux) up_out[off] = u;
+                    if (write_aux) { gate_out[off] = g; up_out[off] = u; }
                     mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
                 }
                 if (r1 < expert_mid_dim) {
+                    float g = g3;
                     float u = u3;
                     if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
                         if (u > clamp) u = clamp;
                         if (u < -clamp) u = -clamp;
                     }
                     const uint64_t off = (uint64_t)pair1 * expert_mid_dim + r1;
-                    const float g = gate_out[off];
-                    if (write_aux) up_out[off] = u;
+                    if (write_aux) { gate_out[off] = g; up_out[off] = u; }
                     mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
                 }
             }

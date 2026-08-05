@@ -23,6 +23,9 @@ def main() -> int:
     parser.add_argument("device")
     parser.add_argument("--process", default="ds4-bench")
     parser.add_argument("--block-size", type=int)
+    parser.add_argument("--grid-size", type=int)
+    parser.add_argument("--static-shared-kib", type=float)
+    parser.add_argument("--dynamic-shared-kib", type=float)
     args = parser.parse_args()
 
     try:
@@ -88,11 +91,50 @@ def main() -> int:
                 f"{args.block_size}"
             )
 
+    if args.grid_size is not None:
+        grid_text = (row.get("launch__grid_size") or "").strip()
+        try:
+            grid_size = int(grid_text.replace(",", ""))
+        except ValueError:
+            fail(f"invalid launch__grid_size value: {grid_text!r}")
+        if grid_size != args.grid_size:
+            fail(
+                f"profiled grid size is {grid_size}, expected "
+                f"{args.grid_size}"
+            )
+
+    def check_shared(column: str, expected: float, label: str) -> None:
+        value_text = (row.get(column) or "").strip()
+        try:
+            value = float(value_text.replace(",", ""))
+        except ValueError:
+            fail(f"invalid {column} value: {value_text!r}")
+        tolerance = max(0.001, abs(expected) * 1.0e-5)
+        if not math.isfinite(value) or abs(value - expected) > tolerance:
+            fail(
+                f"profiled {label} shared memory is {value:g} KiB, "
+                f"expected {expected:g} KiB"
+            )
+
+    if args.static_shared_kib is not None:
+        check_shared(
+            "launch__shared_mem_per_block_static",
+            args.static_shared_kib,
+            "static",
+        )
+    if args.dynamic_shared_kib is not None:
+        check_shared(
+            "launch__shared_mem_per_block_dynamic",
+            args.dynamic_shared_kib,
+            "dynamic",
+        )
+
     print(
         "validated Nsight capture: "
         f"process={process_name} device={actual_device} "
         f"duration={duration_value:g} kernel={kernel_name}"
         + (f" block_size={args.block_size}" if args.block_size is not None else "")
+        + (f" grid_size={args.grid_size}" if args.grid_size is not None else "")
     )
     return 0
 

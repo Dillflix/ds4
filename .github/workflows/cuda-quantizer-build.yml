@@ -27,7 +27,7 @@ on:
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/cuda-sm75-native-q4-production.sh"
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
-      - "speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh"
+      - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
       - "speed-bench/summarize-q4-real-histogram.py"
@@ -71,7 +71,7 @@ jobs:
           for kernel in \
             moe_gate_up_mid_sm75_native_q4_tile8_kernel \
             moe_gate_up_mid_sm75_native_q4_tile16_stream7_kernel \
-            moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel \
+            moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel \
             moe_down_sm75_native_q4_tile_kernel \
             moe_down_sm75_native_q4_tile16_compact7_kernel; do
             grep -Fq "$kernel" /tmp/ds4-sm75.sass
@@ -91,12 +91,14 @@ jobs:
           from pathlib import Path
           lines = Path("/tmp/ds4-sm75.resources").read_text(errors="replace").splitlines()
           targets = (
+              "moe_gate_up_mid_sm75_native_q4_tile8_kernel",
               "moe_gate_up_mid_sm75_native_q4_tile16_stream7_kernel",
               "moe_down_sm75_native_q4_tile16_compact7_kernel",
-              "moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel",
+              "moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel",
               "moe_down_sm75_native_q4_tile_kernel",
           )
           found = {target: 0 for target in targets}
+          fixed_k16_found = 0
           for index, line in enumerate(lines):
               for target in targets:
                   if "Function" not in line or target not in line:
@@ -111,18 +113,27 @@ jobs:
                       raise SystemExit(f"{target} has local-memory traffic: {values}")
                   if values["REG"] > 128:
                       raise SystemExit(f"{target} exceeds the SM75 register gate: {values}")
+                  if target == "moe_gate_up_mid_sm75_native_q4_tile8_kernel":
+                      match = re.search(
+                          r"tile8_kernel<\s*\d+u?\s*,\s*\d+u?\s*,\s*(\d+)u?\s*>",
+                          line,
+                      )
+                      if match and int(match.group(1)) == 16:
+                          fixed_k16_found += 1
                   if target.endswith("stream7_kernel") or target.endswith("compact7_kernel"):
                       if values["SHARED"] >= 32768:
                           raise SystemExit(
                               f"{target} cannot admit two 256-thread CTAs: {values}"
                           )
-                  if target.endswith("full64_kernel") and values["SHARED"] != 0:
+                  if target.endswith("full64_fused_kernel") and values["SHARED"] != 0:
                       raise SystemExit(
                           f"{target} must reserve all 64 KiB dynamically: {values}"
                       )
                   found[target] += 1
           if any(count == 0 for count in found.values()):
               raise SystemExit(f"missing stream7/compact7 resource records: {found}")
+          if fixed_k16_found == 0:
+              raise SystemExit("missing fixed-K16 native-Q4 Gate resource record")
           print("validated native-Q4 candidate resource ceilings", found)
           PY
       - name: Build SM75 Q4 gate/up with PTXAS evidence
@@ -370,8 +381,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-native-q4-production.sh
           test -x speed-bench/cuda-sm75-native-q4-next-ab.sh
           bash -n speed-bench/cuda-sm75-native-q4-next-ab.sh
-          test -x speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
-          bash -n speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
+          test -x speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh
+          bash -n speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh
           test -x speed-bench/cuda-sm75-q4-persistent.sh
           bash -n speed-bench/cuda-sm75-q4-persistent.sh
           python3 - <<'PY'

@@ -66,24 +66,34 @@ The script never modifies `NATIVE_MODEL`. Use `RUN_E2E_EXACT=0` only when
 rerunning timing after the same binary/model combination has already passed
 the raw-logit comparison.
 
-### Full-hot gate and wide-CTA down A/B
+### Gate/Up fixed-K16 and row-fused full64 A/B
 
-`cuda-sm75-native-q4-wide-hot-ab.sh` tests the two designs derived from that
-failure evidence without placing activation payload loads in the hot loop:
+`cuda-sm75-native-q4-gate-fused-ab.sh` isolates two Gate/Up changes while
+leaving Down and the production cost planner untouched:
 
-- `down-wide512` retains the complete 37.5 KiB shared tile16 and remaps the
-  existing 512-row span over one 512-thread CTA. Its 16 resident warps replace
-  the baseline's eight without changing arithmetic, weight reuse, or staging.
-- `gate-full64` opts into Turing's 65,536-byte per-block limit and uses all of
-  it for the complete 16-token by 16-block packed activation payload. Gate and
-  up run as bounded phases so each Q4 fragment feeds both token halves without
-  keeping both matrices' accumulator sets live simultaneously.
+- `fixed` is the current fused tile8 path specialized for the model's fixed 16
+  input blocks. It is the optimized control: same routes, staging, reduction
+  order, and two low8/high8 launches, but compile-time K bounds and strides.
+- `fused` retains all 16 activation payload rows in Turing's 65,536-byte
+  opt-in shared-memory allocation. For each output-row group it computes Gate,
+  lets Gate's scalar accumulator window die, holds only four reduced Gate
+  values while computing Up, and immediately emits the fused SiLU product.
+  It therefore reuses each Q4 weight fragment across low8/high8 without the
+  rejected full64 design's global Gate scratch or phase barrier. Its tail8 and
+  tail4 work uses the fixed-K16 control.
 
-Before loading the model, the runner rejects local-memory traffic or more than
-128 registers. It runs the production exact-output smoke, optional bit-exact
-full-model logits, an alternating four-variant prefill A/B, matching Nsight
-Systems traces, and bounded early/late Nsight Compute captures. Model hashing
-and conversion are deliberately absent.
+Before loading the model, the runner rejects local/stack traffic or more than
+128 registers, requires production API and auxiliary-output exactness, records
+separate dynamic-K/fixed-K SASS summaries, times all three variants against the
+captured early/late production histograms, and records bounded Nsight Compute
+reports. That bounded Gate-only screen is the default (`RUN_FULL_MODEL=0`).
+Model hashing and conversion are deliberately absent.
+
+Only after the bounded evidence is viable, rerun with `RUN_FULL_MODEL=1`. That
+mode additionally compares raw full-model logits, alternates
+baseline/fixed/fused prefill runs, verifies placement and Q8-cache equivalence,
+reports paired throughput ratios, and captures a short Nsight Systems trace for
+each variant.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -95,12 +105,16 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 REPEATS=2 \
 CTX_START=2048 \
 CTX_MAX=8192 \
+RUN_FULL_MODEL=0 \
 RUN_E2E_EXACT=1 \
-RUN_NSYS=1 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \
-./speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
+./speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh
 ```
+
+For the promotion pass, reuse the same exports with
+`RUN_FULL_MODEL=1 RUN_NCU=0`; the already-collected kernel reports do not need
+to be repeated.
 
 ### Compact N-split native-Q4 topology audit
 

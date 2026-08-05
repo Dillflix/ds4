@@ -23582,7 +23582,7 @@ __global__ static void moe_down_f32_kernel(
 
 #include "ds4_cuda_sm75_q4_native.inc.cu"
 
-static int cuda_sm75_native_q4_gate_full64_ok(void) {
+static int cuda_sm75_native_q4_gate_full64_fused_ok(void) {
     enum { UNKNOWN = 0, SUPPORTED = 1, UNSUPPORTED = 2 };
     static std::atomic<int> state[DS4_MAX_GPUS] = {};
     int dev = 0;
@@ -23599,25 +23599,25 @@ static int cuda_sm75_native_q4_gate_full64_ok(void) {
                  &max_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) ==
              cudaSuccess &&
              max_optin >= 65536 && max_sm >= 65536;
-#define DS4_CONFIG_NATIVE_Q4_GATE_FULL64(RS) do { \
+#define DS4_CONFIG_NATIVE_Q4_GATE_FULL64_FUSED(RS) do { \
         cudaFuncAttributes attr; \
         if (ok && cudaFuncGetAttributes( \
-                &attr, moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel<RS>) \
+                &attr, moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<RS>) \
                 != cudaSuccess) ok = 0; \
         if (ok && (attr.maxThreadsPerBlock < 512 || attr.numRegs > 128 || \
-                   attr.sharedSizeBytes != 0)) ok = 0; \
+                   attr.sharedSizeBytes != 0 || attr.localSizeBytes != 0)) ok = 0; \
         if (ok && cudaFuncSetAttribute( \
-                moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel<RS>, \
+                moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<RS>, \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, 65536) \
                 != cudaSuccess) ok = 0; \
         if (ok) (void)cudaFuncSetAttribute( \
-                moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel<RS>, \
+                moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<RS>, \
                 cudaFuncAttributePreferredSharedMemoryCarveout, 100); \
     } while (0)
-    DS4_CONFIG_NATIVE_Q4_GATE_FULL64(512);
-    DS4_CONFIG_NATIVE_Q4_GATE_FULL64(1024);
-    DS4_CONFIG_NATIVE_Q4_GATE_FULL64(2048);
-#undef DS4_CONFIG_NATIVE_Q4_GATE_FULL64
+    DS4_CONFIG_NATIVE_Q4_GATE_FULL64_FUSED(512);
+    DS4_CONFIG_NATIVE_Q4_GATE_FULL64_FUSED(1024);
+    DS4_CONFIG_NATIVE_Q4_GATE_FULL64_FUSED(2048);
+#undef DS4_CONFIG_NATIVE_Q4_GATE_FULL64_FUSED
     state[dev].store(ok ? SUPPORTED : UNSUPPORTED, std::memory_order_release);
     return ok;
 }
@@ -23705,19 +23705,24 @@ static int routed_moe_launch(
         !cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES", 0);
     const uint32_t use_native_q4_gate_stream7 = native_q4 &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7", 0);
+    const uint32_t request_native_q4_gate_fixed_k16 = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16", 0);
     const uint32_t use_native_q4_down_compact7 = native_q4 &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7", 0);
-    const uint32_t request_native_q4_gate_full64 = native_q4 &&
-        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64", 0);
+    const uint32_t request_native_q4_gate_full64_fused = native_q4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64_FUSED", 0);
     const uint32_t request_native_q4_down_wide512 = native_q4 &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512", 0);
     const uint32_t use_native_q4_down_wide512 =
         request_native_q4_down_wide512 &&
         cuda_sm75_native_q4_down_wide512_ok();
-    const uint32_t use_native_q4_gate_full64 =
-        request_native_q4_gate_full64 &&
+    const uint32_t use_native_q4_gate_full64_fused =
+        request_native_q4_gate_full64_fused &&
         expert_in_dim / CUDA_QK_K == 16u &&
-        cuda_sm75_native_q4_gate_full64_ok();
+        cuda_sm75_native_q4_gate_full64_fused_ok();
+    const uint32_t use_native_q4_gate_fixed_k16 =
+        request_native_q4_gate_fixed_k16 &&
+        expert_in_dim / CUDA_QK_K == 16u;
     if (g_cuda_routed_q4_layout != 0u && !native_q4) {
         fprintf(stderr, "ds4: unsupported CUDA routed-Q4 layout 0x%08x\n",
                 g_cuda_routed_q4_layout);
@@ -23740,16 +23745,19 @@ static int routed_moe_launch(
                 "ds4: SM75 native routed-Q4 layout enabled "
                 "(packed A/W, planner=%s, gate=%s, down=%s)\n",
                 use_native_q4_cost_tiles ? "cost" : "legacy",
-                use_native_q4_gate_full64 ? "full64" :
-                    (use_native_q4_gate_stream7 ? "stream7" : "tile8"),
+                use_native_q4_gate_full64_fused ? "full64-fused" :
+                    (use_native_q4_gate_stream7 ? "stream7" :
+                     (use_native_q4_gate_fixed_k16 ? "tile8-fixed-k16" :
+                      "tile8")),
                 use_native_q4_down_wide512 ? "full-stage-wide512" :
                     (use_native_q4_down_compact7 ? "compact7" : "full-stage"));
     }
-    if (request_native_q4_gate_full64 && !use_native_q4_gate_full64) {
+    if (request_native_q4_gate_full64_fused &&
+        !use_native_q4_gate_full64_fused) {
         static std::atomic<bool> warned = false;
         if (!warned.exchange(true, std::memory_order_relaxed))
             fprintf(stderr,
-                    "ds4: SM75 native Q4 full64 gate unavailable; "
+                    "ds4: SM75 native Q4 full64-fused gate unavailable; "
                     "falling back to tile8\n");
     }
     if (request_native_q4_down_wide512 && !use_native_q4_down_wide512) {
@@ -23759,11 +23767,20 @@ static int routed_moe_launch(
                     "ds4: SM75 native Q4 wide512 down unavailable; "
                     "falling back to 256 threads\n");
     }
-    if (use_native_q4_gate_full64) {
+    if (use_native_q4_gate_full64_fused) {
         static std::atomic<bool> logged = false;
         if (!logged.exchange(true, std::memory_order_relaxed))
             fprintf(stderr,
-                    "ds4: SM75 native Q4 candidate selected: gate-full64\n");
+                    "ds4: SM75 native Q4 candidate selected: "
+                    "gate-full64-fused\n");
+    }
+    if (use_native_q4_gate_fixed_k16 &&
+        !use_native_q4_gate_full64_fused) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr,
+                    "ds4: SM75 native Q4 candidate selected: "
+                    "gate-fixed-k16\n");
     }
     if (use_native_q4_down_wide512) {
         static std::atomic<bool> logged = false;
@@ -24255,11 +24272,11 @@ static int routed_moe_launch(
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (gate_q4k) {
                     if (native_q4) {
-#define DS4_NATIVE_Q4_GATE_LIST(RS, TOTAL, EXPERTS, STARTS, CAP, DELTA) \
+#define DS4_NATIVE_Q4_GATE_LIST(RS, TOTAL, EXPERTS, STARTS, CAP, DELTA, FIXED_K) \
                         do { \
                             dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
                                     (CAP), 1u); \
-                            moe_gate_up_mid_sm75_native_q4_tile8_kernel<RS, DELTA> \
+                            moe_gate_up_mid_sm75_native_q4_tile8_kernel<RS, DELTA, FIXED_K> \
                                 <<<ng, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, \
                                     (float *)mid->ptr, gate_w, up_w, \
@@ -24283,11 +24300,11 @@ static int routed_moe_launch(
                                     (const float *)weights->ptr, xq_blocks, \
                                     expert_mid_dim, n_expert, write_gate_up, clamp); \
                         } while (0)
-#define DS4_NATIVE_Q4_GATE_FULL64(RS) \
+#define DS4_NATIVE_Q4_GATE_FULL64_FUSED(RS) \
                         do { \
                             dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
                                     tile16_capacity, 1u); \
-                            moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel<RS> \
+                            moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<RS> \
                                 <<<ng, 512, 65536>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, \
                                     (float *)mid->ptr, gate_w, up_w, \
@@ -24297,26 +24314,39 @@ static int routed_moe_launch(
                                     (const float *)weights->ptr, xq_blocks, \
                                     expert_mid_dim, n_expert, write_gate_up, clamp); \
                         } while (0)
-#define DS4_NATIVE_Q4_GATE_ALL(RS) \
+#define DS4_NATIVE_Q4_GATE_TILE16_LIST(RS, FIXED_K) \
                         do { \
-                            if (use_native_q4_gate_full64) { \
-                                DS4_NATIVE_Q4_GATE_FULL64(RS); \
-                            } else if (use_native_q4_gate_stream7) { \
-                                DS4_NATIVE_Q4_GATE_STREAM7(RS); \
-                            } else { \
-                                DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
-                                    tile16_experts, tile16_starts, \
-                                    tile16_capacity, 0); \
-                                DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
-                                    tile16_experts, tile16_starts, \
-                                    tile16_capacity, 8); \
-                            } \
+                            DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
+                                tile16_experts, tile16_starts, \
+                                tile16_capacity, 0, FIXED_K); \
+                            DS4_NATIVE_Q4_GATE_LIST(RS, tile16_total, \
+                                tile16_experts, tile16_starts, \
+                                tile16_capacity, 8, FIXED_K); \
+                        } while (0)
+#define DS4_NATIVE_Q4_GATE_TAIL_LIST(RS, FIXED_K) \
+                        do { \
                             DS4_NATIVE_Q4_GATE_LIST(RS, tail8_total, \
                                 tail8_experts, tail8_starts, \
-                                tail8_capacity, 0); \
+                                tail8_capacity, 0, FIXED_K); \
                             DS4_NATIVE_Q4_GATE_LIST(RS, tail4_total, \
                                 tail4_experts, tail4_starts, \
-                                tail4_capacity, 0); \
+                                tail4_capacity, 0, FIXED_K); \
+                        } while (0)
+#define DS4_NATIVE_Q4_GATE_ALL(RS) \
+                        do { \
+                            if (use_native_q4_gate_full64_fused) { \
+                                DS4_NATIVE_Q4_GATE_FULL64_FUSED(RS); \
+                            } else if (use_native_q4_gate_stream7) { \
+                                DS4_NATIVE_Q4_GATE_STREAM7(RS); \
+                            } else if (use_native_q4_gate_fixed_k16) { \
+                                DS4_NATIVE_Q4_GATE_TILE16_LIST(RS, 16); \
+                            } else { \
+                                DS4_NATIVE_Q4_GATE_TILE16_LIST(RS, 0); \
+                            } \
+                            if (use_native_q4_gate_fixed_k16) \
+                                DS4_NATIVE_Q4_GATE_TAIL_LIST(RS, 16); \
+                            else \
+                                DS4_NATIVE_Q4_GATE_TAIL_LIST(RS, 0); \
                         } while (0)
                         if (!tile16_total || !tail8_total || !tail4_total) {
                             ok = 0;
@@ -24328,7 +24358,9 @@ static int routed_moe_launch(
                             DS4_NATIVE_Q4_GATE_ALL(512);
                         }
 #undef DS4_NATIVE_Q4_GATE_ALL
-#undef DS4_NATIVE_Q4_GATE_FULL64
+#undef DS4_NATIVE_Q4_GATE_TAIL_LIST
+#undef DS4_NATIVE_Q4_GATE_TILE16_LIST
+#undef DS4_NATIVE_Q4_GATE_FULL64_FUSED
 #undef DS4_NATIVE_Q4_GATE_STREAM7
 #undef DS4_NATIVE_Q4_GATE_LIST
                     } else {

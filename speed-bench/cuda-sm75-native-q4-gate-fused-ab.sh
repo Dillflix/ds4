@@ -3,17 +3,17 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Build, validate, A/B, and profile the two post-failure-audit SM75 native-Q4
-candidates:
-  down-wide512  full shared tile16 with one 512-thread/16-warp CTA;
-  gate-full64   full tile16 activation payload in opt-in 64 KiB shared memory.
+Build, validate, A/B, and profile the bounded SM75 native-Q4 Gate/Up
+candidates.
 
 Required environment:
   NATIVE_MODEL=/absolute/path/to/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf
 
 Optional environment:
   PROMPT=...                  Default: speed-bench/promessi_sposi.txt
-  AB_VARIANTS=baseline,down,gate,both
+  AB_VARIANTS=baseline,fixed,fused
+  HARNESS_REPEATS=5
+  RUN_FULL_MODEL=0          Set to 1 only after the bounded screen is viable
   REPEATS=2
   CTX_START=2048
   CTX_MAX=8192
@@ -27,7 +27,7 @@ Optional environment:
   NCU_USE_SUDO=1
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
-  WIDE_HOT_DIR=/absolute/output/directory
+  GATE_FUSED_DIR=/absolute/output/directory
 
 The run never hashes or converts the model. Production placement is fixed to
 GPUs 0,3,1,2 with a 22/21 stage split.
@@ -45,7 +45,9 @@ cd "$repo_dir"
     die "NATIVE_MODEL must be an existing non-empty absolute path"
 
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
-AB_VARIANTS=${AB_VARIANTS:-baseline,down,gate,both}
+AB_VARIANTS=${AB_VARIANTS:-baseline,fixed,fused}
+HARNESS_REPEATS=${HARNESS_REPEATS:-5}
+RUN_FULL_MODEL=${RUN_FULL_MODEL:-0}
 REPEATS=${REPEATS:-2}
 CTX_START=${CTX_START:-2048}
 CTX_MAX=${CTX_MAX:-8192}
@@ -62,10 +64,12 @@ CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 GPU_DEVICES=0,3,1,2
 CUDA_ARCH=sm_75
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
-OUTPUT_DIR=${WIDE_HOT_DIR:-$repo_dir/sm75-native-q4-wide-hot-$run_stamp}
+OUTPUT_DIR=${GATE_FUSED_DIR:-$repo_dir/sm75-native-q4-gate-fused-$run_stamp}
 
 [[ -s $PROMPT ]] || die "prompt not found or empty: $PROMPT"
-for item in "REPEATS:$REPEATS" "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
+for item in "HARNESS_REPEATS:$HARNESS_REPEATS" \
+            "RUN_FULL_MODEL:$RUN_FULL_MODEL" \
+            "REPEATS:$REPEATS" "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
             "STEP_MUL:$STEP_MUL" "PREFILL_CHUNK:$PREFILL_CHUNK" \
             "RUN_E2E_EXACT:$RUN_E2E_EXACT" "RUN_NSYS:$RUN_NSYS" \
             "RUN_NCU:$RUN_NCU" "PROFILE_TOKENS:$PROFILE_TOKENS" \
@@ -74,20 +78,22 @@ for item in "REPEATS:$REPEATS" "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
-(( REPEATS > 0 && CTX_START > 0 && CTX_MAX >= CTX_START &&
+(( HARNESS_REPEATS > 0 && REPEATS > 0 && CTX_START > 0 && CTX_MAX >= CTX_START &&
    STEP_MUL >= 2 && PREFILL_CHUNK > 0 && PROFILE_TOKENS > 0 )) ||
     die "invalid benchmark shape"
-for flag in RUN_E2E_EXACT RUN_NSYS RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_FULL_MODEL RUN_E2E_EXACT RUN_NSYS RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
 
 IFS=, read -r -a variants <<<"$AB_VARIANTS"
+[[ $AB_VARIANTS == baseline,fixed,fused ]] ||
+    die "AB_VARIANTS must be exactly baseline,fixed,fused for matched evidence"
 (( ${#variants[@]} >= 2 )) || die "AB_VARIANTS must contain at least two variants"
 declare -A seen=()
 for variant in "${variants[@]}"; do
-    case "$variant" in baseline|down|gate|both) ;; *)
+    case "$variant" in baseline|fixed|fused) ;; *)
         die "unknown AB variant: $variant";; esac
     [[ -z ${seen[$variant]:-} ]] || die "duplicate AB variant: $variant"
     seen[$variant]=1
@@ -107,7 +113,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{validation,runs,nsys,ncu,provenance}
+mkdir -p "$OUTPUT_DIR"/{validation,screen,runs,nsys,ncu,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 current_phase=initialization
 finalize() {
@@ -146,46 +152,50 @@ production_prefix=(
 variant_flags() {
     case "$1" in
         baseline) printf '0 0\n' ;;
-        down)     printf '0 1\n' ;;
-        gate)     printf '1 0\n' ;;
-        both)     printf '1 1\n' ;;
+        fixed)    printf '1 0\n' ;;
+        fused)    printf '1 1\n' ;;
     esac
 }
 
 run_variant() {
     local variant=$1; shift
-    local gate down
-    read -r gate down < <(variant_flags "$variant")
+    local fixed fused
+    read -r fixed fused < <(variant_flags "$variant")
     "${clean_prefix[@]}" "${production_prefix[@]}" \
         DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES=0 \
         DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7=0 \
         DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7=0 \
-        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64=$gate" \
-        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512=$down" "$@"
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16=$fixed" \
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64_FUSED=$fused" \
+        DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512=0 "$@"
 }
 
 run_harness() {
     local variant=$1; shift
-    local gate down
-    read -r gate down < <(variant_flags "$variant")
+    local fixed fused
+    read -r fixed fused < <(variant_flags "$variant")
     "${clean_prefix[@]}" CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES=0 \
         DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7=0 \
         DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7=0 \
-        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64=$gate" \
-        "DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512=$down" "$@"
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16=$fixed" \
+        "DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64_FUSED=$fused" \
+        DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512=0 "$@"
 }
 
 validate_log() {
-    local variant=$1 log=$2 gate down gate_name=tile8 down_name=full-stage
-    read -r gate down < <(variant_flags "$variant")
-    [[ $gate == 0 ]] || gate_name=full64
-    [[ $down == 0 ]] || down_name=full-stage-wide512
+    local variant=$1 log=$2 fixed fused gate_name=tile8
+    read -r fixed fused < <(variant_flags "$variant")
+    if [[ $fused == 1 ]]; then
+        gate_name=full64-fused
+    elif [[ $fixed == 1 ]]; then
+        gate_name=tile8-fixed-k16
+    fi
     grep -Fq 'ds4: CUDA EP forced pipeline split 22/21' "$log" ||
         die "$variant did not use split 22/21"
     grep -Fq '4 devices [0,3,1,2] requested' "$log" ||
         die "$variant did not use GPU order 0,3,1,2"
-    grep -Fq "packed A/W, planner=cost, gate=$gate_name, down=$down_name" \
+    grep -Fq "packed A/W, planner=cost, gate=$gate_name, down=full-stage" \
         "$log" || die "$variant did not select the requested candidates"
 }
 
@@ -210,14 +220,15 @@ cuobjdump --dump-resource-usage ./tests/cuda_long_context_smoke \
     die "could not record CUDA resource usage"
 c++filt <"$OUTPUT_DIR/provenance/resource-usage.txt" \
     >"$OUTPUT_DIR/provenance/resource-usage.demangled.txt"
+cuobjdump --dump-sass ./tests/cuda_long_context_smoke | c++filt \
+    >"$OUTPUT_DIR/provenance/gate-kernels.sass"
 python3 - "$OUTPUT_DIR/provenance/resource-usage.demangled.txt" \
         "$OUTPUT_DIR/provenance/candidate-resources.csv" <<'PY'
 import csv, re, sys
 lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-targets = {
-    "gate-full64": "moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel",
-    "down-wide512": "moe_down_sm75_native_q4_tile_kernel",
-}
+tile8 = "moe_gate_up_mid_sm75_native_q4_tile8_kernel"
+full64 = "moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel"
+targets = ("gate-baseline", "gate-fixed-k16", "gate-full64-fused")
 records = []
 for index, line in enumerate(lines):
     if not re.match(r"\s*Function\s*:?\s*", line):
@@ -225,9 +236,19 @@ for index, line in enumerate(lines):
     name = re.sub(r"^\s*Function\s*:?\s*", "", line).rstrip(":")
     resource = next((item for item in lines[index + 1:index + 8]
                      if re.match(r"\s*REG:", item)), "")
-    for label, needle in targets.items():
-        if needle not in name or not resource:
-            continue
+    label = None
+    if tile8 in name:
+        match = re.search(
+            r"tile8_kernel<\s*\d+u?\s*,\s*\d+u?\s*,\s*(\d+)u?\s*>",
+            name,
+        )
+        if match:
+            label = "gate-fixed-k16" if int(match.group(1)) == 16 else (
+                "gate-baseline" if int(match.group(1)) == 0 else None
+            )
+    elif full64 in name:
+        label = "gate-full64-fused"
+    if label is not None and resource:
         values = {key: int(value) for key, value in
                   re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", resource)}
         if set(values) != {"REG", "STACK", "SHARED", "LOCAL"}:
@@ -242,13 +263,49 @@ for label in targets:
             raise SystemExit(f"{label} has local-memory traffic: {row}")
         if row["REG"] > 128:
             raise SystemExit(f"{label} exceeds 128 registers: {row}")
-        if label == "gate-full64" and row["SHARED"] != 0:
-            raise SystemExit(f"gate-full64 must use only dynamic shared memory: {row}")
+        if label == "gate-full64-fused" and row["SHARED"] != 0:
+            raise SystemExit(
+                f"gate-full64-fused must use only dynamic shared memory: {row}"
+            )
 with open(sys.argv[2], "w", newline="", encoding="utf-8") as stream:
     writer = csv.DictWriter(stream,
         fieldnames=("design", "kernel", "REG", "STACK", "SHARED", "LOCAL"))
     writer.writeheader(); writer.writerows(records)
-print("validated full64/wide512: no spills and <=128 registers")
+print("validated baseline/fixed-k16/full64-fused resources")
+PY
+python3 - "$OUTPUT_DIR/provenance/gate-kernels.sass" \
+        "$OUTPUT_DIR/provenance/gate-sass-summary.csv" <<'PY'
+import csv, pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+records = []
+for index, line in enumerate(lines):
+    if "Function : " not in line:
+        continue
+    name = line.split("Function : ", 1)[1].strip()
+    if ("moe_gate_up_mid_sm75_native_q4_tile8_kernel" not in name and
+            "moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel" not in name):
+        continue
+    end = next((i for i in range(index + 1, len(lines))
+                if "Function : " in lines[i]), len(lines))
+    body = lines[index + 1:end]
+    fixed = "full64"
+    match = re.search(r"tile8_kernel<\s*\d+u?\s*,\s*\d+u?\s*,\s*(\d+)u?\s*>", name)
+    if match: fixed = "fixed-k16" if int(match.group(1)) == 16 else "dynamic-k"
+    records.append({"design": fixed, "kernel": name,
+                    "sass_instructions": sum("/*" in item for item in body),
+                    "imma": sum("IMMA" in item for item in body),
+                    "branch": sum(re.search(r"\bBRA\b", item) is not None for item in body),
+                    "address_alu": sum(re.search(r"\b(IMAD|IADD3|LEA)\b", item) is not None for item in body)})
+if not any(row["design"] == "dynamic-k" for row in records):
+    raise SystemExit("dynamic-K tile8 SASS missing")
+if not any(row["design"] == "fixed-k16" for row in records):
+    raise SystemExit("fixed-K16 tile8 SASS missing")
+if not any(row["design"] == "full64" for row in records):
+    raise SystemExit("full64-fused SASS missing")
+with open(sys.argv[2], "w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=records[0].keys())
+    writer.writeheader(); writer.writerows(records)
+print("recorded separate dynamic-K/fixed-K16/full64-fused SASS summaries")
 PY
 
 current_phase=api-exactness
@@ -258,15 +315,69 @@ current_phase=api-exactness
     die "CUDA exact-output suite failed"
 }
 for marker in \
-    'tagged SM75 native Q4 gate-full64 exact' \
-    'tagged SM75 native Q4 down-wide512 exact' \
-    'tagged SM75 native Q4 gate-full64/down-wide512 exact' \
-    'SM75 native Q4 candidate selected: gate-full64' \
-    'SM75 native Q4 candidate selected: down-wide512' \
+    'tagged SM75 native Q4 gate-fixed-k16 exact' \
+    'tagged SM75 native Q4 gate-full64-fused exact' \
+    'tagged SM75 native Q4 gate-full64-fused aux exact' \
+    'SM75 native Q4 candidate selected: gate-fixed-k16' \
+    'SM75 native Q4 candidate selected: gate-full64-fused' \
     'cuda long-context regression: OK'; do
     grep -Fq "$marker" "$OUTPUT_DIR/validation/cuda-exact.log" ||
         die "exact-output marker missing: $marker"
 done
+
+current_phase=bounded-harness-screen
+printf 'scenario\tvariant\tlog\n' >"$OUTPUT_DIR/screen/runs.tsv"
+for scenario in native-q4-early native-q4-late; do
+    if [[ $scenario == native-q4-early ]]; then
+        screen_order=(baseline fixed fused)
+    else
+        screen_order=(fused fixed baseline)
+    fi
+    for variant in "${screen_order[@]}"; do
+        log="$OUTPUT_DIR/screen/$scenario-$variant.log"
+        printf 'Bounded Gate screen: %s %s...\n' "$scenario" "$variant"
+        run_harness "$variant" DS4_PROFILE_REPEATS="$HARNESS_REPEATS" \
+            ./tests/cuda_sm75_profile_harness "$scenario" >"$log" 2>&1
+        grep -q '^harness_status=ok$' "$log" || {
+            tail -n 120 "$log" >&2 || true
+            die "bounded harness failed: $scenario/$variant"
+        }
+        case "$variant" in
+            baseline) grep -Fq 'planner=cost, gate=tile8, down=full-stage' "$log" ;;
+            fixed) grep -Fq 'candidate selected: gate-fixed-k16' "$log" ;;
+            fused) grep -Fq 'candidate selected: gate-full64-fused' "$log" ;;
+        esac || die "bounded harness did not dispatch $variant"
+        printf '%s\t%s\t%s\n' "$scenario" "$variant" "$log" \
+            >>"$OUTPUT_DIR/screen/runs.tsv"
+    done
+done
+python3 - "$OUTPUT_DIR/screen/runs.tsv" \
+        "$OUTPUT_DIR/screen/comparison.csv" <<'PY'
+import csv, pathlib, re, sys
+with open(sys.argv[1], encoding="utf-8", newline="") as stream:
+    runs = list(csv.DictReader(stream, delimiter="\t"))
+times = {}
+for run in runs:
+    text = pathlib.Path(run["log"]).read_text(errors="replace")
+    match = re.search(r"^timed_per_call_ms=([0-9.]+)$", text, re.MULTILINE)
+    if not match:
+        raise SystemExit(f'missing timed_per_call_ms: {run["log"]}')
+    times[(run["scenario"], run["variant"])] = float(match.group(1))
+rows = []
+for scenario in ("native-q4-early", "native-q4-late"):
+    baseline = times[(scenario, "baseline")]
+    for variant in ("baseline", "fixed", "fused"):
+        value = times[(scenario, variant)]
+        rows.append({"scenario": scenario, "variant": variant,
+                     "per_call_ms": f"{value:.6f}",
+                     "speedup_vs_baseline": f"{baseline / value:.6f}"})
+with open(sys.argv[2], "w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+    writer.writeheader(); writer.writerows(rows)
+print("scenario,variant,per_call_ms,speedup_vs_baseline")
+for row in rows:
+    print(",".join(str(row[key]) for key in row))
+PY
 
 {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
@@ -276,6 +387,8 @@ done
         "$NATIVE_MODEL" "$(stat -c %s "$NATIVE_MODEL")"
     printf 'variants=%s\nrepeats=%s\ngpu_devices=%s\nstage_split=22/21\n' \
         "$AB_VARIANTS" "$REPEATS" "$GPU_DEVICES"
+    printf 'harness_repeats=%s\nrun_full_model=%s\n' \
+        "$HARNESS_REPEATS" "$RUN_FULL_MODEL"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nprefill_chunk=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK"
     printf '\n[gpu]\n'; nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,driver_version --format=csv
@@ -283,6 +396,7 @@ done
     printf '\n[git status]\n'; git status --short
 } >"$OUTPUT_DIR/manifest.txt"
 
+if [[ $RUN_FULL_MODEL == 1 ]]; then
 common=(--cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES"
         --gpu-vram auto --prompt-file "$PROMPT" --prefill-chunk "$PREFILL_CHUNK"
         --gen-tokens 0 --model "$NATIVE_MODEL")
@@ -333,16 +447,18 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
     done
 done
 
-python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/ab-summary.csv" <<'PY'
+python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/ab-summary.csv" \
+        "$OUTPUT_DIR/paired-ratios.csv" <<'PY'
 import csv, statistics, sys
 with open(sys.argv[1], encoding="utf-8", newline="") as stream:
     runs = list(csv.DictReader(stream, delimiter="\t"))
-values = {}
+values = {}; by_repeat = {}
 for run in runs:
     with open(run["csv"], encoding="utf-8", newline="") as stream:
         for row in csv.DictReader(stream):
-            values.setdefault((run["variant"], int(row["ctx_tokens"])), []).append(
-                float(row["prefill_tps"]))
+            ctx = int(row["ctx_tokens"]); value = float(row["prefill_tps"])
+            values.setdefault((run["variant"], ctx), []).append(value)
+            by_repeat[(int(run["repeat"]), run["variant"], ctx)] = value
 contexts = sorted(ctx for variant, ctx in values if variant == "baseline")
 records = []
 for ctx in contexts:
@@ -360,6 +476,51 @@ print("ctx_tokens,variant,median_prefill_tps,gain_pct")
 for row in records:
     print(f'{row["ctx_tokens"]},{row["variant"]},'
           f'{row["median_prefill_tps"]},{row["gain_pct"]}')
+paired = []
+for ctx in contexts:
+    for variant in ("fixed", "fused"):
+        ratios = [by_repeat[(repeat, variant, ctx)] /
+                  by_repeat[(repeat, "baseline", ctx)]
+                  for repeat in range(1, max(int(run["repeat"]) for run in runs) + 1)]
+        paired.append({"ctx_tokens": ctx, "variant": variant,
+                       "samples": len(ratios),
+                       "median_ratio": f"{statistics.median(ratios):.6f}",
+                       "min_ratio": f"{min(ratios):.6f}",
+                       "max_ratio": f"{max(ratios):.6f}"})
+with open(sys.argv[3], "w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=paired[0].keys())
+    writer.writeheader(); writer.writerows(paired)
+print("paired ratios:")
+for row in paired: print(row)
+PY
+
+python3 - "$OUTPUT_DIR/runs.tsv" \
+        "$OUTPUT_DIR/placement-cache-equivalence.txt" <<'PY'
+import csv, pathlib, re, sys
+with open(sys.argv[1], encoding="utf-8", newline="") as stream:
+    runs = list(csv.DictReader(stream, delimiter="\t"))
+patterns = (
+    re.compile(r"^  GPU[0-3]:"),
+    re.compile(r"^ds4: CUDA tier \d+ .* selective weights:"),
+    re.compile(r"^ds4: CUDA q8 fp16 cache"),
+)
+fingerprints = {}
+for run in runs:
+    lines = pathlib.Path(run["log"]).read_text(errors="replace").splitlines()
+    selected = tuple(line for line in lines if any(p.search(line) for p in patterns))
+    if not selected:
+        raise SystemExit(f'no placement/cache records in {run["log"]}')
+    fingerprints[(run["repeat"], run["variant"])] = selected
+for repeat in sorted({run["repeat"] for run in runs}):
+    baseline = fingerprints[(repeat, "baseline")]
+    for variant in ("fixed", "fused"):
+        if fingerprints[(repeat, variant)] != baseline:
+            raise SystemExit(
+                f"placement/Q8-cache mismatch repeat={repeat} variant={variant}"
+            )
+pathlib.Path(sys.argv[2]).write_text(
+    "placement_and_q8_cache_records_match=true\n", encoding="utf-8")
+print("placement and Q8-cache records match for every paired run")
 PY
 
 if [[ $RUN_NSYS == 1 ]]; then
@@ -380,6 +541,35 @@ if [[ $RUN_NSYS == 1 ]]; then
         nsys stats --report cuda_gpu_kern_sum --format csv "$base.nsys-rep" \
             >"$base-cuda_gpu_kern_sum.csv" 2>"$base-stats.log"
     done
+    python3 - "$OUTPUT_DIR/nsys" "$OUTPUT_DIR/nsys/gate-summary.csv" <<'PY'
+import csv, io, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+rows = []
+for variant in ("baseline", "fixed", "fused"):
+    path = root / f"{variant}-cuda_gpu_kern_sum.csv"
+    lines = path.read_text(errors="replace").splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if line.startswith("Time (%),Total Time (ns),Instances,")), None)
+    if start is None:
+        raise SystemExit(f"missing Nsight Systems CSV header: {path}")
+    gate_rows = [row for row in csv.DictReader(io.StringIO("\n".join(lines[start:])))
+                 if "moe_gate_up_mid_sm75_native_q4" in row.get("Name", "")]
+    if not gate_rows:
+        raise SystemExit(f"no native-Q4 Gate kernels in {path}")
+    for row in gate_rows:
+        rows.append({"variant": variant, "kernel": row["Name"],
+                     "instances": int(row["Instances"].replace(",", "")),
+                     "total_ms": f'{int(row["Total Time (ns)"].replace(",", "")) / 1e6:.6f}'})
+with open(sys.argv[2], "w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream,
+        fieldnames=("variant", "kernel", "instances", "total_ms"))
+    writer.writeheader(); writer.writerows(rows)
+for variant in ("baseline", "fixed", "fused"):
+    selected = [row for row in rows if row["variant"] == variant]
+    print(f'nsys_gate variant={variant} instances={sum(row["instances"] for row in selected)} '
+          f'total_ms={sum(float(row["total_ms"]) for row in selected):.6f}')
+PY
+fi
 fi
 
 if [[ $RUN_NCU == 1 ]]; then
@@ -395,6 +585,7 @@ if [[ $RUN_NCU == 1 ]]; then
         --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
     profile_one() {
         local name=$1 scenario=$2 variant=$3 kernel=$4 expected=$5
+        local static_kib=$6 dynamic_kib=$7 grid_size=$8
         local base="$OUTPUT_DIR/ncu/$name" rc=0
         printf 'Nsight Compute: %s...\n' "$name"
         run_harness "$variant" "${ncu_command[@]}" --config-file off \
@@ -412,23 +603,38 @@ if [[ $RUN_NCU == 1 ]]; then
         "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
             >"$base.csv" 2>"$base-import.log"
         python3 speed-bench/validate-ncu-capture.py "$base.csv" "$expected" 0 \
-            --process cuda_sm75_profile_harness >"$base-validation.txt" 2>&1 || {
+            --process cuda_sm75_profile_harness --block-size 512 \
+            --grid-size "$grid_size" --static-shared-kib "$static_kib" \
+            --dynamic-shared-kib "$dynamic_kib" \
+            >"$base-validation.txt" 2>&1 || {
             cat "$base-validation.txt" >&2 || true; die "wrong NCU kernel: $name"; }
         cat "$base-validation.txt"
     }
-    profile_one early-down-wide512 native-q4-early down \
-        '^moe_down_sm75_native_q4_tile_kernel.*16.*$' \
-        'moe_down_sm75_native_q4_tile_kernel.*16'
-    profile_one late-down-wide512 native-q4-late down \
-        '^moe_down_sm75_native_q4_tile_kernel.*16.*$' \
-        'moe_down_sm75_native_q4_tile_kernel.*16'
-    profile_one early-gate-full64 native-q4-early gate \
-        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel.*$' \
-        'moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel'
-    profile_one late-gate-full64 native-q4-late gate \
-        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel.*$' \
-        'moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel'
+    profile_one early-gate-baseline native-q4-early baseline \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>' \
+        37.488 0 1280
+    profile_one late-gate-baseline native-q4-late baseline \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>' \
+        37.488 0 1280
+    profile_one early-gate-fixed-k16 native-q4-early fixed \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>' \
+        37.488 0 1280
+    profile_one late-gate-fixed-k16 native-q4-late fixed \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>' \
+        37.488 0 1280
+    profile_one early-gate-full64-fused native-q4-early fused \
+        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>' \
+        0 65.536 1280
+    profile_one late-gate-full64-fused native-q4-late fused \
+        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>.*$' \
+        'moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>' \
+        0 65.536 1280
 fi
 
 current_phase=complete
-printf 'SM75 native-Q4 wide/full-hot A/B complete: %s\n' "$OUTPUT_DIR"
+printf 'SM75 native-Q4 Gate/Up fused A/B complete: %s\n' "$OUTPUT_DIR"
