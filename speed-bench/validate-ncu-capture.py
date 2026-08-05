@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("kernel_regex")
     parser.add_argument("device")
     parser.add_argument("--process", default="ds4-bench")
+    parser.add_argument("--block-size", type=int)
     args = parser.parse_args()
 
     try:
@@ -75,10 +76,23 @@ def main() -> int:
     if not math.isfinite(duration_value) or duration_value <= 0.0:
         fail(f"non-finite or non-positive gpu__time_duration.sum value: {duration_text!r}")
 
+    if args.block_size is not None:
+        block_text = (row.get("launch__block_size") or "").strip()
+        try:
+            block_size = int(block_text.replace(",", ""))
+        except ValueError:
+            fail(f"invalid launch__block_size value: {block_text!r}")
+        if block_size != args.block_size:
+            fail(
+                f"profiled block size is {block_size}, expected "
+                f"{args.block_size}"
+            )
+
     print(
         "validated Nsight capture: "
         f"process={process_name} device={actual_device} "
         f"duration={duration_value:g} kernel={kernel_name}"
+        + (f" block_size={args.block_size}" if args.block_size is not None else "")
     )
     return 0
 

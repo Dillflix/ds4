@@ -7,10 +7,15 @@ cd "$repo_dir"
 PROFILE_GPU=${PROFILE_GPU:-0}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
+SKIP_CORRECTNESS=${SKIP_CORRECTNESS:-0}
+SKIP_BENCHMARK=${SKIP_BENCHMARK:-0}
 BENCH_ROUNDS=${BENCH_ROUNDS:-3}
 BENCH_LAUNCHES=${BENCH_LAUNCHES:-10}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
+REUSE_NCU=${REUSE_NCU:-0}
+NCU_SCENARIOS=${NCU_SCENARIOS:-real-early}
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${NSPLIT_DIR:-$repo_dir/sm75-q4-nsplit-$run_stamp}
 ARCHIVE_PATH=$OUTPUT_DIR.tar.gz
@@ -20,14 +25,25 @@ gate_bin=tests/cuda_sm75_q4_gate_up_native
 validator=speed-bench/validate-ncu-capture.py
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-for value in SKIP_BUILD RUN_NCU NCU_USE_SUDO; do
+for value in SKIP_BUILD RESUME SKIP_CORRECTNESS SKIP_BENCHMARK RUN_NCU NCU_USE_SUDO REUSE_NCU; do
     [[ ${!value} == 0 || ${!value} == 1 ]] || die "$value must be 0 or 1"
 done
 [[ $BENCH_ROUNDS =~ ^[1-9][0-9]*$ ]] || die "BENCH_ROUNDS must be positive"
 [[ $BENCH_LAUNCHES =~ ^[1-9][0-9]*$ ]] || die "BENCH_LAUNCHES must be positive"
 [[ $OUTPUT_DIR == /* ]] || die "NSPLIT_DIR must be absolute"
-[[ ! -e $OUTPUT_DIR && ! -e $ARCHIVE_PATH ]] ||
-    die "output already exists: $OUTPUT_DIR"
+IFS=',' read -r -a ncu_scenarios <<<"$NCU_SCENARIOS"
+(( ${#ncu_scenarios[@]} > 0 )) || die "NCU_SCENARIOS must not be empty"
+for scenario in "${ncu_scenarios[@]}"; do
+    [[ $scenario == real-early || $scenario == real-late ]] ||
+        die "invalid NCU_SCENARIOS entry: $scenario"
+done
+if [[ $RESUME == 1 ]]; then
+    [[ -n ${NSPLIT_DIR:-} ]] || die "RESUME=1 requires NSPLIT_DIR"
+    [[ -d $OUTPUT_DIR ]] || die "resume directory is missing: $OUTPUT_DIR"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $ARCHIVE_PATH ]] ||
+        die "output already exists: $OUTPUT_DIR"
+fi
 for tool in nvidia-smi cuobjdump c++filt python3 tar make; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -166,37 +182,48 @@ print("validated spill-free 4/8-warp N-split resources", rows)
 PY
 
 phase=correctness
-for scenario in real-early real-late; do
-    CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$down_bin --device 0 \
-        --scenario "$scenario" --correctness-only \
-        >"$OUTPUT_DIR/correctness/down-$scenario.log" 2>&1 || {
-            tail -n 100 "$OUTPUT_DIR/correctness/down-$scenario.log" >&2
-            die "down exactness failed: $scenario"
-        }
-    grep -q '^correctness_status=ok$' \
-        "$OUTPUT_DIR/correctness/down-$scenario.log" || die "down exactness marker missing"
-    CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$gate_bin --device 0 \
-        --scenario "$scenario" --correctness-only \
-        >"$OUTPUT_DIR/correctness/gate-$scenario.log" 2>&1 || {
-            tail -n 100 "$OUTPUT_DIR/correctness/gate-$scenario.log" >&2
-            die "gate exactness failed: $scenario"
-        }
-    grep -q '^correctness_status=ok$' \
-        "$OUTPUT_DIR/correctness/gate-$scenario.log" || die "gate exactness marker missing"
-done
+if [[ $SKIP_CORRECTNESS == 0 ]]; then
+    for scenario in real-early real-late; do
+        CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$down_bin --device 0 \
+            --scenario "$scenario" --correctness-only \
+            >"$OUTPUT_DIR/correctness/down-$scenario.log" 2>&1 || {
+                tail -n 100 "$OUTPUT_DIR/correctness/down-$scenario.log" >&2
+                die "down exactness failed: $scenario"
+            }
+        grep -q '^correctness_status=ok$' \
+            "$OUTPUT_DIR/correctness/down-$scenario.log" || die "down exactness marker missing"
+        CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$gate_bin --device 0 \
+            --scenario "$scenario" --correctness-only \
+            >"$OUTPUT_DIR/correctness/gate-$scenario.log" 2>&1 || {
+                tail -n 100 "$OUTPUT_DIR/correctness/gate-$scenario.log" >&2
+                die "gate exactness failed: $scenario"
+            }
+        grep -q '^correctness_status=ok$' \
+            "$OUTPUT_DIR/correctness/gate-$scenario.log" || die "gate exactness marker missing"
+    done
+else
+    for scenario in real-early real-late; do
+        grep -q '^correctness_status=ok$' \
+            "$OUTPUT_DIR/correctness/down-$scenario.log" || die "reused down exactness is missing: $scenario"
+        grep -q '^correctness_status=ok$' \
+            "$OUTPUT_DIR/correctness/gate-$scenario.log" || die "reused gate exactness is missing: $scenario"
+    done
+    printf 'Reusing exactness results in %s/correctness\n' "$OUTPUT_DIR"
+fi
 
 phase=benchmark
-for scenario in real-early real-late; do
-    CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$down_bin --device 0 \
-        --scenario "$scenario" --benchmark-only \
-        --rounds "$BENCH_ROUNDS" --launches "$BENCH_LAUNCHES" \
-        >"$OUTPUT_DIR/benchmark/down-$scenario.log" 2>&1
-    CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$gate_bin --device 0 \
-        --scenario "$scenario" --benchmark-only \
-        --rounds "$BENCH_ROUNDS" --launches "$BENCH_LAUNCHES" \
-        >"$OUTPUT_DIR/benchmark/gate-$scenario.log" 2>&1
-done
-python3 - "$OUTPUT_DIR/benchmark" <<'PY'
+if [[ $SKIP_BENCHMARK == 0 ]]; then
+    for scenario in real-early real-late; do
+        CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$down_bin --device 0 \
+            --scenario "$scenario" --benchmark-only \
+            --rounds "$BENCH_ROUNDS" --launches "$BENCH_LAUNCHES" \
+            >"$OUTPUT_DIR/benchmark/down-$scenario.log" 2>&1
+        CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$gate_bin --device 0 \
+            --scenario "$scenario" --benchmark-only \
+            --rounds "$BENCH_ROUNDS" --launches "$BENCH_LAUNCHES" \
+            >"$OUTPUT_DIR/benchmark/gate-$scenario.log" 2>&1
+    done
+    python3 - "$OUTPUT_DIR/benchmark" <<'PY'
 import csv, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 baselines = {
@@ -224,6 +251,11 @@ with (root/"nsplit-comparison.csv").open("w",newline="") as f:
   w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
 for row in rows: print(row)
 PY
+else
+    [[ -s $OUTPUT_DIR/benchmark/nsplit-comparison.csv ]] ||
+        die "reused benchmark comparison is missing"
+    printf 'Reusing benchmark results in %s/benchmark\n' "$OUTPUT_DIR"
+fi
 
 if [[ $RUN_NCU == 1 ]]; then
     phase=nsight-compute
@@ -239,12 +271,23 @@ if [[ $RUN_NCU == 1 ]]; then
         --section SchedulerStats --section WarpStateStats
         --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
     profile_one() {
-        local kind=$1 scenario=$2 variant=$3 regex=$4 label=$5
+        local kind=$1 scenario=$2 variant=$3 regex=$4 label=$5 block_size=$6
         local binary=$down_bin process=cuda_sm75_q4_down_native
         [[ $kind == down ]] || {
             binary=$gate_bin; process=cuda_sm75_q4_gate_up_native
         }
         local base="$OUTPUT_DIR/ncu/$kind-$scenario-$label" rc=0
+        if [[ $REUSE_NCU == 1 && -s $base.ncu-rep && -s $base.csv ]]; then
+            python3 "$validator" "$base.csv" "$regex" 0 \
+                --process "$process" --block-size "$block_size" \
+                >"$base-validation.txt" 2>&1 || {
+                    cat "$base-validation.txt" >&2
+                    die "reused NCU capture is invalid: $label"
+                }
+            printf 'Reusing validated Nsight Compute capture: %s %s %s\n' \
+                "$kind" "$scenario" "$label"
+            return
+        fi
         printf 'Nsight Compute: %s %s %s...\n' "$kind" "$scenario" "$label"
         CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${ncu_cmd[@]}" --config-file off \
             --target-processes application-only --devices 0 \
@@ -262,23 +305,24 @@ if [[ $RUN_NCU == 1 ]]; then
         "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
             >"$base.csv" 2>"$base-import.log"
         python3 "$validator" "$base.csv" "$regex" 0 --process "$process" \
+            --block-size "$block_size" \
             >"$base-validation.txt" 2>&1 || {
                 cat "$base-validation.txt" >&2; die "wrong NCU kernel: $label";
             }
     }
-    for scenario in real-early real-late; do
+    for scenario in "${ncu_scenarios[@]}"; do
         profile_one down "$scenario" native-aw-consumer \
-            '^sm75_q4_down_native_aw_kernel$' baseline
+            '^sm75_q4_down_native_aw_kernel$' baseline 256
         profile_one down "$scenario" native-aw-nsplit4 \
-            '^sm75_q4_down_native_aw_nsplit_kernel.*4.*$' nsplit4
+            '^sm75_q4_down_native_aw_nsplit_kernel$' nsplit4 128
         profile_one down "$scenario" native-aw-nsplit8 \
-            '^sm75_q4_down_native_aw_nsplit_kernel.*8.*$' nsplit8
+            '^sm75_q4_down_native_aw_nsplit_kernel$' nsplit8 256
         profile_one gate "$scenario" native-aw-warp16-scalar-consumer \
-            '^sm75_q4_gate_up_native_aw_warp16_scalar_kernel$' baseline
+            '^sm75_q4_gate_up_native_aw_warp16_scalar_kernel$' baseline 512
         profile_one gate "$scenario" native-aw-nsplit4 \
-            '^sm75_q4_gate_up_native_aw_nsplit_kernel.*4.*$' nsplit4
+            '^sm75_q4_gate_up_native_aw_nsplit_kernel$' nsplit4 128
         profile_one gate "$scenario" native-aw-nsplit8 \
-            '^sm75_q4_gate_up_native_aw_nsplit_kernel.*8.*$' nsplit8
+            '^sm75_q4_gate_up_native_aw_nsplit_kernel$' nsplit8 256
     done
 fi
 
