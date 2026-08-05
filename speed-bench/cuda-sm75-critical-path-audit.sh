@@ -14,10 +14,10 @@ It also runs the same synthetic production-shaped Q4/Q8 work on physical GPUs
 0 and 3. Timeline annotations are opt-in NVTX ranges and add no CUDA events,
 stream waits, or synchronization.
 
-Required environment:
-  MODEL=/absolute/path/to/full-Q4.gguf
-
 Optional environment:
+  NATIVE_MODEL=/absolute/path/to/tagged-SM75-native-full-Q4.gguf
+  MODEL=...                         defaults to NATIVE_MODEL
+  ALLOW_STANDARD_MODEL=0           explicit diagnostic escape hatch
   PROMPT=...                         fixed prompt file
   CURRENT_DEVICES=0,3,1,2
   SWAPPED_DEVICES=3,0,2,1
@@ -43,8 +43,16 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 
-: "${MODEL:?set MODEL to the absolute full-Q4 GGUF path}"
+NATIVE_MODEL=${NATIVE_MODEL:-/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf}
+MODEL=${MODEL:-$NATIVE_MODEL}
+ALLOW_STANDARD_MODEL=${ALLOW_STANDARD_MODEL:-0}
+[[ $NATIVE_MODEL == /* ]] || die "NATIVE_MODEL must be absolute"
 [[ $MODEL == /* && -f $MODEL ]] || die "MODEL must name an existing absolute file"
+[[ $ALLOW_STANDARD_MODEL == 0 || $ALLOW_STANDARD_MODEL == 1 ]] ||
+    die "ALLOW_STANDARD_MODEL must be 0 or 1"
+if [[ $ALLOW_STANDARD_MODEL == 0 && $MODEL != "$NATIVE_MODEL" ]]; then
+    die "critical-path production baseline requires MODEL=NATIVE_MODEL; set ALLOW_STANDARD_MODEL=1 only for an explicit portable-layout diagnostic"
+fi
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 CURRENT_DEVICES=${CURRENT_DEVICES:-0,3,1,2}
 SWAPPED_DEVICES=${SWAPPED_DEVICES:-3,0,2,1}
@@ -167,6 +175,8 @@ if [[ $resume == 0 ]]; then
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nmodel_hashing=disabled\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
+    printf 'native_model=%s\nallow_standard_model=%s\n' \
+        "$NATIVE_MODEL" "$ALLOW_STANDARD_MODEL"
     printf 'current_devices=%s\nswapped_devices=%s\nstage_split=%s/%s\n' \
         "$CURRENT_DEVICES" "$SWAPPED_DEVICES" "$STAGE_SPLIT" \
         "$((43-STAGE_SPLIT))"
@@ -270,6 +280,10 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
         "$base.log" || die "$label did not use the requested stage split"
     grep -Fq 'partner-classes=t256' "$base.log" ||
         die "$label did not use the fixed T256 partner policy"
+    if [[ $ALLOW_STANDARD_MODEL == 0 ]]; then
+        grep -Fq 'SM75 native routed-Q4 layout enabled' "$base.log" ||
+            die "$label did not dispatch the tagged SM75-native routed-Q4 layout"
+    fi
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
         grep -Fq "$route" "$base.log" ||
             die "$label lacks validated direct NVLink route $route"

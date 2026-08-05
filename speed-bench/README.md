@@ -999,7 +999,11 @@ per-function tables together with the production dispatch matrix.
 ### SM75 prefill critical-path and pair attribution
 
 `cuda-sm75-critical-path-audit.sh` is the bounded follow-up to the T256
-partner-policy screen. It does not repeat a throughput A/B. It records two
+partner-policy screen. The production baseline defaults to the tagged
+SM75-native full-Q4 model at
+`/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf`;
+an ordinary Q4 file is rejected unless `ALLOW_STANDARD_MODEL=1` is explicit.
+It does not repeat a throughput A/B. It records two
 2048-token Nsight Systems traces with the fixed 22/21 split: `0,3,1,2` and the
 pair-preserving swap `3,0,2,1`. Thus each layer stage runs once on physical GPU
 0 and once on physical GPU 3 while each home GPU retains its direct NVLink
@@ -1019,7 +1023,8 @@ and same-work GPU medians. Model hashing remains disabled.
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+unset MODEL ALLOW_STANDARD_MODEL RESUME_DIR
+export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 SKIP_BUILD=0 \
@@ -1030,12 +1035,14 @@ Return `sm75-critical-path-<timestamp>.tar.gz`. The archive is also produced
 on interruption or failure and includes both `.nsys-rep` files, SQLite
 exports, 100-ms GPU clock/power telemetry, harness logs, and derived CSVs.
 
-If a run from commit `ab54701` failed in `same-work-harness` because a dense-Q8
+If the historical standard-layout run from commit `ab54701` failed in
+`same-work-harness` because a dense-Q8
 scenario lacked `timed_per_call_ms`, reuse the completed Nsight Systems traces
 instead of capturing them again:
 
 ```bash
 export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export ALLOW_STANDARD_MODEL=1
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export RESUME_DIR="$PWD/sm75-critical-path-20260805T071911Z"
 
@@ -1047,3 +1054,32 @@ Resume mode validates the model, layouts, split, failed phase, reports,
 SQLite exports, and telemetry before rerunning only the bounded same-work
 harness and summarizer. It preserves the failed run's provenance and writes a
 separate `.resume-<timestamp>.tar.gz` archive.
+
+### Four-GPU Q4 clock and power normalization
+
+`cuda-sm75-q4-clock-audit.sh` diagnoses the physical-board effect without a
+GGUF or multi-GPU placement. It times identical production-shaped early and
+late Q4 work on GPUs 0, 1, 2, and 3 in alternating order, then repeats late Q4
+with both NVLink pairs active concurrently. Its telemetry includes every
+clock-event/throttle-reason field supported by the installed driver.
+
+The default second phase is a reversible common-clock diagnostic at 1620 MHz.
+It does not claim 1620 MHz is the desired production setting: the purpose is
+to determine whether Q4 timing converges at equal clocks and whether GPU2
+shares GPU3's behavior. Original persistence mode, power limits, and unlocked
+clock state are restored on success, failure, or interruption.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+NORMALIZE=1 \
+TARGET_SM_CLOCK=1620 \
+RAISE_POWER_LIMIT=0 \
+USE_SUDO=1 \
+./speed-bench/cuda-sm75-q4-clock-audit.sh
+```
+
+Return `sm75-q4-clock-<timestamp>.tar.gz`. Do not raise power limits until the
+baseline report establishes the active clock-event reason and each board's
+reported default and maximum limits.

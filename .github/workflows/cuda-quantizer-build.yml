@@ -31,7 +31,9 @@ on:
       - "speed-bench/cuda-q8-partner-offload-ab.sh"
       - "speed-bench/cuda-q8-t32-fused-ab.sh"
       - "speed-bench/cuda-sm75-critical-path-audit.sh"
+      - "speed-bench/cuda-sm75-q4-clock-audit.sh"
       - "speed-bench/summarize-cuda-critical-path.py"
+      - "speed-bench/summarize-sm75-q4-clock-audit.py"
       - "speed-bench/summarize-q8-partner-offload-ab.py"
       - "speed-bench/summarize-q8-t32-fused-ab.py"
       - "speed-bench/validate-ncu-capture.py"
@@ -399,6 +401,8 @@ jobs:
           bash -n speed-bench/cuda-q8-t32-fused-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
+          test -x speed-bench/cuda-sm75-q4-clock-audit.sh
+          bash -n speed-bench/cuda-sm75-q4-clock-audit.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
@@ -417,6 +421,7 @@ jobs:
           python3 tests/test_summarize_q8_t32_fused_ab.py
           python3 -m py_compile speed-bench/summarize-cuda-critical-path.py
           python3 tests/test_summarize_cuda_critical_path.py
+          python3 -m py_compile speed-bench/summarize-sm75-q4-clock-audit.py
           python3 -m py_compile speed-bench/summarize-q4-real-histogram.py
           python3 tests/test_summarize_q4_real_histogram.py
           python3 -m py_compile speed-bench/summarize-q4-post-scalar-trace.py
