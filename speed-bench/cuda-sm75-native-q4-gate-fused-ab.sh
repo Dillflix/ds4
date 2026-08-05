@@ -317,7 +317,7 @@ current_phase=api-exactness
 for marker in \
     'tagged SM75 native Q4 gate-fixed-k16 exact' \
     'tagged SM75 native Q4 gate-full64-fused exact' \
-    'tagged SM75 native Q4 gate-full64-fused aux exact' \
+    'tagged SM75 native Q4 gate-full64-fused up-aux/no-perturb exact' \
     'SM75 native Q4 candidate selected: gate-fixed-k16' \
     'SM75 native Q4 candidate selected: gate-full64-fused' \
     'cuda long-context regression: OK'; do

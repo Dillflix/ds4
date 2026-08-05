@@ -83,7 +83,8 @@ leaving Down and the production cost planner untouched:
   tail4 work uses the fixed-K16 control.
 
 Before loading the model, the runner rejects local/stack traffic or more than
-128 registers, requires production API and auxiliary-output exactness, records
+128 registers, requires exact Up auxiliary output and proves that enabling the
+auxiliary stores does not perturb production API output, records
 separate dynamic-K/fixed-K SASS summaries, times all three variants against the
 captured early/late production histograms, and records bounded Nsight Compute
 reports. That bounded Gate-only screen is the default (`RUN_FULL_MODEL=0`).

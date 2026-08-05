@@ -856,8 +856,6 @@ static int check_sm75_native_q4_layout_exact(void) {
     float *wh = (float *)malloc((size_t)pairs * sizeof(float));
     float *mid_ref = (float *)malloc((size_t)mid_count * sizeof(float));
     float *mid_got = (float *)malloc((size_t)mid_count * sizeof(float));
-    float *gate_ref = (float *)malloc((size_t)mid_count * sizeof(float));
-    float *gate_got = (float *)malloc((size_t)mid_count * sizeof(float));
     float *up_ref = (float *)malloc((size_t)mid_count * sizeof(float));
     float *up_got = (float *)malloc((size_t)mid_count * sizeof(float));
     float *out_ref = (float *)malloc((size_t)out_count * sizeof(float));
@@ -872,7 +870,7 @@ static int check_sm75_native_q4_layout_exact(void) {
     ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(down_bytes);
     int rc = 1;
     if (!standard || !native || !xh || !selh || !wh || !mid_ref || !mid_got ||
-        !gate_ref || !gate_got || !up_ref || !up_got ||
+        !up_ref || !up_got ||
         !out_ref || !out_got || !x || !selected || !weights || !out ||
         !gate || !up || !mid || !down) goto cleanup;
     /* Cost-aware residual tiles are the tagged-layout production default.
@@ -982,6 +980,11 @@ static int check_sm75_native_q4_layout_exact(void) {
                 optimized_cases[c].name);
     }
 
+    /* The routed-MoE implementation reuses gate->ptr as the mid-Q8 scratch
+     * immediately after Gate/Up. Reading it after this API returns would compare
+     * standard-Q8 scratch bytes with native-Q8 scratch bytes, not Gate values.
+     * Up remains resident. Validate that auxiliary Up is exact and that
+     * enabling both auxiliary stores leaves mid/final output bit-exact. */
     if (setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7", "0", 1) != 0 ||
         setenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16", "1", 1) != 0 ||
         setenv("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7", "0", 1) != 0 ||
@@ -990,21 +993,19 @@ static int check_sm75_native_q4_layout_exact(void) {
         setenv("DS4_CUDA_MOE_WRITE_GATE_UP", "1", 1) != 0 ||
         !RUN_NATIVE_Q4(standard, 0u, n_tokens, n_expert,
                        mid_ref, out_ref) ||
-        !ds4_gpu_tensor_read(gate, 0, gate_ref,
-                             mid_count * sizeof(float)) ||
         !ds4_gpu_tensor_read(up, 0, up_ref, mid_count * sizeof(float)) ||
         !RUN_NATIVE_Q4(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
                        n_tokens, n_expert, mid_got, out_got) ||
-        !ds4_gpu_tensor_read(gate, 0, gate_got,
-                             mid_count * sizeof(float)) ||
         !ds4_gpu_tensor_read(up, 0, up_got, mid_count * sizeof(float)) ||
-        !compare_exact_f32("sm75 native q4 full64-fused gate aux",
-                           gate_ref, gate_got, mid_count) ||
         !compare_exact_f32("sm75 native q4 full64-fused up aux",
-                           up_ref, up_got, mid_count)) goto cleanup;
+                           up_ref, up_got, mid_count) ||
+        !compare_exact_f32("sm75 native q4 full64-fused aux mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("sm75 native q4 full64-fused aux output",
+                           out_ref, out_got, out_count)) goto cleanup;
     fprintf(stderr,
             "cuda-regression: tagged SM75 native Q4 gate-full64-fused "
-            "aux exact\n");
+            "up-aux/no-perturb exact\n");
     unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7");
@@ -1046,7 +1047,7 @@ cleanup:
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
     free(out_got); free(out_ref); free(up_got); free(up_ref);
-    free(gate_got); free(gate_ref); free(mid_got); free(mid_ref);
+    free(mid_got); free(mid_ref);
     free(wh); free(selh); free(xh); free(native); free(standard);
     return rc;
 }
