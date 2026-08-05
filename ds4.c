@@ -2869,6 +2869,7 @@ typedef struct {
     uint32_t path_class;
     uint32_t layer;
     int physical_device;
+    int fallback_physical_device;
     char label[128];
 } accelerator_q8_cache_candidate;
 
@@ -2929,6 +2930,69 @@ static uint32_t accelerator_q8_cache_benefit_units(uint32_t path_class) {
     }
 }
 
+static bool accelerator_q8_cache_partner_list_has(
+        const char *list, const char *token) {
+    if (!list || !token || !token[0]) return false;
+    const size_t token_len = strlen(token);
+    const char *p = list;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *begin = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > begin && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - begin) == token_len &&
+            memcmp(begin, token, token_len) == 0) return true;
+        if (*p == ',') p++;
+    }
+    return false;
+}
+
+/* The default preserves the first partner-offload experiment exactly.  The
+ * class list is deliberately an experiment control rather than a permanent
+ * performance policy: isolated T32, T256 and shared-down runs must establish
+ * their different NVLink round-trip costs before a measured composite policy
+ * can replace this default. */
+static bool accelerator_q8_cache_partner_class_enabled(uint32_t path_class) {
+    const char *list = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+    if (!list || !list[0] || strcmp(list, "legacy") == 0) {
+        return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
+               path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+    }
+    if (strcmp(list, "none") == 0) return false;
+    if (strcmp(list, "all") == 0) {
+        return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
+               path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B ||
+               path_class == ACCEL_Q8_CACHE_SHARED_DOWN;
+    }
+    switch (path_class) {
+    case ACCEL_Q8_CACHE_T32_Q_B:
+        return accelerator_q8_cache_partner_list_has(list, "t32");
+    case ACCEL_Q8_CACHE_T256_OUTPUT_B:
+        return accelerator_q8_cache_partner_list_has(list, "t256");
+    case ACCEL_Q8_CACHE_SHARED_DOWN:
+        return accelerator_q8_cache_partner_list_has(list, "shared_down");
+    default:
+        return false;
+    }
+}
+
+static int accelerator_q8_cache_partner_tier(
+        uint32_t path_class,
+        bool cuda_tp_decode,
+        int n_gpus,
+        int home_tier,
+        bool peer_forward,
+        bool peer_reverse,
+        bool disabled) {
+    if (disabled || !cuda_tp_decode || n_gpus < 2 || (n_gpus & 1) != 0 ||
+        !accelerator_q8_cache_partner_class_enabled(path_class)) return -1;
+    const int half = n_gpus / 2;
+    if (home_tier < 0 || home_tier >= half || !peer_forward || !peer_reverse)
+        return -1;
+    return home_tier + half;
+}
+
 static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     const accelerator_q8_cache_candidate *a = va;
     const accelerator_q8_cache_candidate *b = vb;
@@ -2941,6 +3005,8 @@ static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     if (a->benefit_units < b->benefit_units) return 1;
     if (a->physical_device < b->physical_device) return -1;
     if (a->physical_device > b->physical_device) return 1;
+    if (a->fallback_physical_device < b->fallback_physical_device) return -1;
+    if (a->fallback_physical_device > b->fallback_physical_device) return 1;
     if (a->layer < b->layer) return -1;
     if (a->layer > b->layer) return 1;
     if (a->path_class < b->path_class) return -1;
@@ -2956,14 +3022,16 @@ static bool accelerator_q8_cache_candidate_append(
         const ds4_model *m, const ds4_tensor *t,
         uint64_t offset, uint64_t weight_bytes,
         uint64_t in_dim, uint64_t out_dim,
-        int physical_device, uint32_t path_class) {
+        int physical_device, int fallback_physical_device,
+        uint32_t path_class) {
     if (!items || !count || !capacity || !m || !t || path_class == ACCEL_Q8_CACHE_NONE ||
         in_dim == 0u || out_dim == 0u || in_dim > UINT64_MAX / out_dim / 2u) return false;
     for (uint64_t i = 0; i < *count; i++) {
         const accelerator_q8_cache_candidate *c = &(*items)[i];
         if (c->model_map == m->map && c->offset == offset &&
             c->weight_bytes == weight_bytes && c->in_dim == in_dim &&
-            c->out_dim == out_dim && c->physical_device == physical_device) return true;
+            c->out_dim == out_dim && c->physical_device == physical_device &&
+            c->fallback_physical_device == fallback_physical_device) return true;
     }
     if (*count == *capacity) {
         uint64_t next = *capacity ? *capacity * 2u : 128u;
@@ -2986,6 +3054,7 @@ static bool accelerator_q8_cache_candidate_append(
     c->path_class = path_class;
     c->layer = accelerator_q8_cache_layer(t->name);
     c->physical_device = physical_device;
+    c->fallback_physical_device = fallback_physical_device;
     snprintf(c->label, sizeof(c->label), "tensor:%.*s",
              (int)(t->name.len < 110u ? t->name.len : 110u), t->name.ptr);
     return true;
@@ -3209,7 +3278,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                 !accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, m, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    0, path_class)) {
+                    0, -1, path_class)) {
                 free(plan);
                 return false;
             }
@@ -3221,9 +3290,10 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
         ds4_gpu_q8_f16_plan_begin();
         for (uint64_t i = 0; i < plan_count; i++) {
             const accelerator_q8_cache_candidate *c = &plan[i];
-            (void)ds4_gpu_cache_q8_f16_range_on_device(
+            (void)ds4_gpu_cache_q8_f16_range_on_device_or_partner(
                 c->model_map, c->model_size, c->offset, c->weight_bytes,
-                c->in_dim, c->out_dim, c->physical_device, c->label);
+                c->in_dim, c->out_dim, c->physical_device,
+                c->fallback_physical_device, c->label);
         }
         ds4_gpu_q8_f16_plan_end();
     }
@@ -55578,6 +55648,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t plan_count = 0;
     uint64_t plan_capacity = 0;
     uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
+    uint64_t partner_fallback_count = 0u;
+    const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+    if (!partner_classes || !partner_classes[0]) partner_classes = "legacy";
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
     const bool split_attn_output =
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
@@ -55597,6 +55670,15 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         const int partner_tier = cuda_tp_decode ? home_tier + tp_half : -1;
         const int partner_device = partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus
             ? g_gpu[partner_tier].device_id : -1;
+        const int fallback_tier = accelerator_q8_cache_partner_tier(
+            path_class, cuda_tp_decode, e->gpu_cfg.n_gpus, home_tier,
+            partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
+                g_gpu_peer_ok[home_tier][partner_tier],
+            partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
+                g_gpu_peer_ok[partner_tier][home_tier],
+            getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL);
+        const int fallback_device = fallback_tier >= 0
+            ? g_gpu[fallback_tier].device_id : -1;
         const uint64_t row_bytes = ((t->dim[0] + 31u) / 32u) * 34u;
         bool ok = true;
 
@@ -55612,15 +55694,15 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, half_bytes, t->dim[0], half_rows,
-                    home_device, path_class) &&
+                    home_device, -1, path_class) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
-                    partner_device, path_class) &&
+                    partner_device, -1, path_class) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, path_class);
+                    home_device, fallback_device, path_class);
         } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B && split_attn_heads &&
                    partner_device >= 0 && (t->dim[1] & 1u) == 0u &&
                    row_bytes <= UINT64_MAX / t->dim[1] &&
@@ -55630,26 +55712,26 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, half_bytes, t->dim[0], half_rows,
-                    home_device, path_class) &&
+                    home_device, -1, path_class) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
-                    partner_device, path_class) &&
+                    partner_device, -1, path_class) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, path_class);
+                    home_device, fallback_device, path_class);
         } else {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, path_class);
+                    home_device, fallback_device, path_class);
             if (ok && path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
                 split_attn_output && partner_device >= 0) {
                 ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    partner_device, path_class);
+                    partner_device, -1, path_class);
             }
         }
         if (!ok) {
@@ -55661,24 +55743,31 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
 
     qsort(plan, (size_t)plan_count, sizeof(plan[0]),
           accelerator_q8_cache_candidate_cmp);
-    for (uint64_t i = 0; i < plan_count; i++) class_count[plan[i].path_class]++;
+    for (uint64_t i = 0; i < plan_count; i++) {
+        class_count[plan[i].path_class]++;
+        if (plan[i].fallback_physical_device >= 0) partner_fallback_count++;
+    }
     fprintf(stderr,
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
-            "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu other=%llu\n",
+            "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
+            "other=%llu partner-fallback=%llu partner-classes=%s\n",
             (unsigned long long)plan_count,
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_OUTPUT_A],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_SHARED_DOWN],
             (unsigned long long)(class_count[ACCEL_Q8_CACHE_SHARED_GATE_UP] +
-                                 class_count[ACCEL_Q8_CACHE_OTHER_ATTN]));
+                                 class_count[ACCEL_Q8_CACHE_OTHER_ATTN]),
+            (unsigned long long)partner_fallback_count,
+            partner_classes);
 
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {
         const accelerator_q8_cache_candidate *c = &plan[i];
-        (void)ds4_gpu_cache_q8_f16_range_on_device(
+        (void)ds4_gpu_cache_q8_f16_range_on_device_or_partner(
             c->model_map, c->model_size, c->offset, c->weight_bytes,
-            c->in_dim, c->out_dim, c->physical_device, c->label);
+            c->in_dim, c->out_dim, c->physical_device,
+            c->fallback_physical_device, c->label);
     }
     ds4_gpu_q8_f16_plan_end();
     free(plan);
@@ -56156,6 +56245,19 @@ int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
     a.fp16_bytes = fp16_bytes_a;
     b.fp16_bytes = fp16_bytes_b;
     return accelerator_q8_cache_candidate_cmp(&a, &b);
+}
+
+int ds4_test_q8_cache_partner_tier(
+        const char *name,
+        int n_gpus,
+        int home_tier,
+        int peer_forward,
+        int peer_reverse,
+        int disabled) {
+    ds4_str s = {name, name ? strlen(name) : 0u};
+    return accelerator_q8_cache_partner_tier(
+        accelerator_q8_cache_classify(s), true, n_gpus, home_tier,
+        peer_forward != 0, peer_reverse != 0, disabled != 0);
 }
 
 bool ds4_test_cuda_routed_moe_quant_types_supported(

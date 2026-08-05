@@ -323,6 +323,85 @@ Return `q8-cache-benefit-ab-<timestamp>.tar.gz`. The runner requires nonzero
 T32/T256 planned coverage, freezes the cache before timing, alternates process
 order, and reports paired planner/first-use throughput ratios per frontier.
 
+### Q8 F16 NVLink-partner execution A/B
+
+`cuda-q8-partner-offload-ab.sh` holds full-Q4 placement at the measured 22/21
+split and logical device order `0,3,1,2`. It screens the identical local cache
+plan with partner execution disabled, T32-only, T256-only, shared-down-only,
+and the initial T32+T256 (`legacy`) heuristic. The class selector changes only
+which home-cache misses may overflow to partner VRAM; it does not remove or
+reorder any home or fixed partner cache candidates.
+
+The runner requires all four logical home/partner routes to be validated
+`DIRECT`, proves that every candidate run executed only its requested class,
+freezes cache state before timed frontiers, rotates process order, and reports
+every candidate/local throughput ratio. The GPU regression deliberately fills
+a home device's per-device F16 cap and proves bit-exact partner execution for
+the production T32, T256, and shared-down shapes. By default it also captures
+one short, measured-prefill Nsight Systems report for each isolated class so
+transfer, cuBLAS, synchronization, and partner contention can be evaluated.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=3 \
+bash ./speed-bench/cuda-q8-partner-offload-ab.sh
+```
+
+Set `RUN_NSYS=0` only for a throughput-only rerun, and set `RUN_GPU_TEST=0`
+only after all three exactness cases have passed for the current binary.
+`VARIANTS` and `NSYS_VARIANTS` accept comma-separated subsets of the named
+variants. Return `q8-partner-offload-ab-<timestamp>.tar.gz`; its
+`class-evidence.csv` records execution counts by class and its `nsys/`
+directory contains the bounded timelines and exported summaries.
+
+### T32 FP16-output fusion and partner-transfer A/B
+
+`cuda-q8-t32-fused-ab.sh` isolates the formerly stubbed CUDA T32 capability
+from the broader cache-policy experiment. It measures four process-isolated
+variants at the fixed full-Q4 22/21 placement: established FP32-output T32 on
+local weights, FP16-output plus fused RMS/RoPE on local weights, established
+FP32-output T32 with partner overflow, and FP16-output/fused T32 with partner
+overflow. The last variant returns an FP16 intermediate over NVLink, halving
+the T32 result transfer before postprocessing on the home GPU.
+
+The GPU regression first proves that local and partner FP16 intermediates are
+bit-exact, their final FP32 outputs are bit-exact, and the new half-input
+RMS/RoPE kernel is bit-exact with the established combined FP32 kernel after
+the same FP16 rounding. The end-to-end runner requires old local/partner and
+new local/partner logits to match within each arithmetic policy. It records,
+but does not require, bit identity between the old and new policies because
+the new cuBLAS output is deliberately rounded to FP16. All four short Nsight
+Systems traces are enabled by default.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=8192 \
+REPEATS=3 \
+bash ./speed-bench/cuda-q8-t32-fused-ab.sh
+```
+
+Return `q8-t32-fused-ab-<timestamp>.tar.gz`. Set `RUN_NSYS=0` only for a
+throughput-only rerun after the execution-path validations have passed.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver

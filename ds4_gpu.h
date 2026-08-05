@@ -127,8 +127,15 @@ int ds4_gpu_cache_q8_f16_range_on_device(const void *model_map, uint64_t model_s
                                           uint64_t offset, uint64_t bytes,
                                           uint64_t in_dim, uint64_t out_dim,
                                           int physical_device, const char *label);
+int ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes,
+        uint64_t in_dim, uint64_t out_dim,
+        int physical_device, int fallback_physical_device,
+        const char *label);
 void ds4_gpu_q8_f16_plan_begin(void);
 void ds4_gpu_q8_f16_plan_end(void);
+uint64_t ds4_gpu_q8_f16_partner_offload_count(void);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD

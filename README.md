@@ -739,9 +739,31 @@ output sharding, pipelined prefill, and compatible grouped decode are selected
 by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
 Pipelined prefill enables the selective Q8-to-F16 weight cache by default and
 uses cuBLAS for eligible dense and shared-expert projections. Cache growth stops
-at the CUDA VRAM reserve and transparently falls back to native Q8 kernels when
-an expansion cannot fit. `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables this
-cache for memory-pressure diagnosis; it is not the performance default.
+at the CUDA VRAM reserve. For the expensive T32 `attn_q_b` and T256
+`attn_output_b` projections, an expansion that does not fit on its stage-home
+GPU is admitted on that home's validated NVLink partner: FP16 activations move
+to the partner, cuBLAS executes against the partner-local F16 weight, and the
+FP32 result returns to the home GPU. The path never peer-reads weights and never
+uses the pinned-host bounce route. If neither device can admit the expansion it
+transparently falls back to native Q8. `DS4_CUDA_Q8_F16_CACHE_MB` is a
+per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
+admission/execution for controlled A/B testing.
+The initial partner policy remains T32+T256 for compatibility, but it is an
+experimental heuristic rather than a measured remote-cost ranking. Set
+`DS4_CUDA_Q8_F16_PARTNER_CLASSES` to `t32`, `t256`, `shared_down`, `legacy`,
+`none`, or a comma-separated class list for class-isolated measurement. The
+local cache plan remains unchanged by this selector; only home-cache misses are
+eligible to use partner VRAM. Shared-down is not enabled by the legacy policy.
+The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
+`DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
+existing half-size Q scratch and then performs head RMS normalization plus
+RoPE in one half-input kernel. A partner-resident T32 slice returns that FP16
+intermediate over NVLink instead of the generic FP32 result, halving result
+traffic. The established FP32-output path remains the default until the fixed
+four-way local/partner A/B establishes an end-to-end win; use
+`DS4_CUDA_NO_T32_F16_FUSED=1` as an explicit diagnostic override.
+`DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables the complete cache for
+memory-pressure diagnosis; it is not the performance default.
 Prefill attention remains on the home GPU by default. The experimental 32/32
 head split can be enabled with `DS4_CUDA_TP_PREFILL_ATTN_HEADS=1`; it keeps raw
 and compressed KV single-copy on the home GPU, runs the two attention/output-A

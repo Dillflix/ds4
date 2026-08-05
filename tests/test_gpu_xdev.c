@@ -29,6 +29,35 @@
         }                                                                   \
     } while (0)
 
+/* Exact IEEE-754 binary16 -> binary32 widening for validating CUDA kernels
+ * from a C-compiled host test (cuda_fp16.h's C++ helpers are unavailable
+ * here).  Every binary16 value has an exact binary32 representation. */
+static float half_bits_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16u;
+    uint32_t exp = (h >> 10u) & 0x1fu;
+    uint32_t frac = h & 0x03ffu;
+    uint32_t bits;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            bits = sign;
+        } else {
+            uint32_t e = 113u;
+            while ((frac & 0x0400u) == 0u) {
+                frac <<= 1u;
+                e--;
+            }
+            bits = sign | (e << 23u) | ((frac & 0x03ffu) << 13u);
+        }
+    } else if (exp == 0x1fu) {
+        bits = sign | 0x7f800000u | (frac << 13u);
+    } else {
+        bits = sign | ((exp + 112u) << 23u) | (frac << 13u);
+    }
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static int run_one(int n_gpus_wanted, int force_bounce) {
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
@@ -1839,6 +1868,267 @@ static int run_attention_output_tp_peer_read(void) {
     return 0;
 }
 
+static int run_q8_partner_projection_case(
+        const char *case_name,
+        const char *tensor_name,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t fp16_bytes = in_dim * out_dim * sizeof(uint16_t);
+    char cache_mib[32];
+    snprintf(cache_mib, sizeof(cache_mib), "%llu",
+             (unsigned long long)(fp16_bytes / 1048576u));
+    (void)setenv("DS4_CUDA_Q8_F16_CACHE_MB", cache_mib, 1);
+    (void)setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", "1", 1);
+    (void)setenv("DS4_CUDA_NO_TF32", "1", 1);
+    (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
+    (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
+    (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
+    (void)unsetenv("DS4_FORCE_HOST_BOUNCE");
+
+    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    CHECK(ds4_gpu_init_multi(&cfg), "q8 partner init_multi");
+    if (!g_gpu_peer_ok[0][1] || !g_gpu_peer_ok[1][0]) {
+        ds4_gpu_cleanup();
+        fprintf(stderr, "  skipping q8 partner projection (no bidirectional peer access)\n");
+        (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_MB");
+        (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB");
+        (void)unsetenv("DS4_CUDA_NO_TF32");
+        (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+        return 0;
+    }
+
+    const uint64_t n_tok = 17u;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    const uint64_t model_size = 2u * weight_bytes;
+    const uint64_t input_count = n_tok * in_dim;
+    const uint64_t output_count = n_tok * out_dim;
+    unsigned char *model = (unsigned char *)malloc((size_t)model_size);
+    float *host_input = (float *)malloc((size_t)input_count * sizeof(float));
+    float *host_local = (float *)malloc((size_t)output_count * sizeof(float));
+    float *host_partner = (float *)malloc((size_t)output_count * sizeof(float));
+    CHECK(model && host_input && host_local && host_partner,
+          "q8 partner host allocations");
+    pack_q8_identity_scale(model, in_dim, out_dim);
+    memcpy(model + weight_bytes, model, (size_t)weight_bytes);
+    for (uint64_t i = 0; i < input_count; i++) {
+        host_input[i] = (float)((int)(i % 101u) - 50) * 0.03125f;
+    }
+
+    CHECK(ds4_gpu_set_model_map(model, model_size), "q8 partner set model map");
+    ds4_tensor_range home_range = {0u, model_size, 0};
+    ds4_tensor_range partner_range = {0u, model_size, 1};
+    CHECK(ds4_gpu_device_cache_tensors(0, &home_range, 1) == 0,
+          "q8 partner cache source on home");
+    CHECK(ds4_gpu_device_cache_tensors(1, &partner_range, 1) == 0,
+          "q8 partner cache source on partner");
+
+    /* The first F16 expansion fills device 0's per-device cap.  The second
+     * same-sized candidate must therefore materialize only on device 1. */
+    ds4_gpu_q8_f16_plan_begin();
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device(
+              model, model_size, 0u, weight_bytes, in_dim, out_dim,
+              0, "tensor:blk.0.partner_reference.weight"),
+          "q8 partner register local reference");
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+              model, model_size, weight_bytes, weight_bytes, in_dim, out_dim,
+              0, 1, tensor_name),
+          "q8 partner register spill candidate");
+    ds4_gpu_q8_f16_plan_end();
+
+    ds4_gpu_tensor input; memset(&input, 0, sizeof(input));
+    ds4_gpu_tensor local; memset(&local, 0, sizeof(local));
+    ds4_gpu_tensor partner; memset(&partner, 0, sizeof(partner));
+    CHECK(ds4_gpu_tensor_alloc_on(
+              &input, 0, input_count * sizeof(float)) == 0,
+          "q8 partner input alloc");
+    CHECK(ds4_gpu_tensor_alloc_on(
+              &local, 0, output_count * sizeof(float)) == 0,
+          "q8 partner local output alloc");
+    CHECK(ds4_gpu_tensor_alloc_on(
+              &partner, 0, output_count * sizeof(float)) == 0,
+          "q8 partner remote output alloc");
+    CHECK(ds4_gpu_tensor_write(
+              &input, 0, host_input, input_count * sizeof(float)),
+          "q8 partner input write");
+    CHECK(ds4_gpu_set_current_device(0) == 0, "q8 partner select home");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+              &local, model, model_size, 0u, in_dim, out_dim, &input, n_tok),
+          "q8 partner local projection");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+              &partner, model, model_size, weight_bytes,
+              in_dim, out_dim, &input, n_tok),
+          "q8 partner remote projection");
+    CHECK(ds4_gpu_tensor_read(
+              &local, 0, host_local, output_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              &partner, 0, host_partner, output_count * sizeof(float)),
+          "q8 partner output read");
+    CHECK(memcmp(host_local, host_partner,
+                 (size_t)output_count * sizeof(float)) == 0,
+          "partner cuBLAS output is bit-exact with local cuBLAS");
+    CHECK(ds4_gpu_q8_f16_partner_offload_count() == 1u,
+          "exactly one projection executed on the partner");
+
+    if (in_dim == 1024u && out_dim == 32768u) {
+        const uint64_t half_bytes = output_count * sizeof(uint16_t);
+        uint16_t *host_local_half =
+            (uint16_t *)malloc((size_t)half_bytes);
+        uint16_t *host_partner_half =
+            (uint16_t *)malloc((size_t)half_bytes);
+        float *host_local_fused =
+            (float *)malloc((size_t)output_count * sizeof(float));
+        float *host_partner_fused =
+            (float *)malloc((size_t)output_count * sizeof(float));
+        float *host_reference =
+            (float *)malloc((size_t)output_count * sizeof(float));
+        CHECK(host_local_half && host_partner_half &&
+              host_local_fused && host_partner_fused && host_reference,
+              "T32 fused host allocations");
+
+        ds4_gpu_tensor local_half; memset(&local_half, 0, sizeof(local_half));
+        ds4_gpu_tensor partner_half; memset(&partner_half, 0, sizeof(partner_half));
+        ds4_gpu_tensor local_fused; memset(&local_fused, 0, sizeof(local_fused));
+        ds4_gpu_tensor partner_fused; memset(&partner_fused, 0, sizeof(partner_fused));
+        ds4_gpu_tensor reference; memset(&reference, 0, sizeof(reference));
+        CHECK(ds4_gpu_tensor_alloc_on(&local_half, 0, half_bytes) == 0 &&
+              ds4_gpu_tensor_alloc_on(&partner_half, 0, half_bytes) == 0 &&
+              ds4_gpu_tensor_alloc_on(
+                  &local_fused, 0, output_count * sizeof(float)) == 0 &&
+              ds4_gpu_tensor_alloc_on(
+                  &partner_fused, 0, output_count * sizeof(float)) == 0 &&
+              ds4_gpu_tensor_alloc_on(
+                  &reference, 0, output_count * sizeof(float)) == 0,
+              "T32 fused device allocations");
+
+        const uint32_t n_head = 64u;
+        const uint32_t head_dim = 512u;
+        const uint32_t n_rot = 64u;
+        const float rope_base = 160000.0f;
+        const float rope_scale = 0.0625f;
+        const float rope_ext = 1.0f;
+        const float rope_attn =
+            1.0f / (1.0f + 0.1f * logf(1.0f / rope_scale));
+        CHECK(ds4_gpu_set_current_device(0) == 0,
+              "T32 fused select home");
+        CHECK(!ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                  &local_fused, &local_half,
+                  model, model_size, 0u, in_dim, out_dim, &input,
+                  1u, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 FP16-output helper is prefill-only");
+        CHECK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                  &local_fused, &local_half,
+                  model, model_size, 0u, in_dim, out_dim, &input,
+                  (uint32_t)n_tok, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 local fused projection");
+        CHECK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+                  &partner_fused, &partner_half,
+                  model, model_size, weight_bytes, in_dim, out_dim, &input,
+                  (uint32_t)n_tok, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 partner fused projection");
+        CHECK(ds4_gpu_tensor_read(
+                  &local_half, 0, host_local_half, half_bytes) &&
+              ds4_gpu_tensor_read(
+                  &partner_half, 0, host_partner_half, half_bytes) &&
+              ds4_gpu_tensor_read(
+                  &local_fused, 0, host_local_fused,
+                  output_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  &partner_fused, 0, host_partner_fused,
+                  output_count * sizeof(float)),
+              "T32 fused output read");
+        CHECK(memcmp(host_local_half, host_partner_half,
+                     (size_t)half_bytes) == 0,
+              "T32 local/partner FP16 intermediates are bit-exact");
+        CHECK(memcmp(host_local_fused, host_partner_fused,
+                     (size_t)output_count * sizeof(float)) == 0,
+              "T32 local/partner fused FP32 outputs are bit-exact");
+        CHECK(ds4_gpu_q8_f16_partner_offload_count() == 2u,
+              "T32 fused helper executed once on the partner");
+
+        /* Validate the half-input postprocess itself, rather than merely
+         * proving that its local and partner invocations agree.  Widen the
+         * exact FP16 intermediate, then run the established FP32 combined
+         * RMS/RoPE implementation with identical parameters. */
+        for (uint64_t i = 0; i < output_count; i++) {
+            host_reference[i] = half_bits_to_float(host_local_half[i]);
+        }
+        CHECK(ds4_gpu_tensor_write(
+                  &reference, 0, host_reference,
+                  output_count * sizeof(float)),
+              "T32 FP32 reference input write");
+        CHECK(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                  &reference, (uint32_t)n_tok, n_head, head_dim, n_rot,
+                  23u, 65536u, false,
+                  rope_base, rope_scale, rope_ext, rope_attn,
+                  32.0f, 1.0f, 1e-6f),
+              "T32 FP32 reference RMS/RoPE");
+        CHECK(ds4_gpu_tensor_read(
+                  &reference, 0, host_reference,
+                  output_count * sizeof(float)),
+              "T32 FP32 reference output read");
+        CHECK(memcmp(host_local_fused, host_reference,
+                     (size_t)output_count * sizeof(float)) == 0,
+              "T32 half-input fused postprocess matches FP32 reference");
+
+        ds4_gpu_tensor_free_in_place(&local_half);
+        ds4_gpu_tensor_free_in_place(&partner_half);
+        ds4_gpu_tensor_free_in_place(&local_fused);
+        ds4_gpu_tensor_free_in_place(&partner_fused);
+        ds4_gpu_tensor_free_in_place(&reference);
+        free(host_local_half);
+        free(host_partner_half);
+        free(host_local_fused);
+        free(host_partner_fused);
+        free(host_reference);
+        fprintf(stderr,
+                "  q8 partner T32 FP16-output RMS/RoPE exactness OK\n");
+    }
+
+    ds4_gpu_tensor_free_in_place(&input);
+    ds4_gpu_tensor_free_in_place(&local);
+    ds4_gpu_tensor_free_in_place(&partner);
+    free(model);
+    free(host_input);
+    free(host_local);
+    free(host_partner);
+    ds4_gpu_cleanup();
+    (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_MB");
+    (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB");
+    (void)unsetenv("DS4_CUDA_NO_TF32");
+    (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
+    (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+    fprintf(stderr, "  q8 partner projection exactness %s OK\n", case_name);
+    return 0;
+}
+
+static int run_q8_partner_projection(void) {
+    int dev_count = 0;
+    (void)cudaGetDeviceCount(&dev_count);
+    if (dev_count < 2) return 0;
+
+    if (run_q8_partner_projection_case(
+            "T32", "tensor:blk.1.attn_q_b.weight", 1024u, 32768u)) return 1;
+    if (run_q8_partner_projection_case(
+            "T256", "tensor:blk.1.attn_output_b.weight", 8192u, 4096u)) return 1;
+    if (run_q8_partner_projection_case(
+            "shared-down", "tensor:blk.1.ffn_down_shexp.weight", 2048u, 4096u)) return 1;
+    fprintf(stderr, "  q8 partner projection exactness OK (3 classes)\n");
+    return 0;
+}
+
 int main(void) {
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
@@ -1866,6 +2156,7 @@ int main(void) {
         if (run_one(2, 0)) return 1;
         if (run_copy3(2, 0)) return 1;
         if (run_attention_output_tp_peer_read()) return 1;
+        if (run_q8_partner_projection()) return 1;
         if (run_one(2, 1)) return 1;
         if (run_copy3(2, 1)) return 1;
         /* Stress: catches the cudaMemcpyPeer driver-corruption pattern that

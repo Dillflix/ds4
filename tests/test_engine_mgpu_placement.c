@@ -44,6 +44,9 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 uint32_t ds4_test_q8_cache_class(const char *name);
 int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
                               const char *name_b, uint64_t fp16_bytes_b);
+int ds4_test_q8_cache_partner_tier(const char *name, int n_gpus,
+                                   int home_tier, int peer_forward,
+                                   int peer_reverse, int disabled);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -164,6 +167,51 @@ static void test_q8_cache_benefit_order(void) {
     CHECK(ds4_test_q8_cache_compare(shared_down, 16ull << 20,
                                     shared_gate, 16ull << 20) < 0,
           "shared down ranks before already-efficient shared gate/up");
+}
+
+static void test_q8_cache_partner_mapping(void) {
+    fprintf(stderr, "RUN: test_q8_cache_partner_mapping\n");
+    const char *q_b = "blk.3.attn_q_b.weight";
+    const char *out_b = "blk.3.attn_output_b.weight";
+    const char *shared = "blk.3.ffn_down_shexp.weight";
+    const int physical[4] = {0, 3, 1, 2};
+
+    (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+
+    const int q_partner = ds4_test_q8_cache_partner_tier(
+        q_b, 4, 0, 1, 1, 0);
+    const int out_partner = ds4_test_q8_cache_partner_tier(
+        out_b, 4, 1, 1, 1, 0);
+    CHECK(q_partner == 2 && physical[q_partner] == 1,
+          "T32 home logical 0 maps to NVLink partner logical 2 (physical 1)");
+    CHECK(out_partner == 3 && physical[out_partner] == 2,
+          "T256 home logical 1 maps to NVLink partner logical 3 (physical 2)");
+    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
+          "legacy policy does not partner-offload shared-down");
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "shared_down", 1);
+    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == 2,
+          "class-isolated policy enables shared-down partner mapping");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
+          "class-isolated shared-down policy excludes T32");
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t32,t256", 1);
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == 2,
+          "explicit T32/T256 policy enables T32");
+    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
+          "explicit T32/T256 policy excludes shared-down");
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "none", 1);
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
+          "none policy disables partner mapping");
+    (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 0, 1, 0) == -1,
+          "forward peer validation is required");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 0, 0) == -1,
+          "reverse peer validation is required");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 2, 1, 1, 0) == -1,
+          "upper-half tiers cannot recursively choose a partner");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 3, 0, 1, 1, 0) == -1,
+          "odd GPU counts cannot use paired offload");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 1) == -1,
+          "explicit opt-out disables partner placement");
 }
 
 static void test_tensor_to_entry(void) {
@@ -788,6 +836,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 int main(void) {
     test_cuda_routed_moe_quant_matrix();
     test_q8_cache_benefit_order();
+    test_q8_cache_partner_mapping();
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();
