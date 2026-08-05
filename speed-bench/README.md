@@ -367,6 +367,14 @@ only after all three exactness cases have passed for the current binary.
 variants. Return `q8-partner-offload-ab-<timestamp>.tar.gz`; its
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
+
+The completed full-Q4 screen selected T256-only as the production default:
+13.1--15.1% over local, versus 12.2--13.5% for T32-only and 12.3--14.4% for
+the mixed legacy policy. T32, T256, and legacy produced byte-identical logits
+to one another, but the T256 trace moved only 3.12 GiB of partner activation
+and result traffic versus T32's 12.70 GiB. Shared-down gained only 2.9--3.4%,
+changed the 2048-token top result in every repeat, and is rejected as a default.
+
 The completed T32 fusion A/B can eliminate redundant local and T32 runs:
 
 ```bash

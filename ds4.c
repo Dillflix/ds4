@@ -2948,14 +2948,17 @@ static bool accelerator_q8_cache_partner_list_has(
     return false;
 }
 
-/* The default preserves the first partner-offload experiment exactly.  The
- * class list is deliberately an experiment control rather than a permanent
- * performance policy: isolated T32, T256 and shared-down runs must establish
- * their different NVLink round-trip costs before a measured composite policy
- * can replace this default. */
+/* The full-Q4 class-isolated screen selects T256 by default.  T32 and T256
+ * produced identical logits and similar compute savings, but T256 moved only
+ * 3.12 GiB per sweep versus T32's 12.70 GiB and was consistently faster.
+ * Shared-down was materially slower and changed the 2048-token top result.
+ * Keep "legacy" as an explicit compatibility/measurement selector. */
 static bool accelerator_q8_cache_partner_class_enabled(uint32_t path_class) {
     const char *list = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
-    if (!list || !list[0] || strcmp(list, "legacy") == 0) {
+    if (!list || !list[0]) {
+        return path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+    }
+    if (strcmp(list, "legacy") == 0) {
         return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
                path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
     }
@@ -55650,7 +55653,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
     uint64_t partner_fallback_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
-    if (!partner_classes || !partner_classes[0]) partner_classes = "legacy";
+    if (!partner_classes || !partner_classes[0]) partner_classes = "t256";
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
     const bool split_attn_output =
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();

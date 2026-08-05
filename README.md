@@ -748,12 +748,16 @@ uses the pinned-host bounce route. If neither device can admit the expansion it
 transparently falls back to native Q8. `DS4_CUDA_Q8_F16_CACHE_MB` is a
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing.
-The initial partner policy remains T32+T256 for compatibility, but it is an
-experimental heuristic rather than a measured remote-cost ranking. Set
+The measured default partner policy is T256-only. On the fixed full-Q4 22/21
+screen it improved prefill by 13.1--15.1%, moved 3.12 GiB per benchmark sweep,
+and preserved the top token at all nine measured frontiers. T32-only produced
+the same logits but moved 12.70 GiB and was slower; the initial mixed policy is
+retained as the explicit `legacy` selector. Set
 `DS4_CUDA_Q8_F16_PARTNER_CLASSES` to `t32`, `t256`, `shared_down`, `legacy`,
-`none`, or a comma-separated class list for class-isolated measurement. The
-local cache plan remains unchanged by this selector; only home-cache misses are
-eligible to use partner VRAM. Shared-down is not enabled by the legacy policy.
+`none`, or a comma-separated class list for controlled measurement. The local
+cache plan remains unchanged by this selector; only home-cache misses are
+eligible to use partner VRAM. Shared-down is not enabled by default or by the
+legacy policy.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

@@ -182,12 +182,24 @@ static void test_q8_cache_partner_mapping(void) {
         q_b, 4, 0, 1, 1, 0);
     const int out_partner = ds4_test_q8_cache_partner_tier(
         out_b, 4, 1, 1, 1, 0);
-    CHECK(q_partner == 2 && physical[q_partner] == 1,
-          "T32 home logical 0 maps to NVLink partner logical 2 (physical 1)");
+    CHECK(q_partner == -1,
+          "measured default excludes the higher-transfer T32 partner path");
     CHECK(out_partner == 3 && physical[out_partner] == 2,
-          "T256 home logical 1 maps to NVLink partner logical 3 (physical 2)");
+          "default T256 home logical 1 maps to NVLink partner logical 3 (physical 2)");
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
-          "legacy policy does not partner-offload shared-down");
+          "measured default does not partner-offload shared-down");
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t256", 1);
+    CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3,
+          "explicit T256 policy matches the measured default");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
+          "explicit T256 policy excludes T32");
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "legacy", 1);
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == 2,
+          "explicit legacy policy retains T32 partner mapping");
+    CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3,
+          "explicit legacy policy retains T256 partner mapping");
+    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
+          "explicit legacy policy excludes shared-down");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "shared_down", 1);
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == 2,
           "class-isolated policy enables shared-down partner mapping");
