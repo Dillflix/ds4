@@ -21,6 +21,13 @@
 #include <algorithm>
 #include <atomic>
 
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define DS4_CUDA_HAVE_NVTX3 1
+#endif
+#endif
+
 #include "ds4_tensor_layout.h"
 
 #ifndef M_PI
@@ -3624,6 +3631,50 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 static thread_local int g_cuda_profiler_device = -1;
 static thread_local int g_cuda_profiler_device_explicit = 0;
 static thread_local int g_cuda_profiler_scope_active = 0;
+
+extern "C" int ds4_gpu_timeline_enabled(void) {
+    return getenv("DS4_CUDA_CRITICAL_PATH_NVTX") != NULL;
+}
+
+extern "C" void ds4_gpu_timeline_range_push(const char *name) {
+    if (!ds4_gpu_timeline_enabled()) return;
+#if defined(DS4_CUDA_HAVE_NVTX3)
+    nvtxRangePushA(name && name[0] ? name : "ds4/unnamed");
+#else
+    static std::atomic<int> warned = 0;
+    if (warned.exchange(1, std::memory_order_relaxed) == 0) {
+        fprintf(stderr,
+                "ds4: DS4_CUDA_CRITICAL_PATH_NVTX requested, but the CUDA "
+                "toolkit lacks nvtx3/nvToolsExt.h; timeline labels are disabled\n");
+    }
+    (void)name;
+#endif
+}
+
+extern "C" void ds4_gpu_timeline_range_pop(void) {
+    if (!ds4_gpu_timeline_enabled()) return;
+#if defined(DS4_CUDA_HAVE_NVTX3)
+    (void)nvtxRangePop();
+#endif
+}
+
+class cuda_timeline_scope {
+public:
+    explicit cuda_timeline_scope(const char *name)
+        : active_(ds4_gpu_timeline_enabled() != 0) {
+        if (active_) ds4_gpu_timeline_range_push(name);
+    }
+
+    ~cuda_timeline_scope() {
+        if (active_) ds4_gpu_timeline_range_pop();
+    }
+
+    cuda_timeline_scope(const cuda_timeline_scope &) = delete;
+    cuda_timeline_scope &operator=(const cuda_timeline_scope &) = delete;
+
+private:
+    bool active_;
+};
 
 static int cuda_profiler_target_device(
         int current_device,
@@ -13683,6 +13734,19 @@ static int cuda_q8_f16_partner_matmul_impl(
         partner_tier, result_offset + result_bytes,
         "q8 partner activation and result");
     if (!home_activation || !partner_scratch) return 0;
+
+    char timeline_name[384];
+    snprintf(timeline_name, sizeof(timeline_name),
+             "ds4/q8/partner/label=%s/home_tier=%d/home_device=%d/"
+             "partner_tier=%d/partner_device=%d/tokens=%llu/in=%llu/"
+             "out=%llu/result=%s",
+             label && label[0] ? label : "q8_0",
+             home_tier, home_device, partner_tier, partner_device,
+             (unsigned long long)n_tok,
+             (unsigned long long)in_dim,
+             (unsigned long long)out_dim,
+             result_f16 ? "f16" : "f32");
+    cuda_timeline_scope timeline_scope(timeline_name);
 
     f32_to_f16_kernel<<<(activation_count + 255u) / 256u, 256>>>(
         home_activation, (const float *)x->ptr, activation_count);

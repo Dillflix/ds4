@@ -104,6 +104,13 @@ int ds4_gpu_synchronize(void);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 int ds4_gpu_profiler_start(void);
 int ds4_gpu_profiler_stop(void);
+/* Opt-in Nsight Systems timeline annotations.  These wrappers are no-ops
+ * unless DS4_CUDA_CRITICAL_PATH_NVTX is present.  They never synchronize a
+ * stream or device; the profiler correlates CUDA API submissions made inside
+ * a range with the resulting GPU work. */
+int ds4_gpu_timeline_enabled(void);
+void ds4_gpu_timeline_range_push(const char *name);
+void ds4_gpu_timeline_range_pop(void);
 void ds4_gpu_q8_audit_set_context(const char *module,
                                   uint32_t layer,
                                   uint32_t token_offset);

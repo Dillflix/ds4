@@ -33502,23 +33502,70 @@ static void metal_graph_report_cuda_prefill_audit(
 #endif
 }
 
+/* Nsight's CUDA trace already contains exact device timestamps.  These
+ * host-side NVTX ranges add the missing semantic ownership without recording
+ * CUDA events or inserting stream/device synchronization.  Formatting is
+ * skipped entirely outside the explicit diagnostic mode. */
+static bool metal_graph_cuda_timeline_pushf(const char *fmt, ...) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ds4_gpu_timeline_enabled()) return false;
+    char name[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof(name), fmt, ap);
+    va_end(ap);
+    ds4_gpu_timeline_range_push(name);
+    return true;
+#else
+    (void)fmt;
+    return false;
+#endif
+}
+
+static void metal_graph_cuda_timeline_pop(bool active) {
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (active) ds4_gpu_timeline_range_pop();
+#else
+    (void)active;
+#endif
+}
+
 static bool metal_graph_encode_prefill_stage_batch(
         ds4_gpu_graph              *g,
         const ds4_model            *model,
         const ds4_weights          *weights,
         const metal_graph_prefill_stage *stage,
+        uint32_t                    stage_index,
+        uint32_t                    microbatch_index,
         uint32_t                    pos0,
         uint32_t                    n_tokens) {
     if (!g || !model || !weights || !stage || n_tokens == 0) return false;
-    if (!metal_graph_set_active_tier_no_copy(g, stage->tier)) return false;
+    const bool stage_range = metal_graph_cuda_timeline_pushf(
+            "ds4/prefill/stage/stage=%u/mb=%u/tier=%d/layers=%u-%u/"
+            "pos=%u/tokens=%u",
+            stage_index, microbatch_index, stage->tier,
+            stage->first_layer, stage->end_layer, pos0, n_tokens);
+    if (!metal_graph_set_active_tier_no_copy(g, stage->tier)) {
+        metal_graph_cuda_timeline_pop(stage_range);
+        return false;
+    }
     for (uint32_t il = stage->first_layer; il < stage->end_layer; il++) {
-        if (g->placement && g->placement[il + 1] != stage->tier) return false;
-        if (!metal_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            pos0,
-                                            n_tokens)) {
+        const bool layer_range = metal_graph_cuda_timeline_pushf(
+                "ds4/prefill/layer/stage=%u/mb=%u/tier=%d/layer=%u/"
+                "pos=%u/tokens=%u",
+                stage_index, microbatch_index, stage->tier, il, pos0,
+                n_tokens);
+        const bool layer_ok =
+            (!g->placement || g->placement[il + 1] == stage->tier) &&
+            metal_graph_encode_layer_batch(g,
+                                           model,
+                                           &weights->layer[il],
+                                           il,
+                                           pos0,
+                                           n_tokens);
+        metal_graph_cuda_timeline_pop(layer_range);
+        if (!layer_ok) {
+            metal_graph_cuda_timeline_pop(stage_range);
             return false;
         }
         if (g->pipeline_capture_chunk_len != 0 &&
@@ -33528,9 +33575,11 @@ static bool metal_graph_encode_prefill_stage_batch(
                     g->pipeline_capture_chunk_len,
                     pos0,
                     n_tokens)) {
+            metal_graph_cuda_timeline_pop(stage_range);
             return false;
         }
     }
+    metal_graph_cuda_timeline_pop(stage_range);
     return true;
 }
 
@@ -33592,10 +33641,17 @@ static bool metal_graph_prefill_pipeline_stage_major(
             uint32_t mb_len = n_tokens - mb_off;
             if (mb_len > mb_cap) mb_len = mb_cap;
             const uint32_t pos0 = start + mb_off;
+            const bool mb_range = metal_graph_cuda_timeline_pushf(
+                    "ds4/prefill/sequential-microbatch/mb=%u/pos=%u/tokens=%u",
+                    mb_i, pos0, mb_len);
 
             for (uint32_t stage_i = 0; ok && stage_i < n_stages; stage_i++) {
                 g->batch_token_offset = mb_off;
                 if (stage_i == 0) {
+                    const bool embedding_range = metal_graph_cuda_timeline_pushf(
+                            "ds4/prefill/embedding/stage=0/mb=%u/tier=%d/"
+                            "pos=%u/tokens=%u",
+                            mb_i, stages[0].tier, pos0, mb_len);
                     ok = metal_graph_set_active_tier_no_copy(g, stages[0].tier);
                     ds4_gpu_tensor *tokens_view = NULL;
                     if (ok) {
@@ -33615,18 +33671,29 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                 mb_len);
                     }
                     ds4_gpu_tensor_free(tokens_view);
+                    metal_graph_cuda_timeline_pop(embedding_range);
                 }
                 if (ok) {
                     ok = metal_graph_encode_prefill_stage_batch(g,
                                                                 model,
                                                                 weights,
                                                                 &stages[stage_i],
+                                                                stage_i,
+                                                                mb_i,
                                                                 pos0,
                                                                 mb_len);
                 }
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
                     ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[stages[stage_i + 1u].tier];
+                    const uint64_t handoff_bytes =
+                        (uint64_t)mb_len * hc_dim * sizeof(float);
+                    const bool handoff_range = metal_graph_cuda_timeline_pushf(
+                            "ds4/prefill/handoff/from_stage=%u/to_stage=%u/mb=%u/"
+                            "src_tier=%d/dst_tier=%d/bytes=%llu",
+                            stage_i, stage_i + 1u, mb_i,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
@@ -33634,9 +33701,11 @@ static bool metal_graph_prefill_pipeline_stage_major(
                     ok = src && dst &&
                          ds4_gpu_tensor_copy_xdev_ordered(dst,
                                                           src,
-                                                          (uint64_t)mb_len * hc_dim * sizeof(float)) != 0;
+                                                          handoff_bytes) != 0;
+                    metal_graph_cuda_timeline_pop(handoff_range);
                 }
             }
+            metal_graph_cuda_timeline_pop(mb_range);
             if (ok) ok = ds4_gpu_end_commands() != 0;
             else (void)ds4_gpu_synchronize();
             if (ok && display_progress) {
@@ -33657,6 +33726,8 @@ static bool metal_graph_prefill_pipeline_stage_major(
         }
     } else {
         for (uint32_t wave = 0; ok && wave < n_mb + n_stages - 1u; wave++) {
+            const bool wave_range = metal_graph_cuda_timeline_pushf(
+                    "ds4/prefill/wave/wave=%u", wave);
             uint32_t smax = wave < n_stages ? wave : n_stages - 1u;
             for (int si = (int)smax; ok && si >= 0; si--) {
                 const uint32_t stage_i = (uint32_t)si;
@@ -33669,6 +33740,10 @@ static bool metal_graph_prefill_pipeline_stage_major(
 
                 g->batch_token_offset = mb_off;
                 if (stage_i == 0) {
+                    const bool embedding_range = metal_graph_cuda_timeline_pushf(
+                            "ds4/prefill/embedding/stage=0/mb=%u/tier=%d/"
+                            "pos=%u/tokens=%u",
+                            mb_i, stages[0].tier, pos0, mb_len);
                     ok = metal_graph_set_active_tier_no_copy(g, stages[0].tier);
                     ds4_gpu_tensor *tokens_view = NULL;
                     if (ok) {
@@ -33688,6 +33763,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                 mb_len);
                     }
                     ds4_gpu_tensor_free(tokens_view);
+                    metal_graph_cuda_timeline_pop(embedding_range);
                 }
 
                 if (ok) {
@@ -33695,12 +33771,22 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                                                 model,
                                                                 weights,
                                                                 &stages[stage_i],
+                                                                stage_i,
+                                                                mb_i,
                                                                 pos0,
                                                                 mb_len);
                 }
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
                     ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[stages[stage_i + 1u].tier];
+                    const uint64_t handoff_bytes =
+                        (uint64_t)mb_len * hc_dim * sizeof(float);
+                    const bool handoff_range = metal_graph_cuda_timeline_pushf(
+                            "ds4/prefill/handoff/from_stage=%u/to_stage=%u/mb=%u/"
+                            "src_tier=%d/dst_tier=%d/bytes=%llu",
+                            stage_i, stage_i + 1u, mb_i,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
@@ -33708,7 +33794,8 @@ static bool metal_graph_prefill_pipeline_stage_major(
                     ok = src && dst &&
                          ds4_gpu_tensor_copy_xdev_ordered(dst,
                                                           src,
-                                                          (uint64_t)mb_len * hc_dim * sizeof(float)) != 0;
+                                                          handoff_bytes) != 0;
+                    metal_graph_cuda_timeline_pop(handoff_range);
                 }
                 if (ok && display_progress && stage_i + 1u == n_stages) {
                     uint32_t done = mb_off + mb_len;
@@ -33719,6 +33806,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                      prompt->len);
                 }
             }
+            metal_graph_cuda_timeline_pop(wave_range);
             if (show_progress) {
                 fprintf(stderr, "ds4: gpu pipeline prefill wave %u/%u\r",
                         wave + 1u,
@@ -33755,7 +33843,13 @@ static bool metal_graph_prefill_pipeline_stage_major(
         g->cur_hc_by_tier[src_tier] = last_hc;
         ok = ds4_gpu_begin_commands() != 0;
     }
+    const bool output_range = ok && logits
+        ? metal_graph_cuda_timeline_pushf(
+                "ds4/prefill/output/tier=%d/pos=%u/tokens=1",
+                src_tier, start + n_tokens - 1u)
+        : false;
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    metal_graph_cuda_timeline_pop(output_range);
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
     else if (!ok) (void)ds4_gpu_synchronize();
     g->cur_hc_by_tier[src_tier] = saved_cur;

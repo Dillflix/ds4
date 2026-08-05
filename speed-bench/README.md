@@ -995,3 +995,37 @@ REPARSE_ONLY=1 \
 Object-wide instruction totals are compiler-coverage checks only. Both objects
 contain symbols excluded by runtime architecture gates; use the paired
 per-function tables together with the production dispatch matrix.
+
+### SM75 prefill critical-path and pair attribution
+
+`cuda-sm75-critical-path-audit.sh` is the bounded follow-up to the T256
+partner-policy screen. It does not repeat a throughput A/B. It records two
+2048-token Nsight Systems traces with the fixed 22/21 split: `0,3,1,2` and the
+pair-preserving swap `3,0,2,1`. Thus each layer stage runs once on physical GPU
+0 and once on physical GPU 3 while each home GPU retains its direct NVLink
+partner. The same production-shaped Q4 and dense-Q8 harness work is also timed
+on GPUs 0 and 3, with alternating order, to separate hardware/clock behavior
+from layer-range behavior.
+
+The opt-in `DS4_CUDA_CRITICAL_PATH_NVTX=1` annotations cover waves,
+microbatches, stages, layers, inter-stage handoffs, output, and T256 partner
+projections. They do not create CUDA events, synchronize, or add waits. The
+SQLite summarizer attributes existing kernel and copy timestamps through their
+CUDA correlation IDs and emits the complete operation table, per-microbatch
+GPU envelopes, stage/device totals, the 2x2 physical-GPU versus stage factors,
+and same-work GPU medians. Model hashing remains disabled.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-critical-path-audit.sh
+```
+
+Return `sm75-critical-path-<timestamp>.tar.gz`. The archive is also produced
+on interruption or failure and includes both `.nsys-rep` files, SQLite
+exports, 100-ms GPU clock/power telemetry, harness logs, and derived CSVs.
