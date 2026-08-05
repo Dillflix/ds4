@@ -161,7 +161,7 @@ retain the shipping 512-row CTA, reuse every packed Q4 fragment across a real
 16-route cost-planner tile, and keep only one matrix's scalar accumulator
 window live. `persistent-seq16` computes Gate then Up sequentially;
 `persistent-ws16` assigns eight warps to each matrix. Because the complete
-16-route native-Q8 activation tile is 74.75 KiB and cannot fit in Turing's
+16-route native-Q8 activation tile is 73.0 KiB (74,752 bytes) and cannot fit in Turing's
 64 KiB shared-memory budget, both consume immutable activations directly
 through the unified cache path.
 

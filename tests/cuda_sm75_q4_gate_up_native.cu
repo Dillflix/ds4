@@ -1004,13 +1004,33 @@ __global__ static void sm75_q4_gate_up_native_aw_nsplit_kernel(
  * measures whether that traffic is cheaper than the rejected barrier-heavy
  * N-split staging.  Each packed Q4 weight fragment still feeds both route
  * halves before it is released. */
-#define PERSIST_GU_SLOT8_DECL(S) \
-    float pg00_##S=0.0f,pg01_##S=0.0f; \
-    float pg10_##S=0.0f,pg11_##S=0.0f
-#define PERSIST_GU_SLOT8_ADD(S,V00,V01,V10,V11) \
-    case S: \
-        pg00_##S+=(V00);pg01_##S+=(V01); \
-        pg10_##S+=(V10);pg11_##S+=(V11);break
+template <uint32_t SLOT>
+__device__ __forceinline__ static void gu_persistent_slot(
+        const NativeWeightTileBlock *native_w,
+        const NativeQ8K *native_a, uint64_t record0,
+        uint32_t lane, uint32_t tok0, uint32_t tok1,
+        bool have0, bool have1,
+        float &o00, float &o01, float &o10, float &o11) {
+    static_assert(SLOT < 8u, "persistent reduction slot");
+    const uint32_t b0 = SLOT, b1 = SLOT + 8u;
+    const NativeQ8K *a00 = native_a +
+        (uint64_t)tok0 * GU_IN_BLOCKS + b0;
+    const NativeQ8K *a01 = native_a +
+        (uint64_t)tok1 * GU_IN_BLOCKS + b0;
+    float v00=0.0f,v01=0.0f,v10=0.0f,v11=0.0f;
+    gu_nsplit_pair_block(native_w + record0 + b0, a00, a01,
+        have0, have1, lane, v00, v01, v10, v11);
+    o00=__fadd_rn(0.0f,v00);o01=__fadd_rn(0.0f,v01);
+    o10=__fadd_rn(0.0f,v10);o11=__fadd_rn(0.0f,v11);
+    const NativeQ8K *a10 = native_a +
+        (uint64_t)tok0 * GU_IN_BLOCKS + b1;
+    const NativeQ8K *a11 = native_a +
+        (uint64_t)tok1 * GU_IN_BLOCKS + b1;
+    gu_nsplit_pair_block(native_w + record0 + b1, a10, a11,
+        have0, have1, lane, v00, v01, v10, v11);
+    o00=__fadd_rn(o00,v00);o01=__fadd_rn(o01,v01);
+    o10=__fadd_rn(o10,v10);o11=__fadd_rn(o11,v11);
+}
 
 __device__ __forceinline__ static void gu_persistent_matrix(
         const NativeWeightTileBlock *native_w,
@@ -1018,33 +1038,47 @@ __device__ __forceinline__ static void gu_persistent_matrix(
         uint32_t expert, uint32_t row0, uint32_t lane,
         uint32_t tok0, uint32_t tok1, bool have0, bool have1,
         float &o00, float &o01, float &o10, float &o11) {
-    PERSIST_GU_SLOT8_DECL(0); PERSIST_GU_SLOT8_DECL(1);
-    PERSIST_GU_SLOT8_DECL(2); PERSIST_GU_SLOT8_DECL(3);
-    PERSIST_GU_SLOT8_DECL(4); PERSIST_GU_SLOT8_DECL(5);
-    PERSIST_GU_SLOT8_DECL(6); PERSIST_GU_SLOT8_DECL(7);
     const uint64_t record0 =
         ((uint64_t)expert * GU_OUT_TILES + row0 / GU_OUT_TILE) *
         GU_IN_BLOCKS;
-#pragma unroll
-    for (uint32_t b = 0; b < GU_IN_BLOCKS; b++) {
-        const NativeQ8K *a0 = native_a + (uint64_t)tok0 * GU_IN_BLOCKS + b;
-        const NativeQ8K *a1 = native_a + (uint64_t)tok1 * GU_IN_BLOCKS + b;
-        float v00=0.0f,v01=0.0f,v10=0.0f,v11=0.0f;
-        gu_nsplit_pair_block(native_w + record0 + b, a0, a1,
-            have0, have1, lane, v00, v01, v10, v11);
-        switch (b & 7u) {
-            PERSIST_GU_SLOT8_ADD(0,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(1,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(2,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(3,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(4,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(5,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(6,v00,v01,v10,v11);
-            PERSIST_GU_SLOT8_ADD(7,v00,v01,v10,v11);
-        }
+    float left00,left01,left10,left11;
+    {
+        float x00,x01,x10,x11,y00,y01,y10,y11;
+        gu_persistent_slot<0>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,x00,x01,x10,x11);
+        gu_persistent_slot<4>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,y00,y01,y10,y11);
+        const float a00=__fadd_rn(x00,y00),a01=__fadd_rn(x01,y01);
+        const float a10=__fadd_rn(x10,y10),a11=__fadd_rn(x11,y11);
+        gu_persistent_slot<2>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,x00,x01,x10,x11);
+        gu_persistent_slot<6>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,y00,y01,y10,y11);
+        left00=__fadd_rn(a00,__fadd_rn(x00,y00));
+        left01=__fadd_rn(a01,__fadd_rn(x01,y01));
+        left10=__fadd_rn(a10,__fadd_rn(x10,y10));
+        left11=__fadd_rn(a11,__fadd_rn(x11,y11));
     }
-    NS_GU_REDUCE(pg00,o00); NS_GU_REDUCE(pg01,o01);
-    NS_GU_REDUCE(pg10,o10); NS_GU_REDUCE(pg11,o11);
+    float right00,right01,right10,right11;
+    {
+        float x00,x01,x10,x11,y00,y01,y10,y11;
+        gu_persistent_slot<1>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,x00,x01,x10,x11);
+        gu_persistent_slot<5>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,y00,y01,y10,y11);
+        const float a00=__fadd_rn(x00,y00),a01=__fadd_rn(x01,y01);
+        const float a10=__fadd_rn(x10,y10),a11=__fadd_rn(x11,y11);
+        gu_persistent_slot<3>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,x00,x01,x10,x11);
+        gu_persistent_slot<7>(native_w,native_a,record0,lane,
+            tok0,tok1,have0,have1,y00,y01,y10,y11);
+        right00=__fadd_rn(a00,__fadd_rn(x00,y00));
+        right01=__fadd_rn(a01,__fadd_rn(x01,y01));
+        right10=__fadd_rn(a10,__fadd_rn(x10,y10));
+        right11=__fadd_rn(a11,__fadd_rn(x11,y11));
+    }
+    o00=__fadd_rn(left00,right00);o01=__fadd_rn(left01,right01);
+    o10=__fadd_rn(left10,right10);o11=__fadd_rn(left11,right11);
 }
 
 __device__ __forceinline__ static void gu_persistent_store_gate(
@@ -1206,9 +1240,6 @@ void sm75_q4_gate_up_native_aw_persistent_ws16_kernel(
         __syncthreads();
     }
 }
-
-#undef PERSIST_GU_SLOT8_ADD
-#undef PERSIST_GU_SLOT8_DECL
 
 #undef NS_GU_REDUCE
 #undef NS_GU_SLOT8_ADD

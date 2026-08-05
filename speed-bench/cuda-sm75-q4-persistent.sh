@@ -19,6 +19,10 @@ gate_bin=tests/cuda_sm75_q4_gate_up_native
 validator=speed-bench/validate-ncu-capture.py
 baseline=native-aw-warp16-scalar-consumer
 candidates=(native-aw-persistent-seq16 native-aw-persistent-ws16)
+declare -A candidate_kernel=(
+    [native-aw-persistent-seq16]=sm75_q4_gate_up_native_aw_persistent_seq16_kernel
+    [native-aw-persistent-ws16]=sm75_q4_gate_up_native_aw_persistent_ws16_kernel
+)
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 for value in SKIP_BUILD RUN_NCU NCU_USE_SUDO; do
@@ -107,9 +111,10 @@ cuobjdump --dump-sass "$gate_bin" | c++filt \
     >"$OUTPUT_DIR/resources/gate.sass"
 cuobjdump --dump-resource-usage "$gate_bin" | c++filt \
     >"$OUTPUT_DIR/resources/gate.resources"
-for kernel in \
-    sm75_q4_gate_up_native_aw_persistent_seq16_kernel \
-    sm75_q4_gate_up_native_aw_persistent_ws16_kernel; do
+printf 'kernel,ldl_instructions,stl_instructions\n' \
+    >"$OUTPUT_DIR/resources/sass-local.csv"
+for candidate in "${candidates[@]}"; do
+    kernel=${candidate_kernel[$candidate]}
     awk -v wanted="$kernel" '
         /Function : / { emit = index($0, wanted) != 0 }
         emit { print }
@@ -120,19 +125,28 @@ for kernel in \
         "$OUTPUT_DIR/resources/$kernel.sass" || die "$kernel omitted U4/U4 MMA"
     grep -Eq 'IMMA\.8832\.S4\.U4' \
         "$OUTPUT_DIR/resources/$kernel.sass" || die "$kernel omitted S4/U4 MMA"
-    ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' \
-        "$OUTPUT_DIR/resources/$kernel.sass" || die "$kernel uses local memory"
+    ldl=$(grep -Ec '(^|[[:space:]])LDL([[:space:].]|$)' \
+        "$OUTPUT_DIR/resources/$kernel.sass" || true)
+    stl=$(grep -Ec '(^|[[:space:]])STL([[:space:].]|$)' \
+        "$OUTPUT_DIR/resources/$kernel.sass" || true)
+    printf '%s,%s,%s\n' "$kernel" "$ldl" "$stl" \
+        >>"$OUTPUT_DIR/resources/sass-local.csv"
 done
 python3 - "$OUTPUT_DIR/resources/gate.resources" \
+        "$OUTPUT_DIR/resources/sass-local.csv" \
         "$OUTPUT_DIR/resources/persistent-resources.csv" <<'PY'
 import csv, pathlib, re, sys
 source = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
-targets = (
-    "sm75_q4_gate_up_native_aw_persistent_seq16_kernel",
-    "sm75_q4_gate_up_native_aw_persistent_ws16_kernel",
-)
+targets = {
+    "sm75_q4_gate_up_native_aw_persistent_seq16_kernel":
+        "native-aw-persistent-seq16",
+    "sm75_q4_gate_up_native_aw_persistent_ws16_kernel":
+        "native-aw-persistent-ws16",
+}
+with pathlib.Path(sys.argv[2]).open(newline="") as handle:
+    sass = {row["kernel"]: row for row in csv.DictReader(handle)}
 rows = []
-for target in targets:
+for target, variant in targets.items():
     matches = []
     for i, line in enumerate(source):
         if "Function" not in line or target not in line:
@@ -146,19 +160,42 @@ for target in targets:
     if len(matches) != 1:
         raise SystemExit(f"expected one resource record for {target}: {matches}")
     values = matches[0]
+    local = sass.get(target)
+    if local is None:
+        raise SystemExit(f"missing SASS local-memory record for {target}")
+    ldl, stl = int(local["ldl_instructions"]), int(local["stl_instructions"])
+    reasons = []
     if values["REG"] > 128:
-        raise SystemExit(f"{target} exceeds 128 registers: {values}")
+        reasons.append(f'registers={values["REG"]}>128')
     if values["STACK"] or values["LOCAL"]:
-        raise SystemExit(f"{target} uses local memory: {values}")
+        reasons.append(
+            f'ptxas-local(stack={values["STACK"]};local={values["LOCAL"]})')
     if values["SHARED"] >= 16384:
-        raise SystemExit(f"{target} exceeds 16 KiB shared: {values}")
-    rows.append({"kernel": target, **values})
-with pathlib.Path(sys.argv[2]).open("w", newline="") as handle:
+        reasons.append(f'shared={values["SHARED"]}>=16384')
+    if ldl or stl:
+        reasons.append(f'sass-local(ldl={ldl};stl={stl})')
+    rows.append({"variant": variant, "kernel": target, **values,
+                 "ldl": ldl, "stl": stl,
+                 "eligible": "yes" if not reasons else "no",
+                 "reason": ";".join(reasons) if reasons else "none"})
+with pathlib.Path(sys.argv[3]).open("w", newline="") as handle:
     writer = csv.DictWriter(handle,
-        fieldnames=("kernel", "REG", "STACK", "SHARED", "LOCAL"))
+        fieldnames=("variant", "kernel", "REG", "STACK", "SHARED", "LOCAL",
+                    "ldl", "stl", "eligible", "reason"))
     writer.writeheader(); writer.writerows(rows)
-print("validated persistent Gate resource ceilings", rows)
+for row in rows:
+    print(row)
 PY
+mapfile -t eligible_candidates < <(python3 - \
+        "$OUTPUT_DIR/resources/persistent-resources.csv" <<'PY'
+import csv, sys
+with open(sys.argv[1], newline="") as handle:
+    for row in csv.DictReader(handle):
+        if row["eligible"] == "yes": print(row["variant"])
+PY
+)
+printf 'Resource-eligible candidates: %s\n' \
+    "${eligible_candidates[*]:-(none)}"
 
 phase=correctness
 for scenario in real-early real-late; do
@@ -180,10 +217,14 @@ for scenario in real-early real-late; do
         --rounds "$BENCH_ROUNDS" --launches "$BENCH_LAUNCHES" \
         >"$OUTPUT_DIR/benchmark/gate-$scenario.log" 2>&1
 done
-python3 - "$OUTPUT_DIR/benchmark" "$baseline" "${candidates[@]}" <<'PY'
+python3 - "$OUTPUT_DIR/benchmark" \
+        "$OUTPUT_DIR/resources/persistent-resources.csv" \
+        "$baseline" "${candidates[@]}" <<'PY'
 import csv, pathlib, sys
-root = pathlib.Path(sys.argv[1]); baseline = sys.argv[2]
-candidates = sys.argv[3:]
+root = pathlib.Path(sys.argv[1]); resources_path = pathlib.Path(sys.argv[2])
+baseline = sys.argv[3]; candidates = sys.argv[4:]
+with resources_path.open(newline="") as handle:
+    resources = {row["variant"]: row for row in csv.DictReader(handle)}
 rows = []
 for scenario in ("real-early", "real-late"):
     lines = (root / f"gate-{scenario}.log").read_text().splitlines()
@@ -196,17 +237,21 @@ for scenario in ("real-early", "real-late"):
     base = table[baseline]
     for candidate in candidates:
         value = table[candidate]
+        resource = resources[candidate]
+        eligible = resource["eligible"] == "yes"
         rows.append({"scenario": scenario, "baseline": baseline,
                      "candidate": candidate, "baseline_us": base,
                      "candidate_us": value, "speedup": base / value,
-                     "duration_gate": "pass" if value < base else "fail"})
+                     "resource_eligible": resource["eligible"],
+                     "resource_reason": resource["reason"],
+                     "duration_gate": "pass" if eligible and value < base else "fail"})
 with (root / "persistent-comparison.csv").open("w", newline="") as handle:
     writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
     writer.writeheader(); writer.writerows(rows)
 for row in rows: print(row)
 PY
 
-if [[ $RUN_NCU == 1 ]]; then
+if [[ $RUN_NCU == 1 && ${#eligible_candidates[@]} -gt 0 ]]; then
     phase=nsight-compute
     command -v ncu >/dev/null 2>&1 || die "ncu not found"
     ncu_bin=$(command -v ncu)
@@ -248,11 +293,14 @@ if [[ $RUN_NCU == 1 ]]; then
     for scenario in real-early real-late; do
         profile_one "$scenario" "$baseline" \
             sm75_q4_gate_up_native_aw_warp16_scalar_kernel baseline
-        profile_one "$scenario" native-aw-persistent-seq16 \
-            sm75_q4_gate_up_native_aw_persistent_seq16_kernel persistent-seq16
-        profile_one "$scenario" native-aw-persistent-ws16 \
-            sm75_q4_gate_up_native_aw_persistent_ws16_kernel persistent-ws16
+        for candidate in "${eligible_candidates[@]}"; do
+            profile_one "$scenario" "$candidate" \
+                "${candidate_kernel[$candidate]}" \
+                "${candidate#native-aw-}"
+        done
     done
+elif [[ $RUN_NCU == 1 ]]; then
+    printf 'Skipping Nsight Compute: both candidates failed resource gates.\n'
 fi
 
 phase=complete
