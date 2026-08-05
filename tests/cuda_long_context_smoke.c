@@ -941,8 +941,8 @@ static int check_sm75_native_q4_layout_exact(void) {
         {"gate-stream7", "0", "1", "0", "0", "0"},
         {"down-compact7", "0", "0", "1", "0", "0"},
         {"gate-stream7/down-compact7", "0", "1", "1", "0", "0"},
-        {"gate-full64", "0", "0", "0", "1", "0"},
         {"down-wide512", "0", "0", "0", "0", "1"},
+        {"gate-full64", "0", "0", "0", "1", "0"},
         {"gate-full64/down-wide512", "0", "0", "0", "1", "1"},
     };
     for (uint32_t c = 0;
