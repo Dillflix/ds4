@@ -102,6 +102,42 @@ NCU_USE_SUDO=1 \
 ./speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
 ```
 
+### Compact N-split native-Q4 topology audit
+
+`cuda-sm75-q4-nsplit.sh` is a harness-only go/no-go experiment for the compact
+N-split CTA topology. It does not alter production dispatch or open a model.
+For both gate/up and down it tests 4- and 8-warp CTAs where one CTA owns one
+real cost-planner tile16 plus one output-row macro-tile. The CTA stages only
+one 256-K activation slab at a time (4,672 bytes), keeps scalar K slots in
+registers, and consumes each packed Q4 fragment for both low8 and high8 route
+halves before advancing.
+
+The early/late inputs use the exact captured production expert histograms;
+8/4 residual work is excluded so the decision measures only the topology it
+could replace. The runner requires bit-exact outputs, no PTXAS/SASS local
+memory, packed m8n8k32 U4/U4 and S4/U4 instructions, and less than 8 KiB shared
+memory. It then records balanced kernel timings and focused Nsight Compute
+reports for baseline, nsplit4, and nsplit8. A duration candidate passes only
+if it beats the matching shipping native-A/W kernel by at least 10% in both
+early and late shapes; a timing miss is recorded rather than suppressing the
+profiles needed to explain it.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+BENCH_ROUNDS=3 \
+BENCH_LAUNCHES=10 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-q4-nsplit.sh
+```
+
+No `MODEL` variable is required. Return the printed
+`sm75-q4-nsplit-<timestamp>.tar.gz` archive.
+
 ### Exact production Q4 expert histogram
 
 `cuda-q4-real-histogram.sh` captures the actual per-expert routed-pair counts

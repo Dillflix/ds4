@@ -267,10 +267,10 @@ tests/cuda_sm75_profile_harness: tests/cuda_sm75_profile_harness.o ds4_cuda.o
 tests/cuda_sm75_int4_mma: tests/cuda_sm75_int4_mma.cu
 	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
 
-tests/cuda_sm75_q4_down_native: tests/cuda_sm75_q4_down_native.cu
+tests/cuda_sm75_q4_down_native: tests/cuda_sm75_q4_down_native.cu tests/cuda_sm75_native_q4_histograms.h
 	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
 
-tests/cuda_sm75_q4_gate_up_native: tests/cuda_sm75_q4_gate_up_native.cu tests/cuda_sm75_q4_down_native.cu
+tests/cuda_sm75_q4_gate_up_native: tests/cuda_sm75_q4_gate_up_native.cu tests/cuda_sm75_q4_down_native.cu tests/cuda_sm75_native_q4_histograms.h
 	$(NVCC) $(NVCCFLAGS) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
 
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h

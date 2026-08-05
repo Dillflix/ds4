@@ -38,6 +38,8 @@ on:
       - "tests/cuda_sm75_int4_mma.cu"
       - "tests/cuda_sm75_q4_down_native.cu"
       - "tests/cuda_sm75_q4_gate_up_native.cu"
+      - "tests/cuda_sm75_native_q4_histograms.h"
+      - "speed-bench/cuda-sm75-q4-nsplit.sh"
       - "tests/test_engine_mgpu_placement.c"
       - "tests/test_summarize_q4_real_histogram.py"
       - "gguf-tools/**"
@@ -128,6 +130,61 @@ jobs:
           set -o pipefail
           make -B tests/cuda_sm75_q4_gate_up_native CUDA_ARCH=sm_75 2>&1 \
             | tee /tmp/sm75-q4-gate-up-build.log
+      - name: Verify bounded SM75 Q4 N-split candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          for spec in \
+            'down tests/cuda_sm75_q4_down_native sm75_q4_down_native_aw_nsplit_kernel' \
+            'gate tests/cuda_sm75_q4_gate_up_native sm75_q4_gate_up_native_aw_nsplit_kernel'; do
+            read -r kind binary needle <<<"$spec"
+            cuobjdump --dump-sass "$binary" | c++filt >"/tmp/$kind-nsplit.sass"
+            cuobjdump --dump-resource-usage "$binary" | c++filt \
+              >"/tmp/$kind-nsplit.resources"
+            grep -Fq "$needle" "/tmp/$kind-nsplit.sass"
+            awk -v wanted="$needle" '
+              /Function : / { emit = index($0, wanted) != 0 }
+              emit { print }
+            ' "/tmp/$kind-nsplit.sass" >"/tmp/$kind-nsplit-only.sass"
+            grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' "/tmp/$kind-nsplit-only.sass"
+            grep -Eq 'IMMA\.8832\.U4\.U4' "/tmp/$kind-nsplit-only.sass"
+            grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/$kind-nsplit-only.sass"
+            ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' \
+              "/tmp/$kind-nsplit-only.sass"
+          done
+          python3 - <<'PY'
+          import pathlib, re
+          targets = {
+              "down": "sm75_q4_down_native_aw_nsplit_kernel",
+              "gate": "sm75_q4_gate_up_native_aw_nsplit_kernel",
+          }
+          for kind, needle in targets.items():
+              lines = pathlib.Path(f"/tmp/{kind}-nsplit.resources").read_text(
+                  errors="replace").splitlines()
+              found = set()
+              for i, line in enumerate(lines):
+                  if "Function" not in line or needle not in line:
+                      continue
+                  record = next((x for x in lines[i+1:i+8]
+                                 if re.match(r"\s*REG:", x)), "")
+                  values = {k: int(v) for k, v in
+                            re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", record)}
+                  warp = 4 if re.search(r"<\s*4(?:u)?\s*>", line) else (
+                      8 if re.search(r"<\s*8(?:u)?\s*>", line) else 0)
+                  if not warp:
+                      continue
+                  if set(values) != {"REG", "STACK", "SHARED", "LOCAL"}:
+                      raise SystemExit(f"missing {kind} nsplit{warp} resources")
+                  if values["STACK"] or values["LOCAL"]:
+                      raise SystemExit(f"{kind} nsplit{warp} local memory: {values}")
+                  if values["SHARED"] >= 8192:
+                      raise SystemExit(f"{kind} nsplit{warp} shared overflow: {values}")
+                  print(kind, warp, values)
+                  found.add(warp)
+              if found != {4, 8}:
+                  raise SystemExit(f"missing {kind} 4/8-warp records: {found}")
+          PY
+          bash -n speed-bench/cuda-sm75-q4-nsplit.sh
       - name: Verify packed-INT4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_sm75_int4_mma | grep -Eqi 'sm_?75'

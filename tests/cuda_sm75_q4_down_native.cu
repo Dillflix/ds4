@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cuda_sm75_native_q4_histograms.h"
+
 enum {
     QK_K = 256,
     Q4_GROUPS = 8,
@@ -90,12 +92,19 @@ struct ScenarioSpec {
     uint32_t active_experts;
     uint32_t tiles;
     uint32_t padded;
+    const uint16_t *expert_counts;
 };
 
 /* Recorded home-half production aggregates from the fixed prompt audit. */
 static const ScenarioSpec kScenarios[] = {
-    {"early", 3u, 1879u, 99u, 183u, 1049u},
-    {"late", 36u, 2186u, 76u, 189u, 838u},
+    {"early", 3u, 1879u, 99u, 183u, 1049u, NULL},
+    {"late", 36u, 2186u, 76u, 189u, 838u, NULL},
+    /* Cost-planner tile16 populations from the exact production histogram.
+     * Residual 8/4 routes are deliberately excluded from this experiment. */
+    {"real-early", 3u, 1617u, 39u, 106u, 79u,
+     ds4_native_q4_early_counts},
+    {"real-late", 36u, 1957u, 23u, 126u, 59u,
+     ds4_native_q4_late_counts},
 };
 
 enum Variant {
@@ -104,6 +113,8 @@ enum Variant {
     VAR_NATIVE_AW_CONSUMER,
     VAR_NATIVE_AW_COMBINED,
     VAR_PACK_A,
+    VAR_NATIVE_AW_NSPLIT4,
+    VAR_NATIVE_AW_NSPLIT8,
     VARIANT_COUNT,
 };
 
@@ -113,6 +124,8 @@ static const char *const kVariantNames[VARIANT_COUNT] = {
     "native-aw-consumer",
     "native-aw-combined",
     "pack-a",
+    "native-aw-nsplit4",
+    "native-aw-nsplit8",
 };
 
 static void cuda_die(cudaError_t err, const char *what) {
@@ -563,6 +576,154 @@ extern "C" __global__ void sm75_q4_down_native_aw_kernel(
         midq_blocks, out_dim, n_expert);
 }
 
+/* Compact N-split experiment.  One CTA owns one real 16-route expert tile
+ * and one output-row macro tile.  Only one 256-K activation slab is staged
+ * at a time (16 * 292 = 4672 bytes); WARPS independent warps own disjoint
+ * native 8-row weight tiles.  Every packed weight fragment feeds both route
+ * halves before the next fragment is loaded. */
+#define NS_DOWN_SLOT4_DECL(S) \
+    float ns0_##S=0.0f,ns1_##S=0.0f,ns2_##S=0.0f,ns3_##S=0.0f
+#define NS_DOWN_SLOT4_SET(S,V0,V1,V2,V3) \
+    case S: ns0_##S=(V0);ns1_##S=(V1);ns2_##S=(V2);ns3_##S=(V3);break
+#define NS_DOWN_REDUCE(P,O) do { \
+    const float _a0=P##_0+P##_4,_a1=P##_1+P##_5; \
+    const float _a2=P##_2+P##_6,_a3=P##_3+P##_7; \
+    (O)=(_a0+_a2)+(_a1+_a3); \
+} while (0)
+
+template <uint32_t WARPS>
+__global__ static void sm75_q4_down_native_aw_nsplit_kernel(
+        float *down_out, const NativeWeightTileBlock *native_w,
+        const NativeQ8K *native_a,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint32_t midq_blocks, uint32_t out_dim) {
+    static_assert(WARPS == 4u || WARPS == 8u,
+                  "N-split sweep is intentionally bounded to 4/8 warps");
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ NativeQ8K sxq[TILE_PAIRS];
+    __shared__ uint32_t s_pair[TILE_PAIRS], s_np;
+    if (threadIdx.x == 0u) {
+        const uint32_t count = counts[expert];
+        const uint32_t remaining = local_start < count ?
+            count - local_start : 0u;
+        const uint32_t np = remaining < TILE_PAIRS ? remaining : TILE_PAIRS;
+        for (uint32_t p = 0; p < np; p++)
+            s_pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t p0 = lane >> 2u, p1 = p0 + 8u;
+    const bool have0 = p0 < np, have1 = p1 < np;
+    const uint32_t row0 = blockIdx.x * (WARPS * OUT_TILE) +
+                          warp * OUT_TILE;
+    const bool row_active = row0 < out_dim;
+    const uint32_t compute_row0 = row_active ? row0 : 0u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    NS_DOWN_SLOT4_DECL(0); NS_DOWN_SLOT4_DECL(1);
+    NS_DOWN_SLOT4_DECL(2); NS_DOWN_SLOT4_DECL(3);
+    NS_DOWN_SLOT4_DECL(4); NS_DOWN_SLOT4_DECL(5);
+    NS_DOWN_SLOT4_DECL(6); NS_DOWN_SLOT4_DECL(7);
+    enum { WORDS_PER_NATIVE_Q8 = sizeof(NativeQ8K) / sizeof(uint32_t) };
+    for (uint32_t b = 0; b < midq_blocks; b++) {
+        for (uint32_t i = threadIdx.x;
+             i < TILE_PAIRS * WORDS_PER_NATIVE_Q8;
+             i += blockDim.x) {
+            const uint32_t p = i / WORDS_PER_NATIVE_Q8;
+            const uint32_t word = i - p * WORDS_PER_NATIVE_Q8;
+            const uint32_t pair = p < np ? s_pair[p] : 0u;
+            const uint32_t value = p < np ?
+                ((const uint32_t *)(native_a +
+                    (uint64_t)pair * midq_blocks + b))[word] : 0u;
+            ((uint32_t *)&sxq[p])[word] = value;
+        }
+        __syncthreads();
+        float v00=0.0f,v01=0.0f,v10=0.0f,v11=0.0f;
+        if (row_active) {
+            const NativeWeightTileBlock *w = native_w +
+                (((uint64_t)expert * OUT_TILES +
+                  compute_row0 / OUT_TILE) * midq_blocks + b);
+            const uint4 h0 = w->hdr[n0], h1 = w->hdr[n0 + 1u];
+            const NativeQ8K *a0 = &sxq[p0], *a1 = &sxq[p1];
+            int i00=0,i01=0,i10=0,i11=0;
+            int m00=0,m01=0,m10=0,m11=0;
+#pragma unroll
+            for (uint32_t j = 0; j < Q4_GROUPS; j++) {
+                const uint32_t wf = w->b[j][lane];
+                int32_t l00=0,l01=0,h00=0,h01=0;
+                int32_t l10=0,l11=0,h10=0,h11=0;
+                mma_m8n8k32_u4_u4(l00,l01,a0->low[j][lane&3u],wf);
+                mma_m8n8k32_s4_u4(h00,h01,a0->high_signed[j][lane&3u],wf);
+                mma_m8n8k32_u4_u4(l10,l11,a1->low[j][lane&3u],wf);
+                mma_m8n8k32_s4_u4(h10,h11,a1->high_signed[j][lane&3u],wf);
+                const int c00=l00+16*h00,c01=l01+16*h01;
+                const int c10=l10+16*h10,c11=l11+16*h11;
+                const int bs0=have0?
+                    (int)a0->bsums[2u*j]+(int)a0->bsums[2u*j+1u]:0;
+                const int bs1=have1?
+                    (int)a1->bsums[2u*j]+(int)a1->bsums[2u*j+1u]:0;
+                uint8_t sc0,mn0,sc1,mn1;
+                q4_get_scale_min(j,(const uint8_t *)&h0.y,&sc0,&mn0);
+                q4_get_scale_min(j,(const uint8_t *)&h1.y,&sc1,&mn1);
+                i00+=(int)sc0*c00;i01+=(int)sc1*c01;
+                i10+=(int)sc0*c10;i11+=(int)sc1*c11;
+                m00+=(int)mn0*bs0;m01+=(int)mn1*bs0;
+                m10+=(int)mn0*bs1;m11+=(int)mn1*bs1;
+            }
+            const float d0=f16_to_f32((uint16_t)h0.x);
+            const float z0=f16_to_f32((uint16_t)(h0.x>>16u));
+            const float d1=f16_to_f32((uint16_t)h1.x);
+            const float z1=f16_to_f32((uint16_t)(h1.x>>16u));
+            const float yd0=have0?a0->d:0.0f,yd1=have1?a1->d:0.0f;
+            v00=yd0*d0*(float)i00-yd0*z0*(float)m00;
+            v01=yd0*d1*(float)i01-yd0*z1*(float)m01;
+            v10=yd1*d0*(float)i10-yd1*z0*(float)m10;
+            v11=yd1*d1*(float)i11-yd1*z1*(float)m11;
+        }
+        switch (b & 7u) {
+            NS_DOWN_SLOT4_SET(0,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(1,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(2,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(3,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(4,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(5,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(6,v00,v01,v10,v11);
+            NS_DOWN_SLOT4_SET(7,v00,v01,v10,v11);
+        }
+        __syncthreads();
+    }
+    float r0,r1,r2,r3;
+    NS_DOWN_REDUCE(ns0,r0); NS_DOWN_REDUCE(ns1,r1);
+    NS_DOWN_REDUCE(ns2,r2); NS_DOWN_REDUCE(ns3,r3);
+    if (row_active) {
+        if (have0) {
+            const uint32_t row = row0 + n0;
+            if (row < out_dim)
+                down_out[(uint64_t)s_pair[p0]*out_dim+row]=r0;
+            if (row+1u < out_dim)
+                down_out[(uint64_t)s_pair[p0]*out_dim+row+1u]=r1;
+        }
+        if (have1) {
+            const uint32_t row = row0 + n0;
+            if (row < out_dim)
+                down_out[(uint64_t)s_pair[p1]*out_dim+row]=r2;
+            if (row+1u < out_dim)
+                down_out[(uint64_t)s_pair[p1]*out_dim+row+1u]=r3;
+        }
+    }
+}
+
+#undef NS_DOWN_REDUCE
+#undef NS_DOWN_SLOT4_SET
+#undef NS_DOWN_SLOT4_DECL
+
 struct HostMetadata {
     uint32_t *counts;
     uint32_t *offsets;
@@ -713,41 +874,67 @@ static int build_metadata(const ScenarioSpec *spec, HostMetadata *m) {
         free_host_metadata(m);
         return 0;
     }
-    for (uint32_t e = 0; e < active; e++) tile_units[e] = 1u;
-    for (uint32_t i = 0; i < spec->tiles - active; i++)
-        tile_units[(i * 37u + 11u) % active]++;
-    uint32_t minimum = 0;
-    for (uint32_t e = 0; e < active; e++) {
-        m->counts[e] = (tile_units[e] - 1u) * TILE_PAIRS + 1u;
-        minimum += m->counts[e];
-    }
-    if (minimum > spec->pairs ||
-        spec->pairs > spec->tiles * TILE_PAIRS) {
-        fprintf(stderr, "error: impossible %s aggregate\n", spec->name);
-        free(tile_units);
-        free_host_metadata(m);
-        return 0;
-    }
-    uint32_t remaining = spec->pairs - minimum;
-    uint32_t cursor = 0;
-    while (remaining) {
-        uint32_t best = UINT32_MAX;
-        for (uint32_t k = 0; k < active; k++) {
-            const uint32_t e = (cursor + k) % active;
-            if (m->counts[e] >= tile_units[e] * TILE_PAIRS) continue;
-            if (best == UINT32_MAX || m->counts[e] < m->counts[best])
-                best = e;
+    if (spec->expert_counts) {
+        /* Preserve the exact per-expert production population for every
+         * tile16 handled by the cost planner.  Experts containing only 8/4
+         * residual work are intentionally omitted and surviving expert ids
+         * are compacted; id values do not affect the kernel geometry. */
+        uint32_t compact = 0u;
+        for (uint32_t source = 0; source < 128u; source++) {
+            const uint32_t count = spec->expert_counts[source];
+            const uint32_t remainder = count & 15u;
+            const uint32_t candidate = (count & ~15u) +
+                (remainder > 8u ? remainder : 0u);
+            if (!candidate) continue;
+            if (compact >= active) break;
+            m->counts[compact] = candidate;
+            tile_units[compact] = (candidate + 15u) / 16u;
+            compact++;
         }
-        if (best == UINT32_MAX) {
-            fprintf(stderr, "error: %s pair capacities exhausted\n",
+        if (compact != active) {
+            fprintf(stderr, "error: %s real histogram active mismatch\n",
                     spec->name);
             free(tile_units);
             free_host_metadata(m);
             return 0;
         }
-        m->counts[best]++;
-        remaining--;
-        cursor = (best + 1u) % active;
+    } else {
+        for (uint32_t e = 0; e < active; e++) tile_units[e] = 1u;
+        for (uint32_t i = 0; i < spec->tiles - active; i++)
+            tile_units[(i * 37u + 11u) % active]++;
+        uint32_t minimum = 0;
+        for (uint32_t e = 0; e < active; e++) {
+            m->counts[e] = (tile_units[e] - 1u) * TILE_PAIRS + 1u;
+            minimum += m->counts[e];
+        }
+        if (minimum > spec->pairs ||
+            spec->pairs > spec->tiles * TILE_PAIRS) {
+            fprintf(stderr, "error: impossible %s aggregate\n", spec->name);
+            free(tile_units);
+            free_host_metadata(m);
+            return 0;
+        }
+        uint32_t remaining = spec->pairs - minimum;
+        uint32_t cursor = 0;
+        while (remaining) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t k = 0; k < active; k++) {
+                const uint32_t e = (cursor + k) % active;
+                if (m->counts[e] >= tile_units[e] * TILE_PAIRS) continue;
+                if (best == UINT32_MAX || m->counts[e] < m->counts[best])
+                    best = e;
+            }
+            if (best == UINT32_MAX) {
+                fprintf(stderr, "error: %s pair capacities exhausted\n",
+                        spec->name);
+                free(tile_units);
+                free_host_metadata(m);
+                return 0;
+            }
+            m->counts[best]++;
+            remaining--;
+            cursor = (best + 1u) % active;
+        }
     }
     uint32_t stride = 97u;
     while (gcd_u32(stride, TOTAL_PAIR_SLOTS) != 1u) stride += 2u;
@@ -1098,6 +1285,27 @@ static void launch_variant(const ScenarioData *d, Variant variant,
         cuda_die(cudaGetLastError(), "launch timed native-A pack");
         if (variant == VAR_PACK_A) return;
     }
+    if (variant == VAR_NATIVE_AW_NSPLIT4 ||
+        variant == VAR_NATIVE_AW_NSPLIT8) {
+        const uint32_t warps = variant == VAR_NATIVE_AW_NSPLIT4 ? 4u : 8u;
+        const dim3 ngrid((OUT_DIM + warps * OUT_TILE - 1u) /
+                         (warps * OUT_TILE), d->spec->tiles, 1u);
+#define NSPLIT_ARGS \
+        (float *)d->output.ptr, \
+        (const NativeWeightTileBlock *)d->native_w.ptr, \
+        (const NativeQ8K *)d->native_a.ptr, d->d_sorted_pairs, \
+        d->d_offsets, d->d_counts, d->d_tile_total, d->d_tile_experts, \
+        d->d_tile_starts, MIDQ_BLOCKS_MAX, OUT_DIM
+        if (variant == VAR_NATIVE_AW_NSPLIT4)
+            sm75_q4_down_native_aw_nsplit_kernel<4><<<
+                ngrid, 128, 0, stream>>>(NSPLIT_ARGS);
+        else
+            sm75_q4_down_native_aw_nsplit_kernel<8><<<
+                ngrid, 256, 0, stream>>>(NSPLIT_ARGS);
+#undef NSPLIT_ARGS
+        cuda_die(cudaGetLastError(), "launch Q4 down N-split consumer");
+        return;
+    }
     const dim3 grid((OUT_DIM + ROW_SPAN - 1u) / ROW_SPAN,
                     d->spec->tiles, 1u);
 #define CONSUMER_ARGS \
@@ -1208,6 +1416,7 @@ static int run_correctness(ScenarioData *d) {
     }
     const Variant checked[] = {
         VAR_NATIVE_W, VAR_NATIVE_AW_CONSUMER, VAR_NATIVE_AW_COMBINED,
+        VAR_NATIVE_AW_NSPLIT4, VAR_NATIVE_AW_NSPLIT8,
     };
     for (uint32_t v = 0; v < sizeof(checked) / sizeof(checked[0]); v++) {
         cuda_die(cudaMemset(d->output.ptr, 0xff, output_bytes),
@@ -1341,12 +1550,13 @@ static int run_profile(ScenarioData *d, Variant variant,
 }
 
 template <typename Kernel>
-static void print_one_resource(const char *name, Kernel kernel) {
+static void print_one_resource(const char *name, Kernel kernel,
+                               int threads = THREADS_PER_CTA) {
     cudaFuncAttributes attr;
     cuda_die(cudaFuncGetAttributes(&attr, kernel), "query kernel attributes");
     int blocks = 0;
     cuda_die(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                 &blocks, kernel, THREADS_PER_CTA, 0),
+                 &blocks, kernel, threads, 0),
              "query kernel occupancy");
     printf("resource_%s_registers_per_thread=%d\n"
            "resource_%s_static_shared_bytes=%zu\n"
@@ -1362,6 +1572,10 @@ static void print_resources(void) {
     print_one_resource("standard", sm75_q4_down_standard_kernel);
     print_one_resource("native_w", sm75_q4_down_native_w_kernel);
     print_one_resource("native_aw", sm75_q4_down_native_aw_kernel);
+    print_one_resource("native_aw_nsplit4",
+        sm75_q4_down_native_aw_nsplit_kernel<4>, 128);
+    print_one_resource("native_aw_nsplit8",
+        sm75_q4_down_native_aw_nsplit_kernel<8>, 256);
     print_one_resource("pack_a", sm75_q4_down_pack_a_kernel);
     printf("resource_spill_note=local_bytes_are_runtime_metadata;verify_spills_with_ptxas_or_ncu\n");
 }
@@ -1743,13 +1957,14 @@ done:
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s [--device N] [--scenario early|late] MODE [OPTIONS]\n"
+        "Usage: %s [--device N] [--scenario early|late|real-early|real-late] MODE [OPTIONS]\n"
         "\n"
         "Modes:\n"
         "  --correctness-only\n"
         "  --benchmark-only [--rounds N] [--launches N]\n"
         "  --profile standard|native-w|native-aw-consumer|"
-        "native-aw-combined|pack-a [--launches N]\n"
+        "native-aw-combined|pack-a|native-aw-nsplit4|native-aw-nsplit8 "
+        "[--launches N]\n"
         "\n"
         "Without --scenario, correctness runs early and late; benchmark and\n"
         "profile default to early. Without a mode, correctness and benchmark\n"
@@ -1833,7 +2048,7 @@ int main(int argc, char **argv) {
         (size_t)(selected - kScenarios) : 0u;
     const size_t end = selected ? begin + 1u :
         (mode == MODE_CORRECTNESS || mode == MODE_ALL ?
-         sizeof(kScenarios) / sizeof(kScenarios[0]) : 1u);
+         2u : 1u);
     int ok = 1;
     for (size_t s = begin; s < end && ok; s++) {
         ScenarioData data;

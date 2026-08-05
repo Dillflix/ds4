@@ -49,14 +49,22 @@ struct GuScenarioSpec {
     uint32_t recorded_tile16;
     uint32_t tile8;
     uint32_t padded8;
+    const uint16_t *expert_counts;
 };
 
 /* Only pairs/active/tile16 were recorded in the production audit.  tile8 is
  * derived from the deterministic synthetic histogram below, not asserted to
  * be the original router histogram. */
 static const GuScenarioSpec gu_scenarios[] = {
-    {"early", 3u, 1879u, 99u, 183u, 282u, 377u},
-    {"late", 36u, 2186u, 76u, 189u, 331u, 462u},
+    {"early", 3u, 1879u, 99u, 183u, 282u, 377u, NULL},
+    {"late", 36u, 2186u, 76u, 189u, 331u, 462u, NULL},
+    /* Exact cost-planner tile16 populations.  Each tile is represented by
+     * two baseline tile8 entries; residual 8/4 routes are outside this
+     * bounded topology experiment. */
+    {"real-early", 3u, 1617u, 39u, 106u, 212u, 79u,
+     ds4_native_q4_early_counts},
+    {"real-late", 36u, 1957u, 23u, 126u, 252u, 59u,
+     ds4_native_q4_late_counts},
 };
 
 enum GuVariant {
@@ -74,6 +82,8 @@ enum GuVariant {
     GU_NATIVE_AW_STAGE7_SCALAR_COMBINED,
     GU_NATIVE_AW_WARP16_SCALAR_COMBINED,
     GU_PACK_A,
+    GU_NATIVE_AW_NSPLIT4,
+    GU_NATIVE_AW_NSPLIT8,
     GU_VARIANT_COUNT,
 };
 
@@ -92,6 +102,8 @@ static const char *const gu_variant_names[GU_VARIANT_COUNT] = {
     "native-aw-stage7-scalar-combined",
     "native-aw-warp16-scalar-combined",
     "pack-a",
+    "native-aw-nsplit4",
+    "native-aw-nsplit8",
 };
 
 struct GuHostMetadata {
@@ -100,6 +112,8 @@ struct GuHostMetadata {
     uint32_t *sorted_pairs;
     uint32_t *tile_experts;
     uint32_t *tile_starts;
+    uint32_t *tile16_experts;
+    uint32_t *tile16_starts;
 };
 
 struct GuData {
@@ -121,6 +135,9 @@ struct GuData {
     uint32_t *d_tile_total;
     uint32_t *d_tile_experts;
     uint32_t *d_tile_starts;
+    uint32_t *d_tile16_total;
+    uint32_t *d_tile16_experts;
+    uint32_t *d_tile16_starts;
     uint64_t weight_bytes;
     uint64_t activation_blocks;
     uint64_t output_values;
@@ -140,6 +157,8 @@ static GuVariant gu_find_variant(const char *name) {
 }
 
 static void gu_free_metadata(GuHostMetadata *m) {
+    free(m->tile16_starts);
+    free(m->tile16_experts);
     free(m->tile_starts);
     free(m->tile_experts);
     free(m->sorted_pairs);
@@ -160,46 +179,77 @@ static int gu_build_metadata(const GuScenarioSpec *spec, GuHostMetadata *m) {
     m->sorted_pairs = (uint32_t *)malloc((size_t)spec->pairs * sizeof(uint32_t));
     m->tile_experts = (uint32_t *)malloc((size_t)spec->tile8 * sizeof(uint32_t));
     m->tile_starts = (uint32_t *)malloc((size_t)spec->tile8 * sizeof(uint32_t));
+    m->tile16_experts = (uint32_t *)malloc(
+        (size_t)spec->recorded_tile16 * sizeof(uint32_t));
+    m->tile16_starts = (uint32_t *)malloc(
+        (size_t)spec->recorded_tile16 * sizeof(uint32_t));
     if (!tile16_units || !m->counts || !m->offsets || !m->sorted_pairs ||
-        !m->tile_experts || !m->tile_starts) {
+        !m->tile_experts || !m->tile_starts || !m->tile16_experts ||
+        !m->tile16_starts) {
         free(tile16_units);
         gu_free_metadata(m);
         return 0;
     }
-    for (uint32_t e = 0; e < active; e++) tile16_units[e] = 1u;
-    for (uint32_t i = 0; i < spec->recorded_tile16 - active; i++)
-        tile16_units[(i * 37u + 11u) % active]++;
-    uint32_t minimum = 0;
-    for (uint32_t e = 0; e < active; e++) {
-        m->counts[e] = (tile16_units[e] - 1u) * 16u + 1u;
-        minimum += m->counts[e];
-    }
-    if (minimum > spec->pairs || spec->pairs > spec->recorded_tile16 * 16u) {
-        fprintf(stderr, "error: impossible %s recorded aggregate\n", spec->name);
-        free(tile16_units);
-        gu_free_metadata(m);
-        return 0;
-    }
-    uint32_t remaining = spec->pairs - minimum;
-    uint32_t cursor = 0u;
-    while (remaining) {
-        uint32_t best = UINT32_MAX;
-        for (uint32_t k = 0; k < active; k++) {
-            const uint32_t e = (cursor + k) % active;
-            if (m->counts[e] >= tile16_units[e] * 16u) continue;
-            if (best == UINT32_MAX || m->counts[e] < m->counts[best]) best = e;
+    if (spec->expert_counts) {
+        uint32_t compact = 0u;
+        for (uint32_t source = 0; source < 128u; source++) {
+            const uint32_t count = spec->expert_counts[source];
+            const uint32_t remainder = count & 15u;
+            const uint32_t candidate = (count & ~15u) +
+                (remainder > 8u ? remainder : 0u);
+            if (!candidate) continue;
+            if (compact >= active) break;
+            m->counts[compact] = candidate;
+            tile16_units[compact] = (candidate + 15u) / 16u;
+            compact++;
         }
-        if (best == UINT32_MAX) {
-            fprintf(stderr, "error: %s count capacity exhausted\n", spec->name);
+        if (compact != active) {
+            fprintf(stderr, "error: %s real histogram active mismatch\n",
+                    spec->name);
             free(tile16_units);
             gu_free_metadata(m);
             return 0;
         }
-        m->counts[best]++;
-        remaining--;
-        cursor = (best + 1u) % active;
+    } else {
+        for (uint32_t e = 0; e < active; e++) tile16_units[e] = 1u;
+        for (uint32_t i = 0; i < spec->recorded_tile16 - active; i++)
+            tile16_units[(i * 37u + 11u) % active]++;
+        uint32_t minimum = 0;
+        for (uint32_t e = 0; e < active; e++) {
+            m->counts[e] = (tile16_units[e] - 1u) * 16u + 1u;
+            minimum += m->counts[e];
+        }
+        if (minimum > spec->pairs ||
+            spec->pairs > spec->recorded_tile16 * 16u) {
+            fprintf(stderr, "error: impossible %s recorded aggregate\n",
+                    spec->name);
+            free(tile16_units);
+            gu_free_metadata(m);
+            return 0;
+        }
+        uint32_t remaining = spec->pairs - minimum;
+        uint32_t cursor = 0u;
+        while (remaining) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t k = 0; k < active; k++) {
+                const uint32_t e = (cursor + k) % active;
+                if (m->counts[e] >= tile16_units[e] * 16u) continue;
+                if (best == UINT32_MAX || m->counts[e] < m->counts[best])
+                    best = e;
+            }
+            if (best == UINT32_MAX) {
+                fprintf(stderr, "error: %s count capacity exhausted\n",
+                        spec->name);
+                free(tile16_units);
+                gu_free_metadata(m);
+                return 0;
+            }
+            m->counts[best]++;
+            remaining--;
+            cursor = (best + 1u) % active;
+        }
     }
-    uint32_t pair_cursor = 0u, tile_cursor = 0u;
+    uint32_t pair_cursor = 0u, tile_cursor = 0u, tile16_cursor = 0u;
     uint32_t stride = 97u;
     while (gcd_u32(stride, GU_PAIR_SLOTS) != 1u) stride += 2u;
     for (uint32_t e = 0; e < active; e++) {
@@ -216,11 +266,17 @@ static int gu_build_metadata(const GuScenarioSpec *spec, GuHostMetadata *m) {
             m->tile_starts[tile_cursor] = t * GU_TILE_PAIRS;
             tile_cursor++;
         }
+        for (uint32_t t = 0; t < tile16_units[e]; t++) {
+            m->tile16_experts[tile16_cursor] = e;
+            m->tile16_starts[tile16_cursor] = t * 16u;
+            tile16_cursor++;
+        }
         pair_cursor += m->counts[e];
     }
     m->offsets[active] = pair_cursor;
     free(tile16_units);
     if (pair_cursor != spec->pairs || tile_cursor != spec->tile8 ||
+        tile16_cursor != spec->recorded_tile16 ||
         spec->tile8 * GU_TILE_PAIRS - spec->pairs != spec->padded8) {
         fprintf(stderr, "error: %s synthetic tile8 aggregate mismatch\n", spec->name);
         gu_free_metadata(m);
@@ -738,6 +794,199 @@ DEFINE_GU_KERNEL(sm75_q4_gate_up_native_aw_warp16_scalar_kernel,
 #undef DEFINE_GU_KERNEL
 #undef GU_KERNEL_ARGS
 
+__device__ __forceinline__ static void gu_nsplit_pair_block(
+        const NativeWeightTileBlock *w,
+        const NativeQ8K *a0, const NativeQ8K *a1,
+        bool have0, bool have1, uint32_t lane,
+        float &v00, float &v01, float &v10, float &v11) {
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const uint4 h0 = w->hdr[n0], h1 = w->hdr[n0 + 1u];
+    int i00=0,i01=0,i10=0,i11=0,m00=0,m01=0,m10=0,m11=0;
+#pragma unroll
+    for (uint32_t j = 0; j < Q4_GROUPS; j++) {
+        const uint32_t wf = w->b[j][lane];
+        int32_t l00=0,l01=0,h00=0,h01=0;
+        int32_t l10=0,l11=0,h10=0,h11=0;
+        mma_m8n8k32_u4_u4(l00,l01,a0->low[j][lane&3u],wf);
+        mma_m8n8k32_s4_u4(h00,h01,a0->high_signed[j][lane&3u],wf);
+        mma_m8n8k32_u4_u4(l10,l11,a1->low[j][lane&3u],wf);
+        mma_m8n8k32_s4_u4(h10,h11,a1->high_signed[j][lane&3u],wf);
+        const int c00=l00+16*h00,c01=l01+16*h01;
+        const int c10=l10+16*h10,c11=l11+16*h11;
+        const int bs0=have0?
+            (int)a0->bsums[2u*j]+(int)a0->bsums[2u*j+1u]:0;
+        const int bs1=have1?
+            (int)a1->bsums[2u*j]+(int)a1->bsums[2u*j+1u]:0;
+        uint8_t sc0,mn0,sc1,mn1;
+        q4_get_scale_min(j,(const uint8_t *)&h0.y,&sc0,&mn0);
+        q4_get_scale_min(j,(const uint8_t *)&h1.y,&sc1,&mn1);
+        i00+=(int)sc0*c00;i01+=(int)sc1*c01;
+        i10+=(int)sc0*c10;i11+=(int)sc1*c11;
+        m00+=(int)mn0*bs0;m01+=(int)mn1*bs0;
+        m10+=(int)mn0*bs1;m11+=(int)mn1*bs1;
+    }
+    const float d0=f16_to_f32((uint16_t)h0.x);
+    const float z0=f16_to_f32((uint16_t)(h0.x>>16u));
+    const float d1=f16_to_f32((uint16_t)h1.x);
+    const float z1=f16_to_f32((uint16_t)(h1.x>>16u));
+    const float yd0=have0?a0->d:0.0f,yd1=have1?a1->d:0.0f;
+    v00=yd0*d0*(float)i00-yd0*z0*(float)m00;
+    v01=yd0*d1*(float)i01-yd0*z1*(float)m01;
+    v10=yd1*d0*(float)i10-yd1*z0*(float)m10;
+    v11=yd1*d1*(float)i11-yd1*z1*(float)m11;
+}
+
+#define NS_GU_SLOT8_DECL(S) \
+    float ng00_##S=0.0f,ng01_##S=0.0f,ng10_##S=0.0f,ng11_##S=0.0f; \
+    float nu00_##S=0.0f,nu01_##S=0.0f,nu10_##S=0.0f,nu11_##S=0.0f
+#define NS_GU_SLOT8_ADD(S,G00,G01,G10,G11,U00,U01,U10,U11) \
+    case S: \
+        ng00_##S+=(G00);ng01_##S+=(G01); \
+        ng10_##S+=(G10);ng11_##S+=(G11); \
+        nu00_##S+=(U00);nu01_##S+=(U01); \
+        nu10_##S+=(U10);nu11_##S+=(U11);break
+#define NS_GU_REDUCE(P,O) do { \
+    const float _a0=P##_0+P##_4,_a1=P##_1+P##_5; \
+    const float _a2=P##_2+P##_6,_a3=P##_3+P##_7; \
+    (O)=(_a0+_a2)+(_a1+_a3); \
+} while (0)
+
+__device__ __forceinline__ static void gu_nsplit_write_pair(
+        float *gate_out, float *up_out, float *mid_out,
+        const float *router_weights, uint32_t n_expert,
+        uint32_t pair, uint32_t token, uint32_t slot, bool have,
+        uint32_t row0, uint32_t n0, float g0, float g1,
+        float u0, float u1, uint32_t write_aux, float clamp) {
+    if (!have) return;
+    const float scale = router_weights[(uint64_t)token * n_expert + slot];
+    float g = g0, u = u0;
+    uint32_t row = row0 + n0;
+    if (row < GU_MID_DIM) {
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * GU_MID_DIM + row;
+        if (write_aux) { gate_out[off] = g; up_out[off] = u; }
+        mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
+    }
+    g = g1; u = u1; row++;
+    if (row < GU_MID_DIM) {
+        if (clamp > 1.0e-6f) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * GU_MID_DIM + row;
+        if (write_aux) { gate_out[off] = g; up_out[off] = u; }
+        mid_out[off] = (g / (1.0f + expf(-g))) * u * scale;
+    }
+}
+
+template <uint32_t WARPS>
+__global__ static void sm75_q4_gate_up_native_aw_nsplit_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const NativeWeightTileBlock *native_gate_w,
+        const NativeWeightTileBlock *native_up_w,
+        const NativeQ8K *native_a,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *router_weights, uint32_t n_expert,
+        uint32_t write_aux, float clamp) {
+    static_assert(WARPS == 4u || WARPS == 8u,
+                  "N-split sweep is intentionally bounded to 4/8 warps");
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ NativeQ8K sxq[16];
+    __shared__ uint32_t s_pair[16], s_np;
+    if (threadIdx.x == 0u) {
+        const uint32_t count = counts[expert];
+        const uint32_t remaining = local_start < count ?
+            count - local_start : 0u;
+        const uint32_t np = remaining < 16u ? remaining : 16u;
+        for (uint32_t p = 0; p < np; p++)
+            s_pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t p0 = lane >> 2u, p1 = p0 + 8u;
+    const bool have0 = p0 < np, have1 = p1 < np;
+    const uint32_t pair0 = have0 ? s_pair[p0] : 0u;
+    const uint32_t pair1 = have1 ? s_pair[p1] : 0u;
+    const uint32_t tok0 = pair0 / n_expert, tok1 = pair1 / n_expert;
+    const uint32_t slot0 = pair0 - tok0 * n_expert;
+    const uint32_t slot1 = pair1 - tok1 * n_expert;
+    const uint32_t row0 = blockIdx.x * (WARPS * GU_OUT_TILE) +
+                          warp * GU_OUT_TILE;
+    const bool row_active = row0 < GU_MID_DIM;
+    const uint32_t compute_row0 = row_active ? row0 : 0u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    NS_GU_SLOT8_DECL(0); NS_GU_SLOT8_DECL(1);
+    NS_GU_SLOT8_DECL(2); NS_GU_SLOT8_DECL(3);
+    NS_GU_SLOT8_DECL(4); NS_GU_SLOT8_DECL(5);
+    NS_GU_SLOT8_DECL(6); NS_GU_SLOT8_DECL(7);
+    enum { WORDS_PER_NATIVE_Q8 = sizeof(NativeQ8K) / sizeof(uint32_t) };
+    for (uint32_t b = 0; b < GU_IN_BLOCKS; b++) {
+        for (uint32_t i = threadIdx.x; i < 16u * WORDS_PER_NATIVE_Q8;
+             i += blockDim.x) {
+            const uint32_t p = i / WORDS_PER_NATIVE_Q8;
+            const uint32_t word = i - p * WORDS_PER_NATIVE_Q8;
+            const uint32_t pair = p < np ? s_pair[p] : 0u;
+            const uint32_t token = pair / n_expert;
+            const uint32_t value = p < np ?
+                ((const uint32_t *)(native_a +
+                    (uint64_t)token * GU_IN_BLOCKS + b))[word] : 0u;
+            ((uint32_t *)&sxq[p])[word] = value;
+        }
+        __syncthreads();
+        float g00=0.0f,g01=0.0f,g10=0.0f,g11=0.0f;
+        float u00=0.0f,u01=0.0f,u10=0.0f,u11=0.0f;
+        if (row_active) {
+            const uint64_t record =
+                ((uint64_t)expert * GU_OUT_TILES +
+                 compute_row0 / GU_OUT_TILE) * GU_IN_BLOCKS + b;
+            gu_nsplit_pair_block(native_gate_w + record,
+                &sxq[p0], &sxq[p1], have0, have1, lane,
+                g00,g01,g10,g11);
+            gu_nsplit_pair_block(native_up_w + record,
+                &sxq[p0], &sxq[p1], have0, have1, lane,
+                u00,u01,u10,u11);
+        }
+        switch (b & 7u) {
+            NS_GU_SLOT8_ADD(0,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(1,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(2,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(3,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(4,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(5,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(6,g00,g01,g10,g11,u00,u01,u10,u11);
+            NS_GU_SLOT8_ADD(7,g00,g01,g10,g11,u00,u01,u10,u11);
+        }
+        __syncthreads();
+    }
+    float g00,g01,g10,g11,u00,u01,u10,u11;
+    NS_GU_REDUCE(ng00,g00); NS_GU_REDUCE(ng01,g01);
+    NS_GU_REDUCE(ng10,g10); NS_GU_REDUCE(ng11,g11);
+    NS_GU_REDUCE(nu00,u00); NS_GU_REDUCE(nu01,u01);
+    NS_GU_REDUCE(nu10,u10); NS_GU_REDUCE(nu11,u11);
+    if (!row_active) return;
+    gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,n_expert,
+        pair0,tok0,slot0,have0,row0,n0,g00,g01,u00,u01,write_aux,clamp);
+    gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,n_expert,
+        pair1,tok1,slot1,have1,row0,n0,g10,g11,u10,u11,write_aux,clamp);
+}
+
+#undef NS_GU_REDUCE
+#undef NS_GU_SLOT8_ADD
+#undef NS_GU_SLOT8_DECL
+
 static void gu_fill_weights(BlockQ4K *weights,
                             const GuScenarioSpec *spec, uint32_t matrix) {
     uint32_t state = 0x243f6a88u ^ spec->layer ^ (matrix * 0x9e3779b9u);
@@ -905,6 +1154,9 @@ static int gu_validate_activation_pack(const GuData *d) {
 }
 
 static void gu_cleanup(GuData *d) {
+    if (d->d_tile16_starts) cudaFree(d->d_tile16_starts);
+    if (d->d_tile16_experts) cudaFree(d->d_tile16_experts);
+    if (d->d_tile16_total) cudaFree(d->d_tile16_total);
     if (d->d_tile_starts) cudaFree(d->d_tile_starts);
     if (d->d_tile_experts) cudaFree(d->d_tile_experts);
     if (d->d_tile_total) cudaFree(d->d_tile_total);
@@ -1052,6 +1304,11 @@ static int gu_setup(GuData *d, const GuScenarioSpec *spec) {
     GU_ALLOC_COPY(d_tile_experts, d->meta.tile_experts, spec->tile8);
     GU_ALLOC_COPY(d_tile_starts, d->meta.tile_starts, spec->tile8);
     GU_ALLOC_COPY(d_tile_total, &spec->tile8, 1u);
+    GU_ALLOC_COPY(d_tile16_experts, d->meta.tile16_experts,
+                  spec->recorded_tile16);
+    GU_ALLOC_COPY(d_tile16_starts, d->meta.tile16_starts,
+                  spec->recorded_tile16);
+    GU_ALLOC_COPY(d_tile16_total, &spec->recorded_tile16, 1u);
 #undef GU_ALLOC_COPY
     ok = validate_canary(&d->standard_gate_w, "standard-gate-W") &&
          validate_canary(&d->standard_up_w, "standard-up-W") &&
@@ -1103,6 +1360,31 @@ static void gu_launch(const GuData *d, GuVariant requested, uint32_t write_aux) 
         if (requested == GU_PACK_A) return;
     }
     const GuVariant variant = gu_consumer_variant(requested);
+    if (variant == GU_NATIVE_AW_NSPLIT4 ||
+        variant == GU_NATIVE_AW_NSPLIT8) {
+        const uint32_t warps = variant == GU_NATIVE_AW_NSPLIT4 ? 4u : 8u;
+        const dim3 ngrid((GU_MID_DIM + warps * GU_OUT_TILE - 1u) /
+                         (warps * GU_OUT_TILE),
+                         GU_TOKENS, 1u);
+#define GU_NSPLIT_ARGS \
+        (float *)d->gate_out.ptr, (float *)d->up_out.ptr, \
+        (float *)d->mid_out.ptr, \
+        (const NativeWeightTileBlock *)d->native_gate_w.ptr, \
+        (const NativeWeightTileBlock *)d->native_up_w.ptr, \
+        (const NativeQ8K *)d->native_a.ptr, d->d_sorted_pairs, \
+        d->d_offsets, d->d_counts, d->d_tile16_total, \
+        d->d_tile16_experts, d->d_tile16_starts, \
+        (const float *)d->router_weights.ptr, GU_SELECTED, write_aux, 1.25f
+        if (variant == GU_NATIVE_AW_NSPLIT4)
+            sm75_q4_gate_up_native_aw_nsplit_kernel<4><<<
+                ngrid, 128>>>(GU_NSPLIT_ARGS);
+        else
+            sm75_q4_gate_up_native_aw_nsplit_kernel<8><<<
+                ngrid, 256>>>(GU_NSPLIT_ARGS);
+#undef GU_NSPLIT_ARGS
+        cuda_die(cudaGetLastError(), "launch Q4 gate/up N-split consumer");
+        return;
+    }
     const dim3 grid(GU_MID_DIM / GU_ROW_SPAN, GU_TOKENS, 1u);
 #define GU_LAUNCH_ARGS \
     (float *)d->gate_out.ptr, (float *)d->up_out.ptr, \
@@ -1257,6 +1539,8 @@ static int gu_run_correctness(GuData *d) {
         GU_NATIVE_AW_WARP16_SCALAR_CONSUMER,
         GU_NATIVE_AW_STAGE7_SCALAR_COMBINED,
         GU_NATIVE_AW_WARP16_SCALAR_COMBINED,
+        GU_NATIVE_AW_NSPLIT4,
+        GU_NATIVE_AW_NSPLIT8,
     };
     for (uint32_t v = 0; v < sizeof(checked) / sizeof(checked[0]); v++) {
         gu_poison_outputs(d);
@@ -1350,6 +1634,10 @@ static void gu_print_resources(void) {
     gu_print_resource("native_aw_warp16_scalar",
         sm75_q4_gate_up_native_aw_warp16_scalar_kernel, 512,
         gu_shared_bytes(1, 8, 1));
+    gu_print_resource("native_aw_nsplit4",
+        sm75_q4_gate_up_native_aw_nsplit_kernel<4>, 128, 0u);
+    gu_print_resource("native_aw_nsplit8",
+        sm75_q4_gate_up_native_aw_nsplit_kernel<8>, 256, 0u);
     gu_print_resource("pack_a", sm75_q4_gate_up_pack_a_kernel, 256, 0u);
     gu_print_resource("pack_w", sm75_q4_gate_up_pack_w_kernel, 256, 0u);
     printf("resource_standard_binary_identity=false\n"
@@ -1491,7 +1779,8 @@ static int gu_run_profile(GuData *d, GuVariant variant,
 
 static void gu_usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s [--device N] [--scenario early|late] MODE [OPTIONS]\n"
+        "Usage: %s [--device N] "
+        "[--scenario early|late|real-early|real-late] MODE [OPTIONS]\n"
         "\nModes:\n"
         "  --correctness-only\n"
         "  --benchmark-only [--rounds N] [--launches N]\n"
@@ -1570,7 +1859,7 @@ int main(int argc, char **argv) {
         (size_t)(selected - gu_scenarios) : 0u;
     const size_t end = selected ? begin + 1u :
         (mode == GU_CORRECTNESS || mode == GU_ALL ?
-         sizeof(gu_scenarios) / sizeof(gu_scenarios[0]) : 1u);
+         2u : 1u);
     int ok = 1;
     for (size_t s = begin; s < end && ok; s++) {
         GuData data;
