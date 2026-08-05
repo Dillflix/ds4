@@ -798,7 +798,7 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel(
                 meta0 + b, meta1 + b, have0, have1, b, 16u,
                 expert, expert_mid_dim, compute_row0, lane,
                 v00, v01, v10, v11);
-            switch (b) {
+            switch (b & 7u) {
                 DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
                 DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
                 DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
@@ -860,7 +860,7 @@ __global__ static void moe_gate_up_mid_sm75_native_q4_tile16_full64_kernel(
                 meta0 + b, meta1 + b, have0, have1, b, 16u,
                 expert, expert_mid_dim, compute_row0, lane,
                 v00, v01, v10, v11);
-            switch (b) {
+            switch (b & 7u) {
                 DS4_SM75_NATIVE_SLOT4_ADD(0,v00,v01,v10,v11);
                 DS4_SM75_NATIVE_SLOT4_ADD(1,v00,v01,v10,v11);
                 DS4_SM75_NATIVE_SLOT4_ADD(2,v00,v01,v10,v11);
