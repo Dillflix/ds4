@@ -32,6 +32,7 @@ Optional environment:
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   CRITICAL_PATH_DIR=/absolute/output/directory
+  RESUME_DIR=/absolute/failed/output   reuse completed traces; rerun harness
 EOF
 }
 
@@ -57,6 +58,7 @@ HARNESS_TRIALS=${HARNESS_TRIALS:-3}
 HARNESS_REPEATS=${HARNESS_REPEATS:-20}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+RESUME_DIR=${RESUME_DIR:-}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${CRITICAL_PATH_DIR:-$repo_dir/sm75-critical-path-$stamp}
 
@@ -97,10 +99,18 @@ for scenario in "${scenarios[@]}"; do
     esac
 done
 
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{nsys,harness,telemetry,provenance}
-OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+resume=0
+if [[ -n $RESUME_DIR ]]; then
+    [[ $RESUME_DIR == /* && -d $RESUME_DIR ]] ||
+        die "RESUME_DIR must name an existing absolute output directory"
+    OUTPUT_DIR=$(cd "$RESUME_DIR" && pwd)
+    resume=1
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"/{nsys,harness,telemetry,provenance}
+    OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+fi
 
 phase=initialization
 sampler_pid=
@@ -119,9 +129,13 @@ finish() {
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
         "$status" "$phase" >"$OUTPUT_DIR/run-status.txt"
     if [[ $CREATE_ARCHIVE == 1 ]]; then
-        tar -C "$(dirname "$OUTPUT_DIR")" -czf "$OUTPUT_DIR.tar.gz" \
+        archive="$OUTPUT_DIR.tar.gz"
+        if [[ $resume == 1 ]]; then
+            archive="$OUTPUT_DIR.resume-$stamp.tar.gz"
+        fi
+        tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
             "$(basename "$OUTPUT_DIR")" || status=1
-        printf 'Archive to return: %s.tar.gz\n' "$OUTPUT_DIR"
+        printf 'Archive to return: %s\n' "$archive"
     fi
     exit "$status"
 }
@@ -134,8 +148,10 @@ for name in "${inherited_ds4[@]}"; do clean+=(-u "$name"); done
 
 if [[ $SKIP_BUILD == 0 ]]; then
     phase=build
+    build_log="$OUTPUT_DIR/build.log"
+    [[ $resume == 0 ]] || build_log="$OUTPUT_DIR/resume-build-$stamp.log"
     make -B -j"$(nproc)" ds4-bench tests/cuda_sm75_profile_harness \
-        CUDA_ARCH=sm_75 2>&1 | tee "$OUTPUT_DIR/build.log"
+        CUDA_ARCH=sm_75 2>&1 | tee "$build_log"
 else
     make -q ds4-bench tests/cuda_sm75_profile_harness CUDA_ARCH=sm_75 ||
         die "SKIP_BUILD=1 found stale targets"
@@ -143,8 +159,9 @@ fi
 [[ -x ./ds4-bench && -x ./tests/cuda_sm75_profile_harness ]] ||
     die "required binaries are missing"
 
-phase=manifest
-{
+if [[ $resume == 0 ]]; then
+    phase=manifest
+    {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$(git branch --show-current)"
@@ -166,11 +183,47 @@ clocks.current.sm,clocks.current.memory,pstate,power.limit,ecc.mode.current,driv
     nvidia-smi topo -m
     printf '\n[nsight systems]\n'
     nsys --version
-} >"$OUTPUT_DIR/manifest.txt"
-git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
-git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
-
-printf 'label\tdevices\tsqlite\n' >"$OUTPUT_DIR/trace-map.tsv"
+    } >"$OUTPUT_DIR/manifest.txt"
+    git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
+    git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+    printf 'label\tdevices\tsqlite\n' >"$OUTPUT_DIR/trace-map.tsv"
+else
+    phase=resume-validation
+    [[ -s $OUTPUT_DIR/manifest.txt && -s $OUTPUT_DIR/run-status.txt &&
+       -s $OUTPUT_DIR/trace-map.tsv ]] ||
+        die "RESUME_DIR lacks manifest, status, or trace map"
+    grep -Fqx -- "model=$MODEL" "$OUTPUT_DIR/manifest.txt" ||
+        die "RESUME_DIR used a different model"
+    grep -Fqx -- "current_devices=$CURRENT_DEVICES" "$OUTPUT_DIR/manifest.txt" ||
+        die "RESUME_DIR used different current devices"
+    grep -Fqx -- "swapped_devices=$SWAPPED_DEVICES" "$OUTPUT_DIR/manifest.txt" ||
+        die "RESUME_DIR used different swapped devices"
+    grep -Fqx -- "stage_split=$STAGE_SPLIT/$((43-STAGE_SPLIT))" \
+        "$OUTPUT_DIR/manifest.txt" || die "RESUME_DIR used a different split"
+    grep -Fqx 'state=failed' "$OUTPUT_DIR/run-status.txt" ||
+        die "RESUME_DIR is not a failed run"
+    grep -Fqx 'last_phase=same-work-harness' "$OUTPUT_DIR/run-status.txt" ||
+        die "RESUME_DIR did not fail in the same-work harness"
+    for label in current swapped; do
+        for suffix in nsys-rep sqlite log benchmark.csv; do
+            [[ -s $OUTPUT_DIR/nsys/$label.$suffix ||
+               -s $OUTPUT_DIR/nsys/$label-$suffix ]] ||
+                die "RESUME_DIR lacks completed $label $suffix evidence"
+        done
+        [[ -s $OUTPUT_DIR/telemetry/$label.csv ]] ||
+            die "RESUME_DIR lacks $label telemetry"
+    done
+    resume_provenance="$OUTPUT_DIR/provenance/resume-$stamp"
+    mkdir -p "$resume_provenance"
+    cp "$OUTPUT_DIR/run-status.txt" "$resume_provenance/original-run-status.txt"
+    git status --short >"$resume_provenance/git-status.txt"
+    git diff --stat >"$resume_provenance/git-diff-stat.txt"
+    printf 'date_utc=%s\ngit_commit=%s\nsource_manifest_commit=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+        "$(awk -F= '$1 == \"git_commit\" {print $2; exit}' "$OUTPUT_DIR/manifest.txt")" \
+        >"$resume_provenance/manifest.txt"
+    printf 'Reusing completed current/swapped Nsight traces in %s\n' "$OUTPUT_DIR"
+fi
 
 capture_trace() {
     local label=$1 devices=$2
@@ -237,8 +290,10 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
         >>"$OUTPUT_DIR/trace-map.tsv"
 }
 
-capture_trace current "$CURRENT_DEVICES"
-capture_trace swapped "$SWAPPED_DEVICES"
+if [[ $resume == 0 ]]; then
+    capture_trace current "$CURRENT_DEVICES"
+    capture_trace swapped "$SWAPPED_DEVICES"
+fi
 
 phase=same-work-harness
 printf 'trial\tslot\tscenario\tdevice\tlog\n' >"$OUTPUT_DIR/harness-runs.tsv"

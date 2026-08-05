@@ -1029,3 +1029,21 @@ SKIP_BUILD=0 \
 Return `sm75-critical-path-<timestamp>.tar.gz`. The archive is also produced
 on interruption or failure and includes both `.nsys-rep` files, SQLite
 exports, 100-ms GPU clock/power telemetry, harness logs, and derived CSVs.
+
+If a run from commit `ab54701` failed in `same-work-harness` because a dense-Q8
+scenario lacked `timed_per_call_ms`, reuse the completed Nsight Systems traces
+instead of capturing them again:
+
+```bash
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export RESUME_DIR="$PWD/sm75-critical-path-20260805T071911Z"
+
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-critical-path-audit.sh
+```
+
+Resume mode validates the model, layouts, split, failed phase, reports,
+SQLite exports, and telemetry before rerunning only the bounded same-work
+harness and summarizer. It preserves the failed run's provenance and writes a
+separate `.resume-<timestamp>.tar.gz` archive.

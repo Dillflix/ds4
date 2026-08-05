@@ -698,7 +698,7 @@ cleanup:
     return ok;
 }
 
-static int run_q8(const scenario_spec *spec) {
+static int run_q8(const scenario_spec *spec, uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint64_t blocks = spec->in_dim / 32u;
     const uint64_t model_bytes = (uint64_t)spec->out_dim * blocks * 34u;
@@ -762,6 +762,28 @@ static int run_q8(const scenario_spec *spec) {
     }
     printf("output_values_checked=%llu\noutput_validation=exact-zero\n",
            (unsigned long long)out_count);
+    if (timed_repeats > 0u) {
+        const double start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (!ds4_gpu_matmul_q8_0_tensor(out, model, model_bytes, 0u,
+                                            spec->in_dim, spec->out_dim,
+                                            x, n_tokens)) {
+                fprintf(stderr,
+                        "error: Q8 timed production launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: Q8 timed synchronization failed\n");
+            goto cleanup;
+        }
+        const double elapsed_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        printf("timed_repeats=%u\ntimed_total_ms=%.6f\n"
+               "timed_per_call_ms=%.6f\n",
+               timed_repeats, elapsed_ms,
+               elapsed_ms / (double)timed_repeats);
+    }
     ok = 1;
 
 cleanup:
@@ -913,7 +935,8 @@ int main(int argc, char **argv) {
     }
 
     const int ok = q4_moe ? run_moe(spec, 0, native_q4_moe, timed_repeats) :
-                   (q2_moe ? run_moe(spec, 1, 0, timed_repeats) : run_q8(spec));
+                   (q2_moe ? run_moe(spec, 1, 0, timed_repeats) :
+                             run_q8(spec, timed_repeats));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;
