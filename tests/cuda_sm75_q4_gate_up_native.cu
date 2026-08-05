@@ -830,10 +830,20 @@ __device__ __forceinline__ static void gu_nsplit_pair_block(
     const float d1=f16_to_f32((uint16_t)h1.x);
     const float z1=f16_to_f32((uint16_t)(h1.x>>16u));
     const float yd0=have0?a0->d:0.0f,yd1=have1?a1->d:0.0f;
-    v00=yd0*d0*(float)i00-yd0*z0*(float)m00;
-    v01=yd0*d1*(float)i01-yd0*z1*(float)m01;
-    v10=yd1*d0*(float)i10-yd1*z0*(float)m10;
-    v11=yd1*d1*(float)i11-yd1*z1*(float)m11;
+
+    /* Match the shipping Q4 gate/up dequantization instruction order.
+     * The wider helper exposes common subexpressions across both route halves;
+     * under --use_fast_math ptxas otherwise contracts only some outputs and
+     * produces a two-ULP difference.  Explicit RN operations retain the
+     * shipping two rounded multiplies plus final fused scale-minus-min. */
+    const float min00=__fmul_rn(__fmul_rn(yd0,z0),(float)m00);
+    const float min01=__fmul_rn(__fmul_rn(yd0,z1),(float)m01);
+    const float min10=__fmul_rn(__fmul_rn(yd1,z0),(float)m10);
+    const float min11=__fmul_rn(__fmul_rn(yd1,z1),(float)m11);
+    v00=__fmaf_rn(__fmul_rn(yd0,d0),(float)i00,-min00);
+    v01=__fmaf_rn(__fmul_rn(yd0,d1),(float)i01,-min01);
+    v10=__fmaf_rn(__fmul_rn(yd1,d0),(float)i10,-min10);
+    v11=__fmaf_rn(__fmul_rn(yd1,d1),(float)i11,-min11);
 }
 
 #define NS_GU_SLOT8_DECL(S) \
