@@ -40,6 +40,7 @@ on:
       - "tests/cuda_sm75_q4_gate_up_native.cu"
       - "tests/cuda_sm75_native_q4_histograms.h"
       - "speed-bench/cuda-sm75-q4-nsplit.sh"
+      - "speed-bench/cuda-sm75-q4-persistent.sh"
       - "tests/test_engine_mgpu_placement.c"
       - "tests/test_summarize_q4_real_histogram.py"
       - "gguf-tools/**"
@@ -228,6 +229,8 @@ jobs:
             sm75_q4_gate_up_native_aw_stage7_kernel \
             sm75_q4_gate_up_native_aw_stage7_scalar_kernel \
             sm75_q4_gate_up_native_aw_warp16_scalar_kernel \
+            sm75_q4_gate_up_native_aw_persistent_seq16_kernel \
+            sm75_q4_gate_up_native_aw_persistent_ws16_kernel \
             sm75_q4_gate_up_pack_a_kernel \
             sm75_q4_gate_up_pack_w_kernel; do
             grep -Fq "Function : $kernel" /tmp/sm75-q4-gate-up-native.sass
@@ -251,11 +254,14 @@ jobs:
           extract_sass native-aw-stage7 sm75_q4_gate_up_native_aw_stage7_kernel
           extract_sass native-aw-stage7-scalar sm75_q4_gate_up_native_aw_stage7_scalar_kernel
           extract_sass native-aw-warp16-scalar sm75_q4_gate_up_native_aw_warp16_scalar_kernel
+          extract_sass native-aw-persistent-seq16 sm75_q4_gate_up_native_aw_persistent_seq16_kernel
+          extract_sass native-aw-persistent-ws16 sm75_q4_gate_up_native_aw_persistent_ws16_kernel
           for label in standard standard-warp16; do
             grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' "/tmp/sm75-q4-gate-up-$label.sass"
           done
           for label in native-w native-aw native-aw-warp16 native-aw-stage7 \
-              native-aw-stage7-scalar native-aw-warp16-scalar; do
+              native-aw-stage7-scalar native-aw-warp16-scalar \
+              native-aw-persistent-seq16 native-aw-persistent-ws16; do
             grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' "/tmp/sm75-q4-gate-up-$label.sass"
             grep -Eq 'IMMA\.8832\.S4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
             grep -Eq 'IMMA\.8832\.U4\.U4' "/tmp/sm75-q4-gate-up-$label.sass"
@@ -264,12 +270,15 @@ jobs:
             > /tmp/sm75-q4-gate-up-local-instructions.csv
           for label in standard standard-warp16 native-w native-aw \
               native-aw-warp16 native-aw-stage7 native-aw-stage7-scalar \
-              native-aw-warp16-scalar; do
+              native-aw-warp16-scalar native-aw-persistent-seq16 \
+              native-aw-persistent-ws16; do
             ldl=$(grep -Ec '(^|[[:space:]])LDL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
             stl=$(grep -Ec '(^|[[:space:]])STL([[:space:].]|$)' "/tmp/sm75-q4-gate-up-$label.sass" || true)
             scalar_gate=not-applicable
             if [[ $label == native-aw-stage7-scalar || \
-                  $label == native-aw-warp16-scalar ]]; then
+                  $label == native-aw-warp16-scalar || \
+                  $label == native-aw-persistent-seq16 || \
+                  $label == native-aw-persistent-ws16 ]]; then
               scalar_gate=pass
               if (( ldl != 0 || stl != 0 )); then
                 scalar_gate=fail
@@ -278,9 +287,9 @@ jobs:
             printf '%s,%s,%s,%s\n' "$label" "$ldl" "$stl" "$scalar_gate" \
               >> /tmp/sm75-q4-gate-up-local-instructions.csv
           done
-          awk -F, 'NR == 1 || $1 ~ /-scalar$/ { print }' \
+          awk -F, 'NR == 1 || $1 ~ /-scalar$/ || $1 ~ /-persistent-/ { print }' \
             /tmp/sm75-q4-gate-up-local-instructions.csv
-          ! grep -Eq '^native-aw-(stage7|warp16)-scalar,[^,]+,[^,]+,fail$' \
+          ! grep -Eq '^native-aw-(stage7-scalar|warp16-scalar|persistent-(seq16|ws16)),[^,]+,[^,]+,fail$' \
             /tmp/sm75-q4-gate-up-local-instructions.csv
           python3 - /tmp/sm75-q4-gate-up-build.log <<'PY'
           import re
@@ -289,6 +298,8 @@ jobs:
           wanted = (
               "sm75_q4_gate_up_native_aw_stage7_scalar_kernel",
               "sm75_q4_gate_up_native_aw_warp16_scalar_kernel",
+              "sm75_q4_gate_up_native_aw_persistent_seq16_kernel",
+              "sm75_q4_gate_up_native_aw_persistent_ws16_kernel",
           )
           with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
               lines = handle.readlines()
@@ -361,6 +372,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-native-q4-next-ab.sh
           test -x speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
           bash -n speed-bench/cuda-sm75-native-q4-wide-hot-ab.sh
+          test -x speed-bench/cuda-sm75-q4-persistent.sh
+          bash -n speed-bench/cuda-sm75-q4-persistent.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()

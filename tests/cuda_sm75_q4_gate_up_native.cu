@@ -84,6 +84,8 @@ enum GuVariant {
     GU_PACK_A,
     GU_NATIVE_AW_NSPLIT4,
     GU_NATIVE_AW_NSPLIT8,
+    GU_NATIVE_AW_PERSISTENT_SEQ16,
+    GU_NATIVE_AW_PERSISTENT_WS16,
     GU_VARIANT_COUNT,
 };
 
@@ -104,6 +106,8 @@ static const char *const gu_variant_names[GU_VARIANT_COUNT] = {
     "pack-a",
     "native-aw-nsplit4",
     "native-aw-nsplit8",
+    "native-aw-persistent-seq16",
+    "native-aw-persistent-ws16",
 };
 
 struct GuHostMetadata {
@@ -993,6 +997,219 @@ __global__ static void sm75_q4_gate_up_native_aw_nsplit_kernel(
         pair1,tok1,slot1,have1,row0,n0,g10,g11,u10,u11,write_aux,clamp);
 }
 
+/* Persistent tile16 successors retain the shipping 512-row CTA macro-tile.
+ * Activations are read directly from the native Q8 layout so the CTA does not
+ * repeatedly stage one slab per 32/64 output rows.  On Turing these immutable
+ * rows are expected to be supplied by the unified L1/L2 path; the audit
+ * measures whether that traffic is cheaper than the rejected barrier-heavy
+ * N-split staging.  Each packed Q4 weight fragment still feeds both route
+ * halves before it is released. */
+#define PERSIST_GU_SLOT8_DECL(S) \
+    float pg00_##S=0.0f,pg01_##S=0.0f; \
+    float pg10_##S=0.0f,pg11_##S=0.0f
+#define PERSIST_GU_SLOT8_ADD(S,V00,V01,V10,V11) \
+    case S: \
+        pg00_##S+=(V00);pg01_##S+=(V01); \
+        pg10_##S+=(V10);pg11_##S+=(V11);break
+
+__device__ __forceinline__ static void gu_persistent_matrix(
+        const NativeWeightTileBlock *native_w,
+        const NativeQ8K *native_a,
+        uint32_t expert, uint32_t row0, uint32_t lane,
+        uint32_t tok0, uint32_t tok1, bool have0, bool have1,
+        float &o00, float &o01, float &o10, float &o11) {
+    PERSIST_GU_SLOT8_DECL(0); PERSIST_GU_SLOT8_DECL(1);
+    PERSIST_GU_SLOT8_DECL(2); PERSIST_GU_SLOT8_DECL(3);
+    PERSIST_GU_SLOT8_DECL(4); PERSIST_GU_SLOT8_DECL(5);
+    PERSIST_GU_SLOT8_DECL(6); PERSIST_GU_SLOT8_DECL(7);
+    const uint64_t record0 =
+        ((uint64_t)expert * GU_OUT_TILES + row0 / GU_OUT_TILE) *
+        GU_IN_BLOCKS;
+#pragma unroll
+    for (uint32_t b = 0; b < GU_IN_BLOCKS; b++) {
+        const NativeQ8K *a0 = native_a + (uint64_t)tok0 * GU_IN_BLOCKS + b;
+        const NativeQ8K *a1 = native_a + (uint64_t)tok1 * GU_IN_BLOCKS + b;
+        float v00=0.0f,v01=0.0f,v10=0.0f,v11=0.0f;
+        gu_nsplit_pair_block(native_w + record0 + b, a0, a1,
+            have0, have1, lane, v00, v01, v10, v11);
+        switch (b & 7u) {
+            PERSIST_GU_SLOT8_ADD(0,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(1,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(2,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(3,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(4,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(5,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(6,v00,v01,v10,v11);
+            PERSIST_GU_SLOT8_ADD(7,v00,v01,v10,v11);
+        }
+    }
+    NS_GU_REDUCE(pg00,o00); NS_GU_REDUCE(pg01,o01);
+    NS_GU_REDUCE(pg10,o10); NS_GU_REDUCE(pg11,o11);
+}
+
+__device__ __forceinline__ static void gu_persistent_store_gate(
+        float *scratch, uint32_t rows, uint32_t p0, uint32_t p1,
+        bool have0, bool have1, uint32_t local_row,
+        float g00, float g01, float g10, float g11) {
+    if (have0) {
+        scratch[(uint64_t)p0 * rows + local_row] = g00;
+        scratch[(uint64_t)p0 * rows + local_row + 1u] = g01;
+    }
+    if (have1) {
+        scratch[(uint64_t)p1 * rows + local_row] = g10;
+        scratch[(uint64_t)p1 * rows + local_row + 1u] = g11;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void sm75_q4_gate_up_native_aw_persistent_seq16_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const NativeWeightTileBlock *native_gate_w,
+        const NativeWeightTileBlock *native_up_w,
+        const NativeQ8K *native_a,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *router_weights, uint32_t n_expert,
+        uint32_t write_aux, float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ uint32_t s_pair[16], s_np;
+    __shared__ float gate_scratch[16 * 128];
+    if (threadIdx.x == 0u) {
+        const uint32_t count = counts[expert];
+        const uint32_t remaining = local_start < count ?
+            count - local_start : 0u;
+        const uint32_t np = remaining < 16u ? remaining : 16u;
+        for (uint32_t p = 0; p < np; p++)
+            s_pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t p0 = lane >> 2u, p1 = p0 + 8u;
+    const bool have0 = p0 < np, have1 = p1 < np;
+    const uint32_t pair0 = have0 ? s_pair[p0] : 0u;
+    const uint32_t pair1 = have1 ? s_pair[p1] : 0u;
+    const uint32_t tok0 = pair0 / n_expert, tok1 = pair1 / n_expert;
+    const uint32_t slot0 = pair0 - tok0 * n_expert;
+    const uint32_t slot1 = pair1 - tok1 * n_expert;
+    const uint32_t n0 = (lane & 3u) * 2u;
+#pragma unroll
+    for (uint32_t rr = 0; rr < GU_ROW_SPAN / 128u; rr++) {
+        const uint32_t local_row = warp * GU_OUT_TILE + n0;
+        const uint32_t row0 = blockIdx.x * GU_ROW_SPAN +
+            rr * 128u + warp * GU_OUT_TILE;
+        {
+            float g00,g01,g10,g11;
+            gu_persistent_matrix(native_gate_w,native_a,expert,row0,lane,
+                tok0,tok1,have0,have1,g00,g01,g10,g11);
+            gu_persistent_store_gate(gate_scratch,128u,p0,p1,
+                have0,have1,local_row,g00,g01,g10,g11);
+        }
+        __syncthreads();
+        float u00,u01,u10,u11;
+        gu_persistent_matrix(native_up_w,native_a,expert,row0,lane,
+            tok0,tok1,have0,have1,u00,u01,u10,u11);
+        if (have0) {
+            const float g00=gate_scratch[(uint64_t)p0*128u+local_row];
+            const float g01=gate_scratch[(uint64_t)p0*128u+local_row+1u];
+            gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,
+                n_expert,pair0,tok0,slot0,true,row0,n0,
+                g00,g01,u00,u01,write_aux,clamp);
+        }
+        if (have1) {
+            const float g10=gate_scratch[(uint64_t)p1*128u+local_row];
+            const float g11=gate_scratch[(uint64_t)p1*128u+local_row+1u];
+            gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,
+                n_expert,pair1,tok1,slot1,true,row0,n0,
+                g10,g11,u10,u11,write_aux,clamp);
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void sm75_q4_gate_up_native_aw_persistent_ws16_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const NativeWeightTileBlock *native_gate_w,
+        const NativeWeightTileBlock *native_up_w,
+        const NativeQ8K *native_a,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *router_weights, uint32_t n_expert,
+        uint32_t write_aux, float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t worker = warp & 7u;
+    const bool up_warp = warp >= 8u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t local_start = tile_starts[tile];
+    __shared__ uint32_t s_pair[16], s_np;
+    __shared__ float gate_scratch[16 * 64];
+    if (threadIdx.x == 0u) {
+        const uint32_t count = counts[expert];
+        const uint32_t remaining = local_start < count ?
+            count - local_start : 0u;
+        const uint32_t np = remaining < 16u ? remaining : 16u;
+        for (uint32_t p = 0; p < np; p++)
+            s_pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+    const uint32_t p0 = lane >> 2u, p1 = p0 + 8u;
+    const bool have0 = p0 < np, have1 = p1 < np;
+    const uint32_t pair0 = have0 ? s_pair[p0] : 0u;
+    const uint32_t pair1 = have1 ? s_pair[p1] : 0u;
+    const uint32_t tok0 = pair0 / n_expert, tok1 = pair1 / n_expert;
+    const uint32_t slot0 = pair0 - tok0 * n_expert;
+    const uint32_t slot1 = pair1 - tok1 * n_expert;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const NativeWeightTileBlock *matrix_w =
+        up_warp ? native_up_w : native_gate_w;
+#pragma unroll
+    for (uint32_t rr = 0; rr < GU_ROW_SPAN / 64u; rr++) {
+        const uint32_t local_row = worker * GU_OUT_TILE + n0;
+        const uint32_t row0 = blockIdx.x * GU_ROW_SPAN +
+            rr * 64u + worker * GU_OUT_TILE;
+        float v00,v01,v10,v11;
+        gu_persistent_matrix(matrix_w,native_a,expert,row0,lane,
+            tok0,tok1,have0,have1,v00,v01,v10,v11);
+        if (!up_warp)
+            gu_persistent_store_gate(gate_scratch,64u,p0,p1,
+                have0,have1,local_row,v00,v01,v10,v11);
+        __syncthreads();
+        if (up_warp) {
+            if (have0) {
+                const float g00=gate_scratch[(uint64_t)p0*64u+local_row];
+                const float g01=gate_scratch[(uint64_t)p0*64u+local_row+1u];
+                gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,
+                    n_expert,pair0,tok0,slot0,true,row0,n0,
+                    g00,g01,v00,v01,write_aux,clamp);
+            }
+            if (have1) {
+                const float g10=gate_scratch[(uint64_t)p1*64u+local_row];
+                const float g11=gate_scratch[(uint64_t)p1*64u+local_row+1u];
+                gu_nsplit_write_pair(gate_out,up_out,mid_out,router_weights,
+                    n_expert,pair1,tok1,slot1,true,row0,n0,
+                    g10,g11,v10,v11,write_aux,clamp);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+#undef PERSIST_GU_SLOT8_ADD
+#undef PERSIST_GU_SLOT8_DECL
+
 #undef NS_GU_REDUCE
 #undef NS_GU_SLOT8_ADD
 #undef NS_GU_SLOT8_DECL
@@ -1370,6 +1587,28 @@ static void gu_launch(const GuData *d, GuVariant requested, uint32_t write_aux) 
         if (requested == GU_PACK_A) return;
     }
     const GuVariant variant = gu_consumer_variant(requested);
+    if (variant == GU_NATIVE_AW_PERSISTENT_SEQ16 ||
+        variant == GU_NATIVE_AW_PERSISTENT_WS16) {
+        const dim3 pgrid(GU_MID_DIM / GU_ROW_SPAN, GU_TOKENS, 1u);
+#define GU_PERSISTENT_ARGS \
+        (float *)d->gate_out.ptr, (float *)d->up_out.ptr, \
+        (float *)d->mid_out.ptr, \
+        (const NativeWeightTileBlock *)d->native_gate_w.ptr, \
+        (const NativeWeightTileBlock *)d->native_up_w.ptr, \
+        (const NativeQ8K *)d->native_a.ptr, d->d_sorted_pairs, \
+        d->d_offsets, d->d_counts, d->d_tile16_total, \
+        d->d_tile16_experts, d->d_tile16_starts, \
+        (const float *)d->router_weights.ptr, GU_SELECTED, write_aux, 1.25f
+        if (variant == GU_NATIVE_AW_PERSISTENT_SEQ16)
+            sm75_q4_gate_up_native_aw_persistent_seq16_kernel<<<
+                pgrid, 512>>>(GU_PERSISTENT_ARGS);
+        else
+            sm75_q4_gate_up_native_aw_persistent_ws16_kernel<<<
+                pgrid, 512>>>(GU_PERSISTENT_ARGS);
+#undef GU_PERSISTENT_ARGS
+        cuda_die(cudaGetLastError(), "launch Q4 gate/up persistent consumer");
+        return;
+    }
     if (variant == GU_NATIVE_AW_NSPLIT4 ||
         variant == GU_NATIVE_AW_NSPLIT8) {
         const uint32_t warps = variant == GU_NATIVE_AW_NSPLIT4 ? 4u : 8u;
@@ -1551,6 +1790,8 @@ static int gu_run_correctness(GuData *d) {
         GU_NATIVE_AW_WARP16_SCALAR_COMBINED,
         GU_NATIVE_AW_NSPLIT4,
         GU_NATIVE_AW_NSPLIT8,
+        GU_NATIVE_AW_PERSISTENT_SEQ16,
+        GU_NATIVE_AW_PERSISTENT_WS16,
     };
     for (uint32_t v = 0; v < sizeof(checked) / sizeof(checked[0]); v++) {
         gu_poison_outputs(d);
@@ -1648,6 +1889,10 @@ static void gu_print_resources(void) {
         sm75_q4_gate_up_native_aw_nsplit_kernel<4>, 128, 0u);
     gu_print_resource("native_aw_nsplit8",
         sm75_q4_gate_up_native_aw_nsplit_kernel<8>, 256, 0u);
+    gu_print_resource("native_aw_persistent_seq16",
+        sm75_q4_gate_up_native_aw_persistent_seq16_kernel, 512, 0u);
+    gu_print_resource("native_aw_persistent_ws16",
+        sm75_q4_gate_up_native_aw_persistent_ws16_kernel, 512, 0u);
     gu_print_resource("pack_a", sm75_q4_gate_up_pack_a_kernel, 256, 0u);
     gu_print_resource("pack_w", sm75_q4_gate_up_pack_w_kernel, 256, 0u);
     printf("resource_standard_binary_identity=false\n"

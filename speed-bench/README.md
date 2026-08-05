@@ -138,6 +138,39 @@ SKIP_BUILD=0 \
 No `MODEL` variable is required. Return the printed
 `sm75-q4-nsplit-<timestamp>.tar.gz` archive.
 
+### Persistent 512-row tile16 Gate audit
+
+`cuda-sm75-q4-persistent.sh` tests the successor to the rejected compact
+N-split Gate topology without changing production dispatch. Both candidates
+retain the shipping 512-row CTA, reuse every packed Q4 fragment across a real
+16-route cost-planner tile, and keep only one matrix's scalar accumulator
+window live. `persistent-seq16` computes Gate then Up sequentially;
+`persistent-ws16` assigns eight warps to each matrix. Because the complete
+16-route native-Q8 activation tile is 74.75 KiB and cannot fit in Turing's
+64 KiB shared-memory budget, both consume immutable activations directly
+through the unified cache path.
+
+The runner checks real early/late histograms for bit-exact output, rejects
+local-memory traffic or more than 128 registers/thread, records balanced
+timings against the shipping warp16 scalar kernel, and captures focused
+early-layer Nsight Compute reports.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+BENCH_ROUNDS=3 \
+BENCH_LAUNCHES=10 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-q4-persistent.sh
+```
+
+No model is opened. Return the printed
+`sm75-q4-persistent-<timestamp>.tar.gz` archive.
+
 ### Exact production Q4 expert histogram
 
 `cuda-q4-real-histogram.sh` captures the actual per-expert routed-pair counts
