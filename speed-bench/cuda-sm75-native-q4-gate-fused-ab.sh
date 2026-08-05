@@ -626,27 +626,27 @@ if [[ $RUN_NCU == 1 ]]; then
         cat "$base-validation.txt"
     }
     profile_one early-gate-baseline native-q4-early baseline \
-        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>' \
         37.488 0 1280
     profile_one late-gate-baseline native-q4-late baseline \
-        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *0[u]?>' \
         37.488 0 1280
     profile_one early-gate-fixed-k16 native-q4-early fixed \
-        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>' \
         37.488 0 1280
     profile_one late-gate-fixed-k16 native-q4-late fixed \
-        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel<512[u]?, *0[u]?, *16[u]?>' \
         37.488 0 1280
     profile_one early-gate-full64-fused native-q4-early fused \
-        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>' \
         0 65.536 1280
     profile_one late-gate-full64-fused native-q4-late fused \
-        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>.*$' \
+        '^moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile16_full64_fused_kernel<512[u]?>' \
         0 65.536 1280
 fi
