@@ -1931,7 +1931,7 @@ static int run_q8_partner_projection_case(
     ds4_gpu_q8_f16_plan_begin();
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
               model, model_size, 0u, weight_bytes, in_dim, out_dim,
-              0, "tensor:blk.0.partner_reference.weight"),
+              0, tensor_name),
           "q8 partner register local reference");
     CHECK(ds4_gpu_cache_q8_f16_range_on_device_or_partner(
               model, model_size, weight_bytes, weight_bytes, in_dim, out_dim,
@@ -1967,11 +1967,14 @@ static int run_q8_partner_projection_case(
           ds4_gpu_tensor_read(
               &partner, 0, host_partner, output_count * sizeof(float)),
           "q8 partner output read");
+    /* Check dispatch before comparing arithmetic.  Otherwise an ineligible
+     * synthetic cache-filler can leave this projection on native Q8 and turn
+     * a missing partner offload into a misleading cuBLAS exactness failure. */
+    CHECK(ds4_gpu_q8_f16_partner_offload_count() == 1u,
+          "exactly one projection executed on the partner");
     CHECK(memcmp(host_local, host_partner,
                  (size_t)output_count * sizeof(float)) == 0,
           "partner cuBLAS output is bit-exact with local cuBLAS");
-    CHECK(ds4_gpu_q8_f16_partner_offload_count() == 1u,
-          "exactly one projection executed on the partner");
 
     if (in_dim == 1024u && out_dim == 32768u) {
         const uint64_t half_bytes = output_count * sizeof(uint16_t);
