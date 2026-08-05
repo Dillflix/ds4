@@ -220,7 +220,7 @@ else
     git diff --stat >"$resume_provenance/git-diff-stat.txt"
     printf 'date_utc=%s\ngit_commit=%s\nsource_manifest_commit=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
-        "$(awk -F= '$1 == \"git_commit\" {print $2; exit}' "$OUTPUT_DIR/manifest.txt")" \
+        "$(awk -F= '$1 == "git_commit" {print $2; exit}' "$OUTPUT_DIR/manifest.txt")" \
         >"$resume_provenance/manifest.txt"
     printf 'Reusing completed current/swapped Nsight traces in %s\n' "$OUTPUT_DIR"
 fi
