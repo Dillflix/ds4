@@ -403,6 +403,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
           test -x speed-bench/cuda-sm75-q4-clock-audit.sh
           bash -n speed-bench/cuda-sm75-q4-clock-audit.sh
+          test -x speed-bench/cuda-sm75-memory-clock-sweep.sh
+          bash -n speed-bench/cuda-sm75-memory-clock-sweep.sh
           python3 - <<'PY'
           from pathlib import Path
           source = Path("speed-bench/cuda-sm75-production-scalar-e2e.sh").read_text()
@@ -422,6 +424,8 @@ jobs:
           python3 -m py_compile speed-bench/summarize-cuda-critical-path.py
           python3 tests/test_summarize_cuda_critical_path.py
           python3 -m py_compile speed-bench/summarize-sm75-q4-clock-audit.py
+          python3 -m py_compile speed-bench/summarize-sm75-memory-clock-sweep.py
+          python3 tests/test_summarize_sm75_memory_clock_sweep.py
           python3 -m py_compile speed-bench/summarize-q4-real-histogram.py
           python3 tests/test_summarize_q4_real_histogram.py
           python3 -m py_compile speed-bench/summarize-q4-post-scalar-trace.py

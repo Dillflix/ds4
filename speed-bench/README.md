@@ -1083,3 +1083,33 @@ USE_SUDO=1 \
 Return `sm75-q4-clock-<timestamp>.tar.gz`. Do not raise power limits until the
 baseline report establishes the active clock-event reason and each board's
 reported default and maximum limits.
+
+### SM75 Q4 memory-clock power-headroom sweep
+
+`cuda-sm75-memory-clock-sweep.sh` is the bounded follow-up when the clock audit
+shows software power capping below the requested SM clock. It compares GPU1 as
+the healthy passive-board control against GPUs2/3, discovers their common
+supported memory clocks, and samples up to five clocks in the upper operating
+range. Each point records actual SM/memory clocks, power, temperature, throttle
+reasons, exactness, and production-shaped Q4 early/late timings.
+
+The sweep does not change power limits. Runtime SM and memory locks are reset,
+and original persistence settings restored, on success, failure, or interrupt.
+Run it only when these GPUs have no other compute processes:
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+DEVICES=1,2,3 \
+TARGET_SM_CLOCK=1620 \
+TRIALS=3 \
+REPEATS=100 \
+USE_SUDO=1 \
+./speed-bench/cuda-sm75-memory-clock-sweep.sh
+```
+
+Return `sm75-memory-clock-<timestamp>.tar.gz`. `decisions.csv` reports the
+best measured clock per device and scenario, but a production clock should be
+chosen only if both Q4 scenarios improve and the full native-Q4 benchmark then
+confirms the result.
