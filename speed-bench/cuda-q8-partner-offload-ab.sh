@@ -167,11 +167,19 @@ topology_link() {
         partner_device=${gpu_device_ids[$partner_tier]}
         forward=$(topology_link "$home_device" "$partner_device")
         reverse=$(topology_link "$partner_device" "$home_device")
-        [[ $forward =~ ^NV[0-9]+$ && $reverse =~ ^NV[0-9]+$ ]] ||
-            die "logical pair $home_tier<->$partner_tier (physical $home_device<->$partner_device) is not NVLink in both directions: ${forward:-missing}/${reverse:-missing}"
+        # NVLink is a physical bidirectional link. Some nvidia-smi releases
+        # omit one symmetric matrix row, so accept one unambiguous NV# report;
+        # the engine still validates CUDA DIRECT peer access independently in
+        # both execution directions before any partner projection is admitted.
+        [[ $forward =~ ^NV[0-9]+$ || $reverse =~ ^NV[0-9]+$ ]] ||
+            die "logical pair $home_tier<->$partner_tier (physical $home_device<->$partner_device) is not reported as NVLink: ${forward:-missing}/${reverse:-missing}"
+        [[ -z $forward || $forward =~ ^NV[0-9]+$ ]] ||
+            die "inconsistent NVLink topology for physical $home_device<->$partner_device: $forward/${reverse:-missing}"
+        [[ -z $reverse || $reverse =~ ^NV[0-9]+$ ]] ||
+            die "inconsistent NVLink topology for physical $home_device<->$partner_device: ${forward:-missing}/$reverse"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$home_tier" "$home_device" "$partner_tier" "$partner_device" \
-            "$forward" "$reverse"
+            "${forward:-unreported}" "${reverse:-unreported}"
     done
 } >"$OUTPUT_DIR/pair-topology.tsv"
 

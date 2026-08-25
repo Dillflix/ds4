@@ -358,7 +358,8 @@ declines larger microbatches instead of growing scratch during execution.
 
 ```bash
 cd ~/ds4-iq2-q4
-git fetch origin agent/partner-q8-offload:refs/remotes/origin/agent/partner-q8-offload
+git remote set-branches --add origin agent/partner-q8-offload
+git fetch origin
 git switch --track origin/agent/partner-q8-offload
 git pull --ff-only
 
