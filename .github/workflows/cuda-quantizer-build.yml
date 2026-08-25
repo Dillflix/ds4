@@ -76,6 +76,14 @@ jobs:
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
         run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev CUDA_ARCH=sm_75
+      - name: Run CPU placement regressions
+        run: ./tests/test_engine_mgpu_placement
+      - name: Check Q8 partner A/B tooling
+        run: |
+          bash -n speed-bench/cuda-q8-partner-offload-ab.sh
+          python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
+          python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
+          python3 tests/test_summarize_q8_partner_offload_ab.py
       - name: Verify production tagged-Q4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'
@@ -366,8 +374,6 @@ jobs:
               if row["stores"] != 0 or row["loads"] != 0:
                   raise SystemExit(f"{kernel} has PTXAS spill traffic")
           PY
-      - name: Run CPU placement regressions
-        run: ./tests/test_engine_mgpu_placement
       - name: Check comparison suite tools
         run: |
           bash -n compare-q2-hybrid-q4.sh
