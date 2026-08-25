@@ -181,7 +181,6 @@ nvidia-smi topo -m >"$OUTPUT_DIR/topology.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
 for gpu in "${devices[@]}"; do
-    nvidia-smi -i "$gpu" -lmi >"$OUTPUT_DIR/supported-clocks/gpu$gpu-lock-info.txt" 2>&1 || true
     nvidia-smi -i "$gpu" -q -d SUPPORTED_CLOCKS \
         >"$OUTPUT_DIR/supported-clocks/gpu$gpu.txt"
 done
@@ -220,8 +219,28 @@ else
         (( clock * 100 >= maximum_clock * MIN_MEMORY_PERCENT )) || continue
         eligible_clocks+=("$clock")
     done
-    ((${#eligible_clocks[@]} >= 2)) ||
-        die "fewer than two common clocks remain; set MEMORY_CLOCKS explicitly"
+    if ((${#eligible_clocks[@]} < 2)); then
+        phase=not-applicable
+        printf '%s\n' "${common_clocks[@]}" >"$OUTPUT_DIR/common-memory-clocks.txt"
+        printf '%s\n' "${eligible_clocks[@]}" >"$OUTPUT_DIR/selected-memory-clocks.txt"
+        {
+            printf 'outcome=not-applicable\n'
+            printf 'common_memory_clocks_mhz=%s\n' \
+                "$(IFS=,; printf '%s' "${common_clocks[*]}")"
+            printf 'performance_eligible_memory_clocks_mhz=%s\n' \
+                "$(IFS=,; printf '%s' "${eligible_clocks[*]}")"
+            printf 'reason=The boards expose fewer than two common memory states above %s%% of maximum.\n' \
+                "$MIN_MEMORY_PERCENT"
+            printf 'conclusion=No bounded memory-clock power-headroom sweep is available; the low-power state also constrains graphics clocks.\n'
+        } | tee "$OUTPUT_DIR/analysis.txt"
+        printf 'date_utc=%s\ngit_commit=%s\ndevices=%s\nscenarios=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+            "$DEVICES" "$SCENARIOS" >"$OUTPUT_DIR/manifest.txt"
+        phase=complete
+        printf 'SM75 Q4 memory-clock sweep is not applicable on these boards: %s\n' \
+            "$OUTPUT_DIR"
+        exit 0
+    fi
     if ((${#eligible_clocks[@]} <= MAX_CLOCK_POINTS)); then
         memory_clocks=("${eligible_clocks[@]}")
     else

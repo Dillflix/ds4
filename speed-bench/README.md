@@ -1069,6 +1069,11 @@ to determine whether Q4 timing converges at equal clocks and whether GPU2
 shares GPU3's behavior. Original persistence mode, power limits, and unlocked
 clock state are restored on success, failure, or interruption.
 
+`TARGET_SM_CLOCK_MODE=1` selects NVIDIA's closed-loop clock-locking mode, which
+is documented as potentially improving performance per watt. This is relevant
+when the default mode cannot sustain the requested clock because of software
+power capping; it must still be measured rather than assumed beneficial.
+
 ```bash
 cd ~/ds4-iq2-q4
 git pull --ff-only
@@ -1113,3 +1118,8 @@ Return `sm75-memory-clock-<timestamp>.tar.gz`. `decisions.csv` reports the
 best measured clock per device and scenario, but a production clock should be
 chosen only if both Q4 scenarios improve and the full native-Q4 benchmark then
 confirms the result.
+
+Some Turing boards expose only a full-performance memory state and a 405 MHz
+idle state whose supported graphics ceiling is also low. In that case the
+script records `outcome=not-applicable` and exits successfully without changing
+clocks; forcing the idle memory state is not a useful power-headroom test.

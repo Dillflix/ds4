@@ -15,6 +15,7 @@ Optional environment:
   RUN_PAIR_CONCURRENT=1
   NORMALIZE=1               also run a reversible common-clock A/B
   TARGET_SM_CLOCK=1620      diagnostic common clock, not a production default
+  TARGET_SM_CLOCK_MODE=0    nvidia-smi lock mode: 0=accuracy, 1=perf-per-watt
   RAISE_POWER_LIMIT=0       if 1, temporarily use each board's reported maximum
   USE_SUDO=1
   SKIP_BUILD=0
@@ -41,6 +42,7 @@ SAMPLE_MS=${SAMPLE_MS:-100}
 RUN_PAIR_CONCURRENT=${RUN_PAIR_CONCURRENT:-1}
 NORMALIZE=${NORMALIZE:-1}
 TARGET_SM_CLOCK=${TARGET_SM_CLOCK:-1620}
+TARGET_SM_CLOCK_MODE=${TARGET_SM_CLOCK_MODE:-0}
 RAISE_POWER_LIMIT=${RAISE_POWER_LIMIT:-0}
 USE_SUDO=${USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -51,6 +53,7 @@ OUTPUT_DIR=${Q4_CLOCK_DIR:-$repo_dir/sm75-q4-clock-$stamp}
 for item in "TRIALS:$TRIALS" "REPEATS:$REPEATS" "SAMPLE_MS:$SAMPLE_MS" \
             "RUN_PAIR_CONCURRENT:$RUN_PAIR_CONCURRENT" "NORMALIZE:$NORMALIZE" \
             "TARGET_SM_CLOCK:$TARGET_SM_CLOCK" \
+            "TARGET_SM_CLOCK_MODE:$TARGET_SM_CLOCK_MODE" \
             "RAISE_POWER_LIMIT:$RAISE_POWER_LIMIT" "USE_SUDO:$USE_SUDO" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
@@ -59,6 +62,8 @@ done
 (( TRIALS >= 2 && REPEATS >= 20 && REPEATS <= 100 &&
    SAMPLE_MS >= 50 && SAMPLE_MS <= 1000 && TARGET_SM_CLOCK > 0 )) ||
     die "invalid trial/repeat/sample/clock setting"
+[[ $TARGET_SM_CLOCK_MODE == 0 || $TARGET_SM_CLOCK_MODE == 1 ]] ||
+    die "TARGET_SM_CLOCK_MODE must be 0 or 1"
 for flag in RUN_PAIR_CONCURRENT NORMALIZE RAISE_POWER_LIMIT USE_SUDO \
             SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
@@ -152,6 +157,8 @@ printf 'date_utc=%s\ngit_commit=%s\nscenarios=%s\npair_scenario=%s\n' \
 printf 'trials=%s\nrepeats=%s\nsample_ms=%s\nnormalize=%s\ntarget_sm_clock=%s\nraise_power_limit=%s\n' \
     "$TRIALS" "$REPEATS" "$SAMPLE_MS" "$NORMALIZE" \
     "$TARGET_SM_CLOCK" "$RAISE_POWER_LIMIT" >>"$OUTPUT_DIR/manifest.txt"
+printf 'target_sm_clock_mode=%s\n' "$TARGET_SM_CLOCK_MODE" \
+    >>"$OUTPUT_DIR/manifest.txt"
 
 query_help=$(nvidia-smi --help-query-gpu 2>/dev/null || true)
 telemetry_query='timestamp,index,pstate,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.current.sm,clocks.current.memory,power.draw,power.limit,temperature.gpu'
@@ -277,7 +284,8 @@ if [[ $NORMALIZE == 1 ]]; then
     fi
     for gpu in 0 1 2 3; do
         "${privilege[@]}" nvidia-smi -i "$gpu" \
-            -lgc "$TARGET_SM_CLOCK,$TARGET_SM_CLOCK" >/dev/null
+            -lgc "$TARGET_SM_CLOCK,$TARGET_SM_CLOCK" \
+            --mode="$TARGET_SM_CLOCK_MODE" >/dev/null
     done
     nvidia-smi -q >"$OUTPUT_DIR/nvidia-smi-q-normalized.txt"
     run_mode normalized
