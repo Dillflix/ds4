@@ -57,6 +57,9 @@ on:
       - "tests/test_summarize_q4_real_histogram.py"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
+      - "produce-verify-q4-max-cache-256k.sh"
+      - "speed-bench/select-q4-max-for-cache.py"
+      - "tests/test_select_q4_max_for_cache.py"
       - "compare-q2-hybrid-q4.sh"
 
 permissions:
@@ -371,6 +374,8 @@ jobs:
       - name: Check comparison suite tools
         run: |
           bash -n compare-q2-hybrid-q4.sh
+          bash -n produce-benchmark-iq2-iq2-q4.sh
+          bash -n produce-verify-q4-max-cache-256k.sh
           bash -n speed-bench/cuda-prefill-audit.sh
           bash -n speed-bench/cuda-prefill-deep-audit.sh
           bash -n speed-bench/cuda-q4-prefill-evidence.sh
@@ -414,6 +419,8 @@ jobs:
           PY
           bash -n speed-bench/cuda-sm75-next-targets.sh
           python3 -m py_compile speed-bench/validate-ncu-capture.py
+          python3 -m py_compile speed-bench/select-q4-max-for-cache.py
+          python3 tests/test_select_q4_max_for_cache.py
           python3 -m py_compile speed-bench/summarize-prefill-placement.py
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py

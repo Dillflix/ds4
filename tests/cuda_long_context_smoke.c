@@ -827,6 +827,49 @@ static void fill_q4_tensor(unsigned char *base, uint32_t matrix,
     }
 }
 
+static void fill_iq2_tensor(unsigned char *base, uint32_t matrix,
+                            uint32_t n_experts, uint32_t n_rows,
+                            uint32_t n_blocks) {
+    const uint64_t row_bytes = (uint64_t)n_blocks * 66u;
+    const uint64_t expert_bytes = (uint64_t)n_rows * row_bytes;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            for (uint32_t b = 0; b < n_blocks; b++) {
+                unsigned char *blk = base + (uint64_t)e * expert_bytes +
+                    (uint64_t)row * row_bytes + (uint64_t)b * 66u;
+                blk[0] = 0x00u;
+                blk[1] = 0x30u; /* finite FP16 d=0.125 */
+                for (uint32_t i = 0; i < 64u; i++)
+                    blk[2u + i] = (unsigned char)(e * 17u + row * 13u +
+                        b * 29u + i * 7u + matrix * 31u);
+            }
+        }
+    }
+}
+
+static void fill_q2_tensor(unsigned char *base, uint32_t matrix,
+                           uint32_t n_experts, uint32_t n_rows,
+                           uint32_t n_blocks) {
+    const uint64_t row_bytes = (uint64_t)n_blocks * 84u;
+    const uint64_t expert_bytes = (uint64_t)n_rows * row_bytes;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            for (uint32_t b = 0; b < n_blocks; b++) {
+                unsigned char *blk = base + (uint64_t)e * expert_bytes +
+                    (uint64_t)row * row_bytes + (uint64_t)b * 84u;
+                for (uint32_t i = 0; i < 16u; i++) blk[i] = 0x01u;
+                for (uint32_t i = 0; i < 64u; i++)
+                    blk[16u + i] = (unsigned char)(e * 11u + row * 19u +
+                        b * 23u + i * 5u + matrix * 37u);
+                blk[80] = 0x00u;
+                blk[81] = 0x30u; /* finite FP16 d=0.125 */
+                blk[82] = 0x00u;
+                blk[83] = 0x00u; /* dmin=0 */
+            }
+        }
+    }
+}
+
 /* This is the production API, not an isolated microkernel comparison.  It
  * proves exact standard-vs-tagged output for a prefill histogram containing
  * full 16s plus true 8/4 tails and for the direct six-expert decode route. */
@@ -1029,6 +1072,82 @@ static int check_sm75_native_q4_layout_exact(void) {
         !compare_exact_f32("sm75 native q4 decode output", out_ref, out_got,
                            out_dim)) goto cleanup;
     fprintf(stderr, "cuda-regression: tagged SM75 native Q4 decode exact\n");
+
+#define RUN_MIXED_NATIVE(MODEL, LAYOUT, MODEL_BYTES, GATE_OFF, UP_OFF, DOWN_OFF, \
+                         GATE_TYPE, DOWN_TYPE, GATE_EXPERT, GATE_ROW, \
+                         DOWN_EXPERT, DOWN_ROW, MID_DST, OUT_DST) \
+    (mid_is_f16 = false, ds4_gpu_set_routed_q4_layout(LAYOUT), \
+     ds4_gpu_set_model_map((MODEL), (MODEL_BYTES)) && \
+     ds4_gpu_routed_moe_batch_tensor( \
+        out, gate, up, mid, down, (MODEL), (MODEL_BYTES), \
+        (GATE_OFF), (UP_OFF), (DOWN_OFF), (GATE_TYPE), (DOWN_TYPE), \
+        (GATE_EXPERT), (GATE_ROW), (DOWN_EXPERT), (DOWN_ROW), \
+        in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert, \
+        10.0f, x, 0u, n_tokens, &mid_is_f16, true) && !mid_is_f16 && \
+     ds4_gpu_synchronize() && \
+     ds4_gpu_tensor_read(mid, 0, (MID_DST), mid_count * sizeof(float)) && \
+     ds4_gpu_tensor_read(out, 0, (OUT_DST), out_count * sizeof(float)))
+
+    /* Mixed tagged layout: only Q4 tensors are transformed. This is the
+     * production recipe space used by the 256K max-Q4 cache selector. */
+    const uint64_t iq2_gate_row = (uint64_t)in_blocks * 66u;
+    const uint64_t iq2_gate_expert = (uint64_t)mid_dim * iq2_gate_row;
+    const uint64_t iq2_up_off = iq2_gate_expert * n_total;
+    const uint64_t iq2_down_off = iq2_up_off + iq2_gate_expert * n_total;
+    const uint64_t iq2_model_bytes = iq2_down_off + down_expert * n_total;
+    memset(standard, 0, (size_t)model_bytes);
+    fill_iq2_tensor(standard, 0u, n_total, mid_dim, in_blocks);
+    fill_iq2_tensor(standard + iq2_up_off, 1u, n_total, mid_dim, in_blocks);
+    fill_q4_tensor(standard + iq2_down_off, 2u, n_total, out_dim, mid_blocks);
+    memcpy(native, standard, (size_t)iq2_model_bytes);
+    pack_sm75_native_q4_tensor(native + iq2_down_off,
+                               standard + iq2_down_off,
+                               n_total, out_dim, mid_blocks);
+    if (!RUN_MIXED_NATIVE(standard, 0u, iq2_model_bytes,
+                          0u, iq2_up_off, iq2_down_off, 16u, 12u,
+                          iq2_gate_expert, iq2_gate_row,
+                          down_expert, down_row, mid_ref, out_ref) ||
+        !RUN_MIXED_NATIVE(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
+                          iq2_model_bytes,
+                          0u, iq2_up_off, iq2_down_off, 16u, 12u,
+                          iq2_gate_expert, iq2_gate_row,
+                          down_expert, down_row, mid_got, out_got) ||
+        !compare_exact_f32("tagged IQ2 gate/Q4 down prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("tagged IQ2 gate/Q4 down prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: tagged IQ2 gate/up + native Q4 down exact\n");
+
+    const uint64_t q2_down_row = (uint64_t)mid_blocks * 84u;
+    const uint64_t q2_down_expert = (uint64_t)out_dim * q2_down_row;
+    const uint64_t q2_model_bytes = down_off + q2_down_expert * n_total;
+    memset(standard, 0, (size_t)model_bytes);
+    fill_q4_tensor(standard + gate_off, 0u, n_total, mid_dim, in_blocks);
+    fill_q4_tensor(standard + up_off, 1u, n_total, mid_dim, in_blocks);
+    fill_q2_tensor(standard + down_off, 2u, n_total, out_dim, mid_blocks);
+    memcpy(native, standard, (size_t)q2_model_bytes);
+    pack_sm75_native_q4_tensor(native + gate_off, standard + gate_off,
+                               n_total, mid_dim, in_blocks);
+    pack_sm75_native_q4_tensor(native + up_off, standard + up_off,
+                               n_total, mid_dim, in_blocks);
+    if (!RUN_MIXED_NATIVE(standard, 0u, q2_model_bytes,
+                          gate_off, up_off, down_off, 12u, 10u,
+                          gate_expert, gate_row,
+                          q2_down_expert, q2_down_row, mid_ref, out_ref) ||
+        !RUN_MIXED_NATIVE(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
+                          q2_model_bytes,
+                          gate_off, up_off, down_off, 12u, 10u,
+                          gate_expert, gate_row,
+                          q2_down_expert, q2_down_row, mid_got, out_got) ||
+        !compare_exact_f32("tagged Q4 gate/Q2 down prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("tagged Q4 gate/Q2 down prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: tagged native Q4 gate/up + Q2 down exact\n");
+
+#undef RUN_MIXED_NATIVE
     rc = 0;
 #undef RUN_NATIVE_Q4
 

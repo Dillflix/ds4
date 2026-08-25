@@ -1840,13 +1840,8 @@ static output_context build_output_context(const gguf_file *tmpl,
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
-        if (sm75_native_q4 && parse_expert_tensor(src->name).is_expert) {
-            if (type != DS4Q_TYPE_Q4_K) {
-                fprintf(stderr,
-                        "error: --sm75-native-q4 routed tensor %s resolves to %s\n",
-                        src->name, ds4q_type_name(type));
-                exit(1);
-            }
+        if (sm75_native_q4 && parse_expert_tensor(src->name).is_expert &&
+            type == DS4Q_TYPE_Q4_K) {
             if (src->ne[0] % 256 != 0 || src->ne[1] % 8 != 0) {
                 fprintf(stderr,
                         "error: --sm75-native-q4 tensor %s is not tile-aligned\n",
@@ -2999,7 +2994,7 @@ static void usage(const char *argv0) {
     printf("  --threads N            expert worker count, default 8\n");
     printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
     printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
-    printf("  --sm75-native-q4      store routed Q4_K tensors in tagged Turing MMA-native A/W layout\n");
+    printf("  --sm75-native-q4      store each routed Q4_K tensor in tagged Turing MMA-native A/W layout\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 

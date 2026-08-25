@@ -1567,6 +1567,53 @@ static void cuda_q8_f16_binding_record(
     g_q8_f16_bindings.push_back(b);
 }
 
+static void cuda_q8_f16_plan_audit_write(
+        const std::vector<int> &candidate_resident) {
+    const char *path = getenv("DS4_CUDA_Q8_PLAN_AUDIT_CSV");
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4: could not open Q8 FP16 plan audit %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+    fprintf(fp,
+            "sequence,label,consumer_device,fallback_device,resident_device,"
+            "weight_offset,weight_bytes,in_dim,out_dim,fp16_bytes,status\n");
+    for (size_t i = 0; i < g_q8_f16_plan.size(); i++) {
+        const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
+        const int resident = i < candidate_resident.size()
+            ? candidate_resident[i] : -1;
+        const char *status = resident < 0 ? "unadmitted" :
+            (resident == c.physical_device ? "home" : "partner");
+        const uint64_t fp16_bytes =
+            c.in_dim != 0u && c.out_dim <= UINT64_MAX / c.in_dim / sizeof(__half)
+                ? c.in_dim * c.out_dim * sizeof(__half) : 0u;
+        /* Tensor labels originate in GGUF tensor names and contain no CSV
+         * delimiters. Keep the format deliberately simple so the production
+         * calibration script can consume it without a profiler dependency. */
+        fprintf(fp, "%zu,%s,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%s\n",
+                i, c.label, c.physical_device, c.fallback_physical_device,
+                resident,
+                (unsigned long long)c.offset,
+                (unsigned long long)c.weight_bytes,
+                (unsigned long long)c.in_dim,
+                (unsigned long long)c.out_dim,
+                (unsigned long long)fp16_bytes,
+                status);
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "ds4: could not finish Q8 FP16 plan audit %s: %s\n",
+                path, strerror(errno));
+    } else {
+        fprintf(stderr,
+                "ds4: wrote Q8 FP16 plan audit %s (%zu candidates)\n",
+                path, g_q8_f16_plan.size());
+    }
+}
+
 static void cuda_q8_f16_plan_materialize(void) {
     if (!g_q8_f16_plan_finalized || g_q8_f16_plan_materialized ||
         g_q8_f16_plan_materializing) return;
@@ -1657,6 +1704,7 @@ static void cuda_q8_f16_plan_materialize(void) {
         if (cudaSetDevice(dev) == cudaSuccess) (void)cudaDeviceSynchronize();
     }
     if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    cuda_q8_f16_plan_audit_write(candidate_resident);
     g_q8_f16_plan_active = 0;
     g_q8_f16_plan_materializing = 0;
     g_q8_f16_plan_materialized = 1;
@@ -24268,17 +24316,20 @@ static int routed_moe_launch(
     const int all_q4k = gate_q4k && down_q4k;
     const int native_q4 =
         g_cuda_routed_q4_layout == DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
-    const uint32_t use_native_q4_cost_tiles = native_q4 &&
+    const int native_q4_gate = native_q4 && gate_q4k;
+    const int native_q4_down = native_q4 && down_q4k;
+    const int native_q4_any = native_q4_gate || native_q4_down;
+    const uint32_t use_native_q4_cost_tiles = native_q4_any &&
         !cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES", 0);
-    const uint32_t use_native_q4_gate_stream7 = native_q4 &&
+    const uint32_t use_native_q4_gate_stream7 = native_q4_gate &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7", 0);
-    const uint32_t request_native_q4_gate_fixed_k16 = native_q4 &&
+    const uint32_t request_native_q4_gate_fixed_k16 = native_q4_gate &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16", 0);
-    const uint32_t use_native_q4_down_compact7 = native_q4 &&
+    const uint32_t use_native_q4_down_compact7 = native_q4_down &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_COMPACT7", 0);
-    const uint32_t request_native_q4_gate_full64_fused = native_q4 &&
+    const uint32_t request_native_q4_gate_full64_fused = native_q4_gate &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_GATE_FULL64_FUSED", 0);
-    const uint32_t request_native_q4_down_wide512 = native_q4 &&
+    const uint32_t request_native_q4_down_wide512 = native_q4_down &&
         cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_DOWN_WIDE512", 0);
     const uint32_t use_native_q4_down_wide512 =
         request_native_q4_down_wide512 &&
@@ -24295,18 +24346,18 @@ static int routed_moe_launch(
                 g_cuda_routed_q4_layout);
         return 0;
     }
-    if (native_q4 &&
-        (!all_q4k || !cuda_sm75_mma_ok() ||
+    if (native_q4_any &&
+        (!cuda_sm75_mma_ok() ||
          (expert_mid_dim & 7u) != 0u || (out_dim & 7u) != 0u ||
          expert_in_dim / CUDA_QK_K > 16u ||
          expert_mid_dim / CUDA_QK_K > 8u)) {
         fprintf(stderr,
-                "ds4: sm75_m8n8k32_native_aw_v1 requires SM75, all-Q4 "
-                "routed tensors, dimensions divisible by 8, at most 4096 "
+                "ds4: sm75_m8n8k32_native_aw_v1 requires SM75, Q4 "
+                "routed dimensions divisible by 8, at most 4096 "
                 "input columns, and at most 2048 intermediate columns\n");
         return 0;
     }
-    if (native_q4 && !g_cuda_native_q4_logged.exchange(
+    if (native_q4_any && !g_cuda_native_q4_logged.exchange(
             true, std::memory_order_relaxed)) {
         fprintf(stderr,
                 "ds4: SM75 native routed-Q4 layout enabled "
@@ -24457,7 +24508,7 @@ static int routed_moe_launch(
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_q4_sorted_pairs =
             gate_q4k && n_tokens > 1u &&
-            (native_q4 || owned_filtered ||
+            (native_q4_gate || owned_filtered ||
              (getenv("DS4_CUDA_MOE_NO_Q4_SORTED") == NULL &&
               getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL &&
               getenv("DS4_CUDA_MOE_TILE4") == NULL));
@@ -24466,13 +24517,13 @@ static int routed_moe_launch(
             (owned_filtered || gate_iq2 || use_q4_sorted_pairs);
         const uint32_t use_expert_tiles =
             use_sorted_pairs &&
-            (native_q4 || owned_filtered ||
+            (native_q4_any || owned_filtered ||
              getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL);
         /* Small batches (DSpark stage chain / verify, n<=8) leave most of an
          * 8-slot expert tile empty (1-2 rows per expert): tile4 halves the
          * wasted dot-slots and measures ~2x faster there. Large prefill
          * keeps tile8. Env overrides both ways. */
-        const uint32_t expert_tile_m = native_q4 ? 8u :
+        const uint32_t expert_tile_m = native_q4_any ? 8u :
             getenv("DS4_CUDA_MOE_TILE4") ? 4u :
             (getenv("DS4_CUDA_MOE_TILE8") ? 8u :
              (n_tokens <= 8u ? 4u : 8u));
@@ -24483,7 +24534,7 @@ static int routed_moe_launch(
         const uint32_t use_atomic_down = down_q2k && use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
-        const uint32_t use_owned_sparse_buffers = owned_filtered && !native_q4 &&
+        const uint32_t use_owned_sparse_buffers = owned_filtered && !native_q4_any &&
             getenv("DS4_CUDA_MOE_NO_OWNED_SPARSE_BUFFERS") == NULL;
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
             (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
@@ -24493,10 +24544,10 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
-        const uint32_t use_q4_gate_mma_tiles16 = gate_q4k && !native_q4 && use_expert_tiles &&
+        const uint32_t use_q4_gate_mma_tiles16 = gate_q4k && !native_q4_gate && use_expert_tiles &&
             expert_tile_m == 8u && cuda_q4_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
-        const uint32_t use_q4_down_mma_tiles16 = down_q4k && !native_q4 && use_expert_tiles &&
+        const uint32_t use_q4_down_mma_tiles16 = down_q4k && !native_q4_down && use_expert_tiles &&
             expert_tile_m == 8u && cuda_q4_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL;
         const uint32_t use_iq2_mma_sm75 = gate_iq2 && use_expert_tiles &&
@@ -24507,14 +24558,14 @@ static int routed_moe_launch(
             n_tokens >= 128u &&
             getenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75") == NULL;
         const uint32_t use_q4_gate_mma_sm75_tile16 =
-            gate_q4k && !native_q4 && use_expert_tiles && expert_tile_m == 8u &&
+            gate_q4k && !native_q4_gate && use_expert_tiles && expert_tile_m == 8u &&
             n_tokens >= 128u && xq_blocks == 16u &&
             (expert_mid_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_Q4_GATE_TILE16_SM75") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_TILE16_SM75") == NULL;
         const uint32_t use_q4_down_mma_sm75_tile16 =
-            down_q4k && !native_q4 && use_expert_tiles && expert_tile_m == 8u &&
+            down_q4k && !native_q4_down && use_expert_tiles && expert_tile_m == 8u &&
             n_tokens >= 128u && midq_blocks <= 8u &&
             (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
@@ -24539,17 +24590,17 @@ static int routed_moe_launch(
             (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q2_DOWN_MMA_SM75") == NULL;
-        const uint32_t use_any_tile16 = native_q4 || use_down_tile16 ||
+        const uint32_t use_any_tile16 = native_q4_any || use_down_tile16 ||
             use_q4_gate_mma_tiles16 || use_q4_down_mma_tiles16 ||
             use_iq2_mma_sm75_tile16 || use_q4_gate_mma_sm75_tile16 ||
             use_q4_down_mma_sm75_tile16 || use_q2_down_mma_sm75_tile16;
         const uint32_t use_mixed_tail_tiles = use_any_tile16 &&
-            (native_q4 || n_tokens >= 128u) &&
-            (native_q4 ||
+            (native_q4_any || n_tokens >= 128u) &&
+            (native_q4_any ||
              (getenv("DS4_CUDA_MOE_MIXED_TAIL_TILES") != NULL &&
               getenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES") == NULL));
         const uint32_t use_small_sorted_prep =
-            !native_q4 && owned_filtered && (gate_q4k || down_q4k) &&
+            !native_q4_any && owned_filtered && (gate_q4k || down_q4k) &&
             n_tokens <= 16u && pair_count <= 96u &&
             n_total_expert <= 128u && use_sorted_pairs && use_expert_tiles &&
             getenv("DS4_CUDA_MOE_NO_SMALL_SORTED_PREP") == NULL;
@@ -24579,30 +24630,30 @@ static int routed_moe_launch(
             n_tokens == 1u && (n_expert == 6u || n_expert == 3u) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         const uint32_t use_direct_midq =
-            gate_q4k && !native_q4 && use_direct_down_sum && !write_gate_up &&
+            gate_q4k && !native_q4_gate && use_direct_down_sum && !write_gate_up &&
             getenv("DS4_CUDA_MOE_DIRECT_MIDQ") != NULL &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_MIDQ") == NULL;
         const uint32_t use_q4_gate_h16r8 =
-            gate_q4k && !use_direct_midq &&
+            gate_q4k && !native_q4_gate && !use_direct_midq &&
             getenv("DS4_CUDA_MOE_Q4_GATE_H16R8") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16R8") == NULL;
         const uint32_t use_q4_gate_h16 =
-            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 &&
+            gate_q4k && !native_q4_gate && !use_direct_midq && !use_q4_gate_h16r8 &&
             getenv("DS4_CUDA_MOE_Q4_GATE_H16") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_H16") == NULL;
         const uint32_t use_q4_gate_w32r16 =
-            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
+            gate_q4k && !native_q4_gate && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
             getenv("DS4_CUDA_MOE_Q4_GATE_W32R16") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32R16") == NULL;
         const uint32_t use_q4_gate_w32 =
-            gate_q4k && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
+            gate_q4k && !native_q4_gate && !use_direct_midq && !use_q4_gate_h16r8 && !use_q4_gate_h16 &&
             !use_q4_gate_w32r16 &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32") == NULL;
         const uint32_t use_q4_gate_w32_noaux =
             use_q4_gate_w32 && !write_gate_up &&
             getenv("DS4_CUDA_MOE_NO_Q4_GATE_W32_NOAUX") == NULL;
         const uint32_t use_q4_down_slot3 =
-            down_q4k && use_direct_down_sum && n_expert == 3u &&
+            down_q4k && !native_q4_down && use_direct_down_sum && n_expert == 3u &&
             getenv("DS4_CUDA_MOE_Q4_DOWN_SLOT3") != NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_DOWN_SLOT3") == NULL;
         const uint32_t use_q4_midq_sidecar =
@@ -24613,7 +24664,7 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_NO_MIDQ_SIDECAR") == NULL;
         float *midq_sidecar = use_q4_midq_sidecar ? (float *)up->ptr : NULL;
         if (g_cuda_moe_decode_graph &&
-            !native_q4 &&
+            !native_q4_any &&
             !owned_filtered &&
             !profile_moe &&
             all_q4k &&
@@ -24669,7 +24720,7 @@ static int routed_moe_launch(
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
-        if (ok && native_q4) {
+        if (ok && native_q4_gate) {
             ok = sm75_q4_pack_activations_inplace(
                 xq, xq_count, "routed_moe native x pack launch");
         }
@@ -24838,7 +24889,7 @@ static int routed_moe_launch(
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (gate_q4k) {
-                    if (native_q4) {
+                    if (native_q4_gate) {
 #define DS4_NATIVE_Q4_GATE_LIST(RS, TOTAL, EXPERTS, STARTS, CAP, DELTA, FIXED_K) \
                         do { \
                             dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
@@ -25355,7 +25406,7 @@ static int routed_moe_launch(
                      * (prefill). An all-Q4 layer is steered here by
                      * use_sorted_pairs = 0
                      * cascading the IQ2 sorted/expert-tile branches off. */
-                    if (native_q4) {
+                    if (native_q4_gate) {
                         dim3 ng((expert_mid_dim + 7u) / 8u,
                                 n_tokens * n_expert, 1u);
                         moe_gate_up_mid_decode_sm75_native_q4_kernel<<<ng, 256>>>(
@@ -25567,7 +25618,7 @@ static int routed_moe_launch(
                 q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
             }
-            if (ok && native_q4) {
+            if (ok && native_q4_down) {
                 ok = sm75_q4_pack_activations_inplace(
                     midq, midq_count, "routed_moe native mid pack launch");
             }
@@ -25595,13 +25646,13 @@ static int routed_moe_launch(
             if (use_direct_down_sum) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (down_q4k) {
-                    if (native_q4 && n_expert == 6u) {
+                    if (native_q4_down && n_expert == 6u) {
                         moe_down_sm75_native_q4_sum_kernel<6><<<sgrid, 256>>>(
                             (float *)out->ptr, down_w,
                             (const cuda_sm75_native_q8_K *)midq,
                             (const int32_t *)selected->ptr,
                             midq_blocks, out_dim);
-                    } else if (native_q4 && n_expert == 3u) {
+                    } else if (native_q4_down && n_expert == 3u) {
                         moe_down_sm75_native_q4_sum_kernel<3><<<sgrid, 256>>>(
                             (float *)out->ptr, down_w,
                             (const cuda_sm75_native_q8_K *)midq,
@@ -25674,7 +25725,7 @@ static int routed_moe_launch(
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (down_q4k) {
-                    if (native_q4) {
+                    if (native_q4_down) {
 #define DS4_NATIVE_Q4_DOWN_LIST(RS, TP, TOTAL, EXPERTS, STARTS, CAP, THREADS) \
                         do { \
                             dim3 ng((out_dim + (RS) - 1u) / (RS), (CAP), 1u); \
@@ -26006,7 +26057,7 @@ static int routed_moe_launch(
                  * and the dot helper to dev_dot_q4_K_q8_K_block. Writes per-pair
                  * outputs into down->ptr; moe_sum_kernel below sums them across
                  * experts into out->ptr. */
-                if (native_q4) {
+                if (native_q4_down) {
                     moe_down_sm75_native_q4_pair_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr, down_w,
                         (const cuda_sm75_native_q8_K *)midq,
@@ -26190,9 +26241,12 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     const bool down_q2k = down_type == 10u;
     const bool native_q4 =
         g_cuda_routed_q4_layout == DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
+    const bool native_q4_gate = native_q4 && gate_q4k;
+    const bool native_q4_down = native_q4 && down_q4k;
+    const bool native_q4_any = native_q4_gate || native_q4_down;
     if ((!gate_q4k && !gate_iq2) || (!down_q4k && !down_q2k)) return 0;
-    if (native_q4 &&
-        (!gate_q4k || !down_q4k || !cuda_sm75_mma_ok() ||
+    if (native_q4_any &&
+        (!cuda_sm75_mma_ok() ||
          (expert_mid_dim & 7u) != 0u || (out_dim & 7u) != 0u ||
          expert_in_dim / CUDA_QK_K > 16u ||
          expert_mid_dim / CUDA_QK_K > 8u)) {
@@ -26279,14 +26333,14 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                 xq, (const float *)x->ptr, expert_in_dim, 1u);
     }
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe x quantize launch")) return 0;
-    if (native_q4 && !sm75_q4_pack_activations_inplace(
+    if (native_q4_gate && !sm75_q4_pack_activations_inplace(
             xq, xq_blocks, "owned routed_moe native x pack launch")) {
         return 0;
     }
 
     if (gate_q4k) {
         dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
-        if (native_q4) {
+        if (native_q4_gate) {
             moe_gate_up_mid_decode_sm75_native_q4_owned_kernel<<<gate_grid, 256>>>(
                 (float *)mid->ptr, gate_w, up_w,
                 (const cuda_sm75_native_q8_K *)xq,
@@ -26335,7 +26389,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe gate/up launch")) return 0;
 
     dim3 midq_grid(midq_blocks, 6u, 1u);
-    if (native_q4) {
+    if (native_q4_down) {
         q8_K_quantize_kernel<<<midq_grid, 256>>>(
                 midq, (const float *)mid->ptr, expert_mid_dim, 6u);
     } else {
@@ -26349,21 +26403,21 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                 resident_expert_count);
     }
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe mid quantize launch")) return 0;
-    if (native_q4 && !sm75_q4_pack_activations_inplace(
+    if (native_q4_down && !sm75_q4_pack_activations_inplace(
             midq, 6ull * midq_blocks,
             "owned routed_moe native mid pack launch")) {
         return 0;
     }
 
     dim3 down_grid((out_dim + 31u) / 32u, pack_fixed3 ? 4u : 6u, 1u);
-    if (native_q4 && pack_fixed3) {
+    if (native_q4_down && pack_fixed3) {
         moe_down_sm75_native_q4_owned_packed_kernel<<<down_grid, 256>>>(
                 down_dst, down_w,
                 (const cuda_sm75_native_q8_K *)midq,
                 (const int32_t *)selected->ptr,
                 midq_blocks, out_dim, resident_expert_base,
                 resident_expert_count);
-    } else if (native_q4) {
+    } else if (native_q4_down) {
         moe_down_sm75_native_q4_owned_slots_kernel<<<down_grid, 256>>>(
                 down_dst, down_w,
                 (const cuda_sm75_native_q8_K *)midq,

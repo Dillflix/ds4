@@ -251,6 +251,25 @@ preference order and should be replaced with the fixed quality suite's ranking
 when that data is available. `IQ2_GATE_UP_LAYER_ORDER` controls the IQ2-pair
 preference independently and defaults to `Q2_DOWN_LAYER_ORDER`.
 
+For the four-card 256K target, use the planner-level workflow instead:
+
+```sh
+bash produce-verify-q4-max-cache-256k.sh \
+  /models/DeepSeek-V4-Flash-0731-HF \
+  /mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf
+```
+
+It calibrates with `ctx_alloc=262273` (262144 context tokens plus 128 decode
+tokens and the terminal slot), enables every Q8 projection supported by the
+FP16 path, and records the complete startup benefit plan. Selection is done per
+NVLink pair and exactly minimizes the number of routed tensors demoted from
+Q4; preserving Q4 down tensors is only the default tie-break. The output keeps
+the tagged SM75-native layout on every remaining Q4 routed tensor while Q2/IQ2
+overrides remain in their standard layouts. A short run using the final 256K
+allocation must report every plan candidate as home- or partner-resident before
+the script succeeds. Set `RUN_FULL_BENCHMARK=1` only when the subsequent
+2K--256K throughput sweep is wanted.
+
 The script builds the CUDA quantizer and an `sm_75` CUDA benchmark, verifies the
 routed-format CPU/CUDA byte checks and the
 routed-MoE matrix classification test, writes the GGUF through an atomic
