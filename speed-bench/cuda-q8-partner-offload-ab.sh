@@ -105,13 +105,16 @@ done
 (( have_local == 1 )) || die "VARIANTS must include local"
 [[ -n ${seen[t32]+x} && -n ${seen[t256]+x} ]] ||
     die "a complete A/B requires both t32 and t256 variants"
-IFS=',' read -r -a nsys_variants <<<"$NSYS_VARIANTS"
-for variant in "${nsys_variants[@]}"; do
-    [[ $variant == t32 || $variant == t256 || $variant == shared_down ||
-       $variant == legacy ]] || die "unsupported NSYS_VARIANTS entry: $variant"
-    [[ -n ${seen[$variant]+x} ]] ||
-        die "Nsight variant $variant is not present in VARIANTS"
-done
+nsys_variants=()
+if [[ $RUN_NSYS == 1 ]]; then
+    IFS=',' read -r -a nsys_variants <<<"$NSYS_VARIANTS"
+    for variant in "${nsys_variants[@]}"; do
+        [[ $variant == t32 || $variant == t256 || $variant == shared_down ||
+           $variant == legacy ]] || die "unsupported NSYS_VARIANTS entry: $variant"
+        [[ -n ${seen[$variant]+x} ]] ||
+            die "Nsight variant $variant is not present in VARIANTS"
+    done
+fi
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"

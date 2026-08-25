@@ -358,6 +358,8 @@ declines larger microbatches instead of growing scratch during execution.
 
 ```bash
 cd ~/ds4-iq2-q4
+git fetch origin agent/partner-q8-offload:refs/remotes/origin/agent/partner-q8-offload
+git switch --track origin/agent/partner-q8-offload
 git pull --ff-only
 
 export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -369,16 +371,20 @@ STAGE_SPLIT=22 \
 CTX_START=2048 \
 CTX_MAX=8192 \
 REPEATS=3 \
+VARIANTS=local,t32,t256 \
+RUN_NSYS=0 \
 bash ./speed-bench/cuda-q8-partner-offload-ab.sh
 ```
 
-Set `RUN_NSYS=0` only for a throughput-only rerun, and set `RUN_GPU_TEST=0`
-only after all three exactness cases have passed for the current binary.
+The command above is throughput-only; set `RUN_NSYS=1` to capture timelines.
+Set `RUN_GPU_TEST=0` only after all three exactness cases have passed for the
+current binary.
 `RUN_GPU_TEST=1` still executes the existing binary when `SKIP_BUILD=1`; the
 latter skips compilation, not validation. `VARIANTS` must include `local`,
 `t32`, and `t256` so every A/B archive proves both expensive projection
 classes; it may additionally include the other named variants.
-`NSYS_VARIANTS` accepts a comma-separated subset. Return
+When `RUN_NSYS=1`, `NSYS_VARIANTS` accepts a comma-separated subset of
+`VARIANTS`; it is ignored for a throughput-only `RUN_NSYS=0` run. Return
 `q8-partner-offload-ab-<timestamp>.tar.gz`; its
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
@@ -402,6 +408,8 @@ STAGE_SPLIT=22 \
 CTX_START=2048 \
 CTX_MAX=8192 \
 REPEATS=3 \
+VARIANTS=local,t32,t256 \
+RUN_NSYS=0 \
 bash ./speed-bench/cuda-q8-partner-offload-ab.sh
 ```
 
