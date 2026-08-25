@@ -1926,8 +1926,16 @@ static int run_q8_partner_projection_case(
     CHECK(ds4_gpu_device_cache_tensors(1, &partner_range, 1) == 0,
           "q8 partner cache source on partner");
 
-    /* The first F16 expansion fills device 0's per-device cap.  The second
-     * same-sized candidate must therefore materialize only on device 1. */
+    /* Exercise the new API's primary-first behavior before planner mode: even
+     * with a valid fallback, available home capacity must keep this expansion
+     * on device 0.  The plan then observes that resident primary allocation.
+     * The second same-sized candidate cannot fit at home and must overflow to
+     * device 1.  Running this helper for T32 and T256 covers both production
+     * projection shapes, not merely a small synthetic GEMM. */
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+              model, model_size, 0u, weight_bytes, in_dim, out_dim,
+              0, 1, tensor_name),
+          "q8 partner API prefers available primary device");
     ds4_gpu_q8_f16_plan_begin();
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
               model, model_size, 0u, weight_bytes, in_dim, out_dim,

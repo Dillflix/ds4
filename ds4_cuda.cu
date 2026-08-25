@@ -538,7 +538,15 @@ struct cuda_q8_f16_binding {
     int consumer_device;
     int resident_device;
     int partner_offload;
+    uint64_t partner_scratch_tokens;
     char label[128];
+};
+
+enum cuda_q8_f16_fill_status {
+    CUDA_Q8_F16_FILL_ERROR = 0,
+    CUDA_Q8_F16_FILL_SUCCESS = 1,
+    CUDA_Q8_F16_FILL_CAPACITY_MISS = 2,
+    CUDA_Q8_F16_FILL_SKIPPED = 3,
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
@@ -563,6 +571,7 @@ static uint64_t g_q8_f16_plan_admitted;
 static std::vector<cuda_q8_f16_plan_candidate> g_q8_f16_plan;
 static std::vector<cuda_q8_f16_binding> g_q8_f16_bindings;
 static uint64_t g_q8_f16_plan_partner_admitted;
+static int g_q8_f16_plan_device_error;
 static std::atomic<uint64_t> g_q8_f16_partner_offloads = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_activation_bytes = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_result_bytes = 0;
@@ -734,7 +743,10 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
                 "ds4: cudaGetDevice failed before scratch alloc on tier %d (dev=%d, what=%s): %s\n",
                 logical_tier, ctx->device_id, what ? what : "scratch",
                 cudaGetErrorString(derr));
+        if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+        g_current_logical_tier = -1;
         (void)cudaGetLastError();
+        if (!g_q8_f16_plan_materializing) abort();
         return NULL;
     }
     derr = cudaSetDevice(ctx->device_id);
@@ -743,28 +755,61 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
                 "ds4: cudaSetDevice(%d) failed before scratch alloc on tier %d (what=%s): %s\n",
                 ctx->device_id, logical_tier, what ? what : "scratch",
                 cudaGetErrorString(derr));
+        if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
         (void)cudaGetLastError();
-        if (prev >= 0) (void)cudaSetDevice(prev);
+        if (prev >= 0 && cudaSetDevice(prev) != cudaSuccess) {
+            g_current_logical_tier = -1;
+            if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+            (void)cudaGetLastError();
+            if (!g_q8_f16_plan_materializing) abort();
+        }
         return NULL;
-    }
-    if (ctx->scratch) {
-        (void)cudaFree(ctx->scratch);
-        ctx->scratch = NULL;
-        ctx->scratch_bytes = 0;
     }
     void *p = NULL;
     cudaError_t err = cudaMalloc(&p, (size_t)bytes);
-    if (prev >= 0) (void)cudaSetDevice(prev);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 "ds4: CUDA scratch alloc on tier %d (dev=%d) failed for %s (%.2f MiB): %s\n",
                 logical_tier, ctx->device_id, what ? what : "scratch",
                 (double)bytes / 1048576.0, cudaGetErrorString(err));
+        if (g_q8_f16_plan_materializing &&
+            err != cudaErrorMemoryAllocation) {
+            g_q8_f16_plan_device_error = 1;
+        }
         (void)cudaGetLastError();
+        if (prev >= 0 && cudaSetDevice(prev) != cudaSuccess) {
+            g_current_logical_tier = -1;
+            if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+            (void)cudaGetLastError();
+            if (!g_q8_f16_plan_materializing) abort();
+        }
         return NULL;
+    }
+    /* Keep the existing arena intact until its replacement is known-good.
+     * Partner admission deliberately grows these arenas while VRAM is tight;
+     * freeing first would turn a recoverable admission miss into loss of the
+     * graph's working scratch. */
+    if (ctx->scratch) {
+        err = cudaFree(ctx->scratch);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal CUDA scratch replacement free failed on tier "
+                    "%d (dev=%d, what=%s): %s\n",
+                    logical_tier, ctx->device_id,
+                    what ? what : "scratch", cudaGetErrorString(err));
+            g_current_logical_tier = -1;
+            (void)cudaGetLastError();
+            abort();
+        }
     }
     ctx->scratch = p;
     ctx->scratch_bytes = (size_t)bytes;
+    if (prev >= 0 && cudaSetDevice(prev) != cudaSuccess) {
+        g_current_logical_tier = -1;
+        if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+        (void)cudaGetLastError();
+        if (!g_q8_f16_plan_materializing) abort();
+    }
     return p;
 }
 
@@ -1034,13 +1079,58 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
-    int saved_device = -1;
-    (void)cudaGetDevice(&saved_device);
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        if (r.device_id >= 0) (void)cudaSetDevice(r.device_id);
-        (void)cudaFree(r.device_ptr);
+    if (g_q8_f16_ranges.empty()) {
+        g_q8_f16_by_offset.clear();
+        g_q8_f16_bindings.clear();
+        g_q8_f16_bytes = 0;
+        return;
     }
-    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    int saved_device = -1;
+    cudaError_t err = cudaGetDevice(&saved_device);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: fatal q8 fp16 cache cleanup device query failed: %s\n",
+                cudaGetErrorString(err));
+        g_current_logical_tier = -1;
+        (void)cudaGetLastError();
+        abort();
+    }
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        if (r.device_id >= 0) {
+            err = cudaSetDevice(r.device_id);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: fatal q8 fp16 cache cleanup cudaSetDevice(%d) "
+                        "failed: %s\n",
+                        r.device_id, cudaGetErrorString(err));
+                g_current_logical_tier = -1;
+                (void)cudaGetLastError();
+                abort();
+            }
+        }
+        err = cudaFree(r.device_ptr);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 fp16 cache cleanup cudaFree on device %d "
+                    "failed: %s\n",
+                    r.device_id, cudaGetErrorString(err));
+            g_current_logical_tier = -1;
+            (void)cudaGetLastError();
+            abort();
+        }
+    }
+    if (saved_device >= 0) {
+        err = cudaSetDevice(saved_device);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 fp16 cache cleanup cannot restore device %d: "
+                    "%s\n",
+                    saved_device, cudaGetErrorString(err));
+            g_current_logical_tier = -1;
+            (void)cudaGetLastError();
+            abort();
+        }
+    }
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bindings.clear();
@@ -1055,6 +1145,7 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_f16_plan_candidates = 0u;
     g_q8_f16_plan_admitted = 0u;
     g_q8_f16_plan_partner_admitted = 0u;
+    g_q8_f16_plan_device_error = 0;
     g_q8_f16_plan.clear();
     g_q8_f16_bindings.clear();
     g_q8_f16_partner_offloads.store(0, std::memory_order_relaxed);
@@ -1222,7 +1313,9 @@ static void cuda_q8_f16_cache_budget_notice(
 }
 
 static int cuda_q8_f16_cache_has_budget(
-        uint64_t request_bytes, int physical_device, const char *label) {
+        uint64_t request_bytes, int physical_device, const char *label,
+        int *capacity_miss) {
+    if (capacity_miss) *capacity_miss = 0;
     (void)label;
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
     const uint64_t cached_bytes =
@@ -1234,6 +1327,7 @@ static int cuda_q8_f16_cache_has_budget(
         cuda_q8_f16_cache_budget_notice(
             "limit reached", request_bytes, cached_bytes, physical_device,
             0, 0, 0, limit);
+        if (capacity_miss) *capacity_miss = 1;
         return 0;
     }
 
@@ -1257,12 +1351,26 @@ static int cuda_q8_f16_cache_has_budget(
                                         physical_device,
                                         free_bytes, total_bytes,
                                         reserve_bytes, limit);
+        if (capacity_miss) *capacity_miss = 1;
         return 0;
     }
     return 1;
 }
 
 static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
+    if (!g_q8_f16_ranges.empty()) {
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 fp16 cache recovery synchronize failed "
+                    "after %s: %s\n",
+                    what ? what : "allocation failure",
+                    cudaGetErrorString(sync_err));
+            g_current_logical_tier = -1;
+            (void)cudaGetLastError();
+            abort();
+        }
+    }
     if (!g_q8_f16_disabled_after_oom) {
         fprintf(stderr,
                 "ds4: CUDA q8 fp16 cache disabled after %s "
@@ -1273,7 +1381,6 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     }
     g_q8_f16_disabled_after_oom = 1;
     if (!g_q8_f16_ranges.empty()) {
-        (void)cudaDeviceSynchronize();
         cuda_q8_f16_cache_release_all();
     }
     (void)cudaGetLastError();
@@ -1349,6 +1456,19 @@ static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_
 
 static void cuda_q8_f16_plan_materialize(void);
 
+static int cuda_q8_f16_restore_fill_device(int previous_device) {
+    if (g_n_gpus <= 1 || previous_device < 0) return 1;
+    const cudaError_t err = cudaSetDevice(previous_device);
+    if (err == cudaSuccess) return 1;
+    fprintf(stderr,
+            "ds4: CUDA q8 fp16 fill cannot restore device %d: %s\n",
+            previous_device, cudaGetErrorString(err));
+    if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+    (void)cudaGetLastError();
+    if (!g_q8_f16_plan_materializing) abort();
+    return 0;
+}
+
 static const cuda_q8_f16_range *cuda_q8_f16_find_range(
         const void *model_map,
         uint64_t offset,
@@ -1395,7 +1515,10 @@ static const __half *cuda_q8_f16_ptr_impl(
         uint64_t out_dim,
         int expected_device,
         const char *label,
-        int preserve_existing_cache_on_failure) {
+        int preserve_existing_cache_on_failure,
+        cuda_q8_f16_fill_status *fill_status,
+        int audit_miss) {
+    if (fill_status) *fill_status = CUDA_Q8_F16_FILL_ERROR;
     if (g_q8_f16_plan_finalized && !g_q8_f16_plan_materialized &&
         !g_q8_f16_plan_materializing) {
         cuda_q8_f16_plan_materialize();
@@ -1403,13 +1526,16 @@ static const __half *cuda_q8_f16_ptr_impl(
     auto audit_return = [&](const __half *ptr,
                             const char *result,
                             const char *reason) -> const __half * {
-        cuda_q8_audit_record_result(offset, weight_bytes, in_dim, out_dim,
-                                    expected_device, label, result, reason);
+        if (ptr || audit_miss) {
+            cuda_q8_audit_record_result(offset, weight_bytes, in_dim, out_dim,
+                                        expected_device, label, result, reason);
+        }
         return ptr;
     };
     if (const cuda_q8_f16_range *r = cuda_q8_f16_find_range(
             model_map, offset, weight_bytes, in_dim, out_dim,
             expected_device)) {
+        if (fill_status) *fill_status = CUDA_Q8_F16_FILL_SUCCESS;
         return audit_return(r->device_ptr, "f16_hit", "resident");
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) {
@@ -1419,6 +1545,7 @@ static const __half *cuda_q8_f16_ptr_impl(
         else if (g_q8_f16_disabled_after_oom) reason = "disabled_after_failure";
         else if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) reason = "disabled_by_env";
         else if (cuda_q8_f16_cache_limit_bytes() == 0u) reason = "zero_limit";
+        if (fill_status) *fill_status = CUDA_Q8_F16_FILL_SKIPPED;
         return audit_return(NULL, "native_q8", reason);
     }
     /* Once startup has seen and ranked the complete candidate set, a cache
@@ -1427,6 +1554,7 @@ static const __half *cuda_q8_f16_ptr_impl(
      * later, higher-benefit tensor.  Engines which do not run the planner keep
      * the legacy lazy behavior because plan_finalized remains false. */
     if (g_q8_f16_plan_finalized && !g_q8_f16_plan_active) {
+        if (fill_status) *fill_status = CUDA_Q8_F16_FILL_SKIPPED;
         return audit_return(NULL, "native_q8", "not_admitted_by_plan");
     }
 
@@ -1458,8 +1586,14 @@ static const __half *cuda_q8_f16_ptr_impl(
     if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half))
         return audit_return(NULL, "native_q8", "size_overflow");
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
-    if (!cuda_q8_f16_cache_has_budget(out_bytes, expected_device, label))
+    int capacity_miss = 0;
+    if (!cuda_q8_f16_cache_has_budget(
+            out_bytes, expected_device, label, &capacity_miss)) {
+        if (fill_status && capacity_miss) {
+            *fill_status = CUDA_Q8_F16_FILL_CAPACITY_MISS;
+        }
         return audit_return(NULL, "native_q8", "budget_or_limit");
+    }
 
     int prev = -1;
     if (g_n_gpus > 1) {
@@ -1475,7 +1609,7 @@ static const __half *cuda_q8_f16_ptr_impl(
             fprintf(stderr, "ds4: cudaSetDevice(%d) failed before q8 fp16 alloc: %s\n",
                     expected_device, cudaGetErrorString(derr));
             (void)cudaGetLastError();
-            if (prev >= 0) (void)cudaSetDevice(prev);
+            (void)cuda_q8_f16_restore_fill_device(prev);
             return audit_return(NULL, "native_q8", "set_device_failed");
         }
     }
@@ -1489,7 +1623,10 @@ static const __half *cuda_q8_f16_ptr_impl(
         } else {
             (void)cudaGetLastError();
         }
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
+        const int restored = cuda_q8_f16_restore_fill_device(prev);
+        if (fill_status && restored && err == cudaErrorMemoryAllocation) {
+            *fill_status = CUDA_Q8_F16_FILL_CAPACITY_MISS;
+        }
         return audit_return(NULL, "native_q8", "allocation_failed");
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -1500,13 +1637,24 @@ static const __half *cuda_q8_f16_ptr_impl(
                                                           out_dim,
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
-        (void)cudaFree(dev);
+        const cudaError_t free_err = cudaFree(dev);
+        if (free_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 fp16 dequant recovery cudaFree failed on "
+                    "device %d: %s\n",
+                    expected_device, cudaGetErrorString(free_err));
+            g_current_logical_tier = -1;
+            (void)cudaGetLastError();
+            abort();
+        }
         if (!preserve_existing_cache_on_failure) {
             cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         } else {
             (void)cudaGetLastError();
         }
-        if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
+        if (!cuda_q8_f16_restore_fill_device(prev)) {
+            return audit_return(NULL, "native_q8", "restore_device_failed");
+        }
         return audit_return(NULL, "native_q8", "dequant_failed");
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev, expected_device});
@@ -1519,7 +1667,9 @@ static const __half *cuda_q8_f16_ptr_impl(
                 (double)out_bytes / 1048576.0, expected_device,
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
-    if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
+    const int restored = cuda_q8_f16_restore_fill_device(prev);
+    if (fill_status && restored) *fill_status = CUDA_Q8_F16_FILL_SUCCESS;
+    if (!restored) return audit_return(NULL, "native_q8", "restore_device_failed");
     return audit_return(dev, "f16_fill", "allocated");
 }
 
@@ -1532,7 +1682,7 @@ static const __half *cuda_q8_f16_ptr(
         int expected_device,
         const char *label) {
     return cuda_q8_f16_ptr_impl(model_map, offset, weight_bytes, in_dim,
-                                out_dim, expected_device, label, 0);
+                                out_dim, expected_device, label, 0, NULL, 1);
 }
 
 static int cuda_logical_tier_for_physical(int physical_device) {
@@ -1543,13 +1693,16 @@ static int cuda_logical_tier_for_physical(int physical_device) {
 }
 
 static void cuda_q8_f16_binding_record(
-        const cuda_q8_f16_plan_candidate &c, int resident_device) {
+        const cuda_q8_f16_plan_candidate &c, int resident_device,
+        uint64_t partner_scratch_tokens) {
     for (cuda_q8_f16_binding &b : g_q8_f16_bindings) {
         if (b.model_map == c.model_map && b.offset == c.offset &&
             b.weight_bytes == c.weight_bytes && b.in_dim == c.in_dim &&
             b.out_dim == c.out_dim && b.consumer_device == c.physical_device) {
             b.resident_device = resident_device;
             b.partner_offload = resident_device != c.physical_device;
+            b.partner_scratch_tokens = b.partner_offload
+                ? partner_scratch_tokens : 0u;
             snprintf(b.label, sizeof(b.label), "%s", c.label);
             return;
         }
@@ -1563,8 +1716,56 @@ static void cuda_q8_f16_binding_record(
     b.consumer_device = c.physical_device;
     b.resident_device = resident_device;
     b.partner_offload = resident_device != c.physical_device;
+    b.partner_scratch_tokens = b.partner_offload
+        ? partner_scratch_tokens : 0u;
     snprintf(b.label, sizeof(b.label), "%s", c.label);
     g_q8_f16_bindings.push_back(b);
+}
+
+static uint64_t cuda_q8_f16_partner_scratch_token_cap(void) {
+    const uint64_t default_cap = 2048u; /* CUDA TP's default prefill chunk. */
+    const char *env = getenv("DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS");
+    if (!env || !env[0]) return default_cap;
+    errno = 0;
+    char *end = NULL;
+    const unsigned long long value = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value == 0u ||
+        value > INT_MAX) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=%s; "
+                "using %llu\n",
+                env, (unsigned long long)default_cap);
+        return default_cap;
+    }
+    return (uint64_t)value;
+}
+
+static int cuda_q8_f16_partner_scratch_sizes(
+        const cuda_q8_f16_plan_candidate &c,
+        uint64_t tokens,
+        uint64_t *home_bytes,
+        uint64_t *partner_bytes) {
+    if (!home_bytes || !partner_bytes || tokens == 0u ||
+        tokens > UINT64_MAX / c.in_dim ||
+        tokens * c.in_dim > UINT64_MAX / sizeof(__half) ||
+        tokens > UINT64_MAX / c.out_dim ||
+        tokens * c.out_dim > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t activation_bytes = tokens * c.in_dim * sizeof(__half);
+    const uint64_t home_result_bytes =
+        tokens * c.out_dim * sizeof(__half);
+    const uint64_t result_bytes = tokens * c.out_dim * sizeof(float);
+    if (activation_bytes > UINT64_MAX - 255u) return 0;
+    const uint64_t result_offset = (activation_bytes + 255u) & ~UINT64_C(255);
+    if (result_offset > UINT64_MAX - result_bytes) return 0;
+    /* The fused T32 path may use the home arena as its FP16 projection
+     * destination when the caller did not supply q_half. Its result and the
+     * activation staging are sequential, so reserve the larger, not the sum. */
+    *home_bytes = activation_bytes > home_result_bytes
+        ? activation_bytes : home_result_bytes;
+    *partner_bytes = result_offset + result_bytes;
+    return 1;
 }
 
 static void cuda_q8_f16_plan_materialize(void) {
@@ -1574,44 +1775,75 @@ static void cuda_q8_f16_plan_materialize(void) {
     g_q8_f16_plan_active = 1;
     g_q8_f16_plan_admitted = 0;
     g_q8_f16_plan_partner_admitted = 0;
+    g_q8_f16_plan_device_error = 0;
     g_q8_f16_bindings.clear();
     uint64_t t32_total = 0, t32_admitted = 0;
     uint64_t t256_total = 0, t256_admitted = 0;
     uint64_t shared_down_total = 0, shared_down_admitted = 0;
     std::vector<int> touched_devices;
     std::vector<int> candidate_resident(g_q8_f16_plan.size(), -1);
+    std::vector<uint64_t> candidate_scratch_tokens(
+        g_q8_f16_plan.size(), 0u);
     std::vector<size_t> pending_fallback;
     int saved_device = -1;
-    (void)cudaGetDevice(&saved_device);
+    int plan_failed = 0;
+    const char *failure_reason = NULL;
+    cudaError_t plan_err = cudaGetDevice(&saved_device);
+    if (plan_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 plan cannot query current device: %s\n",
+                cudaGetErrorString(plan_err));
+        (void)cudaGetLastError();
+        /* There is no known device to restore to, so no local CUDA fallback
+         * can be proven safe. Terminate instead of continuing on an arbitrary
+         * device through another ptr/matmul call site. */
+        abort();
+    }
+
+    for (const cuda_q8_f16_plan_candidate &c : g_q8_f16_plan) {
+        if (strstr(c.label, ".attn_q_b.weight") != NULL) t32_total++;
+        if (strstr(c.label, ".attn_output_b.weight") != NULL) t256_total++;
+        if (strstr(c.label, ".ffn_down_shexp.weight") != NULL) {
+            shared_down_total++;
+        }
+    }
 
     /* Phase one gives every fixed/home placement its ranked opportunity on
      * the intended device.  Only phase two consumes otherwise-unused partner
      * headroom; an early home miss must not steal memory from a later fixed TP
      * candidate whose primary device happens to be that partner. */
-    for (size_t i = 0; i < g_q8_f16_plan.size(); i++) {
+    for (size_t i = 0; !plan_failed && i < g_q8_f16_plan.size(); i++) {
         const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
-        const bool is_t32 = strstr(c.label, ".attn_q_b.weight") != NULL;
-        const bool is_t256 = strstr(c.label, ".attn_output_b.weight") != NULL;
-        const bool is_shared_down =
-            strstr(c.label, ".ffn_down_shexp.weight") != NULL;
-        if (is_t32) t32_total++;
-        if (is_t256) t256_total++;
-        if (is_shared_down) shared_down_total++;
-        if (cudaSetDevice(c.physical_device) != cudaSuccess) {
+        plan_err = cudaSetDevice(c.physical_device);
+        if (plan_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 plan cudaSetDevice(%d) failed: %s\n",
+                    c.physical_device, cudaGetErrorString(plan_err));
             (void)cudaGetLastError();
-            continue;
+            plan_failed = 1;
+            failure_reason = "primary device switch failed";
+            break;
         }
+        cuda_q8_f16_fill_status fill_status = CUDA_Q8_F16_FILL_ERROR;
         const __half *ptr = cuda_q8_f16_ptr_impl(
             c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
-            c.physical_device, c.label, 1);
-        if (ptr) candidate_resident[i] = c.physical_device;
-        else if (c.fallback_physical_device >= 0 &&
+            c.physical_device, c.label, 1, &fill_status, 1);
+        if (g_q8_f16_plan_device_error) {
+            plan_failed = 1;
+            failure_reason = "primary device restoration failed";
+        } else if (ptr) candidate_resident[i] = c.physical_device;
+        else if (fill_status == CUDA_Q8_F16_FILL_CAPACITY_MISS &&
+                 c.fallback_physical_device >= 0 &&
                  c.fallback_physical_device != c.physical_device) {
             pending_fallback.push_back(i);
+        } else if (fill_status == CUDA_Q8_F16_FILL_ERROR) {
+            plan_failed = 1;
+            failure_reason = "primary materialization failed";
         }
     }
 
     for (size_t i : pending_fallback) {
+        if (plan_failed) break;
         const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
         if (g_xdev_force_host_bounce ||
             getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL) continue;
@@ -1620,43 +1852,157 @@ static void cuda_q8_f16_plan_materialize(void) {
             cuda_logical_tier_for_physical(c.fallback_physical_device);
         if (home_tier < 0 || partner_tier < 0 ||
             !g_gpu_peer_ok[home_tier][partner_tier] ||
-            !g_gpu_peer_ok[partner_tier][home_tier] ||
-            cudaSetDevice(c.fallback_physical_device) != cudaSuccess) continue;
+            !g_gpu_peer_ok[partner_tier][home_tier]) continue;
+
+        /* Scratch is part of admission, not a best-effort runtime allocation.
+         * Reserve it before the F16 weight so cudaMemGetInfo sees the real
+         * execution footprint. The binding's token cap prevents a later,
+         * larger custom chunk from growing (and potentially replacing) these
+         * arenas under a fully populated cache. */
+        const uint64_t scratch_tokens =
+            cuda_q8_f16_partner_scratch_token_cap();
+        uint64_t home_scratch_bytes = 0u;
+        uint64_t partner_scratch_bytes = 0u;
+        if (!cuda_q8_f16_partner_scratch_sizes(
+                c, scratch_tokens, &home_scratch_bytes,
+                &partner_scratch_bytes)) {
+            plan_failed = 1;
+            failure_reason = "partner scratch size overflow";
+            break;
+        }
+        if (!cuda_tmp_alloc_on(home_tier, home_scratch_bytes,
+                               "q8 partner admitted home scratch") ||
+            !cuda_tmp_alloc_on(partner_tier, partner_scratch_bytes,
+                               "q8 partner admitted remote scratch")) {
+            if (g_q8_f16_plan_device_error) {
+                plan_failed = 1;
+                failure_reason = "partner scratch device operation failed";
+                break;
+            }
+            /* Scratch allocation pressure is a normal admission miss. Existing
+             * scratch remains intact because cuda_tmp_alloc_on grows
+             * transactionally. */
+            continue;
+        }
+        if (g_q8_f16_plan_device_error) {
+            plan_failed = 1;
+            failure_reason = "partner scratch device restoration failed";
+            break;
+        }
+        plan_err = cudaSetDevice(c.fallback_physical_device);
+        if (plan_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 plan partner cudaSetDevice(%d) "
+                    "failed: %s\n",
+                    c.fallback_physical_device, cudaGetErrorString(plan_err));
+            (void)cudaGetLastError();
+            plan_failed = 1;
+            failure_reason = "partner device switch failed";
+            break;
+        }
+        cuda_q8_f16_fill_status fill_status = CUDA_Q8_F16_FILL_ERROR;
         const __half *ptr = cuda_q8_f16_ptr_impl(
             c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
-            c.fallback_physical_device, c.label, 1);
-        if (ptr) candidate_resident[i] = c.fallback_physical_device;
+            c.fallback_physical_device, c.label, 1, &fill_status, 1);
+        if (g_q8_f16_plan_device_error) {
+            plan_failed = 1;
+            failure_reason = "partner device restoration failed";
+        } else if (ptr) {
+            candidate_resident[i] = c.fallback_physical_device;
+            candidate_scratch_tokens[i] = scratch_tokens;
+        } else if (fill_status == CUDA_Q8_F16_FILL_ERROR) {
+            plan_failed = 1;
+            failure_reason = "partner materialization failed";
+        }
     }
 
+    /* Dequantization was enqueued on each target device's default stream.
+     * Discover the devices from tentative residents, then validate every
+     * stream before publishing even one binding. */
     for (size_t i = 0; i < g_q8_f16_plan.size(); i++) {
         const int resident_device = candidate_resident[i];
         if (resident_device < 0) continue;
-        const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
-        const bool is_t32 = strstr(c.label, ".attn_q_b.weight") != NULL;
-        const bool is_t256 = strstr(c.label, ".attn_output_b.weight") != NULL;
-        const bool is_shared_down =
-            strstr(c.label, ".ffn_down_shexp.weight") != NULL;
-        g_q8_f16_plan_admitted++;
-        cuda_q8_f16_binding_record(c, resident_device);
-        if (resident_device != c.physical_device) {
-            g_q8_f16_plan_partner_admitted++;
-        }
         if (std::find(touched_devices.begin(), touched_devices.end(),
                       resident_device) == touched_devices.end()) {
             touched_devices.push_back(resident_device);
         }
-        if (is_t32) t32_admitted++;
-        if (is_t256) t256_admitted++;
-        if (is_shared_down) shared_down_admitted++;
     }
 
-    /* Dequantization was enqueued on each target device's default stream.
-     * Finish it once here so later per-tier graph streams see immutable F16
-     * weights without inserting synchronization into measured execution. */
     for (int dev : touched_devices) {
-        if (cudaSetDevice(dev) == cudaSuccess) (void)cudaDeviceSynchronize();
+        plan_err = cudaSetDevice(dev);
+        if (plan_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 plan final cudaSetDevice(%d) failed: %s\n",
+                    dev, cudaGetErrorString(plan_err));
+            (void)cudaGetLastError();
+            plan_failed = 1;
+            failure_reason = "final device switch failed";
+            break;
+        }
+        plan_err = cudaDeviceSynchronize();
+        if (plan_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 plan synchronize on device %d failed: %s\n",
+                    dev, cudaGetErrorString(plan_err));
+            (void)cudaGetLastError();
+            plan_failed = 1;
+            failure_reason = "dequant synchronization failed";
+            break;
+        }
     }
-    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+
+    if (saved_device >= 0) {
+        plan_err = cudaSetDevice(saved_device);
+        if (plan_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 plan cannot restore device %d: %s\n",
+                    saved_device, cudaGetErrorString(plan_err));
+            (void)cudaGetLastError();
+            g_current_logical_tier = -1;
+            /* See the initial-query case above: after a failed restoration,
+             * cache cleanup itself cannot safely select/free devices and no
+             * native CUDA fallback has a trustworthy launch device. */
+            abort();
+        } else {
+            g_current_logical_tier =
+                cuda_logical_tier_for_physical(saved_device);
+        }
+    }
+
+    if (plan_failed) {
+        /* No tentative range is allowed to survive an invalid dequant stream.
+         * The Q8 selective cache is independent, so clearing only F16 ranges
+         * leaves the native kernels available whenever device restoration was
+         * successful. */
+        cuda_q8_f16_cache_release_all();
+        g_q8_f16_plan_admitted = 0;
+        g_q8_f16_plan_partner_admitted = 0;
+        g_q8_f16_bindings.clear();
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 plan rejected (%s); using native q8\n",
+                failure_reason ? failure_reason : "materialization error");
+    } else {
+        for (size_t i = 0; i < g_q8_f16_plan.size(); i++) {
+            const int resident_device = candidate_resident[i];
+            if (resident_device < 0) continue;
+            const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
+            const bool is_t32 =
+                strstr(c.label, ".attn_q_b.weight") != NULL;
+            const bool is_t256 =
+                strstr(c.label, ".attn_output_b.weight") != NULL;
+            const bool is_shared_down =
+                strstr(c.label, ".ffn_down_shexp.weight") != NULL;
+            g_q8_f16_plan_admitted++;
+            cuda_q8_f16_binding_record(
+                c, resident_device, candidate_scratch_tokens[i]);
+            if (resident_device != c.physical_device) {
+                g_q8_f16_plan_partner_admitted++;
+            }
+            if (is_t32) t32_admitted++;
+            if (is_t256) t256_admitted++;
+            if (is_shared_down) shared_down_admitted++;
+        }
+    }
     g_q8_f16_plan_active = 0;
     g_q8_f16_plan_materializing = 0;
     g_q8_f16_plan_materialized = 1;
@@ -4707,6 +5053,7 @@ extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
     g_q8_f16_plan_candidates = 0;
     g_q8_f16_plan_admitted = 0;
     g_q8_f16_plan_partner_admitted = 0;
+    g_q8_f16_plan_device_error = 0;
     g_q8_f16_plan.clear();
     g_q8_f16_bindings.clear();
     g_q8_f16_partner_offloads.store(0, std::memory_order_relaxed);
@@ -13675,6 +14022,62 @@ static cuda_q8_f16_binding *cuda_q8_f16_find_partner_binding(
     return NULL;
 }
 
+static cuda_q8_f16_binding *cuda_q8_f16_runtime_partner_binding(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        int consumer_device) {
+    /* Binding records are created by deferred materialization. Looking them up
+     * first would make the very first projection miss its planned partner and
+     * incorrectly execute the local native-Q8 fallback. */
+    if (g_q8_f16_plan_finalized && !g_q8_f16_plan_materialized &&
+        !g_q8_f16_plan_materializing) {
+        cuda_q8_f16_plan_materialize();
+    }
+    return cuda_q8_f16_find_partner_binding(
+        model_map, offset, weight_bytes, in_dim, out_dim, consumer_device);
+}
+
+/* Return -1 when the CUDA current device can no longer be proven to be the
+ * home tier. Callers must propagate that as an operation failure rather than
+ * entering a local fallback on an unknown device. */
+static int cuda_q8_f16_restore_home(int home_tier, const char *where) {
+    int actual_device = -1;
+    if (home_tier >= 0 && home_tier < g_n_gpus &&
+        cudaGetDevice(&actual_device) == cudaSuccess) {
+        if (actual_device == g_gpu[home_tier].device_id) {
+            g_current_logical_tier = home_tier;
+            return 0;
+        }
+        /* Do not let the logical-device cache suppress the required switch. */
+        g_current_logical_tier = -1;
+        if (ds4_gpu_set_current_device(home_tier) == 0) return 0;
+    } else {
+        g_current_logical_tier = -1;
+        (void)cudaGetLastError();
+    }
+    fprintf(stderr,
+            "ds4: fatal q8 partner state error: cannot restore home tier %d "
+            "after %s; refusing unsafe local fallback\n",
+            home_tier, where ? where : "partner execution");
+    return -1;
+}
+
+static int cuda_q8_f16_sync_home_for_fallback(
+        int home_tier, const char *where) {
+    if (cuda_q8_f16_restore_home(home_tier, where) < 0) return -1;
+    const cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err == cudaSuccess) return 0;
+    fprintf(stderr,
+            "ds4: fatal q8 partner recovery error: home synchronize after "
+            "%s failed: %s\n",
+            where ? where : "partner execution", cudaGetErrorString(sync_err));
+    (void)cudaGetLastError();
+    return -1;
+}
+
 /* Execute a planned Q8->F16 projection on its NVLink partner.  The F16
  * expansion stays resident on the partner; only the FP16 activation matrix
  * and the requested FP16/FP32 result matrix cross the link.  Both copies use the existing
@@ -13707,12 +14110,35 @@ static int cuda_q8_f16_partner_matmul_impl(
     const int partner_tier = home_tier + g_n_gpus / 2;
     const int partner_device = g_gpu[partner_tier].device_id;
     if (binding->resident_device != partner_device ||
+        binding->partner_scratch_tokens == 0u ||
+        n_tok > binding->partner_scratch_tokens ||
         !g_gpu_peer_ok[home_tier][partner_tier] ||
         !g_gpu_peer_ok[partner_tier][home_tier]) return 0;
     const cuda_q8_f16_range *range = cuda_q8_f16_find_range(
         model_map, weight_offset, weight_bytes, in_dim, out_dim,
         partner_device);
     if (!range || !range->device_ptr) return 0;
+
+    /* Kernel launch syntax and cuBLAS handles are device-relative. Refuse to
+     * begin unless the actual CUDA device (not only the cached logical tier)
+     * is the consumer's home device. */
+    int entry_device = -1;
+    if (cudaGetDevice(&entry_device) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: fatal q8 partner state error: cannot query entry device\n");
+        g_current_logical_tier = -1;
+        (void)cudaGetLastError();
+        return -1;
+    }
+    if (entry_device != home_device) {
+        g_current_logical_tier = -1;
+        if (cuda_q8_f16_restore_home(home_tier,
+                                     "partner entry validation") < 0) {
+            return -1;
+        }
+    } else {
+        g_current_logical_tier = home_tier;
+    }
 
     const uint64_t result_element_bytes =
         result_f16 ? sizeof(__half) : sizeof(float);
@@ -13728,12 +14154,24 @@ static int cuda_q8_f16_partner_matmul_impl(
     const uint64_t result_offset = (activation_bytes + 255u) & ~UINT64_C(255);
     if (result_offset > UINT64_MAX - result_bytes) return 0;
 
-    __half *home_activation = (__half *)cuda_tmp_alloc_on(
-        home_tier, activation_bytes, "q8 partner fp16 activation");
-    unsigned char *partner_scratch = (unsigned char *)cuda_tmp_alloc_on(
-        partner_tier, result_offset + result_bytes,
-        "q8 partner activation and result");
-    if (!home_activation || !partner_scratch) return 0;
+    /* Admission preallocates both arenas. Never grow them here: cache weights
+     * may have consumed the remaining VRAM, and a runtime grow could otherwise
+     * replace shared graph scratch or fail halfway through an offload. */
+    if (!g_gpu[home_tier].scratch ||
+        g_gpu[home_tier].scratch_bytes < activation_bytes ||
+        !g_gpu[partner_tier].scratch ||
+        g_gpu[partner_tier].scratch_bytes < result_offset + result_bytes) {
+        fprintf(stderr,
+                "ds4: q8 partner scratch invariant failed for %s "
+                "(tokens=%llu admitted=%llu); disabling this binding\n",
+                label ? label : "q8_0", (unsigned long long)n_tok,
+                (unsigned long long)binding->partner_scratch_tokens);
+        binding->partner_offload = 0;
+        return 0;
+    }
+    __half *home_activation = (__half *)g_gpu[home_tier].scratch;
+    unsigned char *partner_scratch =
+        (unsigned char *)g_gpu[partner_tier].scratch;
 
     char timeline_name[384];
     snprintf(timeline_name, sizeof(timeline_name),
@@ -13759,10 +14197,13 @@ static int cuda_q8_f16_partner_matmul_impl(
         partner_scratch, activation_bytes, 0, partner_tier
     };
     if (!ds4_gpu_tensor_copy_xdev_default_impl(
-            &activation_dst, &activation_src, activation_bytes)) return 0;
+            &activation_dst, &activation_src, activation_bytes)) {
+        return cuda_q8_f16_sync_home_for_fallback(
+                   home_tier, "activation peer copy") < 0 ? -1 : 0;
+    }
     if (ds4_gpu_set_current_device(partner_tier) != 0) {
-        (void)ds4_gpu_set_current_device(home_tier);
-        return 0;
+        return cuda_q8_f16_sync_home_for_fallback(
+                   home_tier, "partner device switch") < 0 ? -1 : 0;
     }
 
     void *partner_result = partner_scratch + result_offset;
@@ -13784,7 +14225,18 @@ static int cuda_q8_f16_partner_matmul_impl(
                 "disabling this binding\n",
                 partner_device, (int)st);
         binding->partner_offload = 0;
-        (void)ds4_gpu_set_current_device(home_tier);
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        const int restore_rc = cuda_q8_f16_restore_home(
+            home_tier, "failed partner cuBLAS");
+        if (sync_err != cudaSuccess || restore_rc < 0) {
+            if (sync_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA partner synchronize after cuBLAS failure "
+                        "failed: %s\n", cudaGetErrorString(sync_err));
+                (void)cudaGetLastError();
+            }
+            return -1;
+        }
         return 0;
     }
 
@@ -13794,13 +14246,29 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (!ds4_gpu_tensor_copy_xdev_default_impl(out, &result_src, result_bytes)) {
         /* Make a subsequent native-Q8 overwrite race-free even if the peer
          * copy failed after the partner GEMM had already been submitted. */
-        (void)cudaDeviceSynchronize();
-        (void)ds4_gpu_set_current_device(home_tier);
-        (void)cudaDeviceSynchronize();
+        const cudaError_t partner_sync = cudaDeviceSynchronize();
+        const int restore_rc = cuda_q8_f16_restore_home(
+            home_tier, "failed result peer copy");
+        const cudaError_t home_sync = restore_rc == 0
+            ? cudaDeviceSynchronize() : cudaErrorUnknown;
         binding->partner_offload = 0;
+        if (partner_sync != cudaSuccess || restore_rc < 0 ||
+            home_sync != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 partner copy recovery failure "
+                    "(partner_sync=%s home_sync=%s)\n",
+                    cudaGetErrorString(partner_sync),
+                    restore_rc == 0 ? cudaGetErrorString(home_sync)
+                                    : "home-not-restored");
+            (void)cudaGetLastError();
+            return -1;
+        }
         return 0;
     }
-    if (ds4_gpu_set_current_device(home_tier) != 0) return 0;
+    if (cuda_q8_f16_restore_home(home_tier,
+                                 "successful result peer copy") < 0) {
+        return -1;
+    }
 
     const uint64_t sequence =
         g_q8_f16_partner_offloads.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -13881,7 +14349,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                             (int)out_dim);
             return cublas_ok(st, "q8 fp32 matmul");
         }
-        const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
+        cuda_q8_f16_binding *partner_binding =
+            cuda_q8_f16_runtime_partner_binding(
+                model_map, weight_offset, weight_bytes, in_dim, out_dim,
+                physical_device);
+        const __half *w_f16 = cuda_q8_f16_ptr_impl(
+            model_map, weight_offset, weight_bytes, in_dim, out_dim,
+            physical_device, label, 0, NULL, partner_binding ? 0 : 1);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
             __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "q8 f16 gemm activations");
@@ -13917,11 +14391,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
              * rejects the cached path under memory pressure, retry the same
              * operation through the native Q8 kernels below. */
         }
-        if (!w_f16 && cuda_q8_f16_partner_matmul(
+        if (!w_f16 && partner_binding) {
+            const int partner_rc = cuda_q8_f16_partner_matmul(
                 out, x, model_map, weight_offset, weight_bytes,
                 in_dim, out_dim, n_tok, logical_tier, physical_device,
-                label)) {
-            return 1;
+                label);
+            if (partner_rc > 0) return 1;
+            if (partner_rc < 0) return 0;
+            cuda_q8_audit_record_result(
+                weight_offset, weight_bytes, in_dim, out_dim,
+                physical_device, label, "native_q8",
+                "partner_runtime_fallback");
         }
     }
     if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
@@ -31833,9 +32313,14 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     int partner_projected = 0;
     ds4_gpu_tensor scratch_q_half = {};
     ds4_gpu_tensor *q_half_eff = q_half;
-    const __half *w_f16 = cuda_q8_f16_ptr(
+    cuda_q8_f16_binding *partner_binding =
+        cuda_q8_f16_runtime_partner_binding(
+            model_map, weight_offset, weight_bytes, in_dim, out_dim,
+            physical_device);
+    const __half *w_f16 = cuda_q8_f16_ptr_impl(
         model_map, weight_offset, weight_bytes, in_dim, out_dim,
-        physical_device, "attn_q_b");
+        physical_device, "attn_q_b", 0, NULL,
+        partner_binding ? 0 : 1);
     if (w_f16) {
         const uint64_t xh_count = (uint64_t)n_tok * in_dim;
         const uint64_t xh_bytes = xh_count * sizeof(__half);
@@ -31883,6 +32368,14 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         }
         projected = 1;
     } else {
+        if (!partner_binding) return 0;
+        if ((uint64_t)n_tok > partner_binding->partner_scratch_tokens) {
+            cuda_q8_audit_record_result(
+                weight_offset, weight_bytes, in_dim, out_dim,
+                physical_device, "attn_q_b", "native_q8",
+                "partner_runtime_fallback");
+            return 0;
+        }
         if (!q_half_eff) {
             void *scratch = cuda_tmp_alloc_on(
                 logical_tier, qh_bytes, "attn q_b partner f16 output");
@@ -31897,7 +32390,14 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
             q_half_eff, x, model_map, weight_offset, weight_bytes,
             in_dim, out_dim, n_tok, logical_tier, physical_device,
             "attn_q_b", 1);
-        projected = partner_projected;
+        if (partner_projected < 0) return 0;
+        projected = partner_projected > 0;
+        if (!projected) {
+            cuda_q8_audit_record_result(
+                weight_offset, weight_bytes, in_dim, out_dim,
+                physical_device, "attn_q_b", "native_q8",
+                "partner_runtime_fallback");
+        }
     }
     if (!projected) return 0;
 

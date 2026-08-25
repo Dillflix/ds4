@@ -418,6 +418,7 @@ jobs:
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
+          python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile speed-bench/summarize-q8-t32-fused-ab.py
           python3 tests/test_summarize_q8_t32_fused_ab.py

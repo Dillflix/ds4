@@ -28,6 +28,7 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${Q8_PARTNER_AB_DIR:-$repo_dir/q8-partner-offload-ab-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
+[[ $PROMPT == /* ]] || die "PROMPT must be an absolute path"
 if [[ -n $REUSE_T32_DIR ]]; then
     [[ $REUSE_T32_DIR == /* && -d $REUSE_T32_DIR ]] ||
         die "REUSE_T32_DIR must name an existing absolute T32 A/B directory"
@@ -59,11 +60,34 @@ done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 )) || die "STAGE_SPLIT must be in 1..42"
 (( CTX_START > 0 && CTX_MAX >= CTX_START && PROFILE_TOKENS > 0 )) ||
     die "invalid context/profile range"
+(( STEP_MUL >= 1 && PREFILL_CHUNK > 0 )) ||
+    die "STEP_MUL must be at least 1 and PREFILL_CHUNK must be positive"
 (( REPEATS >= 2 )) || die "REPEATS must be at least 2"
 for flag in SKIP_BUILD RUN_GPU_TEST RUN_NSYS CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+
+IFS=',' read -r -a gpu_device_ids <<<"$GPU_DEVICES"
+(( ${#gpu_device_ids[@]} == 4 )) ||
+    die "GPU_DEVICES must contain four physical device indices (homes first, partners second)"
+declare -A seen_gpu=()
+for device in "${gpu_device_ids[@]}"; do
+    [[ $device =~ ^[0-9]+$ ]] || die "invalid GPU device index: $device"
+    [[ -z ${seen_gpu[$device]+x} ]] || die "duplicate GPU device index: $device"
+    seen_gpu[$device]=1
+done
+partner_device_0=${gpu_device_ids[2]}
+partner_device_1=${gpu_device_ids[3]}
+if [[ $GPU_VRAM != auto ]]; then
+    IFS=',' read -r -a gpu_vram_values <<<"$GPU_VRAM"
+    (( ${#gpu_vram_values[@]} == 4 )) ||
+        die "GPU_VRAM must be auto or four comma-separated GiB budgets"
+    for budget in "${gpu_vram_values[@]}"; do
+        [[ $budget =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+            die "invalid GPU_VRAM budget: $budget"
+    done
+fi
 
 IFS=',' read -r -a variants <<<"$VARIANTS"
 (( ${#variants[@]} >= 2 )) || die "VARIANTS must contain local and at least one candidate"
@@ -79,6 +103,8 @@ for variant in "${variants[@]}"; do
     [[ $variant == local ]] && have_local=1
 done
 (( have_local == 1 )) || die "VARIANTS must include local"
+[[ -n ${seen[t32]+x} && -n ${seen[t256]+x} ]] ||
+    die "a complete A/B requires both t32 and t256 variants"
 IFS=',' read -r -a nsys_variants <<<"$NSYS_VARIANTS"
 for variant in "${nsys_variants[@]}"; do
     [[ $variant == t32 || $variant == t256 || $variant == shared_down ||
@@ -109,6 +135,43 @@ finish() {
 trap finish EXIT
 trap 'phase=interrupted; exit 130' INT TERM
 
+phase=topology
+topology_file="$OUTPUT_DIR/provenance/nvidia-topology.txt"
+nvidia-smi topo -m >"$topology_file" || die "failed to query NVIDIA topology"
+topology_link() {
+    local from=$1
+    local to=$2
+    awk -v from="GPU$from" -v to="GPU$to" '
+        !header {
+            n_gpu = 0
+            for (i = 1; i <= NF; i++) if ($i ~ /^GPU[0-9]+$/) n_gpu++
+            if (n_gpu > 1) {
+                # Data rows add the source GPU as column 1.
+                for (i = 1; i <= NF; i++) if ($i == to) column = i + 1
+                header = 1
+                next
+            }
+        }
+        header && $1 == from && column > 0 { print $column; exit }
+    ' "$topology_file"
+}
+{
+    printf 'home_tier\thome_device\tpartner_tier\tpartner_device\thome_to_partner\tpartner_to_home\n'
+    for pair in 0 1; do
+        home_tier=$pair
+        partner_tier=$((pair + 2))
+        home_device=${gpu_device_ids[$home_tier]}
+        partner_device=${gpu_device_ids[$partner_tier]}
+        forward=$(topology_link "$home_device" "$partner_device")
+        reverse=$(topology_link "$partner_device" "$home_device")
+        [[ $forward =~ ^NV[0-9]+$ && $reverse =~ ^NV[0-9]+$ ]] ||
+            die "logical pair $home_tier<->$partner_tier (physical $home_device<->$partner_device) is not NVLink in both directions: ${forward:-missing}/${reverse:-missing}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$home_tier" "$home_device" "$partner_tier" "$partner_device" \
+            "$forward" "$reverse"
+    done
+} >"$OUTPUT_DIR/pair-topology.tsv"
+
 mapfile -t inherited_ds4 < <(env | awk -F= '$1 ~ /^DS4_/ {print $1}' | sort -u)
 clean=(env)
 for name in "${inherited_ds4[@]}"; do clean+=(-u "$name"); done
@@ -135,23 +198,36 @@ validate_audit() {
     local variant=$1
     local audit=$2
     local counts
-    counts=$(awk -F, -v variant="$variant" '
+    counts=$(awk -F, -v variant="$variant" \
+        -v partner0="$partner_device_0" -v partner1="$partner_device_1" '
         NR == 1 { next }
         $12 == "f16_partner_hit" && $13 == "nvlink_offload" {
-            if ($2 ~ /attn_q_b/ || $3 ~ /attn_q_b/ || ($9 == 1024 && $10 == 32768)) t32++
-            else if ($2 ~ /attn_output_b/ || $3 ~ /attn_output_b/ || ($9 == 8192 && $10 == 4096)) t256++
-            else if ($2 ~ /shared_down/ || $3 ~ /ffn_down_shexp/ || ($9 == 2048 && $10 == 4096)) shared++
+            if ($2 ~ /attn_q_b/ || $3 ~ /attn_q_b/ || ($9 == 1024 && $10 == 32768)) class = "t32"
+            else if ($2 ~ /attn_output_b/ || $3 ~ /attn_output_b/ || ($9 == 8192 && $10 == 4096)) class = "t256"
+            else if ($2 ~ /shared_down/ || $3 ~ /ffn_down_shexp/ || ($9 == 2048 && $10 == 4096)) class = "shared"
+            else class = "other"
+            if (class == "t32") t32++
+            else if (class == "t256") t256++
+            else if (class == "shared") shared++
             else other++
+            if ($6 == partner0) by_pair[class, 0]++
+            else if ($6 == partner1) by_pair[class, 1]++
+            else unexpected_device++
         }
         END {
             total = t32 + t256 + shared + other
-            printf "total=%d t32=%d t256=%d shared_down=%d other=%d", total, t32, t256, shared, other
+            printf "total=%d t32=%d(%d/%d) t256=%d(%d/%d) shared_down=%d(%d/%d) other=%d unexpected_device=%d", \
+                total, t32, by_pair["t32",0], by_pair["t32",1], \
+                t256, by_pair["t256",0], by_pair["t256",1], \
+                shared, by_pair["shared",0], by_pair["shared",1], \
+                other, unexpected_device
             ok = 0
             if (variant == "local") ok = (total == 0)
-            else if (variant == "t32") ok = (t32 > 0 && total == t32)
-            else if (variant == "t256") ok = (t256 > 0 && total == t256)
-            else if (variant == "shared_down") ok = (shared > 0 && total == shared)
-            else if (variant == "legacy") ok = (total > 0 && total == t32 + t256)
+            else if (variant == "t32") ok = (by_pair["t32",0] > 0 && by_pair["t32",1] > 0 && total == t32)
+            else if (variant == "t256") ok = (by_pair["t256",0] > 0 && by_pair["t256",1] > 0 && total == t256)
+            else if (variant == "shared_down") ok = (by_pair["shared",0] > 0 && by_pair["shared",1] > 0 && total == shared)
+            else if (variant == "legacy") ok = (by_pair["t32",0] > 0 && by_pair["t32",1] > 0 && by_pair["t256",0] > 0 && by_pair["t256",1] > 0 && total == t32 + t256)
+            ok = ok && unexpected_device == 0
             exit(ok ? 0 : 1)
         }
     ' "$audit") || {
@@ -165,20 +241,22 @@ if [[ $SKIP_BUILD == 0 ]]; then
     phase=build
     make -B -j"$(nproc)" ds4-bench tests/test_engine_mgpu_placement \
         tests/test_gpu_xdev CUDA_ARCH=sm_75 2>&1 | tee "$OUTPUT_DIR/build.log"
-    ./tests/test_engine_mgpu_placement \
-        >"$OUTPUT_DIR/planner-unit.log" 2>&1 || die "planner unit test failed"
-    if [[ $RUN_GPU_TEST == 1 ]]; then
-        ./tests/test_gpu_xdev >"$OUTPUT_DIR/gpu-exactness.log" 2>&1 || {
-            tail -n 160 "$OUTPUT_DIR/gpu-exactness.log" >&2
-            die "multi-GPU exactness test failed"
-        }
-        grep -Fq 'q8 partner projection exactness OK (3 classes)' \
-            "$OUTPUT_DIR/gpu-exactness.log" ||
-            die "the GPU test did not exercise all three partner projection shapes"
-    fi
 else
     make -q ds4-bench tests/test_engine_mgpu_placement tests/test_gpu_xdev \
         CUDA_ARCH=sm_75 || die "SKIP_BUILD=1 found stale targets"
+fi
+
+phase=tests
+./tests/test_engine_mgpu_placement \
+    >"$OUTPUT_DIR/planner-unit.log" 2>&1 || die "planner unit test failed"
+if [[ $RUN_GPU_TEST == 1 ]]; then
+    ./tests/test_gpu_xdev >"$OUTPUT_DIR/gpu-exactness.log" 2>&1 || {
+        tail -n 160 "$OUTPUT_DIR/gpu-exactness.log" >&2
+        die "multi-GPU exactness test failed"
+    }
+    grep -Fq 'q8 partner projection exactness OK (3 classes)' \
+        "$OUTPUT_DIR/gpu-exactness.log" ||
+        die "the GPU test did not exercise T32, T256, and shared-down overflow"
 fi
 
 phase=manifest
@@ -186,15 +264,15 @@ phase=manifest
     printf 'date_utc=%s\ngit_commit=%s\nmodel=%s\nmodel_bytes=%s\nprompt=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nrepeats=%s\nvariants=%s\n' \
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nprefill_chunk=%s\nrepeats=%s\nvariants=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
-        "$REPEATS" "$VARIANTS"
+        "$PREFILL_CHUNK" "$REPEATS" "$VARIANTS"
     printf 'run_nsys=%s\nnsys_variants=%s\nprofile_tokens=%s\nmodel_hashing=disabled\n' \
         "$RUN_NSYS" "$NSYS_VARIANTS" "$PROFILE_TOKENS"
     printf 'reuse_t32_dir=%s\n' "${REUSE_T32_DIR:-none}"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free \
         --format=csv
-    nvidia-smi topo -m
+    cat "$topology_file"
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -273,6 +351,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             DS4_CUDA_PREFILL_PIPELINE=1 \
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
             DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
+            "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK" \
             "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START" \
             "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
             "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$before" \
@@ -361,6 +440,7 @@ if [[ $RUN_NSYS == 1 ]]; then
             DS4_CUDA_PREFILL_PIPELINE=1 \
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
             DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
+            "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK" \
             "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \
             "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
             DS4_NSYS_CAPTURE_PREFILL=1 \

@@ -748,6 +748,12 @@ uses the pinned-host bounce route. If neither device can admit the expansion it
 transparently falls back to native Q8. `DS4_CUDA_Q8_F16_CACHE_MB` is a
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing.
+Partner activation/result scratch is reserved during cache admission rather
+than grown inside a measured projection. The default reservation covers 2048
+tokens, matching CUDA TP's default prefill chunk;
+`DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=N` changes that bound to a positive token
+count. A larger runtime
+microbatch safely uses the native local path instead of allocating mid-graph.
 The measured default partner policy is T256-only. On the fixed full-Q4 22/21
 screen it improved prefill by 13.1--15.1%, moved 3.12 GiB per benchmark sweep,
 and preserved the top token at all nine measured frontiers. T32-only produced
@@ -758,6 +764,11 @@ retained as the explicit `legacy` selector. Set
 cache plan remains unchanged by this selector; only home-cache misses are
 eligible to use partner VRAM. Shared-down is not enabled by default or by the
 legacy policy.
+The partner A/B treats validated CUDA peer access and physical NVLink topology
+as separate requirements: both logical directions must be `DIRECT`, and each
+homes-first physical pair must be reported as `NV#` by `nvidia-smi topo -m`.
+It records that mapping and requires T32 and T256 audit hits on both pairs,
+rather than accepting a result exercised by only one pipeline stage.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

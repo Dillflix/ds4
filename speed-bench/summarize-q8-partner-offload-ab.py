@@ -70,12 +70,14 @@ with runs_path.open(newline="") as handle:
                 and item["reason"] == "nvlink_offload"
             ]
         by_class = Counter(classify(item) for item in offload_rows)
+        by_device = Counter(int(item["physical_device"]) for item in offload_rows)
         evidence[(repeat, variant)] = {
-            "summary_calls": calls,
+            "process_total_calls": calls,
             "audit_calls": len(offload_rows),
-            "activation_gib": activation_gib,
-            "result_gib": result_gib,
+            "process_total_activation_gib": activation_gib,
+            "process_total_result_gib": result_gib,
             "classes": by_class,
+            "devices": by_device,
         }
 
 repeats = sorted({repeat for repeat, _ in samples})
@@ -87,7 +89,8 @@ for repeat in repeats:
     if not local:
         fail(f"repeat {repeat} lacks a local control")
     local_evidence = evidence[(repeat, "local")]
-    if local_evidence["summary_calls"] != 0 or local_evidence["audit_calls"] != 0:
+    if (local_evidence["process_total_calls"] != 0 or
+            local_evidence["audit_calls"] != 0):
         fail(f"repeat {repeat} local control used partner execution")
     for variant in variants:
         candidate = samples.get((repeat, variant))
@@ -96,6 +99,8 @@ for repeat in repeats:
         item = evidence[(repeat, variant)]
         classes = item["classes"]
         assert isinstance(classes, Counter)
+        devices = item["devices"]
+        assert isinstance(devices, Counter)
         total = sum(classes.values())
         valid = False
         status_reasons: list[str] = []
@@ -111,9 +116,9 @@ for repeat in repeats:
             status_reasons.append("not_exercised")
         elif not valid:
             status_reasons.append("contaminated")
-        if item["summary_calls"] <= 0:
+        if item["process_total_calls"] <= 0:
             status_reasons.append("missing_runtime_count")
-        if item["audit_calls"] > item["summary_calls"]:
+        if item["audit_calls"] > item["process_total_calls"]:
             status_reasons.append("audit_exceeds_runtime")
         status = "+".join(status_reasons) if status_reasons else "ok"
         class_rows.append(
@@ -121,18 +126,23 @@ for repeat in repeats:
                 "repeat": repeat,
                 "variant": variant,
                 "evidence_status": status,
-                "summary_calls": item["summary_calls"],
-                "audit_calls": item["audit_calls"],
-                "audit_coverage": (
-                    float(item["audit_calls"]) / int(item["summary_calls"])
-                    if int(item["summary_calls"]) > 0 else 1.0
+                "process_total_calls": item["process_total_calls"],
+                "audit_sample_calls": item["audit_calls"],
+                "audit_sample_coverage": (
+                    float(item["audit_calls"]) /
+                    int(item["process_total_calls"])
+                    if int(item["process_total_calls"]) > 0 else 1.0
                 ),
-                "t32_calls": classes["t32"],
-                "t256_calls": classes["t256"],
-                "shared_down_calls": classes["shared_down"],
-                "other_calls": classes["other"],
-                "activation_gib": item["activation_gib"],
-                "result_gib": item["result_gib"],
+                "audit_t32_calls": classes["t32"],
+                "audit_t256_calls": classes["t256"],
+                "audit_shared_down_calls": classes["shared_down"],
+                "audit_other_calls": classes["other"],
+                "audit_partner_devices": ";".join(
+                    f"{device}:{devices[device]}" for device in sorted(devices)
+                ),
+                "process_total_activation_gib":
+                    item["process_total_activation_gib"],
+                "process_total_result_gib": item["process_total_result_gib"],
             }
         )
         for context in sorted(candidate):
@@ -232,6 +242,16 @@ lines: list[str] = []
 for variant in variants:
     lines.append(f"[{variant}]")
     for context in sorted({int(row["ctx_tokens"]) for row in paired}):
+        candidate_tps = [
+            float(row["candidate_tps"])
+            for row in paired
+            if row["variant"] == variant and row["ctx_tokens"] == context
+        ]
+        local_tps = [
+            float(row["local_tps"])
+            for row in paired
+            if row["variant"] == variant and row["ctx_tokens"] == context
+        ]
         ratios = [
             float(row["candidate_over_local"])
             for row in paired
@@ -240,16 +260,23 @@ for variant in variants:
         if not ratios:
             continue
         lines.append(
-            f"ctx={context} median_candidate/local={statistics.median(ratios):.5f} "
+            f"ctx={context} median_candidate_tps={statistics.median(candidate_tps):.3f} "
+            f"median_local_tps={statistics.median(local_tps):.3f} "
+            f"median_candidate/local={statistics.median(ratios):.5f} "
             f"min={min(ratios):.5f} max={max(ratios):.5f} n={len(ratios)}"
         )
     selected = [row for row in class_rows if row["variant"] == variant]
     for class_name in ("t32", "t256", "shared_down", "other"):
-        values = [int(row[f"{class_name}_calls"]) for row in selected]
+        values = [int(row[f"audit_{class_name}_calls"]) for row in selected]
         lines.append(
-            f"{class_name}_calls median={statistics.median(values):.1f} "
+            f"audit_sample_{class_name}_calls median={statistics.median(values):.1f} "
             f"min={min(values)} max={max(values)}"
         )
+    process_calls = [int(row["process_total_calls"]) for row in selected]
+    lines.append(
+        f"process_total_calls median={statistics.median(process_calls):.1f} "
+        f"min={min(process_calls)} max={max(process_calls)}"
+    )
     drift = [row for row in logit_rows if row["variant"] == variant]
     lines.append(
         f"logits max_abs={max(float(row['max_abs']) for row in drift):.9g} "

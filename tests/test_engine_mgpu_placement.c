@@ -176,6 +176,11 @@ static void test_q8_cache_partner_mapping(void) {
     const char *shared = "blk.3.ffn_down_shexp.weight";
     const int physical[4] = {0, 3, 1, 2};
 
+    CHECK(physical[0] == 0 && physical[2] == 1,
+          "production logical pair 0<->2 maps physical NVLink pair 0<->1");
+    CHECK(physical[1] == 3 && physical[3] == 2,
+          "production logical pair 1<->3 maps physical NVLink pair 3<->2");
+
     (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
 
     const int q_partner = ds4_test_q8_cache_partner_tier(
@@ -194,10 +199,12 @@ static void test_q8_cache_partner_mapping(void) {
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
           "explicit T256 policy excludes T32");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "legacy", 1);
-    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == 2,
-          "explicit legacy policy retains T32 partner mapping");
-    CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3,
-          "explicit legacy policy retains T256 partner mapping");
+    CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == 2 &&
+          physical[2] == 1,
+          "legacy T32 uses reordered logical partner 2 / physical GPU 1");
+    CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3 &&
+          physical[3] == 2,
+          "legacy T256 uses reordered logical partner 3 / physical GPU 2");
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
           "explicit legacy policy excludes shared-down");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "shared_down", 1);
@@ -213,7 +220,10 @@ static void test_q8_cache_partner_mapping(void) {
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "none", 1);
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
           "none policy disables partner mapping");
-    (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+    /* Keep T32 eligible while testing the topology/shape guards below.
+     * Using the T256-only default here would make every negative assertion
+     * pass before the guard under test is reached. */
+    (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t32", 1);
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 0, 1, 0) == -1,
           "forward peer validation is required");
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 0, 0) == -1,
@@ -224,6 +234,7 @@ static void test_q8_cache_partner_mapping(void) {
           "odd GPU counts cannot use paired offload");
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 1) == -1,
           "explicit opt-out disables partner placement");
+    (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
 }
 
 static void test_tensor_to_entry(void) {

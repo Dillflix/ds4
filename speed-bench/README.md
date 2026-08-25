@@ -333,10 +333,16 @@ which home-cache misses may overflow to partner VRAM; it does not remove or
 reorder any home or fixed partner cache candidates.
 
 The runner requires all four logical home/partner routes to be validated
-`DIRECT`, proves that every candidate run executed only its requested class,
+`DIRECT` and independently rejects any physical pair that `nvidia-smi topo -m`
+does not report as `NV#`; PCIe peer access is not accepted as NVLink evidence.
+Its `pair-topology.tsv` records the production homes-first mapping. It proves
+that both T32 and T256 execute on both physical NVLink pairs and that every
+candidate run executed only its requested class,
 freezes cache state before timed frontiers, rotates process order, and reports
-every candidate/local throughput ratio. The device audit is bounded, so its
-class-pure sample may be smaller than the uncapped runtime call counter without
+the absolute median candidate/local tokens per second alongside every paired
+throughput ratio. Runtime summary fields are explicitly labeled
+`process_total_*`; the bounded device-audit fields are labeled `audit_*`, so a
+class-pure sample may be smaller than the uncapped process total without
 invalidating the run. Full-logit output records numerical drift and top-token
 agreement for every class, while within-variant repeat determinism remains an
 acceptance condition. The GPU regression deliberately fills a home device's
@@ -344,6 +350,11 @@ per-device F16 cap and proves bit-exact partner execution for the production
 T32, T256, and shared-down shapes. By default it also captures one short,
 measured-prefill Nsight Systems report for each isolated class so transfer,
 cuBLAS, synchronization, and partner contention can be evaluated.
+The runner sets `DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS` to the positive
+`PREFILL_CHUNK`, so
+custom chunk sizes reserve matching partner scratch before timing. Outside the
+runner the engine defaults this admission bound to 2048 tokens and safely
+declines larger microbatches instead of growing scratch during execution.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -363,8 +374,12 @@ bash ./speed-bench/cuda-q8-partner-offload-ab.sh
 
 Set `RUN_NSYS=0` only for a throughput-only rerun, and set `RUN_GPU_TEST=0`
 only after all three exactness cases have passed for the current binary.
-`VARIANTS` and `NSYS_VARIANTS` accept comma-separated subsets of the named
-variants. Return `q8-partner-offload-ab-<timestamp>.tar.gz`; its
+`RUN_GPU_TEST=1` still executes the existing binary when `SKIP_BUILD=1`; the
+latter skips compilation, not validation. `VARIANTS` must include `local`,
+`t32`, and `t256` so every A/B archive proves both expensive projection
+classes; it may additionally include the other named variants.
+`NSYS_VARIANTS` accepts a comma-separated subset. Return
+`q8-partner-offload-ab-<timestamp>.tar.gz`; its
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
 

@@ -24,13 +24,16 @@ def audit_rows(variant: str) -> list[list[object]]:
     }
     names = [variant] if variant in shapes else (["t32", "t256"] if variant == "legacy" else [])
     rows = []
-    for sequence, name in enumerate(names):
+    for name_index, name in enumerate(names):
         module, in_dim, out_dim = shapes[name]
-        rows.append([
-            sequence, module, "q8_0", 3, 0, 1, sequence * 4096,
-            1024, in_dim, out_dim, in_dim * out_dim * 2,
-            "f16_partner_hit", "nvlink_offload", 1024,
-        ])
+        for pair_index, physical_device in enumerate((1, 2)):
+            sequence = name_index * 2 + pair_index
+            rows.append([
+                sequence, module, "q8_0", 3 if pair_index == 0 else 36,
+                0, physical_device, sequence * 4096, 1024,
+                in_dim, out_dim, in_dim * out_dim * 2,
+                "f16_partner_hit", "nvlink_offload", 1024,
+            ])
     return rows
 
 
@@ -109,12 +112,20 @@ def main() -> None:
         assert all(row["exact"] == "1" for row in determinism)
         t32 = next(row for row in evidence if row["variant"] == "t32")
         assert t32["evidence_status"] == "ok"
-        assert t32["summary_calls"] == "5" and t32["audit_calls"] == "1"
-        assert t32["t32_calls"] == "1" and t32["t256_calls"] == "0"
+        assert (t32["process_total_calls"] == "5" and
+                t32["audit_sample_calls"] == "2")
+        assert (t32["audit_t32_calls"] == "2" and
+                t32["audit_t256_calls"] == "0")
+        assert t32["audit_partner_devices"] == "1:1;2:1"
         legacy = next(row for row in evidence if row["variant"] == "legacy")
-        assert legacy["t32_calls"] == "1" and legacy["t256_calls"] == "1"
+        assert (legacy["audit_t32_calls"] == "2" and
+                legacy["audit_t256_calls"] == "2")
         summary = (out / "summary.txt").read_text()
-        assert "[shared_down]" in summary and "median_candidate/local=" in summary
+        assert "[shared_down]" in summary
+        assert "median_candidate_tps=" in summary
+        assert "median_local_tps=" in summary
+        assert "median_candidate/local=" in summary
+        assert "process_total_calls median=" in summary
 
         # Invalid class evidence must remain summarizable so the shell driver
         # can finish all bounded Nsight captures before rejecting the archive.
