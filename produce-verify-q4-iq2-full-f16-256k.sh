@@ -8,7 +8,7 @@ Calibrate, produce, and verify a Q4/IQ2 routed-expert model that supports a
 
 Usage:
   bash produce-verify-q4-iq2-full-f16-256k.sh \
-    HF_DIR FULL_Q4.gguf [OUTPUT.gguf] [RESULTS.csv]
+    HF_DIR [OUTPUT.gguf] [RESULTS.csv]
 
 The recipe is measured, not hardcoded. A known all-IQ2-gate/up + Q4-down
 calibration model is loaded with the final 256K allocation, complete dense
@@ -18,6 +18,12 @@ Q4_K as both devices in each NVLink stage can hold while preserving the CUDA
 cache reserve plus the requested safety margin. Routed down remains Q4_K in
 every layer. The output keeps tagged native SM75 packing on every routed
 tensor that remains Q4_K.
+
+No full-Q4 GGUF is required. The quantizer regenerates tensors from HF_DIR,
+using the automatically cached 8 MiB metadata template and routed-MoE imatrix.
+If CALIBRATION_MODEL does not exist, the runner first creates a disposable
+all-IQ2-gate/up + Q4-down calibration model from the same HF checkpoint. It is
+removed only after final verification unless KEEP_GENERATED_CALIBRATION=1.
 
 Defaults:
   GPU_DEVICES=0,3,1,2
@@ -29,6 +35,8 @@ Defaults:
   EXPECTED_DENSE_CANDIDATES=344
   IQ2_GATE_UP_LAYER_ORDER=3-42
   CALIBRATION_MODEL=./gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf
+  GENERATED_CALIBRATION_MODEL=<OUTPUT directory>/.DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.calibration.gguf
+  KEEP_GENERATED_CALIBRATION=0
 
 IQ2_GATE_UP_LAYER_ORDER is a preference order, not a sensitivity ranking. The
 default is deterministic and makes no quality-optimality claim. Supply a
@@ -53,7 +61,7 @@ require_command() {
 }
 
 [[ ${1:-} != -h && ${1:-} != --help ]] || { usage; exit 0; }
-[[ $# -ge 2 && $# -le 4 ]] || { usage >&2; exit 2; }
+[[ $# -ge 1 && $# -le 3 ]] || { usage >&2; exit 2; }
 [[ $(uname -s) == Linux ]] || die "this CUDA production script must run on Linux"
 require_command make
 require_command nproc
@@ -62,16 +70,27 @@ require_command realpath
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ -d $1 ]] || die "HF directory not found: $1"
-[[ -f $2 ]] || die "full-Q4 GGUF not found: $2"
 hf_dir=$(realpath "$1")
-full_q4=$(realpath "$2")
-calibration_model=${CALIBRATION_MODEL:-$script_dir/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf}
-[[ -f $calibration_model ]] || die "all-IQ2 gate/up calibration GGUF not found: $calibration_model"
-calibration_model=$(realpath "$calibration_model")
-out=${3:-${OUT:-/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf}}
+[[ -f $hf_dir/model.safetensors.index.json ]] || \
+    die "HF directory has no model.safetensors.index.json: $hf_dir"
+out=${2:-${OUT:-/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf}}
 out=$(realpath -m "$out")
-results=${4:-${RESULTS_CSV:-${out%.gguf}.bench.csv}}
+results=${3:-${RESULTS_CSV:-${out%.gguf}.bench.csv}}
 results=$(realpath -m "$results")
+default_calibration=$script_dir/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf
+generated_calibration=${GENERATED_CALIBRATION_MODEL:-$(dirname -- "$out")/.DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.calibration.gguf}
+generated_calibration_by_runner=0
+if [[ -n ${CALIBRATION_MODEL:-} ]]; then
+    calibration_model=$CALIBRATION_MODEL
+    [[ -f $calibration_model || ${REUSE_BASELINE:-0} == 1 ]] || \
+        die "CALIBRATION_MODEL does not exist: $calibration_model"
+elif [[ -f $default_calibration ]]; then
+    calibration_model=$default_calibration
+else
+    calibration_model=$generated_calibration
+    generated_calibration_by_runner=1
+fi
+calibration_model=$(realpath -m "$calibration_model")
 cd "$script_dir"
 
 gpu_devices=${GPU_DEVICES:-0,3,1,2}
@@ -85,6 +104,7 @@ expected_candidates=${EXPECTED_DENSE_CANDIDATES:-344}
 iq2_layer_order=${IQ2_GATE_UP_LAYER_ORDER:-3-42}
 reuse_baseline=${REUSE_BASELINE:-0}
 run_full_sweep=${RUN_FULL_SWEEP:-0}
+keep_generated_calibration=${KEEP_GENERATED_CALIBRATION:-0}
 prompt=${PROMPT_FILE:-$script_dir/speed-bench/promessi_sposi.txt}
 prompt=$(realpath "$prompt")
 
@@ -94,6 +114,8 @@ prompt=$(realpath "$prompt")
 [[ $expected_candidates =~ ^[1-9][0-9]*$ ]] || die "EXPECTED_DENSE_CANDIDATES must be positive"
 [[ $reuse_baseline == 0 || $reuse_baseline == 1 ]] || die "REUSE_BASELINE must be 0 or 1"
 [[ $run_full_sweep == 0 || $run_full_sweep == 1 ]] || die "RUN_FULL_SWEEP must be 0 or 1"
+[[ $keep_generated_calibration == 0 || $keep_generated_calibration == 1 ]] || \
+    die "KEEP_GENERATED_CALIBRATION must be 0 or 1"
 [[ -f $prompt ]] || die "prompt file not found: $prompt"
 
 export DS4_CUDA_EP_STAGE_SPLIT=${DS4_CUDA_EP_STAGE_SPLIT:-22}
@@ -121,6 +143,29 @@ verification_csv=${VERIFICATION_CSV:-$prefix.verification-bench.csv}
 mkdir -p -- "$(dirname -- "$out")" "$(dirname -- "$results")"
 
 ctx_alloc=$((target_context + target_gen_tokens + 1))
+if [[ $reuse_baseline != 1 && ! -f $calibration_model ]]; then
+    mkdir -p -- "$(dirname -- "$calibration_model")"
+    printf 'Generating disposable all-IQ2 gate/up + native-Q4 down calibration model...\n'
+    unset DS4_TEMPLATE_GGUF Q4_TEMPLATE
+    QUANTIZE_ONLY=1 \
+    REUSE_MODEL=0 \
+    OVERWRITE=0 \
+    GPU_DEVICES="$gpu_devices" \
+    GPU_VRAM="$gpu_vram" \
+    CUDA_ARCH="$cuda_arch" \
+    MAKE_JOBS="$make_jobs" \
+    ROUTED_W1=iq2_xxs \
+    ROUTED_W2=q4_k \
+    ROUTED_W3=iq2_xxs \
+    SM75_NATIVE_Q4=1 \
+    QUANT_RECIPE='calibration:gate=iq2_xxs,up=iq2_xxs,down=q4_k' \
+    PLAN_LOG="$prefix.generated-calibration-quant-plan.txt" \
+    QUANT_LOG="$prefix.generated-calibration-quantize.log" \
+    bash "$script_dir/produce-benchmark-iq2-iq2-q4.sh" \
+        "$hf_dir" "$calibration_model"
+    [[ -s $calibration_model ]] || \
+        die "calibration generation did not produce $calibration_model"
+fi
 if [[ $reuse_baseline == 1 ]]; then
     [[ -s $baseline_plan ]] || die "REUSE_BASELINE=1 but plan is missing: $baseline_plan"
     [[ -s $baseline_log ]] || die "REUSE_BASELINE=1 but layout log is missing: $baseline_log"
@@ -170,8 +215,9 @@ IFS=$'\t' read -r iq2_layers tensor_overrides <<< "$selection"
 [[ -n $iq2_layers && -n $tensor_overrides ]] || die "selector returned an empty Q4/IQ2 plan"
 
 {
-    printf 'full_q4=%s\n' "$full_q4"
+    printf 'hf_source=%s\n' "$hf_dir"
     printf 'all_iq2_calibration_model=%s\n' "$calibration_model"
+    printf 'calibration_generated_by_runner=%s\n' "$generated_calibration_by_runner"
     printf 'target_context=%s\n' "$target_context"
     printf 'target_gen_tokens=%s\n' "$target_gen_tokens"
     printf 'target_ctx_alloc=%s\n' "$ctx_alloc"
@@ -193,7 +239,7 @@ export GPU_DEVICES="$gpu_devices"
 export GPU_VRAM="$gpu_vram"
 export CUDA_ARCH="$cuda_arch"
 export MAKE_JOBS="$make_jobs"
-export DS4_TEMPLATE_GGUF="$full_q4"
+unset DS4_TEMPLATE_GGUF Q4_TEMPLATE
 export ROUTED_W1=q4_k
 export ROUTED_W2=q4_k
 export ROUTED_W3=q4_k
@@ -241,6 +287,16 @@ if [[ $run_full_sweep == 1 ]]; then
         --ctx-start 2048 --ctx-max "$target_context" \
         --ctx-alloc "$ctx_alloc" --step-mul 2 --step-incr 2048 \
         --gen-tokens "$target_gen_tokens" --csv "$results"
+fi
+
+if [[ $generated_calibration_by_runner == 1 &&
+      $keep_generated_calibration != 1 &&
+      -f $calibration_model ]]; then
+    expected_generated=$(realpath -m "$generated_calibration")
+    [[ $calibration_model == "$expected_generated" ]] || \
+        die "refusing to remove unexpected calibration path: $calibration_model"
+    rm -f -- "$calibration_model"
+    printf 'Removed generated calibration model: %s\n' "$calibration_model"
 fi
 
 printf '\nQ4/IQ2 256K model generated and cache-verified.\n'

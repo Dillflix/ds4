@@ -48,6 +48,9 @@ Override any default as an environment variable, for example:
 The script refuses to replace OUTPUT.gguf. Set OVERWRITE=1 to replace it
 atomically, or REUSE_MODEL=1 to skip quantization and benchmark an existing
 OUTPUT.gguf again.
+
+Set QUANTIZE_ONLY=1 to produce the model and stop before building/running the
+engine benchmark. This is used for disposable capacity-calibration models.
 EOF
 }
 
@@ -175,8 +178,12 @@ done
 
 reuse_model=${REUSE_MODEL:-0}
 overwrite=${OVERWRITE:-0}
+quantize_only=${QUANTIZE_ONLY:-0}
 [[ $reuse_model == 0 || $reuse_model == 1 ]] || die "REUSE_MODEL must be 0 or 1"
 [[ $overwrite == 0 || $overwrite == 1 ]] || die "OVERWRITE must be 0 or 1"
+[[ $quantize_only == 0 || $quantize_only == 1 ]] || die "QUANTIZE_ONLY must be 0 or 1"
+[[ $reuse_model == 0 || $quantize_only == 0 ]] || \
+    die "REUSE_MODEL=1 and QUANTIZE_ONLY=1 cannot be combined"
 if [[ $reuse_model == 1 ]]; then
     [[ -f $out ]] || die "REUSE_MODEL=1 but OUTPUT.gguf does not exist: $out"
 elif [[ -e $out && $overwrite != 1 ]]; then
@@ -266,16 +273,20 @@ fi
 
 [[ $out != "$template" ]] || die "OUTPUT.gguf must not be the template GGUF"
 
-printf 'Building the %s CUDA benchmark...\n' "$cuda_arch"
+printf 'Building the %s CUDA quantizer...\n' "$cuda_arch"
 make -j "$make_jobs" -C gguf-tools deepseek4-quantize-cuda test-quants-cuda \
     CUDA_ARCH="$cuda_arch"
 quantizer=$script_dir/gguf-tools/deepseek4-quantize-cuda
 gguf-tools/test-quants-cuda "$gpu_devices"
-# Force the CUDA object to rebuild: changing CUDA_ARCH alone is not a Makefile
-# dependency and could otherwise leave an object compiled for another GPU.
-make -B -j "$make_jobs" ds4-bench tests/test_engine_mgpu_placement \
-    CUDA_ARCH="$cuda_arch"
-./tests/test_engine_mgpu_placement
+if [[ $quantize_only != 1 ]]; then
+    printf 'Building the %s CUDA benchmark...\n' "$cuda_arch"
+    # Force the CUDA object to rebuild: changing CUDA_ARCH alone is not a
+    # Makefile dependency and could otherwise leave an object compiled for
+    # another GPU.
+    make -B -j "$make_jobs" ds4-bench tests/test_engine_mgpu_placement \
+        CUDA_ARCH="$cuda_arch"
+    ./tests/test_engine_mgpu_placement
+fi
 
 quant_args=(
     --hf "$hf_dir"
@@ -334,6 +345,11 @@ if [[ $reuse_model != 1 ]]; then
         mv -- "$partial" "$out"
     fi
     partial=
+fi
+
+if [[ $quantize_only == 1 ]]; then
+    printf '\nQuantization complete.\nModel: %s\n' "$out"
+    exit 0
 fi
 
 pair0="${gpu_list[0]}<->${gpu_list[2]}"

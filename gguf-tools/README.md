@@ -267,13 +267,19 @@ For the four-RTX-8000 production target, the Q4/IQ2-only 256K workflow is:
 ```sh
 bash produce-verify-q4-iq2-full-f16-256k.sh \
   /models/DeepSeek-V4-Flash-0731-HF \
-  /models/DeepSeek-V4-Flash-Q4KExperts.gguf \
   /mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf
 ```
 
-It loads the existing all-IQ2-gate/up + Q4-down model at the actual 262144-token
-allocation with `GPU_DEVICES=0,3,1,2`, the 22/21 pipeline split, all dense-Q8
-FP16 candidates, and worst-case all-local T256 placement. After a production warm-up it
+No full-Q4 GGUF is an input. Tensor data is generated from the HF checkpoint;
+the published 8 MiB metadata prefix and imatrix are fetched and cached
+automatically. The runner uses an existing all-IQ2-gate/up + Q4-down model only
+as a capacity probe when one is available. Otherwise it generates a temporary
+probe from the same HF checkpoint and removes that file after successful final
+verification unless `KEEP_GENERATED_CALIBRATION=1`.
+
+The probe is loaded at the actual 262144-token allocation with
+`GPU_DEVICES=0,3,1,2`, the 22/21 pipeline split, all dense-Q8 FP16 candidates,
+and worst-case all-local T256 placement. After a production warm-up it
 measures free VRAM and the active cache reserve on every GPU, then promotes as
 many matched gate/up layer pairs to Q4_K as both members of each NVLink stage
 can hold. Routed down stays Q4_K in every layer. This calibration direction is
