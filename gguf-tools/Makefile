@@ -31,7 +31,7 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -Werror=implicit-function-declaration -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score quality-llama-score
+.PHONY: all clean check-source-f16 quality-score quality-llama-score
 
 all: deepseek4-quantize
 
@@ -56,6 +56,13 @@ test_quants_cuda.o: test_quants_cuda.c quants.h quants_cuda.h Makefile
 test-quants-cuda: test_quants_cuda.o quants-cuda-host.o quants_cuda.o
 	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
 
+test-source-f16-checked: test_source_f16_checked.c quants.c quants.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ test_source_f16_checked.c quants.c -lm -pthread
+
+check-source-f16: deepseek4-quantize test-source-f16-checked
+	./test-source-f16-checked
+	python3 test_source_f16_core_dense.py ./deepseek4-quantize
+
 quality-score:
 	$(MAKE) -C .. gguf-tools/quality-testing/score_official
 
@@ -65,5 +72,6 @@ quality-llama-score:
 clean:
 	rm -f deepseek4-quantize deepseek4-quantize-cuda deepseek4-quantize-cuda.o \
 		quants-cuda-host.o quants_cuda.o test-quants-cuda test_quants_cuda.o \
+		test-source-f16-checked \
 		quality-testing/score_official quality-testing/score_official.o \
 		quality-testing/score_llama

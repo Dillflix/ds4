@@ -24,6 +24,117 @@ The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
 
+Run the focused source-F16 selector and conversion checks with:
+
+```sh
+make -C gguf-tools check-source-f16
+```
+
+## Generate A Source-Derived F16 Core-Dense GGUF
+
+`--source-f16-core-dense` is a deliberately strict Flash-only mode for a
+source-derived-F16 dense-path experiment. It changes exactly eight tensors in each of
+layers 0 through 42 (344 tensors total):
+
+```text
+attn_q_a.weight       attn_q_b.weight
+attn_kv.weight        attn_output_a.weight
+attn_output_b.weight  ffn_gate_shexp.weight
+ffn_up_shexp.weight   ffn_down_shexp.weight
+```
+
+Each selected tensor is converted directly from its original HF
+representation to F16. Supported sources are `F8_E4M3` with its
+`F8_E8M0` scale, BF16, and F16; there is no intermediate Q8 encode or decode.
+The writer rejects a non-finite source value and any finite value that rounds
+to an F16 infinity. It also rejects missing, duplicate, wrong-shape, or
+out-of-range core tensors.
+
+Start with the deterministic 344-name manifest and size plan. A source-F16 dry
+run also opens the safetensors headers and validates all 344 weight/scale
+entries, dtypes, shapes, declared payload sizes, and shard bounds without
+reading the tensor payloads:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf /models/DeepSeek-V4-Flash-HF \
+  --template /models/DeepSeek-V4-Flash-Q4-IQ2.gguf \
+  --source-f16-core-dense \
+  --dry-run
+```
+
+The direct CLI writer below is a developer/debugging interface, not the
+production publication path. It writes its `--out` file in place and can leave
+that file incomplete if conversion fails or the process is interrupted. Always
+generate to a new, disposable path when invoking it directly:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf /models/DeepSeek-V4-Flash-HF \
+  --template /models/DeepSeek-V4-Flash-Q4-IQ2.gguf \
+  --out /models/DeepSeek-V4-Flash-Q4-IQ2-SourceF16Dense.gguf \
+  --source-f16-core-dense
+```
+
+The repository-level production wrapper adds the focused converter tests,
+free-space preflight, exact dry-run size check, metadata/directory validation,
+and a locked, fail-closed publication transaction. It generates into one fixed
+partial path, safely reaps abandoned partials while holding the output lock,
+stages the complete validation/provenance bundle, and publishes the model last
+as the bundle's commit record. A rollback journal restores every prior artifact
+after an ordinary failure or signal; a later invocation recovers an interrupted
+transaction before doing any new work. All three paths are required, so no shell
+variable is left implicit:
+
+```sh
+bash ./produce-source-f16-core-dense.sh \
+  /home/jdillman/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062 \
+  /home/jdillman/ds4-iq2-q4/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf \
+  /mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-DenseSourceF16-SM75.gguf
+```
+
+Recovery is automatic on the next invocation. To perform only recovery and
+stale-partial cleanup under the same output lock, pass the same three paths with
+`RECOVER_ONLY=1`; no build, source scan, or conversion is then started.
+
+All unselected tensor payloads are copied byte-for-byte from the template.
+All template KV records are retained byte-for-byte, including routed Q4/IQ2
+provenance, imatrix provenance, and the tagged native-SM75 routed-Q4 layout.
+Tensor-directory records and offsets are necessarily rewritten because the
+selected tensor types and sizes change. This mode therefore cannot be combined
+with quantization overrides, imatrix rewriting, DSpark generation, or
+`--sm75-native-q4`; start from a template that already has the desired routed
+payloads and metadata.
+
+The selected F16 payloads contain 5,681,184,768 elements and occupy exactly
+11,362,369,536 bytes (10.582 GiB), before per-tensor alignment. If all 344
+template tensors are Q8_0, this is 5,326,110,720 bytes (4.960 GiB) more than
+their Q8_0 payloads. Mixed templates differ, so the dry-run size plan is the
+authoritative disk-space estimate. The copied `general.file_type` KV remains
+the template value; consumers must use the per-tensor GGUF types, as DS4 does.
+
+Safetensors preflight rejects duplicate weight names in either the index or a
+shard header, overlapping/descending payload extents, negative offsets, and
+truncated shards. The wrapper's provenance deliberately distinguishes evidence
+from authentication: `hf_snapshot_path_revision_match=true` means only that the
+resolved cache path ends in the requested repository revision, while
+`hf_shard_content_authentication=not_performed` records that the multi-gigabyte
+shards were not hashed. It hashes only the small converter binary, HF index, and
+HF config. To detect ordinary source replacement or mutation during the long
+conversion, it requires the resolved path, device, inode, size, and nanosecond
+mtime of every indexed shard and the template to match before and after the run;
+these identity checks are not cryptographic content authentication.
+`kv_metadata_byte_identical=true` refers specifically to the raw GGUF KV-record
+blob; the tensor directory necessarily changes.
+
+Publication is fail-closed for ordinary errors/signals, journal-recoverable
+after abrupt process interruption, and serialized among cooperating producers;
+it is not a cross-file filesystem transaction. Consumers should treat the final
+GGUF model as the commit record and should not consume newly named sidecars
+while the model path is absent. A machine or storage-server power loss may still
+require the next invocation's journal recovery, subject to the filesystem's
+rename and durability guarantees.
+
 ## Generate An Imatrix
 
 First regenerate or inspect the calibration dataset:

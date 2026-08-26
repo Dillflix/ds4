@@ -117,6 +117,33 @@ void ds4_gpu_q8_audit_set_context(const char *module,
 void ds4_gpu_q8_audit_clear_context(void);
 int ds4_gpu_q8_audit_write_csv(const char *path);
 void ds4_gpu_q8_audit_end(void);
+/* Coverage-only record of the production dense projection actually selected.
+ * The implementation is inert unless DS4_CUDA_DENSE_EXEC_AUDIT_CSV names an
+ * output file.  Timed runs leave that variable unset. */
+int ds4_gpu_dense_exec_audit_record(
+        const ds4_gpu_tensor *out,
+        const char           *module,
+        const char           *label,
+         uint32_t              label_len,
+         uint32_t              layer,
+         uint32_t              token_offset,
+         uint64_t              proof_weight_offset,
+         uint64_t              proof_in_dim,
+         uint64_t              proof_out_dim,
+         uint64_t              proof_input_offset,
+         uint64_t              proof_input_count,
+         uint64_t              proof_output_offset,
+         uint64_t              proof_output_count,
+         uint64_t              weight_offset,
+         uint64_t              weight_bytes,
+         uint32_t              weight_type,
+         uint64_t              in_dim,
+         uint64_t              out_dim,
+         uint64_t              executed_input_offset,
+         uint64_t              executed_input_count,
+         uint64_t              executed_output_offset,
+         uint64_t              executed_output_count,
+         uint64_t              n_tokens);
 int ds4_gpu_q8_cache_state_write_csv(const char *path);
 int ds4_gpu_q8_binding_state_write_csv(const char *path);
 int ds4_gpu_q8_allocation_state_write_csv(const char *path);
@@ -691,6 +718,10 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp);
+/* Returns 1 for the rank that executes the projection.  With dense-exec
+ * auditing enabled, a complementary balanced rank whose device predicate is
+ * intentionally false returns 2; both values are successful production
+ * dispatches, but only 1 carries a gate/up execution proof. */
 int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -788,6 +819,30 @@ int ds4_gpu_matmul_f16_pair_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+/* Core DeepSeek source-F16 projection.  Unlike the legacy generic F16
+ * dispatcher, this entry point deliberately uses the cuBLAS FP16-input/F32-
+ * accumulation path for both decode and prefill, including quality mode. */
+int ds4_gpu_matmul_f16_cublas_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+int ds4_gpu_matmul_f16_pair_mixed_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint64_t              in_dim,
+        uint64_t              out_a_dim,
+        uint64_t              out_b_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
 
 /* Optional Metal decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
@@ -2074,6 +2129,37 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+/* Source-F16 DeepSeek attention output.  The low projection is grouped in
+ * the GGUF as [group][rank][group_dim]; the implementation packs each
+ * group's activation rows once and evaluates the groups with a strided
+ * cuBLAS batch.  The shard form writes compact [token][group_count * rank]
+ * rows for the selected contiguous group range. */
+int ds4_gpu_attention_output_f16_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens);
+int ds4_gpu_attention_output_f16_batch_low_shard_tensor(
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups_total,
+        uint32_t              group0,
+        uint32_t              group_count,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens);
 
 int ds4_gpu_attention_output_q8_batch_shard_tensor(
         ds4_gpu_tensor       *out,

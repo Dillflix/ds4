@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -1358,6 +1359,330 @@ cleanup:
     return rc;
 }
 
+static int check_source_f16_dense_paths(void) {
+    enum {
+        group_dim = 8,
+        rank = 4,
+        n_groups = 3,
+        low_dim = rank * n_groups,
+        out_dim = 7,
+        n_tokens = 5,
+        k_off = 4,
+        k_cnt = 4,
+        x_elem_off = 2,
+    };
+    const uint64_t a_count = (uint64_t)n_groups * rank * group_dim;
+    const uint64_t b_count = (uint64_t)out_dim * low_dim;
+    const uint64_t model_count = a_count + b_count;
+    const uint64_t a_bytes = a_count * sizeof(uint16_t);
+    const uint64_t model_bytes = model_count * sizeof(uint16_t);
+    const uint64_t heads_count = (uint64_t)n_tokens * n_groups * group_dim;
+    const uint64_t low_count = (uint64_t)n_tokens * low_dim;
+    const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    uint16_t *model = (uint16_t *)calloc((size_t)model_count, sizeof(uint16_t));
+    float *heads_host = (float *)malloc((size_t)heads_count * sizeof(float));
+    float *low_expected = (float *)calloc((size_t)low_count, sizeof(float));
+    float *out_expected = (float *)calloc((size_t)out_count, sizeof(float));
+    float *low_candidate = (float *)malloc((size_t)low_count * sizeof(float));
+    float *out_candidate = (float *)malloc((size_t)out_count * sizeof(float));
+    float x_host[8];
+    float slice_expected[out_dim];
+    float slice_candidate[out_dim];
+    float pair0_expected[3];
+    float pair1_expected[5];
+    float pair0_candidate[3];
+    float pair1_candidate[5];
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(x_host));
+    ds4_gpu_tensor *slice_out = ds4_gpu_tensor_alloc(sizeof(slice_candidate));
+    ds4_gpu_tensor *pair0_out = ds4_gpu_tensor_alloc(sizeof(pair0_candidate));
+    ds4_gpu_tensor *pair1_out = ds4_gpu_tensor_alloc(sizeof(pair1_candidate));
+    int rc = 1;
+    if (!model || !heads_host || !low_expected || !out_expected ||
+        !low_candidate || !out_candidate || !heads || !low || !out ||
+        !x || !slice_out || !pair0_out || !pair1_out) goto cleanup;
+
+    /* Sparse power-of-two matrices make the expected values independent of
+     * GEMM reduction order while still detecting every group/row stride. */
+    for (uint32_t g = 0; g < n_groups; g++) {
+        for (uint32_t r = 0; r < rank; r++) {
+            const uint32_t col = (3u * r + g) % group_dim;
+            model[((uint64_t)g * rank + r) * group_dim + col] =
+                ((g + r) & 1u) ? 0xbc00u : 0x3c00u; /* -1 or +1 */
+        }
+    }
+    for (uint32_t o = 0; o < out_dim; o++) {
+        const uint32_t col = k_off + (o % k_cnt);
+        model[a_count + (uint64_t)o * low_dim + col] =
+            (o & 1u) ? 0xbc00u : 0x3c00u;
+    }
+    for (uint64_t i = 0; i < heads_count; i++) {
+        heads_host[i] = (float)((int)(i % 9u) - 4) * 0.25f;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            for (uint32_t r = 0; r < rank; r++) {
+                const uint32_t col = (3u * r + g) % group_dim;
+                const float sign = ((g + r) & 1u) ? -1.0f : 1.0f;
+                low_expected[(uint64_t)t * low_dim + g * rank + r] =
+                    sign * heads_host[((uint64_t)t * n_groups + g) *
+                                      group_dim + col];
+            }
+        }
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const float sign = (o & 1u) ? -1.0f : 1.0f;
+            out_expected[(uint64_t)t * out_dim + o] =
+                sign * low_expected[(uint64_t)t * low_dim +
+                                    k_off + (o % k_cnt)];
+        }
+    }
+    for (uint32_t i = 0; i < 8u; i++) {
+        x_host[i] = (float)((int)i - 3) * 0.5f;
+    }
+    for (uint32_t o = 0; o < out_dim; o++) {
+        const float sign = (o & 1u) ? -1.0f : 1.0f;
+        slice_expected[o] = sign * x_host[x_elem_off + (o % k_cnt)];
+    }
+    for (uint32_t r = 0; r < 3u; r++) {
+        const uint32_t col = (3u * r) % group_dim;
+        pair0_expected[r] = (r & 1u) ? -x_host[col] : x_host[col];
+    }
+    for (uint32_t r = 0; r < 5u; r++) {
+        const uint32_t matrix_row = rank + r;
+        const uint32_t g = matrix_row / rank;
+        const uint32_t gr = matrix_row % rank;
+        const uint32_t col = (3u * gr + g) % group_dim;
+        pair1_expected[r] = ((g + gr) & 1u) ? -x_host[col] : x_host[col];
+    }
+
+    if (!ds4_gpu_tensor_write(heads, 0, heads_host,
+                              heads_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(x, 0, x_host, sizeof(x_host)) ||
+        !ds4_gpu_set_model_map(model, model_bytes) ||
+        !ds4_gpu_attention_output_f16_batch_tensor(
+                out, low, model, model_bytes, 0u, a_bytes,
+                group_dim, rank, n_groups, out_dim, heads, n_tokens) ||
+        !ds4_gpu_matmul_quant_kslice_tensor(
+                slice_out, model, model_bytes, a_bytes, 1u,
+                low_dim, k_off, k_cnt, out_dim, x, x_elem_off) ||
+        !ds4_gpu_matmul_f16_pair_mixed_tensor(
+                pair0_out, pair1_out, model, model_bytes,
+                0u, (uint64_t)rank * group_dim * sizeof(uint16_t),
+                group_dim, 3u, 5u, x, 1u) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low, 0, low_candidate,
+                             low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0, out_candidate,
+                             out_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(slice_out, 0, slice_candidate,
+                             sizeof(slice_candidate)) ||
+        !ds4_gpu_tensor_read(pair0_out, 0, pair0_candidate,
+                             sizeof(pair0_candidate)) ||
+        !ds4_gpu_tensor_read(pair1_out, 0, pair1_candidate,
+                             sizeof(pair1_candidate))) {
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < low_count; i++) {
+        if (low_candidate[i] != low_expected[i]) {
+            fprintf(stderr,
+                    "source f16 grouped-A mismatch at %llu: expected=%g candidate=%g\n",
+                    (unsigned long long)i,
+                    (double)low_expected[i], (double)low_candidate[i]);
+            goto cleanup;
+        }
+    }
+    for (uint64_t i = 0; i < out_count; i++) {
+        if (out_candidate[i] != out_expected[i]) {
+            fprintf(stderr,
+                    "source f16 grouped-B mismatch at %llu: expected=%g candidate=%g\n",
+                    (unsigned long long)i,
+                    (double)out_expected[i], (double)out_candidate[i]);
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < out_dim; i++) {
+        if (slice_candidate[i] != slice_expected[i]) {
+            fprintf(stderr,
+                    "source f16 k-slice mismatch at %u: expected=%g candidate=%g\n",
+                    i, (double)slice_expected[i], (double)slice_candidate[i]);
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (pair0_candidate[i] != pair0_expected[i]) {
+            fprintf(stderr,
+                    "source f16 mixed pair0 mismatch at %u: expected=%g candidate=%g\n",
+                    i, (double)pair0_expected[i], (double)pair0_candidate[i]);
+            goto cleanup;
+        }
+    }
+    for (uint32_t i = 0; i < 5u; i++) {
+        if (pair1_candidate[i] != pair1_expected[i]) {
+            fprintf(stderr,
+                    "source f16 mixed pair1 mismatch at %u: expected=%g candidate=%g\n",
+                    i, (double)pair1_expected[i], (double)pair1_candidate[i]);
+            goto cleanup;
+        }
+    }
+    {
+        static const char label_a[] = "blk.0.attn_output_a.weight";
+        static const char label_b[] = "blk.0.attn_output_b.weight";
+        const uint64_t b_bytes = b_count * sizeof(uint16_t);
+        if (!ds4_gpu_dense_exec_audit_record(
+                    low, "attn_output_a", label_a,
+                    (uint32_t)(sizeof(label_a) - 1u), 0u, 0u,
+                    0u, group_dim, low_dim,
+                    0u, group_dim, 0u, low_dim,
+                    0u, a_bytes, 1u, group_dim, low_dim,
+                    0u, group_dim, 0u, low_dim, n_tokens) ||
+            !ds4_gpu_dense_exec_audit_record(
+                    out, "attn_output_b", label_b,
+                    (uint32_t)(sizeof(label_b) - 1u), 0u, 0u,
+                    a_bytes, low_dim, out_dim,
+                    0u, low_dim, 0u, out_dim,
+                    a_bytes, b_bytes, 1u, low_dim, out_dim,
+                    0u, low_dim, 0u, out_dim, n_tokens) ||
+            !ds4_gpu_dense_exec_audit_record(
+                    slice_out, "attn_output_b", label_b,
+                    (uint32_t)(sizeof(label_b) - 1u), 0u, 0u,
+                    a_bytes, low_dim, out_dim,
+                    k_off, k_cnt, 0u, out_dim,
+                    a_bytes, b_bytes, 1u, low_dim, out_dim,
+                    k_off, k_cnt, 0u, out_dim, 1u)) {
+            fprintf(stderr,
+                    "source f16 dense execution audit proof was rejected\n");
+            goto cleanup;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: source f16 grouped attention output and k-slice exact\n");
+    rc = 0;
+
+cleanup:
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(pair1_out);
+    ds4_gpu_tensor_free(pair0_out);
+    ds4_gpu_tensor_free(slice_out);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(heads);
+    free(out_candidate);
+    free(low_candidate);
+    free(out_expected);
+    free(low_expected);
+    free(heads_host);
+    free(model);
+    return rc;
+}
+
+static int check_source_f16_dense_audit_csv(const char *path) {
+    static const char expected_header[] =
+        "sequence,module,label,layer,token_offset,physical_device,"
+        "weight_offset,weight_bytes,weight_type,in_dim,out_dim,n_tokens,"
+        "executed_input_offset,executed_input_count,"
+        "executed_output_offset,executed_output_count,"
+        "backend,placement,result,reason\n";
+    FILE *fp = fopen(path, "rb");
+    char line[1024];
+    unsigned rows = 0u;
+    unsigned saw_a = 0u;
+    unsigned saw_b_full = 0u;
+    unsigned saw_b_slice = 0u;
+    int rc = 1;
+    if (!fp) {
+        fprintf(stderr, "source f16 dense audit CSV was not created: %s\n", path);
+        return 1;
+    }
+    if (!fgets(line, sizeof(line), fp) || strcmp(line, expected_header) != 0) {
+        fprintf(stderr, "source f16 dense audit CSV has the wrong header\n");
+        goto cleanup;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char *fields[20] = {0};
+        char *save = NULL;
+        unsigned count = 0u;
+        for (char *field = strtok_r(line, ",", &save);
+             field && count < 20u;
+             field = strtok_r(NULL, ",", &save)) {
+            fields[count++] = field;
+        }
+        if (count != 20u) {
+            fprintf(stderr,
+                    "source f16 dense audit CSV row has %u fields, expected 20\n",
+                    count);
+            goto cleanup;
+        }
+        fields[19][strcspn(fields[19], "\r\n")] = '\0';
+        if (strcmp(fields[16], "cublas_gemm_ex") != 0 ||
+            strcmp(fields[17], "local") != 0 ||
+            strcmp(fields[18], "source_f16") != 0 ||
+            strcmp(fields[19], "executed") != 0 ||
+            strtoull(fields[3], NULL, 10) != 0u ||
+            strtoull(fields[4], NULL, 10) != 0u ||
+            strtoull(fields[8], NULL, 10) != 1u) {
+            fprintf(stderr,
+                    "source f16 dense audit CSV contains an unproven row\n");
+            goto cleanup;
+        }
+        if (strcmp(fields[1], "attn_output_a") == 0 &&
+            strcmp(fields[2], "blk.0.attn_output_a.weight") == 0 &&
+            strtoull(fields[6], NULL, 10) == 0u &&
+            strtoull(fields[7], NULL, 10) == 192u &&
+            strtoull(fields[9], NULL, 10) == 8u &&
+            strtoull(fields[10], NULL, 10) == 12u &&
+            strtoull(fields[11], NULL, 10) == 5u &&
+            strtoull(fields[12], NULL, 10) == 0u &&
+            strtoull(fields[13], NULL, 10) == 8u &&
+            strtoull(fields[14], NULL, 10) == 0u &&
+            strtoull(fields[15], NULL, 10) == 12u) {
+            saw_a++;
+        } else if (strcmp(fields[1], "attn_output_b") == 0 &&
+                   strcmp(fields[2], "blk.0.attn_output_b.weight") == 0 &&
+                   strtoull(fields[6], NULL, 10) == 192u &&
+                   strtoull(fields[7], NULL, 10) == 168u &&
+                   strtoull(fields[9], NULL, 10) == 12u &&
+                   strtoull(fields[10], NULL, 10) == 7u &&
+                   strtoull(fields[14], NULL, 10) == 0u &&
+                   strtoull(fields[15], NULL, 10) == 7u) {
+            const uint64_t n_tokens = strtoull(fields[11], NULL, 10);
+            const uint64_t input_offset = strtoull(fields[12], NULL, 10);
+            const uint64_t input_count = strtoull(fields[13], NULL, 10);
+            if (n_tokens == 5u && input_offset == 0u && input_count == 12u) {
+                saw_b_full++;
+            } else if (n_tokens == 1u && input_offset == 4u &&
+                       input_count == 4u) {
+                saw_b_slice++;
+            } else {
+                fprintf(stderr,
+                        "source f16 dense audit CSV has an unexpected B rectangle\n");
+                goto cleanup;
+            }
+        } else {
+            fprintf(stderr,
+                    "source f16 dense audit CSV has an unexpected payload identity\n");
+            goto cleanup;
+        }
+        rows++;
+    }
+    if (rows != 3u || saw_a != 1u || saw_b_full != 1u || saw_b_slice != 1u) {
+        fprintf(stderr,
+                "source f16 dense audit CSV coverage mismatch: "
+                "rows=%u a=%u b_full=%u b_slice=%u\n",
+                rows, saw_a, saw_b_full, saw_b_slice);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: source f16 dense execution audit CSV exact\n");
+    rc = 0;
+
+cleanup:
+    fclose(fp);
+    return rc;
+}
+
 int main(void) {
     /* The regression owns the path and both halves of each new A/B.  Do not
      * let a debug shell silently change tile width, row span, MMA eligibility,
@@ -1404,15 +1729,29 @@ int main(void) {
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
+    char dense_audit_path[] = "/tmp/ds4-dense-exec-smoke-XXXXXX";
+    const int dense_audit_fd = mkstemp(dense_audit_path);
+    if (dense_audit_fd < 0) return 1;
+    if (close(dense_audit_fd) != 0 || unlink(dense_audit_path) != 0 ||
+        setenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV", dense_audit_path, 1) != 0) {
+        (void)unlink(dense_audit_path);
+        return 1;
+    }
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
-    if (!idle_model_map) return 1;
+    if (!idle_model_map) {
+        (void)unsetenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
+        return 1;
+    }
     if (!ds4_gpu_init()) {
         free(idle_model_map);
+        (void)unsetenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
         return 1;
     }
     if (!retire_temporary_model_map()) {
         ds4_gpu_cleanup();
         free(idle_model_map);
+        (void)unlink(dense_audit_path);
+        (void)unsetenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
         return 1;
     }
     int rc = check_sm75_q8_mma_exact();
@@ -1422,7 +1761,11 @@ int main(void) {
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
+    if (check_source_f16_dense_paths() != 0) rc = 1;
     ds4_gpu_cleanup();
+    if (check_source_f16_dense_audit_csv(dense_audit_path) != 0) rc = 1;
+    (void)unlink(dense_audit_path);
+    (void)unsetenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
     free(idle_model_map);
     idle_model_map = NULL;
     if (rc == 0) puts("cuda long-context regression: OK");

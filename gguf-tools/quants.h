@@ -74,6 +74,8 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);
+bool ds4q_f32_to_f16_checked_row(const float *src, uint16_t *dst, int64_t n,
+                                  int64_t *bad_index);
 void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n);
 
 /* Internal IQ2_XXS search tables shared with the optional CUDA encoder. */

@@ -1,4 +1,5 @@
 deepseek4-quantize
+test-source-f16-checked
 gguf-requantize-dense
 quality-testing/score_official
 quality-testing/score_llama

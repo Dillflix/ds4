@@ -498,6 +498,96 @@ Return `q8-fp16-full-quality-<timestamp>.tar.gz`. A valid archive has
 `Experiment integrity: PASS`; the quality gate is a measured result and may
 independently pass or fail.
 
+### Primary dense decode A/B: native Q8 versus source-derived F16
+
+`cuda-dense-f16-decode-ab.sh` is the acceptance experiment for the dense-weight
+storage decision. It compares only the two deployment endpoints:
+
+- stored Q8_0 weights with native exact SM75 Q8 execution; and
+- dense weights converted from the original HF tensor representation to stored
+  F16, with cuBLAS execution.
+
+The second arm is called *source-derived* because an HF tensor may itself be FP8
+plus scale, BF16, or F16. It does not claim to recover an unpublished pre-FP8
+master weight. Q8-derived F16 remains a separate attribution diagnostic; it is
+not run by, required by, or allowed to gate this primary result.
+
+Both model variables and the producer provenance sidecar are mandatory absolute
+paths. Before loading either large payload, the runner reads only the GGUF
+headers/directories and requires the exact 344-name inventory: eight fixed dense
+tensors in every layer 0--42. The Q8 model must store all 344 as Q8_0 and the
+source-derived model must store all 344 as F16. Every non-target tensor name,
+shape, and type must match; both files' payload extents must be valid; and the
+raw GGUF KV metadata records must be byte-identical.
+
+The sidecar must qualify the exact `7872f01b...` snapshot path and record each
+indexed shard name, resolved-path basename, and size. It also states that
+shard-content authentication was not performed. Large model/shard payloads are
+deliberately not hashed; non-target payload identity relies on the producer's recorded
+copy-through guarantee. The index, config, quantizer binary, provenance sidecar,
+and test/runtime binaries are small enough to hash and are hashed. The runner
+holds the producer's publication lock in shared mode and verifies both models'
+byte count, device, inode, and modification time before every load, detecting a
+same-size replacement without rereading a 100+ GiB payload.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL_Q8="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export MODEL_SOURCE_F16="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-DenseSourceF16-SM75.gguf"
+export SOURCE_F16_PROVENANCE="${MODEL_SOURCE_F16%.gguf}.source-f16.provenance.txt"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+GEN_TOKENS=128 \
+REPEATS=4 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-dense-f16-decode-ab.sh
+```
+
+The un-timed 100-case `score_official --production-path` phase exports
+`DS4_CUDA_DENSE_EXEC_AUDIT_CSV`. Its common schema is `sequence,module,label,
+layer,token_offset,physical_device,weight_offset,weight_bytes,weight_type,
+in_dim,out_dim,n_tokens,executed_input_offset,executed_input_count,
+executed_output_offset,executed_output_count,backend,placement,result,
+reason`. Canonical dimensions identify the stored tensor while the executed
+rectangle records the exact row/K slice proven by the CUDA leaf. The summarizer
+joins every record's canonical payload offset and byte count to the generated
+per-model GGUF inventory, unions the execution rectangles, and rejects even one
+wrong or uncovered weight region; a single successful TP half cannot masquerade
+as full-tensor coverage. It also requires exact labels, one-token execution
+coverage for all 344 tensors, backends
+`sm75_native_q8` plus `sm75_native_q8_fused_shared_mid`/result `native_q8`
+for the control, backend
+`cublas_gemm_ex`/result `source_f16` for the candidate, reason `executed`, local
+placement except for proven local/partner balanced shared-middle execution, and
+no unknown module or fallback record. Every layer's native shared gate and up
+must have an explicit fused one-token proof; the comparison does not disable a
+Q8-only production optimization merely to make the arithmetic topologies look
+the same.
+
+The timed phase performs exact AB/BA rotation for four repeats by default and
+measures both prefill and positive-token decode at exactly 2K, 8K, and 32K.
+Dense audit instrumentation is disabled during every timed run. GPU memory is
+sampled separately. The physical-device comparison refuses inherited
+`CUDA_VISIBLE_DEVICES`/`NVIDIA_VISIBLE_DEVICES` remapping, forces
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, and requires runtime validation of all four
+directions across the 0<->1 and 2<->3 NVLink pairs in every quality and timed
+log; a host-bounce fallback invalidates the evidence. Every artifact referenced
+by the manifest/run table is
+root-relative, and the archive includes the actual `git diff`, relevant
+untracked source contents (or an explicit clean marker), compiler/runtime
+versions, and small-binary hashes. Return
+`dense-f16-decode-ab-<timestamp>.tar.gz`; `summary.md` reports production
+coverage, official quality, median prefill/decode tokens/s, and geomean ratios.
+
+The script fails before a model load if the built binaries do not expose the
+exact dense-execution audit markers. This is a fail-closed boundary, not
+permission to infer coverage from a requested environment variable.
+
 ### T256 execution-placement A/B
 
 Each of the 43 layers has one active T256 output-B GEMM and one logical cache

@@ -55,6 +55,10 @@
 #define DS4_KV_Q4_ROUTED_LAYOUT_VERSION    "ds4.routed_expert.q4.layout_version"
 #define DS4_Q4_ROUTED_LAYOUT_SM75_NATIVE   "sm75_m8n8k32_native_aw_v1"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
+#define DS4_SOURCE_F16_CORE_LAYERS 43
+#define DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER 8
+#define DS4_SOURCE_F16_CORE_TENSOR_COUNT \
+    (DS4_SOURCE_F16_CORE_LAYERS * DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER)
 
 typedef enum {
     GGUF_TYPE_UINT8   = 0,
@@ -234,6 +238,7 @@ static int json_add(json_doc *d, json_type type, int start, int end, int parent)
 }
 
 static json_doc json_parse_text(const char *js, size_t len) {
+    if (len > (size_t)INT_MAX) die("JSON document is too large");
     json_doc d = { .js = js, .js_len = (int)len };
     int parent = -1;
     for (int i = 0; i < (int)len; i++) {
@@ -323,9 +328,14 @@ static int64_t json_i64(const json_doc *d, int tok) {
     char tmp[64];
     const int n = d->v[tok].end - d->v[tok].start;
     if (n <= 0 || n >= (int)sizeof(tmp)) die("bad JSON integer");
+    if (d->v[tok].type != JT_PRIMITIVE) die("bad JSON integer type");
     memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
     tmp[n] = '\0';
-    return strtoll(tmp, NULL, 10);
+    errno = 0;
+    char *end = NULL;
+    const long long value = strtoll(tmp, &end, 10);
+    if (errno != 0 || end != tmp + n) die("bad JSON integer");
+    return (int64_t)value;
 }
 
 /* =====
@@ -351,7 +361,7 @@ static uint64_t fnv1a_str(const char *s) {
     return h;
 }
 
-static void hmap_build(hmap *m, char **keys, int n) {
+static void hmap_build(hmap *m, char **keys, int n, const char *kind) {
     int cap = 1;
     while (cap < n * 3) cap <<= 1;
     m->cap = cap ? cap : 2;
@@ -359,7 +369,14 @@ static void hmap_build(hmap *m, char **keys, int n) {
     for (int i = 0; i < n; i++) {
         uint64_t h = fnv1a_str(keys[i]);
         int p = (int)(h & (uint64_t)(m->cap - 1));
-        while (m->slots[p].key) p = (p + 1) & (m->cap - 1);
+        while (m->slots[p].key) {
+            if (strcmp(m->slots[p].key, keys[i]) == 0) {
+                fprintf(stderr, "error: duplicate %s name: %s\n",
+                        kind ? kind : "map", keys[i]);
+                exit(1);
+            }
+            p = (p + 1) & (m->cap - 1);
+        }
         m->slots[p].key = keys[i];
         m->slots[p].value = i;
     }
@@ -451,12 +468,38 @@ static void parse_shape(const json_doc *d, int arr_tok, st_info *info, const cha
     int nd = 0;
     for (int i = arr_tok + 1; i < d->len && d->v[i].parent == arr_tok; i = json_skip(d, i)) {
         if (nd >= MAX_DIMS) die("too many safetensors dimensions");
-        info->shape[nd++] = json_i64(d, i);
+        const int64_t extent = json_i64(d, i);
+        if (extent < 0) {
+            fprintf(stderr, "error: negative safetensors dimension for %s\n",
+                    name);
+            exit(1);
+        }
+        info->shape[nd++] = extent;
     }
     info->n_dims = nd;
 }
 
+static bool safetensors_shard_path_is_safe(const char *path) {
+    if (!path || !path[0] || path[0] == '/' || path[0] == '\\') return false;
+    const char *component = path;
+    for (const char *p = path;; p++) {
+        if (*p != '/' && *p != '\\' && *p != '\0') continue;
+        const size_t n = (size_t)(p - component);
+        if (n == 0 || (n == 2 && component[0] == '.' && component[1] == '.')) {
+            return false;
+        }
+        if (*p == '\0') break;
+        component = p + 1;
+    }
+    return true;
+}
+
 static int db_find_shard(st_db *db, const char *file) {
+    if (!safetensors_shard_path_is_safe(file)) {
+        fprintf(stderr, "error: unsafe safetensors shard path in index: %s\n",
+                file ? file : "(null)");
+        exit(1);
+    }
     for (int i = 0; i < db->n_shards; i++) {
         if (strcmp(db->shards[i].file, file) == 0) return i;
     }
@@ -480,11 +523,77 @@ static void shard_add_tensor(shard *s, char *name, st_info info) {
     s->tensors[s->n_tensors++] = (tensor_entry){ .name = name, .info = info };
 }
 
+static int tensor_entry_extent_cmp(const void *lhs, const void *rhs) {
+    const tensor_entry *const *a = lhs;
+    const tensor_entry *const *b = rhs;
+    if ((*a)->info.begin < (*b)->info.begin) return -1;
+    if ((*a)->info.begin > (*b)->info.begin) return 1;
+    if ((*a)->info.end < (*b)->info.end) return -1;
+    if ((*a)->info.end > (*b)->info.end) return 1;
+    return strcmp((*a)->name, (*b)->name);
+}
+
+static void validate_shard_extents(const shard *s, int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) die_errno("stat safetensors shard", s->path);
+    if (st.st_size < 0 || (uint64_t)st.st_size < s->data_base) {
+        fprintf(stderr,
+                "error: safetensors shard header exceeds file size: %s\n",
+                s->path);
+        exit(1);
+    }
+    tensor_entry **ordered = xmalloc((size_t)s->n_tensors * sizeof(ordered[0]));
+    for (int i = 0; i < s->n_tensors; i++) ordered[i] = &s->tensors[i];
+    qsort(ordered, (size_t)s->n_tensors, sizeof(ordered[0]),
+          tensor_entry_extent_cmp);
+    uint64_t previous_end = 0;
+    const char *previous_name = NULL;
+    for (int i = 0; i < s->n_tensors; i++) {
+        const tensor_entry *te = ordered[i];
+        if (te->info.end < te->info.begin) {
+            fprintf(stderr,
+                    "error: safetensors tensor %s has descending payload "
+                    "offsets in %s\n",
+                    te->name, s->path);
+            exit(1);
+        }
+        if (i > 0 && te->info.begin < previous_end) {
+            fprintf(stderr,
+                    "error: safetensors tensor payloads overlap in %s: "
+                    "%s begins at %" PRIu64 " before %s ends at %" PRIu64
+                    "\n",
+                    s->path, te->name, te->info.begin,
+                    previous_name ? previous_name : "previous tensor",
+                    previous_end);
+            exit(1);
+        }
+        if (te->info.end > (uint64_t)st.st_size - s->data_base) {
+            fprintf(stderr,
+                    "error: safetensors tensor %s is truncated in %s: "
+                    "payload_end=%" PRIu64 " available=%" PRIu64 "\n",
+                    te->name, s->path, te->info.end,
+                    (uint64_t)st.st_size - s->data_base);
+            exit(1);
+        }
+        previous_end = te->info.end;
+        previous_name = te->name;
+    }
+    free(ordered);
+}
+
 static void shard_load(shard *s) {
     if (s->loaded) return;
     FILE *fp = fopen(s->path, "rb");
     if (!fp) die_errno("open", s->path);
     uint64_t header_len = read_u64_le_fp(fp, "safetensors header length");
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0) die_errno("stat safetensors shard", s->path);
+    if (st.st_size < 8 || header_len > (uint64_t)st.st_size - 8 ||
+        header_len > (uint64_t)INT_MAX || header_len > (uint64_t)SIZE_MAX - 1) {
+        fprintf(stderr, "error: invalid safetensors header length in %s\n",
+                s->path);
+        exit(1);
+    }
     char *header = xmalloc((size_t)header_len + 1);
     if (fread(header, 1, (size_t)header_len, fp) != (size_t)header_len) die_errno("read header", s->path);
     header[header_len] = '\0';
@@ -502,12 +611,18 @@ static void shard_load(shard *s) {
             int dtype = json_obj_get(&d, v, "dtype");
             int shape = json_obj_get(&d, v, "shape");
             int offsets = json_obj_get(&d, v, "data_offsets");
-            if (dtype < 0 || shape < 0 || offsets < 0) die("bad safetensors tensor entry");
+            if (dtype < 0 || shape < 0 || offsets < 0 ||
+                d.v[dtype].type != JT_STRING ||
+                d.v[shape].type != JT_ARRAY ||
+                d.v[offsets].type != JT_ARRAY) {
+                die("bad safetensors tensor entry");
+            }
             info.dtype = json_strdup_tok(&d, dtype);
             parse_shape(&d, shape, &info, name);
             int n_off = 0;
             for (int j = offsets + 1; j < d.len && d.v[j].parent == offsets; j = json_skip(&d, j)) {
                 int64_t x = json_i64(&d, j);
+                if (x < 0) die("negative safetensors data offset");
                 if (n_off == 0) info.begin = (uint64_t)x;
                 else if (n_off == 1) info.end = (uint64_t)x;
                 n_off++;
@@ -519,7 +634,9 @@ static void shard_load(shard *s) {
     }
     char **keys = xmalloc((size_t)s->n_tensors * sizeof(keys[0]));
     for (int i = 0; i < s->n_tensors; i++) keys[i] = s->tensors[i].name;
-    hmap_build(&s->tensor_map, keys, s->n_tensors);
+    hmap_build(&s->tensor_map, keys, s->n_tensors,
+               "safetensors shard tensor");
+    validate_shard_extents(s, fileno(fp));
     free(keys);
     json_free(&d);
     free(header);
@@ -535,6 +652,9 @@ static void db_open(st_db *db, const char *hf_dir) {
     size_t len = 0;
     char *text = read_file(index_path, &len);
     json_doc d = json_parse_text(text, len);
+    if (d.len < 1 || d.v[0].type != JT_OBJECT) {
+        die("bad safetensors index root");
+    }
     int weight_map = json_obj_get(&d, 0, "weight_map");
     if (weight_map < 0 || d.v[weight_map].type != JT_OBJECT) die("safetensors index has no weight_map");
 
@@ -543,6 +663,10 @@ static void db_open(st_db *db, const char *hf_dir) {
     for (int i = weight_map + 1; i < d.len && d.v[i].parent == weight_map;) {
         int k = i;
         int v = i + 1;
+        if (v >= d.len || d.v[v].parent != weight_map ||
+            d.v[k].type != JT_STRING || d.v[v].type != JT_STRING) {
+            die("bad safetensors weight_map entry");
+        }
         if (db->n_weights == cap) {
             cap *= 2;
             db->weights = xrealloc(db->weights, (size_t)cap * sizeof(db->weights[0]));
@@ -557,7 +681,8 @@ static void db_open(st_db *db, const char *hf_dir) {
         keys[i] = db->weights[i].name;
         db_find_shard(db, db->weights[i].file);
     }
-    hmap_build(&db->weight_map, keys, db->n_weights);
+    hmap_build(&db->weight_map, keys, db->n_weights,
+               "safetensors index weight");
     free(keys);
     json_free(&d);
     free(text);
@@ -815,7 +940,7 @@ static void imatrix_load(imatrix_store *im, const char *path, bool strict) {
     fclose(fp);
     char **keys = xmalloc((size_t)n_entries * sizeof(keys[0]));
     for (int i = 0; i < n_entries; i++) keys[i] = im->entries[i].name;
-    hmap_build(&im->map, keys, n_entries);
+    hmap_build(&im->map, keys, n_entries, "imatrix entry");
     free(keys);
     fprintf(stderr, "loaded imatrix %s: %d entries%s%s\n",
             path, n_entries, im->dataset ? ", dataset=" : "", im->dataset ? im->dataset : "");
@@ -1012,6 +1137,75 @@ typedef struct {
     type_override *overrides;
     int n_overrides;
 } quant_policy;
+
+typedef struct {
+    const char *suffix;
+    int64_t ne0;
+    int64_t ne1;
+} source_f16_core_spec;
+
+static const source_f16_core_spec source_f16_core_specs[] = {
+    { "attn_q_a.weight",       4096,  1024 },
+    { "attn_q_b.weight",       1024, 32768 },
+    { "attn_kv.weight",        4096,   512 },
+    { "attn_output_a.weight",  4096,  8192 },
+    { "attn_output_b.weight",  8192,  4096 },
+    { "ffn_gate_shexp.weight", 4096,  2048 },
+    { "ffn_up_shexp.weight",   4096,  2048 },
+    { "ffn_down_shexp.weight", 2048,  4096 },
+};
+
+_Static_assert(sizeof(source_f16_core_specs) /
+                   sizeof(source_f16_core_specs[0]) ==
+               DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER,
+               "source-F16 family inventory must contain exactly eight tensors");
+
+static void source_f16_core_name(char *dst, size_t dst_size,
+                                 int layer, int family) {
+    if (family < 0 ||
+        family >= DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER) {
+        die("internal source-F16 family index is out of range");
+    }
+    const int n = snprintf(dst, dst_size, "blk.%d.%s", layer,
+                           source_f16_core_specs[family].suffix);
+    if (n < 0 || (size_t)n >= dst_size) {
+        die("internal source-F16 tensor name buffer is too small");
+    }
+}
+
+static int source_f16_core_family(const char *name, int *layer_out) {
+    if (!str_starts(name, "blk.")) return -1;
+    const char *layer_text = name + strlen("blk.");
+    errno = 0;
+    char *suffix = NULL;
+    const long parsed_layer = strtol(layer_text, &suffix, 10);
+    if (errno != 0 || suffix == layer_text || *suffix != '.' ||
+        parsed_layer < 0 || parsed_layer > INT_MAX) {
+        return -1;
+    }
+    suffix++;
+    for (int family = 0;
+         family < DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER;
+         family++) {
+        if (strcmp(suffix, source_f16_core_specs[family].suffix) != 0) {
+            continue;
+        }
+        char canonical[128];
+        source_f16_core_name(canonical, sizeof(canonical),
+                             (int)parsed_layer, family);
+        if (strcmp(name, canonical) != 0) return -1;
+        if (layer_out) *layer_out = (int)parsed_layer;
+        return family;
+    }
+    return -1;
+}
+
+static int source_f16_core_slot(const char *name) {
+    int layer = -1;
+    const int family = source_f16_core_family(name, &layer);
+    if (family < 0 || layer >= DS4_SOURCE_F16_CORE_LAYERS) return -1;
+    return layer * DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER + family;
+}
 
 static bool is_attention_projection(const char *name) {
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
@@ -1252,10 +1446,21 @@ static void check_reversed_shape_exact(const char *gguf_name, const st_info *inf
 static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char *hf_name,
                                     const tensor_meta *tmpl, ds4q_type target,
                                     const imatrix_store *imatrix,
-                                    bool exact_rank) {
+                                    bool exact_rank,
+                                    bool checked_source_f16) {
     tensor_entry *te = db_tensor(db, hf_name, NULL);
     if (exact_rank) check_reversed_shape_exact(gguf_name, &te->info, tmpl);
     else check_reversed_shape(gguf_name, &te->info, tmpl);
+    if (checked_source_f16 &&
+        strcmp(te->info.dtype, "F8_E4M3") != 0 &&
+        strcmp(te->info.dtype, "BF16") != 0 &&
+        strcmp(te->info.dtype, "F16") != 0) {
+        fprintf(stderr,
+                "error: source-derived F16 tensor %s has unsupported HF "
+                "dtype %s; expected F8_E4M3+F8_E8M0 scale, BF16, or F16\n",
+                gguf_name, te->info.dtype);
+        exit(1);
+    }
     if (target == DS4Q_TYPE_I32) {
         st_value sv = db_read(db, hf_name);
         byte_buf b = i64_to_i32(&sv);
@@ -1272,6 +1477,28 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
         if (!db_has(db, scale_name)) die("missing FP8 scale tensor");
         st_value w = db_read(db, hf_name);
         st_value s = db_read(db, scale_name);
+        if (checked_source_f16) {
+            for (size_t i = 0; i < w.nbytes; i++) {
+                if ((w.data[i] & UINT8_C(0x7f)) == UINT8_C(0x7f)) {
+                    fprintf(stderr,
+                            "error: source-derived F16 tensor %s has a "
+                            "non-finite F8_E4M3 value at element %zu\n",
+                            gguf_name, i);
+                    exit(1);
+                }
+            }
+            if (strcmp(s.dtype, "F8_E8M0") == 0) {
+                for (size_t i = 0; i < s.nbytes; i++) {
+                    if (s.data[i] == UINT8_C(0xff)) {
+                        fprintf(stderr,
+                                "error: source-derived F16 tensor %s has a "
+                                "non-finite F8_E8M0 scale at block %zu\n",
+                                gguf_name, i);
+                        exit(1);
+                    }
+                }
+            }
+        }
         f32 = dequant_fp8_weight(&w, &s, &n);
         st_value_free(&w);
         st_value_free(&s);
@@ -1281,10 +1508,30 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
     }
-    const char *names[2] = { gguf_name, hf_name };
-    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
-    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat,
-                             quant_cuda_device_for_worker(0));
+    byte_buf b = {0};
+    if (checked_source_f16) {
+        if (target != DS4Q_TYPE_F16) {
+            die("internal checked source-F16 conversion has a non-F16 target");
+        }
+        b.size = (size_t)n * sizeof(uint16_t);
+        b.data = xmalloc(b.size);
+        int64_t bad_index = -1;
+        if (!ds4q_f32_to_f16_checked_row(f32, (uint16_t *)b.data, n,
+                                          &bad_index)) {
+            fprintf(stderr,
+                    "error: source-derived F16 tensor %s has a non-finite or "
+                    "out-of-F16-range value at element %" PRId64 " (%.9g)\n",
+                    gguf_name, bad_index,
+                    bad_index >= 0 && bad_index < n ? f32[bad_index] : NAN);
+            exit(1);
+        }
+        fprintf(stderr, "       source %s -> f16 (checked)\n", te->info.dtype);
+    } else {
+        const char *names[2] = { gguf_name, hf_name };
+        const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+        b = f32_to_type(f32, n, target, tmpl->ne[0], imat,
+                        quant_cuda_device_for_worker(0));
+    }
     free(f32);
     return b;
 }
@@ -1292,7 +1539,21 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
 static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                  ds4q_type target, const imatrix_store *imatrix) {
     char *hf_name = hf_name_for_regular(gguf_name);
-    byte_buf b = generate_regular_hf(db, gguf_name, hf_name, tmpl, target, imatrix, false);
+    byte_buf b = generate_regular_hf(db, gguf_name, hf_name, tmpl, target,
+                                     imatrix, false, false);
+    free(hf_name);
+    return b;
+}
+
+static byte_buf generate_source_f16_core_tensor(st_db *db,
+                                                 const char *gguf_name,
+                                                 const tensor_meta *tmpl) {
+    if (source_f16_core_slot(gguf_name) < 0) {
+        die("internal source-F16 generator received an unselected tensor");
+    }
+    char *hf_name = hf_name_for_regular(gguf_name);
+    byte_buf b = generate_regular_hf(db, gguf_name, hf_name, tmpl,
+                                     DS4Q_TYPE_F16, NULL, true, true);
     free(hf_name);
     return b;
 }
@@ -1681,7 +1942,8 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
-static gguf_file load_gguf_metadata(const char *path) {
+static gguf_file load_gguf_metadata_with_kv_policy(const char *path,
+                                                    bool preserve_quant_kvs) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     FILE *fp = fopen(path, "rb");
@@ -1742,7 +2004,8 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key) && !is_q4_layout_kv_key(key)) {
+        if (preserve_quant_kvs ||
+            (!is_imatrix_kv_key(key) && !is_q4_layout_kv_key(key))) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1790,10 +2053,14 @@ static gguf_file load_gguf_metadata(const char *path) {
     g.data_offset = ds4q_pad((size_t)meta_end, g.alignment);
     char **keys = xmalloc((size_t)g.n_tensors * sizeof(keys[0]));
     for (uint64_t i = 0; i < g.n_tensors; i++) keys[i] = g.tensors[i].name;
-    hmap_build(&g.tensor_map, keys, (int)g.n_tensors);
+    hmap_build(&g.tensor_map, keys, (int)g.n_tensors, "GGUF tensor");
     free(keys);
     fclose(fp);
     return g;
+}
+
+static gguf_file load_gguf_metadata(const char *path) {
+    return load_gguf_metadata_with_kv_policy(path, false);
 }
 
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
@@ -1821,14 +2088,166 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
+static void validate_source_f16_core_inventory(const gguf_file *tmpl) {
+    bool seen[DS4_SOURCE_F16_CORE_TENSOR_COUNT] = {false};
+    size_t selected = 0;
+    for (uint64_t i = 0; i < tmpl->n_tensors; i++) {
+        const tensor_meta *t = &tmpl->tensors[i];
+        int parsed_layer = -1;
+        if (source_f16_core_family(t->name, &parsed_layer) >= 0 &&
+            parsed_layer >= DS4_SOURCE_F16_CORE_LAYERS) {
+            fprintf(stderr,
+                    "error: source-F16 template has a core-dense tensor "
+                    "outside Flash layers 0..42: %s\n",
+                    t->name);
+            exit(1);
+        }
+        const int slot = source_f16_core_slot(t->name);
+        if (slot < 0) continue;
+        if (seen[slot]) {
+            fprintf(stderr, "error: duplicate source-F16 tensor in template: %s\n",
+                    t->name);
+            exit(1);
+        }
+        seen[slot] = true;
+        selected++;
+        const int family = slot % DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER;
+        const source_f16_core_spec *spec = &source_f16_core_specs[family];
+        if (t->n_dims != 2 ||
+            t->ne[0] != spec->ne0 || t->ne[1] != spec->ne1) {
+            fprintf(stderr,
+                    "error: source-F16 tensor %s has shape [%" PRId64
+                    ", %" PRId64 "] rank=%d; expected [%" PRId64
+                    ", %" PRId64 "] rank=2\n",
+                    t->name, t->ne[0], t->ne[1], t->n_dims,
+                    spec->ne0, spec->ne1);
+            exit(1);
+        }
+    }
+    if (selected != DS4_SOURCE_F16_CORE_TENSOR_COUNT) {
+        for (int slot = 0; slot < DS4_SOURCE_F16_CORE_TENSOR_COUNT; slot++) {
+            if (seen[slot]) continue;
+            char missing[128];
+            source_f16_core_name(
+                missing, sizeof(missing),
+                slot / DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER,
+                slot % DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER);
+            fprintf(stderr,
+                    "error: source-F16 template is missing required tensor: %s\n",
+                    missing);
+            exit(1);
+        }
+        die("source-F16 template does not contain exactly 344 selected tensors");
+    }
+}
+
+static void validate_source_f16_hf_payload_extent(
+        const char *name, const tensor_entry *te, const shard *s,
+        uint64_t expected_bytes) {
+    if (te->info.end < te->info.begin ||
+        te->info.end - te->info.begin != expected_bytes) {
+        fprintf(stderr,
+                "error: HF tensor %s has payload bytes %" PRIu64
+                ", expected %" PRIu64 "\n",
+                name, te->info.end >= te->info.begin
+                    ? te->info.end - te->info.begin : UINT64_MAX,
+                expected_bytes);
+        exit(1);
+    }
+    struct stat st;
+    if (stat(s->path, &st) != 0) die_errno("stat", s->path);
+    if (te->info.end > UINT64_MAX - s->data_base) {
+        fprintf(stderr,
+                "error: HF tensor %s payload extent overflows in %s\n",
+                name, s->path);
+        exit(1);
+    }
+    const uint64_t payload_end = s->data_base + te->info.end;
+    if (st.st_size < 0 || (uint64_t)st.st_size < payload_end) {
+        fprintf(stderr,
+                "error: HF tensor %s is truncated in %s: end=%" PRIu64
+                " file_bytes=%" PRIu64 "\n",
+                name, s->path, payload_end,
+                st.st_size < 0 ? 0u : (uint64_t)st.st_size);
+        exit(1);
+    }
+}
+
+static void validate_source_f16_hf_inventory(st_db *db,
+                                              const gguf_file *tmpl) {
+    validate_source_f16_core_inventory(tmpl);
+    for (int slot = 0; slot < DS4_SOURCE_F16_CORE_TENSOR_COUNT; slot++) {
+        char gguf_name[128];
+        source_f16_core_name(
+            gguf_name, sizeof(gguf_name),
+            slot / DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER,
+            slot % DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER);
+        const int idx = hmap_get(&tmpl->tensor_map, gguf_name);
+        if (idx < 0 || (uint64_t)idx >= tmpl->n_tensors) {
+            die("internal source-F16 HF preflight lookup failed");
+        }
+        const tensor_meta *tensor = &tmpl->tensors[idx];
+        char *hf_name = hf_name_for_regular(gguf_name);
+        shard *weight_shard = NULL;
+        tensor_entry *weight = db_tensor(db, hf_name, &weight_shard);
+        check_reversed_shape_exact(gguf_name, &weight->info, tensor);
+        const uint64_t elements = (uint64_t)tensor->ne[0] *
+                                  (uint64_t)tensor->ne[1];
+        if (strcmp(weight->info.dtype, "F8_E4M3") == 0) {
+            validate_source_f16_hf_payload_extent(
+                hf_name, weight, weight_shard, elements);
+            char *scale_name = xstrdup(hf_name);
+            strcpy(scale_name + strlen(scale_name) - strlen(".weight"),
+                   ".scale");
+            shard *scale_shard = NULL;
+            tensor_entry *scale = db_tensor(db, scale_name, &scale_shard);
+            if (strcmp(scale->info.dtype, "F8_E8M0") != 0 ||
+                scale->info.n_dims != 2 || weight->info.n_dims != 2 ||
+                weight->info.shape[0] % 128 != 0 ||
+                weight->info.shape[1] % 128 != 0 ||
+                scale->info.shape[0] != weight->info.shape[0] / 128 ||
+                scale->info.shape[1] != weight->info.shape[1] / 128) {
+                fprintf(stderr,
+                        "error: source-derived F16 tensor %s has an invalid "
+                        "F8_E8M0 scale tensor %s\n",
+                        gguf_name, scale_name);
+                exit(1);
+            }
+            const uint64_t scale_elements =
+                (uint64_t)scale->info.shape[0] *
+                (uint64_t)scale->info.shape[1];
+            validate_source_f16_hf_payload_extent(
+                scale_name, scale, scale_shard, scale_elements);
+            free(scale_name);
+        } else if (strcmp(weight->info.dtype, "BF16") == 0 ||
+                   strcmp(weight->info.dtype, "F16") == 0) {
+            validate_source_f16_hf_payload_extent(
+                hf_name, weight, weight_shard, elements * sizeof(uint16_t));
+        } else {
+            fprintf(stderr,
+                    "error: source-derived F16 tensor %s has unsupported HF "
+                    "dtype %s; expected F8_E4M3+F8_E8M0 scale, BF16, or F16\n",
+                    gguf_name, weight->info.dtype);
+            exit(1);
+        }
+        free(hf_name);
+    }
+    printf("source_f16_hf_headers_validated: %d\n",
+           DS4_SOURCE_F16_CORE_TENSOR_COUNT);
+}
+
 static output_context build_output_context(const gguf_file *tmpl,
                                            const quant_policy *policy,
                                            const imatrix_store *im,
-                                           bool sm75_native_q4) {
+                                           bool sm75_native_q4,
+                                           bool source_f16_core_dense) {
+    if (source_f16_core_dense) validate_source_f16_core_inventory(tmpl);
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im) +
-                     extra_q4_layout_kv_count(sm75_native_q4);
+    out.n_kv_extra = source_f16_core_dense
+        ? 0
+        : extra_imatrix_kv_count(im) +
+          extra_q4_layout_kv_count(sm75_native_q4);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1838,9 +2257,14 @@ static output_context build_output_context(const gguf_file *tmpl,
         tensor_meta *dst = &out.tensors[i];
         *dst = *src;
         dst->name = src->name;
-        ds4q_type type = policy_type(policy, src->name, src);
+        ds4q_type type = source_f16_core_dense
+            ? (source_f16_core_slot(src->name) >= 0
+                   ? DS4Q_TYPE_F16
+                   : src->type)
+            : policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
-        if (sm75_native_q4 && parse_expert_tensor(src->name).is_expert &&
+        if (!source_f16_core_dense && sm75_native_q4 &&
+            parse_expert_tensor(src->name).is_expert &&
             type == DS4Q_TYPE_Q4_K) {
             if (src->ne[0] % 256 != 0 || src->ne[1] % 8 != 0) {
                 fprintf(stderr,
@@ -1849,8 +2273,15 @@ static output_context build_output_context(const gguf_file *tmpl,
                 exit(1);
             }
         }
-        if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        if (!source_f16_core_dense) {
+            if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) {
+                die("unsupported planned tensor type");
+            }
+            if (ds4q_can_quantize(type) &&
+                src->ne[0] % ds4q_block_size(type) != 0) {
+                die("ne[0] not divisible by block size");
+            }
+        }
         dst->type = type;
         dst->size = tensor_nbytes(type, src->ne, src->n_dims);
         dst->new_offset = off;
@@ -1859,8 +2290,11 @@ static output_context build_output_context(const gguf_file *tmpl,
     }
     out.tensor_bytes = off;
     out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
-                    extra_imatrix_kv_size(im) +
-                    extra_q4_layout_kv_size(sm75_native_q4) + tensor_info;
+                    (source_f16_core_dense ? 0 : extra_imatrix_kv_size(im)) +
+                    (source_f16_core_dense
+                         ? 0
+                         : extra_q4_layout_kv_size(sm75_native_q4)) +
+                    tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1874,10 +2308,23 @@ static void write_padding(FILE *fp, size_t n) {
     }
 }
 
+static void copy_exact_bytes(FILE *src, FILE *dst, size_t n,
+                             uint8_t *scratch, size_t scratch_size,
+                             const char *src_path, const char *dst_path);
+
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
                             const imatrix_store *imatrix,
-                            bool sm75_native_q4) {
+                            bool sm75_native_q4,
+                            bool source_f16_core_dense) {
+    enum { COPY_CHUNK = 16 * 1024 * 1024 };
+    FILE *template_fp = NULL;
+    uint8_t *copy_scratch = NULL;
+    if (source_f16_core_dense) {
+        template_fp = fopen(tmpl->path, "rb");
+        if (!template_fp) die_errno("open template GGUF", tmpl->path);
+        copy_scratch = xmalloc(COPY_CHUNK);
+    }
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1885,8 +2332,10 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_tensors);
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
-    write_imatrix_kvs(fp, imatrix);
-    write_q4_layout_kvs(fp, sm75_native_q4);
+    if (!source_f16_core_dense) {
+        write_imatrix_kvs(fp, imatrix);
+        write_q4_layout_kvs(fp, sm75_native_q4);
+    }
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1903,26 +2352,68 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
-        fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
+        const bool selected_source_f16 =
+            source_f16_core_dense && source_f16_core_slot(dst->name) >= 0;
+        const bool copy_verbatim =
+            source_f16_core_dense && !selected_source_f16;
+        fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n",
+                i + 1, out_ctx->n_tensors, dst->name,
+                copy_verbatim ? "verbatim" :
+                (selected_source_f16 ? "source-f16" :
+                 ds4q_type_name(dst->type)));
         const double started = monotonic_seconds();
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type,
-                                        n_experts, n_threads, imatrix,
-                                        sm75_native_q4);
-        size_t expected = dst->size;
-        if (data.size != expected) {
-            fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
-            exit(1);
+        if (copy_verbatim) {
+            if (src->type != dst->type || src->size != dst->size) {
+                fprintf(stderr,
+                        "error: copy-unchanged tensor %s changed layout "
+                        "(%s/%zu -> %s/%zu)\n",
+                        src->name, ds4q_type_name(src->type), src->size,
+                        ds4q_type_name(dst->type), dst->size);
+                exit(1);
+            }
+            if (fseeko(template_fp,
+                       (off_t)(tmpl->data_offset + src->old_offset),
+                       SEEK_SET) != 0) {
+                die_errno("seek template GGUF", tmpl->path);
+            }
+            copy_exact_bytes(template_fp, fp, src->size,
+                             copy_scratch, COPY_CHUNK,
+                             tmpl->path, out_path);
+        } else {
+            byte_buf data = selected_source_f16
+                ? generate_source_f16_core_tensor(db, dst->name, src)
+                : generate_tensor(db, dst->name, src, dst->type,
+                                  n_experts, n_threads, imatrix,
+                                  sm75_native_q4);
+            if (data.size != dst->size) {
+                fprintf(stderr,
+                        "error: generated size mismatch for %s: "
+                        "got %zu expected %zu\n",
+                        dst->name, data.size, dst->size);
+                exit(1);
+            }
+            if (fwrite(data.data, 1, data.size, fp) != data.size) {
+                die_errno("write tensor", out_path);
+            }
+            free(data.data);
         }
-        if (fwrite(data.data, 1, data.size, fp) != data.size) die_errno("write tensor", out_path);
-        size_t padded = ds4q_pad(data.size, out_ctx->alignment);
-        write_padding(fp, padded - data.size);
+        size_t padded = ds4q_pad(dst->size, out_ctx->alignment);
+        write_padding(fp, padded - dst->size);
         const double elapsed = monotonic_seconds() - started;
-        const double mib = (double)data.size / 1048576.0;
-        fprintf(stderr, "       generated %.2f MiB in %.2fs (%.2f MiB/s)\n",
+        const double mib = (double)dst->size / 1048576.0;
+        fprintf(stderr, "       %s %.2f MiB in %.2fs (%.2f MiB/s)\n",
+                copy_verbatim ? "copied" : "generated",
                 mib, elapsed, elapsed > 0 ? mib / elapsed : 0.0);
-        free(data.data);
     }
-    fclose(fp);
+    free(copy_scratch);
+    if (template_fp && fclose(template_fp) != 0) {
+        die_errno("close template GGUF", tmpl->path);
+    }
+    if (source_f16_core_dense) {
+        if (fflush(fp) != 0) die_errno("flush output", out_path);
+        if (fsync(fileno(fp)) != 0) die_errno("sync output", out_path);
+    }
+    if (fclose(fp) != 0) die_errno("close output", out_path);
 }
 
 static output_context build_sm75_q4_repack_context(const gguf_file *src) {
@@ -1969,14 +2460,14 @@ static output_context build_sm75_q4_repack_context(const gguf_file *src) {
 
 static void copy_exact_bytes(FILE *src, FILE *dst, size_t n,
                              uint8_t *scratch, size_t scratch_size,
-                             const char *path) {
+                             const char *src_path, const char *dst_path) {
     while (n) {
         const size_t chunk = n < scratch_size ? n : scratch_size;
         if (fread(scratch, 1, chunk, src) != chunk) {
-            die_errno("read GGUF tensor", path);
+            die_errno("read GGUF tensor", src_path);
         }
         if (fwrite(scratch, 1, chunk, dst) != chunk) {
-            die_errno("write GGUF tensor", path);
+            die_errno("write GGUF tensor", dst_path);
         }
         n -= chunk;
     }
@@ -2186,7 +2677,8 @@ static void write_sm75_q4_repack(const gguf_file *src,
             }
             }
         } else {
-            copy_exact_bytes(in, out, st->size, scratch, COPY_CHUNK, src->path);
+            copy_exact_bytes(in, out, st->size, scratch, COPY_CHUNK,
+                             src->path, out_path);
         }
         const size_t padded = ds4q_pad(dt->size, out_ctx->alignment);
         write_padding(out, padded - dt->size);
@@ -2217,6 +2709,35 @@ static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
     printf("tensor_bytes_unpadded: %zu\n", tensor_bytes);
     printf("approx_file_bytes: %zu\n", out_ctx->data_offset + out_ctx->tensor_bytes);
     printf("type_changes: %zu\n", changed);
+}
+
+static void print_source_f16_core_manifest(const gguf_file *tmpl,
+                                           const output_context *out_ctx) {
+    validate_source_f16_core_inventory(tmpl);
+    size_t selected_bytes = 0;
+    for (int slot = 0; slot < DS4_SOURCE_F16_CORE_TENSOR_COUNT; slot++) {
+        char name[128];
+        source_f16_core_name(
+            name, sizeof(name),
+            slot / DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER,
+            slot % DS4_SOURCE_F16_CORE_TENSORS_PER_LAYER);
+        const int idx = hmap_get(&tmpl->tensor_map, name);
+        if (idx < 0 || (uint64_t)idx >= out_ctx->n_tensors) {
+            die("internal source-F16 manifest lookup failed");
+        }
+        const tensor_meta *src = &tmpl->tensors[idx];
+        const tensor_meta *dst = &out_ctx->tensors[idx];
+        if (dst->type != DS4Q_TYPE_F16) {
+            die("internal source-F16 manifest has a non-F16 output tensor");
+        }
+        selected_bytes += dst->size;
+        printf("source_f16_tensor: %s %s -> f16\n",
+               name, ds4q_type_name(src->type));
+    }
+    printf("source_f16_selected: %d\n", DS4_SOURCE_F16_CORE_TENSOR_COUNT);
+    printf("source_f16_selected_bytes: %zu\n", selected_bytes);
+    printf("source_f16_unselected_payloads: verbatim\n");
+    printf("source_f16_template_kvs: verbatim\n");
 }
 
 /* =====
@@ -2264,6 +2785,7 @@ typedef struct {
     bool overwrite;
     bool imatrix_strict;
     bool sm75_native_q4;
+    bool source_f16_core_dense;
     bool dspark_manifest;
     bool dspark_support;
     dspark_support_options dspark;
@@ -2886,7 +3408,8 @@ static byte_buf generate_dspark_tensor(st_db *db, const dspark_tensor_plan *tp,
                                &tp->meta,
                                tp->meta.type,
                                imatrix,
-                               true);
+                               true,
+                               false);
 }
 
 static void write_dspark_support_gguf(st_db *db,
@@ -2995,6 +3518,8 @@ static void usage(const char *argv0) {
     printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
     printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
     printf("  --sm75-native-q4      store each routed Q4_K tensor in tagged Turing MMA-native A/W layout\n");
+    printf("  --source-f16-core-dense  regenerate exactly 43x8 Flash core-dense tensors as checked F16;\n");
+    printf("                          copy all other payloads and all template KV records verbatim\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
@@ -3047,6 +3572,14 @@ static bool file_exists(const char *path) {
     if (!fp) return false;
     fclose(fp);
     return true;
+}
+
+static bool paths_alias(const char *a, const char *b) {
+    if (!a || !b) return false;
+    if (strcmp(a, b) == 0) return true;
+    struct stat sa, sb;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
 static params parse_args(int argc, char **argv) {
@@ -3133,6 +3666,8 @@ static params parse_args(int argc, char **argv) {
             p.quant_gpu_devices = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--sm75-native-q4") == 0) {
             p.sm75_native_q4 = true;
+        } else if (strcmp(arg, "--source-f16-core-dense") == 0) {
+            p.source_f16_core_dense = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
@@ -3141,7 +3676,8 @@ static params parse_args(int argc, char **argv) {
     if (p.repack_sm75_q4) {
         if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
             p.imatrix_file || p.dspark_manifest || p.dspark_support ||
-            p.imatrix_strict || p.sm75_native_q4 || p.n_experts != 0 ||
+            p.imatrix_strict || p.sm75_native_q4 ||
+            p.source_f16_core_dense || p.n_experts != 0 ||
             p.policy.n_overrides ||
             p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
             p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
@@ -3172,6 +3708,24 @@ static params parse_args(int argc, char **argv) {
         }
         return p;
     }
+    if (p.source_f16_core_dense) {
+        if (p.compare_gguf || p.compare_tensor || p.imatrix_file ||
+            p.imatrix_strict || p.sm75_native_q4 || p.dspark_manifest ||
+            p.dspark_support || p.quant_backend || p.quant_gpu_devices ||
+            p.n_experts != 0 || p.policy.n_overrides ||
+            p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
+            p.policy.attention_proj != DS4Q_TYPE_COUNT ||
+            p.policy.attention != DS4Q_TYPE_COUNT ||
+            p.policy.shared != DS4Q_TYPE_COUNT ||
+            p.policy.embedding != DS4Q_TYPE_COUNT ||
+            p.policy.output != DS4Q_TYPE_COUNT ||
+            p.policy.dense != DS4Q_TYPE_COUNT) {
+            die("--source-f16-core-dense cannot be combined with other "
+                "quantization, comparison, DSpark, or metadata rewrite options");
+        }
+    }
     if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
@@ -3187,6 +3741,10 @@ static params parse_args(int argc, char **argv) {
     if (!p.template_gguf) die("--template is required");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
+    if (p.source_f16_core_dense && p.out_gguf &&
+        paths_alias(p.template_gguf, p.out_gguf)) {
+        die("source-F16 output must not alias the template GGUF");
+    }
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
 }
@@ -3415,7 +3973,9 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    gguf_file tmpl = p.source_f16_core_dense
+        ? load_gguf_metadata_with_kv_policy(p.template_gguf, true)
+        : load_gguf_metadata(p.template_gguf);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -3428,12 +3988,33 @@ int main(int argc, char **argv) {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
     output_context out_ctx = build_output_context(
-        &tmpl, &p.policy, &imatrix, p.sm75_native_q4);
+        &tmpl, &p.policy, &imatrix, p.sm75_native_q4,
+        p.source_f16_core_dense);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
+    if (p.source_f16_core_dense) {
+        print_source_f16_core_manifest(&tmpl, &out_ctx);
+    }
+    if (p.dry_run) {
+        if (p.source_f16_core_dense) {
+            st_db dry_db;
+            db_open(&dry_db, p.hf_dir);
+            validate_source_f16_hf_inventory(&dry_db, &tmpl);
+            db_close(&dry_db);
+        }
+        return 0;
+    }
+    if (p.source_f16_core_dense) {
+        fprintf(stderr,
+                "warning: direct --source-f16-core-dense output is "
+                "non-transactional; use produce-source-f16-core-dense.sh "
+                "for production publication\n");
+    }
 
     st_db db;
     db_open(&db, p.hf_dir);
+    if (p.source_f16_core_dense) {
+        validate_source_f16_hf_inventory(&db, &tmpl);
+    }
     if (p.compare_tensor) {
         compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
         db_close(&db);
@@ -3443,7 +4024,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts,
-                    p.n_threads, &imatrix, p.sm75_native_q4);
+                    p.n_threads, &imatrix, p.sm75_native_q4,
+                    p.source_f16_core_dense);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

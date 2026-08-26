@@ -1181,6 +1181,24 @@ void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n) {
     for (int64_t i = 0; i < n; i++) dst[i] = ds4q_f32_to_f16(src[i]);
 }
 
+bool ds4q_f32_to_f16_checked_row(const float *src, uint16_t *dst, int64_t n,
+                                  int64_t *bad_index) {
+    if (bad_index) *bad_index = -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (!isfinite(src[i])) {
+            if (bad_index) *bad_index = i;
+            return false;
+        }
+        const uint16_t value = ds4q_f32_to_f16(src[i]);
+        if (!isfinite(ds4q_f16_to_f32(value))) {
+            if (bad_index) *bad_index = i;
+            return false;
+        }
+        dst[i] = value;
+    }
+    return true;
+}
+
 void ds4q_f32_to_bf16_row(const float *src, uint16_t *dst, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         uint32_t bits = ds4q_f32_to_bits(src[i]);

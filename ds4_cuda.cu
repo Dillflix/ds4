@@ -620,6 +620,448 @@ static uint32_t g_q8_audit_layer = UINT32_MAX;
 static uint32_t g_q8_audit_token_offset = UINT32_MAX;
 static int g_q8_audit_active = -1;
 
+struct cuda_dense_exec_audit_entry {
+    uint64_t sequence;
+    uint64_t weight_offset;
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t executed_input_offset;
+    uint64_t executed_input_count;
+    uint64_t executed_output_offset;
+    uint64_t executed_output_count;
+    uint64_t n_tokens;
+    uint32_t layer;
+    uint32_t token_offset;
+    uint32_t weight_type;
+    int physical_device;
+    char module[32];
+    char label[128];
+    char backend[40];
+    char placement[16];
+    char result[32];
+    char reason[64];
+};
+
+enum cuda_dense_exec_proof_kind {
+    CUDA_DENSE_EXEC_PROOF_UNPROVEN = 0,
+    CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8,
+    CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8_FUSED_SHARED_MID,
+    CUDA_DENSE_EXEC_PROOF_SOURCE_F16_CUBLAS,
+};
+
+/* A record is evidence only if the CUDA entry point that actually completed
+ * the projection left a matching proof.  This deliberately keys on the
+ * destination allocation as well as the stored-weight slice and executed
+ * shape: tensor type plus environment variables are not enough to prove
+ * which leaf ran. */
+struct cuda_dense_exec_proof {
+    const void *out_ptr;
+    uint64_t weight_offset;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t executed_input_offset;
+    uint64_t executed_input_count;
+    uint64_t executed_output_offset;
+    uint64_t executed_output_count;
+    uint64_t n_tokens;
+    int physical_device;
+    cuda_dense_exec_proof_kind kind;
+};
+
+static std::vector<cuda_dense_exec_audit_entry> g_dense_exec_audit_records;
+static std::vector<cuda_dense_exec_proof> g_dense_exec_proofs;
+static uint64_t g_dense_exec_audit_sequence;
+static int g_dense_exec_audit_active = -1;
+static int g_q8_dequant_gemm_enabled = 0;
+
+static int cuda_dense_exec_audit_enabled(void) {
+    if (g_dense_exec_audit_active < 0) {
+        const char *path = getenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
+        g_dense_exec_audit_active = path && path[0] ? 1 : 0;
+    }
+    return g_dense_exec_audit_active;
+}
+
+static void cuda_dense_exec_copy(
+        char *dst, size_t cap, const char *src, size_t src_len) {
+    if (!dst || cap == 0u) return;
+    if (!src) src_len = 0u;
+    if (src_len >= cap) src_len = cap - 1u;
+    if (src_len != 0u) memcpy(dst, src, src_len);
+    dst[src_len] = '\0';
+}
+
+static int cuda_dense_exec_native_q8_is_forced(void) {
+    int physical_device = -1;
+    int major = 0;
+    int minor = 0;
+    return cudaGetDevice(&physical_device) == cudaSuccess &&
+           physical_device >= 0 &&
+           cudaDeviceGetAttribute(&major,
+                                  cudaDevAttrComputeCapabilityMajor,
+                                  physical_device) == cudaSuccess &&
+           cudaDeviceGetAttribute(&minor,
+                                  cudaDevAttrComputeCapabilityMinor,
+                                  physical_device) == cudaSuccess &&
+           major == 7 && minor == 5 &&
+           getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL &&
+           getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL &&
+           getenv("DS4_CUDA_Q8_F32_ALL") == NULL &&
+           getenv("DS4_CUDA_Q8_F32_LARGE") == NULL &&
+           getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") == NULL &&
+           !g_q8_dequant_gemm_enabled;
+}
+
+static void cuda_dense_exec_proof_mark_rect(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t executed_input_offset,
+        uint64_t executed_input_count,
+        uint64_t executed_output_offset,
+        uint64_t executed_output_count,
+        uint64_t n_tokens,
+        cuda_dense_exec_proof_kind kind) {
+    if (!cuda_dense_exec_audit_enabled() || !out || !out->ptr) return;
+    int physical_device = -1;
+    if (cudaGetDevice(&physical_device) != cudaSuccess) {
+        kind = CUDA_DENSE_EXEC_PROOF_UNPROVEN;
+        physical_device = -1;
+    }
+    cuda_dense_exec_proof p = {
+        out->ptr, weight_offset, in_dim, out_dim,
+        executed_input_offset, executed_input_count,
+        executed_output_offset, executed_output_count,
+        n_tokens, physical_device, kind
+    };
+    for (cuda_dense_exec_proof &existing : g_dense_exec_proofs) {
+        if (existing.out_ptr == p.out_ptr &&
+            existing.weight_offset == p.weight_offset &&
+            existing.in_dim == p.in_dim &&
+            existing.out_dim == p.out_dim &&
+            existing.executed_input_offset == p.executed_input_offset &&
+            existing.executed_input_count == p.executed_input_count &&
+            existing.executed_output_offset == p.executed_output_offset &&
+            existing.executed_output_count == p.executed_output_count &&
+            existing.n_tokens == p.n_tokens) {
+            existing = p;
+            return;
+        }
+    }
+    g_dense_exec_proofs.push_back(p);
+}
+
+static void cuda_dense_exec_proof_mark(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens,
+        cuda_dense_exec_proof_kind kind) {
+    cuda_dense_exec_proof_mark_rect(
+        out, weight_offset, in_dim, out_dim,
+        0u, in_dim, 0u, out_dim, n_tokens, kind);
+}
+
+static void cuda_dense_exec_proof_mark_source_f16(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens) {
+    cuda_dense_exec_proof_mark(
+        out, weight_offset, in_dim, out_dim, n_tokens,
+        CUDA_DENSE_EXEC_PROOF_SOURCE_F16_CUBLAS);
+}
+
+static void cuda_dense_exec_proof_mark_source_f16_rect(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t input_offset,
+        uint64_t input_count,
+        uint64_t output_offset,
+        uint64_t output_count,
+        uint64_t n_tokens) {
+    cuda_dense_exec_proof_mark_rect(
+        out, weight_offset, in_dim, out_dim,
+        input_offset, input_count, output_offset, output_count, n_tokens,
+        CUDA_DENSE_EXEC_PROOF_SOURCE_F16_CUBLAS);
+}
+
+static void cuda_dense_exec_proof_mark_q8(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens) {
+    cuda_dense_exec_proof_mark(
+        out, weight_offset, in_dim, out_dim, n_tokens,
+        cuda_dense_exec_native_q8_is_forced()
+            ? CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8
+            : CUDA_DENSE_EXEC_PROOF_UNPROVEN);
+}
+
+static void cuda_dense_exec_proof_mark_q8_rect(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t input_offset,
+        uint64_t input_count,
+        uint64_t output_offset,
+        uint64_t output_count,
+        uint64_t n_tokens) {
+    cuda_dense_exec_proof_mark_rect(
+        out, weight_offset, in_dim, out_dim,
+        input_offset, input_count, output_offset, output_count, n_tokens,
+        cuda_dense_exec_native_q8_is_forced()
+            ? CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8
+            : CUDA_DENSE_EXEC_PROOF_UNPROVEN);
+}
+
+static void cuda_dense_exec_proof_mark_q8_fused_shared_mid(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens) {
+    cuda_dense_exec_proof_mark(
+        out, weight_offset, in_dim, out_dim, n_tokens,
+        cuda_dense_exec_native_q8_is_forced()
+            ? CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8_FUSED_SHARED_MID
+            : CUDA_DENSE_EXEC_PROOF_UNPROVEN);
+}
+
+static int cuda_dense_exec_proof_take(
+        const ds4_gpu_tensor *out,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t executed_input_offset,
+        uint64_t executed_input_count,
+        uint64_t executed_output_offset,
+        uint64_t executed_output_count,
+        uint64_t n_tokens,
+        cuda_dense_exec_proof *proof) {
+    if (proof) *proof = {};
+    if (!out || !out->ptr || !proof) return 0;
+    for (size_t i = g_dense_exec_proofs.size(); i != 0u; i--) {
+        const cuda_dense_exec_proof &p = g_dense_exec_proofs[i - 1u];
+        if (p.out_ptr == out->ptr &&
+            p.weight_offset == weight_offset &&
+            p.in_dim == in_dim && p.out_dim == out_dim &&
+            p.executed_input_offset == executed_input_offset &&
+            p.executed_input_count == executed_input_count &&
+            p.executed_output_offset == executed_output_offset &&
+            p.executed_output_count == executed_output_count &&
+            p.n_tokens == n_tokens) {
+            *proof = p;
+            g_dense_exec_proofs.erase(g_dense_exec_proofs.begin() +
+                                      (i - 1u));
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Coverage-only: the caller invokes this after a successful projection.
+ * Source-F16 calls are routed through explicit cuBLAS-only entry points.
+ * Native-Q8 evidence is accepted only when the expansion cache is explicitly
+ * disabled.  Until the decode cache topology has its own proven dispatch,
+ * DS4_CUDA_Q8_F16_DECODE fails closed instead of mislabelling a native
+ * fallback as q8_derived_f16. */
+extern "C" int ds4_gpu_dense_exec_audit_record(
+        const ds4_gpu_tensor *out,
+        const char *module,
+        const char *label,
+         uint32_t label_len,
+         uint32_t layer,
+         uint32_t token_offset,
+         uint64_t proof_weight_offset,
+         uint64_t proof_in_dim,
+         uint64_t proof_out_dim,
+         uint64_t proof_input_offset,
+         uint64_t proof_input_count,
+         uint64_t proof_output_offset,
+         uint64_t proof_output_count,
+         uint64_t weight_offset,
+         uint64_t weight_bytes,
+         uint32_t weight_type,
+         uint64_t in_dim,
+         uint64_t out_dim,
+         uint64_t executed_input_offset,
+         uint64_t executed_input_count,
+         uint64_t executed_output_offset,
+         uint64_t executed_output_count,
+         uint64_t n_tokens) {
+    if (!cuda_dense_exec_audit_enabled()) return 1;
+    if (!out || !module || !module[0] || !label || label_len == 0u ||
+        layer == UINT32_MAX || weight_bytes == 0u || in_dim == 0u ||
+        out_dim == 0u || n_tokens == 0u ||
+        proof_input_count == 0u || proof_output_count == 0u ||
+        executed_input_count == 0u || executed_output_count == 0u ||
+        proof_input_offset > proof_in_dim ||
+        proof_input_count > proof_in_dim - proof_input_offset ||
+        proof_output_offset > proof_out_dim ||
+        proof_output_count > proof_out_dim - proof_output_offset ||
+        executed_input_offset > in_dim ||
+        executed_input_count > in_dim - executed_input_offset ||
+        executed_output_offset > out_dim ||
+        executed_output_count > out_dim - executed_output_offset) {
+        fprintf(stderr,
+                "ds4: dense-exec-audit rejected an incomplete record\n");
+        return 0;
+    }
+    cuda_dense_exec_audit_entry r = {};
+    r.sequence = g_dense_exec_audit_sequence++;
+    r.weight_offset = weight_offset;
+    r.weight_bytes = weight_bytes;
+    r.in_dim = in_dim;
+    r.out_dim = out_dim;
+    r.executed_input_offset = executed_input_offset;
+    r.executed_input_count = executed_input_count;
+    r.executed_output_offset = executed_output_offset;
+    r.executed_output_count = executed_output_count;
+    r.n_tokens = n_tokens;
+    r.layer = layer;
+    r.token_offset = token_offset;
+    r.weight_type = weight_type;
+    cuda_dense_exec_copy(r.module, sizeof(r.module), module, strlen(module));
+    cuda_dense_exec_copy(r.label, sizeof(r.label), label, label_len);
+    cuda_dense_exec_proof proof = {};
+    const int have_proof = cuda_dense_exec_proof_take(
+        out, proof_weight_offset, proof_in_dim, proof_out_dim,
+        proof_input_offset, proof_input_count,
+        proof_output_offset, proof_output_count,
+        n_tokens, &proof);
+    r.physical_device = have_proof ? proof.physical_device : -1;
+    const int output_tier = ds4_tensor_device_idx(out);
+    const int output_device =
+        g_n_gpus > 1 && output_tier >= 0 && output_tier < g_n_gpus
+            ? g_gpu[output_tier].device_id : 0;
+    const char *placement = have_proof && proof.physical_device >= 0 &&
+            proof.physical_device != output_device
+        ? "partner" : "local";
+    cuda_dense_exec_copy(r.placement, sizeof(r.placement),
+                         placement, strlen(placement));
+    if (weight_type == 1u) {
+        if (!g_cublas_ready ||
+            !have_proof ||
+            proof.kind != CUDA_DENSE_EXEC_PROOF_SOURCE_F16_CUBLAS) {
+            cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                                 "unproven", sizeof("unproven") - 1u);
+            cuda_dense_exec_copy(r.result, sizeof(r.result),
+                                 "unsupported", sizeof("unsupported") - 1u);
+            const char *why = !g_cublas_ready
+                ? "cublas_not_ready" : "execution_proof_missing";
+            cuda_dense_exec_copy(r.reason, sizeof(r.reason), why, strlen(why));
+            g_dense_exec_audit_records.push_back(r);
+            return 0;
+        }
+        cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                             "cublas_gemm_ex", sizeof("cublas_gemm_ex") - 1u);
+        cuda_dense_exec_copy(r.result, sizeof(r.result),
+                             "source_f16", sizeof("source_f16") - 1u);
+        cuda_dense_exec_copy(r.reason, sizeof(r.reason),
+                             "executed", sizeof("executed") - 1u);
+    } else if (weight_type == 8u) {
+        if (!have_proof ||
+            (proof.kind != CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8 &&
+             proof.kind !=
+                CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8_FUSED_SHARED_MID)) {
+            cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                                 "unproven", sizeof("unproven") - 1u);
+            cuda_dense_exec_copy(r.result, sizeof(r.result),
+                                 "unsupported", sizeof("unsupported") - 1u);
+            cuda_dense_exec_copy(r.reason, sizeof(r.reason),
+                                 "execution_proof_missing",
+                                 sizeof("execution_proof_missing") - 1u);
+            g_dense_exec_audit_records.push_back(r);
+            fprintf(stderr,
+                    "ds4: dense-exec-audit cannot prove native SM75 Q8 "
+                    "dispatch for %s\n", r.label);
+            return 0;
+        }
+        const char *backend = proof.kind ==
+                CUDA_DENSE_EXEC_PROOF_SM75_NATIVE_Q8_FUSED_SHARED_MID
+            ? "sm75_native_q8_fused_shared_mid" : "sm75_native_q8";
+        cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                             backend, strlen(backend));
+        cuda_dense_exec_copy(r.result, sizeof(r.result),
+                             "native_q8", sizeof("native_q8") - 1u);
+        cuda_dense_exec_copy(r.reason, sizeof(r.reason),
+                             "executed", sizeof("executed") - 1u);
+    } else {
+        cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                             "unproven", sizeof("unproven") - 1u);
+        cuda_dense_exec_copy(r.result, sizeof(r.result),
+                             "unsupported", sizeof("unsupported") - 1u);
+        cuda_dense_exec_copy(r.reason, sizeof(r.reason),
+                             "decode_backend_not_proven",
+                             sizeof("decode_backend_not_proven") - 1u);
+        g_dense_exec_audit_records.push_back(r);
+        fprintf(stderr,
+                "ds4: dense-exec-audit refuses unproven Q8-derived decode "
+                "dispatch for %s\n", r.label);
+        return 0;
+    }
+    g_dense_exec_audit_records.push_back(r);
+    return 1;
+}
+
+static int cuda_dense_exec_audit_write_csv(const char *path) {
+    if (!path || !path[0]) return 0;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4: cannot create CUDA dense execution audit CSV %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    fprintf(fp,
+            "sequence,module,label,layer,token_offset,physical_device,"
+             "weight_offset,weight_bytes,weight_type,in_dim,out_dim,n_tokens,"
+             "executed_input_offset,executed_input_count,"
+             "executed_output_offset,executed_output_count,"
+             "backend,placement,result,reason\n");
+    int ok = 1;
+    for (const cuda_dense_exec_audit_entry &r : g_dense_exec_audit_records) {
+        if (fprintf(fp,
+                     "%llu,%s,%s,%u,%u,%d,%llu,%llu,%u,%llu,%llu,%llu,"
+                     "%llu,%llu,%llu,%llu,"
+                     "%s,%s,%s,%s\n",
+                    (unsigned long long)r.sequence,
+                    r.module,
+                    r.label,
+                    r.layer,
+                    r.token_offset,
+                    r.physical_device,
+                    (unsigned long long)r.weight_offset,
+                    (unsigned long long)r.weight_bytes,
+                    r.weight_type,
+                     (unsigned long long)r.in_dim,
+                     (unsigned long long)r.out_dim,
+                     (unsigned long long)r.n_tokens,
+                     (unsigned long long)r.executed_input_offset,
+                     (unsigned long long)r.executed_input_count,
+                     (unsigned long long)r.executed_output_offset,
+                     (unsigned long long)r.executed_output_count,
+                    r.backend,
+                    r.placement,
+                    r.result,
+                    r.reason) < 0) {
+            ok = 0;
+            break;
+        }
+    }
+    if (fclose(fp) != 0) ok = 0;
+    return ok;
+}
+
 static int cuda_q8_audit_enabled(void) {
     if (g_q8_audit_active < 0) {
         const char *path = getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV");
@@ -3481,9 +3923,56 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
+    const cudaError_t cleanup_initial_sync = cudaDeviceSynchronize();
     g_current_logical_tier = -1;
     ds4_gpu_prefill_tile_audit_end();
+    const char *dense_audit_path =
+        getenv("DS4_CUDA_DENSE_EXEC_AUDIT_CSV");
+    if (dense_audit_path && dense_audit_path[0]) {
+        /* The audit is coverage-only and written after all participating
+         * devices have reached the same final boundary.  Host records are
+         * appended at dispatch time, but synchronizing every tier here also
+         * prevents a successful record from surviving a late asynchronous
+         * failure on a non-current device. */
+        int previous_device = -1;
+        int dense_audit_sync_ok =
+            cleanup_initial_sync == cudaSuccess &&
+            cudaGetDevice(&previous_device) == cudaSuccess;
+        for (int tier = 0; tier < g_n_gpus; tier++) {
+            if (cudaSetDevice(g_gpu[tier].device_id) == cudaSuccess) {
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    dense_audit_sync_ok = 0;
+                }
+            } else {
+                dense_audit_sync_ok = 0;
+            }
+        }
+        if (previous_device >= 0 &&
+            cudaSetDevice(previous_device) != cudaSuccess) {
+            dense_audit_sync_ok = 0;
+        }
+        if (!dense_audit_sync_ok && !g_dense_exec_audit_records.empty()) {
+            cuda_dense_exec_audit_entry &r =
+                g_dense_exec_audit_records.front();
+            cuda_dense_exec_copy(r.backend, sizeof(r.backend),
+                                 "unproven", sizeof("unproven") - 1u);
+            cuda_dense_exec_copy(r.result, sizeof(r.result),
+                                 "unsupported", sizeof("unsupported") - 1u);
+            cuda_dense_exec_copy(r.reason, sizeof(r.reason),
+                                 "final_device_sync_failed",
+                                 sizeof("final_device_sync_failed") - 1u);
+        }
+        if (!cuda_dense_exec_audit_write_csv(dense_audit_path)) {
+            fprintf(stderr,
+                    "ds4: failed to write dense-exec-audit evidence %s\n",
+                    dense_audit_path);
+        } else {
+            fprintf(stderr,
+                    "ds4: dense-exec-audit wrote %llu records to %s\n",
+                    (unsigned long long)g_dense_exec_audit_records.size(),
+                    dense_audit_path);
+        }
+    }
     const uint64_t partner_calls =
         g_q8_f16_partner_offloads.load(std::memory_order_relaxed);
     if (partner_calls != 0u) {
@@ -3548,6 +4037,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_cublas_ready = 0;
+    g_q8_dequant_gemm_enabled = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
     for (int d = 0; d < DS4_MAX_GPUS; d++) {
@@ -3617,6 +4107,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
+    g_dense_exec_audit_records.clear();
+    g_dense_exec_proofs.clear();
+    g_dense_exec_audit_sequence = 0u;
+    g_dense_exec_audit_active = -1;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -14435,7 +14929,6 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
 /* GLM opt-in: batched q8_0 matmuls with blocks > 32 may run as a
  * streaming dequant-to-f16 GEMM (exact-q8 native kernels only cover
  * blocks <= 32). Never enabled on DS4 paths, keeping them byte-stable. */
-static int g_q8_dequant_gemm_enabled = 0;
 extern "C" void ds4_gpu_enable_q8_dequant_gemm(void) {
     g_q8_dequant_gemm_enabled = 1;
 }
@@ -15565,8 +16058,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
-                                           in_dim, out_dim, x, n_tok, "q8_0");
+    const int ok = cuda_matmul_q8_0_tensor_labeled(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, "q8_0");
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            out, weight_offset, in_dim, out_dim, n_tok);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
@@ -15644,7 +16143,7 @@ extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_top1 unpack launch");
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+static int cuda_matmul_q8_0_kslice_rows_tensor_impl(
         ds4_gpu_tensor *out,
         const void *model_map,
         uint64_t model_size,
@@ -15707,6 +16206,28 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             slice_blocks,
             use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t in_start,
+        uint64_t in_count,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    const int ok = cuda_matmul_q8_0_kslice_rows_tensor_impl(
+        out, model_map, model_size, weight_offset, in_dim, out_dim,
+        in_start, in_count, x, n_tok);
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8_rect(
+            out, weight_offset, in_dim, out_dim,
+            in_start, in_count, 0u, out_dim, n_tok);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
@@ -15787,10 +16308,17 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
             n_embd,
             n_hc,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice_hc_expand_add launch");
+    const int ok = cuda_ok(
+        cudaGetLastError(), "matmul_q8_0_kslice_hc_expand_add launch");
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8_rect(
+            block_out, weight_offset, in_dim, out_dim,
+            in_start, in_count, 0u, out_dim, 1u);
+    }
+    return ok;
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
+static int cuda_matmul_q8_0_pair_tensor_impl(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -16034,6 +16562,31 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    const int ok = cuda_matmul_q8_0_pair_tensor_impl(
+        out0, out1, model_map, model_size,
+        weight0_offset, weight1_offset, in_dim,
+        out0_dim, out1_dim, x, n_tok);
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            out0, weight0_offset, in_dim, out0_dim, n_tok);
+        cuda_dense_exec_proof_mark_q8(
+            out1, weight1_offset, in_dim, out1_dim, n_tok);
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -16248,7 +16801,118 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             owned_home_slots ? 1 : 0,
             owned_expert_split,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
+    const int ok = cuda_ok(cudaGetLastError(),
+                           "matmul_q8_0_hc_expand launch");
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            block_out, weight_offset, in_dim, out_dim, 1u);
+    }
+    return ok;
+}
+
+/* Pointer-based leaf shared by source-F16 now and Q8-derived-F16 once its
+ * decode placement contract is complete.  w points at the first K element
+ * of every output row; lda is the full stored row width, while k is the
+ * executed contiguous slice. */
+static int cuda_matmul_f16_cublas_xh_ptr(
+        ds4_gpu_tensor *out,
+        const __half *w,
+        uint64_t lda,
+        uint64_t k,
+        uint64_t out_dim,
+        const __half *xh,
+        uint64_t n_tok,
+        int logical_tier,
+        const char *what) {
+    if (!out || !w || !xh || !g_cublas_ready ||
+        logical_tier < 0 || logical_tier >= g_n_gpus ||
+        lda == 0u || k == 0u || out_dim == 0u || n_tok == 0u ||
+        lda > INT_MAX || k > INT_MAX || out_dim > INT_MAX ||
+        n_tok > INT_MAX || out_dim > UINT64_MAX / n_tok ||
+        out->bytes < out_dim * n_tok * sizeof(float)) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+            cuda_cublas_for_tier(logical_tier),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, (int)n_tok, (int)k,
+            &alpha,
+            w, CUDA_R_16F, (int)lda,
+            xh, CUDA_R_16F, (int)k,
+            &beta,
+            out->ptr, CUDA_R_32F, (int)out_dim,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, what ? what : "f16 cublas matmul");
+}
+
+static int cuda_matmul_f16_cublas_ptr(
+        ds4_gpu_tensor *out,
+        const __half *w,
+        uint64_t lda,
+        uint64_t k,
+        uint64_t out_dim,
+        const float *x,
+        uint64_t n_tok,
+        int logical_tier,
+        const char *what) {
+    if (!x || n_tok > UINT64_MAX / k ||
+        n_tok * k > UINT64_MAX / sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t xh_count = n_tok * k;
+    __half *xh = (__half *)cuda_tmp_alloc_on(
+            logical_tier, xh_count * sizeof(__half),
+            what ? what : "f16 cublas activations");
+    if (!xh) return 0;
+    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, x, xh_count);
+    if (!cuda_ok(cudaGetLastError(), "f16 cublas activation convert launch")) {
+        return 0;
+    }
+    return cuda_matmul_f16_cublas_xh_ptr(
+            out, w, lda, k, out_dim, xh, n_tok, logical_tier, what);
+}
+
+extern "C" int ds4_gpu_matmul_f16_cublas_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out || !x || !model_map || !g_cublas_ready ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        out_dim > UINT64_MAX / in_dim ||
+        out_dim * in_dim > UINT64_MAX / sizeof(__half) ||
+        weight_offset > model_size ||
+        n_tok > UINT64_MAX / in_dim ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * in_dim * sizeof(__half);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const __half *w = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "source f16 dense");
+    if (!w) return 0;
+    const int ok = cuda_matmul_f16_cublas_ptr(
+            out, w, in_dim, in_dim, out_dim, (const float *)x->ptr,
+            n_tok, logical_tier, "source f16 dense cublas");
+    if (ok) {
+        cuda_dense_exec_proof_mark_source_f16(
+            out, weight_offset, in_dim, out_dim, n_tok);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -16573,6 +17237,87 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         out_dim,
         out_dim);
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+}
+
+extern "C" int ds4_gpu_matmul_f16_pair_mixed_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0u ||
+        out0_dim == 0u || out1_dim == 0u || n_tok == 0u ||
+        in_dim > INT_MAX || out0_dim > INT_MAX || out1_dim > INT_MAX ||
+        n_tok > INT_MAX || out0_dim > UINT64_MAX / in_dim ||
+        out1_dim > UINT64_MAX / in_dim || n_tok > UINT64_MAX / in_dim ||
+        n_tok > UINT64_MAX / out0_dim || n_tok > UINT64_MAX / out1_dim ||
+        weight0_offset > model_size || weight1_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight0_count = out0_dim * in_dim;
+    const uint64_t weight1_count = out1_dim * in_dim;
+    if (weight0_count > UINT64_MAX / sizeof(__half) ||
+        weight1_count > UINT64_MAX / sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t weight0_bytes = weight0_count * sizeof(__half);
+    const uint64_t weight1_bytes = weight1_count * sizeof(__half);
+    const uint64_t x_count = n_tok * in_dim;
+    const uint64_t out0_count = n_tok * out0_dim;
+    const uint64_t out1_count = n_tok * out1_dim;
+    if (weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        x_count > UINT64_MAX / sizeof(float) ||
+        out0_count > UINT64_MAX / sizeof(float) ||
+        out1_count > UINT64_MAX / sizeof(float) ||
+        x->bytes < x_count * sizeof(float) ||
+        out0->bytes < out0_count * sizeof(float) ||
+        out1->bytes < out1_count * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(out1) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    if (!g_cublas_ready) return 0;
+    const __half *w0 = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight0_offset, weight0_bytes, logical_tier,
+            "source f16 pair0");
+    const __half *w1 = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight1_offset, weight1_bytes, logical_tier,
+            "source f16 pair1");
+    if (!w0 || !w1 || x_count > UINT64_MAX / sizeof(__half)) return 0;
+    __half *xh = (__half *)cuda_tmp_alloc_on(
+            logical_tier, x_count * sizeof(__half),
+            "source f16 pair activations");
+    if (!xh) return 0;
+    f32_to_f16_kernel<<<(x_count + 255u) / 256u, 256>>>(
+            xh, (const float *)x->ptr, x_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "source f16 pair activation convert launch")) {
+        return 0;
+    }
+    const int ok0 = cuda_matmul_f16_cublas_xh_ptr(
+            out0, w0, in_dim, in_dim, out0_dim,
+            xh, n_tok, logical_tier, "source f16 pair matmul0");
+    const int ok1 = ok0 && cuda_matmul_f16_cublas_xh_ptr(
+            out1, w1, in_dim, in_dim, out1_dim,
+            xh, n_tok, logical_tier, "source f16 pair matmul1");
+    if (ok0 && ok1) {
+        cuda_dense_exec_proof_mark_source_f16(
+            out0, weight0_offset, in_dim, out0_dim, n_tok);
+        cuda_dense_exec_proof_mark_source_f16(
+            out1, weight1_offset, in_dim, out1_dim, n_tok);
+    }
+    return ok0 && ok1;
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
@@ -18807,6 +19552,179 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
+
+/* Pointer-based grouped output-A leaf.  Keeping source resolution outside the
+ * packing/GEMM/unpack primitive lets a later Q8-derived-F16 diagnostic enter
+ * exactly the same arithmetic and launch topology without duplicating it. */
+static int cuda_attention_output_f16_batch_low_shard_ptr(
+        ds4_gpu_tensor *low,
+        const __half *a,
+        uint64_t group_dim,
+        uint64_t rank,
+        uint32_t n_groups_total,
+        uint32_t group0,
+        uint32_t group_count,
+        const ds4_gpu_tensor *heads,
+        uint32_t n_tokens,
+        int logical_tier) {
+    if (!low || !a || !heads || !g_cublas_ready ||
+        group_dim == 0u || rank == 0u || n_groups_total == 0u ||
+        group_count == 0u || n_tokens == 0u ||
+        group0 > n_groups_total || group_count > n_groups_total - group0 ||
+        logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(low) != logical_tier ||
+        ds4_tensor_device_idx(heads) != logical_tier ||
+        rank > UINT64_MAX / group_count) {
+        return 0;
+    }
+    const uint64_t low_count = (uint64_t)group_count * rank;
+    if (low_count > UINT64_MAX / group_dim ||
+        n_tokens > UINT64_MAX / n_groups_total ||
+        (uint64_t)n_tokens * n_groups_total > UINT64_MAX / group_dim ||
+        n_tokens > UINT64_MAX / low_count) {
+        return 0;
+    }
+    const uint64_t heads_count =
+        (uint64_t)n_tokens * n_groups_total * group_dim;
+    const uint64_t low_output_count = (uint64_t)n_tokens * low_count;
+    if (heads_count > UINT64_MAX / sizeof(float) ||
+        heads->bytes < heads_count * sizeof(float) ||
+        low_output_count > UINT64_MAX / sizeof(float) ||
+        low->bytes < low_output_count * sizeof(float) ||
+        group_dim > INT_MAX || rank > INT_MAX || n_tokens > INT_MAX ||
+        group_count > INT_MAX) {
+        return 0;
+    }
+    const uint64_t heads_h_count =
+        (uint64_t)group_count * n_tokens * group_dim;
+    const uint64_t low_packed_count =
+        (uint64_t)group_count * n_tokens * rank;
+    if (heads_h_count > UINT64_MAX / sizeof(__half) ||
+        low_packed_count > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
+    const uint64_t low_packed_offset = (heads_h_bytes + 255u) & ~255ull;
+    if (low_packed_offset < heads_h_bytes ||
+        low_packed_count * sizeof(float) > UINT64_MAX - low_packed_offset) {
+        return 0;
+    }
+    void *tmp = cuda_tmp_alloc_on(
+            logical_tier,
+            low_packed_offset + low_packed_count * sizeof(float),
+            "source f16 attention output a");
+    if (!tmp) return 0;
+    __half *heads_h = (__half *)tmp;
+    float *low_packed = (float *)((char *)tmp + low_packed_offset);
+    attention_pack_group_heads_slice_f16_kernel
+        <<<(heads_h_count + 255u) / 256u, 256>>>(
+            heads_h, (const float *)heads->ptr, n_tokens,
+            n_groups_total, group0, group_count, group_dim);
+    if (!cuda_ok(cudaGetLastError(),
+                 "source f16 attention output a pack launch")) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t st = cublasGemmStridedBatchedEx(
+            cuda_cublas_for_tier(logical_tier),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)rank, (int)n_tokens, (int)group_dim,
+            &alpha,
+            a, CUDA_R_16F, (int)group_dim,
+            (long long)rank * group_dim,
+            heads_h, CUDA_R_16F, (int)group_dim,
+            (long long)n_tokens * group_dim,
+            &beta,
+            low_packed, CUDA_R_32F, (int)rank,
+            (long long)rank * n_tokens,
+            (int)group_count,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (!cublas_ok(st, "source f16 attention output a gemm")) return 0;
+    attention_unpack_group_low_kernel
+        <<<(low_packed_count + 255u) / 256u, 256>>>(
+            (float *)low->ptr, low_packed, n_tokens, group_count, rank);
+    return cuda_ok(cudaGetLastError(),
+                   "source f16 attention output a unpack launch");
+}
+
+extern "C" int ds4_gpu_attention_output_f16_batch_low_shard_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups_total, uint32_t group0, uint32_t group_count,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!low || !heads || !model_map ||
+        group_dim == 0u || rank == 0u || n_groups_total == 0u ||
+        group_count == 0u || group0 > n_groups_total ||
+        group_count > n_groups_total - group0 ||
+        rank > UINT64_MAX / n_groups_total ||
+        group_dim > UINT64_MAX / ((uint64_t)n_groups_total * rank)) {
+        return 0;
+    }
+    const uint64_t total_rows = (uint64_t)n_groups_total * rank;
+    const uint64_t total_a_count = total_rows * group_dim;
+    const uint64_t low_count = (uint64_t)group_count * rank;
+    if (total_a_count > UINT64_MAX / sizeof(__half) ||
+        low_count > UINT64_MAX / group_dim) {
+        return 0;
+    }
+    const uint64_t total_a_bytes = total_a_count * sizeof(__half);
+    const uint64_t a_slice_bytes = low_count * group_dim * sizeof(__half);
+    const uint64_t a_row0 = (uint64_t)group0 * rank;
+    if (a_row0 > UINT64_MAX / group_dim ||
+        a_row0 * group_dim > UINT64_MAX / sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t a_slice_rel = a_row0 * group_dim * sizeof(__half);
+    if (out_a_offset > model_size ||
+        total_a_bytes > model_size - out_a_offset ||
+        a_slice_rel > total_a_bytes ||
+        a_slice_bytes > total_a_bytes - a_slice_rel) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(low);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(heads) != logical_tier) {
+        return 0;
+    }
+    const __half *a = (const __half *)cuda_resolve_weight_ptr(
+            model_map, out_a_offset + a_slice_rel, a_slice_bytes,
+            logical_tier, "source f16 attn output a shard");
+    if (!a) return 0;
+    const int ok = cuda_attention_output_f16_batch_low_shard_ptr(
+            low, a, group_dim, rank, n_groups_total, group0, group_count,
+            heads, n_tokens, logical_tier);
+    if (ok) {
+        cuda_dense_exec_proof_mark_source_f16(
+            low, out_a_offset + a_slice_rel, group_dim,
+            low_count, n_tokens);
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_attention_output_f16_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+        uint64_t out_dim, const ds4_gpu_tensor *heads,
+        uint32_t n_tokens) {
+    if (!out || !low || !heads || n_groups == 0u || rank == 0u ||
+        rank > UINT64_MAX / n_groups ||
+        ds4_tensor_device_idx(out) != ds4_tensor_device_idx(low)) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (!ds4_gpu_attention_output_f16_batch_low_shard_tensor(
+            low, model_map, model_size, out_a_offset,
+            group_dim, rank, n_groups, 0u, n_groups, heads, n_tokens)) {
+        return 0;
+    }
+    return ds4_gpu_matmul_f16_cublas_tensor(
+            out, model_map, model_size, out_b_offset,
+            low_dim, out_dim, low, n_tokens);
+}
+
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -19028,6 +19946,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         }
         for (uint32_t i = 0; i < 3u; i++) (void)cudaEventDestroy(prof_ev[i]);
     }
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            low, out_a_offset, group_dim, low_dim, n_tokens);
+        cuda_dense_exec_proof_mark_q8(
+            out, out_b_offset, low_dim, out_dim, n_tokens);
+    }
     return ok;
 }
 extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
@@ -19106,12 +20030,19 @@ extern "C" int ds4_gpu_attention_output_q8_batch_low_shard_tensor(
         cuda_q8_f16_binding_mark_used(
             model_map, a_slice_offset, a_slice_bytes, group_dim, low_count,
             physical_device, physical_device);
+        cuda_dense_exec_proof_mark_q8(
+            low, a_slice_offset, group_dim, low_count, n_tokens);
         return 1;
     }
 
-    return ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+    const int ok = ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             low, model_map, model_size, out_a_offset, group_dim, rank,
             n_groups_total, group0, group_count, heads, n_tokens);
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            low, a_slice_offset, group_dim, low_count, n_tokens);
+    }
+    return ok;
 }
 
 __global__ static void gather_pair_rows_xdev_kernel(
@@ -19156,9 +20087,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_b_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t out_b_offset, uint64_t low_dim, uint64_t out_dim,
         const ds4_gpu_tensor *low, uint32_t n_tokens) {
-    return cuda_matmul_q8_0_tensor_labeled(
+    const int ok = cuda_matmul_q8_0_tensor_labeled(
             out, model_map, model_size, out_b_offset, low_dim, out_dim,
             low, n_tokens, "attn_output_b");
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            out, out_b_offset, low_dim, out_dim, n_tokens);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_attention_output_q8_batch_shard_tensor(
@@ -19357,9 +20293,15 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads) {
-    return ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+    const int ok = ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             low, model_map, model_size, out_a_offset, group_dim, rank,
             n_groups, 0u, n_groups, heads, 1u);
+    if (ok) {
+        cuda_dense_exec_proof_mark_q8(
+            low, out_a_offset, group_dim,
+            (uint64_t)n_groups * rank, 1u);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
@@ -19538,7 +20480,53 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
             expert_split,
             home_rank,
             cuda_q8_use_dp4a());
-    return cuda_ok(cudaGetLastError(), "shared mid q8 exact launch");
+    const int ok = cuda_ok(cudaGetLastError(),
+                           "shared mid q8 exact launch");
+    int assigned = 1;
+    if (ok && selected && cuda_dense_exec_audit_enabled()) {
+        /* Coverage runs must not claim the complementary no-op launch as an
+         * execution.  Timed runs never enter this branch.  The kernel's
+         * predicate is deliberately reproduced byte-for-byte here after a
+         * six-element D2H read so the proof is attached only to the rank that
+         * actually wrote `mid`. */
+        int32_t selected_host[6];
+        if (!cuda_ok(cudaMemcpy(selected_host, selected->ptr,
+                                sizeof(selected_host),
+                                cudaMemcpyDeviceToHost),
+                     "shared mid audit selected read")) {
+            return 0;
+        }
+        uint32_t home_count = 0u;
+        uint32_t peer_count = 0u;
+        for (uint32_t i = 0; i < 6u; i++) {
+            const int32_t expert = selected_host[i];
+            if (expert >= 0 && (uint32_t)expert < expert_split) {
+                home_count++;
+            } else if (expert >= 0 &&
+                       (uint32_t)expert < 2u * expert_split) {
+                peer_count++;
+            }
+        }
+        assigned = home_rank
+            ? home_count <= peer_count : peer_count < home_count;
+    }
+    if (ok && assigned) {
+        /* One fused launch computes both projections and SwiGLU.  Leave one
+         * proof for each stored weight so the canonical shared_gate and
+         * shared_up audit rows independently prove the same successful leaf.
+         * The proof captures the current device, which is the partner for the
+         * remote half of balanced shared-mid execution even though `mid` is a
+         * peer-writable tensor owned by the home tier. */
+        cuda_dense_exec_proof_mark_q8_fused_shared_mid(
+                mid, gate_offset, in_dim, out_dim, 1u);
+        cuda_dense_exec_proof_mark_q8_fused_shared_mid(
+                mid, up_offset, in_dim, out_dim, 1u);
+    }
+    /* In audit mode, 2 means a valid complementary launch that was
+     * intentionally predicated off.  Existing production callers treat all
+     * nonzero returns as success; the two audited call sites use the value to
+     * avoid fabricating an execution record for this rank. */
+    return ok ? (assigned ? 1 : 2) : 0;
 }
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
@@ -33235,10 +34223,48 @@ extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t x_elem_off) {
-    if (weight_type != 8u) return 0;
-    return ds4_gpu_matmul_q8_0_kslice_tensor(
-            out, model_map, model_size, weight_offset,
-            full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    if (weight_type == 8u) {
+        return ds4_gpu_matmul_q8_0_kslice_tensor(
+                out, model_map, model_size, weight_offset,
+                full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off);
+    }
+    if (weight_type != 1u || !out || !x || !model_map || !g_cublas_ready ||
+        full_in_dim == 0u || k_cnt == 0u || out_dim == 0u ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        full_in_dim > INT_MAX || k_cnt > INT_MAX || out_dim > INT_MAX ||
+        x_elem_off > x->bytes / sizeof(float) ||
+        k_cnt > x->bytes / sizeof(float) - x_elem_off ||
+        out->bytes < out_dim * sizeof(float) ||
+        out_dim > UINT64_MAX / full_in_dim ||
+        out_dim * full_in_dim > UINT64_MAX / sizeof(__half) ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes =
+        out_dim * full_in_dim * sizeof(__half);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const __half *w = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            "f16 k-slice");
+    if (!w) return 0;
+    const int ok = cuda_matmul_f16_cublas_ptr(
+            out,
+            w + k_off,
+            full_in_dim,
+            k_cnt,
+            out_dim,
+            (const float *)x->ptr + x_elem_off,
+            1u,
+            logical_tier,
+            "f16 k-slice matmul");
+    if (ok) {
+        cuda_dense_exec_proof_mark_source_f16_rect(
+            out, weight_offset, full_in_dim, out_dim,
+            k_off, k_cnt, 0u, out_dim, 1u);
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(

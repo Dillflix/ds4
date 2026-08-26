@@ -4585,6 +4585,22 @@ typedef struct {
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
+static bool weights_have_dsv4_source_f16_core(const ds4_weights *w) {
+    if (!w || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const ds4_tensor *core[] = {
+            l->attn_q_a, l->attn_q_b, l->attn_kv,
+            l->attn_output_a, l->attn_output_b,
+            l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp,
+        };
+        for (size_t i = 0; i < sizeof(core) / sizeof(core[0]); i++) {
+            if (core[i] && core[i]->type == DS4_TENSOR_F16) return true;
+        }
+    }
+    return false;
+}
+
 typedef struct {
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
@@ -4760,6 +4776,14 @@ static bool tensor_type_is_dense_quant(uint32_t type) {
            type == DS4_TENSOR_Q4_0;
 }
 
+/* The eight dense projections in each DeepSeek-V4 transformer layer may be
+ * stored directly as source-derived F16.  Keep this separate from the
+ * generic dense-quant predicate: the vocabulary head, GLM, MTP, and DSpark
+ * layouts retain their existing, deliberately narrower contracts. */
+static bool tensor_type_is_dsv4_core_dense(uint32_t type) {
+    return type == DS4_TENSOR_F16 || tensor_type_is_dense_quant(type);
+}
+
 static void tensor_expect_glm_dense_quant_layout(
         const ds4_tensor *t,
         uint32_t          ndim,
@@ -4788,6 +4812,24 @@ static void tensor_expect_dense_quant_layout(
     if (!tensor_type_is_dense_quant(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
+static void tensor_expect_dsv4_core_dense_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating DeepSeek core dense layout");
+    if (!tensor_type_is_dsv4_core_dense(t->type)) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected F16, q8_0, q4_K, or q4_0\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -5485,14 +5527,14 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_dense_quant_layout(l->attn_q_a,       2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_dsv4_core_dense_layout(l->attn_q_a,       2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_dense_quant_layout(l->attn_q_b,       2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_dense_quant_layout(l->attn_kv,        2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_dsv4_core_dense_layout(l->attn_q_b,       2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_dsv4_core_dense_layout(l->attn_kv,        2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_dense_quant_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_dsv4_core_dense_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_dsv4_core_dense_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -5526,9 +5568,9 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        tensor_expect_dense_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_dense_quant_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_dense_quant_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_dsv4_core_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_dsv4_core_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_dsv4_core_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
@@ -20533,6 +20575,41 @@ static bool metal_graph_matmul_dense_quant_abs(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+static uint32_t metal_graph_dense_audit_token_offset;
+static bool metal_graph_dense_exec_audit_record(
+        const ds4_gpu_tensor *out,
+        const ds4_tensor     *w,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        uint64_t              n_tokens);
+static bool metal_graph_dense_exec_audit_record_rect(
+        const ds4_gpu_tensor *out,
+        const ds4_tensor     *w,
+        uint64_t              proof_weight_offset,
+        uint64_t              proof_in_dim,
+        uint64_t              proof_out_dim,
+        uint64_t              proof_input_offset,
+        uint64_t              proof_input_count,
+        uint64_t              proof_output_offset,
+        uint64_t              proof_output_count,
+        uint64_t              executed_input_offset,
+        uint64_t              executed_input_count,
+        uint64_t              executed_output_offset,
+        uint64_t              executed_output_count,
+        uint64_t              n_tokens);
+static bool metal_graph_matmul_dsv4_shared_gate_up(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        const ds4_model      *model,
+        const ds4_tensor     *gate_w,
+        const ds4_tensor     *up_w,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
 static bool metal_graph_matmul_dense_quant_kslice(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -22032,6 +22109,7 @@ static bool metal_graph_encode_decode_layer_phase(
         uint32_t                n_raw,
         int                     token,
         metal_decode_layer_phase phase) {
+    metal_graph_dense_audit_token_offset = pos;
     /* switch to this layer's home tier before any Class P
      * accessor reads. Single-tier (placement == NULL): no-op. */
     if (g->placement) {
@@ -22173,7 +22251,28 @@ static bool metal_graph_encode_decode_layer_phase(
     if (!resume_after_attn) {
     if (!resume_after_qkv) {
     bool qkv_pair_projected = resume_after_qa_kv_raw;
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
+        layer->attn_q_a->type == DS4_TENSOR_F16 &&
+        layer->attn_kv->type == DS4_TENSOR_F16 &&
+        g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
+        qkv_pair_projected = ds4_gpu_matmul_f16_pair_mixed_tensor(
+                metal_graph_qr(g),
+                metal_graph_kv_raw(g),
+                model->map,
+                model->size,
+                layer->attn_q_a->abs_offset,
+                layer->attn_kv->abs_offset,
+                DS4_N_EMBD,
+                q_rank,
+                DS4_N_HEAD_DIM,
+                metal_graph_attn_norm(g),
+                1u) != 0;
+    } else
+#endif
+    if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
+        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_kv->type == DS4_TENSOR_Q8_0 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
                 metal_graph_qr(g),
@@ -22188,20 +22287,40 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_attn_norm(g),
                 1) != 0;
     }
-    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_qr(g), model->map, model->size,
-                                                                     layer->attn_q_a->abs_offset,
-                                                                     DS4_N_EMBD, q_rank,
-                                                                     metal_graph_attn_norm(g), 1) != 0;
+    if (!resume_after_qa_kv_raw && ok && qkv_pair_projected) {
+        ok = metal_graph_dense_exec_audit_record(
+                    metal_graph_qr(g), layer->attn_q_a,
+                    layer->attn_q_a->abs_offset,
+                    DS4_N_EMBD, q_rank, 1u) &&
+             metal_graph_dense_exec_audit_record(
+                    metal_graph_kv_raw(g), layer->attn_kv,
+                    layer->attn_kv->abs_offset,
+                    DS4_N_EMBD, DS4_N_HEAD_DIM, 1u);
+    }
+    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+        ok = metal_graph_matmul_dense_quant_tensor(metal_graph_qr(g),
+                                                   model,
+                                                   layer->attn_q_a,
+                                                   DS4_N_EMBD,
+                                                   q_rank,
+                                                   metal_graph_attn_norm(g),
+                                                   1);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_qr(g), q_rank, il, pos);
     }
     const bool kvnorm_dump = metal_graph_debug_wants("KVnorm", il, pos);
     bool kv_rope_fused = false;
     if (qkv_rms_fused) {
-        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_kv_raw(g), model->map, model->size,
-                                                                         layer->attn_kv->abs_offset,
-                                                                         DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                                         metal_graph_attn_norm(g), 1) != 0;
+        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+            ok = metal_graph_matmul_dense_quant_tensor(metal_graph_kv_raw(g),
+                                                       model,
+                                                       layer->attn_kv,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HEAD_DIM,
+                                                       metal_graph_attn_norm(g),
+                                                       1);
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_kv_raw(g), DS4_N_HEAD_DIM, il, pos);
         }
@@ -22990,6 +23109,8 @@ static bool metal_graph_encode_decode_layer_phase(
         !metal_graph_use_reference_attn_out_hc();
     const bool fuse_tp_attn_out_hc =
         cuda_tp_attn &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_use_reference_attn_out_hc() &&
         g->cuda_tp_attn_out_hc_fuse;
     if (ok && cuda_tp_attn_requested && !cuda_tp_attn) {
@@ -23049,20 +23170,20 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         if (ok) ok = ds4_gpu_set_current_device(cuda_tp_partner_tier) == 0;
         if (ok) {
-            ok = ds4_gpu_attention_output_q8_tp_tensor(
+            ok = metal_graph_attention_output_dense_quant_tp(
                     g->attn_out_by_tier[cuda_tp_partner_tier],
                     g->attn_low_by_tier[cuda_tp_partner_tier],
-                    model->map,
-                    model->size,
-                    layer->attn_output_a->abs_offset,
-                    layer->attn_output_b->abs_offset,
+                    g,
+                    model,
+                    layer->attn_output_a,
+                    layer->attn_output_b,
                     group_dim,
                     rank,
                     n_groups,
                     tp_groups,
                     tp_groups,
                     DS4_N_EMBD,
-                    peer_heads) != 0;
+                    peer_heads);
         }
         if (ok) ok = ds4_gpu_set_current_device(cuda_tp_home_tier) == 0;
         if (ok && fuse_tp_attn_out_hc) {
@@ -23076,20 +23197,20 @@ static bool metal_graph_encode_decode_layer_phase(
                     tp_groups,
                     metal_graph_heads(g)) != 0;
         } else if (ok) {
-            ok = ds4_gpu_attention_output_q8_tp_tensor(
+            ok = metal_graph_attention_output_dense_quant_tp(
                     metal_graph_attn_out(g),
                     metal_graph_attn_low(g),
-                    model->map,
-                    model->size,
-                    layer->attn_output_a->abs_offset,
-                    layer->attn_output_b->abs_offset,
+                    g,
+                    model,
+                    layer->attn_output_a,
+                    layer->attn_output_b,
                     group_dim,
                     rank,
                     n_groups,
                     0,
                     tp_groups,
                     DS4_N_EMBD,
-                    metal_graph_heads(g)) != 0;
+                    metal_graph_heads(g));
         }
         if (ok) {
             ok = ds4_gpu_tensor_copy_xdev(g->tp_peer_tmp_by_tier[cuda_tp_home_tier],
@@ -23114,6 +23235,30 @@ static bool metal_graph_encode_decode_layer_phase(
                     metal_graph_hc_split(g),
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
+            if (ok) {
+                ok = metal_graph_dense_exec_audit_record(
+                            metal_graph_attn_low(g),
+                            layer->attn_output_a,
+                            layer->attn_output_a->abs_offset,
+                            group_dim,
+                            (uint64_t)tp_groups * rank,
+                            1u) &&
+                     metal_graph_dense_exec_audit_record_rect(
+                            metal_graph_attn_out(g),
+                            layer->attn_output_b,
+                            layer->attn_output_b->abs_offset,
+                            (uint64_t)n_groups * rank,
+                            DS4_N_EMBD,
+                            0u,
+                            (uint64_t)tp_groups * rank,
+                            0u,
+                            DS4_N_EMBD,
+                            0u,
+                            (uint64_t)tp_groups * rank,
+                            0u,
+                            DS4_N_EMBD,
+                            1u);
+            }
             if (ok) cuda_tp_attn_hc_fused = true;
         }
     } else if (ok && fuse_attn_out_hc) {
@@ -23139,6 +23284,22 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         DS4_N_EMBD,
                                                         DS4_N_HC) != 0;
         }
+        if (ok) {
+            ok = metal_graph_dense_exec_audit_record(
+                        metal_graph_attn_low(g),
+                        layer->attn_output_a,
+                        layer->attn_output_a->abs_offset,
+                        group_dim,
+                        (uint64_t)n_groups * rank,
+                        1u) &&
+                 metal_graph_dense_exec_audit_record(
+                        metal_graph_attn_out(g),
+                        layer->attn_output_b,
+                        layer->attn_output_b->abs_offset,
+                        (uint64_t)n_groups * rank,
+                        DS4_N_EMBD,
+                        1u);
+        }
     } else if (ok && g->tp_world == 2) {
         /* Group-sliced attention output: this rank computes its half of the
          * output groups and the matching k-window of the expand projection,
@@ -23156,7 +23317,8 @@ static bool metal_graph_encode_decode_layer_phase(
                 g->tp_rank * tp_groups, tp_groups,
                 DS4_N_EMBD,
                 metal_graph_heads(g));
-    } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
+    } else if (ok && (layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
+                      layer->attn_output_b->type != DS4_TENSOR_Q8_0)) {
         ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = metal_graph_attention_output_dense_quant_low(metal_graph_attn_low(g),
@@ -23189,6 +23351,22 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         group_dim, rank,
                                                         n_groups, DS4_N_EMBD,
                                                         metal_graph_heads(g), 1) != 0;
+        if (ok) {
+            ok = metal_graph_dense_exec_audit_record(
+                        metal_graph_attn_low(g),
+                        layer->attn_output_a,
+                        layer->attn_output_a->abs_offset,
+                        group_dim,
+                        (uint64_t)n_groups * rank,
+                        1u) &&
+                 metal_graph_dense_exec_audit_record(
+                        attn_out_dst,
+                        layer->attn_output_b,
+                        layer->attn_output_b->abs_offset,
+                        (uint64_t)n_groups * rank,
+                        DS4_N_EMBD,
+                        1u);
+        }
     }
     if (ok && g->tp_world == 2) {
         /* Gate ATTN: exchange the attention block output with the peer and
@@ -23425,6 +23603,16 @@ static bool metal_graph_encode_decode_layer_phase(
     bool cuda_tp_ep_dual_prequant = false;
     uint64_t cuda_tp_ep_return_bytes = 0;
     bool cuda_tp_shared_fold_peer_tmp = false;
+    if (ok && cuda_tp_shared_requested && !cuda_tp_shared) {
+        fprintf(stderr,
+                "ds4: CUDA decode TP shared-expert split was requested but "
+                "is unavailable for layer %u (gate=%s up=%s down=%s)\n",
+                il,
+                tensor_type_name(layer->ffn_gate_shexp->type),
+                tensor_type_name(layer->ffn_up_shexp->type),
+                tensor_type_name(layer->ffn_down_shexp->type));
+        ok = false;
+    }
     if (ok && cuda_tp_moe_requested && !cuda_tp_moe) {
         fprintf(stderr,
                 "ds4: CUDA decode TP cannot split routed MoE for tier %d "
@@ -23647,7 +23835,8 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 #if !defined(__APPLE__)
         if (ok && cuda_tp_ep_balanced_shared_mid) {
-            ok = ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+            const int shared_mid_rc =
+                ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
                     metal_graph_shared_mid(g),
                     model->map,
                     model->size,
@@ -23662,7 +23851,20 @@ static bool metal_graph_encode_decode_layer_phase(
                         ? g->shared_gate_by_tier[cuda_tp_partner_tier]
                         : NULL,
                     DS4_N_EXPERT / 2u,
-                    false) != 0;
+                    false);
+            ok = shared_mid_rc != 0;
+            if (ok && shared_mid_rc == 1) {
+                ok = metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_mid(g),
+                            layer->ffn_gate_shexp,
+                            layer->ffn_gate_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim, 1u) &&
+                     metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_mid(g),
+                            layer->ffn_up_shexp,
+                            layer->ffn_up_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim, 1u);
+            }
         }
 #endif
         if (switched_to_partner && ds4_gpu_set_current_device(cuda_tp_home_tier) != 0) {
@@ -23728,7 +23930,8 @@ static bool metal_graph_encode_decode_layer_phase(
         }
 #if !defined(__APPLE__)
         if (ok && cuda_tp_ep_balanced_shared_mid) {
-            ok = ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+            const int shared_mid_rc =
+                ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
                     metal_graph_shared_mid(g),
                     model->map,
                     model->size,
@@ -23743,7 +23946,20 @@ static bool metal_graph_encode_decode_layer_phase(
                         ? metal_graph_shared_gate(g)
                         : NULL,
                     DS4_N_EXPERT / 2u,
-                    true) != 0;
+                    true);
+            ok = shared_mid_rc != 0;
+            if (ok && shared_mid_rc == 1) {
+                ok = metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_mid(g),
+                            layer->ffn_gate_shexp,
+                            layer->ffn_gate_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim, 1u) &&
+                     metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_mid(g),
+                            layer->ffn_up_shexp,
+                            layer->ffn_up_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim, 1u);
+            }
         }
 #endif
         if (ok) {
@@ -23864,22 +24080,30 @@ static bool metal_graph_encode_decode_layer_phase(
                                                              metal_graph_ffn_norm(g),
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_gate(g),
-                                                               model,
-                                                               layer->ffn_gate_shexp,
-                                                               DS4_N_EMBD,
-                                                               shared_dim,
-                                                               metal_graph_ffn_norm(g),
-                                                               1);
-            if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_up(g),
-                                                               model,
-                                                               layer->ffn_up_shexp,
-                                                               DS4_N_EMBD,
-                                                               shared_dim,
-                                                               metal_graph_ffn_norm(g),
-                                                               1);
+            ok = metal_graph_matmul_dsv4_shared_gate_up(
+                    metal_graph_shared_gate(g),
+                    metal_graph_shared_up(g),
+                    model,
+                    layer->ffn_gate_shexp,
+                    layer->ffn_up_shexp,
+                    layer->ffn_gate_shexp->abs_offset,
+                    layer->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD,
+                    shared_dim,
+                    metal_graph_ffn_norm(g),
+                    1u);
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+        }
+        if (ok && fuse_shared_gate_up) {
+            ok = metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_gate(g), layer->ffn_gate_shexp,
+                        layer->ffn_gate_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u) &&
+                 metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_up(g), layer->ffn_up_shexp,
+                        layer->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u);
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
@@ -23938,6 +24162,12 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        DS4_N_EMBD,
                                                        metal_graph_shared_mid(g),
                                                        1);
+        }
+        if (ok && fuse_shared_down_hc) {
+            ok = metal_graph_dense_exec_audit_record(
+                    metal_graph_shared_out(g), layer->ffn_down_shexp,
+                    layer->ffn_down_shexp->abs_offset,
+                    shared_dim, DS4_N_EMBD, 1u);
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
         if (ok) {
@@ -24011,22 +24241,30 @@ static bool metal_graph_encode_decode_layer_phase(
                                                              metal_graph_ffn_norm(g),
                                                              DS4_SWIGLU_CLAMP_EXP) != 0;
         } else if (ok) {
-            if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_gate(g),
-                                                               model,
-                                                               layer->ffn_gate_shexp,
-                                                               DS4_N_EMBD,
-                                                               shared_dim,
-                                                               metal_graph_ffn_norm(g),
-                                                               1);
-            if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_up(g),
-                                                               model,
-                                                               layer->ffn_up_shexp,
-                                                               DS4_N_EMBD,
-                                                               shared_dim,
-                                                               metal_graph_ffn_norm(g),
-                                                               1);
+            ok = metal_graph_matmul_dsv4_shared_gate_up(
+                    metal_graph_shared_gate(g),
+                    metal_graph_shared_up(g),
+                    model,
+                    layer->ffn_gate_shexp,
+                    layer->ffn_up_shexp,
+                    layer->ffn_gate_shexp->abs_offset,
+                    layer->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD,
+                    shared_dim,
+                    metal_graph_ffn_norm(g),
+                    1u);
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+        }
+        if (ok && fuse_shared_gate_up) {
+            ok = metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_gate(g), layer->ffn_gate_shexp,
+                        layer->ffn_gate_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u) &&
+                 metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_up(g), layer->ffn_up_shexp,
+                        layer->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u);
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
         if (ok && !fuse_shared_down_hc) {
@@ -24136,6 +24374,12 @@ static bool metal_graph_encode_decode_layer_phase(
                                                              metal_graph_hc_split(g),
                                                              DS4_N_EMBD,
                                                              DS4_N_HC) != 0;
+        }
+        if (ok && fuse_shared_down_hc) {
+            ok = metal_graph_dense_exec_audit_record(
+                    metal_graph_shared_out(g), layer->ffn_down_shexp,
+                    layer->ffn_down_shexp->abs_offset,
+                    shared_dim, DS4_N_EMBD, 1u);
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
         if (ok) {
@@ -24252,23 +24496,29 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            tp_half,
                                                            metal_graph_ffn_norm(g),
                                                            DS4_SWIGLU_CLAMP_EXP) != 0;
+            if (ok) {
+                ok = metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_gate(g), layer->ffn_gate_shexp,
+                            layer->ffn_gate_shexp->abs_offset + tp_lane_off,
+                            DS4_N_EMBD, tp_half, 1u) &&
+                     metal_graph_dense_exec_audit_record(
+                            metal_graph_shared_up(g), layer->ffn_up_shexp,
+                            layer->ffn_up_shexp->abs_offset + tp_lane_off,
+                            DS4_N_EMBD, tp_half, 1u);
+            }
         } else if (ok) {
-            ok = metal_graph_matmul_dense_quant_abs(metal_graph_shared_gate(g),
-                                                    model,
-                                                    layer->ffn_gate_shexp,
-                                                    layer->ffn_gate_shexp->abs_offset + tp_lane_off,
-                                                    DS4_N_EMBD,
-                                                    tp_half,
-                                                    metal_graph_ffn_norm(g),
-                                                    1);
-            if (ok) ok = metal_graph_matmul_dense_quant_abs(metal_graph_shared_up(g),
-                                                            model,
-                                                            layer->ffn_up_shexp,
-                                                            layer->ffn_up_shexp->abs_offset + tp_lane_off,
-                                                            DS4_N_EMBD,
-                                                            tp_half,
-                                                            metal_graph_ffn_norm(g),
-                                                            1);
+            ok = metal_graph_matmul_dsv4_shared_gate_up(
+                    metal_graph_shared_gate(g),
+                    metal_graph_shared_up(g),
+                    model,
+                    layer->ffn_gate_shexp,
+                    layer->ffn_up_shexp,
+                    layer->ffn_gate_shexp->abs_offset + tp_lane_off,
+                    layer->ffn_up_shexp->abs_offset + tp_lane_off,
+                    DS4_N_EMBD,
+                    tp_half,
+                    metal_graph_ffn_norm(g),
+                    1u);
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                                tp_half, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
@@ -24284,21 +24534,29 @@ static bool metal_graph_encode_decode_layer_phase(
                                                          shared_dim,
                                                          metal_graph_ffn_norm(g),
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
+        if (ok) {
+            ok = metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_gate(g), layer->ffn_gate_shexp,
+                        layer->ffn_gate_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u) &&
+                 metal_graph_dense_exec_audit_record(
+                        metal_graph_shared_up(g), layer->ffn_up_shexp,
+                        layer->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim, 1u);
+        }
     } else {
-        if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_gate(g),
-                                                           model,
-                                                           layer->ffn_gate_shexp,
-                                                           DS4_N_EMBD,
-                                                           shared_dim,
-                                                           metal_graph_ffn_norm(g),
-                                                           1);
-        if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_up(g),
-                                                           model,
-                                                           layer->ffn_up_shexp,
-                                                           DS4_N_EMBD,
-                                                           shared_dim,
-                                                           metal_graph_ffn_norm(g),
-                                                           1);
+        if (ok) ok = metal_graph_matmul_dsv4_shared_gate_up(
+                metal_graph_shared_gate(g),
+                metal_graph_shared_up(g),
+                model,
+                layer->ffn_gate_shexp,
+                layer->ffn_up_shexp,
+                layer->ffn_gate_shexp->abs_offset,
+                layer->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD,
+                shared_dim,
+                metal_graph_ffn_norm(g),
+                1u);
         if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
@@ -24429,6 +24687,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    DS4_N_EMBD,
                                                    metal_graph_shared_mid(g),
                                                    1);
+    }
+    if (ok && (cuda_tp_shared || cuda_tp_ep_fused_hc_reduce ||
+               fuse_shared_down_hc)) {
+        ok = metal_graph_dense_exec_audit_record(
+                metal_graph_shared_out(g), layer->ffn_down_shexp,
+                layer->ffn_down_shexp->abs_offset,
+                shared_dim, DS4_N_EMBD, 1u);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
@@ -25213,8 +25478,130 @@ static bool metal_graph_dense_quant_row_bytes(
         uint64_t          in_dim,
         uint64_t         *row_bytes) {
     if (row_bytes) *row_bytes = 0;
-    if (!w || !row_bytes || !tensor_type_is_dense_quant(w->type)) return false;
+    if (!w || !row_bytes || !tensor_type_is_dsv4_core_dense(w->type)) return false;
     return tensor_nbytes(w->type, in_dim, row_bytes);
+}
+
+/* Coverage-only dense execution evidence.  The CUDA implementation is a
+ * no-op unless DS4_CUDA_DENSE_EXEC_AUDIT_CSV is set, so production timing
+ * runs pay neither allocation nor formatting cost. */
+static const char *metal_graph_dsv4_dense_module(const ds4_tensor *w) {
+    if (!w) return NULL;
+    if (ds4_str_contains_lit(w->name, ".attn_q_a.weight"))
+        return "attn_q_a";
+    if (ds4_str_contains_lit(w->name, ".attn_q_b.weight"))
+        return "attn_q_b";
+    if (ds4_str_contains_lit(w->name, ".attn_kv.weight"))
+        return "attn_kv";
+    if (ds4_str_contains_lit(w->name, ".attn_output_a.weight"))
+        return "attn_output_a";
+    if (ds4_str_contains_lit(w->name, ".attn_output_b.weight"))
+        return "attn_output_b";
+    if (ds4_str_contains_lit(w->name, ".ffn_gate_shexp.weight"))
+        return "shared_gate";
+    if (ds4_str_contains_lit(w->name, ".ffn_up_shexp.weight"))
+        return "shared_up";
+    if (ds4_str_contains_lit(w->name, ".ffn_down_shexp.weight"))
+        return "shared_down";
+    return NULL;
+}
+
+static bool metal_graph_dense_exec_audit_record_rect(
+        const ds4_gpu_tensor *out,
+        const ds4_tensor *w,
+        uint64_t proof_weight_offset,
+        uint64_t proof_in_dim,
+        uint64_t proof_out_dim,
+        uint64_t proof_input_offset,
+        uint64_t proof_input_count,
+        uint64_t proof_output_offset,
+        uint64_t proof_output_count,
+        uint64_t executed_input_offset,
+        uint64_t executed_input_count,
+        uint64_t executed_output_offset,
+        uint64_t executed_output_count,
+        uint64_t n_tok) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    const char *module = metal_graph_dsv4_dense_module(w);
+    const uint32_t layer = w ? accelerator_q8_cache_layer(w->name) : UINT32_MAX;
+    uint64_t row_bytes = 0u;
+    if (!module) return true;
+    const char *suffix =
+        strcmp(module, "attn_q_a") == 0 ? "attn_q_a.weight" :
+        strcmp(module, "attn_q_b") == 0 ? "attn_q_b.weight" :
+        strcmp(module, "attn_kv") == 0 ? "attn_kv.weight" :
+        strcmp(module, "attn_output_a") == 0 ? "attn_output_a.weight" :
+        strcmp(module, "attn_output_b") == 0 ? "attn_output_b.weight" :
+        strcmp(module, "shared_gate") == 0 ? "ffn_gate_shexp.weight" :
+        strcmp(module, "shared_up") == 0 ? "ffn_up_shexp.weight" :
+        strcmp(module, "shared_down") == 0 ? "ffn_down_shexp.weight" : NULL;
+    char expected_label[96];
+    const int expected_len = suffix && layer != UINT32_MAX
+        ? snprintf(expected_label, sizeof(expected_label),
+                   "blk.%u.%s", layer, suffix)
+        : -1;
+    if (!w || (w->type != DS4_TENSOR_F16 && w->type != DS4_TENSOR_Q8_0) ||
+        layer == UINT32_MAX || w->name.len > UINT32_MAX || expected_len < 0 ||
+        (size_t)expected_len >= sizeof(expected_label) ||
+        w->name.len != (size_t)expected_len ||
+        memcmp(w->name.ptr, expected_label, (size_t)expected_len) != 0 ||
+        w->ndim != 2u ||
+        !tensor_nbytes(w->type, w->dim[0], &row_bytes) ||
+        w->dim[1] > UINT64_MAX / row_bytes) {
+        fprintf(stderr,
+                "ds4: cannot form dense-exec-audit record for %.*s\n",
+                w ? (int)w->name.len : 0,
+                w && w->name.ptr ? w->name.ptr : "");
+        return false;
+    }
+    return ds4_gpu_dense_exec_audit_record(
+            out, module, w->name.ptr, (uint32_t)w->name.len,
+            layer, metal_graph_dense_audit_token_offset,
+            proof_weight_offset, proof_in_dim, proof_out_dim,
+            proof_input_offset, proof_input_count,
+            proof_output_offset, proof_output_count,
+            w->abs_offset, w->dim[1] * row_bytes, w->type,
+            w->dim[0], w->dim[1],
+            executed_input_offset, executed_input_count,
+            executed_output_offset, executed_output_count,
+            n_tok) != 0;
+#else
+    (void)out; (void)w;
+    (void)proof_weight_offset; (void)proof_in_dim; (void)proof_out_dim;
+    (void)proof_input_offset; (void)proof_input_count;
+    (void)proof_output_offset; (void)proof_output_count;
+    (void)executed_input_offset; (void)executed_input_count;
+    (void)executed_output_offset; (void)executed_output_count;
+    (void)n_tok;
+    return true;
+#endif
+}
+
+static bool metal_graph_dense_exec_audit_record(
+        const ds4_gpu_tensor *out,
+        const ds4_tensor *w,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    uint64_t row_bytes = 0u;
+    if (!w || !tensor_nbytes(w->type, w->dim[0], &row_bytes) ||
+        weight_offset < w->abs_offset || row_bytes == 0u) {
+        return false;
+    }
+    const uint64_t delta = weight_offset - w->abs_offset;
+    if ((delta % row_bytes) != 0u) return false;
+    const uint64_t output_offset = delta / row_bytes;
+    if (in_dim != w->dim[0] || output_offset > w->dim[1] ||
+        out_dim > w->dim[1] - output_offset) {
+        return false;
+    }
+    return metal_graph_dense_exec_audit_record_rect(
+            out, w,
+            weight_offset, in_dim, out_dim,
+            0u, in_dim, 0u, out_dim,
+            0u, in_dim, output_offset, out_dim,
+            n_tok);
 }
 
 static bool metal_graph_matmul_dense_quant_abs(
@@ -25226,16 +25613,28 @@ static bool metal_graph_matmul_dense_quant_abs(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    if (!w || !tensor_type_is_dense_quant(w->type)) return false;
-    return ds4_gpu_matmul_quant_tensor(out,
-                                       model->map,
-                                       model->size,
-                                       weight_offset,
-                                       w->type,
-                                       in_dim,
-                                       out_dim,
-                                       x,
-                                       n_tok) != 0;
+    if (!w || !tensor_type_is_dsv4_core_dense(w->type)) return false;
+    bool ok;
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (w->type == DS4_TENSOR_F16) {
+        ok = ds4_gpu_matmul_f16_cublas_tensor(
+                out, model->map, model->size, weight_offset,
+                in_dim, out_dim, x, n_tok) != 0;
+    } else
+#endif
+    {
+        ok = ds4_gpu_matmul_quant_tensor(out,
+                                         model->map,
+                                         model->size,
+                                         weight_offset,
+                                         w->type,
+                                         in_dim,
+                                         out_dim,
+                                         x,
+                                         n_tok) != 0;
+    }
+    return ok && metal_graph_dense_exec_audit_record(
+            out, w, weight_offset, in_dim, out_dim, n_tok);
 }
 
 static bool metal_graph_matmul_dense_quant_tensor(
@@ -25257,6 +25656,50 @@ static bool metal_graph_matmul_dense_quant_tensor(
                                              n_tok);
 }
 
+static bool metal_graph_matmul_dsv4_shared_gate_up(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        const ds4_model      *model,
+        const ds4_tensor     *gate_w,
+        const ds4_tensor     *up_w,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (!gate || !up || !model || !gate_w || !up_w || !x) return false;
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (gate_w->type == DS4_TENSOR_F16 && up_w->type == DS4_TENSOR_F16) {
+        const bool ok = ds4_gpu_matmul_f16_pair_mixed_tensor(
+                gate, up, model->map, model->size,
+                gate_offset, up_offset, in_dim, out_dim, out_dim,
+                x, n_tok) != 0;
+        return ok &&
+            metal_graph_dense_exec_audit_record(
+                gate, gate_w, gate_offset, in_dim, out_dim, n_tok) &&
+            metal_graph_dense_exec_audit_record(
+                up, up_w, up_offset, in_dim, out_dim, n_tok);
+    }
+#endif
+    return metal_graph_matmul_dense_quant_abs(gate,
+                                               model,
+                                               gate_w,
+                                               gate_offset,
+                                               in_dim,
+                                               out_dim,
+                                               x,
+                                               n_tok) &&
+           metal_graph_matmul_dense_quant_abs(up,
+                                               model,
+                                               up_w,
+                                               up_offset,
+                                               in_dim,
+                                               out_dim,
+                                               x,
+                                               n_tok);
+}
+
 static bool metal_graph_matmul_dense_quant_kslice(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -25267,18 +25710,24 @@ static bool metal_graph_matmul_dense_quant_kslice(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off) {
-    if (!w || !tensor_type_is_dense_quant(w->type)) return false;
-    return ds4_gpu_matmul_quant_kslice_tensor(out,
-                                             model->map,
-                                             model->size,
-                                             w->abs_offset,
-                                             w->type,
-                                             full_in_dim,
-                                             k_off,
-                                             k_cnt,
-                                             out_dim,
-                                             x,
-                                             x_elem_off) != 0;
+    if (!w || !tensor_type_is_dsv4_core_dense(w->type)) return false;
+    const bool ok = ds4_gpu_matmul_quant_kslice_tensor(out,
+                                                       model->map,
+                                                       model->size,
+                                                       w->abs_offset,
+                                                       w->type,
+                                                       full_in_dim,
+                                                       k_off,
+                                                       k_cnt,
+                                                       out_dim,
+                                                       x,
+                                                       x_elem_off) != 0;
+    return ok && metal_graph_dense_exec_audit_record_rect(
+            out, w,
+            w->abs_offset, full_in_dim, out_dim,
+            k_off, k_cnt, 0u, out_dim,
+            k_off, k_cnt, 0u, out_dim,
+            1u);
 }
 
 static bool metal_graph_attention_output_dense_quant_low(
@@ -25296,15 +25745,32 @@ static bool metal_graph_attention_output_dense_quant_low(
         group_dim == 0 || rank == 0 || group_cnt == 0) {
         return false;
     }
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (out_a->type == DS4_TENSOR_F16 && group0 == 0u) {
+        const bool ok = ds4_gpu_attention_output_f16_batch_low_shard_tensor(
+                low,
+                model->map,
+                model->size,
+                out_a->abs_offset,
+                group_dim,
+                rank,
+                group_cnt,
+                0u,
+                group_cnt,
+                heads,
+                1u) != 0;
+        return ok && metal_graph_dense_exec_audit_record(
+                low, out_a, out_a->abs_offset,
+                group_dim, (uint64_t)group_cnt * rank, 1u);
+    }
+#endif
     if (out_a->type == DS4_TENSOR_Q8_0 && group0 == 0) {
-        return ds4_gpu_attention_output_low_q8_tensor(low,
-                                                      model->map,
-                                                      model->size,
-                                                      out_a->abs_offset,
-                                                      group_dim,
-                                                      rank,
-                                                      group_cnt,
-                                                      heads) != 0;
+        const bool ok = ds4_gpu_attention_output_low_q8_tensor(
+                low, model->map, model->size, out_a->abs_offset,
+                group_dim, rank, group_cnt, heads) != 0;
+        return ok && metal_graph_dense_exec_audit_record(
+                low, out_a, out_a->abs_offset,
+                group_dim, (uint64_t)group_cnt * rank, 1u);
     }
     if (out_a->type == DS4_TENSOR_Q4_K) {
         return ds4_gpu_attention_output_low_q4_K_slice_tensor(low,
@@ -25365,21 +25831,75 @@ static bool metal_graph_attention_output_dense_quant_tp(
         return false;
     }
     if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
-        return ds4_gpu_attention_output_q8_tp_tensor(out,
-                                                     low,
-                                                     model->map,
-                                                     model->size,
-                                                     out_a->abs_offset,
-                                                     out_b->abs_offset,
-                                                     group_dim,
-                                                     rank,
-                                                     n_groups_total,
-                                                     group0,
-                                                     group_cnt,
-                                                     out_dim,
-                                                     heads) != 0;
+        const bool ok = ds4_gpu_attention_output_q8_tp_tensor(
+                out, low, model->map, model->size,
+                out_a->abs_offset, out_b->abs_offset,
+                group_dim, rank, n_groups_total, group0, group_cnt,
+                out_dim, heads) != 0;
+        uint64_t a_row_bytes = 0u;
+        const bool have_a_row = tensor_nbytes(
+                out_a->type, group_dim, &a_row_bytes);
+        const uint64_t a_offset = out_a->abs_offset +
+                (uint64_t)group0 * rank * a_row_bytes;
+        return ok && have_a_row &&
+            metal_graph_dense_exec_audit_record(
+                low, out_a, a_offset, group_dim,
+                (uint64_t)group_cnt * rank, 1u) &&
+            metal_graph_dense_exec_audit_record_rect(
+                out, out_b,
+                out_b->abs_offset,
+                (uint64_t)n_groups_total * rank,
+                out_dim,
+                (uint64_t)group0 * rank,
+                (uint64_t)group_cnt * rank,
+                0u,
+                out_dim,
+                (uint64_t)group0 * rank,
+                (uint64_t)group_cnt * rank,
+                0u,
+                out_dim,
+                1u);
     }
-    if (!metal_graph_attention_output_dense_quant_low(low,
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (out_a->type == DS4_TENSOR_F16 && out_b->type == DS4_TENSOR_F16) {
+        if (!ds4_gpu_attention_output_f16_batch_low_shard_tensor(
+                low,
+                model->map,
+                model->size,
+                out_a->abs_offset,
+                group_dim,
+                rank,
+                n_groups_total,
+                group0,
+                group_cnt,
+                heads,
+                1u)) {
+            return false;
+        }
+        uint64_t a_row_bytes = 0u;
+        if (!tensor_nbytes(out_a->type, group_dim, &a_row_bytes) ||
+            !metal_graph_dense_exec_audit_record(
+                low, out_a,
+                out_a->abs_offset + (uint64_t)group0 * rank * a_row_bytes,
+                group_dim, (uint64_t)group_cnt * rank, 1u)) {
+            return false;
+        }
+        return metal_graph_matmul_dense_quant_kslice(out,
+                                                     model,
+                                                     out_b,
+                                                     (uint64_t)n_groups_total * rank,
+                                                     (uint64_t)group0 * rank,
+                                                     (uint64_t)group_cnt * rank,
+                                                     out_dim,
+                                                     low,
+                                                     0);
+    }
+#endif
+    const uint64_t heads_off = (uint64_t)group0 * group_dim * sizeof(float);
+    const uint64_t heads_bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
+    ds4_gpu_tensor *heads_slice = ds4_gpu_tensor_view(heads, heads_off, heads_bytes);
+    const bool low_ok = heads_slice &&
+        metal_graph_attention_output_dense_quant_low(low,
                                                      g,
                                                      model,
                                                      out_a,
@@ -25387,7 +25907,9 @@ static bool metal_graph_attention_output_dense_quant_tp(
                                                      rank,
                                                      group0,
                                                      group_cnt,
-                                                     heads)) {
+                                                     heads_slice);
+    ds4_gpu_tensor_free(heads_slice);
+    if (!low_ok) {
         return false;
     }
     return metal_graph_matmul_dense_quant_kslice(out,
@@ -25419,7 +25941,7 @@ static bool metal_graph_attention_output_dense_quant_batch(
         return false;
     }
     if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
-        return ds4_gpu_attention_output_q8_batch_tensor(out,
+        const bool ok = ds4_gpu_attention_output_q8_batch_tensor(out,
                                                         low,
                                                         metal_graph_batch_group_tmp(g),
                                                         metal_graph_batch_low_tmp(g),
@@ -25433,7 +25955,37 @@ static bool metal_graph_attention_output_dense_quant_batch(
                                                         out_dim,
                                                         heads,
                                                         n_tokens) != 0;
+        return ok &&
+            metal_graph_dense_exec_audit_record(
+                low, out_a, out_a->abs_offset, group_dim,
+                (uint64_t)n_groups * rank, n_tokens) &&
+            metal_graph_dense_exec_audit_record(
+                out, out_b, out_b->abs_offset,
+                (uint64_t)n_groups * rank, out_dim, n_tokens);
     }
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (out_a->type == DS4_TENSOR_F16 && out_b->type == DS4_TENSOR_F16) {
+        const bool ok = ds4_gpu_attention_output_f16_batch_tensor(out,
+                                                         low,
+                                                         model->map,
+                                                         model->size,
+                                                         out_a->abs_offset,
+                                                         out_b->abs_offset,
+                                                         group_dim,
+                                                         rank,
+                                                         n_groups,
+                                                         out_dim,
+                                                         heads,
+                                                         n_tokens) != 0;
+        return ok &&
+            metal_graph_dense_exec_audit_record(
+                low, out_a, out_a->abs_offset, group_dim,
+                (uint64_t)n_groups * rank, n_tokens) &&
+            metal_graph_dense_exec_audit_record(
+                out, out_b, out_b->abs_offset,
+                (uint64_t)n_groups * rank, out_dim, n_tokens);
+    }
+#endif
     if (out_a->type == DS4_TENSOR_Q4_K && n_tokens >= 32u) {
         if (ds4_gpu_attention_output_q4_K_batch_tensor(out,
                                                        low,
@@ -27330,11 +27882,20 @@ static bool metal_graph_cuda_tp_prefill_heads_active(
     (void)g; (void)layer; (void)il; (void)pos0; (void)n_tokens;
     return false;
 #else
+    bool output_pair_supported =
+        layer &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0;
+#if !defined(DS4_ROCM_BUILD)
+    output_pair_supported = output_pair_supported ||
+        (layer &&
+         layer->attn_output_a->type == DS4_TENSOR_F16 &&
+         layer->attn_output_b->type == DS4_TENSOR_F16);
+#endif
     if (!g || !layer || !g->cuda_tp_prefill_attn_heads ||
         n_tokens < 128u || (DS4_N_HEAD & 1u) != 0u ||
         (DS4_N_OUT_GROUP & 1u) != 0u ||
-        layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
-        layer->attn_output_b->type != DS4_TENSOR_Q8_0 ||
+        !output_pair_supported ||
         metal_graph_directional_steering_attn_enabled(g) ||
         metal_graph_debug_wants("kqv_out", il, pos0) ||
         metal_graph_debug_wants("kqv_back", il, pos0) ||
@@ -27448,17 +28009,45 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
     const uint32_t half_groups = n_groups / 2u;
     const uint64_t half_low = (uint64_t)half_groups * rank;
     const uint64_t low_total = (uint64_t)n_groups * rank;
+    const bool source_f16 =
+        layer->attn_output_a->type == DS4_TENSOR_F16 &&
+        layer->attn_output_b->type == DS4_TENSOR_F16;
     bool ok = true;
     for (int pass = 0; ok && pass < 2; pass++) {
         const int tier = pass == 0 ? partner : home;
         const uint32_t group0 = pass == 0 ? half_groups : 0u;
-        ok = ds4_gpu_set_current_device(tier) == 0 &&
-             ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+        ok = ds4_gpu_set_current_device(tier) == 0;
+#if !defined(DS4_ROCM_BUILD)
+        if (ok && source_f16) {
+            ok = ds4_gpu_attention_output_f16_batch_low_shard_tensor(
                     g->batch_attn_low_by_tier[tier],
                     model->map, model->size,
                     layer->attn_output_a->abs_offset,
                     group_dim, rank, n_groups, group0, half_groups,
                     g->batch_heads_by_tier[tier], n_tokens) != 0;
+        } else
+#else
+        (void)source_f16;
+#endif
+        if (ok) {
+            ok = ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+                    g->batch_attn_low_by_tier[tier],
+                    model->map, model->size,
+                    layer->attn_output_a->abs_offset,
+                    group_dim, rank, n_groups, group0, half_groups,
+                    g->batch_heads_by_tier[tier], n_tokens) != 0;
+        }
+        if (ok) {
+            uint64_t a_row_bytes = 0u;
+            ok = tensor_nbytes(layer->attn_output_a->type,
+                               group_dim, &a_row_bytes) &&
+                 metal_graph_dense_exec_audit_record(
+                    g->batch_attn_low_by_tier[tier],
+                    layer->attn_output_a,
+                    layer->attn_output_a->abs_offset +
+                        (uint64_t)group0 * rank * a_row_bytes,
+                    group_dim, half_low, n_tokens);
+        }
     }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(
@@ -27476,12 +28065,31 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
                 n_tokens, half_low) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_b_tensor(
-                g->batch_attn_out_by_tier[home],
-                model->map, model->size,
-                layer->attn_output_b->abs_offset,
-                low_total, DS4_N_EMBD,
-                g->batch_q_by_tier[home], n_tokens) != 0;
+#if !defined(DS4_ROCM_BUILD)
+        if (source_f16) {
+            ok = ds4_gpu_matmul_f16_cublas_tensor(
+                    g->batch_attn_out_by_tier[home],
+                    model->map, model->size,
+                    layer->attn_output_b->abs_offset,
+                    low_total, DS4_N_EMBD,
+                    g->batch_q_by_tier[home], n_tokens) != 0;
+        } else
+#endif
+        {
+            ok = ds4_gpu_attention_output_q8_batch_b_tensor(
+                    g->batch_attn_out_by_tier[home],
+                    model->map, model->size,
+                    layer->attn_output_b->abs_offset,
+                    low_total, DS4_N_EMBD,
+                    g->batch_q_by_tier[home], n_tokens) != 0;
+        }
+        if (ok) {
+            ok = metal_graph_dense_exec_audit_record(
+                    g->batch_attn_out_by_tier[home],
+                    layer->attn_output_b,
+                    layer->attn_output_b->abs_offset,
+                    low_total, DS4_N_EMBD, n_tokens);
+        }
     }
     return ok;
 #endif
@@ -27679,7 +28287,37 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
+    bool source_f16_qkv_pair = false;
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (ok && qkv_rms_fused && g->cuda_qkv_pair &&
+        !metal_graph_use_reference_qkv_pair_proj() &&
+        layer->attn_q_a->type == DS4_TENSOR_F16 &&
+        layer->attn_kv->type == DS4_TENSOR_F16) {
+        source_f16_qkv_pair = ds4_gpu_matmul_f16_pair_mixed_tensor(
+                metal_graph_batch_qr(g),
+                metal_graph_batch_kv_raw(g),
+                model->map,
+                model->size,
+                layer->attn_q_a->abs_offset,
+                layer->attn_kv->abs_offset,
+                DS4_N_EMBD,
+                q_rank,
+                DS4_N_HEAD_DIM,
+                metal_graph_batch_attn_norm(g),
+                n_tokens) != 0;
+        ok = source_f16_qkv_pair &&
+             metal_graph_dense_exec_audit_record(
+                metal_graph_batch_qr(g), layer->attn_q_a,
+                layer->attn_q_a->abs_offset,
+                DS4_N_EMBD, q_rank, n_tokens) &&
+             metal_graph_dense_exec_audit_record(
+                metal_graph_batch_kv_raw(g), layer->attn_kv,
+                layer->attn_kv->abs_offset,
+                DS4_N_EMBD, DS4_N_HEAD_DIM, n_tokens);
+    }
+#endif
+    if (ok && !source_f16_qkv_pair)
+        ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
                                                       metal_graph_batch_qr(g),
@@ -27695,7 +28333,8 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
+        if (ok && !source_f16_qkv_pair)
+            ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
                                                           pos0,
                                                           metal_graph_batch_kv_raw(g),
@@ -29592,6 +30231,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 
 #define DS4_METAL_TRY_SHARED_DOWN_F16() do { \
         if (ok && !tp_row_split_ffn && !keep_ffn_out && \
+            layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && \
             !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
             shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
                                                                  model->map, \
@@ -29605,7 +30245,19 @@ static bool metal_graph_encode_layer_ffn_batch(
     } while (0)
 
 #define DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT() do { \
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
+        if (ok && layer->ffn_gate_shexp->type == DS4_TENSOR_F16 && \
+            layer->ffn_up_shexp->type == DS4_TENSOR_F16) { \
+            ok = metal_graph_matmul_dsv4_shared_gate_up( \
+                    metal_graph_batch_shared_gate(g), \
+                    metal_graph_batch_shared_up(g), \
+                    model, layer->ffn_gate_shexp, layer->ffn_up_shexp, \
+                    layer->ffn_gate_shexp->abs_offset, \
+                    layer->ffn_up_shexp->abs_offset, \
+                    DS4_N_EMBD, shared_dim, \
+                    tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
+                    tp_rows); \
+        } else { \
+            if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_gate(g), \
@@ -29615,7 +30267,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           shared_dim, \
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
+            if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", \
                                                           il, \
                                                           pos0, \
                                                           metal_graph_batch_shared_up(g), \
@@ -29625,6 +30277,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                           shared_dim, \
                                                           tp_ffn_x ? tp_ffn_x : metal_graph_batch_ffn_norm(g), \
                                                           tp_rows); \
+        } \
         DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up"); \
         if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_batch_shared_mid(g), \
                                              metal_graph_batch_shared_gate(g), \
@@ -29993,6 +30646,7 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    metal_graph_dense_audit_token_offset = pos0;
     if (g->placement) {
         const int this_tier = g->placement[il + 1u];
         if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) {
@@ -57160,6 +57814,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_layer_end,
                  load_output,
                  load_output_optional);
+    if (!opt->inspect_only &&
+        weights_have_dsv4_source_f16_core(&e->weights) &&
+        opt->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr,
+                "ds4: source-F16 DeepSeek core dense tensors currently "
+                "require the CUDA production graph; refusing an unsupported "
+                "%s fallback\n",
+                ds4_backend_name(opt->backend));
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
