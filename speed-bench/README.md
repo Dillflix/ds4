@@ -502,6 +502,35 @@ Resume validates the complete experiment manifest, the prior runtime/scorer
 commit, every reusable arm's row count and runtime dispatch, and refuses reuse
 if the runtime or scorer changed.
 
+### Exact native-Q8 T256 partner anchor
+
+`cuda-q8-partner-native-exact.sh` is the prerequisite to any concurrent row
+split. It transports the block-Q8 activations/scales over NVLink and invokes
+the same SM75 exact-MMA projection used by the local path against the partner's
+already-resident Q8 weights. It admits only T256 layers 15-21 and preserves the
+frozen local cache plan. The runner refuses to benchmark unless the dedicated
+two-GPU regression and all 100 production quality cases are byte-exact.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REPEATS=3 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-q8-partner-native-exact.sh
+```
+
+The performance phase is deliberately limited to 16K and 32K. Every repeat
+must retain the same seven additive T256 bindings, record only
+`native_q8_partner_hit/exact_sm75_mma`, and produce byte-identical frontier
+logits. Return `q8-partner-native-exact-<timestamp>.tar.gz`.
+
 ### Tagged SM75 native-Q4 and automatic-T256 A/B
 
 `cuda-sm75-native-q4-t256-ab.sh` is an evidence runner only; it does not

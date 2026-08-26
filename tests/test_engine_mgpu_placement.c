@@ -223,7 +223,8 @@ static void test_q8_cache_partner_mapping(void) {
           ds4_test_q8_partner_arithmetic_valid("w16-x16-sgemm") == 1 &&
           ds4_test_q8_partner_arithmetic_valid("w16-x32-sgemm") == 1 &&
           ds4_test_q8_partner_arithmetic_valid("w32-x32-sgemm") == 1 &&
-          ds4_test_q8_partner_arithmetic_valid("w32-xq8-sgemm") == 1,
+          ds4_test_q8_partner_arithmetic_valid("w32-xq8-sgemm") == 1 &&
+          ds4_test_q8_partner_arithmetic_valid("native-q8") == 1,
           "all declared partner arithmetic arms are accepted");
     CHECK(ds4_test_q8_partner_arithmetic_valid("fp32") == 0 &&
           ds4_test_q8_partner_arithmetic_valid("w32-x16-sgemm") == 0,

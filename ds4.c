@@ -3079,7 +3079,8 @@ static bool accelerator_q8_partner_arithmetic_valid(const char *value) {
            strcmp(value, "w16-x16-sgemm") == 0 ||
            strcmp(value, "w16-x32-sgemm") == 0 ||
            strcmp(value, "w32-x32-sgemm") == 0 ||
-           strcmp(value, "w32-xq8-sgemm") == 0;
+           strcmp(value, "w32-xq8-sgemm") == 0 ||
+           strcmp(value, "native-q8") == 0;
 }
 
 static int accelerator_q8_cache_partner_tier(

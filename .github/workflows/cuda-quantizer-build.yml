@@ -35,6 +35,7 @@ on:
       - "speed-bench/cuda-q8-partner-production-validation.sh"
       - "speed-bench/cuda-q8-partner-quality-isolation.sh"
       - "speed-bench/cuda-q8-partner-arithmetic-isolation.sh"
+      - "speed-bench/cuda-q8-partner-native-exact.sh"
       - "speed-bench/cuda-q8-t32-fused-ab.sh"
       - "speed-bench/cuda-sm75-critical-path-audit.sh"
       - "speed-bench/cuda-sm75-q4-clock-audit.sh"
@@ -45,6 +46,7 @@ on:
       - "speed-bench/summarize-sm75-native-q4-t256-ab.py"
       - "speed-bench/summarize-q8-partner-quality-isolation.py"
       - "speed-bench/summarize-q8-partner-arithmetic.py"
+      - "speed-bench/summarize-q8-partner-native-exact.py"
       - "speed-bench/q8_partner_audit.py"
       - "speed-bench/summarize-q8-t32-fused-ab.py"
       - "speed-bench/validate-ncu-capture.py"
@@ -67,6 +69,7 @@ on:
       - "tests/test_summarize_sm75_native_q4_t256_ab.py"
       - "tests/test_summarize_q8_partner_quality_isolation.py"
       - "tests/test_summarize_q8_partner_arithmetic.py"
+      - "tests/test_summarize_q8_partner_native_exact.py"
       - "tests/test_summarize_q8_t32_fused_ab.py"
       - "tests/test_summarize_cuda_critical_path.py"
       - "tests/test_summarize_q4_real_histogram.py"
@@ -102,19 +105,24 @@ jobs:
           bash -n speed-bench/cuda-q8-partner-quality-isolation.sh
           test -x speed-bench/cuda-q8-partner-arithmetic-isolation.sh
           bash -n speed-bench/cuda-q8-partner-arithmetic-isolation.sh
+          test -x speed-bench/cuda-q8-partner-native-exact.sh
+          bash -n speed-bench/cuda-q8-partner-native-exact.sh
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-production.py
           python3 -m py_compile speed-bench/summarize-q8-partner-quality-isolation.py
           python3 -m py_compile speed-bench/summarize-q8-partner-arithmetic.py
+          python3 -m py_compile speed-bench/summarize-q8-partner-native-exact.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_production.py
           python3 -m py_compile tests/test_summarize_q8_partner_quality_isolation.py
           python3 -m py_compile tests/test_summarize_q8_partner_arithmetic.py
+          python3 -m py_compile tests/test_summarize_q8_partner_native_exact.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_q8_partner_quality_isolation.py
           python3 tests/test_summarize_q8_partner_arithmetic.py
+          python3 tests/test_summarize_q8_partner_native_exact.py
       - name: Verify production tagged-Q4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'
@@ -443,6 +451,8 @@ jobs:
           bash -n speed-bench/cuda-q8-partner-quality-isolation.sh
           test -x speed-bench/cuda-q8-partner-arithmetic-isolation.sh
           bash -n speed-bench/cuda-q8-partner-arithmetic-isolation.sh
+          test -x speed-bench/cuda-q8-partner-native-exact.sh
+          bash -n speed-bench/cuda-q8-partner-native-exact.sh
           bash -n speed-bench/cuda-q8-t32-fused-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
@@ -467,17 +477,20 @@ jobs:
           python3 -m py_compile speed-bench/summarize-sm75-native-q4-t256-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-quality-isolation.py
           python3 -m py_compile speed-bench/summarize-q8-partner-arithmetic.py
+          python3 -m py_compile speed-bench/summarize-q8-partner-native-exact.py
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_production.py
           python3 -m py_compile tests/test_summarize_sm75_native_q4_t256_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_quality_isolation.py
           python3 -m py_compile tests/test_summarize_q8_partner_arithmetic.py
+          python3 -m py_compile tests/test_summarize_q8_partner_native_exact.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_sm75_native_q4_t256_ab.py
           python3 tests/test_summarize_q8_partner_quality_isolation.py
           python3 tests/test_summarize_q8_partner_arithmetic.py
+          python3 tests/test_summarize_q8_partner_native_exact.py
           python3 -m py_compile speed-bench/summarize-q8-t32-fused-ab.py
           python3 tests/test_summarize_q8_t32_fused_ab.py
           python3 -m py_compile speed-bench/summarize-cuda-critical-path.py

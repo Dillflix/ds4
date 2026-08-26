@@ -520,6 +520,7 @@ enum cuda_q8_partner_arithmetic {
     CUDA_Q8_PARTNER_W16_X32_SGEMM = 2,
     CUDA_Q8_PARTNER_W32_X32_SGEMM = 3,
     CUDA_Q8_PARTNER_W32_XQ8_SGEMM = 4,
+    CUDA_Q8_PARTNER_NATIVE_Q8 = 5,
     CUDA_Q8_PARTNER_ARITHMETIC_INVALID = -1,
 };
 
@@ -1575,6 +1576,9 @@ static int cuda_q8_partner_arithmetic_mode(void) {
     if (strcmp(value, "w32-xq8-sgemm") == 0) {
         return CUDA_Q8_PARTNER_W32_XQ8_SGEMM;
     }
+    if (strcmp(value, "native-q8") == 0) {
+        return CUDA_Q8_PARTNER_NATIVE_Q8;
+    }
     return CUDA_Q8_PARTNER_ARITHMETIC_INVALID;
 }
 
@@ -1585,6 +1589,7 @@ static const char *cuda_q8_partner_arithmetic_name(int mode) {
     case CUDA_Q8_PARTNER_W16_X32_SGEMM: return "w16-x32-sgemm";
     case CUDA_Q8_PARTNER_W32_X32_SGEMM: return "w32-x32-sgemm";
     case CUDA_Q8_PARTNER_W32_XQ8_SGEMM: return "w32-xq8-sgemm";
+    case CUDA_Q8_PARTNER_NATIVE_Q8: return "native-q8";
     default: return "invalid";
     }
 }
@@ -1922,6 +1927,13 @@ static int cuda_q8_f16_partner_scratch_sizes(
         transport_bytes = scale_offset + scales;
         *home_bytes = transport_bytes;
     }
+    if (arithmetic == CUDA_Q8_PARTNER_NATIVE_Q8) {
+        const uint64_t result_offset =
+            (transport_bytes + 255u) & ~UINT64_C(255);
+        if (result_offset > UINT64_MAX - result_bytes) return 0;
+        *partner_bytes = result_offset + result_bytes;
+        return 1;
+    }
     const uint64_t x32_offset =
         (transport_bytes + 255u) & ~UINT64_C(255);
     if (x32_offset > UINT64_MAX - activation_f32_bytes) return 0;
@@ -2068,18 +2080,32 @@ static void cuda_q8_f16_plan_materialize(void) {
         }
         cuda_q8_f16_fill_status fill_status = CUDA_Q8_F16_FILL_ERROR;
         const int arithmetic = cuda_q8_partner_arithmetic_mode();
-        const bool use_f32 = arithmetic != CUDA_Q8_PARTNER_F16_GEMM;
+        const bool use_native_q8 =
+            arithmetic == CUDA_Q8_PARTNER_NATIVE_Q8;
+        const bool use_f32 =
+            arithmetic != CUDA_Q8_PARTNER_F16_GEMM && !use_native_q8;
         const bool half_rounded =
             arithmetic == CUDA_Q8_PARTNER_W16_X16_SGEMM ||
             arithmetic == CUDA_Q8_PARTNER_W16_X32_SGEMM;
-        const void *ptr = use_f32
-            ? (const void *)cuda_q8_f32_ptr_impl(
-                  c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
-                  c.fallback_physical_device, c.label,
-                  half_rounded ? 1 : 0, 1, &fill_status)
-            : (const void *)cuda_q8_f16_ptr_impl(
-                  c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
-                  c.fallback_physical_device, c.label, 1, &fill_status, 1);
+        const void *ptr = NULL;
+        if (use_native_q8) {
+            void *strict_ptr = NULL;
+            if (ds4_gpu_lookup_cache_strict(
+                    c.offset, c.weight_bytes, c.fallback_physical_device,
+                    &strict_ptr) && strict_ptr) {
+                ptr = strict_ptr;
+                fill_status = CUDA_Q8_F16_FILL_SUCCESS;
+            }
+        } else if (use_f32) {
+            ptr = (const void *)cuda_q8_f32_ptr_impl(
+                c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
+                c.fallback_physical_device, c.label,
+                half_rounded ? 1 : 0, 1, &fill_status);
+        } else {
+            ptr = (const void *)cuda_q8_f16_ptr_impl(
+                c.model_map, c.offset, c.weight_bytes, c.in_dim, c.out_dim,
+                c.fallback_physical_device, c.label, 1, &fill_status, 1);
+        }
         if (g_q8_f16_plan_device_error) {
             plan_failed = 1;
             failure_reason = "partner device restoration failed";
@@ -14344,8 +14370,11 @@ extern "C" int ds4_gpu_q8_binding_state_write_csv(const char *path) {
             b.in_dim != 0u && b.out_dim <= UINT64_MAX / b.in_dim / sizeof(__half)
             ? b.in_dim * b.out_dim * sizeof(__half) : 0u;
         const uint64_t resident_weight_bytes = b.partner_offload &&
-            b.partner_arithmetic != CUDA_Q8_PARTNER_F16_GEMM
-                ? b.in_dim * b.out_dim * sizeof(float) : fp16_bytes;
+            b.partner_arithmetic == CUDA_Q8_PARTNER_NATIVE_Q8
+                ? b.weight_bytes
+                : (b.partner_offload &&
+                   b.partner_arithmetic != CUDA_Q8_PARTNER_F16_GEMM
+                       ? b.in_dim * b.out_dim * sizeof(float) : fp16_bytes);
         if (fprintf(fp, "%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%s,%s\n",
                     b.consumer_device, b.resident_device, b.partner_offload,
                     (unsigned long long)b.offset,
@@ -14425,11 +14454,11 @@ static int cuda_q8_f16_sync_home_for_fallback(
     return -1;
 }
 
-/* Execute a planned Q8 expansion on its NVLink partner. Production uses the
- * resident F16 expansion. Explicit arithmetic-isolation arms substitute a
- * resident FP32 expansion and controlled activation representations. All
- * copies use the default-stream event handoff so reusable per-tier scratch
- * cannot be overwritten before the preceding GEMM has consumed it. */
+/* Execute a planned Q8 projection on its NVLink partner. Production uses the
+ * resident F16 expansion. Diagnostic arms can substitute controlled FP32
+ * expansions or transfer the native Q8 activations/scales into the existing
+ * exact SM75 MMA launcher. All copies use the default-stream event handoff so
+ * reusable per-tier scratch cannot be overwritten before compute consumes it. */
 static int cuda_q8_f16_partner_matmul_impl(
         ds4_gpu_tensor *out,
         const ds4_gpu_tensor *x,
@@ -14464,11 +14493,22 @@ static int cuda_q8_f16_partner_matmul_impl(
     const int arithmetic = binding->partner_arithmetic;
     if (arithmetic == CUDA_Q8_PARTNER_ARITHMETIC_INVALID ||
         (result_f16 && arithmetic != CUDA_Q8_PARTNER_F16_GEMM)) return 0;
-    const bool use_f32 = arithmetic != CUDA_Q8_PARTNER_F16_GEMM;
+    const bool use_native_q8 =
+        arithmetic == CUDA_Q8_PARTNER_NATIVE_Q8;
+    const bool use_f32 =
+        arithmetic != CUDA_Q8_PARTNER_F16_GEMM && !use_native_q8;
+    /* This diagnostic exactness anchor deliberately covers only the shipping
+     * SM75 T256 projection measured by the arithmetic audit. Do not silently
+     * broaden it to another shape or architecture before that path has its own
+     * exact-output and production-quality evidence. */
+    if (use_native_q8 &&
+        (in_dim != 8192u || out_dim != 4096u || n_tok < 8u ||
+         g_gpu[partner_tier].compute_major != 7 ||
+         g_gpu[partner_tier].compute_minor != 5)) return 0;
     const bool half_rounded =
         arithmetic == CUDA_Q8_PARTNER_W16_X16_SGEMM ||
         arithmetic == CUDA_Q8_PARTNER_W16_X32_SGEMM;
-    const cuda_q8_f16_range *range_f16 = use_f32 ? NULL
+    const cuda_q8_f16_range *range_f16 = (use_f32 || use_native_q8) ? NULL
         : cuda_q8_f16_find_range(
               model_map, weight_offset, weight_bytes, in_dim, out_dim,
               partner_device);
@@ -14477,8 +14517,22 @@ static int cuda_q8_f16_partner_matmul_impl(
               model_map, weight_offset, weight_bytes, in_dim, out_dim,
               partner_device, half_rounded ? 1 : 0)
         : NULL;
-    if ((!use_f32 && (!range_f16 || !range_f16->device_ptr)) ||
-        (use_f32 && (!range_f32 || !range_f32->device_ptr))) return 0;
+    const unsigned char *range_q8 = NULL;
+    if (use_native_q8) {
+        void *strict_ptr = NULL;
+        if (ds4_gpu_lookup_cache_strict(
+                weight_offset, weight_bytes, partner_device, &strict_ptr) &&
+            strict_ptr) {
+            range_q8 = (const unsigned char *)strict_ptr;
+        }
+    }
+    if (use_native_q8) {
+        if (!range_q8) return 0;
+    } else if (use_f32) {
+        if (!range_f32 || !range_f32->device_ptr) return 0;
+    } else if (!range_f16 || !range_f16->device_ptr) {
+        return 0;
+    }
 
     /* Kernel launch syntax and cuBLAS handles are device-relative. Refuse to
      * begin unless the actual CUDA device (not only the cached logical tier)
@@ -14522,7 +14576,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         arithmetic == CUDA_Q8_PARTNER_W16_X16_SGEMM) {
         transport_bytes = activation_f16_bytes;
         home_required = activation_f16_bytes;
-    } else if (arithmetic == CUDA_Q8_PARTNER_W32_XQ8_SGEMM) {
+    } else if (arithmetic == CUDA_Q8_PARTNER_W32_XQ8_SGEMM ||
+               use_native_q8) {
         const uint64_t blocks = (in_dim + 31u) / 32u;
         if (n_tok > UINT64_MAX / blocks ||
             n_tok * blocks > UINT64_MAX / 32u ||
@@ -14540,9 +14595,11 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (use_f32 && x32_offset > UINT64_MAX - activation_f32_bytes) return 0;
     const uint64_t x32_end = x32_offset + activation_f32_bytes;
     if (use_f32 && x32_end > UINT64_MAX - 255u) return 0;
-    const uint64_t result_offset = use_f32
-        ? ((x32_end + 255u) & ~UINT64_C(255))
-        : ((activation_f16_bytes + 255u) & ~UINT64_C(255));
+    const uint64_t result_offset = use_native_q8
+        ? ((transport_bytes + 255u) & ~UINT64_C(255))
+        : (use_f32
+            ? ((x32_end + 255u) & ~UINT64_C(255))
+            : ((activation_f16_bytes + 255u) & ~UINT64_C(255)));
     if (result_offset > UINT64_MAX - result_bytes) return 0;
 
     /* Admission preallocates both arenas. Never grow them here: cache weights
@@ -14593,7 +14650,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         activation_dst = {partner_scratch, activation_f16_bytes, 0,
                           partner_tier};
         activation_transfer_bytes = activation_f16_bytes;
-    } else if (arithmetic == CUDA_Q8_PARTNER_W32_XQ8_SGEMM) {
+    } else if (arithmetic == CUDA_Q8_PARTNER_W32_XQ8_SGEMM ||
+               use_native_q8) {
         const uint64_t blocks = (in_dim + 31u) / 32u;
         dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
         quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
@@ -14651,7 +14709,24 @@ static int cuda_q8_f16_partner_matmul_impl(
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
-    if (!use_f32) {
+    int compute_ok = 0;
+    if (use_native_q8) {
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        const uint32_t mma_T = blocks <= 32u
+            ? 32u : cuda_q8_exact_threads(blocks);
+        const int mma_rc = cuda_q8_mma_try_launch(
+            (float *)partner_result, range_q8,
+            (const int8_t *)partner_scratch,
+            (const float *)(partner_scratch + scale_offset),
+            in_dim, out_dim, n_tok, blocks, blocks, out_dim, mma_T);
+        compute_ok = mma_rc > 0;
+        if (!compute_ok) {
+            fprintf(stderr,
+                    "ds4: partner native-q8 exact launcher unavailable or "
+                    "failed on device %d (rc=%d); disabling this binding\n",
+                    partner_device, mma_rc);
+        }
+    } else if (!use_f32) {
         st = cublasGemmEx(
             cuda_cublas_for_tier(partner_tier),
             CUBLAS_OP_T, CUBLAS_OP_N,
@@ -14662,6 +14737,7 @@ static int cuda_q8_f16_partner_matmul_impl(
             &beta,
             partner_result, result_f16 ? CUDA_R_16F : CUDA_R_32F,
             (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        compute_ok = st == CUBLAS_STATUS_SUCCESS;
     } else {
         st = cublasSgemm(
             cuda_cublas_for_tier(partner_tier),
@@ -14670,21 +14746,24 @@ static int cuda_q8_f16_partner_matmul_impl(
             &alpha, range_f32->device_ptr, (int)in_dim,
             partner_x32, (int)in_dim,
             &beta, (float *)partner_result, (int)out_dim);
+        compute_ok = st == CUBLAS_STATUS_SUCCESS;
     }
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr,
-                "ds4: partner cuBLAS q8 %s matmul failed on device %d: status %d; "
-                "disabling this binding\n",
-                cuda_q8_partner_arithmetic_name(arithmetic),
-                partner_device, (int)st);
+    if (!compute_ok) {
+        if (!use_native_q8) {
+            fprintf(stderr,
+                    "ds4: partner cuBLAS q8 %s matmul failed on device %d: "
+                    "status %d; disabling this binding\n",
+                    cuda_q8_partner_arithmetic_name(arithmetic),
+                    partner_device, (int)st);
+        }
         binding->partner_offload = 0;
         const cudaError_t sync_err = cudaDeviceSynchronize();
         const int restore_rc = cuda_q8_f16_restore_home(
-            home_tier, "failed partner cuBLAS");
+            home_tier, "failed partner projection");
         if (sync_err != cudaSuccess || restore_rc < 0) {
             if (sync_err != cudaSuccess) {
                 fprintf(stderr,
-                        "ds4: CUDA partner synchronize after cuBLAS failure "
+                        "ds4: CUDA partner synchronize after projection failure "
                         "failed: %s\n", cudaGetErrorString(sync_err));
                 (void)cudaGetLastError();
             }
@@ -14735,9 +14814,12 @@ static int cuda_q8_f16_partner_matmul_impl(
     }
     cuda_q8_audit_record_result(
         weight_offset, weight_bytes, in_dim, out_dim, partner_device, label,
-        use_f32 ? "f32_partner_hit" : "f16_partner_hit",
-        use_f32 ? cuda_q8_partner_arithmetic_name(arithmetic)
-                : "nvlink_offload");
+        use_native_q8 ? "native_q8_partner_hit"
+                      : (use_f32 ? "f32_partner_hit" : "f16_partner_hit"),
+        use_native_q8 ? "exact_sm75_mma"
+                      : (use_f32
+                            ? cuda_q8_partner_arithmetic_name(arithmetic)
+                            : "nvlink_offload"));
     if (sequence == 1u || getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
         fprintf(stderr,
                 "ds4: CUDA q8 partner execution enabled: home tier %d "

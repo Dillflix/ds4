@@ -1879,6 +1879,7 @@ static int run_q8_partner_projection_case(
              (unsigned long long)(fp16_bytes / 1048576u));
     (void)setenv("DS4_CUDA_Q8_F16_CACHE_MB", cache_mib, 1);
     (void)setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "f16", 1);
     (void)setenv("DS4_CUDA_NO_TF32", "1", 1);
     (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
     (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
@@ -1897,6 +1898,7 @@ static int run_q8_partner_projection_case(
         (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB");
         (void)unsetenv("DS4_CUDA_NO_TF32");
         (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+        (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
         return 0;
     }
 
@@ -2163,6 +2165,7 @@ static int run_q8_partner_projection_case(
     (void)unsetenv("DS4_CUDA_NO_TF32");
     (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
     (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+    (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
     fprintf(stderr, "  q8 partner projection exactness %s OK\n", case_name);
     return 0;
 }
@@ -2179,6 +2182,148 @@ static int run_q8_partner_projection(void) {
     if (run_q8_partner_projection_case(
             "shared-down", "tensor:blk.1.ffn_down_shexp.weight", 2048u, 4096u)) return 1;
     fprintf(stderr, "  q8 partner projection exactness OK (3 classes)\n");
+    return 0;
+}
+
+static int run_q8_native_partner_projection(void) {
+    int dev_count = 0;
+    (void)cudaGetDeviceCount(&dev_count);
+    if (dev_count < 2) return 0;
+
+    cudaDeviceProp partner_prop;
+    memset(&partner_prop, 0, sizeof(partner_prop));
+    CHECK(cudaGetDeviceProperties(&partner_prop, 1) == cudaSuccess,
+          "native q8 partner properties");
+    if (partner_prop.major != 7 || partner_prop.minor != 5) {
+        fprintf(stderr,
+                "  skipping native q8 partner projection (device 1 is sm_%d%d)\n",
+                partner_prop.major, partner_prop.minor);
+        return 0;
+    }
+
+    const uint64_t in_dim = 8192u;
+    const uint64_t out_dim = 4096u;
+    const uint64_t n_tok = 17u;
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    const uint64_t model_size = 2u * weight_bytes;
+    const uint64_t input_count = n_tok * in_dim;
+    const uint64_t output_count = n_tok * out_dim;
+    const uint64_t fp16_bytes = in_dim * out_dim * sizeof(uint16_t);
+    char cache_mib[32];
+    snprintf(cache_mib, sizeof(cache_mib), "%llu",
+             (unsigned long long)(fp16_bytes / 1048576u));
+
+    (void)setenv("DS4_CUDA_Q8_F16_CACHE_MB", cache_mib, 1);
+    (void)setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "native-q8", 1);
+    (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
+    (void)unsetenv("DS4_CUDA_NO_Q8_MMA");
+    (void)unsetenv("DS4_CUDA_NO_Q8_MMA_SM75");
+    (void)unsetenv("DS4_FORCE_HOST_BOUNCE");
+
+    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    CHECK(ds4_gpu_init_multi(&cfg), "native q8 partner init_multi");
+    if (!g_gpu_peer_ok[0][1] || !g_gpu_peer_ok[1][0]) {
+        ds4_gpu_cleanup();
+        fprintf(stderr,
+                "  skipping native q8 partner projection (no bidirectional peer access)\n");
+        (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_MB");
+        (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB");
+        (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+        return 0;
+    }
+
+    unsigned char *model = (unsigned char *)malloc((size_t)model_size);
+    float *host_input = (float *)malloc((size_t)input_count * sizeof(float));
+    float *host_local = (float *)malloc((size_t)output_count * sizeof(float));
+    float *host_partner = (float *)malloc((size_t)output_count * sizeof(float));
+    CHECK(model && host_input && host_local && host_partner,
+          "native q8 partner host allocations");
+    pack_q8_identity_scale(model, in_dim, out_dim);
+    memcpy(model + weight_bytes, model, (size_t)weight_bytes);
+    for (uint64_t i = 0; i < input_count; i++) {
+        host_input[i] = (float)((int)(i % 101u) - 50) * 0.03125f;
+    }
+
+    CHECK(ds4_gpu_set_model_map(model, model_size),
+          "native q8 partner set model map");
+    ds4_tensor_range home_range = {0u, model_size, 0};
+    ds4_tensor_range partner_range = {0u, model_size, 1};
+    CHECK(ds4_gpu_device_cache_tensors(0, &home_range, 1) == 0 &&
+          ds4_gpu_device_cache_tensors(1, &partner_range, 1) == 0,
+          "native q8 source resident on both devices");
+
+    ds4_gpu_tensor input; memset(&input, 0, sizeof(input));
+    ds4_gpu_tensor local; memset(&local, 0, sizeof(local));
+    ds4_gpu_tensor partner; memset(&partner, 0, sizeof(partner));
+    CHECK(ds4_gpu_tensor_alloc_on(
+              &input, 0, input_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(
+              &local, 0, output_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(
+              &partner, 0, output_count * sizeof(float)) == 0,
+          "native q8 partner device allocations");
+    CHECK(ds4_gpu_tensor_write(
+              &input, 0, host_input, input_count * sizeof(float)),
+          "native q8 partner input write");
+
+    /* Capture the native local reference before publishing the overflow plan;
+     * otherwise the first lookup materializes the plan and changes this call's
+     * arithmetic to an admitted cache path. */
+    (void)setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 1);
+    CHECK(ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_matmul_q8_0_tensor(
+              &local, model, model_size, 0u, in_dim, out_dim, &input, n_tok),
+          "native q8 local reference");
+    (void)unsetenv("DS4_CUDA_NO_Q8_F16_CACHE");
+
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+              model, model_size, 0u, weight_bytes, in_dim, out_dim,
+              0, 1, "tensor:blk.1.attn_output_b.weight"),
+          "native q8 fill home cache");
+    ds4_gpu_q8_f16_plan_begin();
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device(
+              model, model_size, 0u, weight_bytes, in_dim, out_dim,
+              0, "tensor:blk.1.attn_output_b.weight"),
+          "native q8 register local resident");
+    CHECK(ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+              model, model_size, weight_bytes, weight_bytes,
+              in_dim, out_dim, 0, 1,
+              "tensor:blk.2.attn_output_b.weight"),
+          "native q8 register partner overflow");
+    ds4_gpu_q8_f16_plan_end();
+
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+              &partner, model, model_size, weight_bytes,
+              in_dim, out_dim, &input, n_tok),
+          "native q8 partner projection");
+    CHECK(ds4_gpu_tensor_read(
+              &local, 0, host_local, output_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              &partner, 0, host_partner, output_count * sizeof(float)),
+          "native q8 partner output read");
+    CHECK(ds4_gpu_q8_f16_partner_offload_count() == 1u,
+          "native q8 projection executed exactly once on partner");
+    CHECK(memcmp(host_local, host_partner,
+                 (size_t)output_count * sizeof(float)) == 0,
+          "native q8 partner output is bit-exact with local native q8");
+
+    ds4_gpu_tensor_free_in_place(&input);
+    ds4_gpu_tensor_free_in_place(&local);
+    ds4_gpu_tensor_free_in_place(&partner);
+    free(model);
+    free(host_input);
+    free(host_local);
+    free(host_partner);
+    ds4_gpu_cleanup();
+    (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_MB");
+    (void)unsetenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB");
+    (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+    fprintf(stderr, "  native q8 partner T256 exactness OK\n");
     return 0;
 }
 
@@ -2210,6 +2355,7 @@ int main(void) {
         if (run_copy3(2, 0)) return 1;
         if (run_attention_output_tp_peer_read()) return 1;
         if (run_q8_partner_projection()) return 1;
+        if (run_q8_native_partner_projection()) return 1;
         if (run_one(2, 1)) return 1;
         if (run_copy3(2, 1)) return 1;
         /* Stress: catches the cudaMemcpyPeer driver-corruption pattern that
