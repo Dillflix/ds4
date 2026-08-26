@@ -77,7 +77,7 @@ ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-gguf-tools/quality-testing/score_official: $(QUALITY_SCORE_OBJ) $(CORE_OBJS) rax.o
+gguf-tools/quality-testing/score_official: $(QUALITY_SCORE_OBJ) ds4_gpu_args.o $(CORE_OBJS) rax.o
 	$(CC) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
@@ -152,7 +152,7 @@ ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-gguf-tools/quality-testing/score_official: $(QUALITY_SCORE_OBJ) $(CORE_OBJS) rax.o
+gguf-tools/quality-testing/score_official: $(QUALITY_SCORE_OBJ) ds4_gpu_args.o $(CORE_OBJS) rax.o
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
