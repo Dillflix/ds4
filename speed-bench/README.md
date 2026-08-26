@@ -463,8 +463,8 @@ endpoints selected after the T256 placement screen:
 - every Q8 projection uses native Q8 because the complete FP16 expansion cache
   is disabled; and
 - every active T256 output-B projection uses FP16/cuBLAS on its NVLink partner.
-  The binding inventory is 86/86: 43 fixed pair-local consumers plus 43
-  home-consumer partner bindings, backed by exactly 43 physical FP16 weights.
+  The binding inventory is 43/43: one home-consumer partner binding per layer,
+  backed by exactly 43 physical FP16 weights.
   This policy must also preserve at least the complete 263-binding non-T256
   cache inventory observed by the winning placement run; additional local
   cache admissions are valid.
@@ -496,29 +496,31 @@ independently pass or fail.
 
 ### T256 execution-placement A/B
 
-The 86 T256 binding records are two resident copies for each of 43 layers.
-Prefill gathers the two attention halves and executes one output-B GEMM per
-layer on the active/home path. Binding counts therefore do not establish where
-the 43 executed GEMMs ran.
+Each of the 43 layers has one active T256 output-B GEMM and one logical cache
+binding. The binding names its home consumer and the physical device holding
+the single FP16 expansion; partner placement no longer creates an unused fixed
+peer-consumer duplicate.
 
 `cuda-q8-t256-placement-ab.sh` measures and verifies five policies:
 
 - `native`: zero T256 FP16 bindings and 43 native-Q8 layer paths; other Q8
   cache classes remain enabled so this isolates T256;
-- `all-local`: 86 local plus zero partner bindings, with all 43 active GEMMs
+- `all-local`: 43 local plus zero partner bindings, with all 43 active GEMMs
   local. T256 is ranked ahead of tied T32 entries so the complete class fits;
 - `balanced`: even layers execute locally and odd layers execute on their
-  partner: 22 local plus 21 partner active GEMMs. Its binding inventory is 65
-  local plus 21 partner, and each pipeline stage is balanced within its own
-  NVLink pair (11/11 for layers 0-21 and 11/10 for layers 22-42);
-- `overflow`: the measured 79 local plus seven partner bindings, producing 36
-  active local GEMMs and seven partner GEMMs; and
-- `all-partner`: 43 fixed duplicate bindings remain local while all 43 active
-  home bindings execute on the corresponding NVLink partner.
+  partner: 22 local plus 21 partner bindings. Each pipeline stage is balanced
+  within its own NVLink pair (11/11 for layers 0-21 and 11/10 for layers
+  22-42);
+- `overflow`: 36 local plus seven partner bindings; and
+- `all-partner`: zero local plus 43 partner bindings.
 
-Every run exports binding and runtime-audit tables. The summarizer rejects a
-run whose active layer paths do not match its policy and records all other
-binding shapes so cache entries displaced by `all-local` remain explicit.
+Every run performs an untimed warm-up, then exports binding, physical
+allocation/liveness, and runtime-audit tables before disabling the success
+counters for the measured sweep. The summarizer rejects a run whose active
+layer paths do not match its policy, whose 43 T256 bindings do not map one-to-one
+to 43 live physical weights, or whose forced partner placement silently misses.
+It also records all other binding shapes and total resident/dead bytes so cache
+entries displaced by `all-local` remain explicit.
 
 One-repeat screen:
 
@@ -624,8 +626,8 @@ logits. Return `q8-partner-native-exact-<timestamp>.tar.gz`.
 change the engine, either GGUF, or the native-Q4 dispatch. It requires separate
 existing absolute paths in `MODEL` for the
 standard full-Q4 GGUF and `NATIVE_MODEL` for its tagged SM75-native repack.
-Both arms force the measured all-partner T256 winner: 43 fixed plus 43 partner
-bindings backed by 43 physical T256 expansions, with all active output-B GEMMs
+Both arms force the measured all-partner T256 winner: 43 active partner
+bindings backed by 43 physical T256 expansions, with all output-B GEMMs
 executing on the NVLink partners. It uses the production `0,3,1,2` device order
 and 22/21 split and sweeps 2K through 32K. One standard-then-native pair is the
 default; increase `REPEATS` only when repeat statistics are specifically needed.
@@ -1446,6 +1448,31 @@ Return `sm75-native-q4-t256-profile-<timestamp>.tar.gz`. Model hashing is
 disabled. If the native GGUF is cold in the Linux page cache, its single NFS
 startup may still take roughly 25 minutes at 100--105 MiB/s; the later Nsight
 Compute passes do not touch that file.
+
+If a run completed its production trace but stopped during export or summary,
+reuse that trace in a new result directory and proceed to Nsight Compute
+without opening the GGUF payload again:
+
+```bash
+export NATIVE_MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export REUSE_NSYS_DIR="$PWD/sm75-native-q4-t256-profile-20260826T144211Z"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+PROFILE_GPU=0 \
+PROFILE_PARTNER_GPU=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=1 \
+./speed-bench/cuda-sm75-native-q4-t256-profile.sh
+```
+
+Resume mode copies and revalidates the existing report, benchmark, cache
+snapshots, and exact 43-layer binding inventory. It reruns the corrected
+summaries and the model-free Nsight Compute harnesses in a fresh output
+directory; it does not mutate the original failed evidence.
 
 ### Four-GPU Q4 clock and power normalization
 

@@ -67,13 +67,36 @@ def main() -> int:
         die("usage: summarize-sm75-native-q4-t256-profile.py OUTPUT_DIR")
     output = Path(sys.argv[1]).resolve()
     operations = read_csv(output / "operation-attribution.csv")
-    benchmark = read_csv(output / "nsys" / "benchmark.csv")
+    benchmark = read_csv(output / "nsys" / "combined-benchmark.csv")
+    bindings = read_csv(output / "nsys" / "bindings.csv")
+
+    partner_bindings = [row for row in bindings if row["partner_offload"] == "1"]
+    expected_binding_labels = {
+        f"tensor:blk.{layer}.attn_output_b.weight" for layer in range(43)
+    }
+    actual_binding_labels = {row["label"] for row in partner_bindings}
+    if len(partner_bindings) != 43 or actual_binding_labels != expected_binding_labels:
+        missing_labels = sorted(expected_binding_labels - actual_binding_labels)
+        extra_labels = sorted(actual_binding_labels - expected_binding_labels)
+        die(
+            "expected exactly one partner T256 binding for every layer 0..42; "
+            f"found {len(partner_bindings)} bindings "
+            f"(missing={missing_labels[:1]}, extra={extra_labels[:1]})"
+        )
+    for row in partner_bindings:
+        if (
+            row["in_dim"] != "8192"
+            or row["out_dim"] != "4096"
+            or row["partner_arithmetic"] != "f16"
+            or row["consumer_device"] == row["resident_device"]
+        ):
+            die(f"invalid partner T256 binding: {row['label']}")
 
     groups: dict[str, dict[str, int]] = defaultdict(
         lambda: {"duration_ns": 0, "operations": 0, "bytes": 0}
     )
     partner_ranges: dict[str, dict[str, object]] = {}
-    partner_labels: set[str] = set()
+    partner_range_labels: set[str] = set()
     partner_shape_errors: list[str] = []
     for row in operations:
         group = classify(row)
@@ -86,6 +109,7 @@ def main() -> int:
             continue
         fields = parse_range(range_name)
         expected = {
+            "label": "attn_output_b",
             "tokens": "512",
             "in": "8192",
             "out": "4096",
@@ -103,7 +127,7 @@ def main() -> int:
             )
         label = fields.get("label", "")
         if label:
-            partner_labels.add(label)
+            partner_range_labels.add(label)
         item = partner_ranges.setdefault(
             range_name,
             {
@@ -138,8 +162,28 @@ def main() -> int:
     missing = sorted(required.difference(groups))
     if missing:
         die("trace omitted required combined-path groups: " + ", ".join(missing))
-    if len(partner_labels) != 43:
-        die(f"expected 43 unique partner T256 labels, found {len(partner_labels)}")
+    if partner_range_labels != {"attn_output_b"}:
+        die(
+            "unexpected partner NVTX class labels: "
+            + ", ".join(sorted(partner_range_labels))
+        )
+
+    prefill_tokens = int(benchmark[0]["prefill_tokens"])
+    if prefill_tokens % 512:
+        die(f"prefill token count is not divisible by 512: {prefill_tokens}")
+    expected_projections = 43 * (prefill_tokens // 512)
+    expected_counts = {
+        "partner_t256_activation_convert": expected_projections,
+        "partner_t256_cublas": expected_projections,
+        "partner_t256_memcpy": 2 * expected_projections,
+    }
+    for group, expected_count in expected_counts.items():
+        actual_count = groups[group]["operations"]
+        if actual_count != expected_count:
+            die(
+                f"expected {expected_count} {group} operations, "
+                f"found {actual_count}"
+            )
 
     kernel_total_ns = sum(
         int(row["duration_ns"])
@@ -184,10 +228,12 @@ def main() -> int:
     tps = float(benchmark[0]["prefill_tps"])
     evidence = {
         "accepted": True,
-        "prefill_tokens": int(benchmark[0]["prefill_tokens"]),
+        "prefill_tokens": prefill_tokens,
         "prefill_tps": tps,
         "annotated_kernel_time_ns": kernel_total_ns,
-        "unique_partner_t256_labels": len(partner_labels),
+        "partner_t256_binding_count": len(partner_bindings),
+        "partner_t256_projection_count": expected_projections,
+        "partner_t256_nvtx_range_count": len(partner_ranges),
         "groups": {
             row["group"]: {
                 "duration_ns": int(row["duration_ns"]),
@@ -225,7 +271,8 @@ def main() -> int:
         copy_group = groups["partner_t256_memcpy"]
         handle.write(
             "\nPartner T256 coverage: "
-            f"**{len(partner_labels)} unique layer tensors**; "
+            f"**{len(partner_bindings)} unique layer bindings** and "
+            f"**{expected_projections} captured projections**; "
             f"{copy_group['bytes'] / 1073741824.0:.3f} GiB of captured "
             "peer-copy traffic.\n"
         )

@@ -42,39 +42,39 @@ def main() -> int:
             operation(name="matmul_q8_0_mma_sm75_exact_kernel<256>"),
             operation(name="attention_exact_kernel"),
         ]
-        for layer in range(43):
-            partner = (
-                "ds4/q8/partner/"
-                f"label=tensor:blk.{layer}.attn_output_b.weight/"
-                "home_tier=0/home_device=0/partner_tier=2/partner_device=1/"
-                "tokens=512/in=8192/out=4096/result=f32/arithmetic=f16"
-            )
-            rows.extend(
-                [
-                    operation(
-                        name="f32_to_f16_kernel", partner_range=partner,
-                    ),
-                    operation(
-                        name="volta_h884gemm", partner_range=partner,
-                        device=1,
-                    ),
-                    operation(
-                        kind="memcpy", name="memcpy", partner_range=partner,
-                        bytes=8 * 1024 * 1024,
-                    ),
-                    operation(
-                        kind="memcpy", name="memcpy", partner_range=partner,
-                        bytes=8 * 1024 * 1024,
-                    ),
-                ]
-            )
+        partner = (
+            "ds4/q8/partner/label=attn_output_b/"
+            "home_tier=0/home_device=0/partner_tier=2/partner_device=1/"
+            "tokens=512/in=8192/out=4096/result=f32/arithmetic=f16"
+        )
+        for _layer in range(43):
+            for _microbatch in range(4):
+                rows.extend(
+                    [
+                        operation(
+                            name="f32_to_f16_kernel", partner_range=partner,
+                        ),
+                        operation(
+                            name="volta_h884gemm", partner_range=partner,
+                            device=1,
+                        ),
+                        operation(
+                            kind="memcpy", name="memcpy", partner_range=partner,
+                            bytes=8 * 1024 * 1024,
+                        ),
+                        operation(
+                            kind="memcpy", name="memcpy", partner_range=partner,
+                            bytes=8 * 1024 * 1024,
+                        ),
+                    ]
+                )
         with (output / "operation-attribution.csv").open(
             "w", newline="", encoding="utf-8"
         ) as handle:
             writer = csv.DictWriter(handle, fieldnames=FIELDS)
             writer.writeheader()
             writer.writerows(rows)
-        with (output / "nsys" / "benchmark.csv").open(
+        with (output / "nsys" / "combined-benchmark.csv").open(
             "w", newline="", encoding="utf-8"
         ) as handle:
             writer = csv.DictWriter(
@@ -84,13 +84,35 @@ def main() -> int:
             writer.writerow(
                 {"ctx_tokens": 2048, "prefill_tokens": 2048, "prefill_tps": 541.0}
             )
+        binding_fields = [
+            "consumer_device", "resident_device", "partner_offload",
+            "in_dim", "out_dim", "partner_arithmetic", "label",
+        ]
+        with (output / "nsys" / "bindings.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=binding_fields)
+            writer.writeheader()
+            for layer in range(43):
+                writer.writerow(
+                    {
+                        "consumer_device": 0,
+                        "resident_device": 1,
+                        "partner_offload": 1,
+                        "in_dim": 8192,
+                        "out_dim": 4096,
+                        "partner_arithmetic": "f16",
+                        "label": f"tensor:blk.{layer}.attn_output_b.weight",
+                    }
+                )
 
         subprocess.run([sys.executable, str(SUMMARIZER), str(output)], check=True)
         evidence = json.loads((output / "combined-profile.json").read_text())
         assert evidence["accepted"] is True
-        assert evidence["unique_partner_t256_labels"] == 43
-        assert evidence["groups"]["partner_t256_cublas"]["operations"] == 43
-        assert evidence["groups"]["partner_t256_memcpy"]["operations"] == 86
+        assert evidence["partner_t256_binding_count"] == 43
+        assert evidence["partner_t256_projection_count"] == 172
+        assert evidence["groups"]["partner_t256_cublas"]["operations"] == 172
+        assert evidence["groups"]["partner_t256_memcpy"]["operations"] == 344
         assert (output / "combined-kernel-groups.csv").stat().st_size > 0
         assert (output / "partner-t256-ranges.csv").stat().st_size > 0
     print("combined native-Q4/T256 profile summarizer test: OK")

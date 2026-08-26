@@ -25,6 +25,7 @@ Optional environment:
   RUN_NCU=1
   NCU_USE_SUDO=1
   SKIP_BUILD=0
+  REUSE_NSYS_DIR=             prior profiler output directory; skips GGUF load
   CREATE_ARCHIVE=1
   COMBINED_PROFILE_DIR=...     new output directory
 EOF
@@ -52,6 +53,7 @@ PROFILE_PARTNER_GPU=${PROFILE_PARTNER_GPU:-1}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
+REUSE_NSYS_DIR=${REUSE_NSYS_DIR:-}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${COMBINED_PROFILE_DIR:-$repo_dir/sm75-native-q4-t256-profile-$stamp}
@@ -79,7 +81,7 @@ done
     die "PROFILE_GPU and PROFILE_PARTNER_GPU must differ"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical IDs remain stable"
-for tool in awk basename cat cmp date dirname env find git grep id make mkdir \
+for tool in awk basename cat cmp cp date dirname env find git grep id make mkdir \
             mktemp mv nproc nsys nvidia-smi python3 rm sort stat tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -100,6 +102,11 @@ for gpu in "${gpu_ids[@]}"; do
 done
 [[ -n ${seen[$PROFILE_GPU]+x} && -n ${seen[$PROFILE_PARTNER_GPU]+x} ]] ||
     die "profile pair must be present in GPU_DEVICES"
+if [[ -n $REUSE_NSYS_DIR ]]; then
+    [[ $REUSE_NSYS_DIR == /* && -d $REUSE_NSYS_DIR ]] ||
+        die "REUSE_NSYS_DIR must name an existing absolute profiler directory"
+    REUSE_NSYS_DIR=$(cd "$REUSE_NSYS_DIR" && pwd)
+fi
 
 topology_file=$(mktemp)
 nvidia-smi topo -m >"$topology_file"
@@ -249,6 +256,7 @@ phase=manifest
     printf 't256_policy=all-partner\nt256_layers=0-42\npartner_arithmetic=f16\n'
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU"
+    printf 'reused_nsys_dir=%s\n' "${REUSE_NSYS_DIR:-none}"
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
         --format=csv
@@ -266,44 +274,62 @@ base="$OUTPUT_DIR/nsys/combined"
 bindings="$OUTPUT_DIR/nsys/bindings.csv"
 cache_before="$OUTPUT_DIR/nsys/cache-before.csv"
 cache_after="$OUTPUT_DIR/nsys/cache-after.csv"
-printf 'Capturing one native-Q4/all-partner-T256 production trace...\n'
-nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,\
+if [[ -n $REUSE_NSYS_DIR ]]; then
+    phase=nsight-systems-reuse
+    printf 'Reusing the completed production trace from %s (no GGUF load)...\n' \
+        "$REUSE_NSYS_DIR"
+    [[ -s $REUSE_NSYS_DIR/nsys/combined.nsys-rep &&
+       -s $REUSE_NSYS_DIR/nsys/combined-benchmark.csv &&
+       -s $REUSE_NSYS_DIR/nsys/combined.log &&
+       -s $REUSE_NSYS_DIR/nsys/bindings.csv &&
+       -s $REUSE_NSYS_DIR/nsys/cache-before.csv &&
+       -s $REUSE_NSYS_DIR/nsys/cache-after.csv ]] ||
+        die "REUSE_NSYS_DIR lacks a complete production trace"
+    cp -a "$REUSE_NSYS_DIR/nsys/." "$OUTPUT_DIR/nsys/"
+    if [[ -s $REUSE_NSYS_DIR/telemetry/combined.csv ]]; then
+        cp -a "$REUSE_NSYS_DIR/telemetry/combined.csv" \
+            "$OUTPUT_DIR/telemetry/combined.csv"
+    fi
+else
+    printf 'Capturing one native-Q4/all-partner-T256 production trace...\n'
+    nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,\
 temperature.gpu,clocks.current.sm,clocks.current.memory \
-    --format=csv,noheader,nounits -lms 200 \
-    >"$OUTPUT_DIR/telemetry/combined.csv" &
-sampler_pid=$!
-run_rc=0
-"${production_env[@]}" \
-    DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
-    DS4_CUDA_CRITICAL_PATH_NVTX=1 \
-    "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \
-    DS4_NSYS_CAPTURE_PREFILL=1 \
-    "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$cache_before" \
-    "DS4_CUDA_Q8_CACHE_STATE_CSV=$cache_after" \
-    "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
-    nsys profile --force-overwrite=true --sample=none --cpuctxsw=none \
-        --trace=cuda,nvtx,osrt,cublas --capture-range=cudaProfilerApi \
-        --capture-range-end=stop --output="$base" \
-        ./ds4-bench --cuda --cuda-tensor-parallel \
-            --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-            --model "$NATIVE_MODEL" --prompt-file "$PROMPT" \
-            --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
-            --ctx-alloc "$((PROFILE_TOKENS+1))" \
-            --step-incr "$PROFILE_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
-            --gen-tokens 0 --csv "$base-benchmark.csv" \
-            >"$base.log" 2>&1 || run_rc=$?
-cleanup_sampler
-(( run_rc == 0 )) || {
-    tail -n 200 "$base.log" >&2 || true
-    die "combined Nsight Systems capture failed (exit $run_rc)"
-}
+        --format=csv,noheader,nounits -lms 200 \
+        >"$OUTPUT_DIR/telemetry/combined.csv" &
+    sampler_pid=$!
+    run_rc=0
+    "${production_env[@]}" \
+        DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
+        DS4_CUDA_CRITICAL_PATH_NVTX=1 \
+        "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \
+        DS4_NSYS_CAPTURE_PREFILL=1 \
+        "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$cache_before" \
+        "DS4_CUDA_Q8_CACHE_STATE_CSV=$cache_after" \
+        "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
+        nsys profile --force-overwrite=true --sample=none --cpuctxsw=none \
+            --trace=cuda,nvtx,osrt,cublas --capture-range=cudaProfilerApi \
+            --capture-range-end=stop --output="$base" \
+            ./ds4-bench --cuda --cuda-tensor-parallel \
+                --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+                --model "$NATIVE_MODEL" --prompt-file "$PROMPT" \
+                --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
+                --ctx-alloc "$((PROFILE_TOKENS+1))" \
+                --step-incr "$PROFILE_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
+                --gen-tokens 0 --csv "$base-benchmark.csv" \
+                >"$base.log" 2>&1 || run_rc=$?
+    cleanup_sampler
+    (( run_rc == 0 )) || {
+        tail -n 200 "$base.log" >&2 || true
+        die "combined Nsight Systems capture failed (exit $run_rc)"
+    }
+fi
 [[ -s $base.nsys-rep && -s $base-benchmark.csv ]] ||
     die "Nsight Systems omitted its report or benchmark"
 grep -Fqx 'ds4: SM75 native routed-Q4 layout enabled (packed A/W, planner=cost, gate=tile8, down=full-stage)' \
     "$base.log" || die "production trace did not use the accepted native-Q4 path"
 for marker in "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
               'partner-classes=t256' 'partner-layers=0-42' \
-              't256-placement=all-partner' 'T256-output_b=86/86' \
+              't256-placement=all-partner' 'T256-output_b=43/43' \
               'partner=43 partner-arithmetic=f16' \
               'CUDA q8 fp16 partner summary: calls=344'; do
     grep -Fq "$marker" "$base.log" ||
