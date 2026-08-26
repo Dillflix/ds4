@@ -507,8 +507,9 @@ peer-consumer duplicate.
 
 `cuda-q8-t256-placement-ab.sh` measures and verifies five policies:
 
-- `native`: zero T256 FP16 bindings and 43 native-Q8 layer paths; other Q8
-  cache classes remain enabled so this isolates T256;
+- `native` (`native-T256-only`): zero T256 FP16 bindings and 43 native-Q8
+  layer paths; every other Q8 cache class remains enabled so this isolates
+  T256 placement rather than changing the arithmetic of all dense projections;
 - `all-local`: 43 local plus zero partner bindings, with all 43 active GEMMs
   local. T256 is ranked ahead of tied T32 entries so the complete class fits;
 - `balanced`: even layers execute locally and odd layers execute on their
@@ -526,7 +527,37 @@ counters for the measured sweep. The summarizer rejects a run whose active
 layer paths do not match its policy, whose 43 T256 bindings do not map one-to-one
 to 43 live physical weights, or whose forced partner placement silently misses.
 It also records all other binding shapes and total resident/dead bytes so cache
-entries displaced by `all-local` remain explicit.
+entries displaced by `all-local` remain explicit in the legacy mode.
+
+For the forthcoming mixed Q4/IQ2 model that has enough VRAM for every dense
+FP16 expansion at a 256K allocation, set `REQUIRE_COMPLETE_DENSE_CACHE=1` and
+`CTX_ALLOC=262273` (256K context + 128 generation tokens + 1). This strict
+mode still measures only the requested 2K--32K
+frontiers, but creates the production session at the 256K memory pressure
+before the untimed warm-up materializes the cache. It explicitly disables the
+experimental attention-head split and exports the planner audit as well as the
+binding, physical-allocation, and post-warm-up CUDA-memory tables. Strict mode
+defaults to a predeclared 512 MiB minimum free-memory floor on every device;
+raise it with `MIN_FREE_MIB`, but do not lower it after seeing a result.
+
+The strict summary requires the exact same 344-candidate production plan in
+every arm:
+43 each for Q-A, Q-B, KV, output-A, output-B, and shared-down, plus 86 shared
+gate/up weights. Every required FP16 candidate must be admitted, used, and
+backed one-to-one by a live allocation; displaced non-T256 entries, dead bytes,
+aliases, or unreferenced allocations are fatal. The `native-T256-only` control
+still exports all 344 plan rows, but its 43 output-B rows must be deliberately
+`unadmitted`; its other 301 candidates must be admitted and live.
+Strict mode omits the natural-overflow arm because complete coverage makes it
+redundant; it compares native-T256-only, all-local, balanced, and all-partner.
+Legacy mode retains the five-arm overflow reproduction.
+
+The mixed-model generator currently sizes its reclaim against all-partner T256
+placement. That is a capacity screen for that one placement only, not proof
+that all-partner is optimal and not a guarantee that the stricter five-arm
+comparison fits. A placement-neutral model must also fit the all-local home
+footprint (an additional 1.375 GiB on the 22-layer home and 1.3125 GiB on the
+21-layer home). This runner fails closed if that stronger condition is absent.
 
 One-repeat screen:
 
@@ -541,13 +572,21 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 CTX_START=2048 \
 CTX_MAX=32768 \
+CTX_ALLOC=262273 \
+REQUIRE_COMPLETE_DENSE_CACHE=1 \
+MIN_FREE_MIB=512 \
 REPEATS=1 \
 SKIP_BUILD=0 \
 ./speed-bench/cuda-q8-t256-placement-ab.sh
 ```
 
-For the acceptance-quality result, rerun with `REPEATS=5`; the five rotations
-put every policy in every thermal/run-order slot. Return
+Omit `CTX_ALLOC` and `REQUIRE_COMPLETE_DENSE_CACHE` when reproducing the
+legacy full-Q4 screen where displacement is part of the measured cache-policy
+tradeoff.
+
+For the strict acceptance result, rerun with `REPEATS=4`; the four rotations
+put every strict policy in every thermal/run-order slot. Legacy five-arm
+reproduction still requires `REPEATS=5`. Return
 `q8-t256-placement-<timestamp>.tar.gz`.
 
 ### T256 arithmetic-source isolation

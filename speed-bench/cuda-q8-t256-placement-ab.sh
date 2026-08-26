@@ -5,7 +5,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 
-: "${MODEL:?set MODEL to the absolute full-Q4 GGUF path}"
+: "${MODEL:?set MODEL to the absolute test GGUF path}"
 [[ $MODEL == /* && -f $MODEL ]] || die "MODEL must be an existing absolute path"
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -13,28 +13,49 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_START=${CTX_START:-2048}
 CTX_MAX=${CTX_MAX:-32768}
+CTX_ALLOC=${CTX_ALLOC:-$((CTX_MAX+1))}
 STEP_MUL=${STEP_MUL:-2}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 REPEATS=${REPEATS:-5}
+REQUIRE_COMPLETE_DENSE_CACHE=${REQUIRE_COMPLETE_DENSE_CACHE:-0}
+MIN_FREE_MIB=${MIN_FREE_MIB:-512}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${Q8_T256_PLACEMENT_DIR:-$repo_dir/q8-t256-placement-$stamp}
-variants=(native all-local balanced overflow all-partner)
+if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]]; then
+    variants=(native all-local balanced all-partner)
+else
+    variants=(native all-local balanced overflow all-partner)
+fi
+variant_count=${#variants[@]}
+variant_list=$(IFS=,; printf '%s' "${variants[*]}")
 
 [[ $PROMPT == /* && -f $PROMPT ]] || die "PROMPT must be an existing absolute path"
 [[ $GPU_DEVICES == 0,3,1,2 && $GPU_VRAM == auto && $STAGE_SPLIT == 22 ]] ||
     die "placement A/B requires GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22"
-for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" "STEP_MUL:$STEP_MUL" \
+for item in "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" "CTX_ALLOC:$CTX_ALLOC" \
+            "STEP_MUL:$STEP_MUL" \
             "PREFILL_CHUNK:$PREFILL_CHUNK" "REPEATS:$REPEATS" \
+            "REQUIRE_COMPLETE_DENSE_CACHE:$REQUIRE_COMPLETE_DENSE_CACHE" \
+            "MIN_FREE_MIB:$MIN_FREE_MIB" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( CTX_START >= 2048 && CTX_MAX >= CTX_START && CTX_MAX <= 32768 )) ||
     die "contexts must stay within the fixed 2K-32K range"
+(( CTX_ALLOC > CTX_MAX )) || die "CTX_ALLOC must be greater than CTX_MAX"
 (( STEP_MUL == 2 && PREFILL_CHUNK == 2048 && REPEATS >= 1 )) ||
     die "placement A/B requires STEP_MUL=2 PREFILL_CHUNK=2048 REPEATS>=1"
+[[ $REQUIRE_COMPLETE_DENSE_CACHE == 0 || $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]] ||
+    die "REQUIRE_COMPLETE_DENSE_CACHE must be 0 or 1"
+if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 && $CTX_ALLOC != 262273 ]]; then
+    die "REQUIRE_COMPLETE_DENSE_CACHE=1 requires CTX_ALLOC=262273 (256K + 128 generation tokens + 1)"
+fi
+if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]]; then
+    (( MIN_FREE_MIB >= 512 )) || die "MIN_FREE_MIB must be at least 512 in strict mode"
+fi
 [[ $SKIP_BUILD == 0 || $SKIP_BUILD == 1 ]] || die "SKIP_BUILD must be 0 or 1"
 [[ $CREATE_ARCHIVE == 0 || $CREATE_ARCHIVE == 1 ]] || die "CREATE_ARCHIVE must be 0 or 1"
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] || die "output exists: $OUTPUT_DIR"
@@ -95,9 +116,19 @@ done
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
     printf 'gpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
         "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
-    printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nprefill_chunk=%s\nrepeats=%s\n' \
-        "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$REPEATS"
-    printf 'variants=native,all-local,balanced,overflow,all-partner\n'
+    printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nstep_mul=%s\nprefill_chunk=%s\nrepeats=%s\n' \
+        "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$STEP_MUL" "$PREFILL_CHUNK" "$REPEATS"
+    printf 'variants=%s\n' "$variant_list"
+    printf 'native_control=native-t256-only\n'
+    printf 'prefill_attention_head_split=off\n'
+    printf 'require_complete_dense_cache=%s\n' "$REQUIRE_COMPLETE_DENSE_CACHE"
+    if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]]; then
+        printf 'dense_cache_scope=complete-production-active\n'
+        printf 'dense_cache_plan_candidates=344\n'
+        printf 'dense_cache_native_live_bindings=301\n'
+        printf 'dense_cache_min_free_mib=%s\n' "$MIN_FREE_MIB"
+        printf 'dense_cache_inventory=q_a:43,q_b:43,kv:43,output_a:43,output_b:43,shared_down:43,gate_up:86\n'
+    fi
     printf 'overflow_partner_eligibility=15-21\nmodel_hashing=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free --format=csv
 } >"$OUTPUT_DIR/manifest.txt"
@@ -121,25 +152,38 @@ phase=tests
 grep -Fq 'q8 partner projection exactness OK (3 classes)' "$OUTPUT_DIR/gpu-exactness.log" ||
     die "GPU regression lacks local/partner FP16 exactness evidence"
 
-printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tbindings\tallocations\n' >"$OUTPUT_DIR/runs.tsv"
+printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tbindings\tallocations\tplan\tmemory\n' >"$OUTPUT_DIR/runs.tsv"
 common_env=(
     "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT"
     DS4_CUDA_PREFILL_PIPELINE=1
     DS4_CUDA_PREFILL_PIPELINE_MB=512
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
+    DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
+if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]]; then
+    # Match the model-generation capacity proof exactly.  Keep candidate
+    # eligibility and home ordering identical across every placement arm.
+    # This removes cache-coverage drift; it does not equalize per-device
+    # memory pressure, which requires the separate reservation experiment.
+    common_env+=(
+        DS4_CUDA_Q8_F16_ALL=1
+        DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1
+    )
+fi
 
 phase=benchmark
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
-    for ((slot=0; slot<5; slot++)); do
-        variant=${variants[$(((slot + repeat - 1) % 5))]}
+    for ((slot=0; slot<variant_count; slot++)); do
+        variant=${variants[$(((slot + repeat - 1) % variant_count))]}
         stem="$variant-r$repeat"
         csv="$OUTPUT_DIR/runs/$stem.csv"
         log="$OUTPUT_DIR/runs/$stem.log"
         audit="$OUTPUT_DIR/runs/$stem.q8-audit.csv"
         bindings="$OUTPUT_DIR/runs/$stem.bindings.csv"
         allocations="$OUTPUT_DIR/runs/$stem.allocations.csv"
+        plan="$OUTPUT_DIR/runs/$stem.plan.csv"
+        memory="$OUTPUT_DIR/runs/$stem.memory.csv"
         mode_env=()
         case "$variant" in
             native)
@@ -154,47 +198,57 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 mode_env+=(DS4_CUDA_Q8_T256_PLACEMENT=all-local)
                 ;;
             balanced)
-                mode_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42)
                 mode_env+=(DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16)
                 mode_env+=(DS4_CUDA_Q8_T256_PLACEMENT=balanced)
                 ;;
             overflow)
-                mode_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_LAYERS=15-21)
                 mode_env+=(DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16)
                 mode_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
                 ;;
             all-partner)
-                mode_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256)
                 mode_env+=(DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42)
                 mode_env+=(DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16)
                 mode_env+=(DS4_CUDA_Q8_T256_PLACEMENT=all-partner)
                 ;;
         esac
-        printf 'Benchmarking %s repeat=%d/%d slot=%d/5...\n' \
-            "$variant" "$repeat" "$REPEATS" "$((slot+1))"
+        printf 'Benchmarking %s repeat=%d/%d slot=%d/%d...\n' \
+            "$variant" "$repeat" "$REPEATS" "$((slot+1))" "$variant_count"
+        state_env=(
+            "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START"
+            "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit"
+            "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings"
+            "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations"
+            "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$plan"
+        )
+        if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 ]]; then
+            state_env+=("DS4_CUDA_MEMORY_STATE_CSV=$memory")
+        fi
         "${clean[@]}" "${common_env[@]}" "${mode_env[@]}" \
-            "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START" \
-            "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
-            "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
-            "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
+            "${state_env[@]}" \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
                 --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
-                --ctx-alloc "$((CTX_MAX+1))" --step-mul "$STEP_MUL" \
+                --ctx-alloc "$CTX_ALLOC" --step-mul "$STEP_MUL" \
                 --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 --csv "$csv" \
                 >"$log" 2>&1 || {
                     tail -n 200 "$log" >&2; die "$stem failed"; }
-        [[ -s $csv && -s $audit && -s $bindings && -s $allocations ]] ||
+        [[ -s $csv && -s $audit && -s $bindings && -s $allocations && -s $plan ]] ||
             die "$stem omitted evidence"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        if [[ $REQUIRE_COMPLETE_DENSE_CACHE == 1 && ! -s $memory ]]; then
+            die "$stem omitted CUDA memory evidence"
+        fi
+        memory_field=
+        [[ ! -s $memory ]] || memory_field=$memory
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repeat" "$((slot+1))" "$variant" "$csv" "$log" \
-            "$audit" "$bindings" "$allocations" >>"$OUTPUT_DIR/runs.tsv"
+            "$audit" "$bindings" "$allocations" "$plan" \
+            "$memory_field" >>"$OUTPUT_DIR/runs.tsv"
         cat "$csv"
     done
 done
