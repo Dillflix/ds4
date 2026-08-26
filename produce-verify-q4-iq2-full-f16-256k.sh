@@ -107,12 +107,12 @@ export DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
 unset DS4_CUDA_Q8_F16_PARTNER_LAYERS
 unset DS4_CUDA_Q8_PARTNER_ARITHMETIC
 prefix=${out%.gguf}
-baseline_plan=${BASELINE_PLAN_AUDIT:-$prefix.all-iq2-256k-plan.csv}
-baseline_log=${BASELINE_LOG:-$prefix.all-iq2-256k-plan.log}
-baseline_csv=${BASELINE_CSV:-$prefix.all-iq2-256k-calibration.csv}
-baseline_memory=${BASELINE_MEMORY_STATE:-$prefix.all-iq2-256k-memory.csv}
-baseline_bindings=${BASELINE_BINDING_STATE:-$prefix.all-iq2-256k-bindings.csv}
-baseline_allocations=${BASELINE_ALLOCATION_STATE:-$prefix.all-iq2-256k-allocations.csv}
+baseline_plan=${BASELINE_PLAN_AUDIT:-$prefix.all-iq2-all-local-256k-plan.csv}
+baseline_log=${BASELINE_LOG:-$prefix.all-iq2-all-local-256k-plan.log}
+baseline_csv=${BASELINE_CSV:-$prefix.all-iq2-all-local-256k-calibration.csv}
+baseline_memory=${BASELINE_MEMORY_STATE:-$prefix.all-iq2-all-local-256k-memory.csv}
+baseline_bindings=${BASELINE_BINDING_STATE:-$prefix.all-iq2-all-local-256k-bindings.csv}
+baseline_allocations=${BASELINE_ALLOCATION_STATE:-$prefix.all-iq2-all-local-256k-allocations.csv}
 selection_manifest=${SELECTION_MANIFEST:-$prefix.selection.txt}
 verification_plan=${VERIFICATION_PLAN_AUDIT:-$prefix.full-f16-verification.csv}
 verification_bindings=${VERIFICATION_BINDINGS:-$prefix.full-f16-bindings.csv}
@@ -155,6 +155,8 @@ else
         die "calibration cache plan was rejected; capacity selection is invalid"
     fi
 fi
+grep -Fq 't256-placement=all-local' "$baseline_log" ||
+    die "capacity calibration is not the required all-local T256 policy"
 
 selection=$(python3 speed-bench/select-q4-iq2-full-f16.py \
     --plan-audit "$baseline_plan" \
