@@ -93,8 +93,16 @@ for pair in '0 1' '2 3'; do
     read -r first second <<<"$pair"
     forward=$(topology_link "$first" "$second")
     reverse=$(topology_link "$second" "$first")
-    [[ $forward =~ ^NV[0-9]+$ && $reverse =~ ^NV[0-9]+$ ]] ||
-        die "physical GPU pair $first<->$second is not bidirectional NVLink: ${forward:-missing}/${reverse:-missing}"
+    # NVLink is physical and bidirectional. Some nvidia-smi releases omit one
+    # symmetric matrix row; accept one unambiguous NV# report. DS4 separately
+    # validates CUDA DIRECT peer access in both directions before admitting any
+    # partner execution.
+    [[ $forward =~ ^NV[0-9]+$ || $reverse =~ ^NV[0-9]+$ ]] ||
+        die "physical GPU pair $first<->$second is not reported as NVLink: ${forward:-missing}/${reverse:-missing}"
+    [[ -z $forward || $forward =~ ^NV[0-9]+$ ]] ||
+        die "inconsistent NVLink topology for physical $first<->$second: $forward/${reverse:-missing}"
+    [[ -z $reverse || $reverse =~ ^NV[0-9]+$ ]] ||
+        die "inconsistent NVLink topology for physical $first<->$second: ${forward:-missing}/$reverse"
 done
 
 {
