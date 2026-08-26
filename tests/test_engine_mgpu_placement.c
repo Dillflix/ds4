@@ -61,6 +61,9 @@ int ds4_test_q8_cache_implicit_default_qualified(
                                    int partner_major, int partner_minor,
                                    double forward_gib_per_sec,
                                    double reverse_gib_per_sec);
+int ds4_test_q8_cache_partner_layer_enabled(
+                                   const char *list, uint32_t layer,
+                                   int *valid_out);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -213,6 +216,32 @@ static void test_q8_cache_partner_mapping(void) {
           "production logical pair 1<->3 maps physical NVLink pair 3<->2");
 
     (void)unsetenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
+
+    int layer_list_valid = 0;
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              NULL, 21u, &layer_list_valid) == 1 && layer_list_valid == 1,
+          "unset partner layer filter admits every layer");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "15, 17-19, 21", 15u, &layer_list_valid) == 1 &&
+              layer_list_valid == 1,
+          "partner layer filter accepts a listed singleton");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "15, 17-19, 21", 18u, &layer_list_valid) == 1 &&
+              layer_list_valid == 1,
+          "partner layer filter accepts an inclusive range interior");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "15, 17-19, 21", 20u, &layer_list_valid) == 0 &&
+              layer_list_valid == 1,
+          "partner layer filter rejects an unlisted layer");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "15,", 15u, &layer_list_valid) == 0 && layer_list_valid == 0,
+          "partner layer filter rejects a trailing comma even after a match");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "19-17", 18u, &layer_list_valid) == 0 && layer_list_valid == 0,
+          "partner layer filter rejects a descending range");
+    CHECK(ds4_test_q8_cache_partner_layer_enabled(
+              "43", 42u, &layer_list_valid) == 0 && layer_list_valid == 0,
+          "partner layer filter rejects layers beyond the model");
 
     const int q_partner = ds4_test_q8_cache_partner_tier(
         q_b, 4, 0, 1, 1, 0);

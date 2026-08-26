@@ -18,6 +18,9 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_GPU_TEST=${RUN_GPU_TEST:-1}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 REUSE_LOCAL_DIR=${REUSE_LOCAL_DIR:-}
+VARIANTS=${VARIANTS:-t256,t32}
+T256_LAYERS=${T256_LAYERS:-}
+T32_LAYERS=${T32_LAYERS:-}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${Q8_PARTNER_QUALITY_ISOLATION_DIR:-$repo_dir/q8-partner-quality-isolation-$stamp}
 
@@ -45,6 +48,19 @@ for flag in SKIP_BUILD RUN_GPU_TEST CREATE_ARCHIVE; do
 done
 [[ $RUN_GPU_TEST == 1 ]] ||
     die "quality isolation requires the three-class GPU exactness test"
+
+IFS=',' read -r -a quality_variants <<<"$VARIANTS"
+(( ${#quality_variants[@]} > 0 )) || die "VARIANTS must not be empty"
+declare -A seen_variants=()
+variants_manifest=local
+for variant in "${quality_variants[@]}"; do
+    [[ $variant == t256 || $variant == t32 ]] ||
+        die "VARIANTS may contain only t256 and t32"
+    [[ -z ${seen_variants[$variant]+x} ]] ||
+        die "VARIANTS contains duplicate $variant"
+    seen_variants[$variant]=1
+    variants_manifest+=",$variant"
+done
 
 IFS=',' read -r -a gpu_device_ids <<<"$GPU_DEVICES"
 (( ${#gpu_device_ids[@]} == 4 )) || die "GPU_DEVICES must contain four devices"
@@ -102,7 +118,8 @@ nvidia-smi topo -m >"$OUTPUT_DIR/provenance/topology.txt"
     printf 'gpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
         "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
     printf 'prefill_chunk=%s\nhome_plan=frozen-for-candidates\n' "$PREFILL_CHUNK"
-    printf 'variants=local,t256,t32\nmodel_hashing=disabled\n'
+    printf 'variants=%s\nmodel_hashing=disabled\n' "$variants_manifest"
+    printf 't256_layers=%s\nt32_layers=%s\n' "$T256_LAYERS" "$T32_LAYERS"
     printf 'reuse_local_dir=%s\n' "$REUSE_LOCAL_DIR"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free --format=csv
 } >"$OUTPUT_DIR/manifest.txt"
@@ -150,6 +167,15 @@ run_quality() {
         t256|t32)
             variant_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
             variant_env+=("DS4_CUDA_Q8_F16_PARTNER_CLASSES=$variant")
+            local layer_var
+            if [[ $variant == t256 ]]; then
+                layer_var=$T256_LAYERS
+            else
+                layer_var=$T32_LAYERS
+            fi
+            if [[ -n $layer_var ]]; then
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_LAYERS=$layer_var")
+            fi
             ;;
         *) die "internal unknown quality variant: $variant" ;;
     esac
@@ -188,6 +214,10 @@ run_quality() {
     else
         grep -Fq "partner-classes=$variant" "$log" ||
             die "$variant did not select its isolated class"
+        if [[ -n $layer_var ]]; then
+            grep -Fq "partner-layers=$layer_var" "$log" ||
+                die "$variant did not select the requested layer subset"
+        fi
         grep -Fq 'home-order=frozen' "$log" ||
             die "$variant did not freeze primary/home admission"
         grep -Fq 'CUDA q8 fp16 partner summary:' "$log" ||
@@ -228,7 +258,7 @@ if [[ -n $REUSE_LOCAL_DIR ]]; then
 else
     run_quality local
 fi
-for variant in t256 t32; do
+for variant in "${quality_variants[@]}"; do
     phase="quality-$variant"
     run_quality "$variant"
     python3 gguf-tools/quality-testing/compare_scores.py \

@@ -141,6 +141,36 @@ class QualityIsolationTests(unittest.TestCase):
             self.assertFalse(payload["variants"]["t256"]["quality_pass"])
             self.assertIn("| t256 | 15 |", (root / "summary.md").read_text())
 
+    def test_single_variant_requested_layer_subset_passes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-q8-layer-subset-") as raw:
+            root = Path(raw)
+            make_fixture(root)
+            (root / "manifest.txt").write_text(
+                "gpu_devices=0,3,1,2\ngpu_vram=auto\nstage_split=22/21\n"
+                "quality_ctx=32769\nhome_plan=frozen-for-candidates\n"
+                "variants=local,t256\nt256_layers=15\n",
+                encoding="utf-8",
+            )
+            result = self.run_it(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads((root / "quality-isolation.json").read_text())
+            self.assertEqual(set(payload["variants"]), {"t256"})
+            self.assertEqual(payload["variants"]["t256"]["partner_layers"], [15])
+
+    def test_requested_layer_subset_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-q8-layer-mismatch-") as raw:
+            root = Path(raw)
+            make_fixture(root)
+            (root / "manifest.txt").write_text(
+                "gpu_devices=0,3,1,2\ngpu_vram=auto\nstage_split=22/21\n"
+                "quality_ctx=32769\nhome_plan=frozen-for-candidates\n"
+                "variants=local,t256\nt256_layers=16\n",
+                encoding="utf-8",
+            )
+            result = self.run_it(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("do not match requested subset", result.stderr)
+
 
 def read_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:

@@ -15,7 +15,6 @@ from pathlib import Path
 from q8_partner_audit import REQUIRED_COLUMNS, class_evidence_valid, collect
 
 
-VARIANTS = ("t256", "t32")
 SHAPES = {
     "t256": (8192, 4096),
     "t32": (1024, 32768),
@@ -88,7 +87,7 @@ def binding_map(rows: list[dict[str, str]], path: Path) -> dict[tuple[str, ...],
 
 
 def validate_additive_bindings(
-    root: Path, variant: str,
+    root: Path, variant: str, expected_layers: list[int] | None,
 ) -> dict[str, object]:
     local_path = root / "quality/local.bindings.csv"
     candidate_path = root / f"quality/{variant}.bindings.csv"
@@ -119,6 +118,11 @@ def validate_additive_bindings(
         layers.append(int(match.group(1)))
     if len(layers) != len(set(layers)):
         fail(f"{variant} contains duplicate partner layers")
+    if expected_layers is not None and sorted(layers) != expected_layers:
+        fail(
+            f"{variant} partner layers {sorted(layers)} do not match requested "
+            f"subset {expected_layers}"
+        )
     return {
         "home_bindings": len(local),
         "home_bindings_identical": True,
@@ -127,16 +131,45 @@ def validate_additive_bindings(
     }
 
 
+def parse_layer_spec(value: str, variant: str) -> list[int] | None:
+    if not value:
+        return None
+    layers: set[int] = set()
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", item)
+        if not match:
+            fail(f"manifest has invalid {variant}_layers={value!r}")
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if first > last or first < 0 or last >= 43:
+            fail(f"manifest has out-of-range {variant}_layers={value!r}")
+        layers.update(range(first, last + 1))
+    if not layers:
+        fail(f"manifest has empty {variant}_layers selection")
+    return sorted(layers)
+
+
 if len(sys.argv) != 2:
     fail("usage: summarize-q8-partner-quality-isolation.py OUTPUT_DIR")
 root = Path(sys.argv[1]).resolve()
 manifest = read_manifest(root / "manifest.txt")
+variant_fields = manifest.get("variants", "").split(",")
+if (not variant_fields or variant_fields[0] != "local" or
+        len(variant_fields) == 1 or len(set(variant_fields)) != len(variant_fields)):
+    fail("manifest must list local followed by unique candidate variants")
+VARIANTS = tuple(variant_fields[1:])
+if any(variant not in SHAPES for variant in VARIANTS):
+    fail("manifest contains an unsupported quality-isolation variant")
+expected_layers = {
+    variant: parse_layer_spec(manifest.get(f"{variant}_layers", ""), variant)
+    for variant in VARIANTS
+}
 if (manifest.get("gpu_devices") != "0,3,1,2" or
         manifest.get("gpu_vram") != "auto" or
         manifest.get("stage_split") != "22/21" or
         manifest.get("quality_ctx") != "32769" or
-        manifest.get("home_plan") != "frozen-for-candidates" or
-        manifest.get("variants") != "local,t256,t32"):
+        manifest.get("home_plan") != "frozen-for-candidates"):
     fail("manifest does not describe the fixed quality-isolation experiment")
 
 partner_devices = (1, 2)
@@ -208,7 +241,7 @@ for variant_index, variant in enumerate(VARIANTS):
         and first_loss <= 1 and lcp_loss <= 0.1
     )
     results[variant] = {
-        **validate_additive_bindings(root, variant),
+        **validate_additive_bindings(root, variant, expected_layers[variant]),
         "local_avg_nll": local_summary["avg_nll"],
         "candidate_avg_nll": summary["avg_nll"],
         "delta_nll_per_token": summary["avg_nll"] - local_summary["avg_nll"],

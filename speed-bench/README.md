@@ -529,6 +529,37 @@ model path and size, quality fixture, 32K allocation pressure, GPU order, and
 22/21 split before reusing its local-control evidence. Omit it if that source
 directory is no longer present.
 
+The completed frozen-home class pass rejected T32. It worsened NLL by 0.998%,
+lost 0.47 mean greedy-prefix tokens, and lost seven aggregate token-level top-1
+matches. Full T256 was directionally better on the broader evidence: NLL
+improved 1.339%, the paired-bootstrap upper bound was negative, 59/100 cases
+improved, mean greedy prefix gained 0.17 tokens, and aggregate token-level top-1
+matches rose by five. It nevertheless failed the predeclared first-token gate:
+four cases lost their first token and one gained it. Do not weaken that gate or
+enable the full class implicitly. Isolate the additive layers 15--21 instead.
+
+The runner accepts a candidate subset through `VARIANTS=t256` and
+`T256_LAYERS`; the latter uses comma-separated layers or inclusive ranges. It
+records the request in the manifest and rejects an archive unless the observed
+additive binding set exactly matches it. The first bounded split is 15--18
+versus 19--21, each reusing the already validated local control:
+
+```bash
+COMMON_LOCAL="$PWD/t256-production-validation-20260826T035132Z"
+
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 QUALITY_CTX=32769 \
+VARIANTS=t256 T256_LAYERS=15-18 REUSE_LOCAL_DIR="$COMMON_LOCAL" \
+SKIP_BUILD=0 ./speed-bench/cuda-q8-partner-quality-isolation.sh
+
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 QUALITY_CTX=32769 \
+VARIANTS=t256 T256_LAYERS=19-21 REUSE_LOCAL_DIR="$COMMON_LOCAL" \
+SKIP_BUILD=1 ./speed-bench/cuda-q8-partner-quality-isolation.sh
+```
+
+If one half passes, retain it and subdivide only a failing half. A final
+combined subset still requires its own 100-case run because floating-point
+path effects are not guaranteed to add linearly.
+
 The completed T32 fusion A/B can eliminate redundant local and T32 runs:
 
 ```bash

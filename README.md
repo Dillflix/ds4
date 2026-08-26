@@ -753,6 +753,12 @@ eligibility from the primary admission tie-break. It preserves the
 partner-disabled home binding set, then uses phase-two partner admission only
 for tensors that missed that frozen home plan. It is intended for arithmetic
 and quality attribution, not as an accepted production default.
+`DS4_CUDA_Q8_F16_PARTNER_LAYERS` optionally restricts additive partner
+admission to a comma-separated list of transformer layers and inclusive ranges,
+for example `15,17-19,21`. The engine rejects malformed, descending, or
+out-of-range selectors. An unset value admits every layer selected by the class
+policy. This is an acceptance/attribution control; it does not change primary
+home-cache admission.
 Partner activation/result scratch is reserved during cache admission rather
 than grown inside a measured projection. The default reservation covers 2048
 tokens, matching CUDA TP's default prefill chunk;
@@ -793,8 +799,14 @@ only the tighter stage; the bounded audit records which partner(s) it observed.
 The first `speed-bench/cuda-q8-partner-production-validation.sh` result failed
 its predeclared quality-stability gate, so its implicit candidate was disabled.
 Use `speed-bench/cuda-q8-partner-quality-isolation.sh` to separate additive
-T256 from additive T32 arithmetic before proposing another default. The prior
-bounded acceptance pass measured only 16K/32K and did not validate 64K.
+T256 from additive T32 arithmetic before proposing another default. The frozen
+class pass rejected T32: aggregate NLL, bootstrap bound, greedy prefix, and
+token-level top-1 agreement all worsened. Full additive T256 improved aggregate
+NLL by 1.339%, improved mean greedy prefix by 0.17 tokens, and gained five
+token-level top-1 matches, but four cases lost their first-token match while one
+gained it. It therefore remains disabled pending layer-subset isolation across
+the additive layers 15--21. The prior bounded performance acceptance pass
+measured only 16K/32K and did not validate 64K.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

@@ -2950,6 +2950,82 @@ static bool accelerator_q8_cache_partner_list_has(
     return false;
 }
 
+/* Optional diagnostic/acceptance filter for additive partner admission.
+ * Grammar: comma-separated decimal layers or inclusive ranges (for example
+ * "15,17-19,21").  An unset/empty list admits every layer.  Parse the whole
+ * string even after a match so malformed suffixes cannot silently broaden or
+ * narrow an experiment. */
+static bool accelerator_q8_cache_partner_layer_enabled(
+        const char *list, uint32_t layer, bool *valid_out) {
+    if (valid_out) *valid_out = true;
+    if (!list || !list[0]) return true;
+
+    const char *p = list;
+    bool matched = false;
+    bool have_item = false;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) {
+            if (!have_item && valid_out) *valid_out = false;
+            return have_item && matched;
+        }
+
+        uint64_t first = 0u;
+        bool have_digit = false;
+        while (*p >= '0' && *p <= '9') {
+            have_digit = true;
+            first = first * 10u + (uint64_t)(*p - '0');
+            if (first >= DS4_N_LAYER) {
+                if (valid_out) *valid_out = false;
+                return false;
+            }
+            p++;
+        }
+        if (!have_digit) {
+            if (valid_out) *valid_out = false;
+            return false;
+        }
+        while (*p == ' ' || *p == '\t') p++;
+
+        uint64_t last = first;
+        if (*p == '-') {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            have_digit = false;
+            last = 0u;
+            while (*p >= '0' && *p <= '9') {
+                have_digit = true;
+                last = last * 10u + (uint64_t)(*p - '0');
+                if (last >= DS4_N_LAYER) {
+                    if (valid_out) *valid_out = false;
+                    return false;
+                }
+                p++;
+            }
+            if (!have_digit || last < first) {
+                if (valid_out) *valid_out = false;
+                return false;
+            }
+            while (*p == ' ' || *p == '\t') p++;
+        }
+
+        have_item = true;
+        if ((uint64_t)layer >= first && (uint64_t)layer <= last) matched = true;
+        if (!*p) return matched;
+        if (*p != ',') {
+            if (valid_out) *valid_out = false;
+            return false;
+        }
+        p++;
+        const char *next = p;
+        while (*next == ' ' || *next == '\t') next++;
+        if (!*next) {
+            if (valid_out) *valid_out = false;
+            return false;
+        }
+    }
+}
+
 static bool accelerator_q8_cache_implicit_default_qualified(
         int home_major,
         int home_minor,
@@ -55781,6 +55857,21 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t partner_fallback_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!partner_classes || !partner_classes[0]) partner_classes = "none";
+    const char *partner_layers_env =
+        getenv("DS4_CUDA_Q8_F16_PARTNER_LAYERS");
+    bool partner_layers_valid = true;
+    (void)accelerator_q8_cache_partner_layer_enabled(
+        partner_layers_env, 0u, &partner_layers_valid);
+    if (!partner_layers_valid) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_LAYERS='%s'; "
+                "expected comma-separated layers/ranges within [0,%u]\n",
+                partner_layers_env ? partner_layers_env : "",
+                (unsigned)(DS4_N_LAYER - 1u));
+        return -1;
+    }
+    const char *partner_layers = partner_layers_env && partner_layers_env[0]
+        ? partner_layers_env : "all";
     const bool freeze_home_plan =
         getenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN") != NULL;
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
@@ -55830,14 +55921,20 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         const bool implicit_default_qualified =
             home_tier >= 0 && home_tier < tp_half &&
             implicit_partner_qualified[home_tier];
-        const int fallback_tier = accelerator_q8_cache_partner_tier(
-            path_class, cuda_tp_decode, e->gpu_cfg.n_gpus, home_tier,
-            partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
-                g_gpu_peer_ok[home_tier][partner_tier],
-            partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
-                g_gpu_peer_ok[partner_tier][home_tier],
-            implicit_default_qualified,
-            getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL);
+        const uint32_t layer = accelerator_q8_cache_layer(t->name);
+        const bool partner_layer_enabled =
+            accelerator_q8_cache_partner_layer_enabled(
+                partner_layers_env, layer, NULL);
+        const int fallback_tier = partner_layer_enabled
+            ? accelerator_q8_cache_partner_tier(
+                path_class, cuda_tp_decode, e->gpu_cfg.n_gpus, home_tier,
+                partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
+                    g_gpu_peer_ok[home_tier][partner_tier],
+                partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
+                    g_gpu_peer_ok[partner_tier][home_tier],
+                implicit_default_qualified,
+                getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL)
+            : -1;
         const int fallback_device = fallback_tier >= 0
             ? g_gpu[fallback_tier].device_id : -1;
         const uint64_t row_bytes = ((t->dim[0] + 31u) / 32u) * 34u;
@@ -55912,6 +56009,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
             "other=%llu partner-fallback=%llu partner-classes=%s "
+            "partner-layers=%s "
             "home-order=%s\n",
             (unsigned long long)plan_count,
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
@@ -55922,6 +56020,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                                  class_count[ACCEL_Q8_CACHE_OTHER_ATTN]),
             (unsigned long long)partner_fallback_count,
             partner_classes,
+            partner_layers,
             freeze_home_plan ? "frozen" : "partner-priority");
 
     ds4_gpu_q8_f16_plan_begin();
@@ -56468,6 +56567,15 @@ int ds4_test_q8_cache_implicit_default_qualified(
     return accelerator_q8_cache_implicit_default_qualified(
         home_major, home_minor, partner_major, partner_minor,
         forward_gib_per_sec, reverse_gib_per_sec) ? 1 : 0;
+}
+
+int ds4_test_q8_cache_partner_layer_enabled(
+        const char *list, uint32_t layer, int *valid_out) {
+    bool valid = true;
+    const bool enabled = accelerator_q8_cache_partner_layer_enabled(
+        list, layer, &valid);
+    if (valid_out) *valid_out = valid ? 1 : 0;
+    return enabled ? 1 : 0;
 }
 
 bool ds4_test_cuda_routed_moe_quant_types_supported(
