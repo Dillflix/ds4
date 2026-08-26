@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Summarize the four-way standard/native-Q4 x local/T256 prefill A/B."""
+"""Summarize standard/native-Q4 with the same all-partner T256 policy."""
 
 from __future__ import annotations
 
 import csv
 import json
 import math
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -13,10 +14,8 @@ from pathlib import Path
 
 
 VARIANTS = (
-    "standard-local",
-    "standard-auto",
-    "native-local",
-    "native-auto",
+    "standard-all-partner",
+    "native-all-partner",
 )
 REQUIRED_RUN_COLUMNS = {
     "repeat",
@@ -33,17 +32,15 @@ REQUIRED_RUN_COLUMNS = {
     "logits",
 }
 REQUIRED_BENCH_COLUMNS = {"ctx_tokens", "prefill_tokens", "prefill_tps"}
-REQUIRED_AUDIT_COLUMNS = {"in_dim", "out_dim", "result", "reason"}
-REQUIRED_BINDING_COLUMNS = {"partner_offload", "in_dim", "out_dim"}
+REQUIRED_AUDIT_COLUMNS = {
+    "label", "layer", "physical_device", "in_dim", "out_dim", "result", "reason",
+}
+REQUIRED_BINDING_COLUMNS = {
+    "consumer_device", "resident_device", "partner_offload", "weight_offset",
+    "in_dim", "out_dim", "label",
+}
 LONG_CONTEXTS = (16384, 32768)
-EFFECTS = (
-    "standard_auto_over_standard_local",
-    "native_local_over_standard_local",
-    "native_auto_over_native_local",
-    "native_auto_over_standard_auto",
-    "native_auto_over_standard_local",
-    "interaction",
-)
+EFFECT = "native_all_partner_over_standard_all_partner"
 
 
 def fail(message: str) -> None:
@@ -124,6 +121,28 @@ def median_absolute_deviation(values: list[float]) -> float:
     return statistics.median(abs(value - median) for value in values)
 
 
+def is_t256(row: dict[str, str]) -> bool:
+    return (
+        row.get("in_dim") == "8192"
+        and row.get("out_dim") == "4096"
+        and "attn_output_b" in row.get("label", "")
+    )
+
+
+def layer_of(row: dict[str, str]) -> int:
+    value = row.get("layer", "")
+    if value.isdigit():
+        return int(value)
+    match = re.search(r"blk\.(\d+)\.", row.get("label", ""))
+    if not match:
+        fail(f"cannot recover layer from {row.get('label', '<missing>')}")
+    return int(match.group(1))
+
+
+def devices_for_layer(layer: int) -> tuple[int, int]:
+    return (0, 1) if layer <= 21 else (3, 2)
+
+
 def format_number(value: object) -> object:
     if isinstance(value, float):
         return f"{value:.12g}"
@@ -148,7 +167,7 @@ def main() -> int:
     slot_index: dict[int, dict[int, str]] = defaultdict(dict)
     model_values: dict[str, set[str]] = {"standard": set(), "native": set()}
     samples: dict[tuple[int, str], dict[int, tuple[int, float]]] = {}
-    expected_policy = {variant: variant.rsplit("-", 1)[1] for variant in VARIANTS}
+    expected_policy = {variant: "all-partner" for variant in VARIANTS}
     base_dir = runs_path.parent
 
     for source_row in runs:
@@ -213,11 +232,8 @@ def main() -> int:
         samples[key] = values
 
     repeats = sorted({repeat for repeat, _ in run_index})
-    if len(repeats) < 4 or len(repeats) % 4 != 0:
-        fail(
-            "the A/B requires at least four repeats and a repeat count "
-            "that is a multiple of four"
-        )
+    if not repeats:
+        fail("the integration check contains no repeats")
     if repeats != list(range(1, len(repeats) + 1)):
         fail(f"repeats must be consecutive from 1, found {repeats}")
     expected_keys = {
@@ -235,21 +251,14 @@ def main() -> int:
     expected_slots = set(range(1, len(VARIANTS) + 1))
     for repeat in repeats:
         if set(slot_index[repeat]) != expected_slots:
-            fail(f"repeat {repeat} must contain slots 1..4 exactly once")
+            fail(f"repeat {repeat} must contain slots 1..2 exactly once")
         if set(slot_index[repeat].values()) != set(VARIANTS):
             fail(f"repeat {repeat} must contain every variant exactly once")
-    for block_start in range(0, len(repeats), 4):
-        block = repeats[block_start:block_start + 4]
-        for slot in sorted(expected_slots):
-            counts = Counter(slot_index[repeat][slot] for repeat in block)
-            if counts != Counter({variant: 1 for variant in VARIANTS}):
-                fail(
-                    f"run order is not counterbalanced: repeats "
-                    f"{block[0]}-{block[-1]} slot {slot} must contain every "
-                    "variant exactly once"
-                )
+        order = tuple(slot_index[repeat][slot] for slot in sorted(expected_slots))
+        if order != VARIANTS:
+            fail(f"repeat {repeat} order is {order}, expected {VARIANTS}")
 
-    baseline = samples[(repeats[0], "standard-local")]
+    baseline = samples[(repeats[0], "standard-all-partner")]
     contexts = sorted(baseline)
     if not set(LONG_CONTEXTS).issubset(contexts):
         fail(
@@ -310,27 +319,24 @@ def main() -> int:
     exactness_rows: list[dict[str, object]] = []
     cross_layout_exact = True
     for repeat in repeats:
-        for policy in ("local", "auto"):
-            standard_variant = f"standard-{policy}"
-            native_variant = f"native-{policy}"
-            for context in contexts:
-                reference = raw_logits[(repeat, standard_variant, context)]
-                candidate = raw_logits[(repeat, native_variant, context)]
-                exact = files_equal(reference, candidate)
-                cross_layout_exact = cross_layout_exact and exact
-                exactness_rows.append({
-                    "kind": "cross-layout",
-                    "comparison": f"standard-vs-native-{policy}",
-                    "variant": policy,
-                    "repeat": repeat,
-                    "reference_repeat": repeat,
-                    "ctx_tokens": context,
-                    "reference": reference,
-                    "candidate": candidate,
-                    "reference_bytes": reference.stat().st_size,
-                    "candidate_bytes": candidate.stat().st_size,
-                    "exact": int(exact),
-                })
+        for context in contexts:
+            reference = raw_logits[(repeat, "standard-all-partner", context)]
+            candidate = raw_logits[(repeat, "native-all-partner", context)]
+            exact = files_equal(reference, candidate)
+            cross_layout_exact = cross_layout_exact and exact
+            exactness_rows.append({
+                "kind": "cross-layout",
+                "comparison": "standard-vs-native-all-partner",
+                "variant": "all-partner",
+                "repeat": repeat,
+                "reference_repeat": repeat,
+                "ctx_tokens": context,
+                "reference": reference,
+                "candidate": candidate,
+                "reference_bytes": reference.stat().st_size,
+                "candidate_bytes": candidate.stat().st_size,
+                "exact": int(exact),
+            })
 
     repeat_deterministic = True
     reference_repeat = repeats[0]
@@ -392,45 +398,66 @@ def main() -> int:
                         fail(f"cache-state evidence is empty: {cache_path}")
                 except OSError as exc:
                     fail(f"cannot stat cache-state evidence {cache_path}: {exc}")
-            partner_audit = [
-                row for row in audit_rows
-                if row["result"] == "f16_partner_hit"
-                and row["reason"] == "nvlink_offload"
+            t256_audit = [row for row in audit_rows if is_t256(row)]
+            t256_bindings = [row for row in binding_rows if is_t256(row)]
+            fixed_bindings = [
+                row for row in t256_bindings if row["partner_offload"] == "0"
             ]
             partner_bindings = [
-                row for row in binding_rows if row["partner_offload"] == "1"
+                row for row in t256_bindings if row["partner_offload"] == "1"
             ]
-            policy = expected_policy[variant]
+            non_t256_bindings = [row for row in binding_rows if not is_t256(row)]
             family = variant.split("-", 1)[0]
             planner_ok = planner_marker in log_text
             layout_ok = (
                 (family == "native" and native_marker in log_text)
                 or (family == "standard" and native_marker not in log_text)
             )
-            if policy == "local":
-                policy_ok = (
-                    "partner-classes=none" in log_text
-                    and partner_summary_marker not in log_text
-                    and not partner_audit
-                    and not partner_bindings
+            expected_bindings: Counter[tuple[int, int, int, int]] = Counter()
+            for layer in range(43):
+                home, peer = devices_for_layer(layer)
+                expected_bindings[(layer, peer, peer, 0)] += 1
+                expected_bindings[(layer, home, peer, 1)] += 1
+            observed_bindings = Counter(
+                (
+                    layer_of(row), int(row["consumer_device"]),
+                    int(row["resident_device"]), int(row["partner_offload"]),
                 )
-            else:
-                policy_ok = (
-                    "partner-classes=t256" in log_text
-                    and partner_summary_marker in log_text
-                    and bool(partner_audit)
-                    and bool(partner_bindings)
-                    and all(
-                        row["in_dim"] == "8192"
-                        and row["out_dim"] == "4096"
-                        for row in partner_audit
-                    )
-                    and all(
-                        row["in_dim"] == "8192"
-                        and row["out_dim"] == "4096"
-                        for row in partner_bindings
-                    )
-                )
+                for row in t256_bindings
+            )
+            unique_t256_allocations = {
+                (row["resident_device"], row["weight_offset"])
+                for row in t256_bindings
+            }
+            audit_layers = Counter(layer_of(row) for row in t256_audit)
+            even_layer_coverage = (
+                set(audit_layers) == set(range(43))
+                and len(set(audit_layers.values())) == 1
+            )
+            audit_mapping_ok = all(
+                row["result"] == "f16_partner_hit"
+                and row["reason"] == "nvlink_offload"
+                and int(row["physical_device"])
+                == devices_for_layer(layer_of(row))[1]
+                for row in t256_audit
+            )
+            policy_ok = (
+                "partner-classes=t256" in log_text
+                and "partner-layers=0-42" in log_text
+                and "t256-placement=all-partner" in log_text
+                and "T256-output_b=86/86" in log_text
+                and "partner=43 partner-arithmetic=f16" in log_text
+                and partner_summary_marker in log_text
+                and len(fixed_bindings) == 43
+                and len(partner_bindings) == 43
+                and len(unique_t256_allocations) == 43
+                and observed_bindings == expected_bindings
+                and len(non_t256_bindings) == 263
+                and all(row["partner_offload"] == "0" for row in non_t256_bindings)
+                and bool(t256_audit)
+                and even_layer_coverage
+                and audit_mapping_ok
+            )
             stable = files_equal(cache_before, cache_after)
             cache_stable = cache_stable and stable
             run_ok = planner_ok and layout_ok and policy_ok
@@ -441,104 +468,80 @@ def main() -> int:
                 "planner": planner_ok,
                 "layout_dispatch": layout_ok,
                 "policy": policy_ok,
-                "partner_audit_calls": len(partner_audit),
+                "partner_audit_calls": len(t256_audit),
+                "fixed_t256_bindings": len(fixed_bindings),
                 "partner_bindings": len(partner_bindings),
+                "unique_t256_allocations": len(unique_t256_allocations),
+                "non_t256_bindings": len(non_t256_bindings),
                 "cache_stable": stable,
             })
 
     paired_rows: list[dict[str, object]] = []
-    effect_values: dict[int, dict[str, list[float]]] = {
-        context: {effect: [] for effect in EFFECTS} for context in contexts
+    effect_values: dict[int, list[float]] = {
+        context: [] for context in contexts
     }
     for repeat in repeats:
         for context in contexts:
-            standard_local = samples[(repeat, "standard-local")][context][1]
-            standard_auto = samples[(repeat, "standard-auto")][context][1]
-            native_local = samples[(repeat, "native-local")][context][1]
-            native_auto = samples[(repeat, "native-auto")][context][1]
-            effects = {
-                "standard_auto_over_standard_local":
-                    standard_auto / standard_local,
-                "native_local_over_standard_local":
-                    native_local / standard_local,
-                "native_auto_over_native_local": native_auto / native_local,
-                "native_auto_over_standard_auto": native_auto / standard_auto,
-                "native_auto_over_standard_local": native_auto / standard_local,
-                "interaction":
-                    (native_auto / native_local)
-                    / (standard_auto / standard_local),
-            }
-            for effect, value in effects.items():
-                effect_values[context][effect].append(value)
+            standard = samples[(repeat, "standard-all-partner")][context][1]
+            native = samples[(repeat, "native-all-partner")][context][1]
+            ratio = native / standard
+            effect_values[context].append(ratio)
             paired_rows.append({
                 "repeat": repeat,
                 "ctx_tokens": context,
                 "prefill_tokens": expected_work[context],
-                "standard_local_tps": standard_local,
-                "standard_auto_tps": standard_auto,
-                "native_local_tps": native_local,
-                "native_auto_tps": native_auto,
-                **effects,
+                "standard_all_partner_tps": standard,
+                "native_all_partner_tps": native,
+                EFFECT: ratio,
             })
 
     context_rows: list[dict[str, object]] = []
     context_payload: list[dict[str, object]] = []
-    t256_long_context_ok = True
-    combined_no_regression = True
+    native_no_regression = True
     for context in contexts:
-        medians: dict[str, float] = {}
-        for effect in EFFECTS:
-            values = effect_values[context][effect]
-            median = statistics.median(values)
-            medians[effect] = median
-            required_gate = ""
-            gate_pass: bool | None = None
-            if effect == "native_auto_over_native_local" and context in LONG_CONTEXTS:
-                required_gate = ">=1.05"
-                gate_pass = median >= 1.05
-                t256_long_context_ok = t256_long_context_ok and gate_pass
-            elif effect == "native_auto_over_standard_local":
-                required_gate = ">=1.00"
-                gate_pass = median >= 1.0
-                combined_no_regression = combined_no_regression and gate_pass
-            context_rows.append({
-                "ctx_tokens": context,
-                "effect": effect,
-                "samples": len(values),
-                "median": median,
-                "min": min(values),
-                "max": max(values),
-                "mad": median_absolute_deviation(values),
-                "required_gate": required_gate,
-                "pass": "" if gate_pass is None else int(gate_pass),
-            })
+        values = effect_values[context]
+        median = statistics.median(values)
+        gate_pass = median >= 1.0
+        native_no_regression = native_no_regression and gate_pass
+        context_rows.append({
+            "ctx_tokens": context,
+            "effect": EFFECT,
+            "samples": len(values),
+            "median": median,
+            "min": min(values),
+            "max": max(values),
+            "mad": median_absolute_deviation(values),
+            "required_gate": ">=1.00",
+            "pass": int(gate_pass),
+        })
         context_payload.append({
             "ctx_tokens": context,
             "prefill_tokens": expected_work[context],
-            "median_effects": medians,
-            "native_auto_over_native_local_pass":
-                None if context not in LONG_CONTEXTS
-                else medians["native_auto_over_native_local"] >= 1.05,
-            "native_auto_over_standard_local_pass":
-                medians["native_auto_over_standard_local"] >= 1.0,
+            "standard_median_tps": statistics.median(
+                samples[(repeat, "standard-all-partner")][context][1]
+                for repeat in repeats
+            ),
+            "native_median_tps": statistics.median(
+                samples[(repeat, "native-all-partner")][context][1]
+                for repeat in repeats
+            ),
+            "native_over_standard": median,
+            "native_no_regression_pass": gate_pass,
         })
 
     gates = {
         "cross_layout_raw_logits_exact": cross_layout_exact,
-        "repeat_deterministic": repeat_deterministic,
-        "counterbalanced_order": True,
+        "repeat_deterministic_if_repeated": repeat_deterministic,
+        "focused_standard_then_native_order": True,
         "policy_and_dispatch_evidence": policy_evidence_ok,
         "cache_state_stable": cache_stable,
-        "native_auto_over_native_local_16k_32k": t256_long_context_ok,
-        "native_auto_over_standard_local_no_regression":
-            combined_no_regression,
+        "native_all_partner_no_regression": native_no_regression,
     }
     accepted = all(gates.values())
 
     paired_fields = [
         "repeat", "ctx_tokens", "prefill_tokens",
-        "standard_local_tps", "standard_auto_tps",
-        "native_local_tps", "native_auto_tps", *EFFECTS,
+        "standard_all_partner_tps", "native_all_partner_tps", EFFECT,
     ]
     write_csv(
         out_dir / "paired-effects.csv",
@@ -584,15 +587,15 @@ def main() -> int:
         "evidence": {
             "raw_full_vocab_bytes": full_vocab_bytes,
             "cross_layout_comparisons":
-                2 * len(repeats) * len(contexts),
+                len(repeats) * len(contexts),
             "repeat_determinism_comparisons":
                 len(VARIANTS) * (len(repeats) - 1) * len(contexts),
             "runs": run_evidence,
         },
         "interpretation": (
-            "Effects are paired ratios. The interaction is measured directly; "
-            "component improvements are not assumed to multiply independently. "
-            "Acceptance covers integration and throughput only; the separate "
+            "Both arms use the identical all-partner T256 policy, so the paired "
+            "ratio isolates the tagged native-Q4 layout within the final combined "
+            "configuration. Acceptance covers integration and throughput only; the separate "
             "official T256 quality-isolation gate still applies."
         ),
     }
@@ -601,37 +604,31 @@ def main() -> int:
     )
 
     lines = [
-        "# SM75 native-Q4 + T256 paired A/B",
+        "# SM75 native-Q4 + all-partner T256 integration",
         "",
         f"Overall: **{'PASS' if accepted else 'FAIL'}**",
         "",
         (
             f"Scope: {len(repeats)} repeats, {len(contexts)} context "
-            "frontiers, four counterbalanced variants."
+            "frontiers, two focused variants."
         ),
         "",
         "This result covers dispatch integration and throughput only. The "
         "separate official T256 quality-isolation gate still applies.",
         "",
-        "The effects below are measured paired ratios. Component gains are not "
-        "assumed to be additive or multiplicative; `interaction` reports the "
-        "observed change in T256's ratio after switching to native Q4.",
+        "Both arms force the measured all-partner T256 winner. The ratio therefore "
+        "measures only the effect of switching the routed Q4 tensors to the tagged "
+        "SM75-native layout.",
         "",
-        "| Context | Std auto/local | Native local/std local | "
-        "Native auto/local | Native auto/std auto | Combined | Interaction |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| Context | Standard all-partner | Native all-partner | Native / standard |",
+        "|---:|---:|---:|---:|",
     ]
     for item in context_payload:
-        medians = item["median_effects"]
-        assert isinstance(medians, dict)
         lines.append(
             f"| {int(item['ctx_tokens']) // 1024}K | "
-            f"{medians['standard_auto_over_standard_local']:.4f}x | "
-            f"{medians['native_local_over_standard_local']:.4f}x | "
-            f"{medians['native_auto_over_native_local']:.4f}x | "
-            f"{medians['native_auto_over_standard_auto']:.4f}x | "
-            f"{medians['native_auto_over_standard_local']:.4f}x | "
-            f"{medians['interaction']:.4f}x |"
+            f"{float(item['standard_median_tps']):.2f} | "
+            f"{float(item['native_median_tps']):.2f} | "
+            f"{float(item['native_over_standard']):.4f}x |"
         )
     lines.extend((
         "",
@@ -640,16 +637,15 @@ def main() -> int:
         f"- Standard/native raw full-vocabulary logits: "
         f"{'PASS' if cross_layout_exact else 'FAIL'}",
         f"- Per-variant repeat determinism: "
-        f"{'PASS' if repeat_deterministic else 'FAIL'}",
-        "- Four-way order balance: PASS",
-        f"- Native layout and local/T256 policy evidence: "
+        f"{'PASS' if repeat_deterministic else 'FAIL'}"
+        f" ({'not applicable with one repeat' if len(repeats) == 1 else 'evaluated'}).",
+        "- Focused standard-then-native order: PASS",
+        f"- Native layout and all-partner T256 policy evidence: "
         f"{'PASS' if policy_evidence_ok else 'FAIL'}",
         f"- Cache state frozen during timing: "
         f"{'PASS' if cache_stable else 'FAIL'}",
-        f"- Native T256/local median >= 1.05 at 16K and 32K: "
-        f"{'PASS' if t256_long_context_ok else 'FAIL'}",
-        f"- Native-auto/standard-local median never regresses: "
-        f"{'PASS' if combined_no_regression else 'FAIL'}",
+        f"- Native all-partner median never regresses versus standard all-partner: "
+        f"{'PASS' if native_no_regression else 'FAIL'}",
         "",
     ))
     summary = "\n".join(lines)

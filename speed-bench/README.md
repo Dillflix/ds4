@@ -617,16 +617,17 @@ must retain the same seven additive T256 bindings, record only
 `native_q8_partner_hit/exact_sm75_mma`, and produce byte-identical frontier
 logits. Return `q8-partner-native-exact-<timestamp>.tar.gz`.
 
-### Tagged SM75 native-Q4 and automatic-T256 A/B
+### Tagged SM75 native-Q4 with all-partner T256
 
-`cuda-sm75-native-q4-t256-ab.sh` is an evidence runner only; it does not
-change the engine, either GGUF, the native-Q4 dispatch, or the automatic T256
-policy. It requires separate existing absolute paths in `MODEL` for the
+`cuda-sm75-native-q4-t256-ab.sh` is a focused integration runner; it does not
+change the engine, either GGUF, or the native-Q4 dispatch. It requires separate
+existing absolute paths in `MODEL` for the
 standard full-Q4 GGUF and `NATIVE_MODEL` for its tagged SM75-native repack.
-The fixed 2x2 compares standard/native Q4 with partner execution disabled or
-with the implicit automatic T256 policy. It uses the production `0,3,1,2`
-device order and 22/21 split, sweeps 2K through 32K, and runs four
-counterbalanced repeats so every arm occupies every run slot once.
+Both arms force the measured all-partner T256 winner: 43 fixed plus 43 partner
+bindings backed by 43 physical T256 expansions, with all active output-B GEMMs
+executing on the NVLink partners. It uses the production `0,3,1,2` device order
+and 22/21 split and sweeps 2K through 32K. One standard-then-native pair is the
+default; increase `REPEATS` only when repeat statistics are specifically needed.
 
 The runner records file sizes and exact-output evidence but deliberately does
 not hash either approximately 153-GiB model. It reuses the existing models and
@@ -646,13 +647,14 @@ CTX_START=2048 \
 CTX_MAX=32768 \
 STEP_MUL=2 \
 PREFILL_CHUNK=2048 \
-REPEATS=4 \
+REPEATS=1 \
 ./speed-bench/cuda-sm75-native-q4-t256-ab.sh
 ```
 
 Return `sm75-native-q4-t256-ab-<timestamp>.tar.gz`. The archive contains the
-four-arm throughput decomposition, exact-logit comparisons, T256-only
-admission/binding evidence, frozen-cache checks, and per-run GPU telemetry.
+focused throughput comparison, bit-exact standard/native full-logit checks,
+exact all-partner T256 allocation/binding/runtime evidence, frozen-cache checks,
+and per-run GPU telemetry.
 A `PASS` from this runner accepts only that structural and performance
 interaction. It does not replace or override the separate official T256
 quality-isolation gate described below.

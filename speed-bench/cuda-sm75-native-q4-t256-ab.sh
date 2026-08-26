@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run the fixed four-arm SM75 native-Q4 x automatic-T256 integration A/B.
+Run the focused standard/native-Q4 x all-partner-T256 integration check.
 
 Required environment:
   MODEL=/absolute/path/to/standard-full-Q4.gguf
@@ -18,14 +18,14 @@ Optional environment:
   CTX_MAX=32768
   STEP_MUL=2
   PREFILL_CHUNK=2048
-  REPEATS=4
+  REPEATS=1
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   NATIVE_Q4_T256_AB_DIR=/absolute/output/directory
 
-This runner does not hash, create, or modify either model. It validates the
-dispatch/performance interaction; it does not replace the separate official
-T256 quality-isolation decision gate.
+This runner does not hash, create, or modify either model. Both arms force the
+same all-partner T256 policy, isolating native-Q4 integration and throughput.
+It does not replace the separate official T256 quality decision gate.
 EOF
 }
 
@@ -54,11 +54,9 @@ CTX_START=${CTX_START:-2048}
 CTX_MAX=${CTX_MAX:-32768}
 STEP_MUL=${STEP_MUL:-2}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
-REPEATS=${REPEATS:-4}
+REPEATS=${REPEATS:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
-PREFLIGHT_CTX_ALLOC=32769
-PREFLIGHT_TOKENS=2048
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${NATIVE_Q4_T256_AB_DIR:-$repo_dir/sm75-native-q4-t256-ab-$stamp}
 
@@ -79,7 +77,7 @@ done
 (( CTX_START == 2048 && CTX_MAX == 32768 && STEP_MUL == 2 &&
    PREFILL_CHUNK == 2048 )) ||
     die "the fixed production A/B requires CTX_START=2048 CTX_MAX=32768 STEP_MUL=2 PREFILL_CHUNK=2048"
-(( REPEATS == 4 )) || die "the balanced four-arm design requires REPEATS=4"
+(( REPEATS >= 1 )) || die "REPEATS must be at least one"
 frontier=$CTX_START
 have_16k=0
 have_32k=0
@@ -107,7 +105,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{logits,preflight,provenance,runs,telemetry,validation}
+mkdir -p "$OUTPUT_DIR"/{logits,provenance,runs,telemetry,validation}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -226,34 +224,25 @@ run_policy=
 variant_extra=()
 configure_variant() {
     case "$1" in
-        standard-local)
+        standard-all-partner)
             run_model=$MODEL
             run_kind=standard
-            run_policy=local
-            variant_extra=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
-                           DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+            run_policy=all-partner
             ;;
-        standard-auto)
-            run_model=$MODEL
-            run_kind=standard
-            run_policy=auto
-            variant_extra=()
-            ;;
-        native-local)
+        native-all-partner)
             run_model=$NATIVE_MODEL
             run_kind=native
-            run_policy=local
-            variant_extra=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
-                           DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
-            ;;
-        native-auto)
-            run_model=$NATIVE_MODEL
-            run_kind=native
-            run_policy=auto
-            variant_extra=()
+            run_policy=all-partner
             ;;
         *) die "internal unsupported variant: $1" ;;
     esac
+    variant_extra=(
+        DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1
+        DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
+        DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42
+        DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16
+        DS4_CUDA_Q8_T256_PLACEMENT=all-partner
+    )
 }
 
 native_marker='ds4: SM75 native routed-Q4 layout enabled (packed A/W, planner=cost, gate=tile8, down=full-stage)'
@@ -302,30 +291,27 @@ validate_run_evidence() {
         die "$variant unexpectedly dispatched the tagged native-Q4 path"
     fi
 
-    if [[ $policy == local ]]; then
-        grep -Fq 'partner-classes=none' "$log" ||
-            die "$variant did not record the partner-disabled policy"
-        if awk -F, 'NR > 1 && $3 == 1 {found=1} END {exit found ? 0 : 1}' \
-                "$bindings"; then
-            die "$variant exported a partner binding"
-        fi
-        if grep -Fq 'CUDA q8 fp16 partner summary:' "$log"; then
-            die "$variant executed a partner projection"
-        fi
-        audit_policy=local
-    else
-        grep -Fq 'partner-classes=t256' "$log" ||
-            die "$variant did not select the automatic T256 policy"
-        grep -Fq 'CUDA q8 fp16 partner summary:' "$log" ||
-            die "$variant did not execute partner projections"
-        awk -F, 'NR > 1 && $3 == 1 && $6 == 8192 && $7 == 4096 {n++}
-                   END {exit n > 0 ? 0 : 1}' "$bindings" ||
-            die "$variant has no T256 partner binding"
-        awk -F, 'NR > 1 && $3 == 1 && !($6 == 8192 && $7 == 4096) {bad=1}
-                   END {exit bad}' "$bindings" ||
-            die "$variant exported a non-T256 partner binding"
-        audit_policy=default
-    fi
+    for marker in \
+            'partner-classes=t256' \
+            'partner-layers=0-42' \
+            't256-placement=all-partner' \
+            'T256-output_b=86/86' \
+            'partner=43 partner-arithmetic=f16' \
+            'CUDA q8 fp16 partner summary:'; do
+        grep -Fq "$marker" "$log" ||
+            die "$variant lacks all-partner T256 marker: $marker"
+    done
+    awk -F, '
+        NR > 1 && $6 == 8192 && $7 == 4096 && $12 ~ /attn_output_b/ {
+            if ($3 == 1) partner++
+            else fixed++
+            next
+        }
+        NR > 1 && $3 == 1 {bad_partner=1}
+        END {exit !(fixed == 43 && partner == 43 && !bad_partner)}
+    ' "$bindings" ||
+        die "$variant does not have exactly 43 fixed + 43 partner T256 bindings with no other partner class"
+    audit_policy=default
     python3 speed-bench/q8_partner_audit.py \
         "$audit_policy" "$partner_device_0" "$partner_device_1" "$audit" \
         >"${audit%.csv}.validation.txt" ||
@@ -344,10 +330,9 @@ phase=manifest
         "$PROMPT" "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nprefill_chunk=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK"
-    printf 'repeats=%s\nvariants=standard-local,standard-auto,native-local,native-auto\n' \
+    printf 'repeats=%s\nvariants=standard-all-partner,native-all-partner\n' \
         "$REPEATS"
-    printf 'preflight_tokens=%s\npreflight_ctx_alloc=%s\nauto_policy=implicit-t256-no-selector\nmodel_hashing=disabled\nofficial_quality_suite=not-run-separate-gate\n' \
-        "$PREFLIGHT_TOKENS" "$PREFLIGHT_CTX_ALLOC"
+    printf 't256_policy=forced-all-partner\nt256_layers=0-42\nmodel_hashing=disabled\nofficial_quality_suite=not-run-separate-gate\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
         --format=csv
     printf '\n[topology]\n'
@@ -397,50 +382,12 @@ for marker in \
         die "exact-output marker missing: $marker"
 done
 
-phase=32k-allocation-materialization-preflight
-configure_variant native-auto
-preflight_base="$OUTPUT_DIR/preflight/native-auto-32k-allocation"
-preflight_logits="$OUTPUT_DIR/preflight/native-auto-32k-logits"
-mkdir -p "$preflight_logits"
-printf 'Preflighting native-auto allocation/materialization at 32K...\n'
-preflight_status=0
-"${common_env[@]}" "${variant_extra[@]}" \
-    "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PREFLIGHT_TOKENS" \
-    "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$preflight_base.q8-audit.csv" \
-    "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$preflight_base.cache-before.csv" \
-    "DS4_CUDA_Q8_CACHE_STATE_CSV=$preflight_base.cache-after.csv" \
-    "DS4_CUDA_Q8_BINDING_STATE_CSV=$preflight_base.bindings.csv" \
-    ./ds4-bench --cuda --cuda-tensor-parallel \
-        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-        --model "$run_model" --prompt-file "$PROMPT" \
-        --ctx-start "$PREFLIGHT_TOKENS" --ctx-max "$PREFLIGHT_TOKENS" \
-        --ctx-alloc "$PREFLIGHT_CTX_ALLOC" --step-incr "$PREFLIGHT_TOKENS" \
-        --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
-        --csv "$preflight_base.csv" \
-        --dump-frontier-logits-dir "$preflight_logits" \
-        >"$preflight_base.log" 2>&1 || preflight_status=$?
-if (( preflight_status != 0 )); then
-    tail -n 200 "$preflight_base.log" >&2 || true
-    die "native-auto 32K allocation/materialization preflight failed"
-fi
-[[ -s $preflight_base.csv ]] || die "32K preflight produced no benchmark CSV"
-validate_run_evidence native-auto native auto \
-    "$preflight_base.log" "$preflight_base.q8-audit.csv" \
-    "$preflight_base.bindings.csv" "$preflight_base.cache-before.csv" \
-    "$preflight_base.cache-after.csv" "$preflight_logits"
-
 printf 'repeat\tslot\tvariant\tmodel\tpolicy\tcsv\tlog\taudit\tbindings\tcache_before\tcache_after\tlogits\n' \
     >"$OUTPUT_DIR/runs.tsv"
 
-phase=balanced-four-arm-benchmark
+phase=focused-two-arm-integration
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
-    case "$repeat" in
-        1) order=(standard-local standard-auto native-auto native-local) ;;
-        2) order=(standard-auto native-local standard-local native-auto) ;;
-        3) order=(native-local native-auto standard-auto standard-local) ;;
-        4) order=(native-auto standard-local native-local standard-auto) ;;
-        *) die "internal unsupported repeat: $repeat" ;;
-    esac
+    order=(standard-all-partner native-all-partner)
     slot=0
     for variant in "${order[@]}"; do
         slot=$((slot + 1))
@@ -464,7 +411,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory \
             --format=csv,noheader,nounits -lms 200 >"$telemetry_samples" &
         telemetry_pid=$!
-        printf 'Benchmarking %s repeat=%d/%d slot=%d/4...\n' \
+        printf 'Benchmarking %s repeat=%d/%d slot=%d/2...\n' \
             "$variant" "$repeat" "$REPEATS" "$slot"
         run_status=0
         "${common_env[@]}" "${variant_extra[@]}" \
@@ -507,4 +454,4 @@ python3 speed-bench/summarize-sm75-native-q4-t256-ab.py \
     "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR" | tee "$OUTPUT_DIR/summary-stdout.txt"
 
 phase=complete
-printf 'SM75 native-Q4 x automatic-T256 four-arm A/B complete: %s\n' "$OUTPUT_DIR"
+printf 'SM75 native-Q4 x all-partner-T256 integration check complete: %s\n' "$OUTPUT_DIR"

@@ -11,15 +11,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SUMMARIZER = (
-    ROOT / "speed-bench" / "summarize-sm75-native-q4-t256-ab.py"
-)
-VARIANTS = (
-    "standard-local",
-    "standard-auto",
-    "native-local",
-    "native-auto",
-)
+SUMMARIZER = ROOT / "speed-bench/summarize-sm75-native-q4-t256-ab.py"
+VARIANTS = ("standard-all-partner", "native-all-partner")
 CONTEXTS = (16384, 32768)
 RUN_FIELDS = [
     "repeat", "slot", "variant", "model", "policy", "csv", "log",
@@ -50,31 +43,37 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def t256_binding(layer: int, consumer: int, resident: int) -> dict[str, object]:
+    return {
+        "consumer_device": consumer,
+        "resident_device": resident,
+        "partner_offload": int(consumer != resident),
+        "weight_offset": 1_000_000 + layer,
+        "in_dim": 8192,
+        "out_dim": 4096,
+        "label": f"tensor:blk.{layer}.attn_output_b.weight",
+    }
+
+
 def make_fixture(
     root: Path,
-    tps: dict[str, float] | None = None,
+    standard_tps: float = 100.0,
+    native_tps: float = 120.0,
+    repeats: int = 1,
 ) -> Path:
-    if tps is None:
-        tps = {
-            "standard-local": 100.0,
-            "standard-auto": 110.0,
-            "native-local": 120.0,
-            "native-auto": 132.0,
-        }
     audit_fields = [
-        "module", "label", "physical_device", "in_dim", "out_dim",
+        "label", "layer", "physical_device", "in_dim", "out_dim",
         "result", "reason",
     ]
-    binding_fields = ["partner_offload", "in_dim", "out_dim"]
+    binding_fields = [
+        "consumer_device", "resident_device", "partner_offload",
+        "weight_offset", "in_dim", "out_dim", "label",
+    ]
     records: list[dict[str, object]] = []
 
-    # A four-row Latin square: within the block, every slot sees every variant.
-    for repeat in range(1, 5):
-        order = VARIANTS[-(repeat - 1):] + VARIANTS[:-(repeat - 1)]
-        if repeat == 1:
-            order = VARIANTS
-        for slot, variant in enumerate(order, 1):
-            family, policy = variant.split("-", 1)
+    for repeat in range(1, repeats + 1):
+        for slot, variant in enumerate(VARIANTS, 1):
+            family = variant.split("-", 1)[0]
             stem = root / "runs" / f"{variant}-r{repeat}"
             csv_path = stem.with_suffix(".csv")
             log_path = stem.with_suffix(".log")
@@ -85,6 +84,7 @@ def make_fixture(
             logits = root / "logits" / f"{variant}-r{repeat}"
             logits.mkdir(parents=True, exist_ok=True)
 
+            base_tps = standard_tps if family == "standard" else native_tps
             repeat_scale = 1.0 + 0.002 * (repeat - 1)
             write_table(
                 csv_path,
@@ -93,47 +93,51 @@ def make_fixture(
                     {
                         "ctx_tokens": context,
                         "prefill_tokens": 16384,
-                        "prefill_tps": tps[variant] * repeat_scale,
+                        "prefill_tps": base_tps * repeat_scale,
                     }
                     for context in CONTEXTS
                 ],
             )
 
             log_lines = [
-                "ds4: CUDA q8 fp16 benefit plan candidates=100 "
-                f"partner-classes={'none' if policy == 'local' else 't256'}"
+                "ds4: CUDA q8 fp16 benefit plan partner-classes=t256 "
+                "partner-layers=0-42 t256-placement=all-partner",
+                "ds4: CUDA q8 fp16 benefit plan materialized 349/473 candidates; "
+                "T256-output_b=86/86 partner=43 partner-arithmetic=f16",
+                "ds4: CUDA q8 fp16 partner summary: calls=86",
             ]
             if family == "native":
                 log_lines.append(
                     "ds4: SM75 native routed-Q4 layout enabled "
                     "(packed A/W, planner=cost, gate=tile8, down=full-stage)"
                 )
-            if policy == "auto":
-                log_lines.append(
-                    "ds4: CUDA q8 fp16 partner summary: calls=8 "
-                    "activation=0.10 GiB result=0.10 GiB f16-result-calls=0"
-                )
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
 
-            audit_rows: list[dict[str, object]] = []
-            binding_rows: list[dict[str, object]] = [
-                {"partner_offload": 0, "in_dim": 1024, "out_dim": 32768}
-            ]
-            if policy == "auto":
+            audit_rows = []
+            binding_rows = []
+            for layer in range(43):
+                home, peer = (0, 1) if layer <= 21 else (3, 2)
+                binding_rows.append(t256_binding(layer, peer, peer))
+                binding_rows.append(t256_binding(layer, home, peer))
                 audit_rows.append({
-                    "module": "attention",
-                    "label": "blk.9.attn_output_b.weight",
-                    "physical_device": 1,
+                    "label": f"blk.{layer}.attn_output_b.weight",
+                    "layer": layer,
+                    "physical_device": peer,
                     "in_dim": 8192,
                     "out_dim": 4096,
                     "result": "f16_partner_hit",
                     "reason": "nvlink_offload",
                 })
+            for index in range(263):
                 binding_rows.append({
-                    "partner_offload": 1,
-                    "in_dim": 8192,
-                    "out_dim": 4096,
+                    "consumer_device": 0,
+                    "resident_device": 0,
+                    "partner_offload": 0,
+                    "weight_offset": 2_000_000 + index,
+                    "in_dim": 1,
+                    "out_dim": 1,
+                    "label": f"tensor:non_t256.{index}",
                 })
             write_table(audit_path, audit_fields, audit_rows)
             write_table(bindings_path, binding_fields, binding_rows)
@@ -141,13 +145,7 @@ def make_fixture(
             cache_before.write_text(cache_text, encoding="utf-8")
             cache_after.write_text(cache_text, encoding="utf-8")
 
-            # Native packing must preserve the result within each Q8 policy.
-            # The local and auto policies may legitimately differ from each
-            # other because an overflowed T256 projection changes arithmetic.
-            values = (1.0, -2.0, 3.5, 0.25) if policy == "local" else (
-                1.0, -2.0, 3.5, 0.2501
-            )
-            raw = struct.pack("<4f", *values)
+            raw = struct.pack("<4f", 1.0, -2.0, 3.5, 0.2501)
             for context in CONTEXTS:
                 (logits / f"frontier_{context:06d}.logits.f32").write_bytes(raw)
 
@@ -156,7 +154,7 @@ def make_fixture(
                 "slot": slot,
                 "variant": variant,
                 "model": f"/models/{family}.gguf",
-                "policy": policy,
+                "policy": "all-partner",
                 "csv": csv_path,
                 "log": log_path,
                 "audit": audit_path,
@@ -182,150 +180,80 @@ class SummarizeSm75NativeQ4T256AbTests(unittest.TestCase):
             check=False,
         )
 
-    def test_valid_four_way_ab_passes(self) -> None:
+    def test_valid_focused_integration_passes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds4-native-t256-pass-") as raw:
             root = Path(raw)
-            runs_path = make_fixture(root)
-
-            result = self.run_summarizer(root, runs_path)
-
+            result = self.run_summarizer(root, make_fixture(root))
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads((root / "out/acceptance.json").read_text())
             self.assertTrue(payload["accepted"])
-            self.assertEqual(payload["scope"]["repeats"], 4)
-            self.assertEqual(payload["scope"]["contexts"], list(CONTEXTS))
-            self.assertFalse(payload["scope"]["official_quality_suite"])
-            self.assertTrue(all(payload["gates"].values()))
-            self.assertEqual(
-                payload["evidence"]["cross_layout_comparisons"], 16
-            )
-            self.assertEqual(
-                payload["evidence"]["repeat_determinism_comparisons"], 24
-            )
-
+            self.assertEqual(payload["scope"]["repeats"], 1)
+            self.assertEqual(payload["scope"]["variants"], list(VARIANTS))
+            self.assertEqual(payload["evidence"]["cross_layout_comparisons"], 2)
+            self.assertEqual(payload["evidence"]["repeat_determinism_comparisons"], 0)
             paired = read_csv(root / "out/paired-effects.csv")
-            self.assertEqual(len(paired), 8)
             self.assertAlmostEqual(
-                float(paired[0]["native_auto_over_standard_local"]), 1.32
+                float(paired[0]["native_all_partner_over_standard_all_partner"]),
+                1.2,
             )
-            self.assertAlmostEqual(float(paired[0]["interaction"]), 1.0)
-            context_rows = read_csv(root / "out/context-summary.csv")
-            self.assertEqual(len(context_rows), len(CONTEXTS) * 6)
             self.assertIn("Overall: **PASS**", result.stdout)
-            self.assertIn(
-                "not assumed to be additive or multiplicative", result.stdout
-            )
-            self.assertIn("quality-isolation gate still applies", result.stdout)
 
-    def test_unbalanced_four_way_order_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="ds4-native-t256-order-fail-"
-        ) as raw:
+    def test_wrong_order_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-native-t256-order-") as raw:
             root = Path(raw)
             runs_path = make_fixture(root)
             rows = read_runs(runs_path)
-            fixed_slots = {variant: index + 1 for index, variant in enumerate(VARIANTS)}
-            for row in rows:
-                row["slot"] = str(fixed_slots[row["variant"]])
+            rows[0]["slot"], rows[1]["slot"] = rows[1]["slot"], rows[0]["slot"]
             write_table(runs_path, RUN_FIELDS, rows, delimiter="\t")
-
             result = self.run_summarizer(root, runs_path)
-
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("run order is not counterbalanced", result.stderr)
+            self.assertIn("order is", result.stderr)
 
     def test_nonexact_native_logits_fail_acceptance(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="ds4-native-t256-logit-fail-"
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix="ds4-native-t256-logit-") as raw:
             root = Path(raw)
             runs_path = make_fixture(root)
-            target = (
-                root / "logits/native-auto-r2/"
-                "frontier_016384.logits.f32"
-            )
+            target = root / "logits/native-all-partner-r1/frontier_016384.logits.f32"
             target.write_bytes(struct.pack("<4f", 1.0, -2.0, 3.5, 9.0))
-
             result = self.run_summarizer(root, runs_path)
-
             self.assertEqual(result.returncode, 1, result.stderr)
             payload = json.loads((root / "out/acceptance.json").read_text())
-            self.assertFalse(payload["accepted"])
-            self.assertFalse(
-                payload["gates"]["cross_layout_raw_logits_exact"]
-            )
-            exactness = read_csv(root / "out/exactness.csv")
-            self.assertTrue(any(row["exact"] == "0" for row in exactness))
+            self.assertFalse(payload["gates"]["cross_layout_raw_logits_exact"])
 
     def test_mismatched_frontier_work_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="ds4-native-t256-work-fail-"
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix="ds4-native-t256-work-") as raw:
             root = Path(raw)
             runs_path = make_fixture(root)
-            csv_path = root / "runs/native-local-r3.csv"
-            with csv_path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
+            path = root / "runs/native-all-partner-r1.csv"
+            rows = read_csv(path)
             rows[1]["prefill_tokens"] = "8192"
-            write_table(
-                csv_path,
-                ["ctx_tokens", "prefill_tokens", "prefill_tps"],
-                rows,
-            )
-
+            write_table(path, ["ctx_tokens", "prefill_tokens", "prefill_tps"], rows)
             result = self.run_summarizer(root, runs_path)
-
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mismatched prefill work", result.stderr)
 
-    def test_mismatched_frontier_set_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="ds4-native-t256-frontier-fail-"
-        ) as raw:
+    def test_incomplete_all_partner_mapping_fails_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-native-t256-map-") as raw:
             root = Path(raw)
             runs_path = make_fixture(root)
-            csv_path = root / "runs/native-auto-r4.csv"
-            with csv_path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            write_table(
-                csv_path,
-                ["ctx_tokens", "prefill_tokens", "prefill_tps"],
-                rows[:-1],
-            )
-
+            path = root / "runs/native-all-partner-r1.bindings.csv"
+            rows = read_csv(path)
+            rows[1]["resident_device"] = rows[1]["consumer_device"]
+            rows[1]["partner_offload"] = "0"
+            write_table(path, list(rows[0]), rows)
             result = self.run_summarizer(root, runs_path)
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("mismatched frontier set", result.stderr)
-
-    def test_combined_regression_fails_even_when_t256_gate_passes(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="ds4-native-t256-regression-"
-        ) as raw:
-            root = Path(raw)
-            runs_path = make_fixture(root, {
-                "standard-local": 100.0,
-                "standard-auto": 110.0,
-                "native-local": 80.0,
-                "native-auto": 84.8,
-            })
-
-            result = self.run_summarizer(root, runs_path)
-
             self.assertEqual(result.returncode, 1, result.stderr)
             payload = json.loads((root / "out/acceptance.json").read_text())
-            self.assertFalse(payload["accepted"])
-            self.assertTrue(
-                payload["gates"]["native_auto_over_native_local_16k_32k"]
-            )
-            self.assertFalse(
-                payload["gates"][
-                    "native_auto_over_standard_local_no_regression"
-                ]
-            )
-            self.assertTrue(
-                payload["gates"]["cross_layout_raw_logits_exact"]
-            )
+            self.assertFalse(payload["gates"]["policy_and_dispatch_evidence"])
+
+    def test_native_regression_fails_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-native-t256-regress-") as raw:
+            root = Path(raw)
+            runs_path = make_fixture(root, standard_tps=100.0, native_tps=99.0)
+            result = self.run_summarizer(root, runs_path)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads((root / "out/acceptance.json").read_text())
+            self.assertFalse(payload["gates"]["native_all_partner_no_regression"])
 
 
 if __name__ == "__main__":
