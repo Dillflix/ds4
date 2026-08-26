@@ -96,8 +96,13 @@ finish() {
         partial="$archive.partial.$$"
         if tar -C "$(dirname "$OUTPUT_DIR")" -czf "$partial" \
                 "$(basename "$OUTPUT_DIR")" && [[ -s $partial ]] &&
-                mv "$partial" "$archive"; then
-            printf 'Archive to return: %s\n' "$archive" >&2
+                tar -tzf "$partial" >/dev/null && mv "$partial" "$archive"; then
+            if [[ $status == 0 ]]; then
+                printf 'Archive to return: %s\n' "$archive" >&2
+            else
+                printf 'Failed-run diagnostic archive (phase=%s, exit=%s): %s\n' \
+                    "$phase" "$status" "$archive" >&2
+            fi
         else
             printf 'error: failed to create nonempty archive: %s\n' \
                 "$archive" >&2

@@ -9,10 +9,6 @@ LLAMA_CPP_CXXFLAGS ?= -O3 -Wall -Wextra -std=c++17 \
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
-QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
-QUALITY_TARGETS := ds4.o ds4_metal.o ds4_gpu_args.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o
-QUALITY_OBJS := ../ds4.o ../ds4_metal.o ../ds4_gpu_args.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o
-QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -lggml-blas -lggml-metal \
 	-framework Foundation -framework Metal -framework Accelerate
@@ -28,10 +24,6 @@ NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG
 # Quantization decisions sit on rounding boundaries. Disable device FMA
 # contraction so the CUDA searches follow the scalar C reference ordering.
 QUANT_NVCCFLAGS ?= -O3 -std=c++17 --fmad=false $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-QUALITY_TARGETS := ds4.o ds4_cuda.o ds4_gpu_args.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o
-QUALITY_OBJS := ../ds4.o ../ds4_cuda.o ../ds4_gpu_args.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o
-QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -ldl -lpthread
 endif
@@ -65,8 +57,7 @@ test-quants-cuda: test_quants_cuda.o quants-cuda-host.o quants_cuda.o
 	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
 
 quality-score:
-	$(MAKE) -C .. $(QUALITY_TARGETS)
-	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
+	$(MAKE) -C .. gguf-tools/quality-testing/score_official
 
 quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
@@ -74,4 +65,5 @@ quality-llama-score:
 clean:
 	rm -f deepseek4-quantize deepseek4-quantize-cuda deepseek4-quantize-cuda.o \
 		quants-cuda-host.o quants_cuda.o test-quants-cuda test_quants_cuda.o \
-		quality-testing/score_official quality-testing/score_llama
+		quality-testing/score_official quality-testing/score_official.o \
+		quality-testing/score_llama
