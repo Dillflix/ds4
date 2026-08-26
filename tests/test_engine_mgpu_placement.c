@@ -952,8 +952,10 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 
     char *old_pipe = save_env_value("DS4_CUDA_PREFILL_PIPELINE");
     char *old_chunk = save_env_value("DS4_METAL_PREFILL_CHUNK");
+    char *old_split = save_env_value("DS4_CUDA_EP_STAGE_SPLIT");
     unsetenv("DS4_CUDA_PREFILL_PIPELINE");
     unsetenv("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_CUDA_EP_STAGE_SPLIT");
 
     ds4_gpu_config cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -986,6 +988,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 
     restore_env_value("DS4_CUDA_PREFILL_PIPELINE", old_pipe);
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
+    restore_env_value("DS4_CUDA_EP_STAGE_SPLIT", old_split);
 }
 
 int main(void) {
