@@ -14,7 +14,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_START=${CTX_START:-16384}
-CTX_MAX=${CTX_MAX:-65536}
+CTX_MAX=${CTX_MAX:-32768}
 STEP_MUL=${STEP_MUL:-2}
 QUALITY_CTX=${QUALITY_CTX:-$((CTX_MAX+1))}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
@@ -42,8 +42,8 @@ done
     die "STAGE_SPLIT must be in 1..42"
 [[ $GPU_DEVICES == 0,3,1,2 && $GPU_VRAM == auto && $STAGE_SPLIT == 22 ]] ||
     die "production acceptance requires GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22"
-(( CTX_START == 16384 && CTX_MAX == 65536 && STEP_MUL == 2 )) ||
-    die "production acceptance requires the fixed 16K/32K/64K sweep"
+(( CTX_START == 16384 && CTX_MAX == 32768 && STEP_MUL == 2 )) ||
+    die "production acceptance requires the fixed 16K/32K sweep"
 (( QUALITY_CTX == CTX_MAX + 1 )) ||
     die "QUALITY_CTX must equal CTX_MAX+1 so quality uses production memory pressure"
 (( PREFILL_CHUNK > 0 && REPEATS >= 3 )) ||

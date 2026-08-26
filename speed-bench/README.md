@@ -416,7 +416,7 @@ The production runner builds and runs the placement and multi-GPU exactness
 tests, scores the same full-Q4 model with partner execution disabled and enabled
 across the official 100-case Flash fixture using
 `score_official --production-path`, and performs at least three paired prefill
-repeats at the fixed 16K, 32K, and 64K frontiers. It rejects missing production
+repeats at the fixed 16K and 32K frontiers. It rejects missing production
 path markers, non-T256 partner bindings, impure audit evidence, changed top-1
 tokens, repeat nondeterminism, or quality/performance gates that do not pass.
 The mandatory GPU test separately requires bit-exact local-versus-partner
@@ -445,10 +445,11 @@ also accepts an absolute `QUALITY_MANIFEST` (default:
 `gguf-tools/quality-testing/data/flash/manifest.tsv`), `QUALITY_CTX`,
 `PREFILL_CHUNK`, `SKIP_BUILD`, `CREATE_ARCHIVE`, and `T256_VALIDATION_DIR`.
 Production acceptance fixes `GPU_DEVICES=0,3,1,2`, `GPU_VRAM=auto`,
-`STAGE_SPLIT=22`, `CTX_START=16384`, `CTX_MAX=65536`, `STEP_MUL=2`, and
+`STAGE_SPLIT=22`, `CTX_START=16384`, `CTX_MAX=32768`, `STEP_MUL=2`, and
 `QUALITY_CTX=CTX_MAX+1`; the 100 cases remain short, but the scorer allocates
-the same 64K session footprint so cache admission sees production memory
-pressure. The three-class GPU exactness test is mandatory. The runner rejects
+the same 32K session footprint so cache admission sees the tested production
+memory pressure. This bounded pass does not validate 64K operation. The
+three-class GPU exactness test is mandatory. The runner rejects
 attempts to weaken the target or use fewer than three repeats. Return the generated
 `t256-production-validation-<timestamp>.tar.gz`. Before accepting a result,
 check that `run-status.txt` says `state=finished`, `summary.md` says

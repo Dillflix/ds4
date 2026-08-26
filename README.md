@@ -789,7 +789,8 @@ Use `speed-bench/cuda-q8-partner-production-validation.sh` for the production
 decision gate. It leaves the candidate class selector unset to prove automatic
 SM75/fast-peer admission, compares against a partner-disabled control on the
 same model, scores the official 100-case suite through the production dispatch,
-and measures the fixed 16K/32K/64K prefill frontiers.
+and measures the fixed 16K/32K prefill frontiers. This bounded acceptance pass
+does not validate 64K operation.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

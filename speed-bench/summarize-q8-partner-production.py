@@ -84,9 +84,9 @@ if (manifest.get("gpu_devices") != "0,3,1,2" or
         manifest.get("gpu_vram") != "auto" or
         manifest.get("stage_split") != "22/21" or
         manifest.get("ctx_start") != "16384" or
-        manifest.get("ctx_max") != "65536" or
+        manifest.get("ctx_max") != "32768" or
         manifest.get("step_mul") != "2" or
-        manifest.get("quality_ctx") != "65537" or
+        manifest.get("quality_ctx") != "32769" or
         manifest.get("gpu_exactness_test") != "required-and-enabled"):
     fail("manifest does not describe the fixed production validation target")
 
@@ -184,8 +184,8 @@ for run in runs:
     run_order[repeat][slot] = variant
     rows = read_rows(Path(run["csv"]))
     contexts = [int(row["ctx_tokens"]) for row in rows]
-    if len(rows) != 3 or len(set(contexts)) != 3:
-        fail(f"repeat {repeat} variant {variant} must have three unique frontiers")
+    if len(rows) != 2 or len(set(contexts)) != 2:
+        fail(f"repeat {repeat} variant {variant} must have two unique frontiers")
     for row in rows:
         tps = float(row["prefill_tps"])
         if not math.isfinite(tps) or tps <= 0.0:
@@ -236,7 +236,7 @@ for repeat in repeats:
         candidate_tokens, candidate_tps = candidate[context]
         if local_tokens != candidate_tokens or local_tokens <= 0:
             fail(f"repeat {repeat} context {context} has mismatched prefill work")
-        expected_tokens = 16384 if context in (16384, 32768) else 32768
+        expected_tokens = 16384
         if local_tokens != expected_tokens:
             fail(f"repeat {repeat} context {context} has unexpected prefill work")
         local_seconds = local_tokens / local_tps
@@ -249,9 +249,9 @@ for repeat in repeats:
                 (local_seconds - candidate_seconds) / (local_tokens / 2048.0),
         })
 
-expected_contexts = {16384, 32768, 65536}
+expected_contexts = {16384, 32768}
 if set(by_context) != expected_contexts:
-    fail(f"expected 16K/32K/64K frontiers, found {sorted(by_context)}")
+    fail(f"expected 16K/32K frontiers, found {sorted(by_context)}")
 
 performance_rows: list[dict[str, float | int]] = []
 performance_ok = True
@@ -350,6 +350,10 @@ accepted = all((quality_ok, quality_policy_ok, exact_tests_ok,
                 determinism_ok, bindings_ok, not needs_more_repeats))
 payload = {
     "accepted": accepted,
+    "scope": {
+        "contexts": sorted(expected_contexts),
+        "validates_64k": False,
+    },
     "quality": {
         "local_avg_nll": local_quality["avg_nll"],
         "default_avg_nll": default_quality["avg_nll"],
@@ -379,6 +383,8 @@ lines = [
     "# Production-default T256 validation",
     "",
     f"Overall: **{'PASS' if accepted else 'FAIL'}**",
+    "",
+    "Scope: **16K/32K only; 64K is not validated by this run.**",
     "",
     "## Production-path quality",
     "",

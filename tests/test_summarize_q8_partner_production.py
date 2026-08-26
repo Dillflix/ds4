@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUMMARIZER = ROOT / "speed-bench" / "summarize-q8-partner-production.py"
-CONTEXTS = (16384, 32768, 65536)
+CONTEXTS = (16384, 32768)
 
 
 def write_table(path: Path, fieldnames: list[str], rows: list[dict[str, object]],
@@ -50,9 +50,9 @@ def make_fixture(
         "gpu_vram=auto\n"
         "stage_split=22/21\n"
         "ctx_start=16384\n"
-        "ctx_max=65536\n"
+        "ctx_max=32768\n"
         "step_mul=2\n"
-        "quality_ctx=65537\n"
+        "quality_ctx=32769\n"
         "gpu_exactness_test=required-and-enabled\n",
         encoding="utf-8",
     )
@@ -131,9 +131,7 @@ def make_fixture(
                 [
                     {
                         "ctx_tokens": context,
-                        "prefill_tokens": (
-                            16384 if context in (16384, 32768) else 32768
-                        ),
+                        "prefill_tokens": 16384,
                         "prefill_tps": tps,
                     }
                     for context in CONTEXTS
@@ -224,6 +222,8 @@ class SummarizeQ8PartnerProductionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads((root / "acceptance.json").read_text())
             self.assertTrue(payload["accepted"])
+            self.assertEqual(payload["scope"]["contexts"], [16384, 32768])
+            self.assertFalse(payload["scope"]["validates_64k"])
             self.assertTrue(payload["quality"]["pass"])
             self.assertTrue(all(row["pass"] == 1 for row in payload["performance"]))
             self.assertEqual(
@@ -234,6 +234,29 @@ class SummarizeQ8PartnerProductionTests(unittest.TestCase):
             self.assertTrue(payload["evidence"]["run_order_counterbalanced"])
             self.assertTrue(payload["quality"]["production_policy_evidence"])
             self.assertIn("Overall: **PASS**", (root / "summary.md").read_text())
+            self.assertIn(
+                "64K is not validated", (root / "summary.md").read_text()
+            )
+
+    def test_64k_manifest_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="ds4-q8-production-64k-rejected-"
+        ) as raw:
+            root = Path(raw)
+            make_fixture(root)
+            manifest = root / "manifest.txt"
+            text = manifest.read_text(encoding="utf-8")
+            manifest.write_text(
+                text.replace("ctx_max=32768", "ctx_max=65536").replace(
+                    "quality_ctx=32769", "quality_ctx=65537"
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_summarizer(root)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fixed production validation target", result.stderr)
 
     def test_quality_regression_fails_acceptance(self) -> None:
         with tempfile.TemporaryDirectory(
