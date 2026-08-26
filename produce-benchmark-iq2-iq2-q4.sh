@@ -416,10 +416,14 @@ if [[ -n $ctx_alloc ]]; then
 fi
 ./ds4-bench "${bench_args[@]}" 2>&1 | tee "$bench_log"
 
-if command -v python3 >/dev/null 2>&1; then
+csv_data_rows=$(awk 'NR > 1 && NF { rows++ } END { print rows + 0 }' "$csv")
+if command -v python3 >/dev/null 2>&1 && (( csv_data_rows >= 2 )); then
     python3 speed-bench/plot_speed.py "$csv" \
         --output "$svg" \
         --title "$plot_title"
+elif (( csv_data_rows < 2 )); then
+    printf 'Skipping plot: %s contains %s benchmark data row(s).\n' \
+        "$csv" "$csv_data_rows"
 fi
 
 printf '\nDone.\nModel:    %s\nCSV:      %s\nMetadata: %s\nLog:      %s\n' \
