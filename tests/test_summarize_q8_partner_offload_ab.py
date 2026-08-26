@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUMMARIZER = ROOT / "speed-bench" / "summarize-q8-partner-offload-ab.py"
+VALIDATOR = ROOT / "speed-bench" / "q8_partner_audit.py"
 AUDIT_HEADER = [
     "sequence", "module", "label", "layer", "token_offset",
     "physical_device", "weight_offset", "weight_bytes", "in_dim",
@@ -16,7 +17,9 @@ AUDIT_HEADER = [
 ]
 
 
-def audit_rows(variant: str) -> list[list[object]]:
+def audit_rows(
+    variant: str, devices: tuple[int, ...] = (1, 2)
+) -> list[list[object]]:
     shapes = {
         "t32": ("attn_q_b", 1024, 32768),
         "t256": ("attn_output_b", 8192, 4096),
@@ -26,7 +29,7 @@ def audit_rows(variant: str) -> list[list[object]]:
     rows = []
     for name_index, name in enumerate(names):
         module, in_dim, out_dim = shapes[name]
-        for pair_index, physical_device in enumerate((1, 2)):
+        for pair_index, physical_device in enumerate(devices):
             sequence = name_index * 2 + pair_index
             rows.append([
                 sequence, module, "q8_0", 3 if pair_index == 0 else 36,
@@ -57,7 +60,8 @@ def main() -> None:
                     writer.writerow(["ctx_tokens", "prefill_tps"])
                     writer.writerow([2048, 400 + variant_index * 10 + repeat])
                     writer.writerow([8192, 300 + variant_index * 10 + repeat])
-                rows = audit_rows(variant)
+                devices = (1,) if variant == "t32" and repeat == 1 else (1, 2)
+                rows = audit_rows(variant, devices)
                 calls = len(rows)
                 runtime_calls = 5 if variant == "t32" and repeat == 1 else calls
                 log_path.write_text(
@@ -113,10 +117,10 @@ def main() -> None:
         t32 = next(row for row in evidence if row["variant"] == "t32")
         assert t32["evidence_status"] == "ok"
         assert (t32["process_total_calls"] == "5" and
-                t32["audit_sample_calls"] == "2")
-        assert (t32["audit_t32_calls"] == "2" and
+                t32["audit_sample_calls"] == "1")
+        assert (t32["audit_t32_calls"] == "1" and
                 t32["audit_t256_calls"] == "0")
-        assert t32["audit_partner_devices"] == "1:1;2:1"
+        assert t32["audit_partner_devices"] == "1:1"
         legacy = next(row for row in evidence if row["variant"] == "legacy")
         assert (legacy["audit_t32_calls"] == "2" and
                 legacy["audit_t256_calls"] == "2")
@@ -126,6 +130,55 @@ def main() -> None:
         assert "median_local_tps=" in summary
         assert "median_candidate/local=" in summary
         assert "process_total_calls median=" in summary
+
+        # The command-line validator is shared with the runner. One observed
+        # configured partner is sufficient; zero evidence, a wrong class, or
+        # an unexpected physical device must still fail.
+        for variant in ("t32", "t256", "shared_down"):
+            audit = tmp / f"one-partner-{variant}.csv"
+            with audit.open("w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(AUDIT_HEADER)
+                writer.writerows(audit_rows(variant, (1,)))
+            accepted = subprocess.run(
+                [sys.executable, str(VALIDATOR), variant, "1", "2", str(audit)],
+                capture_output=True,
+                text=True,
+            )
+            assert accepted.returncode == 0, accepted.stderr
+            assert "(1/0)" in accepted.stdout
+
+        empty_audit = tmp / "empty-audit.csv"
+        with empty_audit.open("w", newline="") as handle:
+            csv.writer(handle).writerow(AUDIT_HEADER)
+        assert subprocess.run(
+            [sys.executable, str(VALIDATOR), "t32", "1", "2", str(empty_audit)],
+            capture_output=True,
+            text=True,
+        ).returncode == 1
+
+        unexpected_audit = tmp / "unexpected-audit.csv"
+        with unexpected_audit.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(AUDIT_HEADER)
+            writer.writerows(audit_rows("t256", (3,)))
+        assert subprocess.run(
+            [sys.executable, str(VALIDATOR), "t256", "1", "2",
+             str(unexpected_audit)],
+            capture_output=True,
+            text=True,
+        ).returncode == 1
+
+        t32_only = tmp / "legacy-t32-only.csv"
+        with t32_only.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(AUDIT_HEADER)
+            writer.writerows(audit_rows("t32", (1,)))
+        assert subprocess.run(
+            [sys.executable, str(VALIDATOR), "legacy", "1", "2", str(t32_only)],
+            capture_output=True,
+            text=True,
+        ).returncode == 1
 
         # Invalid class evidence must remain summarizable so the shell driver
         # can finish all bounded Nsight captures before rejecting the archive.

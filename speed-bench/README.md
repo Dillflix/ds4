@@ -326,22 +326,26 @@ order, and reports paired planner/first-use throughput ratios per frontier.
 ### Q8 F16 NVLink-partner execution A/B
 
 `cuda-q8-partner-offload-ab.sh` holds full-Q4 placement at the measured 22/21
-split and logical device order `0,3,1,2`. It screens the identical local cache
-plan with partner execution disabled, T32-only, T256-only, shared-down-only,
-and the initial T32+T256 (`legacy`) heuristic. The class selector changes only
-which home-cache misses may overflow to partner VRAM; it does not remove or
-reorder any home or fixed partner cache candidates.
+split and logical device order `0,3,1,2`. It screens partner execution disabled,
+T32-only, T256-only, shared-down-only, and the initial T32+T256 (`legacy`)
+policy. Within each home-device bucket, at equal benefit per byte,
+fixed/home-only candidates rank before partner-eligible candidates. The class
+selector therefore controls both which home-cache misses may overflow and which
+tied expensive class is preferentially kept local; this is an end-to-end
+placement-policy A/B, not an identical-home-cache microbenchmark.
 
 The runner requires all four logical home/partner routes to be validated
 `DIRECT` and independently rejects any physical pair that `nvidia-smi topo -m`
 does not report as `NV#`; PCIe peer access is not accepted as NVLink evidence.
-Its `pair-topology.tsv` records the production homes-first mapping. It proves
-that both T32 and T256 execute on both physical NVLink pairs and that every
-candidate run executed only its requested class,
-freezes cache state before timed frontiers, rotates process order, and reports
-the absolute median candidate/local tokens per second alongside every paired
-throughput ratio. Runtime summary fields are explicitly labeled
-`process_total_*`; the bounded device-audit fields are labeled `audit_*`, so a
+Its `pair-topology.tsv` records the production homes-first mapping. Every
+candidate run must execute only its requested class on a configured partner.
+One-pair execution is valid when the other stage fits its ranked F16 set locally;
+`class-evidence.csv` makes the partner devices observed in the bounded audit
+sample explicit. It freezes cache state before timed frontiers, rotates process
+order, and reports the absolute median candidate/local tokens per second
+alongside every paired throughput ratio. Runtime summary fields are explicitly
+labeled `process_total_*`; the bounded device-audit fields are labeled
+`audit_*`, so a
 class-pure sample may be smaller than the uncapped process total without
 invalidating the run. Full-logit output records numerical drift and top-token
 agreement for every class, while within-variant repeat determinism remains an
@@ -390,11 +394,12 @@ When `RUN_NSYS=1`, `NSYS_VARIANTS` accepts a comma-separated subset of
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
 
-The completed full-Q4 screen selected T256-only as the production default:
-13.1--15.1% over local, versus 12.2--13.5% for T32-only and 12.3--14.4% for
-the mixed legacy policy. T32, T256, and legacy produced byte-identical logits
-to one another, but the T256 trace moved only 3.12 GiB of partner activation
-and result traffic versus T32's 12.70 GiB. Shared-down gained only 2.9--3.4%,
+Repeated full-Q4 screens selected T256-only as the production default; the
+latest measured 13.0--15.3% over local, versus 12.2--14.3% for T32-only. The
+initial mixed legacy policy measured 12.3--14.4%. T32, T256, and legacy produced
+byte-identical logits to one another, but the T256 trace moved only 3.12 GiB of
+partner activation and result traffic versus T32's 12.70 GiB. Shared-down
+gained only 2.9--3.4%,
 changed the 2048-token top result in every repeat, and is rejected as a default.
 
 The completed T32 fusion A/B can eliminate redundant local and T32 runs:

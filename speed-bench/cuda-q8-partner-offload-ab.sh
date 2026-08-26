@@ -208,44 +208,8 @@ set_variant_extra() {
 validate_audit() {
     local variant=$1
     local audit=$2
-    local counts
-    counts=$(awk -F, -v variant="$variant" \
-        -v partner0="$partner_device_0" -v partner1="$partner_device_1" '
-        NR == 1 { next }
-        $12 == "f16_partner_hit" && $13 == "nvlink_offload" {
-            if ($2 ~ /attn_q_b/ || $3 ~ /attn_q_b/ || ($9 == 1024 && $10 == 32768)) class = "t32"
-            else if ($2 ~ /attn_output_b/ || $3 ~ /attn_output_b/ || ($9 == 8192 && $10 == 4096)) class = "t256"
-            else if ($2 ~ /shared_down/ || $3 ~ /ffn_down_shexp/ || ($9 == 2048 && $10 == 4096)) class = "shared"
-            else class = "other"
-            if (class == "t32") t32++
-            else if (class == "t256") t256++
-            else if (class == "shared") shared++
-            else other++
-            if ($6 == partner0) by_pair[class, 0]++
-            else if ($6 == partner1) by_pair[class, 1]++
-            else unexpected_device++
-        }
-        END {
-            total = t32 + t256 + shared + other
-            printf "total=%d t32=%d(%d/%d) t256=%d(%d/%d) shared_down=%d(%d/%d) other=%d unexpected_device=%d", \
-                total, t32, by_pair["t32",0], by_pair["t32",1], \
-                t256, by_pair["t256",0], by_pair["t256",1], \
-                shared, by_pair["shared",0], by_pair["shared",1], \
-                other, unexpected_device
-            ok = 0
-            if (variant == "local") ok = (total == 0)
-            else if (variant == "t32") ok = (by_pair["t32",0] > 0 && by_pair["t32",1] > 0 && total == t32)
-            else if (variant == "t256") ok = (by_pair["t256",0] > 0 && by_pair["t256",1] > 0 && total == t256)
-            else if (variant == "shared_down") ok = (by_pair["shared",0] > 0 && by_pair["shared",1] > 0 && total == shared)
-            else if (variant == "legacy") ok = (by_pair["t32",0] > 0 && by_pair["t32",1] > 0 && by_pair["t256",0] > 0 && by_pair["t256",1] > 0 && total == t32 + t256)
-            ok = ok && unexpected_device == 0
-            exit(ok ? 0 : 1)
-        }
-    ' "$audit") || {
-        printf '%s: %s\n' "$variant" "$counts"
-        return 1
-    }
-    printf '%s: %s\n' "$variant" "$counts"
+    python3 speed-bench/q8_partner_audit.py \
+        "$variant" "$partner_device_0" "$partner_device_1" "$audit"
 }
 
 if [[ $SKIP_BUILD == 0 ]]; then
@@ -393,7 +357,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         grep -Fq 'q8 fp16 benefit plan registered' "$log" ||
             die "$stem did not use benefit planning"
         if ! validate_audit "$variant" "$audit"; then
-            printf 'benchmark repeat=%s variant=%s did not execute only the requested class\n' \
+            printf 'benchmark repeat=%s variant=%s has invalid requested-class or partner-device evidence\n' \
                 "$repeat" "$variant" >>"$OUTPUT_DIR/validation-failures.txt"
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -472,7 +436,7 @@ if [[ $RUN_NSYS == 1 ]]; then
         [[ -s $base.nsys-rep && -s $audit ]] ||
             die "Nsight Systems omitted report or audit for $variant"
         if ! validate_audit "$variant" "$audit"; then
-            printf 'nsys variant=%s did not execute only the requested class\n' \
+            printf 'nsys variant=%s has invalid requested-class or partner-device evidence\n' \
                 "$variant" >>"$OUTPUT_DIR/validation-failures.txt"
         fi
         for report in cuda_gpu_kern_sum cuda_gpu_mem_time_sum cuda_api_sum cuda_gpu_trace; do
@@ -486,7 +450,7 @@ fi
 
 [[ ! -s $OUTPUT_DIR/validation-failures.txt ]] || {
     cat "$OUTPUT_DIR/validation-failures.txt" >&2
-    die "one or more class-isolated runs were not exercised or were contaminated"
+    die "one or more runs lack pure requested-class partner evidence"
 }
 
 phase=complete

@@ -35,6 +35,7 @@ on:
       - "speed-bench/summarize-cuda-critical-path.py"
       - "speed-bench/summarize-sm75-q4-clock-audit.py"
       - "speed-bench/summarize-q8-partner-offload-ab.py"
+      - "speed-bench/q8_partner_audit.py"
       - "speed-bench/summarize-q8-t32-fused-ab.py"
       - "speed-bench/validate-ncu-capture.py"
       - "speed-bench/summarize-q8-cache-audit.py"
@@ -81,6 +82,7 @@ jobs:
       - name: Check Q8 partner A/B tooling
         run: |
           bash -n speed-bench/cuda-q8-partner-offload-ab.sh
+          python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
@@ -424,6 +426,7 @@ jobs:
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
+          python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile speed-bench/summarize-q8-t32-fused-ab.py

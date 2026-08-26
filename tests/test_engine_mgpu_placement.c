@@ -44,6 +44,9 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 uint32_t ds4_test_q8_cache_class(const char *name);
 int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
                               const char *name_b, uint64_t fp16_bytes_b);
+int ds4_test_q8_cache_compare_fallback(
+        const char *name_a, uint64_t fp16_bytes_a, int fallback_a,
+        const char *name_b, uint64_t fp16_bytes_b, int fallback_b);
 int ds4_test_q8_cache_partner_tier(const char *name, int n_gpus,
                                    int home_tier, int peer_forward,
                                    int peer_reverse, int disabled);
@@ -167,6 +170,12 @@ static void test_q8_cache_benefit_order(void) {
     CHECK(ds4_test_q8_cache_compare(shared_down, 16ull << 20,
                                     shared_gate, 16ull << 20) < 0,
           "shared down ranks before already-efficient shared gate/up");
+    CHECK(ds4_test_q8_cache_compare_fallback(
+              q_b, 64ull << 20, -1, out_b, 64ull << 20, 1) < 0,
+          "equal-value fixed candidate ranks before partner-eligible candidate");
+    CHECK(ds4_test_q8_cache_compare_fallback(
+              q_b, 64ull << 20, 1, out_b, 64ull << 20, -1) > 0,
+          "partner eligibility selects the tied class that may overflow");
 }
 
 static void test_q8_cache_partner_mapping(void) {

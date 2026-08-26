@@ -3008,8 +3008,16 @@ static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     if (a->benefit_units < b->benefit_units) return 1;
     if (a->physical_device < b->physical_device) return -1;
     if (a->physical_device > b->physical_device) return 1;
-    if (a->fallback_physical_device < b->fallback_physical_device) return -1;
-    if (a->fallback_physical_device > b->fallback_physical_device) return 1;
+    /* Within this home-device bucket, at equal benefit/byte, keep fixed/home-
+     * only candidates local before candidates that can spill to an NVLink
+     * partner.  The class selector is therefore a placement policy: on a
+     * constrained home it deliberately
+     * chooses which tied class executes remotely.  Compare eligibility rather
+     * than physical IDs so this policy is explicit and topology-independent. */
+    const int a_can_fallback = a->fallback_physical_device >= 0;
+    const int b_can_fallback = b->fallback_physical_device >= 0;
+    if (a_can_fallback < b_can_fallback) return -1;
+    if (a_can_fallback > b_can_fallback) return 1;
     if (a->layer < b->layer) return -1;
     if (a->layer > b->layer) return 1;
     if (a->path_class < b->path_class) return -1;
@@ -56341,6 +56349,26 @@ int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
     b.benefit_units = accelerator_q8_cache_benefit_units(b.path_class);
     a.fp16_bytes = fp16_bytes_a;
     b.fp16_bytes = fp16_bytes_b;
+    return accelerator_q8_cache_candidate_cmp(&a, &b);
+}
+
+int ds4_test_q8_cache_compare_fallback(
+        const char *name_a, uint64_t fp16_bytes_a, int fallback_a,
+        const char *name_b, uint64_t fp16_bytes_b, int fallback_b) {
+    ds4_str sa = {name_a, name_a ? strlen(name_a) : 0u};
+    ds4_str sb = {name_b, name_b ? strlen(name_b) : 0u};
+    accelerator_q8_cache_candidate a;
+    accelerator_q8_cache_candidate b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    a.path_class = accelerator_q8_cache_classify(sa);
+    b.path_class = accelerator_q8_cache_classify(sb);
+    a.benefit_units = accelerator_q8_cache_benefit_units(a.path_class);
+    b.benefit_units = accelerator_q8_cache_benefit_units(b.path_class);
+    a.fp16_bytes = fp16_bytes_a;
+    b.fp16_bytes = fp16_bytes_b;
+    a.fallback_physical_device = fallback_a;
+    b.fallback_physical_device = fallback_b;
     return accelerator_q8_cache_candidate_cmp(&a, &b);
 }
 

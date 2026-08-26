@@ -754,21 +754,26 @@ tokens, matching CUDA TP's default prefill chunk;
 `DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=N` changes that bound to a positive token
 count. A larger runtime
 microbatch safely uses the native local path instead of allocating mid-graph.
-The measured default partner policy is T256-only. On the fixed full-Q4 22/21
-screen it improved prefill by 13.1--15.1%, moved 3.12 GiB per benchmark sweep,
-and preserved the top token at all nine measured frontiers. T32-only produced
-the same logits but moved 12.70 GiB and was slower; the initial mixed policy is
+The measured default partner policy is T256-only. On the repeated fixed
+full-Q4 22/21 screens it improved prefill by 13.0--15.3%, moved 3.12 GiB per
+benchmark sweep, and preserved the top token at all nine measured frontiers.
+T32-only produced the same logits but moved 12.70 GiB and was slower; the
+initial mixed policy is
 retained as the explicit `legacy` selector. Set
 `DS4_CUDA_Q8_F16_PARTNER_CLASSES` to `t32`, `t256`, `shared_down`, `legacy`,
-`none`, or a comma-separated class list for controlled measurement. The local
-cache plan remains unchanged by this selector; only home-cache misses are
-eligible to use partner VRAM. Shared-down is not enabled by default or by the
-legacy policy.
+`none`, or a comma-separated class list for controlled measurement. Within
+each home-device bucket, at equal benefit per byte, fixed/home-only candidates
+rank before candidates eligible for partner placement. The selector can
+therefore change which tied class occupies constrained home cache: the measured
+T256 policy keeps the much more expensive-to-transfer T32 projection local and
+lets T256 overflow. Shared-down
+is not enabled by default or by the legacy policy.
 The partner A/B treats validated CUDA peer access and physical NVLink topology
 as separate requirements: both logical directions must be `DIRECT`, and each
 homes-first physical pair must be reported as `NV#` by `nvidia-smi topo -m`.
-It records that mapping and requires T32 and T256 audit hits on both pairs,
-rather than accepting a result exercised by only one pipeline stage.
+It records that mapping and requires a nonzero, class-pure audit sample on one
+or both configured partners. An asymmetric stage split may need overflow on
+only the tighter stage; the bounded audit records which partner(s) it observed.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

@@ -7,26 +7,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from q8_partner_audit import class_evidence_valid, classify
+
 
 def fail(message: str) -> None:
     raise SystemExit(f"error: {message}")
-
-
-def classify(row: dict[str, str]) -> str:
-    text = f"{row.get('module', '')} {row.get('label', '')}"
-    if "attn_q_b" in text or (
-        row.get("in_dim") == "1024" and row.get("out_dim") == "32768"
-    ):
-        return "t32"
-    if "attn_output_b" in text or (
-        row.get("in_dim") == "8192" and row.get("out_dim") == "4096"
-    ):
-        return "t256"
-    if "shared_down" in text or "ffn_down_shexp" in text or (
-        row.get("in_dim") == "2048" and row.get("out_dim") == "4096"
-    ):
-        return "shared_down"
-    return "other"
 
 
 if len(sys.argv) != 3:
@@ -102,16 +87,8 @@ for repeat in repeats:
         devices = item["devices"]
         assert isinstance(devices, Counter)
         total = sum(classes.values())
-        valid = False
+        valid = class_evidence_valid(variant, classes)
         status_reasons: list[str] = []
-        if variant == "t32":
-            valid = classes["t32"] > 0 and total == classes["t32"]
-        elif variant == "t256":
-            valid = classes["t256"] > 0 and total == classes["t256"]
-        elif variant == "shared_down":
-            valid = classes["shared_down"] > 0 and total == classes["shared_down"]
-        elif variant == "legacy":
-            valid = total > 0 and total == classes["t32"] + classes["t256"]
         if total == 0:
             status_reasons.append("not_exercised")
         elif not valid:
