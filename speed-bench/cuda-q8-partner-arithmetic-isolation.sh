@@ -18,6 +18,7 @@ T256_LAYERS=${T256_LAYERS:-15-21}
 CASE_IDS=${CASE_IDS:-case_017,case_025,case_030,case_048,case_056}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+RESUME=${RESUME:-0}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${Q8_ARITHMETIC_DIR:-$repo_dir/q8-partner-arithmetic-$stamp}
 variants=(local f16 w16-x16-sgemm w16-x32-sgemm w32-x32-sgemm w32-xq8-sgemm)
@@ -31,14 +32,18 @@ variants=(local f16 w16-x16-sgemm w16-x32-sgemm w32-x32-sgemm w32-xq8-sgemm)
 [[ $SKIP_BUILD == 0 || $SKIP_BUILD == 1 ]] || die "SKIP_BUILD must be 0 or 1"
 [[ $CREATE_ARCHIVE == 0 || $CREATE_ARCHIVE == 1 ]] ||
     die "CREATE_ARCHIVE must be 0 or 1"
+[[ $RESUME == 0 || $RESUME == 1 ]] || die "RESUME must be 0 or 1"
 [[ $T256_LAYERS =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] ||
     die "T256_LAYERS must be a comma-separated layer/range list"
 [[ $CASE_IDS =~ ^case_[0-9]{3}(,case_[0-9]{3})*$ ]] ||
     die "CASE_IDS must be comma-separated case_NNN identifiers"
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
-
-mkdir -p "$OUTPUT_DIR"/{quality,provenance}
+if [[ $RESUME == 1 ]]; then
+    [[ -d $OUTPUT_DIR ]] || die "RESUME=1 requires an existing OUTPUT_DIR"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"/{quality,provenance}
+fi
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 phase=initialization
 finish() {
@@ -79,13 +84,52 @@ for case_id in "${requested_cases[@]}"; do
     wanted[$case_id]=1
 done
 filtered_manifest="$OUTPUT_DIR/quality/manifest.tsv"
-awk -F'\t' -v ids="$CASE_IDS" '
-    BEGIN { n=split(ids,a,","); for (i=1;i<=n;i++) wanted[a[i]]=1 }
-    /^#/ { print; next }
-    $1 in wanted { print; seen[$1]=1 }
-    END { for (id in wanted) if (!(id in seen)) exit 7 }
-' "$SOURCE_MANIFEST" >"$filtered_manifest" ||
-    die "one or more CASE_IDS are absent from QUALITY_MANIFEST"
+if [[ $RESUME == 1 ]]; then
+    existing_manifest="$OUTPUT_DIR/manifest.txt"
+    [[ -s $existing_manifest && -s $filtered_manifest ]] ||
+        die "resume directory lacks its manifest evidence"
+    manifest_value() {
+        awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' \
+            "$existing_manifest"
+    }
+    expected_variants=$(IFS=,; printf '%s' "${variants[*]}")
+    [[ $(manifest_value model) == "$MODEL" &&
+       $(manifest_value model_bytes) == "$(stat -c %s "$MODEL")" &&
+       $(manifest_value source_manifest) == "$SOURCE_MANIFEST" &&
+       $(manifest_value case_ids) == "$CASE_IDS" &&
+       $(manifest_value quality_ctx) == "$QUALITY_CTX" &&
+       $(manifest_value gpu_devices) == "$GPU_DEVICES" &&
+       $(manifest_value gpu_vram) == "$GPU_VRAM" &&
+       $(manifest_value stage_split) == "$STAGE_SPLIT/$((43-STAGE_SPLIT))" &&
+       $(manifest_value prefill_chunk) == "$PREFILL_CHUNK" &&
+       $(manifest_value t256_layers) == "$T256_LAYERS" &&
+       $(manifest_value variants) == "$expected_variants" &&
+       $(manifest_value home_plan) == frozen-for-all-arms ]] ||
+        die "resume manifest does not match the requested experiment"
+    prior_commit=$(manifest_value git_commit)
+    [[ -n $prior_commit ]] && git cat-file -e "$prior_commit^{commit}" 2>/dev/null ||
+        die "resume manifest git commit is unavailable"
+    git diff --quiet "$prior_commit"..HEAD -- \
+        ds4.c ds4_cuda.cu gguf-tools/quality-testing/score_official.c ||
+        die "runtime or scorer changed since the completed resume arms"
+    git diff --quiet -- \
+        ds4.c ds4_cuda.cu gguf-tools/quality-testing/score_official.c ||
+        die "runtime or scorer has uncommitted resume changes"
+    git diff --cached --quiet -- \
+        ds4.c ds4_cuda.cu gguf-tools/quality-testing/score_official.c ||
+        die "runtime or scorer has staged resume changes"
+    printf 'date_utc=%s\nresume_commit=%s\nprior_commit=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+        "$prior_commit" >>"$OUTPUT_DIR/provenance/resume.log"
+else
+    awk -F'\t' -v ids="$CASE_IDS" '
+        BEGIN { n=split(ids,a,","); for (i=1;i<=n;i++) wanted[a[i]]=1 }
+        /^#/ { print; next }
+        $1 in wanted { print; seen[$1]=1 }
+        END { for (id in wanted) if (!(id in seen)) exit 7 }
+    ' "$SOURCE_MANIFEST" >"$filtered_manifest" ||
+        die "one or more CASE_IDS are absent from QUALITY_MANIFEST"
+fi
 actual_cases=$(awk '!/^#/ && NF {n++} END {print n+0}' "$filtered_manifest")
 (( actual_cases == ${#requested_cases[@]} )) || die "filtered manifest count mismatch"
 
@@ -93,25 +137,27 @@ mapfile -t inherited_ds4 < <(env | awk -F= '$1 ~ /^DS4_/ {print $1}' | sort -u)
 clean=(env)
 for name in "${inherited_ds4[@]}"; do clean+=(-u "$name"); done
 
-nvidia-smi topo -m >"$OUTPUT_DIR/provenance/topology.txt"
-{
-    printf 'date_utc=%s\ngit_commit=%s\nmodel=%s\nmodel_bytes=%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
-        "$MODEL" "$(stat -c %s "$MODEL")"
-    printf 'source_manifest=%s\ncase_ids=%s\ncase_count=%s\n' \
-        "$SOURCE_MANIFEST" "$CASE_IDS" "$actual_cases"
-    printf 'quality_ctx=%s\ngpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
-        "$QUALITY_CTX" "$GPU_DEVICES" "$GPU_VRAM" \
-        "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
-    printf 'prefill_chunk=%s\nt256_layers=%s\n' "$PREFILL_CHUNK" "$T256_LAYERS"
-    printf 'variants=%s\nmodel_hashing=disabled\nhome_plan=frozen-for-all-arms\n' \
-        "$(IFS=,; printf '%s' "${variants[*]}")"
-    nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free --format=csv
-} >"$OUTPUT_DIR/manifest.txt"
-git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
-git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
-env | awk -F= '$1 ~ /^DS4_/ {print $0}' | sort -u \
-    >"$OUTPUT_DIR/provenance/inherited-ds4-env.txt"
+if [[ $RESUME == 0 ]]; then
+    nvidia-smi topo -m >"$OUTPUT_DIR/provenance/topology.txt"
+    {
+        printf 'date_utc=%s\ngit_commit=%s\nmodel=%s\nmodel_bytes=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+            "$MODEL" "$(stat -c %s "$MODEL")"
+        printf 'source_manifest=%s\ncase_ids=%s\ncase_count=%s\n' \
+            "$SOURCE_MANIFEST" "$CASE_IDS" "$actual_cases"
+        printf 'quality_ctx=%s\ngpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
+            "$QUALITY_CTX" "$GPU_DEVICES" "$GPU_VRAM" \
+            "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
+        printf 'prefill_chunk=%s\nt256_layers=%s\n' "$PREFILL_CHUNK" "$T256_LAYERS"
+        printf 'variants=%s\nmodel_hashing=disabled\nhome_plan=frozen-for-all-arms\n' \
+            "$(IFS=,; printf '%s' "${variants[*]}")"
+        nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free --format=csv
+    } >"$OUTPUT_DIR/manifest.txt"
+    git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
+    git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+    env | awk -F= '$1 ~ /^DS4_/ {print $0}' | sort -u \
+        >"$OUTPUT_DIR/provenance/inherited-ds4-env.txt"
+fi
 
 if [[ $SKIP_BUILD == 0 ]]; then
     phase=build
@@ -135,6 +181,28 @@ for ((variant_index=0; variant_index<${#variants[@]}; variant_index++)); do
     log="$OUTPUT_DIR/quality/$variant.log"
     audit="$OUTPUT_DIR/quality/$variant.q8-audit.csv"
     bindings="$OUTPUT_DIR/quality/$variant.bindings.csv"
+    if [[ $RESUME == 1 && -s $out && -s $log && -s $audit && -s $bindings ]]; then
+        rows=$(awk -F'\t' 'NR > 1 {n++} END {print n+0}' "$out")
+        (( rows == actual_cases )) || die "$variant resume output has $rows/$actual_cases cases"
+        grep -Fq 'score_official: runtime_path=production' "$log" ||
+            die "$variant resume evidence did not use production dispatch"
+        grep -Fq "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
+            "$log" || die "$variant resume evidence used the wrong split"
+        if [[ $variant == local ]]; then
+            ! grep -Fq 'CUDA q8 partner execution enabled:' "$log" ||
+                die "local resume evidence executed partner work"
+        else
+            grep -Fq "partner-arithmetic=$variant" "$log" ||
+                die "$variant resume evidence used the wrong arithmetic"
+            grep -Fq 'home-order=frozen' "$log" ||
+                die "$variant resume evidence did not freeze home admission"
+            grep -Fq 'CUDA q8 fp16 partner summary:' "$log" ||
+                die "$variant resume evidence lacks partner execution"
+        fi
+        printf 'Reusing validated arithmetic arm %s (%d/%d).\n' \
+            "$variant" "$((variant_index + 1))" "${#variants[@]}"
+        continue
+    fi
     variant_env=()
     if [[ $variant == local ]]; then
         variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
@@ -176,7 +244,7 @@ for ((variant_index=0; variant_index<${#variants[@]}; variant_index++)); do
             die "$variant did not select the requested arithmetic"
         grep -Fq 'home-order=frozen' "$log" ||
             die "$variant did not freeze home admission"
-        grep -Fq 'CUDA q8 partner summary:' "$log" ||
+        grep -Fq 'CUDA q8 fp16 partner summary:' "$log" ||
             die "$variant did not execute partner work"
     fi
 done

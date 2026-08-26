@@ -488,6 +488,20 @@ Return `q8-partner-arithmetic-<timestamp>.tar.gz`. A valid archive reports
 `Experiment integrity: PASS` and proves identical home bindings and identical
 additive T256 layers across every arithmetic arm.
 
+If a runner/check failure stops a pass after one or more complete arms, retain
+the unpacked output directory and resume it without recomputing those arms:
+
+```bash
+Q8_ARITHMETIC_DIR="$PWD/q8-partner-arithmetic-<timestamp>" \
+RESUME=1 \
+SKIP_BUILD=1 \
+./speed-bench/cuda-q8-partner-arithmetic-isolation.sh
+```
+
+Resume validates the complete experiment manifest, the prior runtime/scorer
+commit, every reusable arm's row count and runtime dispatch, and refuses reuse
+if the runtime or scorer changed.
+
 ### Tagged SM75 native-Q4 and automatic-T256 A/B
 
 `cuda-sm75-native-q4-t256-ab.sh` is an evidence runner only; it does not
