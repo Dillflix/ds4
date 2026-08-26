@@ -28,6 +28,7 @@ on:
       - "speed-bench/cuda-sm75-production-scalar-e2e.sh"
       - "speed-bench/cuda-sm75-next-targets.sh"
       - "speed-bench/cuda-sm75-native-q4-production.sh"
+      - "speed-bench/cuda-sm75-native-q4-t256-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
       - "speed-bench/cuda-q8-partner-offload-ab.sh"
@@ -40,6 +41,7 @@ on:
       - "speed-bench/summarize-sm75-q4-clock-audit.py"
       - "speed-bench/summarize-q8-partner-offload-ab.py"
       - "speed-bench/summarize-q8-partner-production.py"
+      - "speed-bench/summarize-sm75-native-q4-t256-ab.py"
       - "speed-bench/summarize-q8-partner-quality-isolation.py"
       - "speed-bench/q8_partner_audit.py"
       - "speed-bench/summarize-q8-t32-fused-ab.py"
@@ -60,6 +62,7 @@ on:
       - "tests/test_gpu_xdev.c"
       - "tests/test_summarize_q8_partner_offload_ab.py"
       - "tests/test_summarize_q8_partner_production.py"
+      - "tests/test_summarize_sm75_native_q4_t256_ab.py"
       - "tests/test_summarize_q8_partner_quality_isolation.py"
       - "tests/test_summarize_q8_t32_fused_ab.py"
       - "tests/test_summarize_cuda_critical_path.py"
@@ -417,6 +420,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-production-scalar-e2e.sh
           test -x speed-bench/cuda-sm75-native-q4-production.sh
           bash -n speed-bench/cuda-sm75-native-q4-production.sh
+          test -x speed-bench/cuda-sm75-native-q4-t256-ab.sh
+          bash -n speed-bench/cuda-sm75-native-q4-t256-ab.sh
           test -x speed-bench/cuda-sm75-native-q4-next-ab.sh
           bash -n speed-bench/cuda-sm75-native-q4-next-ab.sh
           test -x speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh
@@ -449,13 +454,16 @@ jobs:
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-production.py
+          python3 -m py_compile speed-bench/summarize-sm75-native-q4-t256-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-quality-isolation.py
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_production.py
+          python3 -m py_compile tests/test_summarize_sm75_native_q4_t256_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_quality_isolation.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_production.py
+          python3 tests/test_summarize_sm75_native_q4_t256_ab.py
           python3 tests/test_summarize_q8_partner_quality_isolation.py
           python3 -m py_compile speed-bench/summarize-q8-t32-fused-ab.py
           python3 tests/test_summarize_q8_t32_fused_ab.py

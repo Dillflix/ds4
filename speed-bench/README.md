@@ -455,6 +455,46 @@ attempts to weaken the target or use fewer than three repeats. Return the genera
 check that `run-status.txt` says `state=finished`, `summary.md` says
 `Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
 
+### Tagged SM75 native-Q4 and automatic-T256 A/B
+
+`cuda-sm75-native-q4-t256-ab.sh` is an evidence runner only; it does not
+change the engine, either GGUF, the native-Q4 dispatch, or the automatic T256
+policy. It requires separate existing absolute paths in `MODEL` for the
+standard full-Q4 GGUF and `NATIVE_MODEL` for its tagged SM75-native repack.
+The fixed 2x2 compares standard/native Q4 with partner execution disabled or
+with the implicit automatic T256 policy. It uses the production `0,3,1,2`
+device order and 22/21 split, sweeps 2K through 32K, and runs four
+counterbalanced repeats so every arm occupies every run slot once.
+
+The runner records file sizes and exact-output evidence but deliberately does
+not hash either approximately 153-GiB model. It reuses the existing models and
+does not create or modify `NATIVE_MODEL`.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+STEP_MUL=2 \
+PREFILL_CHUNK=2048 \
+REPEATS=4 \
+./speed-bench/cuda-sm75-native-q4-t256-ab.sh
+```
+
+Return `sm75-native-q4-t256-ab-<timestamp>.tar.gz`. The archive contains the
+four-arm throughput decomposition, exact-logit comparisons, T256-only
+admission/binding evidence, frozen-cache checks, and per-run GPU telemetry.
+A `PASS` from this runner accepts only that structural and performance
+interaction. It does not replace or override the separate official T256
+quality-isolation gate described below.
+
 The first production-default result failed its predeclared per-case,
 first-token, and greedy-prefix quality gates even though aggregate NLL improved.
 It also established that the normal partner-priority tie-break changed the
