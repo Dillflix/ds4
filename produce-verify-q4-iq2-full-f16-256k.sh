@@ -17,9 +17,11 @@ on every device. The selector promotes as many matched gate/up layer pairs to
 Q4_K as both devices in each NVLink stage can hold while preserving the CUDA
 cache reserve plus the requested safety margin. Routed down remains Q4_K in
 every layer. The output keeps tagged native SM75 packing on every routed
-tensor that remains Q4_K. Final verification uses the accepted production
-placement: all 43 T256 projections execute from FP16 weights on their NVLink
-partners, while every one of the 344 dense candidates must remain resident.
+tensor that remains Q4_K. Final verification uses the worst-case all-local
+T256 capacity envelope and requires every one of the 344 dense candidates to
+remain resident. Runtime T256 placement is deliberately left to the separate
+native/all-local/balanced/all-partner production A/B; model generation does
+not assume that all-partner remains optimal after the routed quant changes.
 
 No full-Q4 GGUF is required. The quantizer regenerates tensors from HF_DIR,
 using the automatically cached 8 MiB metadata template and routed-MoE imatrix.
@@ -229,8 +231,9 @@ IFS=$'\t' read -r iq2_layers tensor_overrides <<< "$selection"
     printf 'stage_split=%s\n' "$DS4_CUDA_EP_STAGE_SPLIT"
     printf 'dense_cache_policy=all-q8-f16\n'
     printf 'capacity_calibration_t256_placement=all-local\n'
-    printf 'verification_t256_placement=all-partner\n'
-    printf 'placement_target=production-all-partner-t256\n'
+    printf 'verification_t256_placement=all-local\n'
+    printf 'placement_target=neutral-worst-case-home-footprint\n'
+    printf 'runtime_placement_selection=deferred-to-production-ab\n'
     printf 'cache_extra_headroom_mib_per_device=%s\n' "$extra_headroom"
     printf 'expected_dense_candidates=%s\n' "$expected_candidates"
     printf 'routed_down_type=q4_k\n'
@@ -275,11 +278,11 @@ export DS4_CUDA_Q8_BINDING_STATE_CSV="$verification_bindings"
 export DS4_CUDA_Q8_ALLOCATION_STATE_CSV="$verification_allocations"
 export DS4_CUDA_MEMORY_STATE_CSV="$prefix.full-f16-memory.csv"
 export DS4_BENCH_UNTIMED_WARMUP_TOKENS=2048
-export DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
-export DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42
-export DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16
-export DS4_CUDA_Q8_T256_PLACEMENT=all-partner
-unset DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD
+export DS4_CUDA_Q8_F16_PARTNER_CLASSES=none
+export DS4_CUDA_Q8_T256_PLACEMENT=all-local
+export DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
+unset DS4_CUDA_Q8_F16_PARTNER_LAYERS
+unset DS4_CUDA_Q8_PARTNER_ARITHMETIC
 
 bash "$script_dir/produce-benchmark-iq2-iq2-q4.sh" \
     "$hf_dir" "$out" "$verification_csv"
@@ -291,15 +294,15 @@ python3 speed-bench/select-q4-iq2-full-f16.py \
 grep -Fq "q8 fp16 benefit plan materialized $expected_candidates/$expected_candidates candidates" \
     "${BENCH_LOG:-${out%.gguf}.bench.log}" || \
     die "runtime log does not prove complete dense FP16 materialization"
-grep -Fq 't256-placement=all-partner' \
+grep -Fq 't256-placement=all-local' \
     "${BENCH_LOG:-${out%.gguf}.bench.log}" || \
-    die "runtime log does not prove all-partner T256 placement"
+    die "runtime log does not prove the all-local T256 capacity envelope"
 grep -Fq 'T256-output_b=43/43' \
     "${BENCH_LOG:-${out%.gguf}.bench.log}" || \
     die "runtime log does not prove complete T256 FP16 materialization"
-grep -Fq 'partner=43 partner-arithmetic=f16' \
+grep -Fq 'partner=0 ' \
     "${BENCH_LOG:-${out%.gguf}.bench.log}" || \
-    die "runtime log does not prove 43 FP16 partner bindings"
+    die "runtime log does not prove zero partner-resident dense bindings"
 [[ -s $verification_bindings ]] || die "runtime omitted dense FP16 binding evidence"
 [[ -s $verification_allocations ]] || die "runtime omitted dense FP16 allocation evidence"
 
