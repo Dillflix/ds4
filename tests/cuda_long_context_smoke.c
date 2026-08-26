@@ -1077,6 +1077,7 @@ static int check_sm75_native_q4_layout_exact(void) {
      ds4_gpu_synchronize() && \
      ds4_gpu_tensor_read(mid, 0, (MID_DST), mid_count * sizeof(float)) && \
      ds4_gpu_tensor_read(out, 0, (OUT_DST), out_count * sizeof(float)))
+    unsetenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
     if (!ds4_gpu_tensor_write(selected, 0, selh, pairs * sizeof(int32_t)) ||
         !ds4_gpu_tensor_write(weights, 0, wh, pairs * sizeof(float)) ||
         !RUN_MIXED_Q4_IQ2(standard, 0u, mid_ref, out_ref) ||
@@ -1087,7 +1088,19 @@ static int check_sm75_native_q4_layout_exact(void) {
         !compare_exact_f32("tagged IQ2 gate/Q4 down prefill output",
                            out_ref, out_got, out_count)) goto cleanup;
     fprintf(stderr,
-            "cuda-regression: tagged IQ2 gate/up + native Q4 down exact\n");
+            "cuda-regression: tagged IQ2 tail8-default gate/up + native Q4 "
+            "down exact\n");
+
+    if (setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", "0", 1) != 0 ||
+        !RUN_MIXED_Q4_IQ2(native, DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4,
+                          mid_got, out_got) ||
+        !compare_exact_f32("tagged IQ2 tail4 rollback prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("tagged IQ2 tail4 rollback prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: tagged IQ2 tail4 rollback exact\n");
+    unsetenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
 
 #define RUN_MIXED_Q4_IQ2_OWNED(MODEL, LAYOUT, MID_DST, OUT_DST) \
     (mid_is_f16 = false, \
@@ -1120,6 +1133,7 @@ static int check_sm75_native_q4_layout_exact(void) {
 #undef RUN_NATIVE_Q4
 
 cleanup:
+    unsetenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES");
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_STREAM7");
     unsetenv("DS4_CUDA_MOE_NATIVE_Q4_GATE_FIXED_K16");

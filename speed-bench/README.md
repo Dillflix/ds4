@@ -1454,17 +1454,15 @@ SQLite exports, and telemetry before rerunning only the bounded same-work
 harness and summarizer. It preserves the failed run's provenance and writes a
 separate `.resume-<timestamp>.tar.gz` archive.
 
-### SM75 IQ2 wide-CTA and tail-policy A/B
+### SM75 IQ2 tail-policy A/B
 
-`cuda-sm75-iq2-next-ab.sh` keeps two hypotheses independent. Its bounded
-harness compares the shipping 256-thread IQ2 tile16/tile8 kernels with a
-512-thread CTA that doubles resident warps without changing compact IQ2
-weights or arithmetic. Each candidate call is compared bit-for-bit against
-the 256-thread control on nonzero IQ2 gate/up data. A separate alternating
-four-GPU A/B compares the current IQ2 tail4 path with one IQ2 MMA tile8 for
-every residual of 1--8 pairs; native-Q4 down retains its existing 16/8/4
-planner in both variants. Optional Nsight Compute captures validate the
-512-thread launch and report its occupancy, compute/memory traffic, and stalls.
+`cuda-sm75-iq2-next-ab.sh` preserves the accepted production-tail validation.
+Its bounded harness verifies that one IQ2 MMA tile8 for every residual of
+1--8 pairs is bit-exact with the retained tail4 rollback. A separate
+alternating four-GPU A/B measures both policies; native-Q4 down retains its
+existing 16/8/4 planner in both variants. Tail8 is the SM75 production default,
+and `DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75=0` is the explicit rollback. The rejected
+512-thread IQ2 CTA is no longer a production dispatch option.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1480,8 +1478,6 @@ CTX_MAX=8192 \
 CTX_ALLOC=262273 \
 REPEATS=3 \
 PROFILE_GPU=0 \
-RUN_NCU=1 \
-NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-iq2-next-ab.sh
 ```
@@ -1545,6 +1541,21 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-native-q4-t256-profile.sh
 ```
 
+If the targeted 32K attention reports already exist and only the genuine
+production trace is missing, avoid repeating them:
+
+```bash
+unset REUSE_NSYS_DIR REUSE_Q4_NCU_DIR
+PROFILE_TOKENS=32768 \
+CTX_ALLOC=262273 \
+RUN_NCU=0 \
+RUN_ATTENTION_NCU=0 \
+NCU_SET=full \
+NCU_USE_SUDO=0 \
+SKIP_BUILD=1 \
+./speed-bench/cuda-sm75-native-q4-t256-profile.sh
+```
+
 Return `sm75-native-q4-t256-profile-<timestamp>.tar.gz`. Model hashing is
 disabled. If the GGUF is cold in the Linux page cache, its single NFS
 startup may still take roughly 25 minutes at 100--105 MiB/s; the later Nsight
@@ -1572,7 +1583,12 @@ SKIP_BUILD=1 \
 ./speed-bench/cuda-sm75-native-q4-t256-profile.sh
 ```
 
-Resume mode copies and revalidates the existing report, benchmark, cache
+Resume mode first requires the prior manifest to match the model path and
+size, prompt, device order, VRAM policy, stage split, profile frontier,
+allocation, chunk, pipeline size, and T256 policy. It also independently
+requires exactly one benchmark row at the requested frontier. This prevents an
+8K capture from being silently relabeled as a 32K trace. It then copies and
+revalidates the existing report, benchmark, cache
 snapshots, allocation/memory evidence, tile audit, and exact balanced binding
 inventory. It reruns the corrected
 summaries and the model-free Nsight Compute harnesses in a fresh output

@@ -129,6 +129,32 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
     [[ $REUSE_NSYS_DIR == /* && -d $REUSE_NSYS_DIR ]] ||
         die "REUSE_NSYS_DIR must name an existing absolute profiler directory"
     REUSE_NSYS_DIR=$(cd "$REUSE_NSYS_DIR" && pwd)
+    reuse_manifest="$REUSE_NSYS_DIR/manifest.txt"
+    [[ -s $reuse_manifest ]] ||
+        die "REUSE_NSYS_DIR lacks manifest.txt; refusing unverified reuse"
+    reuse_value() {
+        awk -F= -v key="$1" '$1 == key {
+            print substr($0, length(key) + 2); found=1; exit
+        } END {if (!found) exit 1}' "$reuse_manifest"
+    }
+    require_reuse_value() {
+        local key=$1 expected=$2 actual
+        actual=$(reuse_value "$key") ||
+            die "REUSE_NSYS_DIR manifest lacks $key"
+        [[ $actual == "$expected" ]] ||
+            die "REUSE_NSYS_DIR $key mismatch: requested '$expected', captured '$actual'"
+    }
+    require_reuse_value model "$MODEL"
+    require_reuse_value model_bytes "$(stat -c %s "$MODEL")"
+    require_reuse_value prompt "$PROMPT"
+    require_reuse_value gpu_devices "$GPU_DEVICES"
+    require_reuse_value gpu_vram "$GPU_VRAM"
+    require_reuse_value stage_split "$STAGE_SPLIT/$((43-STAGE_SPLIT))"
+    require_reuse_value profile_tokens "$PROFILE_TOKENS"
+    require_reuse_value ctx_alloc "$CTX_ALLOC"
+    require_reuse_value prefill_chunk "$PREFILL_CHUNK"
+    require_reuse_value pipeline_mb "$PIPELINE_MB"
+    require_reuse_value t256_policy automatic-balanced
 fi
 if [[ -n $REUSE_Q4_NCU_DIR ]]; then
     [[ $REUSE_Q4_NCU_DIR == /* && -d $REUSE_Q4_NCU_DIR ]] ||
@@ -250,6 +276,8 @@ phase=exactness
     }
 for marker in 'tagged SM75 native Q4 cost-planner default exact' \
               'tagged SM75 native Q4 decode exact' \
+              'tagged IQ2 tail8-default gate/up + native Q4 down exact' \
+              'tagged IQ2 tail4 rollback exact' \
               'cuda long-context regression: OK'; do
     grep -Fq "$marker" "$OUTPUT_DIR/validation/cuda-exactness.log" ||
         die "missing exactness marker: $marker"
@@ -328,6 +356,12 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
        -s $REUSE_NSYS_DIR/nsys/cache-before.csv &&
        -s $REUSE_NSYS_DIR/nsys/cache-after.csv ]] ||
         die "REUSE_NSYS_DIR lacks a complete production trace"
+    awk -F, -v want="$PROFILE_TOKENS" '
+        NR == 2 {rows++; if (($1 + 0) != want) bad=1}
+        NR > 2 {rows++; bad=1}
+        END {exit !(rows == 1 && !bad)}
+    ' "$REUSE_NSYS_DIR/nsys/combined-benchmark.csv" ||
+        die "REUSE_NSYS_DIR benchmark is not the requested single ${PROFILE_TOKENS}-token frontier"
     cp -a "$REUSE_NSYS_DIR/nsys/." "$OUTPUT_DIR/nsys/"
     if [[ -s $REUSE_NSYS_DIR/telemetry/combined.csv ]]; then
         cp -a "$REUSE_NSYS_DIR/telemetry/combined.csv" \
@@ -380,6 +414,7 @@ for marker in "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
               'partner-classes=automatic:t256' 'partner-layers=all' \
               't256-placement=balanced' 'materialized 344/344 candidates' \
               'T256-output_b=43/43' 'partner=21 partner-arithmetic=f16' \
+              'SM75 IQ2 residual 1..8 tail8 enabled' \
               'CUDA q8 fp16 partner summary: calls='; do
     grep -Fq "$marker" "$base.log" ||
         die "production trace lacks required marker: $marker"

@@ -212,8 +212,8 @@ static void usage(const char *argv0) {
             "DS4_PROFILE_SCALAR=1 selects its scalar candidate; 0 selects\n"
             "the array baseline. DS4_PROFILE_REPEATS times additional calls\n"
             "after correctness/audit warmup (default 0, maximum 100).\n"
-            "DS4_PROFILE_IQ2_WIDE512=1 selects the experimental 512-thread\n"
-            "IQ2 tile16/tile8 CTA. DS4_PROFILE_IQ2_TAIL8_ALL=1 replaces\n"
+            "DS4_PROFILE_IQ2_TAIL8_ALL=1 selects the production IQ2 tail8\n"
+            "policy, while 0 forces the retained tail4 rollback. Tail8 replaces\n"
             "IQ2 residual 1..4 tail4 work with the exact tile8 path while\n"
             "leaving native-Q4 down's 16/8/4 plan unchanged.\n",
             argv0);
@@ -726,11 +726,9 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
         !verify_tile_audit(audit_path, spec, native_q4)) {
         goto cleanup;
     }
-    const char *wide_env = getenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75");
     const char *tail_env = getenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
-    const int restore_wide = wide_env && strcmp(wide_env, "1") == 0;
     const int restore_tail = tail_env && strcmp(tail_env, "1") == 0;
-    if (gate_iq2 && (restore_wide || restore_tail)) {
+    if (gate_iq2 && restore_tail) {
         mid_candidate = (float *)malloc((size_t)mid_count * sizeof(float));
         mid_reference = (float *)malloc((size_t)mid_count * sizeof(float));
         if (!mid_candidate || !mid_reference ||
@@ -739,7 +737,6 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
             fprintf(stderr, "error: IQ2 candidate readback failed\n");
             goto cleanup;
         }
-        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75", "0", 1);
         (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", "0", 1);
         if (!ds4_gpu_routed_moe_batch_owned_tensor(
                 out, gate, up, mid, down, model, model_bytes,
@@ -756,8 +753,6 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
             fprintf(stderr, "error: IQ2 baseline comparison launch failed\n");
             goto cleanup;
         }
-        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75",
-                     restore_wide ? "1" : "0", 1);
         (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75",
                      restore_tail ? "1" : "0", 1);
         if (memcmp(mid_candidate, mid_reference,
@@ -767,7 +762,7 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
                    memcmp(&mid_candidate[mismatch], &mid_reference[mismatch],
                           sizeof(float)) == 0) mismatch++;
             fprintf(stderr,
-                    "error: IQ2 candidate differs from 256-thread/tail4 "
+                    "error: IQ2 tail8 differs from tail4 "
                     "baseline at value %llu (%g versus %g)\n",
                     (unsigned long long)mismatch,
                     mismatch < mid_count ? mid_candidate[mismatch] : 0.0f,
@@ -1086,7 +1081,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     uint32_t scalar_enabled = 0u, timed_repeats = 0u;
-    uint32_t iq2_wide512 = 0u, iq2_tail8_all = 0u;
+    uint32_t iq2_tail8_all = 0u;
     if (!parse_env_u32("DS4_PROFILE_SCALAR", 0u, 1u, &scalar_enabled)) {
         fprintf(stderr, "error: DS4_PROFILE_SCALAR must be 0 or 1\n");
         return 2;
@@ -1097,13 +1092,10 @@ int main(int argc, char **argv) {
                 "error: DS4_PROFILE_REPEATS must be an integer from 0 to 100\n");
         return 2;
     }
-    if (!parse_env_u32("DS4_PROFILE_IQ2_WIDE512", 0u, 1u,
-                       &iq2_wide512) ||
-        !parse_env_u32("DS4_PROFILE_IQ2_TAIL8_ALL", 0u, 1u,
+    if (!parse_env_u32("DS4_PROFILE_IQ2_TAIL8_ALL", 0u, 1u,
                        &iq2_tail8_all)) {
         fprintf(stderr,
-                "error: DS4_PROFILE_IQ2_WIDE512 and "
-                "DS4_PROFILE_IQ2_TAIL8_ALL must be 0 or 1\n");
+                "error: DS4_PROFILE_IQ2_TAIL8_ALL must be 0 or 1\n");
         return 2;
     }
     if (scalar_enabled && scalar_target == SCALAR_TARGET_NONE) {
@@ -1132,9 +1124,9 @@ int main(int argc, char **argv) {
                 scalar_target_name(scalar_target), spec->name);
         return 2;
     }
-    if ((iq2_wide512 || iq2_tail8_all) && !hybrid_iq2_q4_moe) {
+    if (iq2_tail8_all && !hybrid_iq2_q4_moe) {
         fprintf(stderr,
-                "error: IQ2 wide/tail candidates require a "
+                "error: the IQ2 tail8 policy requires a "
                 "hybrid-iq2-q4 scenario\n");
         return 2;
     }
@@ -1160,8 +1152,10 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75");
-    (void)unsetenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
+    /* Be explicit because production defaults to tail8 while the harness
+     * defaults to the tail4 control unless requested otherwise. */
+    (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75",
+                 iq2_tail8_all ? "1" : "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
     (void)unsetenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES");
@@ -1189,10 +1183,6 @@ int main(int argc, char **argv) {
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
-    if (iq2_wide512)
-        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75", "1", 1);
-    if (iq2_tail8_all)
-        (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", "1", 1);
     switch (scalar_target) {
         case SCALAR_TARGET_Q4_GATE:
             if (scalar_enabled)
@@ -1215,9 +1205,9 @@ int main(int argc, char **argv) {
             break;
     }
     printf("scalar_target=%s\nscalar_enabled=%u\n"
-           "iq2_wide512=%u\niq2_tail8_all=%u\ntimed_repeats=%u\n",
+           "iq2_tail8_all=%u\ntimed_repeats=%u\n",
            scalar_target_name(scalar_target), scalar_enabled,
-           iq2_wide512, iq2_tail8_all, timed_repeats);
+           iq2_tail8_all, timed_repeats);
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");

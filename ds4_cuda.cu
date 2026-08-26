@@ -26019,9 +26019,6 @@ static int routed_moe_launch(
         const uint32_t use_iq2_scalar_sm75 =
             cuda_sm75_mma_ok() &&
             cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_SCALAR_SM75", 1);
-        const uint32_t use_iq2_wide512_sm75 =
-            use_iq2_mma_sm75 &&
-            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_WIDE512_SM75", 0);
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_q2_down_mma_sm75_tile16 =
@@ -26041,18 +26038,14 @@ static int routed_moe_launch(
         const uint32_t use_iq2_tail8_all_sm75 =
             gate_iq2 && use_iq2_mma_sm75_tile16 && use_mixed_tail_tiles &&
             use_native_q4_cost_tiles &&
-            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", 0);
-        if (use_iq2_wide512_sm75) {
-            static std::atomic<bool> logged = false;
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                fprintf(stderr,
-                        "ds4: SM75 IQ2 candidate selected: wide512 tile16/tile8\n");
-        }
+            /* The production A/B was exact and won every measured 2K/4K/8K
+             * repeat.  Keep =0 as the explicit rollback/control path. */
+            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", 1);
         if (use_iq2_tail8_all_sm75) {
             static std::atomic<bool> logged = false;
             if (!logged.exchange(true, std::memory_order_relaxed))
                 fprintf(stderr,
-                        "ds4: SM75 IQ2 candidate selected: residual 1..8 -> tail8\n");
+                        "ds4: SM75 IQ2 residual 1..8 tail8 enabled\n");
         }
         const uint32_t use_small_sorted_prep =
             !any_native_q4 && owned_filtered && (gate_q4k || down_q4k) &&
@@ -26613,22 +26606,8 @@ static int routed_moe_launch(
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE16, \
                                 "iq2-gate-tile16", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, STAGE); \
-                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true, 16><<<GRID, 512>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tile16_total, tile16_experts, tile16_starts, \
-                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_scalar_sm75) { \
+                            if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true, 8><<<GRID, 256>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tile16_total, tile16_experts, tile16_starts, \
-                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, false, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile16_total, tile16_experts, tile16_starts, \
@@ -26679,22 +26658,8 @@ static int routed_moe_launch(
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 16><<<GRID, 512>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
-                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
-                                    n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_scalar_sm75) { \
+                            if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 8><<<GRID, 256>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
-                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
-                                    n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
@@ -26835,22 +26800,8 @@ static int routed_moe_launch(
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 16><<<GRID, 512>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
-                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_scalar_sm75) { \
+                            if (use_iq2_scalar_sm75) { \
                                 moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 8><<<GRID, 256>>>( \
-                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
-                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
-                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
-                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
-                            } else if (use_iq2_wide512_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
