@@ -163,6 +163,8 @@ static void test_q8_cache_benefit_order(void) {
     const char *shared_down = "blk.3.ffn_down_shexp.weight";
     const char *shared_gate = "blk.3.ffn_gate_shexp.weight";
 
+    (void)unsetenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN");
+
     CHECK(ds4_test_q8_cache_class(q_b) != 0u, "T32 q_b is cache-plannable");
     CHECK(ds4_test_q8_cache_class(out_b) != 0u, "T256 output_b is cache-plannable");
     CHECK(ds4_test_q8_cache_class("blk.3.attn_norm.weight") == 0u,
@@ -187,6 +189,15 @@ static void test_q8_cache_benefit_order(void) {
     CHECK(ds4_test_q8_cache_compare_fallback(
               q_b, 64ull << 20, 1, out_b, 64ull << 20, -1) > 0,
           "partner eligibility selects the tied class that may overflow");
+
+    (void)setenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN", "1", 1);
+    CHECK(ds4_test_q8_cache_compare_fallback(
+              q_b, 64ull << 20, 1, out_b, 64ull << 20, -1) < 0,
+          "frozen-home diagnostic ignores partner eligibility in primary order");
+    CHECK(ds4_test_q8_cache_compare_fallback(
+              q_b, 64ull << 20, -1, out_b, 64ull << 20, 1) < 0,
+          "frozen-home order matches the partner-disabled class order");
+    (void)unsetenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN");
 }
 
 static void test_q8_cache_partner_mapping(void) {
@@ -209,34 +220,34 @@ static void test_q8_cache_partner_mapping(void) {
         out_b, 4, 1, 1, 1, 0);
     CHECK(q_partner == -1,
           "measured default excludes the higher-transfer T32 partner path");
-    CHECK(out_partner == 3 && physical[out_partner] == 2,
-          "default T256 home logical 1 maps to NVLink partner logical 3 (physical 2)");
+    CHECK(out_partner == -1,
+          "failed production candidate is not admitted implicitly");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               7, 5, 7, 5, 18.0, 18.0) == 1,
-          "implicit T256 default accepts the exact SM75 fast-peer threshold");
+          "SM75 fast-peer candidate accepts the exact measurement threshold");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               7, 5, 7, 5, 17.999, 18.0) == 0,
-          "implicit T256 default rejects a slow forward direction");
+          "SM75 fast-peer candidate rejects a slow forward direction");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               7, 5, 7, 5, 18.0, 17.999) == 0,
-          "implicit T256 default rejects a slow reverse direction");
+          "SM75 fast-peer candidate rejects a slow reverse direction");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               8, 0, 8, 0, 100.0, 100.0) == 0,
-          "implicit T256 default rejects an unmeasured SM80 pair");
+          "SM75 fast-peer candidate rejects an unmeasured SM80 pair");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               7, 5, 8, 0, 100.0, 100.0) == 0,
-          "implicit T256 default requires both endpoints to be SM75");
+          "SM75 fast-peer candidate requires both endpoints to be SM75");
     CHECK(ds4_test_q8_cache_partner_tier_qualified(
-              out_b, 4, 1, 1, 1, 0, 0) == -1,
-          "implicit T256 default requires measured SM75 fast-peer qualification");
+              out_b, 4, 1, 1, 1, 1, 0) == -1,
+          "qualified SM75 fast-peer pair remains disabled pending quality isolation");
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
-          "measured default does not partner-offload shared-down");
+          "implicit policy does not partner-offload shared-down");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t256", 1);
     CHECK(ds4_test_q8_cache_partner_tier_qualified(
               out_b, 4, 1, 1, 1, 0, 0) == 3,
-          "explicit T256 remains available outside the measured default target");
+          "explicit T256 remains available as an isolation override");
     CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3,
-          "explicit T256 policy matches the measured default");
+          "explicit T256 maps to the measured fast peer");
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,
           "explicit T256 policy excludes T32");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "legacy", 1);

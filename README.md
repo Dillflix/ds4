@@ -739,9 +739,8 @@ output sharding, pipelined prefill, and compatible grouped decode are selected
 by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
 Pipelined prefill enables the selective Q8-to-F16 weight cache by default and
 uses cuBLAS for eligible dense and shared-expert projections. Cache growth stops
-at the CUDA VRAM reserve. For selected expensive projections—T256
-`attn_output_b` automatically on the qualified target, and T32 `attn_q_b` only
-through an explicit selector—an expansion that does not fit on its stage-home
+at the CUDA VRAM reserve. For explicitly selected expensive T256
+`attn_output_b` or T32 `attn_q_b` projections, an expansion that does not fit on its stage-home
 GPU is admitted on that home's validated NVLink partner: FP16 activations move
 to the partner, cuBLAS executes against the partner-local F16 weight, and the
 FP32 result returns to the home GPU. The path never peer-reads weights and never
@@ -749,21 +748,27 @@ uses the pinned-host bounce route. If neither device can admit the expansion it
 transparently falls back to native Q8. `DS4_CUDA_Q8_F16_CACHE_MB` is a
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing.
+`DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1` is a diagnostic mode that removes partner
+eligibility from the primary admission tie-break. It preserves the
+partner-disabled home binding set, then uses phase-two partner admission only
+for tensors that missed that frozen home plan. It is intended for arithmetic
+and quality attribution, not as an accepted production default.
 Partner activation/result scratch is reserved during cache admission rather
 than grown inside a measured projection. The default reservation covers 2048
 tokens, matching CUDA TP's default prefill chunk;
 `DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=N` changes that bound to a positive token
 count. A larger runtime
 microbatch safely uses the native local path instead of allocating mid-graph.
-The measured automatic partner policy is T256-only on a qualified SM75
-fast-peer pair. Qualification is per home/partner pair: both devices must be
+Automatic partner admission is currently disabled pending frozen-home quality
+isolation. Explicit expert selectors still require a qualified home/partner
+pair: both devices must be
 compute capability 7.5 and startup peer-bandwidth measurements must reach at
 least 18 GiB/s in both directions. A validated `DIRECT` CUDA peer route alone
 does not enable the automatic policy. If either architecture or bandwidth gate
-fails, no partner class is selected implicitly and the local/native fallback
-remains in use. On the repeated fixed full-Q4 22/21 screens, automatic T256
-improved prefill by 13.0--15.3%, moved 3.12 GiB per benchmark sweep, and
-preserved the top token at all nine measured frontiers. T32-only produced the
+fails, partner execution falls back to the local/native path. On the repeated
+fixed full-Q4 22/21 screens, the T256 candidate improved prefill by
+13.0--15.3%, moved 3.12 GiB per benchmark sweep, and preserved the top token at
+all nine measured frontiers. T32-only produced the
 same logits but moved 12.70 GiB and was slower; the initial mixed policy is
 retained as the explicit `legacy` selector.
 
@@ -785,12 +790,11 @@ homes-first physical pair must be reported as `NV#` by `nvidia-smi topo -m`.
 It records that mapping and requires a nonzero, class-pure audit sample on one
 or both configured partners. An asymmetric stage split may need overflow on
 only the tighter stage; the bounded audit records which partner(s) it observed.
-Use `speed-bench/cuda-q8-partner-production-validation.sh` for the production
-decision gate. It leaves the candidate class selector unset to prove automatic
-SM75/fast-peer admission, compares against a partner-disabled control on the
-same model, scores the official 100-case suite through the production dispatch,
-and measures the fixed 16K/32K prefill frontiers. This bounded acceptance pass
-does not validate 64K operation.
+The first `speed-bench/cuda-q8-partner-production-validation.sh` result failed
+its predeclared quality-stability gate, so its implicit candidate was disabled.
+Use `speed-bench/cuda-q8-partner-quality-isolation.sh` to separate additive
+T256 from additive T32 arithmetic before proposing another default. The prior
+bounded acceptance pass measured only 16K/32K and did not validate 64K.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

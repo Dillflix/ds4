@@ -2963,21 +2963,18 @@ static bool accelerator_q8_cache_implicit_default_qualified(
            reverse_gib_per_sec >= 18.0;
 }
 
-/* The full-Q4 class-isolated screen selects T256 by default on the measured
- * SM75 + fast-peer target.  The automatic path requires at least 18 GiB/s in
- * both directions, which excludes PCIe 3.0 x16 while retaining the RTX 8000
- * NVLink pairs.  An explicit class selector remains an expert override.
- * T32 and T256
- * produced identical logits and similar compute savings, but T256 moved only
- * 3.12 GiB per sweep versus T32's 12.70 GiB and was consistently faster.
- * Shared-down was materially slower and changed the 2048-token top result.
+/* T256 was the best full-Q4 performance candidate on the measured SM75 +
+ * fast-peer target, but its first production quality run also changed the
+ * tied home-cache set and failed the predeclared stability gates. Keep
+ * implicit admission disabled until frozen-home class isolation identifies a
+ * quality-safe policy. Explicit selectors remain expert measurement tools.
  * Keep "legacy" as an explicit compatibility/measurement selector. */
 static bool accelerator_q8_cache_partner_class_enabled(
         uint32_t path_class, bool implicit_default_qualified) {
     const char *list = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!list || !list[0]) {
-        return implicit_default_qualified &&
-               path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+        (void)implicit_default_qualified;
+        return false;
     }
     if (strcmp(list, "legacy") == 0) {
         return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
@@ -3034,13 +3031,18 @@ static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     /* Within this home-device bucket, at equal benefit/byte, keep fixed/home-
      * only candidates local before candidates that can spill to an NVLink
      * partner.  The class selector is therefore a placement policy: on a
-     * constrained home it deliberately
-     * chooses which tied class executes remotely.  Compare eligibility rather
-     * than physical IDs so this policy is explicit and topology-independent. */
-    const int a_can_fallback = a->fallback_physical_device >= 0;
-    const int b_can_fallback = b->fallback_physical_device >= 0;
-    if (a_can_fallback < b_can_fallback) return -1;
-    if (a_can_fallback > b_can_fallback) return 1;
+     * constrained home it deliberately chooses which tied class executes
+     * remotely.  The frozen-home diagnostic omits only this tie-break so its
+     * primary order is identical to partner-disabled admission; phase two may
+     * then add genuine misses without reshuffling the home cache. */
+    const bool freeze_home_order =
+        getenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN") != NULL;
+    if (!freeze_home_order) {
+        const int a_can_fallback = a->fallback_physical_device >= 0;
+        const int b_can_fallback = b->fallback_physical_device >= 0;
+        if (a_can_fallback < b_can_fallback) return -1;
+        if (a_can_fallback > b_can_fallback) return 1;
+    }
     if (a->layer < b->layer) return -1;
     if (a->layer > b->layer) return 1;
     if (a->path_class < b->path_class) return -1;
@@ -55778,7 +55780,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
     uint64_t partner_fallback_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
-    if (!partner_classes || !partner_classes[0]) partner_classes = "t256";
+    if (!partner_classes || !partner_classes[0]) partner_classes = "none";
+    const bool freeze_home_plan =
+        getenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN") != NULL;
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
     const bool split_attn_output =
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
@@ -55907,7 +55911,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     fprintf(stderr,
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
-            "other=%llu partner-fallback=%llu partner-classes=%s\n",
+            "other=%llu partner-fallback=%llu partner-classes=%s "
+            "home-order=%s\n",
             (unsigned long long)plan_count,
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
@@ -55916,7 +55921,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             (unsigned long long)(class_count[ACCEL_Q8_CACHE_SHARED_GATE_UP] +
                                  class_count[ACCEL_Q8_CACHE_OTHER_ATTN]),
             (unsigned long long)partner_fallback_count,
-            partner_classes);
+            partner_classes,
+            freeze_home_plan ? "frozen" : "partner-priority");
 
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {

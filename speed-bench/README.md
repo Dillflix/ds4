@@ -394,25 +394,25 @@ When `RUN_NSYS=1`, `NSYS_VARIANTS` accepts a comma-separated subset of
 `class-evidence.csv` records execution counts by class and its `nsys/`
 directory contains the bounded timelines and exported summaries.
 
-Repeated full-Q4 screens selected T256-only as the production default; the
-latest measured 13.0--15.3% over local, versus 12.2--14.3% for T32-only. The
+Repeated full-Q4 screens selected T256-only as the best performance candidate;
+the latest measured 13.0--15.3% over local, versus 12.2--14.3% for T32-only. The
 initial mixed legacy policy measured 12.3--14.4%. T32, T256, and legacy produced
 byte-identical logits to one another, but the T256 trace moved only 3.12 GiB of
 partner activation and result traffic versus T32's 12.70 GiB. Shared-down
 gained only 2.9--3.4%,
 changed the 2048-token top result in every repeat, and is rejected as a default.
 
-For the production-default decision, use
+The first production-default decision used
 `cuda-q8-partner-production-validation.sh` rather than the exploratory variant
-screen. The control disables partner execution. The candidate deliberately
+screen. The control disabled partner execution. The candidate deliberately
 sets no `DS4_CUDA_Q8_F16_PARTNER_CLASSES` override, so it validates the measured
-automatic policy: T256 is admitted only for SM75 home/partner devices whose
+automatic candidate: T256 was admitted only for SM75 home/partner devices whose
 startup peer-bandwidth measurements reach at least 18 GiB/s in both directions.
 An explicit `t256` selector remains useful for expert diagnostics on other
 targets, but such a run does not prove that automatic admission selected the
 production default.
 
-The production runner builds and runs the placement and multi-GPU exactness
+That production runner builds and runs the placement and multi-GPU exactness
 tests, scores the same full-Q4 model with partner execution disabled and enabled
 across the official 100-case Flash fixture using
 `score_official --production-path`, and performs at least three paired prefill
@@ -454,6 +454,40 @@ attempts to weaken the target or use fewer than three repeats. Return the genera
 `t256-production-validation-<timestamp>.tar.gz`. Before accepting a result,
 check that `run-status.txt` says `state=finished`, `summary.md` says
 `Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
+
+The first production-default result failed its predeclared per-case,
+first-token, and greedy-prefix quality gates even though aggregate NLL improved.
+It also established that the normal partner-priority tie-break changed the
+home cache: six additional T32 and seven additional T256 projections switched
+from native Q8 to F16/cuBLAS. Use the frozen-home quality-isolation runner
+before attributing that result to either class. For candidate runs it removes
+partner eligibility from the primary sort, proves that all home bindings remain
+identical to the partner-disabled control, and then admits only previously
+uncached T256 or T32 tensors on the partner. Quality failure is a measured
+outcome rather than a runner failure; structural contamination still aborts.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+QUALITY_CTX=32769 \
+REUSE_LOCAL_DIR="$PWD/t256-production-validation-20260826T035132Z" \
+SKIP_BUILD=0 \
+./speed-bench/cuda-q8-partner-quality-isolation.sh
+```
+
+Return `q8-partner-quality-isolation-<timestamp>.tar.gz`. Its `summary.md`
+reports the T256-only and T32-only quality gates and the exact additive partner
+layers. This pass is quality-only; benchmark only a class/subset that survives
+it. `REUSE_LOCAL_DIR` is optional; when set, the runner verifies the prior
+model path and size, quality fixture, 32K allocation pressure, GPU order, and
+22/21 split before reusing its local-control evidence. Omit it if that source
+directory is no longer present.
 
 The completed T32 fusion A/B can eliminate redundant local and T32 runs:
 
