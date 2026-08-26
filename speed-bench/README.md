@@ -552,12 +552,11 @@ Strict mode omits the natural-overflow arm because complete coverage makes it
 redundant; it compares native-T256-only, all-local, balanced, and all-partner.
 Legacy mode retains the five-arm overflow reproduction.
 
-The mixed-model generator currently sizes its reclaim against all-partner T256
-placement. That is a capacity screen for that one placement only, not proof
-that all-partner is optimal and not a guarantee that the stricter five-arm
-comparison fits. A placement-neutral model must also fit the all-local home
-footprint (an additional 1.375 GiB on the 22-layer home and 1.3125 GiB on the
-21-layer home). This runner fails closed if that stronger condition is absent.
+The mixed-model generator sizes its reclaim against the worst-case all-local
+home footprint (an additional 1.375 GiB on the 22-layer home and 1.3125 GiB on
+the 21-layer home relative to all-partner). This is a placement-neutral capacity
+envelope, not a claim that all-local is optimal. The runner still fails closed
+unless every tested arm preserves complete coverage and the free-memory floor.
 
 One-repeat screen:
 

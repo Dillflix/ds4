@@ -12,7 +12,7 @@ Usage:
 
 The recipe is measured, not hardcoded. A known all-IQ2-gate/up + Q4-down
 calibration model is loaded with the final 256K allocation, complete dense
-FP16 coverage, and all-partner T256 policy. Post-warm-up free VRAM is measured
+FP16 coverage, and worst-case all-local T256 policy. Post-warm-up free VRAM is measured
 on every device. The selector promotes as many matched gate/up layer pairs to
 Q4_K as both devices in each NVLink stage can hold while preserving the CUDA
 cache reserve plus the requested safety margin. Routed down remains Q4_K in
@@ -100,11 +100,12 @@ export DS4_CUDA_EP_STAGE_SPLIT=${DS4_CUDA_EP_STAGE_SPLIT:-22}
 export DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
 export DS4_CUDA_Q8_F16_ALL=1
 export DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1
-export DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
-export DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42
+export DS4_CUDA_Q8_F16_PARTNER_CLASSES=none
 export DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048
-export DS4_CUDA_Q8_T256_PLACEMENT=all-partner
-export DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16
+export DS4_CUDA_Q8_T256_PLACEMENT=all-local
+export DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
+unset DS4_CUDA_Q8_F16_PARTNER_LAYERS
+unset DS4_CUDA_Q8_PARTNER_ARITHMETIC
 prefix=${out%.gguf}
 baseline_plan=${BASELINE_PLAN_AUDIT:-$prefix.all-iq2-256k-plan.csv}
 baseline_log=${BASELINE_LOG:-$prefix.all-iq2-256k-plan.log}
@@ -175,7 +176,8 @@ IFS=$'\t' read -r iq2_layers tensor_overrides <<< "$selection"
     printf 'gpu_devices=%s\n' "$gpu_devices"
     printf 'stage_split=%s\n' "$DS4_CUDA_EP_STAGE_SPLIT"
     printf 'dense_cache_policy=all-q8-f16\n'
-    printf 't256_placement=all-partner\n'
+    printf 'capacity_calibration_t256_placement=all-local\n'
+    printf 'placement_target=neutral-worst-case-home-footprint\n'
     printf 'cache_extra_headroom_mib_per_device=%s\n' "$extra_headroom"
     printf 'expected_dense_candidates=%s\n' "$expected_candidates"
     printf 'routed_down_type=q4_k\n'

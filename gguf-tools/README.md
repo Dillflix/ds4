@@ -273,7 +273,7 @@ bash produce-verify-q4-iq2-full-f16-256k.sh \
 
 It loads the existing all-IQ2-gate/up + Q4-down model at the actual 262144-token
 allocation with `GPU_DEVICES=0,3,1,2`, the 22/21 pipeline split, all dense-Q8
-FP16 candidates, and all-partner T256 placement. After a production warm-up it
+FP16 candidates, and worst-case all-local T256 placement. After a production warm-up it
 measures free VRAM and the active cache reserve on every GPU, then promotes as
 many matched gate/up layer pairs to Q4_K as both members of each NVLink stage
 can hold. Routed down stays Q4_K in every layer. This calibration direction is
@@ -287,6 +287,11 @@ IQ2; the default `3-42` is deterministic but is not presented as a
 quality-sensitivity ranking. Tagged files store only their remaining Q4 routed
 tensors in the SM75-native format; IQ2 tensors retain their standard layout and
 dispatch.
+
+All-local is a capacity envelope, not a presumed deployment winner: it places
+an additional 1.375 GiB on the 22-layer home and 1.3125 GiB on the 21-layer
+home relative to all-partner. The resulting model must subsequently pass the
+strict all-local/balanced/all-partner screen before any placement is selected.
 
 Useful checks before writing a full model:
 
