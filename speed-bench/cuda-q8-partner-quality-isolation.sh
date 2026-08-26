@@ -163,10 +163,12 @@ run_quality() {
         local)
             variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
             variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         t256|t32)
             variant_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
             variant_env+=("DS4_CUDA_Q8_F16_PARTNER_CLASSES=$variant")
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             local layer_var
             if [[ $variant == t256 ]]; then
                 layer_var=$T256_LAYERS

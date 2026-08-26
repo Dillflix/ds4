@@ -2187,7 +2187,8 @@ static void cuda_q8_f16_plan_materialize(void) {
         getenv("DS4_CUDA_Q8_T256_PLACEMENT");
     const bool force_all_t256_partner = t256_placement_env &&
         strcmp(t256_placement_env, "all-partner") == 0;
-    const bool force_balanced_t256_partner = t256_placement_env &&
+    const bool force_balanced_t256_partner =
+        !t256_placement_env || !t256_placement_env[0] ||
         strcmp(t256_placement_env, "balanced") == 0;
     const char *plan_audit_path = getenv("DS4_CUDA_Q8_PLAN_AUDIT_CSV");
     const bool allow_forced_capacity_miss_for_audit =

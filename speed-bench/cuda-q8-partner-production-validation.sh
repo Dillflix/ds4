@@ -190,6 +190,7 @@ run_quality() {
     if [[ $variant == local ]]; then
         variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
         variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+        variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
     elif [[ $variant != default ]]; then
         die "internal unknown quality variant: $variant"
     fi

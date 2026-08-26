@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize one combined native-Q4/all-partner-T256 production trace."""
+"""Summarize one mixed-Q4/IQ2, balanced-T256 production trace."""
 
 from __future__ import annotations
 
@@ -51,6 +51,8 @@ def classify(row: dict[str, str]) -> str:
         return "other_memcpy"
     if "moe_gate_up_mid_sm75_native_q4_tile8_kernel" in name:
         return "native_q4_gate_up"
+    if "moe_gate_up_mid_iq2_" in name:
+        return "iq2_gate_up"
     if "moe_down_sm75_native_q4_tile_kernel" in name:
         return "native_q4_down"
     if "matmul_q8_0_mma_sm75_exact_kernel" in name:
@@ -72,14 +74,14 @@ def main() -> int:
 
     partner_bindings = [row for row in bindings if row["partner_offload"] == "1"]
     expected_binding_labels = {
-        f"tensor:blk.{layer}.attn_output_b.weight" for layer in range(43)
+        f"tensor:blk.{layer}.attn_output_b.weight" for layer in range(1, 43, 2)
     }
     actual_binding_labels = {row["label"] for row in partner_bindings}
-    if len(partner_bindings) != 43 or actual_binding_labels != expected_binding_labels:
+    if len(partner_bindings) != 21 or actual_binding_labels != expected_binding_labels:
         missing_labels = sorted(expected_binding_labels - actual_binding_labels)
         extra_labels = sorted(actual_binding_labels - expected_binding_labels)
         die(
-            "expected exactly one partner T256 binding for every layer 0..42; "
+            "expected exactly one partner T256 binding for every odd layer; "
             f"found {len(partner_bindings)} bindings "
             f"(missing={missing_labels[:1]}, extra={extra_labels[:1]})"
         )
@@ -154,6 +156,7 @@ def main() -> int:
         die("unexpected partner range shape: " + partner_shape_errors[0])
     required = {
         "native_q4_gate_up",
+        "iq2_gate_up",
         "native_q4_down",
         "partner_t256_activation_convert",
         "partner_t256_cublas",
@@ -171,7 +174,7 @@ def main() -> int:
     prefill_tokens = int(benchmark[0]["prefill_tokens"])
     if prefill_tokens % 512:
         die(f"prefill token count is not divisible by 512: {prefill_tokens}")
-    expected_projections = 43 * (prefill_tokens // 512)
+    expected_projections = 21 * (prefill_tokens // 512)
     expected_counts = {
         "partner_t256_activation_convert": expected_projections,
         "partner_t256_cublas": expected_projections,
@@ -250,12 +253,15 @@ def main() -> int:
 
     by_name = {row["group"]: row for row in group_rows}
     with (output / "summary.md").open("w", encoding="utf-8") as handle:
-        handle.write("# SM75 native-Q4 + all-partner T256 profile\n\n")
-        handle.write(f"Bounded 2K prefill: **{tps:.2f} tokens/s**.\n\n")
+        handle.write("# SM75 mixed-Q4/IQ2 + balanced-T256 profile\n\n")
+        handle.write(
+            f"Bounded {prefill_tokens}-token prefill at a production 256K "
+            f"allocation: **{tps:.2f} tokens/s**.\n\n"
+        )
         handle.write("| Attributed group | GPU time | Share of annotated kernel time | Operations |\n")
         handle.write("|---|---:|---:|---:|\n")
         for name in (
-            "native_q4_gate_up", "native_q4_down",
+            "native_q4_gate_up", "iq2_gate_up", "native_q4_down",
             "partner_t256_activation_convert", "partner_t256_cublas",
             "partner_t256_memcpy", "dense_q8_native", "attention",
             "other_moe", "other", "other_memcpy",

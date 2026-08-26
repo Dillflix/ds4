@@ -207,9 +207,11 @@ for ((variant_index=0; variant_index<${#variants[@]}; variant_index++)); do
     if [[ $variant == local ]]; then
         variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
         variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+        variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
     else
         variant_env+=(DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1)
         variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256)
+        variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
         variant_env+=("DS4_CUDA_Q8_F16_PARTNER_LAYERS=$T256_LAYERS")
         variant_env+=("DS4_CUDA_Q8_PARTNER_ARITHMETIC=$variant")
     fi

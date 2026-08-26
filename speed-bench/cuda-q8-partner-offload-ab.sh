@@ -219,13 +219,24 @@ set_variant_extra() {
         local)
             variant_extra+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
             variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+            variant_extra+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         default) ;;
-        legacy) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=legacy) ;;
-        t32) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t32) ;;
-        t256) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256) ;;
+        legacy)
+            variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=legacy)
+            variant_extra+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
+            ;;
+        t32)
+            variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t32)
+            variant_extra+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
+            ;;
+        t256)
+            variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256)
+            variant_extra+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
+            ;;
         shared_down)
             variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=shared_down)
+            variant_extra+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         *) die "internal unknown variant: $1" ;;
     esac

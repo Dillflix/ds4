@@ -1459,33 +1459,40 @@ SQLite exports, and telemetry before rerunning only the bounded same-work
 harness and summarizer. It preserves the failed run's provenance and writes a
 separate `.resume-<timestamp>.tar.gz` archive.
 
-### Combined native-Q4 and all-partner T256 profile
+### Mixed-Q4/IQ2 and balanced-T256 production profile
 
 `cuda-sm75-native-q4-t256-profile.sh` profiles the accepted combined
 configuration without repeating its throughput A/B. It opens the NFS-backed
-native model exactly once and captures only one timed 2048-token frontier with
-Nsight Systems. The trace requires the tagged native Q4 gate/down dispatch,
-the exact 43-layer full-Q4 recipe, frozen cache state, and the complete
-all-partner T256 binding inventory.
+model exactly once and captures one timed 8192-token frontier at the production
+256K context allocation with Nsight Systems. No placement/class environment
+override is set: the trace must prove that the engine selected its automatic
+balanced policy, qualified both SM75 NVLink pairs, materialized all 344 dense
+F16 weights, and produced exactly 22 local plus 21 odd-layer partner T256
+bindings. It also requires the tagged native-Q4 dispatch and the exact mixed
+Q4/IQ2/Q4 routed recipe.
 
 Nsight Compute does not reopen the GGUF. Production-shaped harnesses capture
-representative early/late native-Q4 gate and down calls, plus a two-GPU
-512-token partner-T256 FP16 cuBLAS call matching the actual pipeline
-microbatch. The reports include occupancy, compute/memory throughput, cache
-traffic, and warp-stall sections. The production trace separately attributes
-the activation conversion, both NVLink copies, and partner cuBLAS work through
-the existing NVTX correlation ranges.
+representative early/late native-Q4 gate/down and IQ2 tile16/tile8 calls, plus
+512-token T32 and T256 dense-F16 cuBLAS calls. The reports include occupancy,
+compute/memory throughput, cache traffic, and warp-stall sections. The
+production trace separately attributes stage/device work, communication,
+activation conversion, both NVLink copies, and partner cuBLAS through existing
+NVTX correlation ranges. A 200 ms `nvidia-smi` stream records utilization,
+power, clocks, temperature, and memory while a device-buffer tile audit records
+real pair/tile/padding/ownership counts with one final host copy.
 
 ```bash
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
+PROFILE_TOKENS=8192 \
+CTX_ALLOC=262273 \
 PROFILE_GPU=0 \
 PROFILE_PARTNER_GPU=1 \
 RUN_NCU=1 \
@@ -1495,7 +1502,7 @@ SKIP_BUILD=0 \
 ```
 
 Return `sm75-native-q4-t256-profile-<timestamp>.tar.gz`. Model hashing is
-disabled. If the native GGUF is cold in the Linux page cache, its single NFS
+disabled. If the GGUF is cold in the Linux page cache, its single NFS
 startup may still take roughly 25 minutes at 100--105 MiB/s; the later Nsight
 Compute passes do not touch that file.
 
@@ -1504,13 +1511,15 @@ reuse that trace in a new result directory and proceed to Nsight Compute
 without opening the GGUF payload again:
 
 ```bash
-export NATIVE_MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export REUSE_NSYS_DIR="$PWD/sm75-native-q4-t256-profile-20260826T144211Z"
 
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
+PROFILE_TOKENS=8192 \
+CTX_ALLOC=262273 \
 PROFILE_GPU=0 \
 PROFILE_PARTNER_GPU=1 \
 RUN_NCU=1 \
@@ -1520,7 +1529,8 @@ SKIP_BUILD=1 \
 ```
 
 Resume mode copies and revalidates the existing report, benchmark, cache
-snapshots, and exact 43-layer binding inventory. It reruns the corrected
+snapshots, allocation/memory evidence, tile audit, and exact balanced binding
+inventory. It reruns the corrected
 summaries and the model-free Nsight Compute harnesses in a fresh output
 directory; it does not mutate the original failed evidence.
 

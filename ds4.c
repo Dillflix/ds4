@@ -3050,18 +3050,16 @@ static bool accelerator_q8_cache_implicit_default_qualified(
            reverse_gib_per_sec >= 18.0;
 }
 
-/* T256 was the best full-Q4 performance candidate on the measured SM75 +
- * fast-peer target, but its first production quality run also changed the
- * tied home-cache set and failed the predeclared stability gates. Keep
- * implicit admission disabled until frozen-home class isolation identifies a
- * quality-safe policy. Explicit selectors remain expert measurement tools.
+/* The accepted SM75 production policy alternates T256 execution between each
+ * layer's home and its fast NVLink partner.  An unset class selector therefore
+ * admits T256 only when the measured architecture/link qualification passed.
  * Keep "legacy" as an explicit compatibility/measurement selector. */
 static bool accelerator_q8_cache_partner_class_enabled(
         uint32_t path_class, bool implicit_default_qualified) {
     const char *list = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!list || !list[0]) {
-        (void)implicit_default_qualified;
-        return false;
+        return implicit_default_qualified &&
+               path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
     }
     if (strcmp(list, "legacy") == 0) {
         return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
@@ -3104,7 +3102,9 @@ typedef enum {
 
 static accelerator_q8_t256_placement accelerator_q8_t256_placement_mode(void) {
     const char *value = getenv("DS4_CUDA_Q8_T256_PLACEMENT");
-    if (!value || !value[0] || strcmp(value, "overflow") == 0)
+    if (!value || !value[0] || strcmp(value, "balanced") == 0)
+        return ACCEL_Q8_T256_BALANCED;
+    if (strcmp(value, "overflow") == 0)
         return ACCEL_Q8_T256_OVERFLOW;
     if (strcmp(value, "all-local") == 0)
         return ACCEL_Q8_T256_ALL_LOCAL;
@@ -55922,7 +55922,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
     uint64_t partner_fallback_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
-    if (!partner_classes || !partner_classes[0]) partner_classes = "none";
+    if (!partner_classes || !partner_classes[0])
+        partner_classes = "automatic:t256";
     const char *partner_arithmetic_env =
         getenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
     const char *partner_arithmetic =
@@ -56680,6 +56681,25 @@ int ds4_test_q8_t256_placement_valid(const char *value) {
         (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
     }
     return valid;
+}
+
+int ds4_test_q8_t256_placement_matches(
+        const char *value, const char *expected) {
+    const char *old = getenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    char *saved = old ? strdup(old) : NULL;
+    if (value) (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", value, 1);
+    else (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    const accelerator_q8_t256_placement mode =
+        accelerator_q8_t256_placement_mode();
+    const int matches = expected &&
+        strcmp(accelerator_q8_t256_placement_name(mode), expected) == 0;
+    if (saved) {
+        (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", saved, 1);
+        free(saved);
+    } else {
+        (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    }
+    return matches;
 }
 
 int ds4_test_q8_cache_partner_tier(

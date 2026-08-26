@@ -252,6 +252,7 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
         "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB" \
         DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
         DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256 \
+        DS4_CUDA_Q8_T256_PLACEMENT=overflow \
         DS4_CUDA_CRITICAL_PATH_NVTX=1 \
         DS4_CUDA_PREFILL_AUDIT=1 \
         "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \

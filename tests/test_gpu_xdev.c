@@ -1875,7 +1875,8 @@ static int run_q8_partner_projection_case(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t n_tok,
-        int profile_capture) {
+        int profile_capture,
+        int t32_fused) {
     const uint64_t fp16_bytes = in_dim * out_dim * sizeof(uint16_t);
     char cache_mib[32];
     snprintf(cache_mib, sizeof(cache_mib), "%llu",
@@ -1885,8 +1886,13 @@ static int run_q8_partner_projection_case(
     (void)setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "f16", 1);
     (void)setenv("DS4_CUDA_NO_TF32", "1", 1);
     (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
-    (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
-    (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
+    if (t32_fused) {
+        (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
+        (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
+    } else {
+        (void)setenv("DS4_CUDA_NO_T32_F16_FUSED", "1", 1);
+        (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+    }
     (void)unsetenv("DS4_FORCE_HOST_BOUNCE");
 
     ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
@@ -2192,13 +2198,13 @@ static int run_q8_partner_projection(void) {
 
     if (run_q8_partner_projection_case(
             "T32", "tensor:blk.1.attn_q_b.weight",
-            1024u, 32768u, 17u, 0)) return 1;
+            1024u, 32768u, 17u, 0, 1)) return 1;
     if (run_q8_partner_projection_case(
             "T256", "tensor:blk.1.attn_output_b.weight",
-            8192u, 4096u, 17u, 0)) return 1;
+            8192u, 4096u, 17u, 0, 1)) return 1;
     if (run_q8_partner_projection_case(
             "shared-down", "tensor:blk.1.ffn_down_shexp.weight",
-            2048u, 4096u, 17u, 0)) return 1;
+            2048u, 4096u, 17u, 0, 1)) return 1;
     fprintf(stderr, "  q8 partner projection exactness OK (3 classes)\n");
     return 0;
 }
@@ -2350,25 +2356,32 @@ int main(int argc, char **argv) {
     (void)cudaGetDeviceCount(&dev_count);
     fprintf(stderr, "test_gpu_xdev: %d CUDA devices visible\n", dev_count);
 
-    if (argc == 2 && strcmp(argv[1], "q8-partner-t256-profile") == 0) {
+    if (argc == 2 &&
+        (strcmp(argv[1], "q8-partner-t256-profile") == 0 ||
+         strcmp(argv[1], "q8-partner-t32-profile") == 0)) {
         if (dev_count < 2) {
             fprintf(stderr,
-                    "error: q8-partner-t256-profile requires two visible GPUs\n");
+                    "error: Q8 partner profile requires two visible GPUs\n");
             return 2;
         }
+        const int t32 = strcmp(argv[1], "q8-partner-t32-profile") == 0;
         fprintf(stdout,
-                "scenario=q8-partner-t256-profile\n"
+                "scenario=%s\n"
                 "profile_kind=partner_f16_cublas\n"
-                "profile_tokens=512\n");
+                "profile_tokens=512\n", argv[1]);
         const int rc = run_q8_partner_projection_case(
-            "T256-profile", "tensor:blk.1.attn_output_b.weight",
-            8192u, 4096u, 512u, 1);
+            t32 ? "T32-profile" : "T256-profile",
+            t32 ? "tensor:blk.1.attn_q_b.weight" :
+                  "tensor:blk.1.attn_output_b.weight",
+            t32 ? 1024u : 8192u, t32 ? 32768u : 4096u, 512u, 1,
+            0);
         if (rc == 0) fprintf(stdout, "harness_status=ok\n");
         return rc;
     }
     if (argc != 1) {
         fprintf(stderr,
-                "Usage: %s [q8-partner-t256-profile]\n", argv[0]);
+                "Usage: %s [q8-partner-t256-profile|q8-partner-t32-profile]\n",
+                argv[0]);
         return 2;
     }
 

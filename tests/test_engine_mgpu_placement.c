@@ -69,6 +69,8 @@ int ds4_test_q8_cache_partner_layer_enabled(
                                    int *valid_out);
 int ds4_test_q8_partner_arithmetic_valid(const char *value);
 int ds4_test_q8_t256_placement_valid(const char *value);
+int ds4_test_q8_t256_placement_matches(const char *value,
+                                       const char *expected);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -172,7 +174,7 @@ static void test_q8_cache_benefit_order(void) {
     const char *shared_gate = "blk.3.ffn_gate_shexp.weight";
 
     (void)unsetenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN");
-    (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", "overflow", 1);
 
     CHECK(ds4_test_q8_cache_class(q_b) != 0u, "T32 q_b is cache-plannable");
     CHECK(ds4_test_q8_cache_class(out_b) != 0u, "T256 output_b is cache-plannable");
@@ -229,6 +231,10 @@ static void test_q8_cache_benefit_order(void) {
     CHECK(ds4_test_q8_cache_compare(out_b, 64ull << 20,
                                     q_b, 64ull << 20) < 0,
           "all-local T256 priority is antisymmetric");
+    (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", "balanced", 1);
+    CHECK(ds4_test_q8_cache_compare(out_b, 64ull << 20,
+                                    q_b, 64ull << 20) < 0,
+          "balanced production policy preserves complete T256 residency");
     (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
 }
 
@@ -248,6 +254,10 @@ static void test_q8_cache_partner_mapping(void) {
     CHECK(ds4_test_q8_t256_placement_valid("local") == 0 &&
           ds4_test_q8_t256_placement_valid("alternating") == 0,
           "undeclared T256 placement policies are rejected");
+    CHECK(ds4_test_q8_t256_placement_matches(NULL, "balanced") == 1,
+          "unset T256 placement selects the production balanced policy");
+    CHECK(ds4_test_q8_t256_placement_matches("overflow", "overflow") == 1,
+          "the legacy overflow policy remains an explicit diagnostic");
 
     CHECK(physical[0] == 0 && physical[2] == 1,
           "production logical pair 0<->2 maps physical NVLink pair 0<->1");
@@ -300,8 +310,8 @@ static void test_q8_cache_partner_mapping(void) {
         out_b, 4, 1, 1, 1, 0);
     CHECK(q_partner == -1,
           "measured default excludes the higher-transfer T32 partner path");
-    CHECK(out_partner == -1,
-          "failed production candidate is not admitted implicitly");
+    CHECK(out_partner == 3,
+          "qualified default admits T256 on its measured fast peer");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
               7, 5, 7, 5, 18.0, 18.0) == 1,
           "SM75 fast-peer candidate accepts the exact measurement threshold");
@@ -318,8 +328,11 @@ static void test_q8_cache_partner_mapping(void) {
               7, 5, 8, 0, 100.0, 100.0) == 0,
           "SM75 fast-peer candidate requires both endpoints to be SM75");
     CHECK(ds4_test_q8_cache_partner_tier_qualified(
-              out_b, 4, 1, 1, 1, 1, 0) == -1,
-          "qualified SM75 fast-peer pair remains disabled pending quality isolation");
+              out_b, 4, 1, 1, 1, 1, 0) == 3,
+          "qualified SM75 fast-peer pair enables production T256 placement");
+    CHECK(ds4_test_q8_cache_partner_tier_qualified(
+              out_b, 4, 1, 1, 1, 0, 0) == -1,
+          "unqualified pair cannot use implicit T256 partner placement");
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
           "implicit policy does not partner-offload shared-down");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t256", 1);

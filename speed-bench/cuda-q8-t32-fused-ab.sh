@@ -102,19 +102,23 @@ set_variant_env() {
             variant_env+=(DS4_CUDA_T32_F16_FUSED=0)
             variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
             variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         new_local)
             variant_env+=(DS4_CUDA_T32_F16_FUSED=1)
             variant_env+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
             variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         old_partner)
             variant_env+=(DS4_CUDA_T32_F16_FUSED=0)
             variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t32)
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         new_partner)
             variant_env+=(DS4_CUDA_T32_F16_FUSED=1)
             variant_env+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t32)
+            variant_env+=(DS4_CUDA_Q8_T256_PLACEMENT=overflow)
             ;;
         *) die "unknown variant $1" ;;
     esac

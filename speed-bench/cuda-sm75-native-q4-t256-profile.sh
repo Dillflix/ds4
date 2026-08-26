@@ -3,21 +3,22 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Profile the accepted SM75 native-Q4 + all-partner T256 production path.
+Profile the accepted SM75 mixed-Q4/IQ2 + balanced-T256 production path.
 
-The full 153 GiB model is opened exactly once for a bounded 2K Nsight Systems
-capture. Nsight Compute uses small production-shaped harnesses and therefore
-does not reread the GGUF for each metric pass.
+The model is opened exactly once for a bounded Nsight Systems capture at the
+production 256K allocation. Nsight Compute uses small production-shaped
+harnesses and therefore does not reread the GGUF for each metric pass.
 
 Required environment:
-  NATIVE_MODEL=/absolute/path/to/tagged-SM75-native-full-Q4.gguf
+  MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
 
 Optional environment:
   PROMPT=...                    default: speed-bench/promessi_sposi.txt
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
   STAGE_SPLIT=22
-  PROFILE_TOKENS=2048
+  PROFILE_TOKENS=8192
+  CTX_ALLOC=262273
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
   PROFILE_GPU=0                physical GPU for native-Q4 NCU harnesses
@@ -37,15 +38,18 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
-: "${NATIVE_MODEL:?set NATIVE_MODEL to the absolute tagged SM75-native Q4 GGUF}"
-[[ $NATIVE_MODEL == /* && -f $NATIVE_MODEL ]] ||
-    die "NATIVE_MODEL must name an existing absolute file"
+MODEL=${MODEL:-${NATIVE_MODEL:-}}
+: "${MODEL:?set MODEL to the absolute tagged SM75 mixed-Q4/IQ2 GGUF}"
+[[ $MODEL == /* && -f $MODEL ]] ||
+    die "MODEL must name an existing absolute file"
+NATIVE_MODEL=$MODEL
 
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
-PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
+PROFILE_TOKENS=${PROFILE_TOKENS:-8192}
+CTX_ALLOC=${CTX_ALLOC:-262273}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
 PROFILE_GPU=${PROFILE_GPU:-0}
@@ -60,7 +64,8 @@ OUTPUT_DIR=${COMBINED_PROFILE_DIR:-$repo_dir/sm75-native-q4-t256-profile-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
-            "PREFILL_CHUNK:$PREFILL_CHUNK" "PIPELINE_MB:$PIPELINE_MB" \
+            "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
+            "PIPELINE_MB:$PIPELINE_MB" \
             "PROFILE_GPU:$PROFILE_GPU" \
             "PROFILE_PARTNER_GPU:$PROFILE_PARTNER_GPU" \
             "RUN_NCU:$RUN_NCU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
@@ -70,9 +75,11 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 )) ||
     die "STAGE_SPLIT must be in 1..42"
-(( PROFILE_TOKENS == 2048 && PREFILL_CHUNK == 2048 &&
+(( PROFILE_TOKENS >= PREFILL_CHUNK &&
+   PROFILE_TOKENS % PREFILL_CHUNK == 0 &&
+   CTX_ALLOC > PROFILE_TOKENS && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
-    die "the production-shaped profile must remain 2048/2048/512 tokens"
+    die "require profile_tokens>=2048, a 2048-token chunk, 512-token pipeline, and ctx_alloc>profile_tokens"
 for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -195,11 +202,6 @@ production_env=(
     "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB"
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
-    DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1
-    DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
-    DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42
-    DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16
-    DS4_CUDA_Q8_T256_PLACEMENT=all-partner
 )
 
 phase=build
@@ -240,20 +242,29 @@ env CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
 grep -Fq 'harness_status=ok' \
     "$OUTPUT_DIR/validation/partner-t256-harness.log" ||
     die "partner T256 harness omitted success"
+env CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
+    ./tests/test_gpu_xdev q8-partner-t32-profile \
+    >"$OUTPUT_DIR/validation/partner-t32-harness.log" 2>&1 || {
+        tail -n 120 "$OUTPUT_DIR/validation/partner-t32-harness.log" >&2 || true
+        die "partner T32 profile harness failed"
+    }
+grep -Fq 'harness_status=ok' \
+    "$OUTPUT_DIR/validation/partner-t32-harness.log" ||
+    die "partner T32 harness omitted success"
 
 phase=manifest
 {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$(git branch --show-current)"
-    printf 'native_model=%s\nnative_model_bytes=%s\nmodel_hashing=disabled\n' \
-        "$NATIVE_MODEL" "$(stat -c %s "$NATIVE_MODEL")"
+    printf 'model=%s\nmodel_bytes=%s\nmodel_hashing=disabled\n' \
+        "$MODEL" "$(stat -c %s "$MODEL")"
     printf 'prompt=%s\ngpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
         "$PROMPT" "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" \
         "$((43-STAGE_SPLIT))"
-    printf 'profile_tokens=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
-        "$PROFILE_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 't256_policy=all-partner\nt256_layers=0-42\npartner_arithmetic=f16\n'
+    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
+        "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 't256_policy=automatic-balanced\nt256_local_layers=even\nt256_partner_layers=odd\npartner_arithmetic=f16\n'
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU"
     printf 'reused_nsys_dir=%s\n' "${REUSE_NSYS_DIR:-none}"
@@ -272,6 +283,11 @@ env | awk -F= '$1 ~ /^DS4_/ {print}' | sort -u \
 phase=nsight-systems
 base="$OUTPUT_DIR/nsys/combined"
 bindings="$OUTPUT_DIR/nsys/bindings.csv"
+allocations="$OUTPUT_DIR/nsys/allocations.csv"
+memory="$OUTPUT_DIR/nsys/memory.csv"
+plan="$OUTPUT_DIR/nsys/plan.csv"
+q8_audit="$OUTPUT_DIR/nsys/q8-cache-audit.csv"
+tile_audit="$OUTPUT_DIR/nsys/routed-tile-audit.csv"
 cache_before="$OUTPUT_DIR/nsys/cache-before.csv"
 cache_after="$OUTPUT_DIR/nsys/cache-after.csv"
 if [[ -n $REUSE_NSYS_DIR ]]; then
@@ -282,6 +298,10 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
        -s $REUSE_NSYS_DIR/nsys/combined-benchmark.csv &&
        -s $REUSE_NSYS_DIR/nsys/combined.log &&
        -s $REUSE_NSYS_DIR/nsys/bindings.csv &&
+       -s $REUSE_NSYS_DIR/nsys/allocations.csv &&
+       -s $REUSE_NSYS_DIR/nsys/memory.csv &&
+       -s $REUSE_NSYS_DIR/nsys/plan.csv &&
+       -s $REUSE_NSYS_DIR/nsys/routed-tile-audit.csv &&
        -s $REUSE_NSYS_DIR/nsys/cache-before.csv &&
        -s $REUSE_NSYS_DIR/nsys/cache-after.csv ]] ||
         die "REUSE_NSYS_DIR lacks a complete production trace"
@@ -291,7 +311,7 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
             "$OUTPUT_DIR/telemetry/combined.csv"
     fi
 else
-    printf 'Capturing one native-Q4/all-partner-T256 production trace...\n'
+    printf 'Capturing one mixed-Q4/IQ2 balanced-T256 production trace...\n'
     nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,\
 temperature.gpu,clocks.current.sm,clocks.current.memory \
         --format=csv,noheader,nounits -lms 200 \
@@ -301,8 +321,14 @@ temperature.gpu,clocks.current.sm,clocks.current.memory \
     "${production_env[@]}" \
         DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
         DS4_CUDA_CRITICAL_PATH_NVTX=1 \
+        "DS4_CUDA_PREFILL_TILE_AUDIT_CSV=$tile_audit" \
+        DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY=32768 \
         "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \
         DS4_NSYS_CAPTURE_PREFILL=1 \
+        "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$q8_audit" \
+        "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$plan" \
+        "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
+        "DS4_CUDA_MEMORY_STATE_CSV=$memory" \
         "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$cache_before" \
         "DS4_CUDA_Q8_CACHE_STATE_CSV=$cache_after" \
         "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
@@ -311,9 +337,9 @@ temperature.gpu,clocks.current.sm,clocks.current.memory \
             --capture-range-end=stop --output="$base" \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-                --model "$NATIVE_MODEL" --prompt-file "$PROMPT" \
+                --model "$MODEL" --prompt-file "$PROMPT" \
                 --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
-                --ctx-alloc "$((PROFILE_TOKENS+1))" \
+                --ctx-alloc "$CTX_ALLOC" \
                 --step-incr "$PROFILE_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
                 --gen-tokens 0 --csv "$base-benchmark.csv" \
                 >"$base.log" 2>&1 || run_rc=$?
@@ -328,10 +354,10 @@ fi
 grep -Fqx 'ds4: SM75 native routed-Q4 layout enabled (packed A/W, planner=cost, gate=tile8, down=full-stage)' \
     "$base.log" || die "production trace did not use the accepted native-Q4 path"
 for marker in "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
-              'partner-classes=t256' 'partner-layers=0-42' \
-              't256-placement=all-partner' 'T256-output_b=43/43' \
-              'partner=43 partner-arithmetic=f16' \
-              'CUDA q8 fp16 partner summary: calls=344'; do
+              'partner-classes=automatic:t256' 'partner-layers=all' \
+              't256-placement=balanced' 'materialized 344/344 candidates' \
+              'T256-output_b=43/43' 'partner=21 partner-arithmetic=f16' \
+              'CUDA q8 fp16 partner summary: calls='; do
     grep -Fq "$marker" "$base.log" ||
         die "production trace lacks required marker: $marker"
 done
@@ -339,20 +365,45 @@ for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
     grep -Fq "$route" "$base.log" ||
         die "production trace lacks validated direct route $route"
 done
-recipe_count=$(grep -Ec \
-    '^ds4: routed-quant-audit layer=[0-9]+ gate=q4_k up=q4_k down=q4_k$' \
-    "$base.log" || true)
-[[ $recipe_count == 43 ]] ||
-    die "production trace has $recipe_count/43 exact full-Q4 recipe records"
+[[ $(grep -Fc 'qualified=yes' "$base.log") == 2 ]] ||
+    die "production trace did not qualify both SM75 NVLink pairs"
+awk '
+    /^ds4: routed-quant-audit layer=/ {
+        count++
+        if ($0 ~ /gate=q4_k up=q4_k down=q4_k$/) q4++
+        else if ($0 ~ /gate=iq2_xxs up=iq2_xxs down=q4_k$/) iq2++
+        else bad++
+    }
+    END {exit !(count == 43 && q4 > 0 && iq2 > 0 && bad == 0)}
+' "$base.log" ||
+    die "production trace is not the expected 43-layer mixed Q4/IQ2/Q4 recipe"
 cmp -s "$cache_before" "$cache_after" ||
     die "Q8 cache state changed during the captured frontier"
 awk -F, '
+    NR == 1 {next}
     NR > 1 && $6 == 8192 && $7 == 4096 && $12 ~ /attn_output_b/ {
-        if ($3 == 1) partner++; else fixed++; next
+        label=$12
+        sub(/^tensor:blk\./, "", label)
+        sub(/\..*$/, "", label)
+        layer=label+0
+        if ($3 == 1) {
+            partner++
+            if (layer % 2 == 0) bad++
+        } else {
+            fixed++
+            if (layer % 2 != 0) bad++
+        }
+        next
     }
-    NR > 1 && $3 == 1 {bad_partner=1}
-    END {exit !(fixed == 43 && partner == 43 && !bad_partner)}
-' "$bindings" || die "binding inventory is not the exact all-partner T256 plan"
+    $3 == 1 {bad++}
+    END {exit !(fixed == 22 && partner == 21 && bad == 0 && NR == 345)}
+' "$bindings" || die "binding inventory is not the exact 22-local/21-partner balanced plan"
+awk -F, 'NR > 1 {if ($10 != $11 || $13 != 0 || $14 != 1) bad++; rows++}
+    END {exit !(rows == 344 && bad == 0)}' "$allocations" ||
+    die "allocation inventory contains missing or dead dense-F16 payloads"
+awk -F, 'NR > 1 {if ($3 + 0 < 512 * 1048576) bad++; rows++}
+    END {exit !(rows == 4 && bad == 0)}' "$memory" ||
+    die "production trace left less than 512 MiB free on a CUDA device"
 
 phase=nsight-systems-export
 nsys export --type sqlite --force-overwrite=true \
@@ -384,7 +435,7 @@ if [[ $RUN_NCU == 1 ]]; then
               --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
 
     profile_native() {
-        local label=$1 scenario=$2 kernel=$3 expected=$4 base=$5 rc=0
+        local label=$1 scenario=$2 kernel=$3 expected=$4 block_size=$5 base=$6 rc=0
         printf 'Nsight Compute: %s...\n' "$label"
         env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${ncu_cmd[@]}" \
             --config-file off --target-processes application-only --devices 0 \
@@ -403,56 +454,85 @@ if [[ $RUN_NCU == 1 ]]; then
             --csv --page raw >"$base.csv" 2>"$base-import.log"
         python3 speed-bench/validate-ncu-capture.py \
             "$base.csv" "$expected" 0 \
-            --process cuda_sm75_profile_harness --block-size 512
+            --process cuda_sm75_profile_harness --block-size "$block_size"
     }
 
     profile_native early-native-q4-gate native-q4-early \
         '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel' \
+        512 \
         "$OUTPUT_DIR/ncu/early-native-q4-gate"
     profile_native late-native-q4-gate native-q4-late \
         '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel' \
+        512 \
         "$OUTPUT_DIR/ncu/late-native-q4-gate"
     profile_native early-native-q4-down native-q4-early \
         '^moe_down_sm75_native_q4_tile_kernel$' \
         'moe_down_sm75_native_q4_tile_kernel' \
+        512 \
         "$OUTPUT_DIR/ncu/early-native-q4-down"
     profile_native late-native-q4-down native-q4-late \
         '^moe_down_sm75_native_q4_tile_kernel$' \
         'moe_down_sm75_native_q4_tile_kernel' \
+        512 \
         "$OUTPUT_DIR/ncu/late-native-q4-down"
+    profile_native early-iq2-gate-tile16 q2-early \
+        '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tile16"
+    profile_native late-iq2-gate-tile16 q2-late \
+        '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tile16"
+    profile_native early-iq2-gate-tile8 q2-early \
+        '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tile8"
+    profile_native late-iq2-gate-tile8 q2-late \
+        '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tile8"
 
-    partner_base="$OUTPUT_DIR/ncu/partner-t256-cublas"
-    printf 'Nsight Compute: production-shaped partner T256 cuBLAS...\n'
-    rc=0
-    env CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
-        "${ncu_cmd[@]}" --config-file off \
-        --target-processes application-only --devices 1 \
-        --profile-from-start off --launch-count 1 --replay-mode kernel \
-        --cache-control none --clock-control none --force-overwrite \
-        --export "$partner_base" "${sections[@]}" \
-        ./tests/test_gpu_xdev q8-partner-t256-profile \
-        >"$partner_base.log" 2>&1 || rc=$?
-    (( rc == 0 )) || {
-        tail -n 120 "$partner_base.log" >&2 || true
-        die "ncu failed: partner T256 cuBLAS"
+    profile_dense_cublas() {
+        local shape=$1 scenario=$2 base="$OUTPUT_DIR/ncu/$1-cublas" rc=0
+        printf 'Nsight Compute: production-shaped %s dense-F16 cuBLAS...\n' "$shape"
+        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
+            "${ncu_cmd[@]}" --config-file off \
+            --target-processes application-only --devices 1 \
+            --profile-from-start off --launch-count 1 --replay-mode kernel \
+            --cache-control none --clock-control none --force-overwrite \
+            --export "$base" "${sections[@]}" \
+            ./tests/test_gpu_xdev "$scenario" \
+            >"$base.log" 2>&1 || rc=$?
+        (( rc == 0 )) || {
+            tail -n 120 "$base.log" >&2 || true
+            die "ncu failed: $shape dense-F16 cuBLAS"
+        }
+        [[ -s $base.ncu-rep ]] || die "ncu omitted $shape cuBLAS report"
+        if [[ $NCU_USE_SUDO == 1 ]]; then
+            sudo chown -- "$(id -u):$(id -g)" "$base.ncu-rep"
+        fi
+        "$ncu_bin" --config-file off --import "$base.ncu-rep" \
+            --csv --page raw >"$base.csv" 2>"$base-import.log"
+        python3 speed-bench/validate-ncu-capture.py \
+            "$base.csv" '(?i)(gemm|mma)' 1 --process test_gpu_xdev
     }
-    [[ -s $partner_base.ncu-rep ]] ||
-        die "ncu omitted partner T256 report"
-    if [[ $NCU_USE_SUDO == 1 ]]; then
-        sudo chown -- "$(id -u):$(id -g)" "$partner_base.ncu-rep"
-    fi
-    "$ncu_bin" --config-file off --import "$partner_base.ncu-rep" \
-        --csv --page raw >"$partner_base.csv" 2>"$partner_base-import.log"
-    python3 speed-bench/validate-ncu-capture.py \
-        "$partner_base.csv" '(?i)(gemm|mma)' 1 --process test_gpu_xdev
+    profile_dense_cublas t32 q8-partner-t32-profile
+    profile_dense_cublas t256 q8-partner-t256-profile
 fi
 
 phase=complete
 for required in summary.md combined-profile.json combined-kernel-groups.csv \
                 partner-t256-ranges.csv stage-device-summary.csv \
-                partner-projection-summary.csv nsys/combined.nsys-rep; do
+                partner-projection-summary.csv nsys/combined.nsys-rep \
+                nsys/bindings.csv nsys/allocations.csv nsys/memory.csv \
+                nsys/plan.csv nsys/q8-cache-audit.csv \
+                nsys/routed-tile-audit.csv; do
     [[ -s $OUTPUT_DIR/$required ]] || die "missing final evidence: $required"
 done
 printf 'Combined SM75 production profile complete: %s\n' "$OUTPUT_DIR"
