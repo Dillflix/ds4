@@ -636,6 +636,8 @@ int main(int argc, char **argv) {
         getenv("DS4_CUDA_Q8_BINDING_STATE_CSV");
     const char *q8_allocation_state_csv =
         getenv("DS4_CUDA_Q8_ALLOCATION_STATE_CSV");
+    const char *cuda_memory_state_csv =
+        getenv("DS4_CUDA_MEMORY_STATE_CSV");
     const char *q8_cache_audit_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV") : NULL;
     bool q8_cache_audit_done = false;
@@ -661,7 +663,8 @@ int main(int argc, char **argv) {
     }
     if (((q8_cache_pretiming_state_csv && q8_cache_pretiming_state_csv[0]) ||
          (q8_binding_state_csv && q8_binding_state_csv[0]) ||
-         (q8_allocation_state_csv && q8_allocation_state_csv[0])) &&
+         (q8_allocation_state_csv && q8_allocation_state_csv[0]) ||
+         (cuda_memory_state_csv && cuda_memory_state_csv[0])) &&
         untimed_warmup_tokens == 0) {
         fprintf(stderr,
                 "ds4-bench: CUDA Q8 pre-timing state export "
@@ -837,6 +840,16 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: failed to write CUDA Q8 allocation state %s\n",
                     q8_allocation_state_csv);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (cuda_memory_state_csv && cuda_memory_state_csv[0] &&
+            !ds4_gpu_memory_state_write_csv(cuda_memory_state_csv)) {
+            fprintf(stderr,
+                    "ds4-bench: failed to write CUDA memory state %s\n",
+                    cuda_memory_state_csv);
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
             ds4_engine_close(engine);

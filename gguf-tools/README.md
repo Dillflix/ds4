@@ -262,6 +262,32 @@ Results include CSV throughput data, an SVG chart when `python3` is available,
 the quantization plan and logs, and a GPU/git metadata record beside the output
 model.
 
+For the four-RTX-8000 production target, the Q4/IQ2-only 256K workflow is:
+
+```sh
+bash produce-verify-q4-iq2-full-f16-256k.sh \
+  /models/DeepSeek-V4-Flash-0731-HF \
+  /models/DeepSeek-V4-Flash-Q4KExperts.gguf \
+  /mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf
+```
+
+It loads the existing all-IQ2-gate/up + Q4-down model at the actual 262144-token
+allocation with `GPU_DEVICES=0,3,1,2`, the 22/21 pipeline split, all dense-Q8
+FP16 candidates, and all-partner T256 placement. After a production warm-up it
+measures free VRAM and the active cache reserve on every GPU, then promotes as
+many matched gate/up layer pairs to Q4_K as both members of each NVLink stage
+can hold. Routed down stays Q4_K in every layer. This calibration direction is
+intentional: full Q4 can fail the 256K placement check before a cache audit can
+run, while the all-IQ2 starting point fits and gives a directly measurable Q4
+promotion budget. A second run with the final model must report all 344
+production dense-FP16 candidates resident; otherwise the workflow fails. The
+512 MiB/device default safety margin is kept in addition to the runtime's
+reported cache reserve. `IQ2_GATE_UP_LAYER_ORDER` controls which layers remain
+IQ2; the default `3-42` is deterministic but is not presented as a
+quality-sensitivity ranking. Tagged files store only their remaining Q4 routed
+tensors in the SM75-native format; IQ2 tensors retain their standard layout and
+dispatch.
+
 Useful checks before writing a full model:
 
 ```sh

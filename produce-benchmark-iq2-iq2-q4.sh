@@ -38,6 +38,7 @@ Advanced recipe overrides (used by the selective-Q2 wrapper):
   ROUTED_W2=q4_k
   ROUTED_W3=iq2_xxs
   TENSOR_TYPE_OVERRIDES='blk.3.ffn_down_exps.weight=q2_k,...'
+  SM75_NATIVE_Q4=1
   QUANT_RECIPE='gate:iq2_xxs,up:iq2_xxs,down:q4_k'
   PLOT_TITLE='RTX 8000 2x2 TP - IQ2 gate/up, Q4 down'
 
@@ -135,12 +136,15 @@ ctx_start=${CTX_START:-2048}
 ctx_max=${CTX_MAX:-65536}
 step_incr=${STEP_INCR:-2048}
 gen_tokens=${GEN_TOKENS:-128}
+ctx_alloc=${CTX_ALLOC:-}
+step_mul=${STEP_MUL:-1}
 routed_w1=${ROUTED_W1:-iq2_xxs}
 routed_w2=${ROUTED_W2:-q4_k}
 routed_w3=${ROUTED_W3:-iq2_xxs}
 quant_recipe=${QUANT_RECIPE:-gate:$routed_w1,up:$routed_w3,down:$routed_w2}
 plot_title=${PLOT_TITLE:-RTX 8000 2x2 TP - IQ2 gate/up, Q4 down}
 tensor_type_overrides=${TENSOR_TYPE_OVERRIDES:-}
+sm75_native_q4=${SM75_NATIVE_Q4:-0}
 prompt_arg=${PROMPT_FILE:-$script_dir/speed-bench/promessi_sposi.txt}
 [[ -f $prompt_arg ]] || die "benchmark prompt not found: $prompt_arg"
 prompt=$(realpath "$prompt_arg")
@@ -151,6 +155,9 @@ require_positive_integer CTX_START "$ctx_start"
 require_positive_integer CTX_MAX "$ctx_max"
 require_positive_integer STEP_INCR "$step_incr"
 [[ $gen_tokens =~ ^[0-9]+$ ]] || die "GEN_TOKENS must be a nonnegative integer"
+[[ -z $ctx_alloc || $ctx_alloc =~ ^[1-9][0-9]*$ ]] || die "CTX_ALLOC must be empty or a positive integer"
+[[ $step_mul =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || die "STEP_MUL must be at least 1"
+[[ $sm75_native_q4 == 0 || $sm75_native_q4 == 1 ]] || die "SM75_NATIVE_Q4 must be 0 or 1"
 (( ctx_start <= ctx_max )) || die "CTX_START must be no greater than CTX_MAX"
 
 IFS=',' read -r -a gpu_list <<< "$gpu_devices"
@@ -288,6 +295,9 @@ if [[ -n $tensor_type_overrides ]]; then
         quant_args+=(--tensor-type "$override")
     done
 fi
+if [[ $sm75_native_q4 == 1 ]]; then
+    quant_args+=(--sm75-native-q4)
+fi
 
 partial=
 cleanup() {
@@ -333,6 +343,7 @@ pair1="${gpu_list[1]}<->${gpu_list[3]}"
     printf 'model_bytes=%s\n' "$(stat -c %s "$out")"
     printf 'quant=%s\n' "$quant_recipe"
     printf 'tensor_type_overrides=%s\n' "$tensor_type_overrides"
+    printf 'sm75_native_q4=%s\n' "$sm75_native_q4"
     printf 'quant_backend=cuda\n'
     printf 'quant_gpu_devices=%s\n' "$gpu_devices"
     printf 'template=%s\n' "$template"
@@ -369,19 +380,25 @@ if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then
 fi
 
 printf 'Benchmarking with TP pairs %s and %s...\n' "$pair0" "$pair1"
-./ds4-bench \
-    --cuda \
-    --cuda-tensor-parallel \
-    --gpu-vram "$gpu_vram" \
-    --gpu-devices "$gpu_devices" \
-    --warm-weights \
-    -m "$out" \
-    --prompt-file "$prompt" \
-    --ctx-start "$ctx_start" \
-    --ctx-max "$ctx_max" \
-    --step-incr "$step_incr" \
-    --gen-tokens "$gen_tokens" \
-    --csv "$csv" 2>&1 | tee "$bench_log"
+bench_args=(
+    --cuda
+    --cuda-tensor-parallel
+    --gpu-vram "$gpu_vram"
+    --gpu-devices "$gpu_devices"
+    --warm-weights
+    -m "$out"
+    --prompt-file "$prompt"
+    --ctx-start "$ctx_start"
+    --ctx-max "$ctx_max"
+    --step-incr "$step_incr"
+    --step-mul "$step_mul"
+    --gen-tokens "$gen_tokens"
+    --csv "$csv"
+)
+if [[ -n $ctx_alloc ]]; then
+    bench_args+=(--ctx-alloc "$ctx_alloc")
+fi
+./ds4-bench "${bench_args[@]}" 2>&1 | tee "$bench_log"
 
 if command -v python3 >/dev/null 2>&1; then
     python3 speed-bench/plot_speed.py "$csv" \
