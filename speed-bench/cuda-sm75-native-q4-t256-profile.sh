@@ -470,12 +470,12 @@ if [[ $RUN_NCU == 1 ]]; then
     profile_native early-native-q4-down native-q4-early \
         '^moe_down_sm75_native_q4_tile_kernel$' \
         'moe_down_sm75_native_q4_tile_kernel' \
-        512 \
+        256 \
         "$OUTPUT_DIR/ncu/early-native-q4-down"
     profile_native late-native-q4-down native-q4-late \
         '^moe_down_sm75_native_q4_tile_kernel$' \
         'moe_down_sm75_native_q4_tile_kernel' \
-        512 \
+        256 \
         "$OUTPUT_DIR/ncu/late-native-q4-down"
     profile_native early-iq2-gate-tile16 q2-early \
         '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
@@ -497,6 +497,16 @@ if [[ $RUN_NCU == 1 ]]; then
         'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel' \
         256 \
         "$OUTPUT_DIR/ncu/late-iq2-gate-tile8"
+    profile_native early-iq2-gate-tail4 q2-early \
+        '^moe_gate_up_mid_expert_tile4_row32_kernel$' \
+        'moe_gate_up_mid_expert_tile4_row32_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tail4"
+    profile_native late-iq2-gate-tail4 q2-late \
+        '^moe_gate_up_mid_expert_tile4_row32_kernel$' \
+        'moe_gate_up_mid_expert_tile4_row32_kernel' \
+        256 \
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tail4"
 
     profile_dense_cublas() {
         local shape=$1 scenario=$2 base="$OUTPUT_DIR/ncu/$1-cublas" rc=0

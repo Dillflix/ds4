@@ -38,6 +38,8 @@ def main() -> int:
         (output / "nsys").mkdir()
         rows = [
             operation(name="moe_gate_up_mid_sm75_native_q4_tile8_kernel<512>"),
+            operation(name="moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512>"),
+            operation(name="moe_gate_up_mid_expert_tile4_row32_kernel"),
             operation(name="moe_down_sm75_native_q4_tile_kernel<512,16>"),
             operation(name="matmul_q8_0_mma_sm75_exact_kernel<256>"),
             operation(name="attention_exact_kernel"),
@@ -47,7 +49,7 @@ def main() -> int:
             "home_tier=0/home_device=0/partner_tier=2/partner_device=1/"
             "tokens=512/in=8192/out=4096/result=f32/arithmetic=f16"
         )
-        for _layer in range(43):
+        for _layer in range(1, 43, 2):
             for _microbatch in range(4):
                 rows.extend(
                     [
@@ -94,11 +96,12 @@ def main() -> int:
             writer = csv.DictWriter(handle, fieldnames=binding_fields)
             writer.writeheader()
             for layer in range(43):
+                partner_offload = int(layer % 2 == 1)
                 writer.writerow(
                     {
                         "consumer_device": 0,
-                        "resident_device": 1,
-                        "partner_offload": 1,
+                        "resident_device": partner_offload,
+                        "partner_offload": partner_offload,
                         "in_dim": 8192,
                         "out_dim": 4096,
                         "partner_arithmetic": "f16",
@@ -109,10 +112,11 @@ def main() -> int:
         subprocess.run([sys.executable, str(SUMMARIZER), str(output)], check=True)
         evidence = json.loads((output / "combined-profile.json").read_text())
         assert evidence["accepted"] is True
-        assert evidence["partner_t256_binding_count"] == 43
-        assert evidence["partner_t256_projection_count"] == 172
-        assert evidence["groups"]["partner_t256_cublas"]["operations"] == 172
-        assert evidence["groups"]["partner_t256_memcpy"]["operations"] == 344
+        assert evidence["partner_t256_binding_count"] == 21
+        assert evidence["partner_t256_projection_count"] == 84
+        assert evidence["groups"]["partner_t256_cublas"]["operations"] == 84
+        assert evidence["groups"]["partner_t256_memcpy"]["operations"] == 168
+        assert evidence["groups"]["iq2_gate_up"]["operations"] == 2
         assert (output / "combined-kernel-groups.csv").stat().st_size > 0
         assert (output / "partner-t256-ranges.csv").stat().st_size > 0
     print("combined native-Q4/T256 profile summarizer test: OK")

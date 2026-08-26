@@ -51,7 +51,10 @@ def classify(row: dict[str, str]) -> str:
         return "other_memcpy"
     if "moe_gate_up_mid_sm75_native_q4_tile8_kernel" in name:
         return "native_q4_gate_up"
-    if "moe_gate_up_mid_iq2_" in name:
+    if (
+        "moe_gate_up_mid_iq2_" in name
+        or "moe_gate_up_mid_expert_tile4_row32_kernel" in name
+    ):
         return "iq2_gate_up"
     if "moe_down_sm75_native_q4_tile_kernel" in name:
         return "native_q4_down"
