@@ -189,10 +189,16 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
             f"unique={len(unique_allocations)}"
         )
     non_t256_classes = Counter(non_t256_class(row) for row in non_t256)
-    if len(non_t256) != NON_T256_BINDINGS or non_t256_classes != EXPECTED_NON_T256_CLASSES:
+    missing_non_t256 = {
+        name: minimum - non_t256_classes[name]
+        for name, minimum in EXPECTED_NON_T256_CLASSES.items()
+        if non_t256_classes[name] < minimum
+    }
+    if len(non_t256) < NON_T256_BINDINGS or missing_non_t256 or non_t256_classes["other"]:
         fail(
-            "full FP16 did not preserve the complete non-T256 cache inventory: "
-            f"total={len(non_t256)} classes={dict(sorted(non_t256_classes.items()))}"
+            "full FP16 did not preserve the baseline non-T256 cache inventory: "
+            f"total={len(non_t256)} missing={missing_non_t256} "
+            f"classes={dict(sorted(non_t256_classes.items()))}"
         )
     if any(row["partner_offload"] != "0" for row in non_t256):
         fail("full FP16 contains a non-T256 partner binding")

@@ -452,7 +452,7 @@ def main() -> int:
                 and len(partner_bindings) == 43
                 and len(unique_t256_allocations) == 43
                 and observed_bindings == expected_bindings
-                and len(non_t256_bindings) == 263
+                and len(non_t256_bindings) >= 263
                 and all(row["partner_offload"] == "0" for row in non_t256_bindings)
                 and bool(t256_audit)
                 and even_layer_coverage

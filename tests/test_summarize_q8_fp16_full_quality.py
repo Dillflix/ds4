@@ -268,7 +268,24 @@ class FullFp16QualitySummaryTests(unittest.TestCase):
             write_table(path, list(rows[0]), rows)
             result = self.run_summary(root)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("complete non-T256 cache inventory", result.stderr)
+            self.assertIn("baseline non-T256 cache inventory", result.stderr)
+
+    def test_additional_local_non_t256_entry_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-fp16-full-cache-extra-") as raw:
+            root = Path(raw)
+            make_fixture(root)
+            path = root / "quality/fp16-t256-full.bindings.csv"
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            rows.append(non_t256_binding("attn_output_a", 999))
+            write_table(path, list(rows[0]), rows)
+            result = self.run_summary(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads((root / "quality-comparison.json").read_text())
+            self.assertEqual(
+                payload["coverage"]["fp16_t256_full"]["non_t256_bindings"],
+                264,
+            )
 
     def test_quality_regression_is_reported_without_invalidating_evidence(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds4-fp16-full-quality-fail-") as raw:

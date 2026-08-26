@@ -465,8 +465,9 @@ endpoints selected after the T256 placement screen:
 - every active T256 output-B projection uses FP16/cuBLAS on its NVLink partner.
   The binding inventory is 86/86: 43 fixed pair-local consumers plus 43
   home-consumer partner bindings, backed by exactly 43 physical FP16 weights.
-  This policy must also preserve the complete 263-binding non-T256 cache
-  inventory observed by the winning placement run.
+  This policy must also preserve at least the complete 263-binding non-T256
+  cache inventory observed by the winning placement run; additional local
+  cache admissions are valid.
 
 The runner validates execution, not just requested policy. Across the 100-case
 suite the native endpoint must record exactly 4,300 native T256 calls. The
