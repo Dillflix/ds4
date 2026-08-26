@@ -22,6 +22,9 @@ T256 capacity envelope and requires every one of the 344 dense candidates to
 remain resident. Runtime T256 placement is deliberately left to the separate
 native/all-local/balanced/all-partner production A/B; model generation does
 not assume that all-partner remains optimal after the routed quant changes.
+The final GGUF path is published atomically only after that verification
+passes; a failed benchmark or incomplete cache plan cannot leave an
+unverified model at OUTPUT.gguf.
 
 No full-Q4 GGUF is required. The quantizer regenerates tensors from HF_DIR,
 using the automatically cached 8 MiB metadata template and routed-MoE imatrix.
@@ -83,6 +86,22 @@ out=${2:-${OUT:-/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-0731-Q4-IQ2-Fu
 out=$(realpath -m "$out")
 results=${3:-${RESULTS_CSV:-${out%.gguf}.bench.csv}}
 results=$(realpath -m "$results")
+reuse_model=${REUSE_MODEL:-0}
+overwrite=${OVERWRITE:-0}
+[[ $reuse_model == 0 || $reuse_model == 1 ]] || die "REUSE_MODEL must be 0 or 1"
+[[ $overwrite == 0 || $overwrite == 1 ]] || die "OVERWRITE must be 0 or 1"
+if [[ $reuse_model == 1 ]]; then
+    [[ -f $out ]] || die "REUSE_MODEL=1 but OUTPUT.gguf does not exist: $out"
+elif [[ -e $out && $overwrite != 1 ]]; then
+    die "OUTPUT.gguf already exists; set OVERWRITE=1 or REUSE_MODEL=1: $out"
+fi
+verification_candidate=
+cleanup_verification_candidate() {
+    if [[ -n $verification_candidate && -f $verification_candidate ]]; then
+        rm -f -- "$verification_candidate"
+    fi
+}
+trap cleanup_verification_candidate EXIT
 default_calibration=$script_dir/gguf/DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.gguf
 generated_calibration=${GENERATED_CALIBRATION_MODEL:-$(dirname -- "$out")/.DeepSeek-V4-Flash-0731-IQ2-IQ2-Q4.calibration.gguf}
 generated_calibration_by_runner=0
@@ -284,8 +303,21 @@ export DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1
 unset DS4_CUDA_Q8_F16_PARTNER_LAYERS
 unset DS4_CUDA_Q8_PARTNER_ARITHMETIC
 
+verification_model=$out
+if [[ $reuse_model != 1 ]]; then
+    verification_candidate=$(dirname -- "$out")/.$(basename -- "${out%.gguf}").unverified.$$.gguf
+    [[ ! -e $verification_candidate ]] || \
+        die "temporary verification model already exists: $verification_candidate"
+    verification_model=$verification_candidate
+fi
+export PLAN_LOG=${PLAN_LOG:-$prefix.quant-plan.txt}
+export QUANT_LOG=${QUANT_LOG:-$prefix.quantize.log}
+export BENCH_LOG=${BENCH_LOG:-$prefix.bench.log}
+export METADATA_LOG=${METADATA_LOG:-$prefix.bench-metadata.txt}
+export RESULTS_SVG=${RESULTS_SVG:-$prefix.bench.svg}
+
 bash "$script_dir/produce-benchmark-iq2-iq2-q4.sh" \
-    "$hf_dir" "$out" "$verification_csv"
+    "$hf_dir" "$verification_model" "$verification_csv"
 
 python3 speed-bench/select-q4-iq2-full-f16.py \
     --plan-audit "$verification_plan" \
@@ -305,6 +337,15 @@ grep -Fq 'partner=0 ' \
     die "runtime log does not prove zero partner-resident dense bindings"
 [[ -s $verification_bindings ]] || die "runtime omitted dense FP16 binding evidence"
 [[ -s $verification_allocations ]] || die "runtime omitted dense FP16 allocation evidence"
+
+if [[ -n $verification_candidate ]]; then
+    if [[ $overwrite == 1 ]]; then
+        mv -f -- "$verification_candidate" "$out"
+    else
+        mv -- "$verification_candidate" "$out"
+    fi
+    verification_candidate=
+fi
 
 if [[ $run_full_sweep == 1 ]]; then
     printf 'Running optional 2K..256K frontier sweep...\n'

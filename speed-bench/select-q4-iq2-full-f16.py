@@ -317,16 +317,30 @@ def select_from_all_iq2_calibration(
     pairs: list[set[int]],
     memory: dict[int, dict[str, int]],
     preferred: list[int],
+    selectable_first: int,
+    selectable_last: int,
     saving_bytes_per_device: int,
     extra_headroom_bytes_per_device: int,
 ) -> list[int]:
-    """Promote as many IQ2 gate/up pairs back to Q4 as measured VRAM permits."""
+    """Promote as many IQ2 gate/up pairs back to Q4 as measured VRAM permits.
+
+    The calibration GGUF makes every routed gate/up pair IQ2.  The final
+    recipe keeps layers outside the selectable range at its Q4 default, so
+    those mandatory promotions must be charged before optional promotions.
+    In the production recipe that is layers 0-2: omitting their fixed
+    3*624-MiB/device cost overcommits stage 0 even when the calibration itself
+    had the requested reserve and safety margin.
+    """
 
     selected_iq2: list[int] = []
     for stage, (lo, hi) in enumerate(layout):
         stage_layers = [layer for layer in preferred if lo <= layer <= hi]
         expected_layers = [
-            layer for layer in range(max(lo, 3), min(hi, N_LAYERS - 1) + 1)
+            layer
+            for layer in range(
+                max(lo, selectable_first),
+                min(hi, selectable_last) + 1,
+            )
         ]
         if set(stage_layers) != set(expected_layers):
             missing = sorted(set(expected_layers) - set(stage_layers))
@@ -334,6 +348,14 @@ def select_from_all_iq2_calibration(
                 "IQ2 layer preference must order every routed layer; "
                 f"stage {stage} is missing {missing}"
             )
+        mandatory_q4_layers = [
+            layer
+            for layer in range(max(lo, 0), min(hi, N_LAYERS - 1) + 1)
+            if layer < selectable_first or layer > selectable_last
+        ]
+        mandatory_q4_bytes = (
+            len(mandatory_q4_layers) * saving_bytes_per_device
+        )
         available_by_device: dict[int, int] = {}
         for device in sorted(pairs[stage]):
             if device not in memory:
@@ -344,7 +366,16 @@ def select_from_all_iq2_calibration(
                 + extra_headroom_bytes_per_device
             )
             available_by_device[device] = max(0, row["free_bytes"] - protected)
-        pair_available = min(available_by_device.values())
+        raw_pair_available = min(available_by_device.values())
+        if mandatory_q4_bytes > raw_pair_available:
+            die(
+                f"stage {stage} cannot fit mandatory Q4 gate/up layers "
+                f"{mandatory_q4_layers} while preserving the cache reserve "
+                "and requested headroom "
+                f"(need={mandatory_q4_bytes / MIB:.0f} MiB/device, "
+                f"available={raw_pair_available / MIB:.0f} MiB/device)"
+            )
+        pair_available = raw_pair_available - mandatory_q4_bytes
         q4_promotions = min(
             len(stage_layers), pair_available // saving_bytes_per_device
         )
@@ -364,7 +395,10 @@ def select_from_all_iq2_calibration(
             f"all-IQ2 post-cache free={free_text} MiB "
             f"cache_reserve={reserve_text} MiB "
             f"extra_headroom={extra_headroom_bytes_per_device / MIB:.0f} "
-            f"MiB/device; Q4_pairs={q4_promotions} "
+            f"MiB/device; mandatory_Q4_layers="
+            f"{','.join(map(str, mandatory_q4_layers)) or 'none'} "
+            f"mandatory_Q4_cost={mandatory_q4_bytes / MIB:.0f} MiB/device; "
+            f"optional_Q4_pairs={q4_promotions} "
             f"IQ2_pairs={iq2_count}; IQ2_layers={','.join(map(str, chosen))}",
             file=sys.stderr,
         )
@@ -442,6 +476,8 @@ def main() -> int:
             pairs,
             read_device_memory(args.device_memory),
             preferred,
+            args.routed_first,
+            args.routed_last,
             saving,
             headroom,
         )

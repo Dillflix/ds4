@@ -140,8 +140,10 @@ class SelectQ4Iq2FullF16Tests(unittest.TestCase):
             self.write_memory(
                 path,
                 {
-                    0: 768 + 512 + 2 * 624 + 200,
-                    1: 768 + 512 + 2 * 624,
+                    # Stage 0 first pays for the three mandatory Q4 pairs in
+                    # layers 0-2, then has room for two optional promotions.
+                    0: 768 + 512 + 3 * 624 + 2 * 624 + 200,
+                    1: 768 + 512 + 3 * 624 + 2 * 624,
                     3: 768 + 512 + 4 * 624,
                     2: 768 + 512 + 3 * 624,
                 },
@@ -151,10 +153,39 @@ class SelectQ4Iq2FullF16Tests(unittest.TestCase):
                 SELECTOR.device_pairs([0, 3, 1, 2]),
                 SELECTOR.read_device_memory(path),
                 list(range(3, 43)),
+                3,
+                42,
                 624 * SELECTOR.MIB,
                 512 * SELECTOR.MIB,
             )
             self.assertEqual(selected, list(range(3, 20)) + list(range(22, 40)))
+
+    def test_all_iq2_calibration_charges_mandatory_q4_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.csv"
+            # This would have appeared to allow two stage-0 promotions under
+            # the old accounting, but it cannot even fund layers 0-2 becoming
+            # Q4 while preserving reserve + headroom.
+            self.write_memory(
+                path,
+                {
+                    0: 768 + 512 + 2 * 624,
+                    1: 768 + 512 + 2 * 624,
+                    3: 768 + 512 + 4 * 624,
+                    2: 768 + 512 + 3 * 624,
+                },
+            )
+            with self.assertRaisesRegex(SystemExit, "mandatory Q4 gate/up"):
+                SELECTOR.select_from_all_iq2_calibration(
+                    [(0, 21), (22, 42)],
+                    SELECTOR.device_pairs([0, 3, 1, 2]),
+                    SELECTOR.read_device_memory(path),
+                    list(range(3, 43)),
+                    3,
+                    42,
+                    624 * SELECTOR.MIB,
+                    512 * SELECTOR.MIB,
+                )
 
     def test_all_iq2_calibration_requires_a_complete_layer_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -166,6 +197,8 @@ class SelectQ4Iq2FullF16Tests(unittest.TestCase):
                     SELECTOR.device_pairs([0, 3, 1, 2]),
                     SELECTOR.read_device_memory(path),
                     list(range(3, 42)),
+                    3,
+                    42,
                     624 * SELECTOR.MIB,
                     512 * SELECTOR.MIB,
                 )

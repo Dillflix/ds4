@@ -285,8 +285,12 @@ many matched gate/up layer pairs to Q4_K as both members of each NVLink stage
 can hold. Routed down stays Q4_K in every layer. This calibration direction is
 intentional: full Q4 can fail the 256K placement check before a cache audit can
 run, while the all-IQ2 starting point fits and gives a directly measurable Q4
-promotion budget. A second run with the final model must report all 344
-production dense-FP16 candidates resident; otherwise the workflow fails. The
+promotion budget. Layers 0-2 are pinned to Q4 by the final recipe, so their
+fixed 1872 MiB/device promotion cost is charged to stage 0 before any optional
+Q4 promotions from layers 3-42. A second run with the final model must report
+all 344 production dense-FP16 candidates resident; otherwise the workflow
+fails and the unverified candidate is removed without replacing the requested
+output path. The
 512 MiB/device default safety margin is kept in addition to the runtime's
 reported cache reserve. `IQ2_GATE_UP_LAYER_ORDER` controls which layers remain
 IQ2; the default `3-42` is deterministic but is not presented as a
