@@ -2190,7 +2190,7 @@ static int run_q8_native_partner_projection(void) {
     (void)cudaGetDeviceCount(&dev_count);
     if (dev_count < 2) return 0;
 
-    cudaDeviceProp partner_prop;
+    struct cudaDeviceProp partner_prop;
     memset(&partner_prop, 0, sizeof(partner_prop));
     CHECK(cudaGetDeviceProperties(&partner_prop, 1) == cudaSuccess,
           "native q8 partner properties");
