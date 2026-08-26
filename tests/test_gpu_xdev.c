@@ -2007,7 +2007,7 @@ static int run_q8_partner_projection_case(
                  (size_t)output_count * sizeof(float)) == 0,
           "partner cuBLAS output is bit-exact with local cuBLAS");
 
-    if (in_dim == 1024u && out_dim == 32768u) {
+    if (t32_fused && in_dim == 1024u && out_dim == 32768u) {
         const uint64_t half_bytes = output_count * sizeof(uint16_t);
         uint16_t *host_local_half =
             (uint16_t *)malloc((size_t)half_bytes);
