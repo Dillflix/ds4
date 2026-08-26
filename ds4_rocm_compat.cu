@@ -11,6 +11,7 @@
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
+double g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS] = {};
 
 static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;

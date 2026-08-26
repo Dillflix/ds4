@@ -402,6 +402,58 @@ partner activation and result traffic versus T32's 12.70 GiB. Shared-down
 gained only 2.9--3.4%,
 changed the 2048-token top result in every repeat, and is rejected as a default.
 
+For the production-default decision, use
+`cuda-q8-partner-production-validation.sh` rather than the exploratory variant
+screen. The control disables partner execution. The candidate deliberately
+sets no `DS4_CUDA_Q8_F16_PARTNER_CLASSES` override, so it validates the measured
+automatic policy: T256 is admitted only for SM75 home/partner devices whose
+startup peer-bandwidth measurements reach at least 18 GiB/s in both directions.
+An explicit `t256` selector remains useful for expert diagnostics on other
+targets, but such a run does not prove that automatic admission selected the
+production default.
+
+The production runner builds and runs the placement and multi-GPU exactness
+tests, scores the same full-Q4 model with partner execution disabled and enabled
+across the official 100-case Flash fixture using
+`score_official --production-path`, and performs at least three paired prefill
+repeats at the fixed 16K, 32K, and 64K frontiers. It rejects missing production
+path markers, non-T256 partner bindings, impure audit evidence, changed top-1
+tokens, repeat nondeterminism, or quality/performance gates that do not pass.
+The mandatory GPU test separately requires bit-exact local-versus-partner
+projection output for all three supported classes. Full local/default logits
+are not expected to be byte-identical: the control intentionally leaves an
+overflowed T256 weight on native Q8 while the candidate admits its expanded
+F16/cuBLAS path. That deliberate arithmetic change is covered by top-1,
+teacher-forced NLL, first-token, and greedy-prefix gates instead.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REPEATS=3 \
+./speed-bench/cuda-q8-partner-production-validation.sh
+```
+
+`MODEL` must be an existing absolute path; `PROMPT` defaults to the tracked
+fixed prompt but is exported above to make the run self-contained. The runner
+also accepts an absolute `QUALITY_MANIFEST` (default:
+`gguf-tools/quality-testing/data/flash/manifest.tsv`), `QUALITY_CTX`,
+`PREFILL_CHUNK`, `SKIP_BUILD`, `CREATE_ARCHIVE`, and `T256_VALIDATION_DIR`.
+Production acceptance fixes `GPU_DEVICES=0,3,1,2`, `GPU_VRAM=auto`,
+`STAGE_SPLIT=22`, `CTX_START=16384`, `CTX_MAX=65536`, `STEP_MUL=2`, and
+`QUALITY_CTX=CTX_MAX+1`; the 100 cases remain short, but the scorer allocates
+the same 64K session footprint so cache admission sees production memory
+pressure. The three-class GPU exactness test is mandatory. The runner rejects
+attempts to weaken the target or use fewer than three repeats. Return the generated
+`t256-production-validation-<timestamp>.tar.gz`. Before accepting a result,
+check that `run-status.txt` says `state=finished`, `summary.md` says
+`Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
+
 The completed T32 fusion A/B can eliminate redundant local and T32 runs:
 
 ```bash

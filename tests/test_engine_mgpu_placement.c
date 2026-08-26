@@ -50,6 +50,17 @@ int ds4_test_q8_cache_compare_fallback(
 int ds4_test_q8_cache_partner_tier(const char *name, int n_gpus,
                                    int home_tier, int peer_forward,
                                    int peer_reverse, int disabled);
+int ds4_test_q8_cache_partner_tier_qualified(
+                                   const char *name, int n_gpus,
+                                   int home_tier, int peer_forward,
+                                   int peer_reverse,
+                                   int implicit_default_qualified,
+                                   int disabled);
+int ds4_test_q8_cache_implicit_default_qualified(
+                                   int home_major, int home_minor,
+                                   int partner_major, int partner_minor,
+                                   double forward_gib_per_sec,
+                                   double reverse_gib_per_sec);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -200,9 +211,30 @@ static void test_q8_cache_partner_mapping(void) {
           "measured default excludes the higher-transfer T32 partner path");
     CHECK(out_partner == 3 && physical[out_partner] == 2,
           "default T256 home logical 1 maps to NVLink partner logical 3 (physical 2)");
+    CHECK(ds4_test_q8_cache_implicit_default_qualified(
+              7, 5, 7, 5, 18.0, 18.0) == 1,
+          "implicit T256 default accepts the exact SM75 fast-peer threshold");
+    CHECK(ds4_test_q8_cache_implicit_default_qualified(
+              7, 5, 7, 5, 17.999, 18.0) == 0,
+          "implicit T256 default rejects a slow forward direction");
+    CHECK(ds4_test_q8_cache_implicit_default_qualified(
+              7, 5, 7, 5, 18.0, 17.999) == 0,
+          "implicit T256 default rejects a slow reverse direction");
+    CHECK(ds4_test_q8_cache_implicit_default_qualified(
+              8, 0, 8, 0, 100.0, 100.0) == 0,
+          "implicit T256 default rejects an unmeasured SM80 pair");
+    CHECK(ds4_test_q8_cache_implicit_default_qualified(
+              7, 5, 8, 0, 100.0, 100.0) == 0,
+          "implicit T256 default requires both endpoints to be SM75");
+    CHECK(ds4_test_q8_cache_partner_tier_qualified(
+              out_b, 4, 1, 1, 1, 0, 0) == -1,
+          "implicit T256 default requires measured SM75 fast-peer qualification");
     CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
           "measured default does not partner-offload shared-down");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t256", 1);
+    CHECK(ds4_test_q8_cache_partner_tier_qualified(
+              out_b, 4, 1, 1, 1, 0, 0) == 3,
+          "explicit T256 remains available outside the measured default target");
     CHECK(ds4_test_q8_cache_partner_tier(out_b, 4, 1, 1, 1, 0) == 3,
           "explicit T256 policy matches the measured default");
     CHECK(ds4_test_q8_cache_partner_tier(q_b, 4, 0, 1, 1, 0) == -1,

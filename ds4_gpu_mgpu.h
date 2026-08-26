@@ -85,6 +85,8 @@ typedef struct ds4_gpu_config {
 
 typedef struct {
     int    device_id;
+    int    compute_major;
+    int    compute_minor;
     void  *stream;             /* cudaStream_t under CUDA */
     void  *cublas;             /* cublasHandle_t under CUDA */
     int    cublas_ready;
@@ -98,6 +100,7 @@ typedef struct {
 extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 extern int         g_n_gpus;
 extern int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+extern double      g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 /* Primary multi-device init. The existing ds4_gpu_init (declared in
  * ds4_gpu.h) is a thin shim that builds a single-device config for

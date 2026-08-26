@@ -112,6 +112,30 @@ Use `data/flash/manifest.tsv` for Flash GGUFs,
 which model produced the manifest; the manifest path selects the continuation
 set.
 
+The scorer uses its exact-quality runtime path by default. For a same-model
+validation of a production cache, placement, or offload policy, add
+`--production-path` together with the production CUDA arguments:
+
+```sh
+gguf-tools/quality-testing/score_official \
+  /path/to/deepseek-v4-flash.gguf \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  /tmp/production.tsv \
+  4096 \
+  --gpu-devices 0,3,1,2 \
+  --gpu-vram auto \
+  --cuda-tensor-parallel \
+  --production-path
+```
+
+This remains the same teacher-forced official-continuation measurement; only
+the inference dispatch changes from the exact-quality path to the path used by
+normal throughput runs. The scorer prints
+`score_official: runtime_path=production` to stderr. Preserve and verify that
+marker in policy-validation evidence. Use the default exact-quality path for
+model/release quality, and compare the same model with the policy disabled and
+enabled under `--production-path` when validating runtime-policy neutrality.
+
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
 

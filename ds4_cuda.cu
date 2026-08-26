@@ -335,6 +335,7 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+double      g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 typedef struct {
     uint32_t sequence;
@@ -2872,6 +2873,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     for (int i = 0; i < cfg->n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
         c->device_id = cfg->device_indices[i];
+        c->compute_major = 0;
+        c->compute_minor = 0;
         if (c->device_id < 0) return 0;
         /* Publish the in-progress device id so cleanup can target it on
          * any later failure. cudaSetDevice is also required before
@@ -2881,6 +2884,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            c->compute_major = prop.major;
+            c->compute_minor = prop.minor;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         }
@@ -2926,6 +2931,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * bounce path automatically. */
     for (int i = 0; i < g_n_gpus; i++) {
         for (int j = 0; j < g_n_gpus; j++) {
+            g_gpu_peer_gib_per_sec[i][j] = 0.0;
             if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
             int can = 0;
             (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
@@ -2983,6 +2989,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             int    peer_validated = 1;
             size_t failed_bytes   = 0;
             int    failed_iter    = -1;
+            double peer_best_gib_s = 0.0;
             for (int s_idx = 0;
                  s_idx < kNValidateSizes && peer_validated;
                  s_idx++) {
@@ -2999,6 +3006,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                         peer_validated = 0; failed_bytes = n; failed_iter = it;
                         break;
                     }
+                    const double peer_t0 = s_idx == kNValidateSizes - 1
+                        ? cuda_wall_sec() : 0.0;
                     cudaError_t pc = cudaMemcpyPeer(
                         dst_dev, g_gpu[j].device_id,
                         src_dev, g_gpu[i].device_id, n);
@@ -3007,6 +3016,17 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                         break;
                     }
                     (void)cudaSetDevice(g_gpu[j].device_id);
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        peer_validated = 0; failed_bytes = n; failed_iter = it;
+                        break;
+                    }
+                    if (s_idx == kNValidateSizes - 1) {
+                        const double elapsed = cuda_wall_sec() - peer_t0;
+                        if (elapsed > 0.0) {
+                            const double gib_s = ((double)n / 1073741824.0) / elapsed;
+                            if (gib_s > peer_best_gib_s) peer_best_gib_s = gib_s;
+                        }
+                    }
                     if (cudaMemcpy(vh_dst, dst_dev, n,
                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
                         peer_validated = 0; failed_bytes = n; failed_iter = it;
@@ -3027,13 +3047,15 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             free(vh_dst);
 
             g_gpu_peer_ok[i][j] = peer_validated;
+            g_gpu_peer_gib_per_sec[i][j] = peer_validated
+                ? peer_best_gib_s : 0.0;
             if (peer_validated) {
                 fprintf(stderr,
                     "ds4: peer access %d->%d validated across %d sizes x %d"
-                    " iterations (max %zu MiB)\n",
+                    " iterations (max %zu MiB, best %.2f GiB/s)\n",
                     g_gpu[i].device_id, g_gpu[j].device_id,
                     kNValidateSizes, kValidateIters,
-                    kMaxValidate / (1024u * 1024u));
+                    kMaxValidate / (1024u * 1024u), peer_best_gib_s);
             } else {
                 fprintf(stderr,
                     "ds4: peer access %d->%d FAILED validation at"
@@ -14020,6 +14042,55 @@ static cuda_q8_f16_binding *cuda_q8_f16_find_partner_binding(
             b.consumer_device == consumer_device) return &b;
     }
     return NULL;
+}
+
+extern "C" int ds4_gpu_q8_binding_state_write_csv(const char *path) {
+    if (!path || !path[0]) return 0;
+    std::vector<cuda_q8_f16_binding> bindings = g_q8_f16_bindings;
+    std::sort(bindings.begin(), bindings.end(),
+              [](const cuda_q8_f16_binding &a,
+                 const cuda_q8_f16_binding &b) {
+        if (a.consumer_device != b.consumer_device)
+            return a.consumer_device < b.consumer_device;
+        if (a.resident_device != b.resident_device)
+            return a.resident_device < b.resident_device;
+        if (a.offset != b.offset) return a.offset < b.offset;
+        if (a.in_dim != b.in_dim) return a.in_dim < b.in_dim;
+        return a.out_dim < b.out_dim;
+    });
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot create CUDA Q8 binding-state CSV %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    int ok = fprintf(fp,
+            "consumer_device,resident_device,partner_offload,weight_offset,"
+            "weight_bytes,in_dim,out_dim,fp16_bytes,partner_scratch_tokens,label\n")
+        >= 0;
+    for (const cuda_q8_f16_binding &b : bindings) {
+        const uint64_t fp16_bytes =
+            b.in_dim != 0u && b.out_dim <= UINT64_MAX / b.in_dim / sizeof(__half)
+            ? b.in_dim * b.out_dim * sizeof(__half) : 0u;
+        if (fprintf(fp, "%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%s\n",
+                    b.consumer_device, b.resident_device, b.partner_offload,
+                    (unsigned long long)b.offset,
+                    (unsigned long long)b.weight_bytes,
+                    (unsigned long long)b.in_dim,
+                    (unsigned long long)b.out_dim,
+                    (unsigned long long)fp16_bytes,
+                    (unsigned long long)b.partner_scratch_tokens,
+                    b.label) < 0) {
+            ok = 0;
+            break;
+        }
+    }
+    if (fclose(fp) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to write CUDA Q8 binding-state CSV %s\n",
+                path);
+    }
+    return ok;
 }
 
 static cuda_q8_f16_binding *cuda_q8_f16_runtime_partner_binding(

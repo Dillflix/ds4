@@ -632,6 +632,8 @@ int main(int argc, char **argv) {
     int untimed_warmup_tokens = 0;
     const char *q8_cache_pretiming_state_csv =
         getenv("DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV");
+    const char *q8_binding_state_csv =
+        getenv("DS4_CUDA_Q8_BINDING_STATE_CSV");
     const char *warmup_env = getenv("DS4_BENCH_UNTIMED_WARMUP_TOKENS");
     if (warmup_env && warmup_env[0]) {
         errno = 0;
@@ -652,11 +654,11 @@ int main(int argc, char **argv) {
         }
         untimed_warmup_tokens = (int)parsed;
     }
-    if (q8_cache_pretiming_state_csv &&
-        q8_cache_pretiming_state_csv[0] &&
+    if (((q8_cache_pretiming_state_csv && q8_cache_pretiming_state_csv[0]) ||
+         (q8_binding_state_csv && q8_binding_state_csv[0])) &&
         untimed_warmup_tokens == 0) {
         fprintf(stderr,
-                "ds4-bench: DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV "
+                "ds4-bench: CUDA Q8 pre-timing state export "
                 "requires DS4_BENCH_UNTIMED_WARMUP_TOKENS\n");
         return 2;
     }
@@ -791,6 +793,16 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "ds4-bench: failed to write pre-timing CUDA Q8 cache state %s\n",
                     q8_cache_pretiming_state_csv);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (q8_binding_state_csv && q8_binding_state_csv[0] &&
+            !ds4_gpu_q8_binding_state_write_csv(q8_binding_state_csv)) {
+            fprintf(stderr,
+                    "ds4-bench: failed to write CUDA Q8 binding state %s\n",
+                    q8_binding_state_csv);
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
             ds4_engine_close(engine);

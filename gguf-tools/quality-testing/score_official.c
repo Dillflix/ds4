@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
 
@@ -21,7 +22,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
             "[--gpu-vram auto|N[,N...]] [--gpu-devices N[,N...]] "
-            "[--cuda-tensor-parallel] [--warm-weights] "
+            "[--cuda-tensor-parallel] [--warm-weights] [--production-path] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N]\n",
@@ -529,6 +530,7 @@ int main(int argc, char **argv) {
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
     bool warm_weights = false;
+    bool production_path = false;
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
@@ -540,6 +542,8 @@ int main(int argc, char **argv) {
             cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             warm_weights = true;
+        } else if (!strcmp(arg, "--production-path")) {
+            production_path = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -593,8 +597,11 @@ int main(int argc, char **argv) {
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
         .warm_weights = warm_weights,
-        /* Quality scoring must not use TF32 or throughput-only fast paths. */
-        .quality = true,
+        /* Exact quality mode remains the default.  --production-path is an
+         * explicit same-model policy-validation mode: teacher-forced NLL is
+         * unchanged, but inference uses the actual throughput dispatch so
+         * cache/offload policies can be compared instead of silently bypassed. */
+        .quality = !production_path,
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
@@ -602,6 +609,8 @@ int main(int argc, char **argv) {
     };
 
     ds4_engine *engine = NULL;
+    fprintf(stderr, "score_official: runtime_path=%s\n",
+            production_path ? "production" : "exact-quality");
     if (skip_cuda) opt.backend = DS4_BACKEND_CPU;
     if (have_gpu_config && !skip_cuda) {
         const bool was_auto =
@@ -877,10 +886,44 @@ int main(int argc, char **argv) {
             total_api.pair_total,
             safe_ratio(total_api.pair_agree, total_api.pair_total));
 
-    fclose(out);
-    fclose(mf);
+    int evidence_ok = 1;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (production_path && opt.backend == DS4_BACKEND_CUDA) {
+        const char *audit_path = getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV");
+        const char *bindings_path =
+            getenv("DS4_CUDA_Q8_BINDING_STATE_CSV");
+        if (audit_path && audit_path[0]) {
+            if (!ds4_gpu_q8_audit_write_csv(audit_path)) {
+                fprintf(stderr,
+                        "score_official: failed to write CUDA Q8 cache audit %s\n",
+                        audit_path);
+                evidence_ok = 0;
+            } else {
+                fprintf(stderr,
+                        "score_official: wrote CUDA Q8 cache audit %s\n",
+                        audit_path);
+            }
+            ds4_gpu_q8_audit_end();
+        }
+        if (bindings_path && bindings_path[0]) {
+            if (!ds4_gpu_q8_binding_state_write_csv(bindings_path)) {
+                fprintf(stderr,
+                        "score_official: failed to write CUDA Q8 binding state %s\n",
+                        bindings_path);
+                evidence_ok = 0;
+            } else {
+                fprintf(stderr,
+                        "score_official: wrote CUDA Q8 binding state %s\n",
+                        bindings_path);
+            }
+        }
+    }
+#endif
+
+    if (fclose(out) != 0) evidence_ok = 0;
+    if (fclose(mf) != 0) evidence_ok = 0;
     free(logits);
     ds4_session_free(session);
     ds4_engine_close(engine);
-    return 0;
+    return evidence_ok ? 0 : 1;
 }

@@ -85,6 +85,12 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   short prompts and long-prompt attention cases.
 - Run the 100-case DeepSeek V4 Flash fixture for every released Flash GGUF:
   `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
+- When a CUDA cache, placement, or offload policy changes, also score the same
+  model with the policy disabled and enabled using `--production-path` and the
+  production `--gpu-devices`, `--gpu-vram`, and `--cuda-tensor-parallel`
+  arguments. Retain the `score_official: runtime_path=production` marker in the
+  QA evidence. This dispatch-neutrality check supplements rather than replaces
+  the default exact-quality release score.
 - Run the 100-case GLM 5.2 OpenRouter fixture for every released GLM GGUF:
   `gguf-tools/quality-testing/score_official models/GLM-5.2-UD-Q4_K_XL.gguf gguf-tools/quality-testing/data/glm52-openrouter-100/manifest.tsv /tmp/glm52-q4.tsv 4096`.
   Current Q4 XL reference band: first-token match `95/100`, API top-1 agreement

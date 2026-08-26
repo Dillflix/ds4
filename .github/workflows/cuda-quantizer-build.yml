@@ -9,8 +9,10 @@ on:
       - "ds4.h"
       - "ds4_bench.c"
       - "ds4_cuda.cu"
+      - "ds4_rocm_compat.cu"
       - "ds4_cuda_sm75_q4_native.inc.cu"
       - "ds4_gpu.h"
+      - "ds4_gpu_mgpu.h"
       - "ds4_tensor_layout.h"
       - "ds4_help.c"
       - "Makefile"
@@ -29,12 +31,14 @@ on:
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
       - "speed-bench/cuda-q8-partner-offload-ab.sh"
+      - "speed-bench/cuda-q8-partner-production-validation.sh"
       - "speed-bench/cuda-q8-t32-fused-ab.sh"
       - "speed-bench/cuda-sm75-critical-path-audit.sh"
       - "speed-bench/cuda-sm75-q4-clock-audit.sh"
       - "speed-bench/summarize-cuda-critical-path.py"
       - "speed-bench/summarize-sm75-q4-clock-audit.py"
       - "speed-bench/summarize-q8-partner-offload-ab.py"
+      - "speed-bench/summarize-q8-partner-production.py"
       - "speed-bench/q8_partner_audit.py"
       - "speed-bench/summarize-q8-t32-fused-ab.py"
       - "speed-bench/validate-ncu-capture.py"
@@ -53,6 +57,7 @@ on:
       - "tests/test_engine_mgpu_placement.c"
       - "tests/test_gpu_xdev.c"
       - "tests/test_summarize_q8_partner_offload_ab.py"
+      - "tests/test_summarize_q8_partner_production.py"
       - "tests/test_summarize_q8_t32_fused_ab.py"
       - "tests/test_summarize_cuda_critical_path.py"
       - "tests/test_summarize_q4_real_histogram.py"
@@ -82,10 +87,15 @@ jobs:
       - name: Check Q8 partner A/B tooling
         run: |
           bash -n speed-bench/cuda-q8-partner-offload-ab.sh
+          test -x speed-bench/cuda-q8-partner-production-validation.sh
+          bash -n speed-bench/cuda-q8-partner-production-validation.sh
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
+          python3 -m py_compile speed-bench/summarize-q8-partner-production.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
+          python3 -m py_compile tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
+          python3 tests/test_summarize_q8_partner_production.py
       - name: Verify production tagged-Q4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'
@@ -406,6 +416,8 @@ jobs:
           test -x speed-bench/cuda-sm75-q4-persistent.sh
           bash -n speed-bench/cuda-sm75-q4-persistent.sh
           bash -n speed-bench/cuda-q8-partner-offload-ab.sh
+          test -x speed-bench/cuda-q8-partner-production-validation.sh
+          bash -n speed-bench/cuda-q8-partner-production-validation.sh
           bash -n speed-bench/cuda-q8-t32-fused-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
@@ -426,9 +438,12 @@ jobs:
           python3 -m py_compile speed-bench/summarize-tile-audit.py
           python3 -m py_compile speed-bench/summarize-q8-cache-audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
+          python3 -m py_compile speed-bench/summarize-q8-partner-production.py
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
+          python3 -m py_compile tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
+          python3 tests/test_summarize_q8_partner_production.py
           python3 -m py_compile speed-bench/summarize-q8-t32-fused-ab.py
           python3 tests/test_summarize_q8_t32_fused_ab.py
           python3 -m py_compile speed-bench/summarize-cuda-critical-path.py

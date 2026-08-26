@@ -17,8 +17,15 @@ STEP_MUL=${STEP_MUL:-2}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 REPEATS=${REPEATS:-3}
 VARIANTS=${VARIANTS:-local,t32,t256,shared_down,legacy}
+AB_MODE=${AB_MODE:-screen}
 RUN_NSYS=${RUN_NSYS:-1}
-NSYS_VARIANTS=${NSYS_VARIANTS:-t32,t256,shared_down}
+if [[ -z ${NSYS_VARIANTS+x} ]]; then
+    if [[ $AB_MODE == production ]]; then
+        NSYS_VARIANTS=default
+    else
+        NSYS_VARIANTS=t32,t256,shared_down
+    fi
+fi
 PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
 SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_GPU_TEST=${RUN_GPU_TEST:-1}
@@ -29,6 +36,8 @@ OUTPUT_DIR=${Q8_PARTNER_AB_DIR:-$repo_dir/q8-partner-offload-ab-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 [[ $PROMPT == /* ]] || die "PROMPT must be an absolute path"
+[[ $AB_MODE == screen || $AB_MODE == production ]] ||
+    die "AB_MODE must be screen or production"
 if [[ -n $REUSE_T32_DIR ]]; then
     [[ $REUSE_T32_DIR == /* && -d $REUSE_T32_DIR ]] ||
         die "REUSE_T32_DIR must name an existing absolute T32 A/B directory"
@@ -95,7 +104,7 @@ declare -A seen=()
 have_local=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        local|t32|t256|shared_down|legacy) ;;
+        local|default|t32|t256|shared_down|legacy) ;;
         *) die "unsupported variant: $variant" ;;
     esac
     [[ -z ${seen[$variant]+x} ]] || die "duplicate variant: $variant"
@@ -103,13 +112,20 @@ for variant in "${variants[@]}"; do
     [[ $variant == local ]] && have_local=1
 done
 (( have_local == 1 )) || die "VARIANTS must include local"
-[[ -n ${seen[t32]+x} && -n ${seen[t256]+x} ]] ||
-    die "a complete A/B requires both t32 and t256 variants"
+if [[ $AB_MODE == screen ]]; then
+    [[ -n ${seen[t32]+x} && -n ${seen[t256]+x} ]] ||
+        die "a complete class screen requires both t32 and t256 variants"
+else
+    [[ $VARIANTS == local,default ]] ||
+        die "production validation requires VARIANTS=local,default"
+    [[ -z $REUSE_T32_DIR ]] ||
+        die "production validation cannot reuse an explicit T32 screen"
+fi
 nsys_variants=()
 if [[ $RUN_NSYS == 1 ]]; then
     IFS=',' read -r -a nsys_variants <<<"$NSYS_VARIANTS"
     for variant in "${nsys_variants[@]}"; do
-        [[ $variant == t32 || $variant == t256 || $variant == shared_down ||
+        [[ $variant == default || $variant == t32 || $variant == t256 || $variant == shared_down ||
            $variant == legacy ]] || die "unsupported NSYS_VARIANTS entry: $variant"
         [[ -n ${seen[$variant]+x} ]] ||
             die "Nsight variant $variant is not present in VARIANTS"
@@ -122,9 +138,18 @@ mkdir -p "$OUTPUT_DIR"/{runs,logits,nsys,provenance,telemetry}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
+telemetry_pid=
+stop_telemetry() {
+    if [[ -n ${telemetry_pid:-} ]]; then
+        kill "$telemetry_pid" 2>/dev/null || true
+        wait "$telemetry_pid" 2>/dev/null || true
+        telemetry_pid=
+    fi
+}
 finish() {
     status=$?
     trap - EXIT INT TERM
+    stop_telemetry
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
         "$status" "$phase" >"$OUTPUT_DIR/run-status.txt"
@@ -195,6 +220,7 @@ set_variant_extra() {
             variant_extra+=(DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1)
             variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=none)
             ;;
+        default) ;;
         legacy) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=legacy) ;;
         t32) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t32) ;;
         t256) variant_extra+=(DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256) ;;
@@ -239,9 +265,9 @@ phase=manifest
     printf 'date_utc=%s\ngit_commit=%s\nmodel=%s\nmodel_bytes=%s\nprompt=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nprefill_chunk=%s\nrepeats=%s\nvariants=%s\n' \
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nprefill_chunk=%s\nrepeats=%s\nvariants=%s\nab_mode=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
-        "$PREFILL_CHUNK" "$REPEATS" "$VARIANTS"
+        "$PREFILL_CHUNK" "$REPEATS" "$VARIANTS" "$AB_MODE"
     printf 'run_nsys=%s\nnsys_variants=%s\nprofile_tokens=%s\nmodel_hashing=disabled\n' \
         "$RUN_NSYS" "$NSYS_VARIANTS" "$PROFILE_TOKENS"
     printf 'reuse_t32_dir=%s\n' "${REUSE_T32_DIR:-none}"
@@ -251,6 +277,8 @@ phase=manifest
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+env | awk -F= '$1 ~ /^DS4_/ {print $0}' | sort -u \
+    >"$OUTPUT_DIR/provenance/inherited-ds4-env.txt"
 if [[ -n $REUSE_T32_DIR ]]; then
     cp "$REUSE_T32_DIR/manifest.txt" \
         "$OUTPUT_DIR/provenance/reused-t32-manifest.txt"
@@ -263,10 +291,11 @@ phase=benchmarks
 n_variants=${#variants[@]}
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
     for ((slot=0; slot<n_variants; slot++)); do
+        pair_index=$(((repeat - 1) / 2))
         if (( repeat % 2 )); then
-            idx=$(((slot + repeat - 1) % n_variants))
+            idx=$(((slot + pair_index) % n_variants))
         else
-            idx=$((n_variants - 1 - ((slot + repeat - 1) % n_variants)))
+            idx=$(((n_variants - 1 - slot + pair_index) % n_variants))
         fi
         variant=${variants[$idx]}
         set_variant_extra "$variant"
@@ -276,6 +305,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         audit="$OUTPUT_DIR/runs/$stem.q8-audit.csv"
         before="$OUTPUT_DIR/runs/$stem.cache-before.csv"
         after="$OUTPUT_DIR/runs/$stem.cache-after.csv"
+        bindings="$OUTPUT_DIR/runs/$stem.bindings.csv"
         logits="$OUTPUT_DIR/logits/$stem"
         telemetry_before="$OUTPUT_DIR/telemetry/$stem.before.csv"
         telemetry_after="$OUTPUT_DIR/telemetry/$stem.after.csv"
@@ -319,6 +349,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 
         nvidia-smi --query-gpu=index,memory.used,memory.free \
             --format=csv >"$telemetry_before"
+        nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,\
+power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory \
+            --format=csv,noheader,nounits -lms 200 \
+            >"$OUTPUT_DIR/telemetry/$stem.samples.csv" &
+        telemetry_pid=$!
         printf 'Benchmarking %s repeat=%d/%d slot=%d/%d...\n' \
             "$variant" "$repeat" "$REPEATS" "$((slot+1))" "$n_variants"
         "${clean[@]}" "${variant_extra[@]}" \
@@ -331,6 +366,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
             "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$before" \
             "DS4_CUDA_Q8_CACHE_STATE_CSV=$after" \
+            "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
@@ -342,10 +378,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     tail -n 180 "$log" >&2
                     die "$stem failed"
                 }
+        stop_telemetry
+        [[ -s $OUTPUT_DIR/telemetry/$stem.samples.csv ]] ||
+            die "$stem produced no peak-VRAM telemetry samples"
         nvidia-smi --query-gpu=index,memory.used,memory.free \
             --format=csv >"$telemetry_after"
 
-        [[ -s $csv && -s $audit && -s $before && -s $after ]] ||
+        [[ -s $csv && -s $audit && -s $before && -s $after && -s $bindings ]] ||
             die "$stem omitted required evidence"
         cmp -s "$before" "$after" ||
             die "$stem changed the F16 cache during timed frontiers"
@@ -356,6 +395,19 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         done
         grep -Fq 'q8 fp16 benefit plan registered' "$log" ||
             die "$stem did not use benefit planning"
+        if [[ $variant == default ]]; then
+            grep -Fq 'partner-classes=t256' "$log" ||
+                die "$stem did not select the production-default T256 policy"
+            ! grep -q '^DS4_CUDA_Q8_F16_PARTNER_CLASSES=' \
+                "$OUTPUT_DIR/provenance/inherited-ds4-env.txt" ||
+                die "$stem default-policy proof inherited an explicit class selector"
+            awk -F, 'NR > 1 && $3 == 1 && $6 == 8192 && $7 == 4096 {n++}
+                       END {exit n > 0 ? 0 : 1}' "$bindings" ||
+                die "$stem has no T256 partner binding in its exported plan"
+            awk -F, 'NR > 1 && $3 == 1 && !($6 == 8192 && $7 == 4096) {bad=1}
+                       END {exit bad}' "$bindings" ||
+                die "$stem exported a non-T256 partner binding"
+        fi
         if ! validate_audit "$variant" "$audit"; then
             printf 'benchmark repeat=%s variant=%s has invalid requested-class or partner-device evidence\n' \
                 "$repeat" "$variant" >>"$OUTPUT_DIR/validation-failures.txt"

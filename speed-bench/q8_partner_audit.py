@@ -43,7 +43,7 @@ def class_evidence_valid(variant: str, counts: Counter[str]) -> bool:
         return total == 0
     if variant == "t32":
         return counts["t32"] > 0 and total == counts["t32"]
-    if variant == "t256":
+    if variant in ("t256", "default"):
         return counts["t256"] > 0 and total == counts["t256"]
     if variant == "shared_down":
         return counts["shared_down"] > 0 and total == counts["shared_down"]

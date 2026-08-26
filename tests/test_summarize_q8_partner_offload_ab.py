@@ -25,7 +25,9 @@ def audit_rows(
         "t256": ("attn_output_b", 8192, 4096),
         "shared_down": ("shared_down", 2048, 4096),
     }
-    names = [variant] if variant in shapes else (["t32", "t256"] if variant == "legacy" else [])
+    names = (["t256"] if variant == "default" else
+             [variant] if variant in shapes else
+             ["t32", "t256"] if variant == "legacy" else [])
     rows = []
     for name_index, name in enumerate(names):
         module, in_dim, out_dim = shapes[name]
@@ -134,7 +136,7 @@ def main() -> None:
         # The command-line validator is shared with the runner. One observed
         # configured partner is sufficient; zero evidence, a wrong class, or
         # an unexpected physical device must still fail.
-        for variant in ("t32", "t256", "shared_down"):
+        for variant in ("default", "t32", "t256", "shared_down"):
             audit = tmp / f"one-partner-{variant}.csv"
             with audit.open("w", newline="") as handle:
                 writer = csv.writer(handle)

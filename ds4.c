@@ -345,6 +345,7 @@ int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) { (void)t; return -1; }
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+double      g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #endif
 
 #if defined(DS4_NO_GPU)
@@ -356,6 +357,7 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+double      g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -2948,15 +2950,34 @@ static bool accelerator_q8_cache_partner_list_has(
     return false;
 }
 
-/* The full-Q4 class-isolated screen selects T256 by default.  T32 and T256
+static bool accelerator_q8_cache_implicit_default_qualified(
+        int home_major,
+        int home_minor,
+        int partner_major,
+        int partner_minor,
+        double forward_gib_per_sec,
+        double reverse_gib_per_sec) {
+    return home_major == 7 && home_minor == 5 &&
+           partner_major == 7 && partner_minor == 5 &&
+           forward_gib_per_sec >= 18.0 &&
+           reverse_gib_per_sec >= 18.0;
+}
+
+/* The full-Q4 class-isolated screen selects T256 by default on the measured
+ * SM75 + fast-peer target.  The automatic path requires at least 18 GiB/s in
+ * both directions, which excludes PCIe 3.0 x16 while retaining the RTX 8000
+ * NVLink pairs.  An explicit class selector remains an expert override.
+ * T32 and T256
  * produced identical logits and similar compute savings, but T256 moved only
  * 3.12 GiB per sweep versus T32's 12.70 GiB and was consistently faster.
  * Shared-down was materially slower and changed the 2048-token top result.
  * Keep "legacy" as an explicit compatibility/measurement selector. */
-static bool accelerator_q8_cache_partner_class_enabled(uint32_t path_class) {
+static bool accelerator_q8_cache_partner_class_enabled(
+        uint32_t path_class, bool implicit_default_qualified) {
     const char *list = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!list || !list[0]) {
-        return path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+        return implicit_default_qualified &&
+               path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
     }
     if (strcmp(list, "legacy") == 0) {
         return path_class == ACCEL_Q8_CACHE_T32_Q_B ||
@@ -2987,9 +3008,11 @@ static int accelerator_q8_cache_partner_tier(
         int home_tier,
         bool peer_forward,
         bool peer_reverse,
+        bool implicit_default_qualified,
         bool disabled) {
     if (disabled || !cuda_tp_decode || n_gpus < 2 || (n_gpus & 1) != 0 ||
-        !accelerator_q8_cache_partner_class_enabled(path_class)) return -1;
+        !accelerator_q8_cache_partner_class_enabled(
+            path_class, implicit_default_qualified)) return -1;
     const int half = n_gpus / 2;
     if (home_tier < 0 || home_tier >= half || !peer_forward || !peer_reverse)
         return -1;
@@ -55761,6 +55784,31 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
     const bool split_attn_heads =
         split_attn_output && metal_graph_cuda_tp_prefill_attn_heads_requested();
+    bool implicit_partner_qualified[DS4_MAX_GPUS] = {false};
+    for (int home_tier = 0; home_tier < tp_half; home_tier++) {
+        const int partner_tier = home_tier + tp_half;
+        implicit_partner_qualified[home_tier] =
+            accelerator_q8_cache_implicit_default_qualified(
+                g_gpu[home_tier].compute_major,
+                g_gpu[home_tier].compute_minor,
+                g_gpu[partner_tier].compute_major,
+                g_gpu[partner_tier].compute_minor,
+                g_gpu_peer_gib_per_sec[home_tier][partner_tier],
+                g_gpu_peer_gib_per_sec[partner_tier][home_tier]);
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 automatic partner pair "
+                "home=%d(sm_%d%d) partner=%d(sm_%d%d) "
+                "peer=%.2f/%.2f GiB/s qualified=%s\n",
+                g_gpu[home_tier].device_id,
+                g_gpu[home_tier].compute_major,
+                g_gpu[home_tier].compute_minor,
+                g_gpu[partner_tier].device_id,
+                g_gpu[partner_tier].compute_major,
+                g_gpu[partner_tier].compute_minor,
+                g_gpu_peer_gib_per_sec[home_tier][partner_tier],
+                g_gpu_peer_gib_per_sec[partner_tier][home_tier],
+                implicit_partner_qualified[home_tier] ? "yes" : "no");
+    }
 
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
@@ -55775,12 +55823,16 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         const int partner_tier = cuda_tp_decode ? home_tier + tp_half : -1;
         const int partner_device = partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus
             ? g_gpu[partner_tier].device_id : -1;
+        const bool implicit_default_qualified =
+            home_tier >= 0 && home_tier < tp_half &&
+            implicit_partner_qualified[home_tier];
         const int fallback_tier = accelerator_q8_cache_partner_tier(
             path_class, cuda_tp_decode, e->gpu_cfg.n_gpus, home_tier,
             partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
                 g_gpu_peer_ok[home_tier][partner_tier],
             partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
                 g_gpu_peer_ok[partner_tier][home_tier],
+            implicit_default_qualified,
             getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL);
         const int fallback_device = fallback_tier >= 0
             ? g_gpu[fallback_tier].device_id : -1;
@@ -56382,7 +56434,34 @@ int ds4_test_q8_cache_partner_tier(
     ds4_str s = {name, name ? strlen(name) : 0u};
     return accelerator_q8_cache_partner_tier(
         accelerator_q8_cache_classify(s), true, n_gpus, home_tier,
-        peer_forward != 0, peer_reverse != 0, disabled != 0);
+        peer_forward != 0, peer_reverse != 0, true, disabled != 0);
+}
+
+int ds4_test_q8_cache_partner_tier_qualified(
+        const char *name,
+        int n_gpus,
+        int home_tier,
+        int peer_forward,
+        int peer_reverse,
+        int implicit_default_qualified,
+        int disabled) {
+    ds4_str s = {name, name ? strlen(name) : 0u};
+    return accelerator_q8_cache_partner_tier(
+        accelerator_q8_cache_classify(s), true, n_gpus, home_tier,
+        peer_forward != 0, peer_reverse != 0,
+        implicit_default_qualified != 0, disabled != 0);
+}
+
+int ds4_test_q8_cache_implicit_default_qualified(
+        int home_major,
+        int home_minor,
+        int partner_major,
+        int partner_minor,
+        double forward_gib_per_sec,
+        double reverse_gib_per_sec) {
+    return accelerator_q8_cache_implicit_default_qualified(
+        home_major, home_minor, partner_major, partner_minor,
+        forward_gib_per_sec, reverse_gib_per_sec) ? 1 : 0;
 }
 
 bool ds4_test_cuda_routed_moe_quant_types_supported(
