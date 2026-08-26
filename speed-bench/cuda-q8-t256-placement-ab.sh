@@ -97,7 +97,8 @@ done
         "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
     printf 'ctx_start=%s\nctx_max=%s\nstep_mul=%s\nprefill_chunk=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$STEP_MUL" "$PREFILL_CHUNK" "$REPEATS"
-    printf 'variants=native,all-local,balanced,overflow,all-partner\nmodel_hashing=disabled\n'
+    printf 'variants=native,all-local,balanced,overflow,all-partner\n'
+    printf 'overflow_partner_eligibility=15-21\nmodel_hashing=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free --format=csv
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
@@ -120,7 +121,7 @@ phase=tests
 grep -Fq 'q8 partner projection exactness OK (3 classes)' "$OUTPUT_DIR/gpu-exactness.log" ||
     die "GPU regression lacks local/partner FP16 exactness evidence"
 
-printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tbindings\n' >"$OUTPUT_DIR/runs.tsv"
+printf 'repeat\tslot\tvariant\tcsv\tlog\taudit\tbindings\tallocations\n' >"$OUTPUT_DIR/runs.tsv"
 common_env=(
     "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT"
     DS4_CUDA_PREFILL_PIPELINE=1
@@ -138,6 +139,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         log="$OUTPUT_DIR/runs/$stem.log"
         audit="$OUTPUT_DIR/runs/$stem.q8-audit.csv"
         bindings="$OUTPUT_DIR/runs/$stem.bindings.csv"
+        allocations="$OUTPUT_DIR/runs/$stem.allocations.csv"
         mode_env=()
         case "$variant" in
             native)
@@ -179,6 +181,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$CTX_START" \
             "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
             "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
+            "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
@@ -187,10 +190,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 --csv "$csv" \
                 >"$log" 2>&1 || {
                     tail -n 200 "$log" >&2; die "$stem failed"; }
-        [[ -s $csv && -s $audit && -s $bindings ]] || die "$stem omitted evidence"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        [[ -s $csv && -s $audit && -s $bindings && -s $allocations ]] ||
+            die "$stem omitted evidence"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repeat" "$((slot+1))" "$variant" "$csv" "$log" \
-            "$audit" "$bindings" >>"$OUTPUT_DIR/runs.tsv"
+            "$audit" "$bindings" "$allocations" >>"$OUTPUT_DIR/runs.tsv"
         cat "$csv"
     done
 done

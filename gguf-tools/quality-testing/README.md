@@ -136,6 +136,15 @@ marker in policy-validation evidence. Use the default exact-quality path for
 model/release quality, and compare the same model with the policy disabled and
 enabled under `--production-path` when validating runtime-policy neutrality.
 
+Production scoring can also export quiescent selective-cache evidence after
+the final case. Set `DS4_CUDA_Q8_BINDING_STATE_CSV` and
+`DS4_CUDA_Q8_ALLOCATION_STATE_CSV` to record logical bindings and their
+physical expanded F16/F32 allocations, including call counts, liveness,
+aliases, resident bytes, and dead bytes. The scorer writes both snapshots
+before disabling usage tracking. `cuda-q8-fp16-full-quality.sh` requires these
+files for its strict all-native-Q8 versus complete-production-FP16-cache
+comparison.
+
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
 

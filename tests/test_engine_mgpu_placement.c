@@ -42,6 +42,9 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 uint32_t ds4_test_q8_cache_class(const char *name);
+uint32_t ds4_test_q8_cache_candidate_copies(
+        const char *name, int split_attn_heads,
+        int partner_available, int sliceable);
 int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,
                               const char *name_b, uint64_t fp16_bytes_b);
 int ds4_test_q8_cache_compare_fallback(
@@ -175,6 +178,20 @@ static void test_q8_cache_benefit_order(void) {
     CHECK(ds4_test_q8_cache_class(out_b) != 0u, "T256 output_b is cache-plannable");
     CHECK(ds4_test_q8_cache_class("blk.3.attn_norm.weight") == 0u,
           "non-Q8 projection is not cache-plannable");
+    CHECK(ds4_test_q8_cache_candidate_copies(out_a, 0, 1, 1) == 1u,
+          "output-A halves are absent when head-parallel prefill is disabled");
+    CHECK(ds4_test_q8_cache_candidate_copies(out_a, 1, 1, 1) == 3u,
+          "head-parallel output-A plans two halves plus the full fallback");
+    CHECK(ds4_test_q8_cache_candidate_copies(out_a, 1, 0, 1) == 1u,
+          "head-parallel output-A does not plan peer halves without P2P");
+    CHECK(ds4_test_q8_cache_candidate_copies(q_b, 1, 1, 1) == 3u,
+          "head-parallel q_b plans two halves plus the full fallback");
+    CHECK(ds4_test_q8_cache_candidate_copies(q_b, 0, 1, 1) == 1u,
+          "ordinary q_b planning keeps only its full tensor");
+    CHECK(ds4_test_q8_cache_candidate_copies(q_b, 1, 1, 0) == 1u,
+          "non-sliceable q_b planning keeps only its full tensor");
+    CHECK(ds4_test_q8_cache_candidate_copies(out_b, 1, 1, 1) == 1u,
+          "T256 has one logical consumer and no fixed partner duplicate");
 
     /* Both expensive paths expand to 64 MiB in DeepSeek V4 Flash. */
     CHECK(ds4_test_q8_cache_compare(q_b, 64ull << 20,

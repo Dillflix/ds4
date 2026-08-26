@@ -634,6 +634,11 @@ int main(int argc, char **argv) {
         getenv("DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV");
     const char *q8_binding_state_csv =
         getenv("DS4_CUDA_Q8_BINDING_STATE_CSV");
+    const char *q8_allocation_state_csv =
+        getenv("DS4_CUDA_Q8_ALLOCATION_STATE_CSV");
+    const char *q8_cache_audit_csv = cfg.backend == DS4_BACKEND_CUDA
+        ? getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV") : NULL;
+    bool q8_cache_audit_done = false;
     const char *warmup_env = getenv("DS4_BENCH_UNTIMED_WARMUP_TOKENS");
     if (warmup_env && warmup_env[0]) {
         errno = 0;
@@ -655,7 +660,8 @@ int main(int argc, char **argv) {
         untimed_warmup_tokens = (int)parsed;
     }
     if (((q8_cache_pretiming_state_csv && q8_cache_pretiming_state_csv[0]) ||
-         (q8_binding_state_csv && q8_binding_state_csv[0])) &&
+         (q8_binding_state_csv && q8_binding_state_csv[0]) ||
+         (q8_allocation_state_csv && q8_allocation_state_csv[0])) &&
         untimed_warmup_tokens == 0) {
         fprintf(stderr,
                 "ds4-bench: CUDA Q8 pre-timing state export "
@@ -774,6 +780,23 @@ int main(int argc, char **argv) {
                 "ds4-bench: completed untimed CUDA warm-up frontier %d\n",
                 untimed_warmup_tokens);
 
+        if (q8_cache_audit_csv && q8_cache_audit_csv[0]) {
+            if (!ds4_gpu_q8_audit_write_csv(q8_cache_audit_csv)) {
+                fprintf(stderr,
+                        "ds4-bench: failed to write untimed CUDA Q8 cache audit %s\n",
+                        q8_cache_audit_csv);
+                ds4_session_free(session);
+                ds4_tokens_free(&prompt);
+                ds4_engine_close(engine);
+                return 1;
+            }
+            ds4_gpu_q8_audit_end();
+            q8_cache_audit_done = true;
+            fprintf(stderr,
+                    "ds4-bench: wrote untimed CUDA Q8 cache audit %s\n",
+                    q8_cache_audit_csv);
+        }
+
         /* Recreate the session so every reported frontier starts from the
          * same empty sequence state while retaining the engine-owned Q8
          * cache populated by the untimed pass. */
@@ -807,6 +830,24 @@ int main(int argc, char **argv) {
             ds4_tokens_free(&prompt);
             ds4_engine_close(engine);
             return 1;
+        }
+        if (q8_allocation_state_csv && q8_allocation_state_csv[0] &&
+            !ds4_gpu_q8_allocation_state_write_csv(
+                q8_allocation_state_csv)) {
+            fprintf(stderr,
+                    "ds4-bench: failed to write CUDA Q8 allocation state %s\n",
+                    q8_allocation_state_csv);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if ((q8_binding_state_csv && q8_binding_state_csv[0]) ||
+            (q8_allocation_state_csv && q8_allocation_state_csv[0])) {
+            /* Liveness is sampled only by the untimed warm-up.  Timed
+             * dispatches retain only the disabled fast-path check; they do
+             * not take the usage mutex or update a counter. */
+            ds4_gpu_q8_binding_usage_end();
         }
     }
 #endif
@@ -842,9 +883,6 @@ int main(int argc, char **argv) {
     const char *tile_audit_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_PREFILL_TILE_AUDIT_CSV") : NULL;
     bool tile_audit_done = false;
-    const char *q8_cache_audit_csv = cfg.backend == DS4_BACKEND_CUDA
-        ? getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV") : NULL;
-    bool q8_cache_audit_done = false;
     const char *q8_cache_state_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_Q8_CACHE_STATE_CSV") : NULL;
 #endif

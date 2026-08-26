@@ -925,6 +925,8 @@ int main(int argc, char **argv) {
         const char *audit_path = getenv("DS4_CUDA_Q8_CACHE_AUDIT_CSV");
         const char *bindings_path =
             getenv("DS4_CUDA_Q8_BINDING_STATE_CSV");
+        const char *allocations_path =
+            getenv("DS4_CUDA_Q8_ALLOCATION_STATE_CSV");
         if (audit_path && audit_path[0]) {
             if (!ds4_gpu_q8_audit_write_csv(audit_path)) {
                 fprintf(stderr,
@@ -949,6 +951,22 @@ int main(int argc, char **argv) {
                         "score_official: wrote CUDA Q8 binding state %s\n",
                         bindings_path);
             }
+        }
+        if (allocations_path && allocations_path[0]) {
+            if (!ds4_gpu_q8_allocation_state_write_csv(allocations_path)) {
+                fprintf(stderr,
+                        "score_official: failed to write CUDA Q8 allocation state %s\n",
+                        allocations_path);
+                evidence_ok = 0;
+            } else {
+                fprintf(stderr,
+                        "score_official: wrote CUDA Q8 allocation state %s\n",
+                        allocations_path);
+            }
+        }
+        if ((bindings_path && bindings_path[0]) ||
+            (allocations_path && allocations_path[0])) {
+            ds4_gpu_q8_binding_usage_end();
         }
     }
 #endif

@@ -3026,6 +3026,17 @@ static bool accelerator_q8_cache_partner_layer_enabled(
     }
 }
 
+static uint32_t accelerator_q8_cache_candidate_copies(
+        uint32_t path_class,
+        bool split_attn_heads,
+        bool partner_available,
+        bool sliceable) {
+    return split_attn_heads && partner_available && sliceable &&
+           (path_class == ACCEL_Q8_CACHE_OUTPUT_A ||
+            path_class == ACCEL_Q8_CACHE_T32_Q_B)
+        ? 3u : 1u;
+}
+
 static bool accelerator_q8_cache_implicit_default_qualified(
         int home_major,
         int home_minor,
@@ -56002,6 +56013,10 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         const int partner_tier = cuda_tp_decode ? home_tier + tp_half : -1;
         const int partner_device = partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus
             ? g_gpu[partner_tier].device_id : -1;
+        const bool partner_peer_available =
+            partner_tier >= 0 && partner_tier < e->gpu_cfg.n_gpus &&
+            g_gpu_peer_ok[home_tier][partner_tier] &&
+            g_gpu_peer_ok[partner_tier][home_tier];
         const bool implicit_default_qualified =
             home_tier >= 0 && home_tier < tp_half &&
             implicit_partner_qualified[home_tier];
@@ -56049,12 +56064,17 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             return -1;
         }
         const uint64_t row_bytes = ((t->dim[0] + 31u) / 32u) * 34u;
+        const bool sliceable =
+            (t->dim[1] & 1u) == 0u &&
+            row_bytes <= UINT64_MAX / t->dim[1] &&
+            row_bytes * t->dim[1] == t->bytes;
+        const uint32_t candidate_copies =
+            accelerator_q8_cache_candidate_copies(
+                path_class, split_attn_heads, partner_peer_available,
+                sliceable);
         bool ok = true;
 
-        if (path_class == ACCEL_Q8_CACHE_OUTPUT_A && split_attn_output &&
-            partner_device >= 0 && (t->dim[1] & 1u) == 0u &&
-            row_bytes <= UINT64_MAX / t->dim[1] &&
-            row_bytes * t->dim[1] == t->bytes) {
+        if (path_class == ACCEL_Q8_CACHE_OUTPUT_A && candidate_copies == 3u) {
             /* Production TP output uses one contiguous group/row half on each
              * member of the NVLink pair. Plan the exact slices looked up by
              * cuda_q8_f16_ptr; a full-tensor entry would never hit them. */
@@ -56072,10 +56092,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
                     home_device, fallback_device, path_class);
-        } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B && split_attn_heads &&
-                   partner_device >= 0 && (t->dim[1] & 1u) == 0u &&
-                   row_bytes <= UINT64_MAX / t->dim[1] &&
-                   row_bytes * t->dim[1] == t->bytes) {
+        } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B &&
+                   candidate_copies == 3u) {
             const uint64_t half_rows = t->dim[1] / 2u;
             const uint64_t half_bytes = half_rows * row_bytes;
             ok = accelerator_q8_cache_candidate_append(
@@ -56095,13 +56113,6 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
                     home_device, fallback_device, path_class);
-            if (ok && path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
-                split_attn_output && partner_device >= 0) {
-                ok = accelerator_q8_cache_candidate_append(
-                    &plan, &plan_count, &plan_capacity, &e->model, t,
-                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    partner_device, -1, path_class);
-            }
         }
         if (!ok) {
             free(plan);
@@ -56603,6 +56614,19 @@ typedef struct {
 uint32_t ds4_test_q8_cache_class(const char *name) {
     ds4_str s = {name, name ? strlen(name) : 0u};
     return accelerator_q8_cache_classify(s);
+}
+
+uint32_t ds4_test_q8_cache_candidate_copies(
+        const char *name,
+        int split_attn_heads,
+        int partner_available,
+        int sliceable) {
+    ds4_str s = {name, name ? strlen(name) : 0u};
+    return accelerator_q8_cache_candidate_copies(
+        accelerator_q8_cache_classify(s),
+        split_attn_heads != 0,
+        partner_available != 0,
+        sliceable != 0);
 }
 
 int ds4_test_q8_cache_compare(const char *name_a, uint64_t fp16_bytes_a,

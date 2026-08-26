@@ -34,13 +34,22 @@ def binding(layer: int, consumer: int, resident: int) -> dict[str, object]:
         "resident_device": resident,
         "partner_offload": int(consumer != resident),
         "partner_arithmetic": "f16",
+        "allocation_id": layer + 1,
+        "used_calls": 1,
+        "live": 1,
     }
 
 
-def make_fixture(root: Path, repeats: int = 5) -> None:
+def make_fixture(
+    root: Path,
+    repeats: int = 5,
+    overflow_partner_layers: tuple[int, ...] = tuple(range(15, 22)),
+) -> None:
+    overflow_partner_layer_set = set(overflow_partner_layers)
     (root / "manifest.txt").write_text(
         "gpu_devices=0,3,1,2\ngpu_vram=auto\nstage_split=22/21\n"
-        "variants=native,all-local,balanced,overflow,all-partner\n",
+        "variants=native,all-local,balanced,overflow,all-partner\n"
+        "overflow_partner_eligibility=15-21\n",
         encoding="utf-8",
     )
     run_rows = []
@@ -52,6 +61,7 @@ def make_fixture(root: Path, repeats: int = 5) -> None:
             log_path = stem.with_suffix(".log")
             audit_path = Path(f"{stem}.q8-audit.csv")
             bindings_path = Path(f"{stem}.bindings.csv")
+            allocations_path = Path(f"{stem}.allocations.csv")
             speed = {
                 "native": 300, "all-local": 500, "balanced": 490,
                 "overflow": 480, "all-partner": 440,
@@ -64,23 +74,29 @@ def make_fixture(root: Path, repeats: int = 5) -> None:
             log_path.write_text(
                 "ds4: CUDA EP forced pipeline split 22/21\n"
                 f"ds4: benefit plan t256-placement={placement}\n"
-                + ("" if variant == "native" else "T256-output_b=86/86\n"),
+                + ("" if variant == "native" else "T256-output_b=43/43\n"),
                 encoding="utf-8",
             )
             counts = {
-                "native": (0, 0), "all-local": (86, 0),
-                "balanced": (65, 21), "overflow": (79, 7),
-                "all-partner": (43, 43),
+                "native": (0, 0), "all-local": (43, 0),
+                "balanced": (22, 21),
+                "overflow": (
+                    43 - len(overflow_partner_layer_set),
+                    len(overflow_partner_layer_set),
+                ),
+                "all-partner": (0, 43),
             }[variant]
             binding_rows = []
             if variant != "native":
                 for layer in range(43):
                     home, peer = (0, 1) if layer <= 21 else (3, 2)
-                    binding_rows.append(binding(layer, peer, peer))
                     use_partner = (
                         variant == "all-partner"
                         or (variant == "balanced" and layer % 2 == 1)
-                        or (variant == "overflow" and 15 <= layer <= 21)
+                        or (
+                            variant == "overflow"
+                            and layer in overflow_partner_layer_set
+                        )
                     )
                     binding_rows.append(
                         binding(layer, home, peer if use_partner else home)
@@ -96,8 +112,38 @@ def make_fixture(root: Path, repeats: int = 5) -> None:
                 [
                     "in_dim", "out_dim", "label", "consumer_device",
                     "resident_device", "partner_offload", "partner_arithmetic",
+                    "allocation_id", "used_calls", "live",
                 ],
                 binding_rows,
+            )
+            allocation_rows = []
+            for row in binding_rows:
+                allocation_rows.append({
+                    "allocation_id": row["allocation_id"],
+                    "storage_kind": "f16",
+                    "half_rounded": 0,
+                    "physical_device": row["resident_device"],
+                    "weight_offset": int(row["allocation_id"]) * 4096,
+                    "weight_bytes": 4096,
+                    "in_dim": 8192,
+                    "out_dim": 4096,
+                    "resident_bytes": 8192 * 4096 * 2,
+                    "logical_aliases": 1,
+                    "live_aliases": 1,
+                    "used_calls": 1,
+                    "dead_bytes": 0,
+                    "usage_tracking": 1,
+                })
+            write(
+                allocations_path,
+                [
+                    "allocation_id", "storage_kind", "half_rounded",
+                    "physical_device", "weight_offset", "weight_bytes",
+                    "in_dim", "out_dim", "resident_bytes", "logical_aliases",
+                    "live_aliases", "used_calls", "dead_bytes",
+                    "usage_tracking",
+                ],
+                allocation_rows,
             )
             audit_rows = []
             for layer in range(43):
@@ -106,7 +152,11 @@ def make_fixture(root: Path, repeats: int = 5) -> None:
                 elif variant == "balanced":
                     result = "f16_partner_hit" if layer % 2 else "f16_hit"
                 elif variant == "overflow":
-                    result = "f16_partner_hit" if 15 <= layer <= 21 else "f16_hit"
+                    result = (
+                        "f16_partner_hit"
+                        if layer in overflow_partner_layer_set
+                        else "f16_hit"
+                    )
                 else: result = "f16_partner_hit"
                 audit_rows.append({
                     "module": "attention_output", "label": "attn_output_b",
@@ -134,11 +184,14 @@ def make_fixture(root: Path, repeats: int = 5) -> None:
             run_rows.append({
                 "repeat": repeat, "slot": slot + 1, "variant": variant,
                 "csv": csv_path, "log": log_path, "audit": audit_path,
-                "bindings": bindings_path,
+                "bindings": bindings_path, "allocations": allocations_path,
             })
     write(
         root / "runs.tsv",
-        ["repeat", "slot", "variant", "csv", "log", "audit", "bindings"],
+        [
+            "repeat", "slot", "variant", "csv", "log", "audit",
+            "bindings", "allocations",
+        ],
         run_rows,
         "\t",
     )
@@ -173,6 +226,29 @@ class T256PlacementSummaryTests(unittest.TestCase):
             self.assertFalse(payload["high_confidence_counterbalanced"])
             self.assertIn("SCREEN ONLY", (root / "summary.md").read_text())
 
+    def test_zero_natural_overflow_is_valid_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-t256-zero-overflow-") as raw:
+            root = Path(raw)
+            make_fixture(root, repeats=1, overflow_partner_layers=())
+            result = self.run_summary(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads((root / "t256-placement.json").read_text())
+            self.assertEqual(payload["overflow_observed"], [{
+                "repeat": 1,
+                "local_bindings": 43,
+                "partner_bindings": 0,
+                "partner_layers": [],
+            }])
+            self.assertIn("r1=43/0", (root / "summary.md").read_text())
+
+    def test_ineligible_overflow_partner_layer_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-t256-bad-overflow-layer-") as raw:
+            root = Path(raw)
+            make_fixture(root, repeats=1, overflow_partner_layers=(14,))
+            result = self.run_summary(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ineligible partner layers [14]", result.stderr)
+
     def test_partial_all_partner_binding_set_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds4-t256-bad-bindings-") as raw:
             root = Path(raw)
@@ -183,7 +259,7 @@ class T256PlacementSummaryTests(unittest.TestCase):
             write(path, list(items[0]), items[:-1])
             result = self.run_summary(root)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("expected 43+43", result.stderr)
+            self.assertIn("expected 0+43", result.stderr)
 
     def test_wrong_balanced_runtime_layers_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds4-t256-bad-balanced-") as raw:
@@ -197,6 +273,21 @@ class T256PlacementSummaryTests(unittest.TestCase):
             result = self.run_summary(root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("partner layers", result.stderr)
+
+    def test_dead_all_partner_physical_weight_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-t256-dead-allocation-") as raw:
+            root = Path(raw)
+            make_fixture(root, repeats=1)
+            path = root / "runs/all-partner-r1.allocations.csv"
+            with path.open(newline="", encoding="utf-8") as handle:
+                items = list(csv.DictReader(handle))
+            items[0]["live_aliases"] = "0"
+            items[0]["used_calls"] = "0"
+            items[0]["dead_bytes"] = items[0]["resident_bytes"]
+            write(path, list(items[0]), items)
+            result = self.run_summary(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not one live physical weight", result.stderr)
 
 
 if __name__ == "__main__":

@@ -749,10 +749,25 @@ transparently falls back to native Q8. `DS4_CUDA_Q8_F16_CACHE_MB` is a
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing.
 `DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1` is a diagnostic mode that removes partner
-eligibility from the primary admission tie-break. It preserves the
-partner-disabled home binding set, then uses phase-two partner admission only
-for tensors that missed that frozen home plan. It is intended for arithmetic
-and quality attribution, not as an accepted production default.
+eligibility from the primary admission tie-break. It freezes the home ranking,
+not an exact imported inventory: ordinary phase-two partner admission can still
+fill candidates that miss locally. It is intended for arithmetic and quality
+attribution, not as an accepted production default.
+
+For allocation/liveness evidence, set
+`DS4_CUDA_Q8_ALLOCATION_STATE_CSV=/path/to/allocations.csv` together with a
+positive `DS4_BENCH_UNTIMED_WARMUP_TOKENS`. The warm-up counts successful
+logical binding executions, then `ds4-bench` takes a quiescent snapshot of the
+expanded F16/F32 weight payload allocations and disables counting before the
+timed sweep. Native-Q8 selective-cache slabs, graph scratch, CUDA allocator
+overhead, and cuBLAS workspaces are outside this table. The existing cache-state
+CSV schema is unchanged. Binding-state rows gain `allocation_id`, `used_calls`,
+and `live`; the separate allocation table reports aliases, aggregate warm-up
+uses, resident bytes, and dead bytes. Deliberate balanced/all-partner T256
+placement is admitted in ranked phase one with partner scratch reserved, and
+has one logical binding backed by one physical weight per layer rather than a
+dead fixed partner-consumer duplicate. A requested forced placement that cannot
+materialize is a plan failure, never a silent native fallback.
 `DS4_CUDA_Q8_F16_PARTNER_LAYERS` optionally restricts additive partner
 admission to a comma-separated list of transformer layers and inclusive ranges,
 for example `15,17-19,21`. The engine rejects malformed, descending, or

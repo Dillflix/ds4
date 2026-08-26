@@ -16,18 +16,17 @@ import re
 VARIANTS = ("native", "all-local", "balanced", "overflow", "all-partner")
 EXPECTED_BINDINGS = {
     "native": (0, 0),
-    "all-local": (86, 0),
-    "balanced": (65, 21),
-    "overflow": (79, 7),
-    "all-partner": (43, 43),
+    "all-local": (43, 0),
+    "balanced": (22, 21),
+    "all-partner": (0, 43),
 }
 EXPECTED_RESULTS = {
     "native": {"native_q8"},
     "all-local": {"f16_hit"},
     "balanced": {"f16_hit", "f16_partner_hit"},
-    "overflow": {"f16_hit", "f16_partner_hit"},
     "all-partner": {"f16_partner_hit"},
 }
+OVERFLOW_ELIGIBLE_PARTNER_LAYERS = frozenset(range(15, 22))
 
 
 def fail(message: str) -> None:
@@ -79,23 +78,47 @@ def devices_for_layer(layer: int) -> tuple[int, int]:
 def partner_layer(variant: str, layer: int) -> bool:
     if variant == "balanced":
         return (layer & 1) != 0
-    if variant == "overflow":
-        return 15 <= layer <= 21
     return variant == "all-partner"
 
 
 def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, object]]:
     variant = run["variant"]
     binding_rows = rows(Path(run["bindings"]))
+    allocation_rows = rows(Path(run["allocations"]))
     t256_bindings = [row for row in binding_rows if is_t256(row)]
     local = [row for row in t256_bindings if row["partner_offload"] == "0"]
     partner = [row for row in t256_bindings if row["partner_offload"] == "1"]
-    expected_local, expected_partner = EXPECTED_BINDINGS[variant]
-    if (len(local), len(partner)) != (expected_local, expected_partner):
-        fail(
-            f"{variant} repeat {run['repeat']} has T256 bindings "
-            f"{len(local)}+{len(partner)}, expected {expected_local}+{expected_partner}"
+    binding_partner_layers = sorted(layer_of(row) for row in partner)
+    binding_partner_layer_set = set(binding_partner_layers)
+    if variant == "overflow":
+        if len(t256_bindings) != 43 or len(local) + len(partner) != 43:
+            fail(
+                f"overflow repeat {run['repeat']} has T256 bindings "
+                f"{len(local)}+{len(partner)}, expected 43 total live bindings"
+            )
+        if len(partner) > len(OVERFLOW_ELIGIBLE_PARTNER_LAYERS):
+            fail(
+                f"overflow repeat {run['repeat']} has {len(partner)} partner "
+                "bindings, expected at most 7"
+            )
+        ineligible = sorted(
+            binding_partner_layer_set - OVERFLOW_ELIGIBLE_PARTNER_LAYERS
         )
+        if ineligible:
+            fail(
+                f"overflow repeat {run['repeat']} has ineligible partner "
+                f"layers {ineligible}; eligible layers are 15-21"
+            )
+        if len(binding_partner_layers) != len(binding_partner_layer_set):
+            fail(f"overflow repeat {run['repeat']} duplicates a partner layer")
+    else:
+        expected_local, expected_partner = EXPECTED_BINDINGS[variant]
+        if (len(local), len(partner)) != (expected_local, expected_partner):
+            fail(
+                f"{variant} repeat {run['repeat']} has T256 bindings "
+                f"{len(local)}+{len(partner)}, expected "
+                f"{expected_local}+{expected_partner}"
+            )
     if any(row["partner_arithmetic"] != "f16" for row in t256_bindings):
         fail(f"{variant} repeat {run['repeat']} contains non-F16 T256 bindings")
     observed_bindings = Counter(
@@ -109,9 +132,12 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
     if variant != "native":
         for layer in range(43):
             home, peer = devices_for_layer(layer)
-            # Fixed pair-resident consumer used by the sharded attention path.
-            expected_bindings[(layer, peer, peer, 0)] += 1
-            if partner_layer(variant, layer):
+            uses_partner = (
+                layer in binding_partner_layer_set
+                if variant == "overflow"
+                else partner_layer(variant, layer)
+            )
+            if uses_partner:
                 expected_bindings[(layer, home, peer, 1)] += 1
             else:
                 expected_bindings[(layer, home, home, 0)] += 1
@@ -121,11 +147,81 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
             "binding count but the wrong per-layer consumer/resident mapping"
         )
 
+    allocation_by_id: dict[int, dict[str, str]] = {}
+    for row in allocation_rows:
+        allocation_id = int(row["allocation_id"])
+        if allocation_id <= 0 or allocation_id in allocation_by_id:
+            fail(
+                f"{variant} repeat {run['repeat']} has an invalid or duplicate "
+                f"physical allocation id {allocation_id}"
+            )
+        allocation_by_id[allocation_id] = row
+        if row.get("usage_tracking") != "1":
+            fail(f"{variant} repeat {run['repeat']} lacks warm-up liveness tracking")
+        resident_bytes = int(row["resident_bytes"])
+        used_calls = int(row["used_calls"])
+        expected_dead = resident_bytes if used_calls == 0 else 0
+        if int(row["dead_bytes"]) != expected_dead:
+            fail(
+                f"{variant} repeat {run['repeat']} allocation {allocation_id} "
+                "has inconsistent dead-byte accounting"
+            )
+
+    t256_allocation_ids: set[int] = set()
+    for row in t256_bindings:
+        allocation_id = int(row.get("allocation_id", "0"))
+        allocation = allocation_by_id.get(allocation_id)
+        if not allocation:
+            fail(
+                f"{variant} repeat {run['repeat']} has a T256 binding without "
+                "a physical allocation"
+            )
+        t256_allocation_ids.add(allocation_id)
+        if row.get("live") != "1" or int(row.get("used_calls", "0")) <= 0:
+            fail(
+                f"{variant} repeat {run['repeat']} has a dead T256 logical binding"
+            )
+        if (
+            allocation["storage_kind"] != "f16"
+            or allocation["in_dim"] != "8192"
+            or allocation["out_dim"] != "4096"
+            or int(allocation["logical_aliases"]) != 1
+            or int(allocation["live_aliases"]) != 1
+            or int(allocation["used_calls"]) <= 0
+            or int(allocation["dead_bytes"]) != 0
+        ):
+            fail(
+                f"{variant} repeat {run['repeat']} T256 allocation "
+                f"{allocation_id} is not one live physical weight"
+            )
+    expected_physical_t256 = 0 if variant == "native" else 43
+    physical_t256_rows = [
+        row for row in allocation_rows
+        if row["storage_kind"] == "f16"
+        and row["in_dim"] == "8192"
+        and row["out_dim"] == "4096"
+    ]
+    if (
+        len(t256_allocation_ids) != expected_physical_t256
+        or len(physical_t256_rows) != expected_physical_t256
+    ):
+        fail(
+            f"{variant} repeat {run['repeat']} has "
+            f"{len(physical_t256_rows)} physical T256 allocations and "
+            f"{len(t256_allocation_ids)} referenced, expected "
+            f"{expected_physical_t256}"
+        )
+
     audit_rows = [row for row in rows(Path(run["audit"])) if is_t256(row)]
     if not audit_rows:
         fail(f"{variant} repeat {run['repeat']} has no T256 runtime evidence")
     result_counts = Counter(row["result"] for row in audit_rows)
-    if set(result_counts) != EXPECTED_RESULTS[variant]:
+    expected_results = (
+        {"f16_hit"} | ({"f16_partner_hit"} if partner else set())
+        if variant == "overflow"
+        else EXPECTED_RESULTS[variant]
+    )
+    if set(result_counts) != expected_results:
         fail(
             f"{variant} repeat {run['repeat']} has wrong T256 paths: "
             f"{dict(result_counts)}"
@@ -137,13 +233,16 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
         layer_of(row) for row in audit_rows
         if row["result"] == "f16_partner_hit"
     })
-    expected_partner_layers = {
-        "native": [],
-        "all-local": [],
-        "balanced": list(range(1, 43, 2)),
-        "overflow": list(range(15, 22)),
-        "all-partner": list(range(43)),
-    }[variant]
+    expected_partner_layers = (
+        binding_partner_layers
+        if variant == "overflow"
+        else {
+            "native": [],
+            "all-local": [],
+            "balanced": list(range(1, 43, 2)),
+            "all-partner": list(range(43)),
+        }[variant]
+    )
     if partner_layers != expected_partner_layers:
         fail(
             f"{variant} repeat {run['repeat']} partner layers are "
@@ -152,7 +251,11 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
     for row in audit_rows:
         layer = layer_of(row)
         home, peer = devices_for_layer(layer)
-        uses_partner = partner_layer(variant, layer)
+        uses_partner = (
+            layer in binding_partner_layer_set
+            if variant == "overflow"
+            else partner_layer(variant, layer)
+        )
         if variant == "native":
             expected_result, expected_reason, expected_device = (
                 "native_q8", "disabled_t256_by_env", home
@@ -183,8 +286,8 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
     ):
         if marker not in log:
             fail(f"{variant} repeat {run['repeat']} lacks marker: {marker}")
-    if variant != "native" and "T256-output_b=86/86" not in log:
-        fail(f"{variant} repeat {run['repeat']} did not admit 86/86 T256 bindings")
+    if variant != "native" and "T256-output_b=43/43" not in log:
+        fail(f"{variant} repeat {run['repeat']} did not admit 43/43 T256 bindings")
 
     perf = rows(Path(run["csv"]))
     values: dict[int, float] = {}
@@ -211,6 +314,14 @@ def validate_run(run: dict[str, str]) -> tuple[dict[int, float], dict[str, objec
         "t256_calls_per_layer": next(iter(layer_counts.values())),
         "partner_layers": partner_layers,
         "total_bindings": len(binding_rows),
+        "physical_allocations": len(allocation_rows),
+        "physical_resident_bytes": sum(
+            int(row["resident_bytes"]) for row in allocation_rows
+        ),
+        "physical_dead_bytes": sum(
+            int(row["dead_bytes"]) for row in allocation_rows
+        ),
+        "t256_physical_allocations": len(t256_allocation_ids),
         "binding_shapes": {
             f"{key[0]}x{key[1]}:{'partner' if key[2] == '1' else 'local'}": value
             for key, value in sorted(binding_shapes.items())
@@ -229,6 +340,7 @@ def main() -> int:
         or meta.get("gpu_vram") != "auto"
         or meta.get("stage_split") != "22/21"
         or meta.get("variants") != ",".join(VARIANTS)
+        or meta.get("overflow_partner_eligibility") != "15-21"
     ):
         fail("manifest does not describe the fixed T256 placement experiment")
 
@@ -282,7 +394,25 @@ def main() -> int:
                 ),
             }
 
-    high_confidence = len(repeats) >= 5 and {
+    overflow_observed = [
+        {
+            "repeat": item["repeat"],
+            "local_bindings": item["t256_local_bindings"],
+            "partner_bindings": item["t256_partner_bindings"],
+            "partner_layers": item["partner_layers"],
+        }
+        for item in evidence
+        if item["variant"] == "overflow"
+    ]
+    overflow_signatures = {
+        (
+            item["local_bindings"], item["partner_bindings"],
+            tuple(item["partner_layers"]),
+        )
+        for item in overflow_observed
+    }
+    overflow_placement_stable = len(overflow_signatures) == 1
+    high_confidence = overflow_placement_stable and len(repeats) >= 5 and {
         tuple(slots[repeat][slot] for slot in sorted(slots[repeat]))
         for repeat in repeats[:5]
     } == {
@@ -294,6 +424,8 @@ def main() -> int:
         "high_confidence_counterbalanced": high_confidence,
         "repeats": len(repeats),
         "contexts": contexts,
+        "overflow_placement_stable": overflow_placement_stable,
+        "overflow_observed": overflow_observed,
         "performance": summary,
         "run_evidence": evidence,
     }
@@ -309,7 +441,18 @@ def main() -> int:
         f"Counterbalanced confidence: **{'PASS' if high_confidence else 'SCREEN ONLY'}** "
         f"({len(repeats)} repeats).",
         "",
+        "Natural-overflow placement stability: "
+        f"**{'PASS' if overflow_placement_stable else 'FAIL'}**.",
+        "",
         "Binding inventory and active runtime paths were validated independently for every run.",
+        "",
+        "Observed natural-overflow placement (local/partner bindings): "
+        + "; ".join(
+            f"r{item['repeat']}={item['local_bindings']}/{item['partner_bindings']} "
+            f"layers={item['partner_layers']}"
+            for item in overflow_observed
+        )
+        + ".",
         "",
         "| Context | Native | All local | 22 local + 21 partner | Overflow | All partner | Best |",
         "|---:|---:|---:|---:|---:|---:|---|",
@@ -325,7 +468,8 @@ def main() -> int:
     lines.extend((
         "",
         "`all-local` is allowed to displace lower-ranked cache entries in order to make all "
-        "86 T256 copies local. The exported binding-shape inventory records that resource "
+        "43 active T256 weights local. The exported binding and allocation inventories "
+        "record that resource "
         "tradeoff; this is an end-to-end cache-policy comparison, not an isolated kernel test.",
         "",
     ))

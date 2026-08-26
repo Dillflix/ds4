@@ -119,6 +119,8 @@ int ds4_gpu_q8_audit_write_csv(const char *path);
 void ds4_gpu_q8_audit_end(void);
 int ds4_gpu_q8_cache_state_write_csv(const char *path);
 int ds4_gpu_q8_binding_state_write_csv(const char *path);
+int ds4_gpu_q8_allocation_state_write_csv(const char *path);
+void ds4_gpu_q8_binding_usage_end(void);
 int ds4_gpu_prefill_tile_audit_begin(uint32_t capacity_per_device);
 int ds4_gpu_prefill_tile_audit_write_csv(const char *path);
 void ds4_gpu_prefill_tile_audit_end(void);

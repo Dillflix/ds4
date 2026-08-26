@@ -253,12 +253,14 @@ validate_run_evidence() {
     local log=$4
     local audit=$5
     local bindings=$6
-    local before=$7
-    local after=$8
-    local logits=$9
+    local allocations=$7
+    local before=$8
+    local after=$9
+    local logits=${10}
     local count first_logit audit_policy
 
-    for evidence in "$log" "$audit" "$bindings" "$before" "$after"; do
+    for evidence in "$log" "$audit" "$bindings" "$allocations" \
+                    "$before" "$after"; do
         [[ -s $evidence ]] || die "$variant omitted required evidence: $evidence"
     done
     cmp -s "$before" "$after" ||
@@ -295,7 +297,7 @@ validate_run_evidence() {
             'partner-classes=t256' \
             'partner-layers=0-42' \
             't256-placement=all-partner' \
-            'T256-output_b=86/86' \
+            'T256-output_b=43/43' \
             'partner=43 partner-arithmetic=f16' \
             'CUDA q8 fp16 partner summary:'; do
         grep -Fq "$marker" "$log" ||
@@ -303,14 +305,35 @@ validate_run_evidence() {
     done
     awk -F, '
         NR > 1 && $6 == 8192 && $7 == 4096 && $12 ~ /attn_output_b/ {
-            if ($3 == 1) partner++
-            else fixed++
+            if ($3 == 1 && $11 == "f16" && $13 > 0 && $14 > 0 && $15 == 1)
+                partner++
+            else local++
             next
         }
         NR > 1 && $3 == 1 {bad_partner=1}
-        END {exit !(fixed == 43 && partner == 43 && !bad_partner)}
+        END {exit !(local == 0 && partner == 43 && !bad_partner)}
     ' "$bindings" ||
-        die "$variant does not have exactly 43 fixed + 43 partner T256 bindings with no other partner class"
+        die "$variant does not have exactly 43 active partner T256 bindings with no local T256 or other partner class"
+    awk -F, '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) column[$i] = i
+            next
+        }
+        {
+            if ($(column["usage_tracking"]) != 1 ||
+                $(column["dead_bytes"]) != 0) dead++
+            if ($(column["storage_kind"]) == "f16" &&
+                $(column["in_dim"]) == 8192 &&
+                $(column["out_dim"]) == 4096) {
+                t256++
+                if ($(column["logical_aliases"]) != 1 ||
+                    $(column["live_aliases"]) != 1 ||
+                    $(column["used_calls"]) <= 0) bad_t256++
+            }
+        }
+        END {exit !(dead == 0 && t256 == 43 && bad_t256 == 0)}
+    ' "$allocations" ||
+        die "$variant does not have 43 live physical T256 weights and zero dead expanded-weight allocations"
     audit_policy=default
     python3 speed-bench/q8_partner_audit.py \
         "$audit_policy" "$partner_device_0" "$partner_device_1" "$audit" \
@@ -382,7 +405,7 @@ for marker in \
         die "exact-output marker missing: $marker"
 done
 
-printf 'repeat\tslot\tvariant\tmodel\tpolicy\tcsv\tlog\taudit\tbindings\tcache_before\tcache_after\tlogits\n' \
+printf 'repeat\tslot\tvariant\tmodel\tpolicy\tcsv\tlog\taudit\tbindings\tallocations\tcache_before\tcache_after\tlogits\n' \
     >"$OUTPUT_DIR/runs.tsv"
 
 phase=focused-two-arm-integration
@@ -397,6 +420,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         log="$OUTPUT_DIR/runs/$stem.log"
         audit="$OUTPUT_DIR/runs/$stem.q8-audit.csv"
         bindings="$OUTPUT_DIR/runs/$stem.bindings.csv"
+        allocations="$OUTPUT_DIR/runs/$stem.allocations.csv"
         before="$OUTPUT_DIR/runs/$stem.cache-before.csv"
         after="$OUTPUT_DIR/runs/$stem.cache-after.csv"
         logits="$OUTPUT_DIR/logits/$stem"
@@ -420,6 +444,7 @@ power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory \
             "DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV=$before" \
             "DS4_CUDA_Q8_CACHE_STATE_CSV=$after" \
             "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
+            "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$run_model" --prompt-file "$PROMPT" \
@@ -440,11 +465,12 @@ power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory \
             die "$stem omitted before/after telemetry"
         [[ -s $csv ]] || die "$stem produced no benchmark CSV"
         validate_run_evidence "$variant" "$run_kind" "$run_policy" \
-            "$log" "$audit" "$bindings" "$before" "$after" "$logits"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$log" "$audit" "$bindings" "$allocations" "$before" \
+            "$after" "$logits"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repeat" "$slot" "$variant" "$run_model" "$run_policy" \
-            "$csv" "$log" "$audit" "$bindings" "$before" "$after" \
-            "$logits" >>"$OUTPUT_DIR/runs.tsv"
+            "$csv" "$log" "$audit" "$bindings" "$allocations" "$before" \
+            "$after" "$logits" >>"$OUTPUT_DIR/runs.tsv"
         cat "$csv"
     done
 done

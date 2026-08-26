@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and summarize native-Q8 versus complete T256 FP16 admission."""
+"""Validate all-native Q8 versus the complete production FP16-cache policy."""
 
 from __future__ import annotations
 
@@ -16,26 +16,23 @@ from pathlib import Path
 
 CASES = 100
 LAYERS = 43
-T256_BINDINGS = 86
-T256_FIXED_BINDINGS = 43
+T256_BINDINGS = 43
+T256_LOCAL_BINDINGS = 0
 T256_PARTNER_BINDINGS = 43
 T256_UNIQUE_ALLOCATIONS = 43
-NON_T256_BINDINGS = 263
 T256_RUNTIME_CALLS = CASES * LAYERS
 T256_PARTNER_CALLS = CASES * T256_PARTNER_BINDINGS
 EXPECTED_PARTNER_LAYERS = list(range(LAYERS))
-EXPECTED_NON_T256_CLASSES = Counter({
-    "attn_kv": 24,
-    "attn_output_a": 90,
-    "attn_q_a": 21,
-    "attn_q_b": 43,
-    "shared_down": 43,
-    "shared_gate": 21,
-    "shared_up": 21,
-})
 BINDING_COLUMNS = {
     "consumer_device", "resident_device", "partner_offload", "in_dim",
-    "out_dim", "partner_arithmetic", "weight_offset", "label",
+    "out_dim", "partner_arithmetic", "weight_offset", "weight_bytes",
+    "resident_weight_bytes", "label", "allocation_id", "used_calls", "live",
+}
+ALLOCATION_COLUMNS = {
+    "allocation_id", "storage_kind", "half_rounded", "physical_device",
+    "weight_offset", "weight_bytes", "in_dim", "out_dim", "resident_bytes",
+    "logical_aliases", "live_aliases", "used_calls", "dead_bytes",
+    "usage_tracking",
 }
 AUDIT_COLUMNS = {
     "module", "label", "layer", "physical_device", "in_dim", "out_dim",
@@ -128,12 +125,145 @@ def non_t256_class(row: dict[str, str]) -> str:
     return "other"
 
 
+def nonnegative(row: dict[str, str], key: str, context: str) -> int:
+    try:
+        value = int(row[key])
+    except (KeyError, ValueError) as exc:
+        fail(f"{context} has invalid {key}: {row.get(key, '<missing>')}")
+        raise AssertionError from exc
+    if value < 0:
+        fail(f"{context} has negative {key}: {value}")
+    return value
+
+
+def expected_storage(row: dict[str, str]) -> tuple[str, int]:
+    arithmetic = row["partner_arithmetic"]
+    if row["partner_offload"] == "0" or arithmetic == "f16":
+        return "f16", 0
+    if arithmetic == "native-q8":
+        fail(f"expanded binding unexpectedly names native-Q8 storage: {row['label']}")
+    return "f32", int(arithmetic in {"w16-x16-sgemm", "w16-x32-sgemm"})
+
+
+def validate_allocation_liveness(
+    path: Path, bindings: list[dict[str, str]], arm: str,
+) -> tuple[dict[int, dict[str, str]], dict[str, object]]:
+    allocations = read_rows(path)
+    require_columns(path, allocations, ALLOCATION_COLUMNS)
+    by_id: dict[int, dict[str, str]] = {}
+    for row in allocations:
+        allocation_id = nonnegative(row, "allocation_id", f"{arm} allocation")
+        if allocation_id == 0 or allocation_id in by_id:
+            fail(f"{arm} has invalid or duplicate allocation_id={allocation_id}")
+        if row["storage_kind"] not in {"f16", "f32"}:
+            fail(f"{arm} allocation {allocation_id} has unsupported storage_kind")
+        if row["usage_tracking"] != "1":
+            fail(f"{arm} allocation {allocation_id} lacks usage tracking")
+        if nonnegative(row, "logical_aliases", arm) == 0:
+            fail(f"{arm} allocation {allocation_id} has no logical alias")
+        if nonnegative(row, "live_aliases", arm) == 0:
+            fail(f"{arm} allocation {allocation_id} has no live alias")
+        if nonnegative(row, "used_calls", arm) == 0:
+            fail(f"{arm} allocation {allocation_id} was never used")
+        if nonnegative(row, "resident_bytes", arm) == 0:
+            fail(f"{arm} allocation {allocation_id} has no resident payload")
+        if nonnegative(row, "dead_bytes", arm) != 0:
+            fail(f"{arm} allocation {allocation_id} contains dead expanded-weight bytes")
+        by_id[allocation_id] = row
+
+    aliases: Counter[int] = Counter()
+    live_aliases: Counter[int] = Counter()
+    used_calls: Counter[int] = Counter()
+    for binding in bindings:
+        context = f"{arm} binding {binding.get('label', '<missing>')}"
+        allocation_id = nonnegative(binding, "allocation_id", context)
+        if allocation_id == 0 or allocation_id not in by_id:
+            fail(f"{context} has no matching expanded-weight allocation")
+        if binding["live"] != "1" or nonnegative(binding, "used_calls", context) == 0:
+            fail(f"{context} was exported but never used")
+        allocation = by_id[allocation_id]
+        storage, half_rounded = expected_storage(binding)
+        expected = {
+            "storage_kind": storage,
+            "half_rounded": str(half_rounded),
+            "physical_device": binding["resident_device"],
+            "weight_offset": binding["weight_offset"],
+            "weight_bytes": binding["weight_bytes"],
+            "in_dim": binding["in_dim"],
+            "out_dim": binding["out_dim"],
+            "resident_bytes": binding["resident_weight_bytes"],
+        }
+        wrong = {
+            key: (allocation.get(key), value)
+            for key, value in expected.items()
+            if allocation.get(key) != value
+        }
+        if wrong:
+            fail(f"{context} allocation {allocation_id} does not match: {wrong}")
+        aliases[allocation_id] += 1
+        live_aliases[allocation_id] += 1
+        used_calls[allocation_id] += int(binding["used_calls"])
+
+    if set(by_id) != set(aliases):
+        fail(f"{arm} contains expanded-weight allocations with no exported binding")
+    for allocation_id, allocation in by_id.items():
+        observed = (
+            aliases[allocation_id], live_aliases[allocation_id],
+            used_calls[allocation_id],
+        )
+        recorded = (
+            int(allocation["logical_aliases"]), int(allocation["live_aliases"]),
+            int(allocation["used_calls"]),
+        )
+        if observed != recorded:
+            fail(
+                f"{arm} allocation {allocation_id} alias/use totals differ: "
+                f"bindings={observed} allocation={recorded}"
+            )
+    return by_id, {
+        "allocations": len(allocations),
+        "f16_allocations": sum(row["storage_kind"] == "f16" for row in allocations),
+        "f32_allocations": sum(row["storage_kind"] == "f32" for row in allocations),
+        "resident_bytes": sum(int(row["resident_bytes"]) for row in allocations),
+        "dead_bytes": sum(int(row["dead_bytes"]) for row in allocations),
+    }
+
+
+def dynamic_non_t256_inventory(
+    rows: list[dict[str, str]], allocations: dict[int, dict[str, str]],
+) -> tuple[dict[str, int], dict[str, int]]:
+    classes = Counter(non_t256_class(row) for row in rows)
+    descriptors: Counter[str] = Counter()
+    for row in rows:
+        allocation = allocations[int(row["allocation_id"])]
+        descriptor = ";".join((
+            f"class={non_t256_class(row)}",
+            f"label={row['label']}",
+            f"shape={row['in_dim']}x{row['out_dim']}",
+            f"consumer={row['consumer_device']}",
+            f"resident={row['resident_device']}",
+            f"arithmetic={row['partner_arithmetic']}",
+            f"storage={allocation['storage_kind']}",
+            f"half_rounded={allocation['half_rounded']}",
+        ))
+        descriptors[descriptor] += 1
+    return dict(sorted(classes.items())), dict(sorted(descriptors.items()))
+
+
 def validate_native(root: Path) -> dict[str, object]:
     binding_path = root / "quality/native-q8.bindings.csv"
     bindings = read_rows(binding_path)
     require_columns(binding_path, bindings, BINDING_COLUMNS)
     if bindings:
         fail(f"native-q8 exported {len(bindings)} FP16 bindings; expected zero")
+    allocations, allocation_summary = validate_allocation_liveness(
+        root / "quality/native-q8.allocations.csv", bindings, "native-q8"
+    )
+    if allocations:
+        fail(
+            f"native-q8 exported {len(allocations)} expanded-weight allocations; "
+            "expected zero"
+        )
 
     audit_path = root / "quality/native-q8.q8-audit.csv"
     audit = read_rows(audit_path)
@@ -155,23 +285,24 @@ def validate_native(root: Path) -> dict[str, object]:
         "t256_runtime_calls": len(t256),
         "runtime_results": dict(sorted(results.items())),
         "runtime_reasons": dict(sorted(reasons.items())),
+        "expanded_weights": allocation_summary,
     }
 
 
-def validate_full_fp16(root: Path) -> dict[str, object]:
-    binding_path = root / "quality/fp16-t256-full.bindings.csv"
+def validate_production_fp16_cache(root: Path) -> dict[str, object]:
+    binding_path = root / "quality/production-fp16-cache.bindings.csv"
     bindings = read_rows(binding_path)
     require_columns(binding_path, bindings, BINDING_COLUMNS)
     t256 = [row for row in bindings if is_t256(row)]
     non_t256 = [row for row in bindings if not is_t256(row)]
-    home = [row for row in t256 if row["partner_offload"] == "0"]
+    local = [row for row in t256 if row["partner_offload"] == "0"]
     partner = [row for row in t256 if row["partner_offload"] == "1"]
     if len(t256) != T256_BINDINGS:
-        fail(f"full FP16 exported {len(t256)}/86 T256 bindings")
-    if len(home) != T256_FIXED_BINDINGS or len(partner) != T256_PARTNER_BINDINGS:
+        fail(f"full FP16 exported {len(t256)}/{T256_BINDINGS} T256 bindings")
+    if len(local) != T256_LOCAL_BINDINGS or len(partner) != T256_PARTNER_BINDINGS:
         fail(
-            "full FP16 T256 placement is not 43 fixed + 43 partner: "
-            f"fixed={len(home)} partner={len(partner)}"
+            "full FP16 T256 placement is not 0 local + 43 partner: "
+            f"local={len(local)} partner={len(partner)}"
         )
     if any(row["partner_arithmetic"] != "f16" for row in t256):
         fail("full FP16 T256 bindings contain non-F16 arithmetic")
@@ -180,32 +311,25 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
     partner_layers = sorted(layer_of(row) for row in partner)
     if partner_layers != EXPECTED_PARTNER_LAYERS:
         fail(f"full FP16 partner layers are {partner_layers}, expected 0-42")
-    unique_allocations = {
-        (row["resident_device"], row["weight_offset"]) for row in t256
-    }
+    allocation_rows, allocation_summary = validate_allocation_liveness(
+        root / "quality/production-fp16-cache.allocations.csv",
+        bindings,
+        "production FP16 cache",
+    )
+    unique_allocations = {int(row["allocation_id"]) for row in t256}
     if len(unique_allocations) != T256_UNIQUE_ALLOCATIONS:
         fail(
             "full FP16 T256 bindings do not share exactly 43 physical weights: "
             f"unique={len(unique_allocations)}"
         )
-    non_t256_classes = Counter(non_t256_class(row) for row in non_t256)
-    missing_non_t256 = {
-        name: minimum - non_t256_classes[name]
-        for name, minimum in EXPECTED_NON_T256_CLASSES.items()
-        if non_t256_classes[name] < minimum
-    }
-    if len(non_t256) < NON_T256_BINDINGS or missing_non_t256 or non_t256_classes["other"]:
-        fail(
-            "full FP16 did not preserve the baseline non-T256 cache inventory: "
-            f"total={len(non_t256)} missing={missing_non_t256} "
-            f"classes={dict(sorted(non_t256_classes.items()))}"
-        )
     if any(row["partner_offload"] != "0" for row in non_t256):
         fail("full FP16 contains a non-T256 partner binding")
+    non_t256_classes, non_t256_descriptors = dynamic_non_t256_inventory(
+        non_t256, allocation_rows
+    )
     expected_bindings: Counter[tuple[int, int, int, int]] = Counter()
     for layer in range(LAYERS):
         home_device, partner_device = devices_for_layer(layer)
-        expected_bindings[(layer, partner_device, partner_device, 0)] += 1
         expected_bindings[(layer, home_device, partner_device, 1)] += 1
     observed_bindings = Counter(
         (
@@ -217,7 +341,7 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
     if observed_bindings != expected_bindings:
         fail("full FP16 T256 per-layer consumer/resident mapping is incorrect")
 
-    audit_path = root / "quality/fp16-t256-full.q8-audit.csv"
+    audit_path = root / "quality/production-fp16-cache.q8-audit.csv"
     audit = read_rows(audit_path)
     require_columns(audit_path, audit, AUDIT_COLUMNS)
     calls = [row for row in audit if is_t256(row)]
@@ -248,14 +372,16 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
             )
     return {
         "t256_bindings": len(t256),
-        "fixed_bindings": len(home),
+        "local_bindings": len(local),
         "partner_bindings": len(partner),
         "unique_t256_allocations": len(unique_allocations),
         "non_t256_bindings": len(non_t256),
-        "non_t256_classes": dict(sorted(non_t256_classes.items())),
+        "non_t256_class_inventory": non_t256_classes,
+        "non_t256_descriptor_inventory": non_t256_descriptors,
         "partner_layers": partner_layers,
         "t256_runtime_calls": len(calls),
         "runtime_results": dict(sorted(results.items())),
+        "expanded_weights": allocation_summary,
     }
 
 
@@ -365,10 +491,13 @@ def main() -> int:
         "stage_split": "22/21",
         "quality_ctx": "32769",
         "t256_layers": "0-42",
-        "comparison": "native-q8-vs-fp16-t256-86-of-86",
-        "fp16_expected_placement": "43-fixed-plus-43-partner",
+        "comparison": "all-native-q8-vs-complete-production-fp16-cache",
+        "native_expected_expanded_bindings": "0",
+        "fp16_expected_t256_bindings": "43/43",
+        "fp16_expected_placement": "43-partner",
         "fp16_expected_unique_t256_allocations": "43",
-        "fp16_expected_non_t256_bindings": "263",
+        "fp16_non_t256_inventory": "dynamic-production-policy",
+        "expanded_weight_liveness": "all-bindings-and-allocations-live",
         "model_hashing": "disabled",
     }
     wrong = {
@@ -392,13 +521,13 @@ def main() -> int:
                 ["CUDA q8 partner execution enabled:"],
             )
             coverage = validate_native(root)
-        elif arm == "fp16-t256-full":
+        elif arm == "production-fp16-cache":
             validate_log(
-                root / "quality/fp16-t256-full.log",
+                root / "quality/production-fp16-cache.log",
                 [
                     "score_official: runtime_path=production",
                     "CUDA EP forced pipeline split 22/21",
-                    "T256-output_b=86/86",
+                    "T256-output_b=43/43",
                     "partner=43 partner-arithmetic=f16",
                     "partner-classes=t256",
                     "partner-layers=0-42",
@@ -408,7 +537,7 @@ def main() -> int:
                 ],
                 ["arithmetic=native-q8"],
             )
-            coverage = validate_full_fp16(root)
+            coverage = validate_production_fp16_cache(root)
         else:
             fail(f"unknown coverage arm: {arm}")
         print(json.dumps({"arm": arm, "coverage": coverage}, indent=2))
@@ -424,11 +553,11 @@ def main() -> int:
         ["CUDA q8 partner execution enabled:"],
     )
     validate_log(
-        root / "quality/fp16-t256-full.log",
+        root / "quality/production-fp16-cache.log",
         [
             "score_official: runtime_path=production",
             "CUDA EP forced pipeline split 22/21",
-            "T256-output_b=86/86",
+            "T256-output_b=43/43",
             "partner=43 partner-arithmetic=f16",
             "partner-classes=t256",
             "partner-layers=0-42",
@@ -440,7 +569,7 @@ def main() -> int:
     )
 
     native_coverage = validate_native(root)
-    candidate_coverage = validate_full_fp16(root)
+    candidate_coverage = validate_production_fp16_cache(root)
 
     planner = (root / "planner-unit.log").read_text(encoding="utf-8", errors="replace")
     gpu_test = (root / "gpu-exactness.log").read_text(encoding="utf-8", errors="replace")
@@ -450,7 +579,7 @@ def main() -> int:
         fail("local/partner FP16 projection exactness evidence is missing")
 
     native = read_scores(root / "quality/native-q8.tsv")
-    candidate = read_scores(root / "quality/fp16-t256-full.tsv")
+    candidate = read_scores(root / "quality/production-fp16-cache.tsv")
     if set(native) != set(candidate):
         fail("quality case IDs differ between arms")
     ids = sorted(native)
@@ -482,14 +611,14 @@ def main() -> int:
 
     payload = {
         "experiment_integrity": True,
-        "comparison": "pure native Q8 vs all-active-partner T256 FP16 admission",
+        "comparison": "all-native Q8 vs complete production FP16-cache policy",
         "coverage": {
             "native_q8": native_coverage,
-            "fp16_t256_full": candidate_coverage,
+            "production_fp16_cache": candidate_coverage,
         },
         "quality": {
             "native_q8": native_summary,
-            "fp16_t256_full": candidate_summary,
+            "production_fp16_cache": candidate_summary,
             "delta_nll_per_token": nll_delta,
             "relative_nll_delta": nll_relative,
             "paired_bootstrap_95pct_ci": [ci_lower, ci_upper],
@@ -516,21 +645,26 @@ def main() -> int:
     )
 
     lines = [
-        "# Native Q8 vs complete T256 FP16 quality",
+        "# All-native Q8 vs complete production FP16-cache quality",
         "",
         "Experiment integrity: **PASS**",
         "",
         "This comparison contains only the two decision-relevant endpoints. The native arm "
-        "has no FP16 expansion bindings; the candidate keeps one physical T256 expansion "
-        "per layer on the NVLink partner and executes every active T256 projection there.",
+        "has no expanded-weight cache. The candidate uses the complete production FP16-cache "
+        "policy: every active T256 projection executes from one partner-resident F16 weight, "
+        "while all dynamically admitted non-T256 FP16 projections remain local.",
         "",
         "## Proven execution coverage",
         "",
-        "| Arm | T256 bindings | Fixed / partner bindings | Physical T256 weights | Runtime path |",
+        "| Arm | T256 bindings | Local / partner bindings | Physical T256 weights | Runtime path |",
         "|---|---:|---:|---:|---|",
-        f"| Native Q8 | 0 / 86 | 0 / 0 | 0 | {T256_RUNTIME_CALLS} native Q8 |",
-        f"| Full FP16 T256 | 86 / 86 | 43 / 43 | {T256_UNIQUE_ALLOCATIONS} | "
+        f"| Native Q8 | 0 / 43 | 0 / 0 | 0 | {T256_RUNTIME_CALLS} native Q8 |",
+        f"| Production FP16 cache | 43 / 43 | 0 / 43 | {T256_UNIQUE_ALLOCATIONS} | "
         f"{T256_PARTNER_CALLS} partner FP16 |",
+        f"\nDynamic local non-T256 inventory: **{candidate_coverage['non_t256_bindings']} "
+        "bindings**; every exported binding/allocation was used and dead expanded-weight "
+        "bytes were zero. Exact class and descriptor inventories are recorded in "
+        "`quality-comparison.json`.",
         "",
         "## Official-continuation quality",
         "",
@@ -545,7 +679,7 @@ def main() -> int:
         f"{fmt(native_summary['api_top1_rate'], 6)} | "
         f"{fmt(native_summary['api_topn_recall'], 6)} | "
         f"{fmt(native_summary['api_pair_rate'], 6)} |",
-        f"| Full FP16 T256 | {float(candidate_summary['avg_nll']):.9f} | "
+        f"| Production FP16 cache | {float(candidate_summary['avg_nll']):.9f} | "
         f"{float(candidate_summary['first_match_rate']):.1%} | "
         f"{float(candidate_summary['avg_greedy_lcp']):.3f} | "
         f"{fmt(candidate_summary['api_target_mae'], 9)} | "

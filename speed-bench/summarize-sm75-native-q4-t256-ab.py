@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
@@ -27,6 +28,7 @@ REQUIRED_RUN_COLUMNS = {
     "log",
     "audit",
     "bindings",
+    "allocations",
     "cache_before",
     "cache_after",
     "logits",
@@ -37,7 +39,14 @@ REQUIRED_AUDIT_COLUMNS = {
 }
 REQUIRED_BINDING_COLUMNS = {
     "consumer_device", "resident_device", "partner_offload", "weight_offset",
-    "in_dim", "out_dim", "label",
+    "weight_bytes", "in_dim", "out_dim", "partner_arithmetic", "label",
+    "allocation_id", "used_calls", "live",
+}
+REQUIRED_ALLOCATION_COLUMNS = {
+    "allocation_id", "storage_kind", "physical_device", "weight_offset",
+    "weight_bytes", "in_dim", "out_dim", "resident_bytes",
+    "logical_aliases", "live_aliases", "used_calls", "dead_bytes",
+    "usage_tracking",
 }
 LONG_CONTEXTS = (16384, 32768)
 EFFECT = "native_all_partner_over_standard_all_partner"
@@ -80,6 +89,16 @@ def parse_positive_int(value: str, label: str) -> int:
         fail(f"invalid integer for {label}: {value!r}")
     if parsed <= 0:
         fail(f"{label} must be positive, found {parsed}")
+    return parsed
+
+
+def parse_nonnegative_int(value: str, label: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        fail(f"invalid integer for {label}: {value!r}")
+    if parsed < 0:
+        fail(f"{label} must be nonnegative, found {parsed}")
     return parsed
 
 
@@ -143,6 +162,30 @@ def devices_for_layer(layer: int) -> tuple[int, int]:
     return (0, 1) if layer <= 21 else (3, 2)
 
 
+def non_t256_descriptor(
+    binding: dict[str, str], allocation: dict[str, str]
+) -> tuple[str, ...]:
+    return (
+        binding["label"],
+        binding["weight_offset"],
+        binding["weight_bytes"],
+        binding["in_dim"],
+        binding["out_dim"],
+        binding["consumer_device"],
+        binding["resident_device"],
+        allocation["storage_kind"],
+        binding["partner_arithmetic"],
+    )
+
+
+def inventory_digest(inventory: Counter[tuple[str, ...]]) -> str:
+    canonical = json.dumps(
+        [(list(descriptor), count) for descriptor, count in sorted(inventory.items())],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def format_number(value: object) -> object:
     if isinstance(value, float):
         return f"{value:.12g}"
@@ -192,7 +235,7 @@ def main() -> int:
         paths = {
             name: resolve_path(source_row[name], base_dir, name)
             for name in (
-                "csv", "log", "audit", "bindings", "cache_before",
+                "csv", "log", "audit", "bindings", "allocations", "cache_before",
                 "cache_after", "logits",
             )
         }
@@ -363,6 +406,10 @@ def main() -> int:
 
     policy_evidence_ok = True
     cache_stable = True
+    zero_dead_expanded_weights = True
+    non_t256_inventories: dict[
+        tuple[int, str], Counter[tuple[str, ...]]
+    ] = {}
     run_evidence: list[dict[str, object]] = []
     native_marker = "SM75 native routed-Q4 layout enabled"
     planner_marker = "CUDA q8 fp16 benefit plan"
@@ -373,12 +420,13 @@ def main() -> int:
             log_path = run["log"]
             audit_path = run["audit"]
             bindings_path = run["bindings"]
+            allocations_path = run["allocations"]
             cache_before = run["cache_before"]
             cache_after = run["cache_after"]
             assert all(
                 isinstance(path, Path)
                 for path in (
-                    log_path, audit_path, bindings_path,
+                    log_path, audit_path, bindings_path, allocations_path,
                     cache_before, cache_after,
                 )
             )
@@ -392,6 +440,31 @@ def main() -> int:
             binding_rows = read_table(
                 bindings_path, ",", REQUIRED_BINDING_COLUMNS
             )
+            allocation_rows = read_table(
+                allocations_path, ",", REQUIRED_ALLOCATION_COLUMNS
+            )
+            allocation_by_id: dict[int, dict[str, str]] = {}
+            for allocation in allocation_rows:
+                allocation_id = parse_positive_int(
+                    allocation["allocation_id"], "allocation_id"
+                )
+                if allocation_id in allocation_by_id:
+                    fail(
+                        f"{allocations_path} contains duplicate allocation_id "
+                        f"{allocation_id}"
+                    )
+                allocation_by_id[allocation_id] = allocation
+            live_allocation_inventory = all(
+                row["usage_tracking"] == "1"
+                and parse_nonnegative_int(row["dead_bytes"], "dead_bytes") == 0
+                and parse_positive_int(row["used_calls"], "allocation used_calls") > 0
+                and parse_positive_int(row["logical_aliases"], "logical_aliases") > 0
+                and parse_positive_int(row["live_aliases"], "live_aliases") > 0
+                for row in allocation_rows
+            )
+            zero_dead_expanded_weights = (
+                zero_dead_expanded_weights and live_allocation_inventory
+            )
             for cache_path in (cache_before, cache_after):
                 try:
                     if cache_path.stat().st_size == 0:
@@ -400,13 +473,43 @@ def main() -> int:
                     fail(f"cannot stat cache-state evidence {cache_path}: {exc}")
             t256_audit = [row for row in audit_rows if is_t256(row)]
             t256_bindings = [row for row in binding_rows if is_t256(row)]
-            fixed_bindings = [
+            local_bindings = [
                 row for row in t256_bindings if row["partner_offload"] == "0"
             ]
             partner_bindings = [
                 row for row in t256_bindings if row["partner_offload"] == "1"
             ]
             non_t256_bindings = [row for row in binding_rows if not is_t256(row)]
+            binding_allocations: dict[int, dict[str, str]] = {}
+            binding_allocation_ok = True
+            for index, binding in enumerate(binding_rows):
+                allocation_id = parse_positive_int(
+                    binding["allocation_id"], f"binding {index} allocation_id"
+                )
+                allocation = allocation_by_id.get(allocation_id)
+                if allocation is None:
+                    binding_allocation_ok = False
+                    continue
+                binding_allocations[index] = allocation
+                binding_allocation_ok = binding_allocation_ok and (
+                    allocation["physical_device"] == binding["resident_device"]
+                    and allocation["weight_offset"] == binding["weight_offset"]
+                    and allocation["weight_bytes"] == binding["weight_bytes"]
+                    and allocation["in_dim"] == binding["in_dim"]
+                    and allocation["out_dim"] == binding["out_dim"]
+                )
+            live_non_t256 = Counter()
+            for index, binding in enumerate(binding_rows):
+                if is_t256(binding) or binding.get("live") != "1":
+                    continue
+                if parse_positive_int(
+                    binding["used_calls"], f"binding {index} used_calls"
+                ) <= 0:
+                    continue
+                allocation = binding_allocations.get(index)
+                if allocation is not None:
+                    live_non_t256[non_t256_descriptor(binding, allocation)] += 1
+            non_t256_inventories[(repeat, variant)] = live_non_t256
             family = variant.split("-", 1)[0]
             planner_ok = planner_marker in log_text
             layout_ok = (
@@ -416,7 +519,6 @@ def main() -> int:
             expected_bindings: Counter[tuple[int, int, int, int]] = Counter()
             for layer in range(43):
                 home, peer = devices_for_layer(layer)
-                expected_bindings[(layer, peer, peer, 0)] += 1
                 expected_bindings[(layer, home, peer, 1)] += 1
             observed_bindings = Counter(
                 (
@@ -426,9 +528,31 @@ def main() -> int:
                 for row in t256_bindings
             )
             unique_t256_allocations = {
-                (row["resident_device"], row["weight_offset"])
+                parse_positive_int(row["allocation_id"], "T256 allocation_id")
                 for row in t256_bindings
             }
+            physical_t256_rows = [
+                row for row in allocation_rows
+                if row["storage_kind"] == "f16"
+                and row["in_dim"] == "8192"
+                and row["out_dim"] == "4096"
+            ]
+            t256_physical_ok = (
+                len(unique_t256_allocations) == 43
+                and len(physical_t256_rows) == 43
+                and all(
+                    allocation_id in allocation_by_id
+                    and allocation_by_id[allocation_id]["storage_kind"] == "f16"
+                    and allocation_by_id[allocation_id]["logical_aliases"] == "1"
+                    and allocation_by_id[allocation_id]["live_aliases"] == "1"
+                    and parse_positive_int(
+                        allocation_by_id[allocation_id]["used_calls"],
+                        "T256 allocation used_calls",
+                    ) > 0
+                    and allocation_by_id[allocation_id]["dead_bytes"] == "0"
+                    for allocation_id in unique_t256_allocations
+                )
+            )
             audit_layers = Counter(layer_of(row) for row in t256_audit)
             even_layer_coverage = (
                 set(audit_layers) == set(range(43))
@@ -445,15 +569,22 @@ def main() -> int:
                 "partner-classes=t256" in log_text
                 and "partner-layers=0-42" in log_text
                 and "t256-placement=all-partner" in log_text
-                and "T256-output_b=86/86" in log_text
+                and "T256-output_b=43/43" in log_text
                 and "partner=43 partner-arithmetic=f16" in log_text
                 and partner_summary_marker in log_text
-                and len(fixed_bindings) == 43
+                and len(local_bindings) == 0
                 and len(partner_bindings) == 43
-                and len(unique_t256_allocations) == 43
+                and all(
+                    row["partner_arithmetic"] == "f16"
+                    and row["live"] == "1"
+                    and parse_positive_int(row["used_calls"], "T256 used_calls") > 0
+                    for row in partner_bindings
+                )
+                and t256_physical_ok
+                and binding_allocation_ok
                 and observed_bindings == expected_bindings
-                and len(non_t256_bindings) >= 263
                 and all(row["partner_offload"] == "0" for row in non_t256_bindings)
+                and live_allocation_inventory
                 and bool(t256_audit)
                 and even_layer_coverage
                 and audit_mapping_ok
@@ -469,12 +600,30 @@ def main() -> int:
                 "layout_dispatch": layout_ok,
                 "policy": policy_ok,
                 "partner_audit_calls": len(t256_audit),
-                "fixed_t256_bindings": len(fixed_bindings),
+                "local_t256_bindings": len(local_bindings),
                 "partner_bindings": len(partner_bindings),
                 "unique_t256_allocations": len(unique_t256_allocations),
                 "non_t256_bindings": len(non_t256_bindings),
+                "live_non_t256_bindings": sum(live_non_t256.values()),
+                "live_non_t256_inventory_sha256": inventory_digest(live_non_t256),
+                "expanded_allocations": len(allocation_rows),
+                "dead_expanded_bytes": sum(
+                    parse_nonnegative_int(row["dead_bytes"], "dead_bytes")
+                    for row in allocation_rows
+                ),
                 "cache_stable": stable,
             })
+
+    reference_inventory = non_t256_inventories[(repeats[0], VARIANTS[0])]
+    non_t256_inventory_exact = all(
+        inventory == reference_inventory
+        for inventory in non_t256_inventories.values()
+    )
+    policy_evidence_ok = (
+        policy_evidence_ok
+        and non_t256_inventory_exact
+        and zero_dead_expanded_weights
+    )
 
     paired_rows: list[dict[str, object]] = []
     effect_values: dict[int, list[float]] = {
@@ -534,6 +683,8 @@ def main() -> int:
         "repeat_deterministic_if_repeated": repeat_deterministic,
         "focused_standard_then_native_order": True,
         "policy_and_dispatch_evidence": policy_evidence_ok,
+        "live_non_t256_inventory_exact": non_t256_inventory_exact,
+        "zero_dead_expanded_weight_allocations": zero_dead_expanded_weights,
         "cache_state_stable": cache_stable,
         "native_all_partner_no_regression": native_no_regression,
     }
@@ -591,6 +742,11 @@ def main() -> int:
             "repeat_determinism_comparisons":
                 len(VARIANTS) * (len(repeats) - 1) * len(contexts),
             "runs": run_evidence,
+            "live_non_t256_descriptor_fields": [
+                "label", "weight_offset", "weight_bytes", "in_dim", "out_dim",
+                "consumer_device", "resident_device", "storage_kind",
+                "partner_arithmetic",
+            ],
         },
         "interpretation": (
             "Both arms use the identical all-partner T256 policy, so the paired "
@@ -642,6 +798,10 @@ def main() -> int:
         "- Focused standard-then-native order: PASS",
         f"- Native layout and all-partner T256 policy evidence: "
         f"{'PASS' if policy_evidence_ok else 'FAIL'}",
+        f"- Exact live non-T256 expanded-weight descriptor inventory: "
+        f"{'PASS' if non_t256_inventory_exact else 'FAIL'}",
+        f"- Zero dead expanded-weight allocations after warm-up: "
+        f"{'PASS' if zero_dead_expanded_weights else 'FAIL'}",
         f"- Cache state frozen during timing: "
         f"{'PASS' if cache_stable else 'FAIL'}",
         f"- Native all-partner median never regresses versus standard all-partner: "

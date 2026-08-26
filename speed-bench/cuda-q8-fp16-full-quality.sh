@@ -113,11 +113,13 @@ done
         "$QUALITY_MANIFEST" "$QUALITY_CTX" "$GPU_DEVICES" "$GPU_VRAM"
     printf 'stage_split=%s/%s\nprefill_chunk=%s\nt256_layers=0-42\n' \
         "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$PREFILL_CHUNK"
-    printf 'comparison=native-q8-vs-fp16-t256-86-of-86\n'
-    printf 'native_expected_bindings=0/86\nfp16_expected_bindings=86/86\n'
-    printf 'fp16_expected_placement=43-fixed-plus-43-partner\n'
+    printf 'comparison=all-native-q8-vs-complete-production-fp16-cache\n'
+    printf 'native_expected_expanded_bindings=0\n'
+    printf 'fp16_expected_t256_bindings=43/43\n'
+    printf 'fp16_expected_placement=43-partner\n'
     printf 'fp16_expected_unique_t256_allocations=43\n'
-    printf 'fp16_expected_non_t256_bindings=263\n'
+    printf 'fp16_non_t256_inventory=dynamic-production-policy\n'
+    printf 'expanded_weight_liveness=all-bindings-and-allocations-live\n'
     printf 'model_hashing=disabled\nquality_runtime=production\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free \
         --format=csv
@@ -179,6 +181,7 @@ run_quality() {
     local log="$OUTPUT_DIR/quality/$arm.log"
     local audit="$OUTPUT_DIR/quality/$arm.q8-audit.csv"
     local bindings="$OUTPUT_DIR/quality/$arm.bindings.csv"
+    local allocations="$OUTPUT_DIR/quality/$arm.allocations.csv"
     local -a mode_env=()
     if [[ $arm == native-q8 ]]; then
         mode_env=("${native_env[@]}")
@@ -190,12 +193,13 @@ run_quality() {
     "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
         "DS4_CUDA_Q8_CACHE_AUDIT_CSV=$audit" \
         "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
+        "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
         ./gguf-tools/quality-testing/score_official \
             "$MODEL" "$QUALITY_MANIFEST" "$out" "$QUALITY_CTX" \
             --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
             --cuda-tensor-parallel --warm-weights --production-path \
             2>&1 | tee "$log"
-    [[ -s $out && -s $audit && -s $bindings ]] ||
+    [[ -s $out && -s $audit && -s $bindings && -s $allocations ]] ||
         die "$arm omitted required score or execution evidence"
     awk -F'\t' 'NR > 1 {n++} END {exit n == 100 ? 0 : 1}' "$out" ||
         die "$arm quality output does not contain exactly 100 cases"
@@ -206,19 +210,19 @@ run_quality() {
 
 phase=quality-native-q8
 run_quality native-q8
-phase=quality-fp16-t256-full
-run_quality fp16-t256-full
+phase=quality-production-fp16-cache
+run_quality production-fp16-cache
 
 phase=compare
 python3 gguf-tools/quality-testing/compare_scores.py \
     "$OUTPUT_DIR/quality/native-q8.tsv" \
-    "$OUTPUT_DIR/quality/fp16-t256-full.tsv" \
-    >"$OUTPUT_DIR/quality/native-q8-vs-fp16-t256-full.txt"
+    "$OUTPUT_DIR/quality/production-fp16-cache.tsv" \
+    >"$OUTPUT_DIR/quality/all-native-q8-vs-production-fp16-cache.txt"
 python3 speed-bench/summarize-q8-fp16-full-quality.py "$OUTPUT_DIR" \
     | tee "$OUTPUT_DIR/summary-stdout.txt"
 [[ -s $OUTPUT_DIR/quality-comparison.json && -s $OUTPUT_DIR/summary.md ]] ||
     die "quality comparison summary is missing"
 
 phase=complete
-printf 'Native-Q8 versus 86/86 T256 FP16 quality comparison complete: %s\n' \
+printf 'All-native Q8 versus complete production FP16-cache quality comparison complete: %s\n' \
     "$OUTPUT_DIR"

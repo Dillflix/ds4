@@ -455,27 +455,31 @@ attempts to weaken the target or use fewer than three repeats. Return the genera
 check that `run-status.txt` says `state=finished`, `summary.md` says
 `Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
 
-### Native-Q8 versus complete T256-FP16 quality endpoint
+### All-native Q8 versus complete production FP16-cache quality endpoint
 
 `cuda-q8-fp16-full-quality.sh` scores only the two decision-relevant production
 endpoints selected after the T256 placement screen:
 
 - every Q8 projection uses native Q8 because the complete FP16 expansion cache
   is disabled; and
-- every active T256 output-B projection uses FP16/cuBLAS on its NVLink partner.
-  The binding inventory is 43/43: one home-consumer partner binding per layer,
-  backed by exactly 43 physical FP16 weights.
-  This policy must also preserve at least the complete 263-binding non-T256
-  cache inventory observed by the winning placement run; additional local
-  cache admissions are valid.
+- the complete production FP16-cache policy runs every active T256 output-B
+  projection with FP16/cuBLAS on its NVLink partner and retains whatever
+  non-T256 FP16 projections the production admission planner selects locally.
+  The T256 inventory is fixed at 43/43—one live partner binding and one live
+  physical F16 allocation per layer—but the non-T256 inventory is deliberately
+  dynamic rather than pinned to a stale count from an earlier model plan.
 
 The runner validates execution, not just requested policy. Across the 100-case
 suite the native endpoint must record exactly 4,300 native T256 calls. The
 FP16 endpoint must record exactly 4,300 partner-FP16 calls, with no local-FP16
-T256 call and no T256 native fallback. Only then does it report official-continuation
-NLL, first-token accuracy, greedy-prefix length, and API-reference metrics with
-a paired bootstrap interval. It never hashes the model and does not require a
-new quant.
+T256 call and no T256 native fallback. The scorer exports binding and physical
+allocation state after all 100 cases. Every exported F16/F32 binding and
+allocation must be used and live, dead expanded-weight bytes must be zero, and
+no non-T256 binding may be partner-offloaded. The summary records the exact
+dynamic non-T256 class and descriptor inventory before reporting
+official-continuation NLL, first-token accuracy, greedy-prefix length, and
+API-reference metrics with a paired bootstrap interval. It never hashes the
+model and does not require a new quant.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -511,7 +515,9 @@ peer-consumer duplicate.
   partner: 22 local plus 21 partner bindings. Each pipeline stage is balanced
   within its own NVLink pair (11/11 for layers 0-21 and 11/10 for layers
   22-42);
-- `overflow`: 36 local plus seven partner bindings; and
+- `overflow`: exactly 43 live bindings, with zero to seven natural partner
+  overflows drawn only from eligible layers 15-21. The runner records the
+  observed local/partner count instead of assuming the earlier 36/7 split; and
 - `all-partner`: zero local plus 43 partner bindings.
 
 Every run performs an untimed warm-up, then exports binding, physical
@@ -628,9 +634,14 @@ existing absolute paths in `MODEL` for the
 standard full-Q4 GGUF and `NATIVE_MODEL` for its tagged SM75-native repack.
 Both arms force the measured all-partner T256 winner: 43 active partner
 bindings backed by 43 physical T256 expansions, with all output-B GEMMs
-executing on the NVLink partners. It uses the production `0,3,1,2` device order
-and 22/21 split and sweeps 2K through 32K. One standard-then-native pair is the
-default; increase `REPEATS` only when repeat statistics are specifically needed.
+executing on the NVLink partners. After the untimed warm-up, the runner also
+requires every expanded-weight allocation to be live and compares the standard
+and native arms by their exact live non-T256 descriptor multiset: label, source
+offset/bytes, dimensions, consumer/resident device, storage kind, and arithmetic.
+There is no historical minimum binding-count assumption. It uses the production
+`0,3,1,2` device order and 22/21 split and sweeps 2K through 32K. One
+standard-then-native pair is the default; increase `REPEATS` only when repeat
+statistics are specifically needed.
 
 The runner records file sizes and exact-output evidence but deliberately does
 not hash either approximately 153-GiB model. It reuses the existing models and
@@ -657,6 +668,7 @@ REPEATS=1 \
 Return `sm75-native-q4-t256-ab-<timestamp>.tar.gz`. The archive contains the
 focused throughput comparison, bit-exact standard/native full-logit checks,
 exact all-partner T256 allocation/binding/runtime evidence, frozen-cache checks,
+exact live non-T256 inventory equality, zero dead expanded-weight allocations,
 and per-run GPU telemetry.
 A `PASS` from this runner accepts only that structural and performance
 interaction. It does not replace or override the separate official T256
