@@ -646,6 +646,8 @@ int main(int argc, char **argv) {
     }
     fprintf(out,
             "id\tprompt_tokens\ttarget_tokens\tnll\tavg_nll\tfirst_match\tgreedy_lcp"
+            "\tfirst_target_id\tfirst_greedy_id\tfirst_target_logit"
+            "\tfirst_greedy_logit\tfirst_target_margin\tfirst_greedy_margin"
             "\tapi_ref_tokens\tapi_target_tokens\tapi_target_mae\tapi_target_mean_delta"
             "\tapi_top_items\tapi_top_mapped\tapi_top_coverage"
             "\tapi_top1_count\tapi_top1_match\tapi_top1_rate"
@@ -713,6 +715,12 @@ int main(int argc, char **argv) {
         int lcp = 0;
         bool still_matching = true;
         bool first_match = false;
+        int first_target_id = -1;
+        int first_greedy_id = -1;
+        double first_target_logit = NAN;
+        double first_greedy_logit = NAN;
+        double first_target_margin = NAN;
+        double first_greedy_margin = NAN;
         for (int i = 0; i < target.len; i++) {
             double logsum = 0.0;
             int greedy = -1;
@@ -721,7 +729,28 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            if (i == 0) first_match = (greedy == target.v[i]);
+            if (i == 0) {
+                first_target_id = target.v[i];
+                first_greedy_id = greedy;
+                first_match = (greedy == first_target_id);
+                first_target_logit = logits[first_target_id];
+                first_greedy_logit = logits[first_greedy_id];
+                double best_other_target = -INFINITY;
+                double best_other_greedy = -INFINITY;
+                for (int token_id = 0; token_id < n_vocab; token_id++) {
+                    const double value = logits[token_id];
+                    if (token_id != first_target_id &&
+                        value > best_other_target) {
+                        best_other_target = value;
+                    }
+                    if (token_id != first_greedy_id &&
+                        value > best_other_greedy) {
+                        best_other_greedy = value;
+                    }
+                }
+                first_target_margin = first_target_logit - best_other_target;
+                first_greedy_margin = first_greedy_logit - best_other_greedy;
+            }
             if (still_matching && greedy == target.v[i]) lcp++;
             else still_matching = false;
 
@@ -800,6 +829,7 @@ int main(int argc, char **argv) {
         const double avg = target.len ? nll / (double)target.len : 0.0;
         fprintf(out,
                 "%s\t%d\t%d\t%.9f\t%.9f\t%d\t%d"
+                "\t%d\t%d\t%.9f\t%.9f\t%.9f\t%.9f"
                 "\t%d\t%ld\t%.9f\t%.9f"
                 "\t%ld\t%ld\t%.9f"
                 "\t%ld\t%ld\t%.9f"
@@ -807,6 +837,9 @@ int main(int argc, char **argv) {
                 "\t%ld\t%.9f\t%.9f"
                 "\t%ld\t%ld\t%.9f\n",
                 id, prompt.len, target.len, nll, avg, first_match ? 1 : 0, lcp,
+                first_target_id, first_greedy_id,
+                first_target_logit, first_greedy_logit,
+                first_target_margin, first_greedy_margin,
                 have_api ? ref.n_pos : 0,
                 cm.target_count,
                 safe_avg(cm.target_abs_delta, cm.target_count),

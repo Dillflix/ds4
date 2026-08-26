@@ -455,6 +455,39 @@ attempts to weaken the target or use fewer than three repeats. Return the genera
 check that `run-status.txt` says `state=finished`, `summary.md` says
 `Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
 
+### T256 arithmetic-source isolation
+
+`cuda-q8-partner-arithmetic-isolation.sh` explains a quality difference; it
+does not select a production layer allowlist. It freezes the home cache and
+the additive T256 tensor/layer set, then runs native Q8 plus five controlled
+partner arithmetic arms. Adjacent comparisons isolate Tensor-GEMM arithmetic,
+activation FP16 rounding, weight FP16 rounding, activation block-Q8
+quantization, and finally the native INT32-dot/reduction structure. The scorer
+records first-token IDs and signed target/greedy logit margins.
+
+The default bounded pass contains the five cases whose first-token result
+changed in the initial T256 isolation. Set `CASE_IDS` to a larger comma-
+separated `case_NNN` set only after this causal pass succeeds.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+T256_LAYERS=15-21 \
+CASE_IDS=case_017,case_025,case_030,case_048,case_056 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-q8-partner-arithmetic-isolation.sh
+```
+
+Return `q8-partner-arithmetic-<timestamp>.tar.gz`. A valid archive reports
+`Experiment integrity: PASS` and proves identical home bindings and identical
+additive T256 layers across every arithmetic arm.
+
 ### Tagged SM75 native-Q4 and automatic-T256 A/B
 
 `cuda-sm75-native-q4-t256-ab.sh` is an evidence runner only; it does not

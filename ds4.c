@@ -3074,6 +3074,14 @@ static bool accelerator_q8_cache_partner_class_enabled(
     }
 }
 
+static bool accelerator_q8_partner_arithmetic_valid(const char *value) {
+    return !value || !value[0] || strcmp(value, "f16") == 0 ||
+           strcmp(value, "w16-x16-sgemm") == 0 ||
+           strcmp(value, "w16-x32-sgemm") == 0 ||
+           strcmp(value, "w32-x32-sgemm") == 0 ||
+           strcmp(value, "w32-xq8-sgemm") == 0;
+}
+
 static int accelerator_q8_cache_partner_tier(
         uint32_t path_class,
         bool cuda_tp_decode,
@@ -55857,6 +55865,17 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t partner_fallback_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!partner_classes || !partner_classes[0]) partner_classes = "none";
+    const char *partner_arithmetic_env =
+        getenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+    const char *partner_arithmetic =
+        partner_arithmetic_env && partner_arithmetic_env[0]
+            ? partner_arithmetic_env : "f16";
+    if (!accelerator_q8_partner_arithmetic_valid(partner_arithmetic_env)) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_PARTNER_ARITHMETIC='%s'\n",
+                partner_arithmetic_env ? partner_arithmetic_env : "");
+        return -1;
+    }
     const char *partner_layers_env =
         getenv("DS4_CUDA_Q8_F16_PARTNER_LAYERS");
     bool partner_layers_valid = true;
@@ -55874,6 +55893,15 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         ? partner_layers_env : "all";
     const bool freeze_home_plan =
         getenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN") != NULL;
+    if (strcmp(partner_arithmetic, "f16") != 0 &&
+        (strcmp(partner_classes, "t256") != 0 || !freeze_home_plan)) {
+        fprintf(stderr,
+                "ds4: DS4_CUDA_Q8_PARTNER_ARITHMETIC=%s is a diagnostic "
+                "T256-only mode and requires partner-classes=t256 plus "
+                "home-order=frozen\n",
+                partner_arithmetic);
+        return -1;
+    }
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
     const bool split_attn_output =
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
@@ -56010,7 +56038,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
             "other=%llu partner-fallback=%llu partner-classes=%s "
             "partner-layers=%s "
-            "home-order=%s\n",
+            "home-order=%s partner-arithmetic=%s\n",
             (unsigned long long)plan_count,
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
@@ -56021,7 +56049,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             (unsigned long long)partner_fallback_count,
             partner_classes,
             partner_layers,
-            freeze_home_plan ? "frozen" : "partner-priority");
+            freeze_home_plan ? "frozen" : "partner-priority",
+            partner_arithmetic);
 
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {
@@ -56576,6 +56605,10 @@ int ds4_test_q8_cache_partner_layer_enabled(
         list, layer, &valid);
     if (valid_out) *valid_out = valid ? 1 : 0;
     return enabled ? 1 : 0;
+}
+
+int ds4_test_q8_partner_arithmetic_valid(const char *value) {
+    return accelerator_q8_partner_arithmetic_valid(value) ? 1 : 0;
 }
 
 bool ds4_test_cuda_routed_moe_quant_types_supported(
