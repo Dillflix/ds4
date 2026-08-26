@@ -58,7 +58,30 @@ def binding_row(
         "in_dim": 8192,
         "out_dim": 4096,
         "partner_arithmetic": "f16",
+        "weight_offset": 1_000_000 + layer,
         "label": f"tensor:blk.{layer}.attn_output_b.weight",
+    }
+
+
+def non_t256_binding(kind: str, index: int) -> dict[str, object]:
+    labels = {
+        "attn_kv": "attn_kv",
+        "attn_output_a": "attn_output_a",
+        "attn_q_a": "attn_q_a",
+        "attn_q_b": "attn_q_b",
+        "shared_down": "ffn_down_shexp",
+        "shared_gate": "ffn_gate_shexp",
+        "shared_up": "ffn_up_shexp",
+    }
+    return {
+        "consumer_device": 0,
+        "resident_device": 0,
+        "partner_offload": 0,
+        "in_dim": 1,
+        "out_dim": 1,
+        "partner_arithmetic": "f16",
+        "weight_offset": 2_000_000 + index,
+        "label": f"tensor:blk.0.{labels[kind]}.weight.{index}",
     }
 
 
@@ -70,8 +93,11 @@ def make_fixture(root: Path, quality_delta: float = 0.0) -> None:
         "gpu_vram=auto\n"
         "stage_split=22/21\n"
         "quality_ctx=32769\n"
-        "t256_layers=15-21\n"
+        "t256_layers=0-42\n"
         "comparison=native-q8-vs-fp16-t256-86-of-86\n"
+        "fp16_expected_placement=43-fixed-plus-43-partner\n"
+        "fp16_expected_unique_t256_allocations=43\n"
+        "fp16_expected_non_t256_bindings=263\n"
         "model_hashing=disabled\n",
         encoding="utf-8",
     )
@@ -92,10 +118,10 @@ def make_fixture(root: Path, quality_delta: float = 0.0) -> None:
         "score_official: runtime_path=production\n"
         "ds4: CUDA EP forced pipeline split 22/21\n"
         "ds4: CUDA q8 fp16 benefit plan policy partner-classes=t256 "
-        "partner-layers=15-21 home-order=frozen\n"
-        "ds4: CUDA q8 fp16 benefit plan materialized 250/250 candidates; "
-        "T256-output_b=86/86 partner=7 partner-arithmetic=f16 "
-        "t256-placement=overflow\n"
+        "partner-layers=0-42 home-order=frozen\n"
+        "ds4: CUDA q8 fp16 benefit plan materialized 349/473 candidates; "
+        "T256-output_b=86/86 partner=43 partner-arithmetic=f16 "
+        "t256-placement=all-partner\n"
         "ds4: CUDA q8 partner execution enabled: arithmetic=f16\n",
         encoding="utf-8",
     )
@@ -108,20 +134,30 @@ def make_fixture(root: Path, quality_delta: float = 0.0) -> None:
 
     binding_fields = [
         "consumer_device", "resident_device", "partner_offload", "in_dim",
-        "out_dim", "partner_arithmetic", "label",
+        "out_dim", "partner_arithmetic", "weight_offset", "label",
     ]
     write_table(quality / "native-q8.bindings.csv", binding_fields, [])
     bindings = []
     for layer in range(43):
         if layer <= 21:
             bindings.append(binding_row(layer, 1, 1, 0))
-            if layer <= 14:
-                bindings.append(binding_row(layer, 0, 0, 0))
-            else:
-                bindings.append(binding_row(layer, 0, 1, 1))
+            bindings.append(binding_row(layer, 0, 1, 1))
         else:
             bindings.append(binding_row(layer, 2, 2, 0))
-            bindings.append(binding_row(layer, 3, 3, 0))
+            bindings.append(binding_row(layer, 3, 2, 1))
+    next_index = 0
+    for kind, count in {
+        "attn_kv": 24,
+        "attn_output_a": 90,
+        "attn_q_a": 21,
+        "attn_q_b": 43,
+        "shared_down": 43,
+        "shared_gate": 21,
+        "shared_up": 21,
+    }.items():
+        for _ in range(count):
+            bindings.append(non_t256_binding(kind, next_index))
+            next_index += 1
     write_table(quality / "fp16-t256-full.bindings.csv", binding_fields, bindings)
 
     audit_fields = [
@@ -146,12 +182,11 @@ def make_fixture(root: Path, quality_delta: float = 0.0) -> None:
                 "result": "native_q8",
                 "reason": "disabled_by_env",
             })
-            partner = layer in range(15, 22)
             full_audit.append({
                 **common,
-                "physical_device": 1 if partner else home_device,
-                "result": "f16_partner_hit" if partner else "f16_hit",
-                "reason": "nvlink_offload" if partner else "resident",
+                "physical_device": 1 if layer <= 21 else 2,
+                "result": "f16_partner_hit",
+                "reason": "nvlink_offload",
             })
     write_table(quality / "native-q8.q8-audit.csv", audit_fields, native_audit)
     write_table(
@@ -181,8 +216,10 @@ class FullFp16QualitySummaryTests(unittest.TestCase):
             self.assertEqual(payload["coverage"]["native_q8"]["t256_bindings"], 0)
             full = payload["coverage"]["fp16_t256_full"]
             self.assertEqual(full["t256_bindings"], 86)
-            self.assertEqual(full["local_bindings"], 79)
-            self.assertEqual(full["partner_bindings"], 7)
+            self.assertEqual(full["fixed_bindings"], 43)
+            self.assertEqual(full["partner_bindings"], 43)
+            self.assertEqual(full["unique_t256_allocations"], 43)
+            self.assertEqual(full["non_t256_bindings"], 263)
             self.assertTrue(payload["quality"]["predeclared_noninferiority_pass"])
             self.assertIn("86 / 86", (root / "summary.md").read_text())
 
@@ -193,7 +230,14 @@ class FullFp16QualitySummaryTests(unittest.TestCase):
             path = root / "quality/fp16-t256-full.bindings.csv"
             with path.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
-            write_table(path, list(rows[0]), rows[:-1])
+            victim = next(
+                i for i, row in enumerate(rows)
+                if "attn_output_b" in row["label"]
+                and row["in_dim"] == "8192"
+                and row["out_dim"] == "4096"
+            )
+            del rows[victim]
+            write_table(path, list(rows[0]), rows)
             result = self.run_summary(root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("85/86", result.stderr)
@@ -211,6 +255,20 @@ class FullFp16QualitySummaryTests(unittest.TestCase):
             result = self.run_summary(root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("contaminated", result.stderr)
+
+    def test_missing_non_t256_cache_entry_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ds4-fp16-full-cache-loss-") as raw:
+            root = Path(raw)
+            make_fixture(root)
+            path = root / "quality/fp16-t256-full.bindings.csv"
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            victim = next(i for i, row in enumerate(rows) if "attn_kv" in row["label"])
+            del rows[victim]
+            write_table(path, list(rows[0]), rows)
+            result = self.run_summary(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("complete non-T256 cache inventory", result.stderr)
 
     def test_quality_regression_is_reported_without_invalidating_evidence(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ds4-fp16-full-quality-fail-") as raw:

@@ -14,7 +14,6 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 QUALITY_CTX=${QUALITY_CTX:-32769}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
-T256_LAYERS=${T256_LAYERS:-15-21}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -24,8 +23,8 @@ OUTPUT_DIR=${Q8_FP16_FULL_QUALITY_DIR:-$repo_dir/q8-fp16-full-quality-$stamp}
     die "QUALITY_MANIFEST must name an existing absolute path"
 [[ $GPU_DEVICES == 0,3,1,2 && $GPU_VRAM == auto && $STAGE_SPLIT == 22 ]] ||
     die "comparison requires GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22"
-[[ $QUALITY_CTX == 32769 && $PREFILL_CHUNK == 2048 && $T256_LAYERS == 15-21 ]] ||
-    die "comparison requires QUALITY_CTX=32769 PREFILL_CHUNK=2048 T256_LAYERS=15-21"
+[[ $QUALITY_CTX == 32769 && $PREFILL_CHUNK == 2048 ]] ||
+    die "comparison requires QUALITY_CTX=32769 PREFILL_CHUNK=2048"
 for item in "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}
     value=${item#*:}
@@ -104,11 +103,13 @@ done
         "$MODEL" "$(stat -c %s "$MODEL")"
     printf 'quality_manifest=%s\nquality_ctx=%s\ngpu_devices=%s\ngpu_vram=%s\n' \
         "$QUALITY_MANIFEST" "$QUALITY_CTX" "$GPU_DEVICES" "$GPU_VRAM"
-    printf 'stage_split=%s/%s\nprefill_chunk=%s\nt256_layers=%s\n' \
-        "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$PREFILL_CHUNK" "$T256_LAYERS"
+    printf 'stage_split=%s/%s\nprefill_chunk=%s\nt256_layers=0-42\n' \
+        "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$PREFILL_CHUNK"
     printf 'comparison=native-q8-vs-fp16-t256-86-of-86\n'
     printf 'native_expected_bindings=0/86\nfp16_expected_bindings=86/86\n'
-    printf 'fp16_expected_placement=79-local-plus-7-partner\n'
+    printf 'fp16_expected_placement=43-fixed-plus-43-partner\n'
+    printf 'fp16_expected_unique_t256_allocations=43\n'
+    printf 'fp16_expected_non_t256_bindings=263\n'
     printf 'model_hashing=disabled\nquality_runtime=production\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free \
         --format=csv
@@ -159,9 +160,9 @@ native_env=(
 full_env=(
     DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1
     DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
-    "DS4_CUDA_Q8_F16_PARTNER_LAYERS=$T256_LAYERS"
+    DS4_CUDA_Q8_F16_PARTNER_LAYERS=0-42
     DS4_CUDA_Q8_PARTNER_ARITHMETIC=f16
-    DS4_CUDA_Q8_T256_PLACEMENT=overflow
+    DS4_CUDA_Q8_T256_PLACEMENT=all-partner
 )
 
 run_quality() {

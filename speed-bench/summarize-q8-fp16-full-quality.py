@@ -17,15 +17,25 @@ from pathlib import Path
 CASES = 100
 LAYERS = 43
 T256_BINDINGS = 86
-T256_HOME_BINDINGS = 79
-T256_PARTNER_BINDINGS = 7
+T256_FIXED_BINDINGS = 43
+T256_PARTNER_BINDINGS = 43
+T256_UNIQUE_ALLOCATIONS = 43
+NON_T256_BINDINGS = 263
 T256_RUNTIME_CALLS = CASES * LAYERS
-T256_HOME_CALLS = CASES * (LAYERS - T256_PARTNER_BINDINGS)
 T256_PARTNER_CALLS = CASES * T256_PARTNER_BINDINGS
-EXPECTED_PARTNER_LAYERS = list(range(15, 22))
+EXPECTED_PARTNER_LAYERS = list(range(LAYERS))
+EXPECTED_NON_T256_CLASSES = Counter({
+    "attn_kv": 24,
+    "attn_output_a": 90,
+    "attn_q_a": 21,
+    "attn_q_b": 43,
+    "shared_down": 43,
+    "shared_gate": 21,
+    "shared_up": 21,
+})
 BINDING_COLUMNS = {
     "consumer_device", "resident_device", "partner_offload", "in_dim",
-    "out_dim", "partner_arithmetic", "label",
+    "out_dim", "partner_arithmetic", "weight_offset", "label",
 }
 AUDIT_COLUMNS = {
     "module", "label", "layer", "physical_device", "in_dim", "out_dim",
@@ -102,6 +112,22 @@ def devices_for_layer(layer: int) -> tuple[int, int]:
     return (0, 1) if layer <= 21 else (3, 2)
 
 
+def non_t256_class(row: dict[str, str]) -> str:
+    label = row.get("label", "")
+    for needle, name in (
+        ("attn_kv", "attn_kv"),
+        ("attn_output_a", "attn_output_a"),
+        ("attn_q_a", "attn_q_a"),
+        ("attn_q_b", "attn_q_b"),
+        ("ffn_down_shexp", "shared_down"),
+        ("ffn_gate_shexp", "shared_gate"),
+        ("ffn_up_shexp", "shared_up"),
+    ):
+        if needle in label:
+            return name
+    return "other"
+
+
 def validate_native(root: Path) -> dict[str, object]:
     binding_path = root / "quality/native-q8.bindings.csv"
     bindings = read_rows(binding_path)
@@ -137,14 +163,15 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
     bindings = read_rows(binding_path)
     require_columns(binding_path, bindings, BINDING_COLUMNS)
     t256 = [row for row in bindings if is_t256(row)]
+    non_t256 = [row for row in bindings if not is_t256(row)]
     home = [row for row in t256 if row["partner_offload"] == "0"]
     partner = [row for row in t256 if row["partner_offload"] == "1"]
     if len(t256) != T256_BINDINGS:
         fail(f"full FP16 exported {len(t256)}/86 T256 bindings")
-    if len(home) != T256_HOME_BINDINGS or len(partner) != T256_PARTNER_BINDINGS:
+    if len(home) != T256_FIXED_BINDINGS or len(partner) != T256_PARTNER_BINDINGS:
         fail(
-            "full FP16 T256 placement is not 79 local + 7 partner: "
-            f"local={len(home)} partner={len(partner)}"
+            "full FP16 T256 placement is not 43 fixed + 43 partner: "
+            f"fixed={len(home)} partner={len(partner)}"
         )
     if any(row["partner_arithmetic"] != "f16" for row in t256):
         fail("full FP16 T256 bindings contain non-F16 arithmetic")
@@ -152,15 +179,28 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
         fail("full FP16 partner binding is resident on its consumer")
     partner_layers = sorted(layer_of(row) for row in partner)
     if partner_layers != EXPECTED_PARTNER_LAYERS:
-        fail(f"full FP16 partner layers are {partner_layers}, expected 15-21")
+        fail(f"full FP16 partner layers are {partner_layers}, expected 0-42")
+    unique_allocations = {
+        (row["resident_device"], row["weight_offset"]) for row in t256
+    }
+    if len(unique_allocations) != T256_UNIQUE_ALLOCATIONS:
+        fail(
+            "full FP16 T256 bindings do not share exactly 43 physical weights: "
+            f"unique={len(unique_allocations)}"
+        )
+    non_t256_classes = Counter(non_t256_class(row) for row in non_t256)
+    if len(non_t256) != NON_T256_BINDINGS or non_t256_classes != EXPECTED_NON_T256_CLASSES:
+        fail(
+            "full FP16 did not preserve the complete non-T256 cache inventory: "
+            f"total={len(non_t256)} classes={dict(sorted(non_t256_classes.items()))}"
+        )
+    if any(row["partner_offload"] != "0" for row in non_t256):
+        fail("full FP16 contains a non-T256 partner binding")
     expected_bindings: Counter[tuple[int, int, int, int]] = Counter()
     for layer in range(LAYERS):
         home_device, partner_device = devices_for_layer(layer)
         expected_bindings[(layer, partner_device, partner_device, 0)] += 1
-        if layer in EXPECTED_PARTNER_LAYERS:
-            expected_bindings[(layer, home_device, partner_device, 1)] += 1
-        else:
-            expected_bindings[(layer, home_device, home_device, 0)] += 1
+        expected_bindings[(layer, home_device, partner_device, 1)] += 1
     observed_bindings = Counter(
         (
             layer_of(row), int(row["consumer_device"]),
@@ -177,7 +217,6 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
     calls = [row for row in audit if is_t256(row)]
     results = Counter(row["result"] for row in calls)
     expected_results = Counter({
-        "f16_hit": T256_HOME_CALLS,
         "f16_partner_hit": T256_PARTNER_CALLS,
     })
     if len(calls) != T256_RUNTIME_CALLS:
@@ -189,14 +228,11 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
         fail("full FP16 partner audit contains a non-NVLink reason")
     hit_layers = Counter(layer_of(row) for row in partner_hits)
     if hit_layers != Counter({layer: CASES for layer in EXPECTED_PARTNER_LAYERS}):
-        fail(f"full FP16 partner execution does not cover layers 15-21: {dict(hit_layers)}")
+        fail(f"full FP16 partner execution does not cover layers 0-42: {dict(hit_layers)}")
     for row in calls:
         layer = layer_of(row)
-        home_device, partner_device = devices_for_layer(layer)
-        if layer in EXPECTED_PARTNER_LAYERS:
-            expected = ("f16_partner_hit", "nvlink_offload", partner_device)
-        else:
-            expected = ("f16_hit", "resident", home_device)
+        _home_device, partner_device = devices_for_layer(layer)
+        expected = ("f16_partner_hit", "nvlink_offload", partner_device)
         observed = (
             row["result"], row["reason"], int(row["physical_device"])
         )
@@ -206,8 +242,11 @@ def validate_full_fp16(root: Path) -> dict[str, object]:
             )
     return {
         "t256_bindings": len(t256),
-        "local_bindings": len(home),
+        "fixed_bindings": len(home),
         "partner_bindings": len(partner),
+        "unique_t256_allocations": len(unique_allocations),
+        "non_t256_bindings": len(non_t256),
+        "non_t256_classes": dict(sorted(non_t256_classes.items())),
         "partner_layers": partner_layers,
         "t256_runtime_calls": len(calls),
         "runtime_results": dict(sorted(results.items())),
@@ -319,8 +358,11 @@ def main() -> int:
         "gpu_vram": "auto",
         "stage_split": "22/21",
         "quality_ctx": "32769",
-        "t256_layers": "15-21",
+        "t256_layers": "0-42",
         "comparison": "native-q8-vs-fp16-t256-86-of-86",
+        "fp16_expected_placement": "43-fixed-plus-43-partner",
+        "fp16_expected_unique_t256_allocations": "43",
+        "fp16_expected_non_t256_bindings": "263",
         "model_hashing": "disabled",
     }
     wrong = {
@@ -351,11 +393,11 @@ def main() -> int:
                     "score_official: runtime_path=production",
                     "CUDA EP forced pipeline split 22/21",
                     "T256-output_b=86/86",
-                    "partner=7 partner-arithmetic=f16",
+                    "partner=43 partner-arithmetic=f16",
                     "partner-classes=t256",
-                    "partner-layers=15-21",
+                    "partner-layers=0-42",
                     "home-order=frozen",
-                    "t256-placement=overflow",
+                    "t256-placement=all-partner",
                     "CUDA q8 partner execution enabled:",
                 ],
                 ["arithmetic=native-q8"],
@@ -381,11 +423,11 @@ def main() -> int:
             "score_official: runtime_path=production",
             "CUDA EP forced pipeline split 22/21",
             "T256-output_b=86/86",
-            "partner=7 partner-arithmetic=f16",
+            "partner=43 partner-arithmetic=f16",
             "partner-classes=t256",
-            "partner-layers=15-21",
+            "partner-layers=0-42",
             "home-order=frozen",
-            "t256-placement=overflow",
+            "t256-placement=all-partner",
             "CUDA q8 partner execution enabled:",
         ],
         ["arithmetic=native-q8"],
@@ -434,7 +476,7 @@ def main() -> int:
 
     payload = {
         "experiment_integrity": True,
-        "comparison": "pure native Q8 vs complete 86/86 T256 FP16 admission",
+        "comparison": "pure native Q8 vs all-active-partner T256 FP16 admission",
         "coverage": {
             "native_q8": native_coverage,
             "fp16_t256_full": candidate_coverage,
@@ -473,16 +515,16 @@ def main() -> int:
         "Experiment integrity: **PASS**",
         "",
         "This comparison contains only the two decision-relevant endpoints. The native arm "
-        "has no FP16 expansion bindings; the candidate admits every T256 projection, "
-        "including the seven partner-resident projections.",
+        "has no FP16 expansion bindings; the candidate keeps one physical T256 expansion "
+        "per layer on the NVLink partner and executes every active T256 projection there.",
         "",
         "## Proven execution coverage",
         "",
-        "| Arm | T256 bindings | Local / partner bindings | T256 runtime calls | Runtime path |",
+        "| Arm | T256 bindings | Fixed / partner bindings | Physical T256 weights | Runtime path |",
         "|---|---:|---:|---:|---|",
-        f"| Native Q8 | 0 / 86 | 0 / 0 | {T256_RUNTIME_CALLS} | {T256_RUNTIME_CALLS} native Q8 |",
-        f"| Full FP16 T256 | 86 / 86 | 79 / 7 | {T256_RUNTIME_CALLS} | "
-        f"{T256_HOME_CALLS} local FP16 + {T256_PARTNER_CALLS} partner FP16 |",
+        f"| Native Q8 | 0 / 86 | 0 / 0 | 0 | {T256_RUNTIME_CALLS} native Q8 |",
+        f"| Full FP16 T256 | 86 / 86 | 43 / 43 | {T256_UNIQUE_ALLOCATIONS} | "
+        f"{T256_PARTNER_CALLS} partner FP16 |",
         "",
         "## Official-continuation quality",
         "",

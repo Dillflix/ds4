@@ -457,19 +457,21 @@ check that `run-status.txt` says `state=finished`, `summary.md` says
 
 ### Native-Q8 versus complete T256-FP16 quality endpoint
 
-`cuda-q8-fp16-full-quality.sh` deliberately removes the intermediate 79/86
-quality arm. It scores only the two decision-relevant production endpoints:
+`cuda-q8-fp16-full-quality.sh` scores only the two decision-relevant production
+endpoints selected after the T256 placement screen:
 
 - every Q8 projection uses native Q8 because the complete FP16 expansion cache
   is disabled; and
-- every active T256 output-B projection uses FP16/cuBLAS. The measured binding
-  inventory is 86/86: 79 device-local bindings plus seven bindings that reuse
-  the corresponding FP16 weights on the NVLink partner.
+- every active T256 output-B projection uses FP16/cuBLAS on its NVLink partner.
+  The binding inventory is 86/86: 43 fixed pair-local consumers plus 43
+  home-consumer partner bindings, backed by exactly 43 physical FP16 weights.
+  This policy must also preserve the complete 263-binding non-T256 cache
+  inventory observed by the winning placement run.
 
 The runner validates execution, not just requested policy. Across the 100-case
 suite the native endpoint must record exactly 4,300 native T256 calls. The
-FP16 endpoint must record exactly 3,600 local-FP16 plus 700 partner-FP16 calls,
-with no T256 native fallback. Only then does it report official-continuation
+FP16 endpoint must record exactly 4,300 partner-FP16 calls, with no local-FP16
+T256 call and no T256 native fallback. Only then does it report official-continuation
 NLL, first-token accuracy, greedy-prefix length, and API-reference metrics with
 a paired bootstrap interval. It never hashes the model and does not require a
 new quant.
