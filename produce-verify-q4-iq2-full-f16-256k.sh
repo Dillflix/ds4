@@ -23,7 +23,9 @@ No full-Q4 GGUF is required. The quantizer regenerates tensors from HF_DIR,
 using the automatically cached 8 MiB metadata template and routed-MoE imatrix.
 If CALIBRATION_MODEL does not exist, the runner first creates a disposable
 all-IQ2-gate/up + Q4-down calibration model from the same HF checkpoint. It is
-removed only after final verification unless KEEP_GENERATED_CALIBRATION=1.
+removed after capacity selection, before final quantization, unless
+KEEP_GENERATED_CALIBRATION=1. The persisted calibration evidence supports a
+REUSE_BASELINE=1 retry without regenerating the disposable model.
 
 Defaults:
   GPU_DEVICES=0,3,1,2
@@ -235,6 +237,17 @@ IFS=$'\t' read -r iq2_layers tensor_overrides <<< "$selection"
     printf 'tensor_type_overrides=%s\n' "$tensor_overrides"
 } | tee "$selection_manifest"
 
+if [[ $generated_calibration_by_runner == 1 &&
+      $keep_generated_calibration != 1 &&
+      -f $calibration_model ]]; then
+    expected_generated=$(realpath -m "$generated_calibration")
+    [[ $calibration_model == "$expected_generated" ]] || \
+        die "refusing to remove unexpected calibration path: $calibration_model"
+    rm -f -- "$calibration_model"
+    printf 'Removed generated calibration model after capacity selection: %s\n' \
+        "$calibration_model"
+fi
+
 export GPU_DEVICES="$gpu_devices"
 export GPU_VRAM="$gpu_vram"
 export CUDA_ARCH="$cuda_arch"
@@ -287,16 +300,6 @@ if [[ $run_full_sweep == 1 ]]; then
         --ctx-start 2048 --ctx-max "$target_context" \
         --ctx-alloc "$ctx_alloc" --step-mul 2 --step-incr 2048 \
         --gen-tokens "$target_gen_tokens" --csv "$results"
-fi
-
-if [[ $generated_calibration_by_runner == 1 &&
-      $keep_generated_calibration != 1 &&
-      -f $calibration_model ]]; then
-    expected_generated=$(realpath -m "$generated_calibration")
-    [[ $calibration_model == "$expected_generated" ]] || \
-        die "refusing to remove unexpected calibration path: $calibration_model"
-    rm -f -- "$calibration_model"
-    printf 'Removed generated calibration model: %s\n' "$calibration_model"
 fi
 
 printf '\nQ4/IQ2 256K model generated and cache-verified.\n'
