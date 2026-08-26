@@ -104,13 +104,23 @@ done
 topology_file=$(mktemp)
 nvidia-smi topo -m >"$topology_file"
 topology_link() {
-    local source=$1 destination=$2
-    awk -v row="GPU$source" -v column="GPU$destination" '
-        NR == 1 {
-            for (i = 1; i <= NF; i++) if ($i == column) target = i
-            next
+    local from=$1 to=$2
+    awk -v from="GPU$from" -v to="GPU$to" '
+        !header {
+            n_gpu = 0
+            for (i = 1; i <= NF; i++) if ($i ~ /^GPU[0-9]+$/) n_gpu++
+            if (n_gpu > 1) {
+                # The header begins with GPU0, whereas each matrix row begins
+                # with its source-GPU label. Account for that extra row field.
+                for (i = 1; i <= NF; i++) if ($i == to) column = i + 1
+                header = 1
+                next
+            }
         }
-        $1 == row && target > 0 && target <= NF {print $target; exit}
+        header && $1 == from && column > 0 && column <= NF {
+            print $column
+            exit
+        }
     ' "$topology_file"
 }
 forward=$(topology_link "$PROFILE_GPU" "$PROFILE_PARTNER_GPU")
