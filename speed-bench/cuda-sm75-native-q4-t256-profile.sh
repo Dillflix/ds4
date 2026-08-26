@@ -27,6 +27,7 @@ Optional environment:
   NCU_USE_SUDO=1
   SKIP_BUILD=0
   REUSE_NSYS_DIR=             prior profiler output directory; skips GGUF load
+  REUSE_Q4_NCU_DIR=           prior output with four validated native-Q4 reports
   CREATE_ARCHIVE=1
   COMBINED_PROFILE_DIR=...     new output directory
 EOF
@@ -58,6 +59,7 @@ RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 REUSE_NSYS_DIR=${REUSE_NSYS_DIR:-}
+REUSE_Q4_NCU_DIR=${REUSE_Q4_NCU_DIR:-}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${COMBINED_PROFILE_DIR:-$repo_dir/sm75-native-q4-t256-profile-$stamp}
@@ -113,6 +115,11 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
     [[ $REUSE_NSYS_DIR == /* && -d $REUSE_NSYS_DIR ]] ||
         die "REUSE_NSYS_DIR must name an existing absolute profiler directory"
     REUSE_NSYS_DIR=$(cd "$REUSE_NSYS_DIR" && pwd)
+fi
+if [[ -n $REUSE_Q4_NCU_DIR ]]; then
+    [[ $REUSE_Q4_NCU_DIR == /* && -d $REUSE_Q4_NCU_DIR ]] ||
+        die "REUSE_Q4_NCU_DIR must name an existing absolute profiler directory"
+    REUSE_Q4_NCU_DIR=$(cd "$REUSE_Q4_NCU_DIR" && pwd)
 fi
 
 topology_file=$(mktemp)
@@ -268,6 +275,7 @@ phase=manifest
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU"
     printf 'reused_nsys_dir=%s\n' "${REUSE_NSYS_DIR:-none}"
+    printf 'reused_q4_ncu_dir=%s\n' "${REUSE_Q4_NCU_DIR:-none}"
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
         --format=csv
@@ -435,9 +443,30 @@ if [[ $RUN_NCU == 1 ]]; then
               --section MemoryWorkloadAnalysis --section ComputeWorkloadAnalysis)
 
     profile_native() {
-        local label=$1 scenario=$2 kernel=$3 expected=$4 block_size=$5 base=$6 rc=0
+        local label=$1 scenario=$2 kernel=$3 expected=$4 block_size=$5 base=$6
+        local scalar_target=${7:-none} rc=0 source_base=
+        local -a scalar_env=()
+        if [[ $scalar_target != none ]]; then
+            scalar_env=("DS4_PROFILE_SCALAR_TARGET=$scalar_target"
+                        DS4_PROFILE_SCALAR=1)
+        fi
+        if [[ -n $REUSE_Q4_NCU_DIR && $label == *native-q4* ]]; then
+            source_base="$REUSE_Q4_NCU_DIR/ncu/$label"
+            [[ -s $source_base.ncu-rep ]] ||
+                die "reusable Q4 NCU report is missing: $source_base.ncu-rep"
+            printf 'Reusing validated Nsight Compute capture: %s...\n' "$label"
+            cp -a "$source_base.ncu-rep" "$base.ncu-rep"
+            [[ ! -f $source_base.log ]] || cp -a "$source_base.log" "$base.log"
+            "$ncu_bin" --config-file off --import "$base.ncu-rep" \
+                --csv --page raw >"$base.csv" 2>"$base-import.log"
+            python3 speed-bench/validate-ncu-capture.py \
+                "$base.csv" "$expected" 0 \
+                --process cuda_sm75_profile_harness --block-size "$block_size"
+            return
+        fi
         printf 'Nsight Compute: %s...\n' "$label"
-        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${ncu_cmd[@]}" \
+        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${scalar_env[@]}" \
+            "${ncu_cmd[@]}" \
             --config-file off --target-processes application-only --devices 0 \
             --kernel-name-base function --kernel-name "regex:$kernel" \
             --launch-skip 0 --launch-count 1 --replay-mode kernel \
@@ -477,36 +506,36 @@ if [[ $RUN_NCU == 1 ]]; then
         'moe_down_sm75_native_q4_tile_kernel' \
         256 \
         "$OUTPUT_DIR/ncu/late-native-q4-down"
-    profile_native early-iq2-gate-tile16 q2-early \
+    profile_native early-iq2-gate-tile16 hybrid-iq2-q4-early \
         '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1>' \
         256 \
-        "$OUTPUT_DIR/ncu/early-iq2-gate-tile16"
-    profile_native late-iq2-gate-tile16 q2-late \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tile16" iq2-tile16
+    profile_native late-iq2-gate-tile16 hybrid-iq2-q4-late \
         '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1>' \
         256 \
-        "$OUTPUT_DIR/ncu/late-iq2-gate-tile16"
-    profile_native early-iq2-gate-tile8 q2-early \
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tile16" iq2-tile16
+    profile_native early-iq2-gate-tile8 hybrid-iq2-q4-early \
         '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1>' \
         256 \
-        "$OUTPUT_DIR/ncu/early-iq2-gate-tile8"
-    profile_native late-iq2-gate-tile8 q2-late \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tile8" iq2-tile16
+    profile_native late-iq2-gate-tile8 hybrid-iq2-q4-late \
         '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1>' \
         256 \
-        "$OUTPUT_DIR/ncu/late-iq2-gate-tile8"
-    profile_native early-iq2-gate-tail4 q2-early \
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tile8" iq2-tile16
+    profile_native early-iq2-gate-tail4 hybrid-iq2-q4-early \
         '^moe_gate_up_mid_expert_tile4_row32_kernel$' \
         'moe_gate_up_mid_expert_tile4_row32_kernel' \
         256 \
-        "$OUTPUT_DIR/ncu/early-iq2-gate-tail4"
-    profile_native late-iq2-gate-tail4 q2-late \
+        "$OUTPUT_DIR/ncu/early-iq2-gate-tail4" iq2-tile16
+    profile_native late-iq2-gate-tail4 hybrid-iq2-q4-late \
         '^moe_gate_up_mid_expert_tile4_row32_kernel$' \
         'moe_gate_up_mid_expert_tile4_row32_kernel' \
         256 \
-        "$OUTPUT_DIR/ncu/late-iq2-gate-tail4"
+        "$OUTPUT_DIR/ncu/late-iq2-gate-tail4" iq2-tile16
 
     profile_dense_cublas() {
         local shape=$1 scenario=$2 base="$OUTPUT_DIR/ncu/$1-cublas" rc=0

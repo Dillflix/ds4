@@ -20,6 +20,8 @@ typedef enum {
     SCENARIO_MOE_NATIVE_Q4_LATE,
     SCENARIO_MOE_Q2_EARLY,
     SCENARIO_MOE_Q2_LATE,
+    SCENARIO_MOE_HYBRID_IQ2_Q4_EARLY,
+    SCENARIO_MOE_HYBRID_IQ2_Q4_LATE,
     SCENARIO_Q8_Q_B,
     SCENARIO_Q8_ATTN,
     SCENARIO_Q8_SHARED,
@@ -86,6 +88,47 @@ static const uint16_t native_q4_late_counts[128] = {
     0u, 1u, 34u, 39u, 3u, 0u, 0u, 1u,
 };
 
+/* Exact home-half histograms from the accepted mixed-Q4/IQ2 production trace.
+ * These are IQ2 gate/up + SM75-native Q4 down layers, so they exercise the
+ * same cost-aware 16/8/4 tail planner as the shipping mixed model. */
+static const uint16_t hybrid_iq2_q4_early_counts[128] = {
+    15u, 22u, 1u, 3u, 4u, 4u, 12u, 0u,
+    0u, 0u, 2u, 9u, 0u, 3u, 7u, 1u,
+    7u, 26u, 10u, 6u, 30u, 10u, 1u, 35u,
+    6u, 5u, 29u, 19u, 1u, 0u, 2u, 2u,
+    0u, 0u, 4u, 5u, 1u, 18u, 1u, 0u,
+    6u, 4u, 0u, 0u, 9u, 9u, 11u, 0u,
+    3u, 0u, 0u, 0u, 2u, 2u, 21u, 4u,
+    1u, 5u, 0u, 0u, 485u, 17u, 1u, 0u,
+    2u, 0u, 3u, 2u, 3u, 25u, 6u, 26u,
+    1u, 24u, 439u, 9u, 0u, 10u, 0u, 4u,
+    2u, 12u, 1u, 6u, 21u, 32u, 11u, 37u,
+    0u, 3u, 4u, 0u, 1u, 18u, 1u, 0u,
+    4u, 4u, 0u, 10u, 53u, 1u, 3u, 11u,
+    1u, 22u, 1u, 12u, 6u, 2u, 0u, 41u,
+    2u, 9u, 14u, 28u, 5u, 42u, 2u, 1u,
+    3u, 1u, 3u, 14u, 1u, 0u, 0u, 0u,
+};
+
+static const uint16_t hybrid_iq2_q4_late_counts[128] = {
+    0u, 2u, 1u, 3u, 1u, 42u, 0u, 1u,
+    0u, 1u, 12u, 0u, 205u, 0u, 0u, 53u,
+    0u, 0u, 493u, 0u, 0u, 1u, 0u, 134u,
+    15u, 0u, 9u, 0u, 0u, 0u, 1u, 34u,
+    0u, 3u, 15u, 0u, 0u, 0u, 0u, 25u,
+    3u, 3u, 0u, 4u, 0u, 1u, 1u, 0u,
+    1u, 0u, 0u, 1u, 0u, 1u, 0u, 18u,
+    39u, 1u, 1u, 0u, 33u, 0u, 0u, 5u,
+    0u, 1u, 0u, 3u, 7u, 2u, 0u, 2u,
+    0u, 61u, 0u, 1u, 3u, 0u, 93u, 1u,
+    1u, 1u, 2u, 0u, 1u, 0u, 4u, 1u,
+    2u, 0u, 1u, 0u, 3u, 2u, 17u, 2u,
+    0u, 18u, 5u, 1u, 2u, 1u, 12u, 1u,
+    2u, 5u, 0u, 0u, 1u, 36u, 163u, 2u,
+    9u, 2u, 0u, 0u, 4u, 5u, 0u, 3u,
+    0u, 0u, 4u, 0u, 0u, 1u, 0u, 1u,
+};
+
 static const scenario_spec scenarios[] = {
     {
         "q4-early", SCENARIO_MOE_Q4_EARLY, 3u,
@@ -112,6 +155,16 @@ static const scenario_spec scenarios[] = {
         2186u, 76u, 189u, 4096u, 4096u, NULL,
     },
     {
+        "hybrid-iq2-q4-early", SCENARIO_MOE_HYBRID_IQ2_Q4_EARLY, 3u,
+        1880u, 100u, 184u, 4096u, 4096u,
+        hybrid_iq2_q4_early_counts,
+    },
+    {
+        "hybrid-iq2-q4-late", SCENARIO_MOE_HYBRID_IQ2_Q4_LATE, 27u,
+        1652u, 77u, 162u, 4096u, 4096u,
+        hybrid_iq2_q4_late_counts,
+    },
+    {
         "q8-q-b", SCENARIO_Q8_Q_B, 9u,
         0u, 0u, 0u, 1024u, 32768u, NULL,
     },
@@ -136,7 +189,8 @@ static unsigned char *model_storage;
 static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s q4-early|q4-late|native-q4-early|native-q4-late|"
-            "q2-early|q2-late|"
+            "q2-early|q2-late|hybrid-iq2-q4-early|"
+            "hybrid-iq2-q4-late|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
@@ -489,8 +543,8 @@ static int confirm_device_copy(uint64_t free_before, uint64_t free_after,
     return 1;
 }
 
-static int run_moe(const scenario_spec *spec, int q2_recipe, int native_q4,
-                   uint32_t timed_repeats) {
+static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
+                   int native_q4, uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint32_t n_expert = 6u;
     const uint32_t n_total_expert = 256u;
@@ -498,10 +552,10 @@ static int run_moe(const scenario_spec *spec, int q2_recipe, int native_q4,
     const uint32_t in_dim = 4096u;
     const uint32_t mid_dim = 2048u;
     const uint32_t out_dim = 4096u;
-    const uint32_t gate_type = q2_recipe ? 16u : 12u;
-    const uint32_t down_type = q2_recipe ? 10u : 12u;
-    const uint64_t gate_block_bytes = q2_recipe ? 66u : 144u;
-    const uint64_t down_block_bytes = q2_recipe ? 84u : 144u;
+    const uint32_t gate_type = gate_iq2 ? 16u : 12u;
+    const uint32_t down_type = down_q2 ? 10u : 12u;
+    const uint64_t gate_block_bytes = gate_iq2 ? 66u : 144u;
+    const uint64_t down_block_bytes = down_q2 ? 84u : 144u;
     const uint64_t gate_row_bytes =
         (uint64_t)(in_dim / 256u) * gate_block_bytes;
     const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
@@ -534,11 +588,12 @@ static int run_moe(const scenario_spec *spec, int q2_recipe, int native_q4,
            "model_bytes=%llu\ntensor_bytes=%llu\n"
            "predicted_device_bytes=%llu\ndevice_limit_bytes=%llu\n",
            spec->name,
-           q2_recipe ? "iq2_gate_up_q2_down" :
-               (native_q4 ? "native_q4_gate_up_q4_down" :
-                            "q4_gate_up_q4_down"),
-           q2_recipe ? "iq2_xxs" : "q4_k",
-           q2_recipe ? "q2_k" : "q4_k",
+            gate_iq2 && down_q2 ? "iq2_gate_up_q2_down" :
+                (gate_iq2 && native_q4 ? "iq2_gate_up_native_q4_down" :
+                (native_q4 ? "native_q4_gate_up_q4_down" :
+                             "q4_gate_up_q4_down")),
+            gate_iq2 ? "iq2_xxs" : "q4_k",
+            down_q2 ? "q2_k" : "q4_k",
            spec->layer, n_tokens, resident_experts,
            (unsigned long long)model_bytes,
            (unsigned long long)tensor_bytes,
@@ -836,11 +891,15 @@ int main(int argc, char **argv) {
     const int q4_moe = standard_q4_moe || native_q4_moe;
     const int q2_moe = spec->kind == SCENARIO_MOE_Q2_EARLY ||
                        spec->kind == SCENARIO_MOE_Q2_LATE;
+    const int hybrid_iq2_q4_moe =
+        spec->kind == SCENARIO_MOE_HYBRID_IQ2_Q4_EARLY ||
+        spec->kind == SCENARIO_MOE_HYBRID_IQ2_Q4_LATE;
     const int scalar_q4 = scalar_target == SCALAR_TARGET_Q4_GATE ||
                           scalar_target == SCALAR_TARGET_Q4_DOWN;
     const int scalar_iq2 = scalar_target == SCALAR_TARGET_IQ2_TILE16 ||
                            scalar_target == SCALAR_TARGET_IQ2_TILE8;
-    if ((scalar_q4 && !standard_q4_moe) || (scalar_iq2 && !q2_moe)) {
+    if ((scalar_q4 && !standard_q4_moe) ||
+        (scalar_iq2 && !q2_moe && !hybrid_iq2_q4_moe)) {
         fprintf(stderr,
                 "error: scalar target %s is incompatible with scenario %s\n",
                 scalar_target_name(scalar_target), spec->name);
@@ -934,9 +993,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const int ok = q4_moe ? run_moe(spec, 0, native_q4_moe, timed_repeats) :
-                   (q2_moe ? run_moe(spec, 1, 0, timed_repeats) :
-                             run_q8(spec, timed_repeats));
+    const int ok = q4_moe ?
+        run_moe(spec, 0, 0, native_q4_moe, timed_repeats) :
+        (q2_moe ? run_moe(spec, 1, 1, 0, timed_repeats) :
+         (hybrid_iq2_q4_moe ? run_moe(spec, 1, 0, 1, timed_repeats) :
+                              run_q8(spec, timed_repeats)));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;
