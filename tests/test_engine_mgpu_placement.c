@@ -65,6 +65,7 @@ int ds4_test_q8_cache_partner_layer_enabled(
                                    const char *list, uint32_t layer,
                                    int *valid_out);
 int ds4_test_q8_partner_arithmetic_valid(const char *value);
+int ds4_test_q8_t256_placement_valid(const char *value);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -168,6 +169,7 @@ static void test_q8_cache_benefit_order(void) {
     const char *shared_gate = "blk.3.ffn_gate_shexp.weight";
 
     (void)unsetenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN");
+    (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
 
     CHECK(ds4_test_q8_cache_class(q_b) != 0u, "T32 q_b is cache-plannable");
     CHECK(ds4_test_q8_cache_class(out_b) != 0u, "T256 output_b is cache-plannable");
@@ -202,6 +204,15 @@ static void test_q8_cache_benefit_order(void) {
               q_b, 64ull << 20, -1, out_b, 64ull << 20, 1) < 0,
           "frozen-home order matches the partner-disabled class order");
     (void)unsetenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN");
+
+    (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", "all-local", 1);
+    CHECK(ds4_test_q8_cache_compare(q_b, 64ull << 20,
+                                    out_b, 64ull << 20) > 0,
+          "all-local policy prioritizes complete T256 residency over tied T32");
+    CHECK(ds4_test_q8_cache_compare(out_b, 64ull << 20,
+                                    q_b, 64ull << 20) < 0,
+          "all-local T256 priority is antisymmetric");
+    (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
 }
 
 static void test_q8_cache_partner_mapping(void) {
@@ -210,6 +221,16 @@ static void test_q8_cache_partner_mapping(void) {
     const char *out_b = "blk.3.attn_output_b.weight";
     const char *shared = "blk.3.ffn_down_shexp.weight";
     const int physical[4] = {0, 3, 1, 2};
+
+    CHECK(ds4_test_q8_t256_placement_valid(NULL) == 1 &&
+          ds4_test_q8_t256_placement_valid("overflow") == 1 &&
+          ds4_test_q8_t256_placement_valid("all-local") == 1 &&
+          ds4_test_q8_t256_placement_valid("balanced") == 1 &&
+          ds4_test_q8_t256_placement_valid("all-partner") == 1,
+          "all declared T256 placement policies are accepted");
+    CHECK(ds4_test_q8_t256_placement_valid("local") == 0 &&
+          ds4_test_q8_t256_placement_valid("alternating") == 0,
+          "undeclared T256 placement policies are rejected");
 
     CHECK(physical[0] == 0 && physical[2] == 1,
           "production logical pair 0<->2 maps physical NVLink pair 0<->1");

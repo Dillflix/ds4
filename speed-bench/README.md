@@ -455,6 +455,90 @@ attempts to weaken the target or use fewer than three repeats. Return the genera
 check that `run-status.txt` says `state=finished`, `summary.md` says
 `Overall: **PASS**`, and `acceptance.json` has `"accepted": true`.
 
+### Native-Q8 versus complete T256-FP16 quality endpoint
+
+`cuda-q8-fp16-full-quality.sh` deliberately removes the intermediate 79/86
+quality arm. It scores only the two decision-relevant production endpoints:
+
+- every Q8 projection uses native Q8 because the complete FP16 expansion cache
+  is disabled; and
+- every active T256 output-B projection uses FP16/cuBLAS. The measured binding
+  inventory is 86/86: 79 device-local bindings plus seven bindings that reuse
+  the corresponding FP16 weights on the NVLink partner.
+
+The runner validates execution, not just requested policy. Across the 100-case
+suite the native endpoint must record exactly 4,300 native T256 calls. The
+FP16 endpoint must record exactly 3,600 local-FP16 plus 700 partner-FP16 calls,
+with no T256 native fallback. Only then does it report official-continuation
+NLL, first-token accuracy, greedy-prefix length, and API-reference metrics with
+a paired bootstrap interval. It never hashes the model and does not require a
+new quant.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-q8-fp16-full-quality.sh
+```
+
+Return `q8-fp16-full-quality-<timestamp>.tar.gz`. A valid archive has
+`Experiment integrity: PASS`; the quality gate is a measured result and may
+independently pass or fail.
+
+### T256 execution-placement A/B
+
+The 86 T256 binding records are two resident copies for each of 43 layers.
+Prefill gathers the two attention halves and executes one output-B GEMM per
+layer on the active/home path. Binding counts therefore do not establish where
+the 43 executed GEMMs ran.
+
+`cuda-q8-t256-placement-ab.sh` measures and verifies five policies:
+
+- `native`: zero T256 FP16 bindings and 43 native-Q8 layer paths; other Q8
+  cache classes remain enabled so this isolates T256;
+- `all-local`: 86 local plus zero partner bindings, with all 43 active GEMMs
+  local. T256 is ranked ahead of tied T32 entries so the complete class fits;
+- `balanced`: even layers execute locally and odd layers execute on their
+  partner: 22 local plus 21 partner active GEMMs. Its binding inventory is 65
+  local plus 21 partner, and each pipeline stage is balanced within its own
+  NVLink pair (11/11 for layers 0-21 and 11/10 for layers 22-42);
+- `overflow`: the measured 79 local plus seven partner bindings, producing 36
+  active local GEMMs and seven partner GEMMs; and
+- `all-partner`: 43 fixed duplicate bindings remain local while all 43 active
+  home bindings execute on the corresponding NVLink partner.
+
+Every run exports binding and runtime-audit tables. The summarizer rejects a
+run whose active layer paths do not match its policy and records all other
+binding shapes so cache entries displaced by `all-local` remain explicit.
+
+One-repeat screen:
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+REPEATS=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-q8-t256-placement-ab.sh
+```
+
+For the acceptance-quality result, rerun with `REPEATS=5`; the five rotations
+put every policy in every thermal/run-order slot. Return
+`q8-t256-placement-<timestamp>.tar.gz`.
+
 ### T256 arithmetic-source isolation
 
 `cuda-q8-partner-arithmetic-isolation.sh` explains a quality difference; it

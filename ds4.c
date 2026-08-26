@@ -3083,6 +3083,38 @@ static bool accelerator_q8_partner_arithmetic_valid(const char *value) {
            strcmp(value, "native-q8") == 0;
 }
 
+typedef enum {
+    ACCEL_Q8_T256_OVERFLOW = 0,
+    ACCEL_Q8_T256_ALL_LOCAL,
+    ACCEL_Q8_T256_BALANCED,
+    ACCEL_Q8_T256_ALL_PARTNER,
+    ACCEL_Q8_T256_INVALID,
+} accelerator_q8_t256_placement;
+
+static accelerator_q8_t256_placement accelerator_q8_t256_placement_mode(void) {
+    const char *value = getenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    if (!value || !value[0] || strcmp(value, "overflow") == 0)
+        return ACCEL_Q8_T256_OVERFLOW;
+    if (strcmp(value, "all-local") == 0)
+        return ACCEL_Q8_T256_ALL_LOCAL;
+    if (strcmp(value, "balanced") == 0)
+        return ACCEL_Q8_T256_BALANCED;
+    if (strcmp(value, "all-partner") == 0)
+        return ACCEL_Q8_T256_ALL_PARTNER;
+    return ACCEL_Q8_T256_INVALID;
+}
+
+static const char *accelerator_q8_t256_placement_name(
+        accelerator_q8_t256_placement mode) {
+    switch (mode) {
+    case ACCEL_Q8_T256_OVERFLOW:    return "overflow";
+    case ACCEL_Q8_T256_ALL_LOCAL:   return "all-local";
+    case ACCEL_Q8_T256_BALANCED:    return "balanced";
+    case ACCEL_Q8_T256_ALL_PARTNER: return "all-partner";
+    default:                        return "invalid";
+    }
+}
+
 static int accelerator_q8_cache_partner_tier(
         uint32_t path_class,
         bool cuda_tp_decode,
@@ -3104,6 +3136,20 @@ static int accelerator_q8_cache_partner_tier(
 static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     const accelerator_q8_cache_candidate *a = va;
     const accelerator_q8_cache_candidate *b = vb;
+    /* The controlled all-local and balanced experiments require their exact
+     * local T256 subsets to survive admission. Rank that class before equally
+     * valued T32 candidates so the result is not silently determined by
+     * enum/layer tie order. Any displaced classes remain visible in the
+     * exported binding table. */
+    const accelerator_q8_t256_placement t256_placement =
+        accelerator_q8_t256_placement_mode();
+    if (t256_placement == ACCEL_Q8_T256_ALL_LOCAL ||
+        t256_placement == ACCEL_Q8_T256_BALANCED) {
+        const int a_t256 = a->path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+        const int b_t256 = b->path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B;
+        if (a_t256 > b_t256) return -1;
+        if (a_t256 < b_t256) return 1;
+    }
     /* Sort descending by benefit / expanded-F16 byte without floating point. */
     const uint64_t lhs = (uint64_t)a->benefit_units * b->fp16_bytes;
     const uint64_t rhs = (uint64_t)b->benefit_units * a->fp16_bytes;
@@ -55892,6 +55938,15 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     }
     const char *partner_layers = partner_layers_env && partner_layers_env[0]
         ? partner_layers_env : "all";
+    const accelerator_q8_t256_placement t256_placement =
+        accelerator_q8_t256_placement_mode();
+    if (t256_placement == ACCEL_Q8_T256_INVALID) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_T256_PLACEMENT='%s'; expected "
+                "overflow, all-local, balanced, or all-partner\n",
+                getenv("DS4_CUDA_Q8_T256_PLACEMENT"));
+        return -1;
+    }
     const bool freeze_home_plan =
         getenv("DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN") != NULL;
     if (strcmp(partner_arithmetic, "f16") != 0 &&
@@ -55964,8 +56019,35 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                 implicit_default_qualified,
                 getenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD") != NULL)
             : -1;
-        const int fallback_device = fallback_tier >= 0
+        int fallback_device = fallback_tier >= 0
             ? g_gpu[fallback_tier].device_id : -1;
+        if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
+            t256_placement == ACCEL_Q8_T256_ALL_LOCAL) {
+            fallback_device = -1;
+        }
+        if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
+            t256_placement == ACCEL_Q8_T256_BALANCED &&
+            (layer & 1u) == 0u) {
+            /* Even layers are the 22 active-local half. Odd layers retain a
+             * validated partner fallback and are forced there by CUDA plan
+             * materialization. This yields 11/11 within the 22-layer stage
+             * and 11/10 within the 21-layer stage, rather than assigning one
+             * whole pipeline stage to each policy. */
+            fallback_device = -1;
+        }
+        if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B &&
+            (t256_placement == ACCEL_Q8_T256_ALL_PARTNER ||
+             (t256_placement == ACCEL_Q8_T256_BALANCED &&
+              (layer & 1u) != 0u)) &&
+            fallback_device < 0) {
+            free(plan);
+            fprintf(stderr,
+                    "ds4: T256 %s placement requires a validated "
+                    "partner for layer %u (set partner-classes=t256 and keep "
+                    "bidirectional peer access enabled)\n",
+                    accelerator_q8_t256_placement_name(t256_placement), layer);
+            return -1;
+        }
         const uint64_t row_bytes = ((t->dim[0] + 31u) / 32u) * 34u;
         bool ok = true;
 
@@ -56039,7 +56121,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
             "other=%llu partner-fallback=%llu partner-classes=%s "
             "partner-layers=%s "
-            "home-order=%s partner-arithmetic=%s\n",
+            "home-order=%s partner-arithmetic=%s t256-placement=%s\n",
             (unsigned long long)plan_count,
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T32_Q_B],
             (unsigned long long)class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
@@ -56051,7 +56133,8 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             partner_classes,
             partner_layers,
             freeze_home_plan ? "frozen" : "partner-priority",
-            partner_arithmetic);
+            partner_arithmetic,
+            accelerator_q8_t256_placement_name(t256_placement));
 
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {
@@ -56557,6 +56640,22 @@ int ds4_test_q8_cache_compare_fallback(
     a.fallback_physical_device = fallback_a;
     b.fallback_physical_device = fallback_b;
     return accelerator_q8_cache_candidate_cmp(&a, &b);
+}
+
+int ds4_test_q8_t256_placement_valid(const char *value) {
+    const char *old = getenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    char *saved = old ? strdup(old) : NULL;
+    if (value) (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", value, 1);
+    else (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    const int valid = accelerator_q8_t256_placement_mode() !=
+        ACCEL_Q8_T256_INVALID;
+    if (saved) {
+        (void)setenv("DS4_CUDA_Q8_T256_PLACEMENT", saved, 1);
+        free(saved);
+    } else {
+        (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    }
+    return valid;
 }
 
 int ds4_test_q8_cache_partner_tier(

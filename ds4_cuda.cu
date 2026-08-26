@@ -1471,8 +1471,11 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (g_q8_f16_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
-    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
     if (!label) return 0;
+    if ((strstr(label, "attn_output_b") != NULL ||
+         strstr(label, "attention_output_b") != NULL) &&
+        getenv("DS4_CUDA_NO_T256_F16_CACHE") != NULL) return 0;
+    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
         strstr(label, "attention_output_a") != NULL ||
@@ -1669,6 +1672,10 @@ static const __half *cuda_q8_f16_ptr_impl(
         else if (g_q8_cache_suppressed) reason = "pipeline_suppressed";
         else if (g_q8_f16_disabled_after_oom) reason = "disabled_after_failure";
         else if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) reason = "disabled_by_env";
+        else if (getenv("DS4_CUDA_NO_T256_F16_CACHE") != NULL && label &&
+                 (strstr(label, "attn_output_b") != NULL ||
+                  strstr(label, "attention_output_b") != NULL))
+            reason = "disabled_t256_by_env";
         else if (cuda_q8_f16_cache_limit_bytes() == 0u) reason = "zero_limit";
         if (fill_status) *fill_status = CUDA_Q8_F16_FILL_SKIPPED;
         return audit_return(NULL, "native_q8", reason);
@@ -1869,6 +1876,13 @@ static uint64_t cuda_q8_f16_partner_scratch_token_cap(void) {
     return (uint64_t)value;
 }
 
+static uint32_t cuda_q8_plan_label_layer(const char *label) {
+    unsigned layer = UINT_MAX;
+    if (!label || sscanf(label, "tensor:blk.%u.", &layer) != 1 ||
+        layer >= 43u) return UINT_MAX;
+    return (uint32_t)layer;
+}
+
 static int cuda_q8_f16_partner_scratch_sizes(
         const cuda_q8_f16_plan_candidate &c,
         uint64_t tokens,
@@ -1990,8 +2004,28 @@ static void cuda_q8_f16_plan_materialize(void) {
      * the intended device.  Only phase two consumes otherwise-unused partner
      * headroom; an early home miss must not steal memory from a later fixed TP
      * candidate whose primary device happens to be that partner. */
+    const char *t256_placement_env =
+        getenv("DS4_CUDA_Q8_T256_PLACEMENT");
+    const bool force_all_t256_partner = t256_placement_env &&
+        strcmp(t256_placement_env, "all-partner") == 0;
+    const bool force_balanced_t256_partner = t256_placement_env &&
+        strcmp(t256_placement_env, "balanced") == 0;
     for (size_t i = 0; !plan_failed && i < g_q8_f16_plan.size(); i++) {
         const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
+        /* A T256 tensor has one active home-consumer candidate and one fixed
+         * duplicate on the other member of its NVLink pair. In all-partner
+         * mode, skip only the active candidate's local allocation and send it
+         * directly to phase two. The fixed duplicate remains local and can be
+         * reused as the partner-resident F16 weight. */
+        const uint32_t t256_layer = cuda_q8_plan_label_layer(c.label);
+        if ((force_all_t256_partner ||
+             (force_balanced_t256_partner &&
+              t256_layer != UINT_MAX && (t256_layer & 1u) != 0u)) &&
+            c.fallback_physical_device >= 0 &&
+            strstr(c.label, ".attn_output_b.weight") != NULL) {
+            pending_fallback.push_back(i);
+            continue;
+        }
         plan_err = cudaSetDevice(c.physical_device);
         if (plan_err != cudaSuccess) {
             fprintf(stderr,
