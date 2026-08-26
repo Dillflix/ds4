@@ -139,6 +139,20 @@ def main() -> int:
         )
         assert math.isclose(actual, expected_gpu_factor, rel_tol=1e-6)
         assert "late_stage_over_early_stage_factor=" in analysis
+
+        # A bounded production profile may intentionally collect one trace to
+        # avoid loading a 153 GiB NFS-backed model twice.  The same attribution
+        # outputs must remain available without inventing 2x2 factors.
+        (out / "trace-map.tsv").write_text(
+            "label\tdevices\tsqlite\n"
+            f"current\t0,3,1,2\t{current}\n",
+            encoding="utf-8",
+        )
+        subprocess.run([sys.executable, str(SUMMARIZER), str(out)], check=True)
+        single = (out / "analysis.txt").read_text(encoding="utf-8")
+        assert "single_trace=true" in single
+        assert "pair_attribution=not_requested" in single
+        assert "physical_gpu3_over_gpu0_factor=" not in single
     print("critical-path summarizer synthetic 2x2 test: OK")
     return 0
 

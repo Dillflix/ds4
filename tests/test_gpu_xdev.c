@@ -16,6 +16,7 @@
 #include "ds4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1872,7 +1873,9 @@ static int run_q8_partner_projection_case(
         const char *case_name,
         const char *tensor_name,
         uint64_t in_dim,
-        uint64_t out_dim) {
+        uint64_t out_dim,
+        uint64_t n_tok,
+        int profile_capture) {
     const uint64_t fp16_bytes = in_dim * out_dim * sizeof(uint16_t);
     char cache_mib[32];
     snprintf(cache_mib, sizeof(cache_mib), "%llu",
@@ -1902,7 +1905,7 @@ static int run_q8_partner_projection_case(
         return 0;
     }
 
-    const uint64_t n_tok = 17u;
+    CHECK(n_tok > 1u, "q8 partner token count");
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t weight_bytes = out_dim * blocks * 34u;
     const uint64_t model_size = 2u * weight_bytes;
@@ -1968,10 +1971,22 @@ static int run_q8_partner_projection_case(
     CHECK(ds4_gpu_matmul_q8_0_tensor(
               &local, model, model_size, 0u, in_dim, out_dim, &input, n_tok),
           "q8 partner local projection");
-    CHECK(ds4_gpu_matmul_q8_0_tensor(
-              &partner, model, model_size, weight_bytes,
-              in_dim, out_dim, &input, n_tok),
-          "q8 partner remote projection");
+    if (profile_capture) {
+        CHECK(cudaDeviceSynchronize() == cudaSuccess,
+              "q8 partner profile pre-synchronize");
+        CHECK(cudaProfilerStart() == cudaSuccess,
+              "q8 partner profiler start");
+    }
+    const int partner_ok = ds4_gpu_matmul_q8_0_tensor(
+        &partner, model, model_size, weight_bytes,
+        in_dim, out_dim, &input, n_tok);
+    if (profile_capture) {
+        CHECK(cudaDeviceSynchronize() == cudaSuccess,
+              "q8 partner profile synchronize");
+        CHECK(cudaProfilerStop() == cudaSuccess,
+              "q8 partner profiler stop");
+    }
+    CHECK(partner_ok, "q8 partner remote projection");
     CHECK(ds4_gpu_tensor_read(
               &local, 0, host_local, output_count * sizeof(float)) &&
           ds4_gpu_tensor_read(
@@ -2176,11 +2191,14 @@ static int run_q8_partner_projection(void) {
     if (dev_count < 2) return 0;
 
     if (run_q8_partner_projection_case(
-            "T32", "tensor:blk.1.attn_q_b.weight", 1024u, 32768u)) return 1;
+            "T32", "tensor:blk.1.attn_q_b.weight",
+            1024u, 32768u, 17u, 0)) return 1;
     if (run_q8_partner_projection_case(
-            "T256", "tensor:blk.1.attn_output_b.weight", 8192u, 4096u)) return 1;
+            "T256", "tensor:blk.1.attn_output_b.weight",
+            8192u, 4096u, 17u, 0)) return 1;
     if (run_q8_partner_projection_case(
-            "shared-down", "tensor:blk.1.ffn_down_shexp.weight", 2048u, 4096u)) return 1;
+            "shared-down", "tensor:blk.1.ffn_down_shexp.weight",
+            2048u, 4096u, 17u, 0)) return 1;
     fprintf(stderr, "  q8 partner projection exactness OK (3 classes)\n");
     return 0;
 }
@@ -2327,10 +2345,32 @@ static int run_q8_native_partner_projection(void) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
     fprintf(stderr, "test_gpu_xdev: %d CUDA devices visible\n", dev_count);
+
+    if (argc == 2 && strcmp(argv[1], "q8-partner-t256-profile") == 0) {
+        if (dev_count < 2) {
+            fprintf(stderr,
+                    "error: q8-partner-t256-profile requires two visible GPUs\n");
+            return 2;
+        }
+        fprintf(stdout,
+                "scenario=q8-partner-t256-profile\n"
+                "profile_kind=partner_f16_cublas\n"
+                "profile_tokens=512\n");
+        const int rc = run_q8_partner_projection_case(
+            "T256-profile", "tensor:blk.1.attn_output_b.weight",
+            8192u, 4096u, 512u, 1);
+        if (rc == 0) fprintf(stdout, "harness_status=ok\n");
+        return rc;
+    }
+    if (argc != 1) {
+        fprintf(stderr,
+                "Usage: %s [q8-partner-t256-profile]\n", argv[0]);
+        return 2;
+    }
 
     /* N=1 same-device path. */
     if (run_one(1, 0)) return 1;

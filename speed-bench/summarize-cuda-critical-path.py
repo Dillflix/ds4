@@ -203,8 +203,8 @@ def read_trace_map(path: Path):
             if len(devices) != 4:
                 raise RuntimeError(f"{row['label']} must specify four devices")
             traces.append((row["label"], Path(row["sqlite"]), devices))
-    if len(traces) != 2:
-        raise RuntimeError("trace-map.tsv must contain exactly two traces")
+    if len(traces) not in (1, 2):
+        raise RuntimeError("trace-map.tsv must contain one or two traces")
     return traces
 
 
@@ -489,9 +489,10 @@ def main() -> int:
         harness_rows,
     )
 
-    # The two maps form a 2x2 experiment: each stage runs once on GPU 0 and
-    # once on GPU 3.  Per-layer home-kernel time removes the 22/21 layer-count
-    # difference before separating physical-GPU and stage effects.
+    # Two maps form the original 2x2 experiment: each stage runs once on GPU 0
+    # and once on GPU 3.  A single map is also useful for a bounded production
+    # critical-path profile where reloading a very large NFS-backed model just
+    # to swap stages would dominate collection time.
     values: dict[tuple[int, int], float] = {}
     for row in stage_rows:
         if row["role"] == "home" and row["device"] in (0, 3):
@@ -510,23 +511,29 @@ def main() -> int:
         )
 
     with (output_dir / "analysis.txt").open("w", encoding="utf-8") as handle:
-        handle.write("DS4 SM75 critical-path / pair-attribution audit\n\n")
+        handle.write("DS4 SM75 critical-path audit\n\n")
         for row in trace_rows:
             handle.write(
                 f"{row['trace']}: devices={row['devices']} "
                 f"pipeline_gpu_span={row['pipeline_gpu_span_ms']:.3f} ms "
                 f"annotated_kernel={row['annotated_kernel_ms']:.3f} ms\n"
             )
-        handle.write("\nPer-layer home-kernel 2x2 cells (ms):\n")
-        for stage in (0, 1):
+        if len(traces) == 2:
+            handle.write("\nPer-layer home-kernel 2x2 cells (ms):\n")
+            for stage in (0, 1):
+                handle.write(
+                    f"  stage {stage}: gpu0={values.get((stage, 0), 0.0):.6f} "
+                    f"gpu3={values.get((stage, 3), 0.0):.6f}\n"
+                )
             handle.write(
-                f"  stage {stage}: gpu0={values.get((stage, 0), 0.0):.6f} "
-                f"gpu3={values.get((stage, 3), 0.0):.6f}\n"
+                f"\nphysical_gpu3_over_gpu0_factor={gpu_factor:.6f}\n"
+                f"late_stage_over_early_stage_factor={stage_factor:.6f}\n"
             )
-        handle.write(
-            f"\nphysical_gpu3_over_gpu0_factor={gpu_factor:.6f}\n"
-            f"late_stage_over_early_stage_factor={stage_factor:.6f}\n"
-        )
+        else:
+            handle.write(
+                "\nsingle_trace=true\n"
+                "pair_attribution=not_requested\n"
+            )
         if harness_rows:
             handle.write("\nSame-work harness medians:\n")
             for row in harness_rows:
@@ -535,12 +542,19 @@ def main() -> int:
                     f"gpu3={row['gpu3_median_ms']:.6f} ms "
                     f"ratio={row['gpu3_over_gpu0']:.6f}\n"
                 )
-        handle.write(
-            "\nInterpretation boundary: the 2x2 factors describe attributed GPU "
-            "work, not end-to-end speedup. Use trace-summary.csv for pipeline "
-            "span and same-work-gpu-summary.csv to confirm or reject a physical "
-            "GPU/clock explanation.\n"
-        )
+        if len(traces) == 2:
+            handle.write(
+                "\nInterpretation boundary: the 2x2 factors describe attributed "
+                "GPU work, not end-to-end speedup. Use trace-summary.csv for "
+                "pipeline span and same-work-gpu-summary.csv to confirm or "
+                "reject a physical GPU/clock explanation.\n"
+            )
+        else:
+            handle.write(
+                "\nInterpretation boundary: this is one bounded production "
+                "trace. It attributes the captured critical path but does not "
+                "separate physical-GPU and layer-range effects.\n"
+            )
     print((output_dir / "analysis.txt").read_text(encoding="utf-8"), end="")
     return 0
 
