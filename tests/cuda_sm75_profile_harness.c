@@ -26,6 +26,8 @@ typedef enum {
     SCENARIO_Q8_ATTN,
     SCENARIO_Q8_SHARED,
     SCENARIO_Q8_OUT_B,
+    SCENARIO_ATTN_INDEXED_32K,
+    SCENARIO_ATTN_MIXED_32K,
 } scenario_kind;
 
 typedef enum {
@@ -180,6 +182,14 @@ static const scenario_spec scenarios[] = {
         "q8-out-b", SCENARIO_Q8_OUT_B, 9u,
         0u, 0u, 0u, 8192u, 4096u, NULL,
     },
+    {
+        "attn-indexed-32k", SCENARIO_ATTN_INDEXED_32K, 27u,
+        0u, 0u, 0u, 512u, 64u, NULL,
+    },
+    {
+        "attn-mixed-32k", SCENARIO_ATTN_MIXED_32K, 27u,
+        0u, 0u, 0u, 512u, 64u, NULL,
+    },
 };
 
 /* The host mapping must outlive ds4_gpu_cleanup even when a requested device
@@ -191,7 +201,8 @@ static void usage(const char *argv0) {
             "Usage: %s q4-early|q4-late|native-q4-early|native-q4-late|"
             "q2-early|q2-late|hybrid-iq2-q4-early|"
             "hybrid-iq2-q4-late|"
-            "q8-q-b|q8-attn|q8-shared|q8-out-b\n"
+            "q8-q-b|q8-attn|q8-shared|q8-out-b|"
+            "attn-indexed-32k|attn-mixed-32k\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
@@ -200,7 +211,11 @@ static void usage(const char *argv0) {
             "iq2-tile16, or iq2-tile8 to hold the production path fixed.\n"
             "DS4_PROFILE_SCALAR=1 selects its scalar candidate; 0 selects\n"
             "the array baseline. DS4_PROFILE_REPEATS times additional calls\n"
-            "after correctness/audit warmup (default 0, maximum 100).\n",
+            "after correctness/audit warmup (default 0, maximum 100).\n"
+            "DS4_PROFILE_IQ2_WIDE512=1 selects the experimental 512-thread\n"
+            "IQ2 tile16/tile8 CTA. DS4_PROFILE_IQ2_TAIL8_ALL=1 replaces\n"
+            "IQ2 residual 1..4 tail4 work with the exact tile8 path while\n"
+            "leaving native-Q4 down's 16/8/4 plan unchanged.\n",
             argv0);
 }
 
@@ -611,6 +626,7 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
     int32_t *selected_host = (int32_t *)malloc((size_t)pair_count * sizeof(int32_t));
     float *weights_host = (float *)malloc((size_t)pair_count * sizeof(float));
     float *out_host = (float *)malloc((size_t)out_count * sizeof(float));
+    float *mid_candidate = NULL, *mid_reference = NULL;
     ds4_gpu_tensor *x = NULL, *selected = NULL, *weights = NULL;
     ds4_gpu_tensor *out = NULL, *gate = NULL, *up = NULL, *mid = NULL, *down = NULL;
     int ok = 0;
@@ -628,6 +644,21 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
     if (!model || !x_host || !selected_host || !weights_host || !out_host) {
         fprintf(stderr, "error: host allocation failed for routed-MoE harness\n");
         goto cleanup;
+    }
+    /* Make the candidate comparison exercise nonzero IQ2 arithmetic. IQ2_XXS
+     * stores its fp16 scale first; 0x3c00 is exactly 1.0. The code/sign bytes
+     * remain a valid deterministic zero-code stream. Down remains zero so the
+     * final-output oracle stays simple and independent of native-Q4 packing. */
+    if (gate_iq2) {
+        const uint64_t resident_gate_bytes =
+            gate_expert_bytes * resident_experts;
+        for (uint64_t off = 0; off < resident_gate_bytes;
+             off += gate_block_bytes) {
+            model[gate_offset + off] = 0x00u;
+            model[gate_offset + off + 1u] = 0x3cu;
+            model[up_offset + off] = 0x00u;
+            model[up_offset + off + 1u] = 0x3cu;
+        }
     }
     for (uint64_t i = 0; i < x_count; i++) {
         const int value = (int)((i * 23u + (i >> 5u) * 17u) % 257u) - 128;
@@ -695,6 +726,58 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
         !verify_tile_audit(audit_path, spec, native_q4)) {
         goto cleanup;
     }
+    const char *wide_env = getenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75");
+    const char *tail_env = getenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
+    const int restore_wide = wide_env && strcmp(wide_env, "1") == 0;
+    const int restore_tail = tail_env && strcmp(tail_env, "1") == 0;
+    if (gate_iq2 && (restore_wide || restore_tail)) {
+        mid_candidate = (float *)malloc((size_t)mid_count * sizeof(float));
+        mid_reference = (float *)malloc((size_t)mid_count * sizeof(float));
+        if (!mid_candidate || !mid_reference ||
+            !ds4_gpu_tensor_read(mid, 0, mid_candidate,
+                                 mid_count * sizeof(float))) {
+            fprintf(stderr, "error: IQ2 candidate readback failed\n");
+            goto cleanup;
+        }
+        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75", "0", 1);
+        (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", "0", 1);
+        if (!ds4_gpu_routed_moe_batch_owned_tensor(
+                out, gate, up, mid, down, model, model_bytes,
+                gate_offset, up_offset, down_offset, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                in_dim, mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert,
+                0u, resident_experts, 10.0f, x,
+                spec->layer, n_tokens, 0u, &mid_is_f16) ||
+            mid_is_f16 || !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(mid, 0, mid_reference,
+                                 mid_count * sizeof(float))) {
+            fprintf(stderr, "error: IQ2 baseline comparison launch failed\n");
+            goto cleanup;
+        }
+        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75",
+                     restore_wide ? "1" : "0", 1);
+        (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75",
+                     restore_tail ? "1" : "0", 1);
+        if (memcmp(mid_candidate, mid_reference,
+                   (size_t)mid_count * sizeof(float)) != 0) {
+            uint64_t mismatch = 0u;
+            while (mismatch < mid_count &&
+                   memcmp(&mid_candidate[mismatch], &mid_reference[mismatch],
+                          sizeof(float)) == 0) mismatch++;
+            fprintf(stderr,
+                    "error: IQ2 candidate differs from 256-thread/tail4 "
+                    "baseline at value %llu (%g versus %g)\n",
+                    (unsigned long long)mismatch,
+                    mismatch < mid_count ? mid_candidate[mismatch] : 0.0f,
+                    mismatch < mid_count ? mid_reference[mismatch] : 0.0f);
+            goto cleanup;
+        }
+        printf("iq2_candidate_reference_values=%llu\n"
+               "iq2_candidate_reference_validation=bit-exact\n",
+               (unsigned long long)mid_count);
+    }
     if (!ds4_gpu_tensor_read(out, 0, out_host, out_count * sizeof(float)) ||
         !verify_zero_f32(out_host, out_count, spec->name)) {
         goto cleanup;
@@ -746,6 +829,8 @@ cleanup:
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(x);
     free(out_host);
+    free(mid_reference);
+    free(mid_candidate);
     free(weights_host);
     free(selected_host);
     free(x_host);
@@ -849,6 +934,138 @@ cleanup:
     return ok;
 }
 
+static int run_attention_32k(const scenario_spec *spec,
+                             uint32_t timed_repeats) {
+    const uint32_t n_tokens = 512u;
+    const uint32_t pos0 = 31744u;
+    const uint32_t n_raw = 2304u;
+    const uint32_t raw_cap = 2304u;
+    const uint32_t raw_start = 0u;
+    const uint32_t n_comp = 7936u;
+    const uint32_t top_k = 512u;
+    const uint32_t window = 2048u;
+    const uint32_t ratio = 4u;
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 512u;
+    const uint64_t q_count =
+        (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t heads_count = q_count;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t topk_count = (uint64_t)n_tokens * top_k;
+    const uint64_t model_bytes = n_head * sizeof(float);
+    const uint64_t tensor_bytes =
+        (q_count + heads_count + raw_count + comp_count) * sizeof(float) +
+        topk_count * sizeof(int32_t);
+    const uint64_t predicted =
+        model_bytes + tensor_bytes + PROFILE_SAFETY_RESERVE;
+    const int indexed = spec->kind == SCENARIO_ATTN_INDEXED_32K;
+    printf("scenario=%s\nprofile_kind=attention_sm75_32k\n"
+           "attention_path=%s\nn_tokens=%u\npos0=%u\nn_raw=%u\n"
+           "raw_cap=%u\nraw_start=%u\nn_comp=%u\ntop_k=%u\n"
+           "window=%u\nratio=%u\nn_head=%u\nhead_dim=%u\n"
+           "model_bytes=%llu\ntensor_bytes=%llu\n"
+           "predicted_device_bytes=%llu\ndevice_limit_bytes=%llu\n",
+           spec->name, indexed ? "indexed-topk" : "mixed-online",
+           n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+           window, ratio, n_head, head_dim,
+           (unsigned long long)model_bytes,
+           (unsigned long long)tensor_bytes,
+           (unsigned long long)predicted,
+           (unsigned long long)PROFILE_DEVICE_LIMIT);
+    if (predicted > PROFILE_DEVICE_LIMIT) {
+        fprintf(stderr,
+                "error: predicted attention state exceeds the 3 GiB ceiling\n");
+        return 0;
+    }
+
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_bytes);
+    int32_t *topk_host = indexed
+        ? (int32_t *)malloc((size_t)topk_count * sizeof(int32_t)) : NULL;
+    float *heads_host = (float *)malloc((size_t)heads_count * sizeof(float));
+    ds4_gpu_tensor *q = NULL, *heads = NULL, *raw = NULL, *comp = NULL;
+    ds4_gpu_tensor *topk = NULL;
+    int ok = 0;
+    model_storage = model;
+    if (!model || (indexed && !topk_host) || !heads_host) {
+        fprintf(stderr, "error: host attention allocation failed\n");
+        goto cleanup;
+    }
+    if (indexed) {
+        for (uint64_t i = 0; i < topk_count; i++)
+            topk_host[i] = (int32_t)(i % n_comp);
+    }
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    heads = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    if (indexed) topk = ds4_gpu_tensor_alloc(topk_count * sizeof(int32_t));
+    if (!q || !heads || !raw || !comp || (indexed && !topk) ||
+        !ds4_gpu_tensor_fill_f32(q, 0.0f, q_count) ||
+        !ds4_gpu_tensor_fill_f32(raw, 0.0f, raw_count) ||
+        !ds4_gpu_tensor_fill_f32(comp, 0.0f, comp_count) ||
+        (indexed && !ds4_gpu_tensor_write(
+            topk, 0, topk_host, topk_count * sizeof(int32_t)))) {
+        fprintf(stderr, "error: attention device allocation/input failed\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_set_model_map(model, model_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: attention model setup failed\n");
+        goto cleanup;
+    }
+#define DS4_RUN_ATTN_32K() \
+    (indexed ? \
+        ds4_gpu_attention_indexed_mixed_batch_heads_tensor( \
+            heads, model, model_bytes, 0u, q, raw, comp, 0u, topk, \
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, \
+            window, ratio, n_head, head_dim) : \
+        ds4_gpu_attention_decode_mixed_batch_heads_tensor( \
+            heads, model, model_bytes, 0u, q, raw, comp, 0u, NULL, 0u, \
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, \
+            ratio, n_head, head_dim))
+    if (!DS4_RUN_ATTN_32K() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            heads, 0, heads_host, heads_count * sizeof(float)) ||
+        !verify_zero_f32(heads_host, heads_count, spec->name)) {
+        fprintf(stderr, "error: attention production kernel validation failed\n");
+        goto cleanup;
+    }
+    printf("output_values_checked=%llu\noutput_validation=exact-zero\n",
+           (unsigned long long)heads_count);
+    if (timed_repeats > 0u) {
+        const double start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (!DS4_RUN_ATTN_32K()) {
+                fprintf(stderr, "error: attention timed launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: attention timed synchronization failed\n");
+            goto cleanup;
+        }
+        const double elapsed_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        printf("timed_repeats=%u\ntimed_total_ms=%.6f\n"
+               "timed_per_call_ms=%.6f\n",
+               timed_repeats, elapsed_ms,
+               elapsed_ms / (double)timed_repeats);
+    }
+    ok = 1;
+#undef DS4_RUN_ATTN_32K
+
+cleanup:
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(q);
+    free(heads_host);
+    free(topk_host);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         usage(argv[0]);
@@ -869,6 +1086,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     uint32_t scalar_enabled = 0u, timed_repeats = 0u;
+    uint32_t iq2_wide512 = 0u, iq2_tail8_all = 0u;
     if (!parse_env_u32("DS4_PROFILE_SCALAR", 0u, 1u, &scalar_enabled)) {
         fprintf(stderr, "error: DS4_PROFILE_SCALAR must be 0 or 1\n");
         return 2;
@@ -877,6 +1095,15 @@ int main(int argc, char **argv) {
                        &timed_repeats)) {
         fprintf(stderr,
                 "error: DS4_PROFILE_REPEATS must be an integer from 0 to 100\n");
+        return 2;
+    }
+    if (!parse_env_u32("DS4_PROFILE_IQ2_WIDE512", 0u, 1u,
+                       &iq2_wide512) ||
+        !parse_env_u32("DS4_PROFILE_IQ2_TAIL8_ALL", 0u, 1u,
+                       &iq2_tail8_all)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_IQ2_WIDE512 and "
+                "DS4_PROFILE_IQ2_TAIL8_ALL must be 0 or 1\n");
         return 2;
     }
     if (scalar_enabled && scalar_target == SCALAR_TARGET_NONE) {
@@ -905,6 +1132,12 @@ int main(int argc, char **argv) {
                 scalar_target_name(scalar_target), spec->name);
         return 2;
     }
+    if ((iq2_wide512 || iq2_tail8_all) && !hybrid_iq2_q4_moe) {
+        fprintf(stderr,
+                "error: IQ2 wide/tail candidates require a "
+                "hybrid-iq2-q4 scenario\n");
+        return 2;
+    }
 
     /* Presence-based production switches are normalized inside the harness so
      * an inherited debug shell cannot silently select a different kernel. */
@@ -927,6 +1160,8 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_NO_IQ2_MMA_TILE16_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE6_SM75");
     (void)unsetenv("DS4_CUDA_MOE_IQ2_STAGE4_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
     (void)unsetenv("DS4_CUDA_MOE_Q2_DOWN_MMA_SM75");
     (void)unsetenv("DS4_CUDA_MOE_MIXED_TAIL_TILES");
     (void)unsetenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES");
@@ -954,6 +1189,10 @@ int main(int argc, char **argv) {
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
+    if (iq2_wide512)
+        (void)setenv("DS4_CUDA_MOE_IQ2_WIDE512_SM75", "1", 1);
+    if (iq2_tail8_all)
+        (void)setenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", "1", 1);
     switch (scalar_target) {
         case SCALAR_TARGET_Q4_GATE:
             if (scalar_enabled)
@@ -975,8 +1214,10 @@ int main(int argc, char **argv) {
         case SCALAR_TARGET_NONE:
             break;
     }
-    printf("scalar_target=%s\nscalar_enabled=%u\ntimed_repeats=%u\n",
-           scalar_target_name(scalar_target), scalar_enabled, timed_repeats);
+    printf("scalar_target=%s\nscalar_enabled=%u\n"
+           "iq2_wide512=%u\niq2_tail8_all=%u\ntimed_repeats=%u\n",
+           scalar_target_name(scalar_target), scalar_enabled,
+           iq2_wide512, iq2_tail8_all, timed_repeats);
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");
@@ -993,11 +1234,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const int attention_32k =
+        spec->kind == SCENARIO_ATTN_INDEXED_32K ||
+        spec->kind == SCENARIO_ATTN_MIXED_32K;
     const int ok = q4_moe ?
         run_moe(spec, 0, 0, native_q4_moe, timed_repeats) :
         (q2_moe ? run_moe(spec, 1, 1, 0, timed_repeats) :
          (hybrid_iq2_q4_moe ? run_moe(spec, 1, 0, 1, timed_repeats) :
-                              run_q8(spec, timed_repeats)));
+          (attention_32k ? run_attention_32k(spec, timed_repeats) :
+                           run_q8(spec, timed_repeats))));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;

@@ -287,8 +287,9 @@ def main() -> int:
         )
         handle.write(
             "\nNsight Compute reports in `ncu/` provide occupancy, compute, "
-            "memory, and warp-stall evidence for representative early/late "
-            "native-Q4 calls and the production-shaped partner T256 cuBLAS call.\n"
+            "memory, and warp-stall evidence for the requested bounded "
+            "kernel set (full routed/dense coverage or targeted 32K "
+            "attention).\n"
         )
     print((output / "summary.md").read_text(encoding="utf-8"), end="")
     return 0

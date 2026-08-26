@@ -1403,15 +1403,12 @@ per-function tables together with the production dispatch matrix.
 ### SM75 prefill critical-path and pair attribution
 
 `cuda-sm75-critical-path-audit.sh` is the bounded follow-up to the T256
-partner-policy screen. The production baseline defaults to the tagged
-SM75-native full-Q4 model at
-`/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf`;
-an ordinary Q4 file is rejected unless `ALLOW_STANDARD_MODEL=1` is explicit.
-It does not repeat a throughput A/B. It records two
-2048-token Nsight Systems traces with the fixed 22/21 split: `0,3,1,2` and the
+partner-policy screen. It requires the tagged mixed-Q4/IQ2 model and its
+production 256K allocation. It does not repeat a throughput A/B. It records
+two 8192-token Nsight Systems traces with the fixed 22/21 split: `0,3,1,2` and the
 pair-preserving swap `3,0,2,1`. Thus each layer stage runs once on physical GPU
 0 and once on physical GPU 3 while each home GPU retains its direct NVLink
-partner. The same production-shaped Q4 and dense-Q8 harness work is also timed
+partner. The same production-shaped hybrid IQ2/Q4 routed work is also timed
 on GPUs 0 and 3, with alternating order, to separate hardware/clock behavior
 from layer-range behavior.
 
@@ -1427,10 +1424,11 @@ and same-work GPU medians. Model hashing remains disabled.
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-unset MODEL ALLOW_STANDARD_MODEL RESUME_DIR
-export NATIVE_MODEL="/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf"
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
+PROFILE_TOKENS=8192 \
+CTX_ALLOC=262273 \
 SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-critical-path-audit.sh
 ```
@@ -1439,14 +1437,11 @@ Return `sm75-critical-path-<timestamp>.tar.gz`. The archive is also produced
 on interruption or failure and includes both `.nsys-rep` files, SQLite
 exports, 100-ms GPU clock/power telemetry, harness logs, and derived CSVs.
 
-If the historical standard-layout run from commit `ab54701` failed in
-`same-work-harness` because a dense-Q8
-scenario lacked `timed_per_call_ms`, reuse the completed Nsight Systems traces
-instead of capturing them again:
+If a run fails in `same-work-harness`, reuse the completed Nsight Systems
+traces instead of loading the model again:
 
 ```bash
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-export ALLOW_STANDARD_MODEL=1
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export RESUME_DIR="$PWD/sm75-critical-path-20260805T071911Z"
 
@@ -1458,6 +1453,38 @@ Resume mode validates the model, layouts, split, failed phase, reports,
 SQLite exports, and telemetry before rerunning only the bounded same-work
 harness and summarizer. It preserves the failed run's provenance and writes a
 separate `.resume-<timestamp>.tar.gz` archive.
+
+### SM75 IQ2 wide-CTA and tail-policy A/B
+
+`cuda-sm75-iq2-next-ab.sh` keeps two hypotheses independent. Its bounded
+harness compares the shipping 256-thread IQ2 tile16/tile8 kernels with a
+512-thread CTA that doubles resident warps without changing compact IQ2
+weights or arithmetic. Each candidate call is compared bit-for-bit against
+the 256-thread control on nonzero IQ2 gate/up data. A separate alternating
+four-GPU A/B compares the current IQ2 tail4 path with one IQ2 MMA tile8 for
+every residual of 1--8 pairs; native-Q4 down retains its existing 16/8/4
+planner in both variants. Optional Nsight Compute captures validate the
+512-thread launch and report its occupancy, compute/memory traffic, and stalls.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+CTX_START=2048 \
+CTX_MAX=8192 \
+CTX_ALLOC=262273 \
+REPEATS=3 \
+PROFILE_GPU=0 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-iq2-next-ab.sh
+```
 
 ### Mixed-Q4/IQ2 and balanced-T256 production profile
 
@@ -1480,6 +1507,9 @@ activation conversion, both NVLink copies, and partner cuBLAS through existing
 NVTX correlation ranges. A 200 ms `nvidia-smi` stream records utilization,
 power, clocks, temperature, and memory while a device-buffer tile audit records
 real pair/tile/padding/ownership counts with one final host copy.
+At `PROFILE_TOKENS=32768`, targeted Nsight Compute is enabled automatically
+for production-kernel harnesses representing late-frontier indexed top-K and
+mixed online attention calls; set `RUN_ATTENTION_NCU=0` only to omit them.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1495,6 +1525,20 @@ PROFILE_TOKENS=8192 \
 CTX_ALLOC=262273 \
 PROFILE_GPU=0 \
 PROFILE_PARTNER_GPU=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-native-q4-t256-profile.sh
+```
+
+For the requested 32K production trace and targeted attention pass, use the
+same command with:
+
+```bash
+PROFILE_TOKENS=32768 \
+CTX_ALLOC=262273 \
+NCU_SET=attention \
+RUN_ATTENTION_NCU=1 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \

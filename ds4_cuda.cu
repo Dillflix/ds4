@@ -21068,6 +21068,29 @@ __global__ static void moe_build_expert_mixed_tail_tiles_kernel(
     }
 }
 
+/* IQ2 gate/up has a materially different SM75 tail cost from native Q4
+ * down.  Keep Q4's cost-aware 16/8/4 plan intact, but optionally replace
+ * IQ2's residual 1..8 work with one MMA tile8.  Residuals 9..15 are already
+ * represented by the shared cost-aware tile16 list. */
+__global__ static void moe_build_iq2_tail8_tiles_kernel(
+        uint32_t *tail8_total,
+        uint32_t *tail8_experts,
+        uint32_t *tail8_starts,
+        const uint32_t *counts,
+        uint32_t n_total_expert) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t n8 = 0u;
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        const uint32_t count = counts[e];
+        const uint32_t rem = count & 15u;
+        if (rem != 0u && rem <= 8u) {
+            tail8_experts[n8] = e;
+            tail8_starts[n8++] = count - rem;
+        }
+    }
+    *tail8_total = n8;
+}
+
 /* Decode-sized routed batches spend more host time launching metadata kernels
  * than doing the <= 96 pair / 128 expert setup. Build both tile lists in one
  * deterministic block; the expensive expert kernels remain unchanged. */
@@ -23374,7 +23397,8 @@ __device__ __forceinline__ static int32_t iq2_group_scale(
  * odd scale is applied to the integer result, before the block's float
  * scale, exactly as in dev_dot_iq2_xxs_q8_K_block8_deq_lut. The eight
  * float slots reproduce the scalar quarter-warp reduction order. */
-template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false>
+template <uint32_t ROW_SPAN, bool SCALAR_SLOTS = false,
+          uint32_t BLOCK_WARPS = 8u>
 __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
         float *gate_out,
         float *up_out,
@@ -23440,8 +23464,10 @@ __global__ static void moe_gate_up_mid_iq2_tile8_mma_sm75_kernel(
 
     const uint32_t mtok = lane >> 2u;
     const uint32_t n0 = (lane & 3u) * 2u;
-    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
-        const uint32_t row0 = blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+    for (uint32_t row_in_span = warp * 8u;
+         row_in_span < ROW_SPAN;
+         row_in_span += BLOCK_WARPS * 8u) {
+        const uint32_t row0 = blockIdx.x * ROW_SPAN + row_in_span;
         if (row0 >= expert_mid_dim) continue;
         const char *grow = gate_base + (uint64_t)expert * gate_expert_bytes +
                            (uint64_t)row0 * gate_row_bytes;
@@ -23673,7 +23699,7 @@ __device__ __forceinline__ static void moe_iq2_tile16_mma_sm75_pass(
 }
 
 template <uint32_t ROW_SPAN, uint32_t STAGED_ROWS,
-          bool SCALAR_SLOTS = false>
+          bool SCALAR_SLOTS = false, uint32_t BLOCK_WARPS = 8u>
 __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
         float *gate_out,
         float *up_out,
@@ -23739,9 +23765,10 @@ __global__ static void moe_gate_up_mid_iq2_tile16_mma_sm75_kernel(
     const uint32_t mtok_a = lane >> 2u;
     const uint32_t mtok_b = mtok_a + 8u;
     const uint32_t n0 = (lane & 3u) * 2u;
-    for (uint32_t rr = 0; rr < ROW_SPAN / 64u; rr++) {
-        const uint32_t row0 =
-            blockIdx.x * ROW_SPAN + rr * 64u + warp * 8u;
+    for (uint32_t row_in_span = warp * 8u;
+         row_in_span < ROW_SPAN;
+         row_in_span += BLOCK_WARPS * 8u) {
+        const uint32_t row0 = blockIdx.x * ROW_SPAN + row_in_span;
         if (row0 >= expert_mid_dim) continue;
         const char *grow = gate_base +
             (uint64_t)expert * gate_expert_bytes +
@@ -25992,6 +26019,9 @@ static int routed_moe_launch(
         const uint32_t use_iq2_scalar_sm75 =
             cuda_sm75_mma_ok() &&
             cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_SCALAR_SM75", 1);
+        const uint32_t use_iq2_wide512_sm75 =
+            use_iq2_mma_sm75 &&
+            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_WIDE512_SM75", 0);
         const uint32_t use_down_tile16 = down_q2k && use_atomic_down && expert_tile_m == 8u &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_q2_down_mma_sm75_tile16 =
@@ -26008,6 +26038,22 @@ static int routed_moe_launch(
             (any_native_q4 ||
              (getenv("DS4_CUDA_MOE_MIXED_TAIL_TILES") != NULL &&
               getenv("DS4_CUDA_MOE_NO_MIXED_TAIL_TILES") == NULL));
+        const uint32_t use_iq2_tail8_all_sm75 =
+            gate_iq2 && use_iq2_mma_sm75_tile16 && use_mixed_tail_tiles &&
+            use_native_q4_cost_tiles &&
+            cuda_env_flag_enabled("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75", 0);
+        if (use_iq2_wide512_sm75) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                fprintf(stderr,
+                        "ds4: SM75 IQ2 candidate selected: wide512 tile16/tile8\n");
+        }
+        if (use_iq2_tail8_all_sm75) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                fprintf(stderr,
+                        "ds4: SM75 IQ2 candidate selected: residual 1..8 -> tail8\n");
+        }
         const uint32_t use_small_sorted_prep =
             !any_native_q4 && owned_filtered && (gate_q4k || down_q4k) &&
             n_tokens <= 16u && pair_count <= 96u &&
@@ -26123,9 +26169,12 @@ static int routed_moe_launch(
         uint32_t *tile16_starts = NULL;
         uint32_t *tail8_total = NULL, *tail8_experts = NULL, *tail8_starts = NULL;
         uint32_t *tail4_total = NULL, *tail4_experts = NULL, *tail4_starts = NULL;
+        uint32_t *iq2_tail8_total = NULL, *iq2_tail8_experts = NULL;
+        uint32_t *iq2_tail8_starts = NULL;
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         uint32_t tail8_capacity = 0, tail4_capacity = 0;
+        uint32_t iq2_tail8_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
@@ -26143,6 +26192,7 @@ static int routed_moe_launch(
             tile16_capacity = use_any_tile16 ? ((pair_count + 15u) / 16u + n_total_expert) : 0u;
             tail8_capacity = use_mixed_tail_tiles ? n_total_expert : 0u;
             tail4_capacity = use_mixed_tail_tiles ? 2u * n_total_expert : 0u;
+            iq2_tail8_capacity = use_iq2_tail8_all_sm75 ? n_total_expert : 0u;
             const uint64_t tile_offsets_bytes = ((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
@@ -26157,6 +26207,9 @@ static int routed_moe_launch(
             const uint64_t tail4_total_bytes = use_mixed_tail_tiles ? sizeof(uint32_t) : 0u;
             const uint64_t tail4_experts_bytes = (uint64_t)tail4_capacity * sizeof(uint32_t);
             const uint64_t tail4_starts_bytes = (uint64_t)tail4_capacity * sizeof(uint32_t);
+            const uint64_t iq2_tail8_total_bytes = use_iq2_tail8_all_sm75 ? sizeof(uint32_t) : 0u;
+            const uint64_t iq2_tail8_experts_bytes = (uint64_t)iq2_tail8_capacity * sizeof(uint32_t);
+            const uint64_t iq2_tail8_starts_bytes = (uint64_t)iq2_tail8_capacity * sizeof(uint32_t);
             const uint64_t tile_offsets_off = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
             const uint64_t tile_total_off = tile_offsets_off + tile_offsets_bytes;
             const uint64_t tile_experts_off = tile_total_off + tile_total_bytes;
@@ -26171,7 +26224,10 @@ static int routed_moe_launch(
             const uint64_t tail4_total_off = tail8_starts_off + tail8_starts_bytes;
             const uint64_t tail4_experts_off = tail4_total_off + tail4_total_bytes;
             const uint64_t tail4_starts_off = tail4_experts_off + tail4_experts_bytes;
-            const uint64_t scratch_bytes = tail4_starts_off + tail4_starts_bytes;
+            const uint64_t iq2_tail8_total_off = tail4_starts_off + tail4_starts_bytes;
+            const uint64_t iq2_tail8_experts_off = iq2_tail8_total_off + iq2_tail8_total_bytes;
+            const uint64_t iq2_tail8_starts_off = iq2_tail8_experts_off + iq2_tail8_experts_bytes;
+            const uint64_t scratch_bytes = iq2_tail8_starts_off + iq2_tail8_starts_bytes;
             uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(logical_tier, scratch_bytes,
                                                              "routed_moe sorted pairs");
             if (!scratch) {
@@ -26197,6 +26253,9 @@ static int routed_moe_launch(
                 tail4_total = use_mixed_tail_tiles ? (uint32_t *)(scratch + tail4_total_off) : NULL;
                 tail4_experts = use_mixed_tail_tiles ? (uint32_t *)(scratch + tail4_experts_off) : NULL;
                 tail4_starts = use_mixed_tail_tiles ? (uint32_t *)(scratch + tail4_starts_off) : NULL;
+                iq2_tail8_total = use_iq2_tail8_all_sm75 ? (uint32_t *)(scratch + iq2_tail8_total_off) : NULL;
+                iq2_tail8_experts = use_iq2_tail8_all_sm75 ? (uint32_t *)(scratch + iq2_tail8_experts_off) : NULL;
+                iq2_tail8_starts = use_iq2_tail8_all_sm75 ? (uint32_t *)(scratch + iq2_tail8_starts_off) : NULL;
                 if (use_small_sorted_prep) {
                     moe_prepare_sorted_tiles_small_kernel<<<1, 128>>>(
                         counts, offsets, cursors, sorted_pairs,
@@ -26283,6 +26342,13 @@ static int routed_moe_launch(
                         use_native_q4_cost_tiles);
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe mixed tail tile launch");
+                }
+                if (ok && use_iq2_tail8_all_sm75 && !use_small_sorted_prep) {
+                    moe_build_iq2_tail8_tiles_kernel<<<1, 1>>>(
+                        iq2_tail8_total, iq2_tail8_experts,
+                        iq2_tail8_starts, counts, n_total_expert);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe IQ2 tail8 tile launch");
                 }
             }
         }
@@ -26547,15 +26613,29 @@ static int routed_moe_launch(
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE16, \
                                 "iq2-gate-tile16", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, STAGE); \
-                            if (use_iq2_scalar_sm75) { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true><<<GRID, 256>>>( \
+                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true, 16><<<GRID, 512>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, true, 8><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, false, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile16_total, tile16_experts, tile16_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
                             } else { \
-                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, false><<<GRID, 256>>>( \
+                                moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<RS, STAGE, false, 8><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile16_total, tile16_experts, tile16_starts, \
@@ -26599,15 +26679,29 @@ static int routed_moe_launch(
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_iq2_scalar_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 16><<<GRID, 512>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
+                                    n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 8><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
+                                    gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
+                                    n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
                                     gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, \
                                     n_expert, write_gate_up, clamp); \
                             } else { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 8><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
                                     tile_total, tile_experts, tile_starts, (const float *)weights->ptr, \
@@ -26727,47 +26821,71 @@ static int routed_moe_launch(
 #undef DS4_Q4_GATE_TAIL4_LAUNCH
 #undef DS4_Q4_GATE_TAIL8_LAUNCH
                     } else {
+                        const uint32_t *iq2_gate_tail8_total =
+                            use_iq2_tail8_all_sm75 ? iq2_tail8_total : tail8_total;
+                        const uint32_t *iq2_gate_tail8_experts =
+                            use_iq2_tail8_all_sm75 ? iq2_tail8_experts : tail8_experts;
+                        const uint32_t *iq2_gate_tail8_starts =
+                            use_iq2_tail8_all_sm75 ? iq2_tail8_starts : tail8_starts;
+                        const uint32_t iq2_gate_tail8_capacity =
+                            use_iq2_tail8_all_sm75 ? iq2_tail8_capacity : tail8_capacity;
 #define DS4_IQ2_GATE_TAIL8_LAUNCH(RS, GRID) \
                         do { \
                             cuda_sm75_scalar_audit_launch( \
                                 CUDA_SM75_SCALAR_AUDIT_IQ2_GATE_TILE8, \
                                 "iq2-gate-tile8", use_iq2_scalar_sm75, \
                                 scalar_audit_device, layer_index, RS, 0u); \
-                            if (use_iq2_scalar_sm75) { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true><<<GRID, 256>>>( \
+                            if (use_iq2_scalar_sm75 && use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 16><<<GRID, 512>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tail8_total, tail8_experts, tail8_starts, \
+                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_scalar_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, true, 8><<<GRID, 256>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
+                                    (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
+                                    xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
+                            } else if (use_iq2_wide512_sm75) { \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 16><<<GRID, 512>>>( \
+                                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
+                                    gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
+                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
                             } else { \
-                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false><<<GRID, 256>>>( \
+                                moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<RS, false, 8><<<GRID, 256>>>( \
                                     (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
                                     gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts, \
-                                    tail8_total, tail8_experts, tail8_starts, \
+                                    iq2_gate_tail8_total, iq2_gate_tail8_experts, iq2_gate_tail8_starts, \
                                     (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes, \
                                     xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp); \
                             } \
                         } while (0)
                         if (gate_row_span == 512u) {
-                            dim3 g8((expert_mid_dim + 511u) / 512u, tail8_capacity, 1);
+                            dim3 g8((expert_mid_dim + 511u) / 512u, iq2_gate_tail8_capacity, 1);
                             DS4_IQ2_GATE_TAIL8_LAUNCH(512, g8);
                         } else if (gate_row_span == 1024u) {
-                            dim3 g8((expert_mid_dim + 1023u) / 1024u, tail8_capacity, 1);
+                            dim3 g8((expert_mid_dim + 1023u) / 1024u, iq2_gate_tail8_capacity, 1);
                             DS4_IQ2_GATE_TAIL8_LAUNCH(1024, g8);
                         } else {
-                            dim3 g8((expert_mid_dim + 2047u) / 2048u, tail8_capacity, 1);
+                            dim3 g8((expert_mid_dim + 2047u) / 2048u, iq2_gate_tail8_capacity, 1);
                             DS4_IQ2_GATE_TAIL8_LAUNCH(2048, g8);
                         }
 #undef DS4_IQ2_GATE_TAIL8_LAUNCH
-                        dim3 g4((expert_mid_dim + 31u) / 32u,
-                                tail4_capacity, 1);
-                        moe_gate_up_mid_expert_tile4_row32_kernel<<<g4, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tail4_total, tail4_experts, tail4_starts,
-                            (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
-                            xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                        if (!use_iq2_tail8_all_sm75) {
+                            dim3 g4((expert_mid_dim + 31u) / 32u,
+                                    tail4_capacity, 1);
+                            moe_gate_up_mid_expert_tile4_row32_kernel<<<g4, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tail4_total, tail4_experts, tail4_starts,
+                                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                                xq_blocks, expert_mid_dim, n_expert, write_gate_up, clamp);
+                        }
                     }
                 }
             } else if (ok && sorted_pairs && use_p2_sorted) {

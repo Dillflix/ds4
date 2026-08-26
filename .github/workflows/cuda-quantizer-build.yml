@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -30,6 +30,7 @@ on:
       - "speed-bench/cuda-sm75-native-q4-production.sh"
       - "speed-bench/cuda-sm75-native-q4-t256-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-t256-profile.sh"
+      - "speed-bench/cuda-sm75-iq2-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
       - "speed-bench/cuda-q8-partner-offload-ab.sh"
@@ -125,6 +126,10 @@ jobs:
           bash -n speed-bench/cuda-q8-partner-native-exact.sh
           test -x speed-bench/cuda-sm75-native-q4-t256-profile.sh
           bash -n speed-bench/cuda-sm75-native-q4-t256-profile.sh
+          test -x speed-bench/cuda-sm75-iq2-next-ab.sh
+          bash -n speed-bench/cuda-sm75-iq2-next-ab.sh
+          test -x speed-bench/cuda-sm75-critical-path-audit.sh
+          bash -n speed-bench/cuda-sm75-critical-path-audit.sh
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-production.py

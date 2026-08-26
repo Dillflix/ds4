@@ -6,7 +6,7 @@ usage() {
 Capture the bounded DS4 SM75 prefill critical path and attribute the observed
 stage imbalance to either layer range or physical GPU/pair.
 
-The audit performs exactly two 2048-token Nsight Systems captures:
+The audit performs exactly two production-path Nsight Systems captures:
   current: 0,3,1,2  (stage 0 on GPU 0, stage 1 on GPU 3)
   swapped: 3,0,2,1  (stage 0 on GPU 3, stage 1 on GPU 0)
 
@@ -15,18 +15,17 @@ It also runs the same synthetic production-shaped Q4/Q8 work on physical GPUs
 stream waits, or synchronization.
 
 Optional environment:
-  NATIVE_MODEL=/absolute/path/to/tagged-SM75-native-full-Q4.gguf
-  MODEL=...                         defaults to NATIVE_MODEL
-  ALLOW_STANDARD_MODEL=0           explicit diagnostic escape hatch
+  MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
   PROMPT=...                         fixed prompt file
   CURRENT_DEVICES=0,3,1,2
   SWAPPED_DEVICES=3,0,2,1
   GPU_VRAM=auto
   STAGE_SPLIT=22
-  PROFILE_TOKENS=2048
+  PROFILE_TOKENS=8192
+  CTX_ALLOC=262273
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
-  HARNESS_SCENARIOS=q4-early,q4-late,q8-q-b,q8-attn
+  HARNESS_SCENARIOS=hybrid-iq2-q4-early,hybrid-iq2-q4-late
   HARNESS_TRIALS=3
   HARNESS_REPEATS=20
   SKIP_BUILD=0
@@ -43,25 +42,19 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 
-NATIVE_MODEL=${NATIVE_MODEL:-/mnt/nfs-images/models/gguf/ds4/DeepSeek-V4-Flash-Q4KExperts-SM75-native.gguf}
-MODEL=${MODEL:-$NATIVE_MODEL}
-ALLOW_STANDARD_MODEL=${ALLOW_STANDARD_MODEL:-0}
-[[ $NATIVE_MODEL == /* ]] || die "NATIVE_MODEL must be absolute"
-[[ $MODEL == /* && -f $MODEL ]] || die "MODEL must name an existing absolute file"
-[[ $ALLOW_STANDARD_MODEL == 0 || $ALLOW_STANDARD_MODEL == 1 ]] ||
-    die "ALLOW_STANDARD_MODEL must be 0 or 1"
-if [[ $ALLOW_STANDARD_MODEL == 0 && $MODEL != "$NATIVE_MODEL" ]]; then
-    die "critical-path production baseline requires MODEL=NATIVE_MODEL; set ALLOW_STANDARD_MODEL=1 only for an explicit portable-layout diagnostic"
-fi
+MODEL=${MODEL:-}
+[[ $MODEL == /* && -f $MODEL ]] ||
+    die "MODEL must name the existing absolute tagged mixed-Q4/IQ2 model"
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 CURRENT_DEVICES=${CURRENT_DEVICES:-0,3,1,2}
 SWAPPED_DEVICES=${SWAPPED_DEVICES:-3,0,2,1}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
-PROFILE_TOKENS=${PROFILE_TOKENS:-2048}
+PROFILE_TOKENS=${PROFILE_TOKENS:-8192}
+CTX_ALLOC=${CTX_ALLOC:-262273}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
-HARNESS_SCENARIOS=${HARNESS_SCENARIOS:-q4-early,q4-late,q8-q-b,q8-attn}
+HARNESS_SCENARIOS=${HARNESS_SCENARIOS:-hybrid-iq2-q4-early,hybrid-iq2-q4-late}
 HARNESS_TRIALS=${HARNESS_TRIALS:-3}
 HARNESS_REPEATS=${HARNESS_REPEATS:-20}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -72,7 +65,8 @@ OUTPUT_DIR=${CRITICAL_PATH_DIR:-$repo_dir/sm75-critical-path-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
-            "PREFILL_CHUNK:$PREFILL_CHUNK" "PIPELINE_MB:$PIPELINE_MB" \
+            "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
+            "PIPELINE_MB:$PIPELINE_MB" \
             "HARNESS_TRIALS:$HARNESS_TRIALS" \
             "HARNESS_REPEATS:$HARNESS_REPEATS" "SKIP_BUILD:$SKIP_BUILD" \
             "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
@@ -81,9 +75,10 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 )) || die "STAGE_SPLIT must be in 1..42"
-(( PROFILE_TOKENS >= 1024 && PREFILL_CHUNK >= PROFILE_TOKENS &&
-   PIPELINE_MB > 0 && PIPELINE_MB < PROFILE_TOKENS )) ||
-    die "PROFILE_TOKENS must exceed PIPELINE_MB and fit PREFILL_CHUNK"
+(( PROFILE_TOKENS >= PREFILL_CHUNK &&
+   PROFILE_TOKENS % PREFILL_CHUNK == 0 && CTX_ALLOC > PROFILE_TOKENS &&
+   PREFILL_CHUNK == 2048 && PIPELINE_MB == 512 )) ||
+    die "require a multiple-of-2048 frontier, ctx_alloc above it, and a 512-token pipeline"
 (( HARNESS_TRIALS >= 2 && HARNESS_REPEATS >= 5 )) ||
     die "use at least two harness trials and five timed repeats"
 [[ $SKIP_BUILD == 0 || $SKIP_BUILD == 1 ]] || die "SKIP_BUILD must be 0 or 1"
@@ -102,7 +97,7 @@ IFS=',' read -r -a scenarios <<<"$HARNESS_SCENARIOS"
 (( ${#scenarios[@]} > 0 )) || die "HARNESS_SCENARIOS is empty"
 for scenario in "${scenarios[@]}"; do
     case "$scenario" in
-        q4-early|q4-late|q8-q-b|q8-attn|q8-shared|q8-out-b) ;;
+        hybrid-iq2-q4-early|hybrid-iq2-q4-late) ;;
         *) die "unsupported harness scenario: $scenario" ;;
     esac
 done
@@ -175,14 +170,12 @@ if [[ $resume == 0 ]]; then
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nmodel_hashing=disabled\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'native_model=%s\nallow_standard_model=%s\n' \
-        "$NATIVE_MODEL" "$ALLOW_STANDARD_MODEL"
     printf 'current_devices=%s\nswapped_devices=%s\nstage_split=%s/%s\n' \
         "$CURRENT_DEVICES" "$SWAPPED_DEVICES" "$STAGE_SPLIT" \
         "$((43-STAGE_SPLIT))"
-    printf 'profile_tokens=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
-        "$PROFILE_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 'q8_partner_classes=t256\nharness_scenarios=%s\n' "$HARNESS_SCENARIOS"
+    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
+        "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 'q8_t256_placement=automatic-balanced\nharness_scenarios=%s\n' "$HARNESS_SCENARIOS"
     printf 'harness_trials=%s\nharness_repeats=%s\n' \
         "$HARNESS_TRIALS" "$HARNESS_REPEATS"
     printf '\n[gpu inventory]\n'
@@ -210,6 +203,11 @@ else
         die "RESUME_DIR used different swapped devices"
     grep -Fqx -- "stage_split=$STAGE_SPLIT/$((43-STAGE_SPLIT))" \
         "$OUTPUT_DIR/manifest.txt" || die "RESUME_DIR used a different split"
+    grep -Fqx -- "profile_tokens=$PROFILE_TOKENS" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "RESUME_DIR used a different profile frontier"
+    grep -Fqx -- "ctx_alloc=$CTX_ALLOC" "$OUTPUT_DIR/manifest.txt" ||
+        die "RESUME_DIR used a different context allocation"
     grep -Fqx 'state=failed' "$OUTPUT_DIR/run-status.txt" ||
         die "RESUME_DIR is not a failed run"
     grep -Fqx 'last_phase=same-work-harness' "$OUTPUT_DIR/run-status.txt" ||
@@ -251,8 +249,7 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
         DS4_CUDA_PREFILL_PIPELINE=1 \
         "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB" \
         DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
-        DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256 \
-        DS4_CUDA_Q8_T256_PLACEMENT=overflow \
+        "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK" \
         DS4_CUDA_CRITICAL_PATH_NVTX=1 \
         DS4_CUDA_PREFILL_AUDIT=1 \
         "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$PROFILE_TOKENS" \
@@ -264,7 +261,7 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
                 --gpu-devices "$devices" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
                 --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
-                --ctx-alloc "$((PROFILE_TOKENS+1))" \
+                --ctx-alloc "$CTX_ALLOC" \
                 --step-incr "$PROFILE_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
                 --gen-tokens 0 --csv "$base-benchmark.csv" \
                 >"$base.log" 2>&1
@@ -279,12 +276,16 @@ memory.used,power.draw,temperature.gpu,clocks.current.sm,clocks.current.memory,p
         die "$label omitted its Nsight report or benchmark CSV"
     grep -Fq "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
         "$base.log" || die "$label did not use the requested stage split"
-    grep -Fq 'partner-classes=t256' "$base.log" ||
-        die "$label did not use the fixed T256 partner policy"
-    if [[ $ALLOW_STANDARD_MODEL == 0 ]]; then
-        grep -Fq 'SM75 native routed-Q4 layout enabled' "$base.log" ||
-            die "$label did not dispatch the tagged SM75-native routed-Q4 layout"
-    fi
+    for marker in 'partner-classes=automatic:t256' \
+                  'partner-layers=all' \
+                  't256-placement=balanced' \
+                  'materialized 344/344 candidates' \
+                  'T256-output_b=43/43' \
+                  'partner=21 partner-arithmetic=f16' \
+                  'SM75 native routed-Q4 layout enabled'; do
+        grep -Fq "$marker" "$base.log" ||
+            die "$label did not use required production marker: $marker"
+    done
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
         grep -Fq "$route" "$base.log" ||
             die "$label lacks validated direct NVLink route $route"

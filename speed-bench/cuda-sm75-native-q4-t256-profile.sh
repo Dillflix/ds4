@@ -24,6 +24,8 @@ Optional environment:
   PROFILE_GPU=0                physical GPU for native-Q4 NCU harnesses
   PROFILE_PARTNER_GPU=1        its NVLink partner for T256 cuBLAS NCU
   RUN_NCU=1
+  NCU_SET=full                  full or attention
+  RUN_ATTENTION_NCU=auto        auto enables at PROFILE_TOKENS >= 32768
   NCU_USE_SUDO=1
   SKIP_BUILD=0
   REUSE_NSYS_DIR=             prior profiler output directory; skips GGUF load
@@ -56,6 +58,8 @@ PIPELINE_MB=${PIPELINE_MB:-512}
 PROFILE_GPU=${PROFILE_GPU:-0}
 PROFILE_PARTNER_GPU=${PROFILE_PARTNER_GPU:-1}
 RUN_NCU=${RUN_NCU:-1}
+NCU_SET=${NCU_SET:-full}
+RUN_ATTENTION_NCU=${RUN_ATTENTION_NCU:-auto}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 REUSE_NSYS_DIR=${REUSE_NSYS_DIR:-}
@@ -75,6 +79,16 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
+if [[ $RUN_ATTENTION_NCU == auto ]]; then
+    if (( PROFILE_TOKENS >= 32768 )); then RUN_ATTENTION_NCU=1; else RUN_ATTENTION_NCU=0; fi
+fi
+[[ $RUN_ATTENTION_NCU == 0 || $RUN_ATTENTION_NCU == 1 ]] ||
+    die "RUN_ATTENTION_NCU must be auto, 0, or 1"
+[[ $NCU_SET == full || $NCU_SET == attention ]] ||
+    die "NCU_SET must be full or attention"
+if [[ $NCU_SET == attention && $RUN_NCU == 1 && $RUN_ATTENTION_NCU == 0 ]]; then
+    die "NCU_SET=attention requires RUN_ATTENTION_NCU=1"
+fi
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 )) ||
     die "STAGE_SPLIT must be in 1..42"
 (( PROFILE_TOKENS >= PREFILL_CHUNK &&
@@ -272,8 +286,9 @@ phase=manifest
     printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
         "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 't256_policy=automatic-balanced\nt256_local_layers=even\nt256_partner_layers=odd\npartner_arithmetic=f16\n'
-    printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\n' \
-        "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU"
+    printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\nncu_set=%s\nrun_attention_ncu=%s\n' \
+        "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU" "$NCU_SET" \
+        "$RUN_ATTENTION_NCU"
     printf 'reused_nsys_dir=%s\n' "${REUSE_NSYS_DIR:-none}"
     printf 'reused_q4_ncu_dir=%s\n' "${REUSE_Q4_NCU_DIR:-none}"
     printf '\n[gpu inventory]\n'
@@ -465,7 +480,7 @@ if [[ $RUN_NCU == 1 ]]; then
             return
         fi
         printf 'Nsight Compute: %s...\n' "$label"
-        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${scalar_env[@]}" \
+        "${clean[@]}" CUDA_VISIBLE_DEVICES="$PROFILE_GPU" "${scalar_env[@]}" \
             "${ncu_cmd[@]}" \
             --config-file off --target-processes application-only --devices 0 \
             --kernel-name-base function --kernel-name "regex:$kernel" \
@@ -486,6 +501,7 @@ if [[ $RUN_NCU == 1 ]]; then
             --process cuda_sm75_profile_harness --block-size "$block_size"
     }
 
+    if [[ $NCU_SET == full ]]; then
     profile_native early-native-q4-gate native-q4-early \
         '^moe_gate_up_mid_sm75_native_q4_tile8_kernel$' \
         'moe_gate_up_mid_sm75_native_q4_tile8_kernel' \
@@ -508,22 +524,22 @@ if [[ $RUN_NCU == 1 ]]; then
         "$OUTPUT_DIR/ncu/late-native-q4-down"
     profile_native early-iq2-gate-tile16 hybrid-iq2-q4-early \
         '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1>' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1, 8>' \
         256 \
         "$OUTPUT_DIR/ncu/early-iq2-gate-tile16" iq2-tile16
     profile_native late-iq2-gate-tile16 hybrid-iq2-q4-late \
         '^moe_gate_up_mid_iq2_tile16_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1>' \
+        'moe_gate_up_mid_iq2_tile16_mma_sm75_kernel<512, 8, 1, 8>' \
         256 \
         "$OUTPUT_DIR/ncu/late-iq2-gate-tile16" iq2-tile16
     profile_native early-iq2-gate-tile8 hybrid-iq2-q4-early \
         '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1>' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1, 8>' \
         256 \
         "$OUTPUT_DIR/ncu/early-iq2-gate-tile8" iq2-tile16
     profile_native late-iq2-gate-tile8 hybrid-iq2-q4-late \
         '^moe_gate_up_mid_iq2_tile8_mma_sm75_kernel.*' \
-        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1>' \
+        'moe_gate_up_mid_iq2_tile8_mma_sm75_kernel<512, 1, 8>' \
         256 \
         "$OUTPUT_DIR/ncu/late-iq2-gate-tile8" iq2-tile16
     profile_native early-iq2-gate-tail4 hybrid-iq2-q4-early \
@@ -536,11 +552,25 @@ if [[ $RUN_NCU == 1 ]]; then
         'moe_gate_up_mid_expert_tile4_row32_kernel' \
         256 \
         "$OUTPUT_DIR/ncu/late-iq2-gate-tail4" iq2-tile16
+    fi
+
+    if [[ $RUN_ATTENTION_NCU == 1 ]]; then
+        profile_native attention-indexed-32k attn-indexed-32k \
+            '^attention_indexed_mixed_heads8_online_kernel.*' \
+            'attention_indexed_mixed_heads8_online_kernel<8, 16>' \
+            512 \
+            "$OUTPUT_DIR/ncu/attention-indexed-32k"
+        profile_native attention-mixed-32k attn-mixed-32k \
+            '^attention_decode_mixed_heads8_online_kernel.*' \
+            'attention_decode_mixed_heads8_online_kernel' \
+            256 \
+            "$OUTPUT_DIR/ncu/attention-mixed-32k"
+    fi
 
     profile_dense_cublas() {
         local shape=$1 scenario=$2 base="$OUTPUT_DIR/ncu/$1-cublas" rc=0
         printf 'Nsight Compute: production-shaped %s dense-F16 cuBLAS...\n' "$shape"
-        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
+        "${clean[@]}" CUDA_VISIBLE_DEVICES="$PROFILE_GPU,$PROFILE_PARTNER_GPU" \
             "${ncu_cmd[@]}" --config-file off \
             --target-processes application-only --devices 1 \
             --profile-from-start off --launch-count 1 --replay-mode kernel \
@@ -561,8 +591,10 @@ if [[ $RUN_NCU == 1 ]]; then
         python3 speed-bench/validate-ncu-capture.py \
             "$base.csv" '(?i)(gemm|mma)' 1 --process test_gpu_xdev
     }
-    profile_dense_cublas t32 q8-partner-t32-profile
-    profile_dense_cublas t256 q8-partner-t256-profile
+    if [[ $NCU_SET == full ]]; then
+        profile_dense_cublas t32 q8-partner-t32-profile
+        profile_dense_cublas t256 q8-partner-t256-profile
+    fi
 fi
 
 phase=complete
