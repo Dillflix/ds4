@@ -20603,6 +20603,12 @@ static uint32_t metal_graph_index_comp_update_row(
     return g->index_comp_cache_f16 ? 0u : row;
 }
 
+static bool metal_graph_borrow_tensor_view(
+        ds4_gpu_tensor       *view,
+        const ds4_gpu_tensor *base,
+        uint64_t              offset,
+        uint64_t              bytes);
+
 static bool metal_graph_qat_index_comp_row(
         ds4_gpu_graph *g,
         uint32_t       il,
