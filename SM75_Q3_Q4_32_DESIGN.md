@@ -1,9 +1,10 @@
 # SM75 Q3/Q4-32 experiment
 
-This document fixes the arithmetic and byte-layout contract for the bounded
-SM75 experiment.  These formats are **not** production GGUF types yet.  The
-experiment must establish both quality and kernel value before the loader,
-quantizer, or production dispatch accepts them.
+This document fixes the arithmetic and byte-layout contract that began as a
+bounded SM75 experiment. Q4-32 and Q3A4 have now crossed the production
+boundary: the quantizer, tagged GGUF loader, and routed-MoE dispatcher accept
+them. The remaining formats in this document are still experiments unless
+explicitly stated otherwise.
 
 ## Invariants
 
@@ -223,20 +224,17 @@ The on-disk identity is deliberately unambiguous:
   metadata and misinterpret the reordered payload.  The native type records
   standard-Q3_K quantization semantics, while untagged type Q3_K always retains
   its portable row-major interpretation.
-- Q3-32 and Q4-32 use symbolic private types
-  `DS4_GGML_TYPE_SM75_Q3_32_V1` and
-  `DS4_GGML_TYPE_SM75_Q4_32_V1`; numeric GGML enum values are intentionally
-  not allocated by this experiment.  Their
-  native tags are `sm75_m8n8k32_q3_native_aw_v1` and
-  `sm75_m8n8k32_q4s_native_aw_v1` respectively.
+- Production Q4-32 and Q3A4 use DS4-private type IDs 42 and 43. Both require
+  `ds4.routed_expert.sm75.layout =
+  sm75_m8n8k32_q4_32_q3a4_native_aw_v1` and layout version `1`. Q3-32 remains
+  experimental and has no production type ID.
 - DS4 rejects a private type/layout pair it does not recognize.  Generic GGUF
   readers will encounter an unknown private tensor type rather than silently
   reinterpreting native bytes as Q3_K or Q4_K.
 
-Deferring the numeric IDs is intentional: there is no safe vendor-reserved
-range in the upstream GGML enum.  The production patch must allocate the IDs
-against the exact upstream revision that DS4 vendors and cover collision and
-unknown-tag refusal in tests.
+The IDs are private to this DS4 revision; generic GGUF readers must treat them
+as unknown. The versioned tag, role/alignment checks, SM75 backend refusal, and
+unknown-tag refusal prevent accidental reinterpretation.
 
 ## Experiment gates
 

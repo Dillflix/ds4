@@ -847,6 +847,238 @@ static void fill_iq2_tensor(unsigned char *base, uint32_t matrix,
     }
 }
 
+typedef struct {
+    uint16_t d[8];
+    uint8_t scales[8][6];
+    uint32_t b[8][32];
+} test_sm75_q4_32_tile;
+
+typedef struct {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    uint8_t scales[8][4];
+    uint8_t mins[8][4];
+    uint16_t low2[8][32];
+    uint8_t high[8][32];
+} test_sm75_q3a4_tile;
+
+_Static_assert(sizeof(test_sm75_q4_32_tile) == 8u * 136u,
+               "test Q4-32 record size");
+_Static_assert(sizeof(test_sm75_q3a4_tile) == 8u * 108u,
+               "test Q3A4 record size");
+
+static void test_pack_scale6(uint8_t packed[6], uint32_t group, int value) {
+    const uint32_t code = (uint32_t)(value + 32) & 63u;
+    if (group < 4u) packed[group] |= (uint8_t)(code & 15u);
+    else packed[group - 4u] |= (uint8_t)((code & 15u) << 4u);
+    packed[4u + (group >> 2u)] |=
+        (uint8_t)(((code >> 4u) & 3u) << (2u * (group & 3u)));
+}
+
+static void fill_sm75_q4_32_tensor(unsigned char *base, uint32_t matrix,
+                                    uint32_t n_experts, uint32_t n_rows,
+                                    uint32_t n_blocks) {
+    test_sm75_q4_32_tile *tiles = (test_sm75_q4_32_tile *)base;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t rt = 0; rt < n_rows / 8u; rt++) {
+            for (uint32_t b = 0; b < n_blocks; b++) {
+                test_sm75_q4_32_tile *tile = tiles +
+                    ((uint64_t)e * (n_rows / 8u) + rt) * n_blocks + b;
+                memset(tile, 0, sizeof(*tile));
+                for (uint32_t r = 0; r < 8u; r++) {
+                    tile->d[r] = 0x2800u; /* 1/32, exact FP16. */
+                    for (uint32_t g = 0; g < 8u; g++)
+                        test_pack_scale6(tile->scales[r], g,
+                            (int)((e + rt + r + b + g + matrix) % 7u) - 3);
+                }
+                for (uint32_t g = 0; g < 8u; g++) {
+                    for (uint32_t lane = 0; lane < 32u; lane++) {
+                        uint32_t word = 0u;
+                        for (uint32_t i = 0; i < 8u; i++) {
+                            const int q = (int)((e * 3u + rt * 5u + b * 7u +
+                                g * 11u + lane * 13u + i * 17u +
+                                matrix * 19u) % 16u) - 8;
+                            word |= ((uint32_t)q & 15u) << (4u * i);
+                        }
+                        tile->b[g][lane] = word;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void fill_sm75_q3a4_tensor(unsigned char *base, uint32_t matrix,
+                                   uint32_t n_experts, uint32_t n_rows,
+                                   uint32_t n_blocks) {
+    test_sm75_q3a4_tile *tiles = (test_sm75_q3a4_tile *)base;
+    for (uint32_t e = 0; e < n_experts; e++) {
+        for (uint32_t rt = 0; rt < n_rows / 8u; rt++) {
+            for (uint32_t b = 0; b < n_blocks; b++) {
+                test_sm75_q3a4_tile *tile = tiles +
+                    ((uint64_t)e * (n_rows / 8u) + rt) * n_blocks + b;
+                memset(tile, 0, sizeof(*tile));
+                for (uint32_t r = 0; r < 8u; r++) {
+                    tile->d[r] = 0x2800u;
+                    tile->dmin[r] = 0x2400u;
+                    for (uint32_t g = 0; g < 8u; g++) {
+                        const uint8_t scale =
+                            (uint8_t)(1u + (e + rt + r + g + matrix) % 7u);
+                        const uint8_t minv =
+                            (uint8_t)((e + b + r + 2u * g + matrix) % 5u);
+                        tile->scales[r][g >> 1u] |=
+                            (uint8_t)(scale << (4u * (g & 1u)));
+                        tile->mins[r][g >> 1u] |=
+                            (uint8_t)(minv << (4u * (g & 1u)));
+                    }
+                }
+                for (uint32_t g = 0; g < 8u; g++) {
+                    for (uint32_t lane = 0; lane < 32u; lane++) {
+                        uint16_t low = 0u;
+                        uint8_t high = 0u;
+                        for (uint32_t i = 0; i < 8u; i++) {
+                            const uint32_t q = (e * 3u + rt * 5u + b * 7u +
+                                g * 11u + lane * 13u + i * 17u +
+                                matrix * 19u) & 7u;
+                            low |= (uint16_t)((q & 3u) << (2u * i));
+                            high |= (uint8_t)(((q >> 2u) & 1u) << i);
+                        }
+                        tile->low2[g][lane] = low;
+                        tile->high[g][lane] = high;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Compare the real sorted 16/8/4 prefill dispatcher with the independent
+ * direct-decode dispatcher, token by token. This covers production offsets,
+ * expert selection, native records, Q4-32 down, and both supported gate/up
+ * formats without treating an isolated harness kernel as production proof. */
+static int check_sm75_q32_production_exact_case(uint32_t gate_type,
+                                                const char *label) {
+    const uint32_t n_total = 8u, n_expert = 1u, n_tokens = 32u;
+    const uint32_t in_dim = 256u, mid_dim = 256u, out_dim = 256u;
+    const uint32_t in_blocks = 1u, mid_blocks = 1u;
+    const uint64_t gate_block = gate_type == 43u ? 108u : 136u;
+    const uint64_t gate_row = gate_block * in_blocks;
+    const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
+    const uint64_t down_row = 136u * mid_blocks;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    const uint64_t gate_off = 0u;
+    const uint64_t up_off = gate_expert * n_total;
+    const uint64_t down_off = up_off + gate_expert * n_total;
+    const uint64_t model_bytes = down_off + down_expert * n_total;
+    const uint64_t x_count = (uint64_t)n_tokens * in_dim;
+    const uint64_t mid_count = (uint64_t)n_tokens * mid_dim;
+    const uint64_t out_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t scratch_bytes = x_count * sizeof(float) >
+        out_count * sizeof(float) ? x_count * sizeof(float) :
+                                   out_count * sizeof(float);
+    unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
+    float *xh = (float *)malloc((size_t)x_count * sizeof(float));
+    int32_t *selh = (int32_t *)malloc(n_tokens * sizeof(int32_t));
+    float *wh = (float *)malloc(n_tokens * sizeof(float));
+    float *mid_ref = (float *)malloc((size_t)mid_count * sizeof(float));
+    float *mid_got = (float *)malloc((size_t)mid_count * sizeof(float));
+    float *out_ref = (float *)malloc((size_t)out_count * sizeof(float));
+    float *out_got = (float *)malloc((size_t)out_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_count * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(n_tokens * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(n_tokens * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(scratch_bytes);
+    int rc = 1;
+    if (!model || !xh || !selh || !wh || !mid_ref || !mid_got ||
+        !out_ref || !out_got || !x || !selected || !weights || !out ||
+        !gate || !up || !mid || !down) goto cleanup;
+    if (gate_type == 43u) {
+        fill_sm75_q3a4_tensor(model + gate_off, 0u, n_total,
+                              mid_dim, in_blocks);
+        fill_sm75_q3a4_tensor(model + up_off, 1u, n_total,
+                              mid_dim, in_blocks);
+    } else {
+        fill_sm75_q4_32_tensor(model + gate_off, 0u, n_total,
+                               mid_dim, in_blocks);
+        fill_sm75_q4_32_tensor(model + up_off, 1u, n_total,
+                               mid_dim, in_blocks);
+    }
+    fill_sm75_q4_32_tensor(model + down_off, 2u, n_total,
+                           out_dim, mid_blocks);
+    for (uint64_t i = 0; i < x_count; i++)
+        xh[i] = (float)((int)((i * 23u + (i >> 3u) * 17u) % 193u) - 96) /
+            101.0f;
+    /* Exact 16/8/4/4 expert populations force every production tile size. */
+    const uint32_t cuts[4] = {16u, 24u, 28u, 32u};
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t e = 0u;
+        while (e < 3u && t >= cuts[e]) e++;
+        selh[t] = (int32_t)e;
+        wh[t] = (float)((t % 7u) + 1u) / 8.0f;
+    }
+    ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                                  DS4_TENSOR_LAYOUT_SM75_Q3A4);
+    if (!ds4_gpu_set_model_map(model, model_bytes)) goto cleanup;
+    bool mid_is_f16 = false;
+#define RUN_Q32(NTOK, MID_DST, OUT_DST) \
+    (mid_is_f16 = false, \
+     ds4_gpu_routed_moe_batch_tensor( \
+        out, gate, up, mid, down, model, model_bytes, \
+        gate_off, up_off, down_off, gate_type, 42u, \
+        gate_expert, gate_row, down_expert, down_row, \
+        in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert, \
+        10.0f, x, 0u, (NTOK), &mid_is_f16, true) && !mid_is_f16 && \
+     ds4_gpu_synchronize() && \
+     ds4_gpu_tensor_read(mid, 0, (MID_DST), \
+                         (uint64_t)(NTOK) * mid_dim * sizeof(float)) && \
+     ds4_gpu_tensor_read(out, 0, (OUT_DST), \
+                         (uint64_t)(NTOK) * out_dim * sizeof(float)))
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (!ds4_gpu_tensor_write(x, 0, xh + (uint64_t)t * in_dim,
+                                  (uint64_t)in_dim * sizeof(float)) ||
+            !ds4_gpu_tensor_write(selected, 0, selh + t, sizeof(int32_t)) ||
+            !ds4_gpu_tensor_write(weights, 0, wh + t, sizeof(float)) ||
+            !RUN_Q32(1u, mid_ref + (uint64_t)t * mid_dim,
+                     out_ref + (uint64_t)t * out_dim)) goto cleanup;
+    }
+    if (!ds4_gpu_tensor_write(x, 0, xh, x_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(selected, 0, selh,
+                              n_tokens * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(weights, 0, wh,
+                              n_tokens * sizeof(float)) ||
+        !RUN_Q32(n_tokens, mid_got, out_got) ||
+        !compare_exact_f32("SM75 Q32 production prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("SM75 Q32 production prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: SM75 %s gate/up + Q4-32 down production "
+            "16/8/4 prefill/direct-decode exact\n", label);
+    rc = 0;
+#undef RUN_Q32
+
+cleanup:
+    ds4_gpu_set_routed_q4_layout(0u);
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
+    free(out_got); free(out_ref); free(mid_got); free(mid_ref);
+    free(wh); free(selh); free(xh); free(model);
+    return rc;
+}
+
+static int check_sm75_q32_production_exact(void) {
+    int rc = check_sm75_q32_production_exact_case(42u, "Q4-32");
+    if (check_sm75_q32_production_exact_case(43u, "Q3A4") != 0) rc = 1;
+    return rc;
+}
+
 /* This is the production API, not an isolated microkernel comparison.  It
  * proves exact standard-vs-tagged output for a prefill histogram containing
  * full 16s plus true 8/4 tails and for the direct six-expert decode route. */
@@ -1432,6 +1664,7 @@ int main(void) {
     int rc = check_sm75_q8_mma_exact();
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
+    if (check_sm75_q32_production_exact() != 0) rc = 1;
     if (check_sm75_native_q4_layout_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;

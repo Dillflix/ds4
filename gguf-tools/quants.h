@@ -54,7 +54,11 @@ typedef enum {
     DS4Q_TYPE_MXFP4   = 39,
     DS4Q_TYPE_NVFP4   = 40,
     DS4Q_TYPE_Q1_0    = 41,
-    DS4Q_TYPE_COUNT   = 42,
+    /* DS4-private, architecture-tagged routed-expert formats in this revision.
+     * They must never be read as standard GGUF quant types. */
+    DS4Q_TYPE_SM75_Q4_32 = 42,
+    DS4Q_TYPE_SM75_Q3A4  = 43,
+    DS4Q_TYPE_COUNT      = 44,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {
@@ -84,9 +88,8 @@ bool ds4q_iq2_xxs_tables(const uint64_t **grid, size_t *grid_len,
 /*
  * Bounded research API for the SM75 Q3/Q4-32 experiment.  The shipping
  * IQ2_XXS gate/up format is included as a comparison control.  The new
- * formats are deliberately not registered as GGUF output types: real-weight
- * quality must clear the audit gate before either native layout becomes
- * production data.
+ * Q4-32 and Q3A4 were subsequently promoted to architecture-tagged GGUF
+ * output types; they remain here as controls for the bounded format sweep.
  */
 typedef enum {
     DS4Q_EXPERIMENT_Q4_K = 0,
@@ -118,6 +121,13 @@ bool ds4q_experimental_quantize_block(ds4q_experimental_format format,
 bool ds4q_experimental_dequantize_block(ds4q_experimental_format format,
                                         const void *src,
                                         float dst[256]);
+
+/* Size-neutral canonical-row to SM75 m8n8k32 tile transforms.  nrows must be
+ * a multiple of eight and ncols a multiple of 256. */
+size_t ds4q_repack_sm75_q4_32(const void *src, void *dst,
+                              int64_t nrows, int64_t ncols);
+size_t ds4q_repack_sm75_q3a4(const void *src, void *dst,
+                             int64_t nrows, int64_t ncols);
 
 #ifdef __cplusplus
 }

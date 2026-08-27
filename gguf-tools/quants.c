@@ -71,6 +71,8 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_MXFP4]   = { "mxfp4",      32,  17, false, false },
     [DS4Q_TYPE_NVFP4]   = { "nvfp4",      64,  36, false, false },
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
+    [DS4Q_TYPE_SM75_Q4_32] = { "sm75_q4_32", QK_K, 136, true, true },
+    [DS4Q_TYPE_SM75_Q3A4]  = { "sm75_q3a4",  QK_K, 108, true, true },
 };
 
 static float ds4q_f32_from_bits(uint32_t bits) {
@@ -639,6 +641,31 @@ static size_t ds4q_quantize_q4_k(const float *src, void *dst, int64_t start,
     return (size_t)nrows * row_size;
 }
 
+static size_t ds4q_quantize_experimental_rows(
+        ds4q_experimental_format format, ds4q_type type,
+        const float *src, void *dst, int64_t start,
+        int64_t nrows, int64_t ncols, const float *quant_weights) {
+    const size_t row_size = ds4q_row_size(type, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+    const size_t block_bytes = ds4q_experimental_block_bytes(format);
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            const float *im = quant_weights
+                ? quant_weights + (size_t)b * QK_K : NULL;
+            if (!ds4q_experimental_quantize_block(
+                    format, xrow + (size_t)b * QK_K, im,
+                    out + (size_t)row * row_size +
+                          (size_t)b * block_bytes)) {
+                return 0;
+            }
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
 typedef struct {
     uint8_t hmask[32];
     uint8_t qs[64];
@@ -664,6 +691,29 @@ typedef struct {
     uint8_t qs[160];
 } ds4q_experimental_q5_32_block;
 
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[4];
+    uint8_t mins[4];
+    uint8_t qs[96];
+} ds4q_sm75_q3a4_block;
+
+typedef struct {
+    uint16_t d[8];
+    uint8_t scales[8][6];
+    uint32_t b[8][32];
+} ds4q_sm75_q4_32_tile;
+
+typedef struct {
+    uint16_t d[8];
+    uint16_t dmin[8];
+    uint8_t scales[8][4];
+    uint8_t mins[8][4];
+    uint16_t low2[8][32];
+    uint8_t high[8][32];
+} ds4q_sm75_q3a4_tile;
+
 _Static_assert(sizeof(ds4q_experimental_q3_k_block) == 110,
                "standard Q3_K block size");
 _Static_assert(sizeof(ds4q_experimental_q3_32_block) == 104,
@@ -672,6 +722,12 @@ _Static_assert(sizeof(ds4q_experimental_q4_32_block) == 136,
                "SM75 Q4-32 block size");
 _Static_assert(sizeof(ds4q_experimental_q5_32_block) == 168,
                "SM75 Q5-32 block size");
+_Static_assert(sizeof(ds4q_sm75_q3a4_block) == 108,
+               "SM75 Q3A4 block size");
+_Static_assert(sizeof(ds4q_sm75_q4_32_tile) == 1088,
+               "SM75 Q4-32 tile size");
+_Static_assert(sizeof(ds4q_sm75_q3a4_tile) == 864,
+               "SM75 Q3A4 tile size");
 
 enum {
     DS4Q_Q3A4_BYTES = 108,
@@ -707,6 +763,94 @@ static uint8_t ds4q_unpack_bits(const uint8_t *data, int index, int bits) {
     if (shift + (unsigned)bits > 8u)
         value |= (unsigned)data[byte + 1] << (8u - shift);
     return (uint8_t)(value & ((1u << bits) - 1u));
+}
+
+static uint32_t ds4q_pack_nibbles8(const uint8_t values[8]) {
+    uint32_t out = 0;
+    for (int i = 0; i < 8; i++)
+        out |= (uint32_t)(values[i] & 15u) << (4u * (unsigned)i);
+    return out;
+}
+
+size_t ds4q_repack_sm75_q4_32(const void *src_void, void *dst_void,
+                              int64_t nrows, int64_t ncols) {
+    if (!src_void || !dst_void || nrows <= 0 || ncols <= 0 ||
+        nrows % 8 != 0 || ncols % QK_K != 0) return 0;
+    const ds4q_experimental_q4_32_block *src =
+        (const ds4q_experimental_q4_32_block *)src_void;
+    ds4q_sm75_q4_32_tile *dst = (ds4q_sm75_q4_32_tile *)dst_void;
+    const size_t blocks = (size_t)ncols / QK_K;
+    for (size_t tile = 0; tile < (size_t)nrows / 8u; tile++) {
+        for (size_t b = 0; b < blocks; b++) {
+            ds4q_sm75_q4_32_tile *out = dst + tile * blocks + b;
+            memset(out, 0, sizeof(*out));
+            for (size_t row = 0; row < 8u; row++) {
+                const ds4q_experimental_q4_32_block *in =
+                    src + (tile * 8u + row) * blocks + b;
+                out->d[row] = in->d;
+                memcpy(out->scales[row], in->scales, 6u);
+            }
+            for (size_t group = 0; group < 8u; group++) {
+                for (size_t lane = 0; lane < 32u; lane++) {
+                    const size_t row = lane >> 2u;
+                    const size_t k0 = group * 32u + (lane & 3u) * 8u;
+                    const ds4q_experimental_q4_32_block *in =
+                        src + (tile * 8u + row) * blocks + b;
+                    uint8_t values[8];
+                    for (size_t i = 0; i < 8u; i++) {
+                        const size_t k = k0 + i;
+                        values[i] = (uint8_t)((in->qs[k / 2u] >>
+                            (4u * (k & 1u))) & 15u);
+                    }
+                    out->b[group][lane] = ds4q_pack_nibbles8(values);
+                }
+            }
+        }
+    }
+    return (size_t)nrows * blocks * 136u;
+}
+
+size_t ds4q_repack_sm75_q3a4(const void *src_void, void *dst_void,
+                             int64_t nrows, int64_t ncols) {
+    if (!src_void || !dst_void || nrows <= 0 || ncols <= 0 ||
+        nrows % 8 != 0 || ncols % QK_K != 0) return 0;
+    const ds4q_sm75_q3a4_block *src =
+        (const ds4q_sm75_q3a4_block *)src_void;
+    ds4q_sm75_q3a4_tile *dst = (ds4q_sm75_q3a4_tile *)dst_void;
+    const size_t blocks = (size_t)ncols / QK_K;
+    for (size_t tile = 0; tile < (size_t)nrows / 8u; tile++) {
+        for (size_t b = 0; b < blocks; b++) {
+            ds4q_sm75_q3a4_tile *out = dst + tile * blocks + b;
+            memset(out, 0, sizeof(*out));
+            for (size_t row = 0; row < 8u; row++) {
+                const ds4q_sm75_q3a4_block *in =
+                    src + (tile * 8u + row) * blocks + b;
+                out->d[row] = in->d;
+                out->dmin[row] = in->dmin;
+                memcpy(out->scales[row], in->scales, 4u);
+                memcpy(out->mins[row], in->mins, 4u);
+            }
+            for (size_t group = 0; group < 8u; group++) {
+                for (size_t lane = 0; lane < 32u; lane++) {
+                    const size_t row = lane >> 2u;
+                    const size_t k0 = group * 32u + (lane & 3u) * 8u;
+                    const ds4q_sm75_q3a4_block *in =
+                        src + (tile * 8u + row) * blocks + b;
+                    uint16_t low = 0;
+                    uint8_t high = 0;
+                    for (size_t i = 0; i < 8u; i++) {
+                        const uint8_t code = ds4q_unpack_bits(
+                            in->qs, (int)(k0 + i), 3);
+                        low |= (uint16_t)(code & 3u) << (2u * i);
+                        high |= (uint8_t)((code >> 2u) & 1u) << i;
+                    }
+                    out->low2[group][lane] = low;
+                    out->high[group][lane] = high;
+                }
+            }
+        }
+    }
+    return (size_t)nrows * blocks * 108u;
 }
 
 static void ds4q_pack_unsigned_fields(const uint8_t values[8], int bits,
@@ -1956,6 +2100,16 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_SM75_Q4_32) {
+        return ds4q_quantize_experimental_rows(
+            DS4Q_EXPERIMENT_SM75_Q4_32, type, src, dst, start,
+            nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_SM75_Q3A4) {
+        return ds4q_quantize_experimental_rows(
+            DS4Q_EXPERIMENT_SM75_Q3A_32_4, type, src, dst, start,
+            nrows, ncols, imatrix);
     }
     (void)src;
     (void)dst;

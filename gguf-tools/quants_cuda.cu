@@ -188,6 +188,173 @@ static __device__ float d_make_qp_quants(int n, int nmax,
     return suml2 > 0 ? sumlx / suml2 : 0;
 }
 
+static __device__ float d_make_qx_quants(int n, int nmax,
+                                         const float *x, int8_t *L,
+                                         const float *weights) {
+    float maxv = 0.0f, amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; maxv = x[i]; }
+    }
+    if (amax < GROUP_EPS) {
+        for (int i = 0; i < n; i++) L[i] = 0;
+        return 0.0f;
+    }
+    float iscale = -(float)nmax / maxv;
+    float sumlx = 0.0f, suml2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        int l = d_nearest(iscale * x[i]);
+        l = d_max_i(-nmax, d_min_i(nmax - 1, l));
+        L[i] = (int8_t)(l + nmax);
+        const float w = weights ? weights[i] : x[i] * x[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    float scale = suml2 ? sumlx / suml2 : 0.0f;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; is++) {
+        if (!is) continue;
+        iscale = -(nmax + 0.1f * is) / maxv;
+        sumlx = 0.0f; suml2 = 0.0f;
+        for (int i = 0; i < n; i++) {
+            int l = d_nearest(iscale * x[i]);
+            l = d_max_i(-nmax, d_min_i(nmax - 1, l));
+            const float w = weights ? weights[i] : x[i] * x[i];
+            sumlx += w * x[i] * l;
+            suml2 += w * l * l;
+        }
+        if (suml2 > 0.0f && sumlx * sumlx > best * suml2) {
+            for (int i = 0; i < n; i++) {
+                int l = d_nearest(iscale * x[i]);
+                l = d_max_i(-nmax, d_min_i(nmax - 1, l));
+                L[i] = (int8_t)(l + nmax);
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    return scale;
+}
+
+static __device__ void d_pack_signed_scales8(const int8_t in[8],
+                                              uint8_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+    for (int j = 0; j < 8; j++) {
+        const unsigned code = (unsigned)(uint8_t)in[j] & 63u;
+        if (j < 4) out[j] |= (uint8_t)(code & 15u);
+        else out[j - 4] |= (uint8_t)((code & 15u) << 4);
+        out[4 + j / 4] |= (uint8_t)((code >> 4) << (2 * (j % 4)));
+    }
+}
+
+static __device__ int d_unpack_signed_scale8(const uint8_t in[6], int j) {
+    const unsigned low = j < 4 ? in[j] & 15u : in[j - 4] >> 4;
+    const unsigned high = (in[4 + j / 4] >> (2 * (j % 4))) & 3u;
+    return (int)(low | (high << 4)) - 32;
+}
+
+static __device__ void d_pack_bits(const uint8_t *values, int n, int bits,
+                                   uint8_t *out) {
+    const int bytes = (n * bits + 7) / 8;
+    for (int i = 0; i < bytes; i++) out[i] = 0;
+    for (int i = 0, bit = 0; i < n; i++, bit += bits) {
+        const int byte = bit >> 3;
+        const int shift = bit & 7;
+        const unsigned value = values[i] & ((1u << bits) - 1u);
+        out[byte] |= (uint8_t)(value << shift);
+        if (shift + bits > 8)
+            out[byte + 1] |= (uint8_t)(value >> (8 - shift));
+    }
+}
+
+static __device__ unsigned d_unpack_bits(const uint8_t *data, int index,
+                                         int bits) {
+    const unsigned bit = (unsigned)index * (unsigned)bits;
+    const unsigned byte = bit >> 3;
+    const unsigned shift = bit & 7u;
+    unsigned value = data[byte] >> shift;
+    if (shift + (unsigned)bits > 8u)
+        value |= (unsigned)data[byte + 1] << (8u - shift);
+    return value & ((1u << bits) - 1u);
+}
+
+static __device__ void d_write_sm75_q4_32(const float *x, uint8_t *y,
+                                           const float *quant_weights) {
+    int8_t L[QK_K], Ls[8];
+    float scales[8], weights[32], sw[8];
+    float sumx2 = 0.0f;
+    for (int i = 0; i < QK_K; i++) sumx2 += x[i] * x[i];
+    const float sigma2 = 2.0f * sumx2 / QK_K;
+    for (int g = 0; g < 8; g++) {
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            const float xv = x[32 * g + i];
+            weights[i] = quant_weights
+                ? quant_weights[32 * g + i] * sqrtf(sigma2 + xv * xv)
+                : xv * xv;
+            sw[g] += weights[i];
+        }
+        scales[g] = d_make_qx_quants(32, 8, x + 32 * g,
+                                      L + 32 * g, weights);
+    }
+    const float dblock = d_make_qx_quants(8, 32, scales, Ls, sw);
+    const uint16_t hd = d_f16_bits(dblock);
+    d_store_u16(y, hd);
+    d_pack_signed_scales8(Ls, y + 2);
+    const float d = d_f16_value(hd);
+    for (int g = 0; g < 8; g++) {
+        const float scale = d * d_unpack_signed_scale8(y + 2, g);
+        if (!scale) continue;
+        for (int i = 0; i < 32; i++) {
+            int l = d_nearest(x[32 * g + i] / scale);
+            l = d_max_i(-8, d_min_i(7, l));
+            L[32 * g + i] = (int8_t)(l + 8);
+        }
+    }
+    for (int i = 0; i < 128; i++) y[8 + i] = 0;
+    for (int k = 0; k < QK_K; k++) {
+        const uint8_t code = (uint8_t)(L[k] - 8) & 15u;
+        y[8 + k / 2] |= (uint8_t)(code << (4 * (k & 1)));
+    }
+}
+
+static __device__ void d_write_sm75_q3a4(const float *x, uint8_t *y,
+                                          const float *quant_weights) {
+    uint8_t codes[QK_K], scratch[32], scales_q[8], mins_q[8];
+    float scales[8], mins[8], sw[8], weights[32];
+    float sumx2 = 0.0f;
+    for (int i = 0; i < QK_K; i++) sumx2 += x[i] * x[i];
+    const float sigma2 = 2.0f * sumx2 / QK_K;
+    for (int g = 0; g < 8; g++) {
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            const float xv = x[32 * g + i];
+            weights[i] = quant_weights
+                ? quant_weights[32 * g + i] * sqrtf(sigma2 + xv * xv)
+                : xv * xv;
+            sw[g] += weights[i];
+        }
+        scales[g] = d_make_qkx3_quants(32, 7, x + 32 * g, weights,
+            codes + 32 * g, &mins[g], scratch, -0.9f, 0.05f, 36);
+    }
+    const float dblock = d_make_qp_quants(8, 15, scales, scales_q, sw);
+    const float mblock = d_make_qp_quants(8, 15, mins, mins_q, sw);
+    const uint16_t hd = d_f16_bits(dblock), hm = d_f16_bits(mblock);
+    d_store_u16(y, hd); d_store_u16(y + 2, hm);
+    d_pack_bits(scales_q, 8, 4, y + 4);
+    d_pack_bits(mins_q, 8, 4, y + 8);
+    const float d = d_f16_value(hd), m = d_f16_value(hm);
+    for (int g = 0; g < 8; g++) {
+        const float scale = d * d_unpack_bits(y + 4, g, 4);
+        const float minv = m * d_unpack_bits(y + 8, g, 4);
+        for (int i = 0; i < 32; i++) {
+            int q = scale ? d_nearest((x[32 * g + i] + minv) / scale) : 0;
+            codes[32 * g + i] = (uint8_t)d_max_i(0, d_min_i(7, q));
+        }
+    }
+    d_pack_bits(codes, QK_K, 3, y + 12);
+}
+
 static __device__ __forceinline__ void d_get_scale_min_k4(
         int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
     if (j < 4) {
@@ -524,6 +691,24 @@ static __global__ __launch_bounds__(64) void iq2_xxs_kernel(
                      grid, map, neighbours);
 }
 
+static __global__ __launch_bounds__(64) void sm75_q4_32_kernel(
+        const float *src, uint8_t *dst, const float *imatrix,
+        int64_t nblocks, int64_t blocks_per_row) {
+    const int64_t b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    d_write_sm75_q4_32(src + b * QK_K, dst + b * 136,
+                       imatrix + (b % blocks_per_row) * QK_K);
+}
+
+static __global__ __launch_bounds__(64) void sm75_q3a4_kernel(
+        const float *src, uint8_t *dst, const float *imatrix,
+        int64_t nblocks, int64_t blocks_per_row) {
+    const int64_t b = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    d_write_sm75_q3a4(src + b * QK_K, dst + b * 108,
+                      imatrix + (b % blocks_per_row) * QK_K);
+}
+
 /* One CTA transforms one eight-row by one-Q4-block record. The first warp
  * copies the eight 16-byte headers; all eight warps emit one packed m8n8k32
  * B-fragment word apiece. */
@@ -557,6 +742,78 @@ static __global__ __launch_bounds__(256) void repack_sm75_native_q4_kernel(
                   << (4u * (i + 4u));
     }
     ((uint32_t *)(record_dst + 8u * 16u))[group * 32u + lane] = packed;
+}
+
+static __global__ __launch_bounds__(256) void repack_sm75_q4_32_kernel(
+        const uint8_t *src, uint8_t *dst,
+        uint64_t records, uint32_t blocks_per_row) {
+    const uint64_t record = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (record >= records) return;
+    const uint64_t tile = record / blocks_per_row;
+    const uint32_t block = (uint32_t)(record - tile * blocks_per_row);
+    const uint32_t group = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint64_t src_block =
+        ((tile * 8u + row) * blocks_per_row + block) * 136u;
+    uint8_t *out = dst + record * 1088u;
+    if (tid < 8u) {
+        const uint8_t *h = src +
+            ((tile * 8u + tid) * blocks_per_row + block) * 136u;
+        ((uint16_t *)out)[tid] = *(const uint16_t *)h;
+        for (uint32_t i = 0; i < 6u; i++)
+            out[16u + tid * 6u + i] = h[2u + i];
+    }
+    const uint8_t *qs = src + src_block + 8u;
+    uint32_t packed = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t k = group * 32u + lane4 * 8u + i;
+        const uint32_t code = (qs[k >> 1u] >> (4u * (k & 1u))) & 15u;
+        packed |= code << (4u * i);
+    }
+    ((uint32_t *)(out + 64u))[group * 32u + lane] = packed;
+}
+
+static __global__ __launch_bounds__(256) void repack_sm75_q3a4_kernel(
+        const uint8_t *src, uint8_t *dst,
+        uint64_t records, uint32_t blocks_per_row) {
+    const uint64_t record = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (record >= records) return;
+    const uint64_t tile = record / blocks_per_row;
+    const uint32_t block = (uint32_t)(record - tile * blocks_per_row);
+    const uint32_t group = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t row = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint64_t src_block =
+        ((tile * 8u + row) * blocks_per_row + block) * 108u;
+    uint8_t *out = dst + record * 864u;
+    if (tid < 8u) {
+        const uint8_t *h = src +
+            ((tile * 8u + tid) * blocks_per_row + block) * 108u;
+        ((uint16_t *)out)[tid] = *(const uint16_t *)h;
+        ((uint16_t *)(out + 16u))[tid] = *(const uint16_t *)(h + 2u);
+        for (uint32_t i = 0; i < 4u; i++) {
+            out[32u + tid * 4u + i] = h[4u + i];
+            out[64u + tid * 4u + i] = h[8u + i];
+        }
+    }
+    const uint8_t *qs = src + src_block + 12u;
+    uint16_t low = 0u;
+    uint8_t high = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t k = group * 32u + lane4 * 8u + i;
+        const uint32_t code = d_unpack_bits(qs, (int)k, 3);
+        low |= (uint16_t)(code & 3u) << (2u * i);
+        high |= (uint8_t)((code >> 2u) & 1u) << i;
+    }
+    ((uint16_t *)(out + 96u))[group * 32u + lane] = low;
+    out[608u + group * 32u + lane] = high;
 }
 
 struct cuda_thread_state {
@@ -671,7 +928,9 @@ static bool ensure_device(int device, bool need_iq2, char *error, size_t error_c
 }
 
 bool ds4q_cuda_type_supported(ds4q_type type) {
-    return type == DS4Q_TYPE_IQ2_XXS || type == DS4Q_TYPE_Q4_K || type == DS4Q_TYPE_Q2_K;
+    return type == DS4Q_TYPE_IQ2_XXS || type == DS4Q_TYPE_Q4_K ||
+           type == DS4Q_TYPE_Q2_K || type == DS4Q_TYPE_SM75_Q4_32 ||
+           type == DS4Q_TYPE_SM75_Q3A4;
 }
 
 int ds4q_cuda_device_count(char *error, size_t error_cap) {
@@ -706,7 +965,9 @@ size_t ds4q_cuda_quantize_chunk(ds4q_type type,
     const size_t src_bytes = (size_t)nrows * (size_t)ncols * sizeof(float);
     const size_t imatrix_bytes = (size_t)ncols * sizeof(float);
     const size_t block_bytes = type == DS4Q_TYPE_IQ2_XXS ? 66 :
-                               type == DS4Q_TYPE_Q4_K ? 144 : 84;
+                               type == DS4Q_TYPE_Q4_K ? 144 :
+                               type == DS4Q_TYPE_Q2_K ? 84 :
+                               type == DS4Q_TYPE_SM75_Q4_32 ? 136 : 108;
     const size_t dst_bytes = (size_t)nblocks * block_bytes;
     if (!ensure_allocation((void **)&tls.src, &tls.src_cap, src_bytes, error, error_cap) ||
         !ensure_allocation((void **)&tls.imatrix, &tls.imatrix_cap, imatrix_bytes, error, error_cap) ||
@@ -732,12 +993,43 @@ size_t ds4q_cuda_quantize_chunk(ds4q_type type,
     } else if (type == DS4Q_TYPE_Q4_K) {
         q4_k_kernel<<<blocks, threads, 0, tls.stream>>>(
                 tls.src, tls.dst, tls.imatrix, nblocks, blocks_per_row);
+    } else if (type == DS4Q_TYPE_SM75_Q4_32) {
+        sm75_q4_32_kernel<<<blocks, threads, 0, tls.stream>>>(
+                tls.src, tls.dst, tls.imatrix, nblocks, blocks_per_row);
+    } else if (type == DS4Q_TYPE_SM75_Q3A4) {
+        sm75_q3a4_kernel<<<blocks, threads, 0, tls.stream>>>(
+                tls.src, tls.dst, tls.imatrix, nblocks, blocks_per_row);
     } else {
         q2_k_kernel<<<blocks, threads, 0, tls.stream>>>(
                 tls.src, tls.dst, tls.imatrix, nblocks, blocks_per_row);
     }
     st = cudaGetLastError();
-    if (st == cudaSuccess) st = cudaMemcpyAsync(dst, tls.dst, dst_bytes,
+    const uint8_t *device_output = tls.dst;
+    if (st == cudaSuccess && (type == DS4Q_TYPE_SM75_Q4_32 ||
+                             type == DS4Q_TYPE_SM75_Q3A4)) {
+        if ((nrows & 7) != 0) {
+            if (error && error_cap)
+                snprintf(error, error_cap,
+                         "SM75 Q32 output requires a multiple of eight rows");
+            return 0;
+        }
+        const uint64_t records = (uint64_t)(nrows / 8) *
+                                 (uint64_t)blocks_per_row;
+        if (type == DS4Q_TYPE_SM75_Q4_32) {
+            repack_sm75_q4_32_kernel<<<
+                (unsigned)records, 256, 0, tls.stream>>>(
+                    tls.dst, (uint8_t *)tls.src, records,
+                    (uint32_t)blocks_per_row);
+        } else {
+            repack_sm75_q3a4_kernel<<<
+                (unsigned)records, 256, 0, tls.stream>>>(
+                    tls.dst, (uint8_t *)tls.src, records,
+                    (uint32_t)blocks_per_row);
+        }
+        st = cudaGetLastError();
+        device_output = (const uint8_t *)tls.src;
+    }
+    if (st == cudaSuccess) st = cudaMemcpyAsync(dst, device_output, dst_bytes,
                                                 cudaMemcpyDeviceToHost, tls.stream);
     if (st == cudaSuccess) st = cudaStreamSynchronize(tls.stream);
     if (st != cudaSuccess) {
