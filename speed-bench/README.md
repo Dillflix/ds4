@@ -1801,6 +1801,25 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
 
 Return `sm75-attention-rowsplit-production-<timestamp>.tar.gz`.
 
+After accepting the indexed-chain crossover, set `AB_TARGET=mixed` to isolate
+the incremental decode-mixed row split. The baseline keeps the accepted
+indexed-chain split; the candidate adds only mixed-attention splitting. Both
+arms require the complete 344/344 dense-F16 cache, validate the requested paths
+on both physical NVLink pairs, and compare every frontier's logits byte for
+byte:
+
+```bash
+AB_TARGET=mixed \
+CTX_START=2048 \
+CTX_MAX=32768 \
+STEP_MUL=2 \
+CTX_ALLOC=32769 \
+REPEATS=3 \
+RUN_HARNESS=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
+```
+
 The full crossover sweep is:
 
 ```bash

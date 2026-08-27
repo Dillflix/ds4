@@ -42,6 +42,7 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_rows_mixed_requested(void);
 uint32_t ds4_test_q8_cache_class(const char *name);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -858,10 +859,14 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    char *old_mixed = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED");
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "CUDA TP query-row splitting remains off before production A/B");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_mixed_requested(),
+          "CUDA TP mixed-attention row splitting remains off before production A/B");
 
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "1", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
@@ -871,7 +876,16 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "CUDA TP query-row splitting accepts an explicit zero");
 
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED", "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_mixed_requested(),
+          "CUDA TP mixed-attention row splitting accepts an explicit opt-in");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_mixed_requested(),
+          "CUDA TP mixed-attention row splitting accepts an explicit zero");
+
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
+    restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED", old_mixed);
 }
 
 static void test_cuda_tp_prefill_default_accounting(void) {

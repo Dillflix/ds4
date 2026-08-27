@@ -15448,6 +15448,20 @@ static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
 #endif
 }
 
+static bool cuda_tp_prefill_attn_rows_mixed_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED");
+    /* This is an evidence-only extension of the accepted indexed-chain row
+     * split.  It uses the same partner-local raw/compressed KV mirrors, but
+     * additionally splits production decode-mixed attention.  Keep it behind
+     * an independent opt-in until a full-cache indexed-only versus
+     * indexed+mixed production A/B establishes the transfer-inclusive win. */
+    return env && env[0] && strcmp(env, "0") != 0;
+#endif
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -15736,6 +15750,7 @@ typedef struct {
     bool cuda_tp_prefill_attn_output;
     bool cuda_tp_prefill_attn_heads;
     bool cuda_tp_prefill_attn_rows;
+    bool cuda_tp_prefill_attn_rows_mixed;
     bool cuda_q_norm_rope_fuse;
     bool cuda_qkv_kv_rope_fuse;
     bool cuda_qkv_pair;
@@ -17309,6 +17324,14 @@ static bool metal_graph_cuda_tp_prefill_attn_rows_requested(void) {
 #endif
 }
 
+static bool metal_graph_cuda_tp_prefill_attn_rows_mixed_requested(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    return cuda_tp_prefill_attn_rows_mixed_env_enabled();
+#endif
+}
+
 static uint32_t metal_graph_cuda_prefill_pipeline_microbatch(void) {
     const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_MB");
     if (env && env[0]) {
@@ -17383,8 +17406,13 @@ static bool metal_graph_alloc_raw_cap(
     g->cuda_tp_attn = g->cuda_tp_decode && metal_graph_cuda_tp_attn_requested();
     g->cuda_tp_attn_peer_read = metal_graph_cuda_tp_attn_peer_read_requested();
     g->cuda_tp_attn_heads = g->cuda_tp_decode && metal_graph_cuda_tp_attn_heads_requested();
-    g->cuda_tp_prefill_attn_rows =
-        g->cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_rows_requested();
+    const bool cuda_tp_prefill_attn_rows_mixed_requested =
+        metal_graph_cuda_tp_prefill_attn_rows_mixed_requested();
+    g->cuda_tp_prefill_attn_rows = g->cuda_tp_decode &&
+        (metal_graph_cuda_tp_prefill_attn_rows_requested() ||
+         cuda_tp_prefill_attn_rows_mixed_requested);
+    g->cuda_tp_prefill_attn_rows_mixed =
+        g->cuda_tp_decode && cuda_tp_prefill_attn_rows_mixed_requested;
     g->cuda_tp_attn_cache_dup =
         (g->cuda_tp_attn_heads && metal_graph_cuda_tp_attn_cache_dup_requested()) ||
         g->cuda_tp_prefill_attn_rows;
@@ -29337,7 +29365,25 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         &index_stage_t0);
                     }
                 } else {
-                    if (cuda_tp_prefill_heads && !use_comp_mask) {
+                    if (g->cuda_tp_prefill_attn_rows_mixed &&
+                        !use_comp_mask) {
+                        if (!metal_graph_cuda_tp_prefill_attention_rows_active(
+                                g, layer, il, pos0, n_tokens, n_raw)) {
+                            fprintf(stderr,
+                                    "ds4: CUDA prefill mixed-attention "
+                                    "query-row split required but unavailable "
+                                    "for layer=%u pos=%u tokens=%u raw=%u\n",
+                                    il, pos0, n_tokens, n_raw);
+                            ok = false;
+                        } else {
+                            ok = metal_graph_cuda_tp_prefill_attention_rows_launch(
+                                    g, model, layer, il,
+                                    DS4_CUDA_PREFILL_ATTN_DECODE_MIXED,
+                                    NULL, n_tokens, pos0, n_raw, g->raw_cap,
+                                    raw_start, n_comp, 0u, g->raw_window,
+                                    ratio);
+                        }
+                    } else if (cuda_tp_prefill_heads && !use_comp_mask) {
                         ok = metal_graph_cuda_tp_prefill_attention_launch(
                                 g, model, layer, DS4_CUDA_PREFILL_ATTN_DECODE_MIXED,
                                 g->layer_raw_cache[il],
@@ -34278,11 +34324,12 @@ static void metal_graph_report_cuda_prefill_audit(
             "ds4: CUDA prefill audit tokens=%u microbatch_cap=%u microbatches=%u stages=%u waves=%u\n",
             n_tokens, mb_cap, n_mb, n_stages, waves);
     fprintf(stderr,
-            "ds4: CUDA prefill audit features pipeline=1 expert_parallel=%d q8_f16_cache=%d attention_head_split=%d attention_row_split=%d\n",
+            "ds4: CUDA prefill audit features pipeline=1 expert_parallel=%d q8_f16_cache=%d attention_head_split=%d attention_row_split=%d attention_mixed_row_split=%d\n",
             g->cuda_tp_ep ? 1 : 0,
             metal_graph_cuda_prefill_pipeline_q8_cache_requested() ? 1 : 0,
             g->cuda_tp_prefill_attn_heads ? 1 : 0,
-            g->cuda_tp_prefill_attn_rows ? 1 : 0);
+            g->cuda_tp_prefill_attn_rows ? 1 : 0,
+            g->cuda_tp_prefill_attn_rows_mixed ? 1 : 0);
     for (uint32_t s = 0; s < n_stages; s++) {
         const uint32_t layers = stages[s].end_layer - stages[s].first_layer;
         const int partner = metal_graph_cuda_tp_partner_tier(stages[s].tier);
@@ -57429,6 +57476,10 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
     return cuda_tp_prefill_attn_rows_env_enabled();
+}
+
+bool ds4_test_cuda_tp_prefill_attn_rows_mixed_requested(void) {
+    return cuda_tp_prefill_attn_rows_mixed_env_enabled();
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
