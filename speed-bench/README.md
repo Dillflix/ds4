@@ -1125,6 +1125,54 @@ templates. It deliberately repeats T64/T128 because changes to the common Q8
 loader can change every template's memory instruction stream.
 `NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
 
+### SM75 Q3_K, Q3-32, and Q4-32 experiment
+
+`cuda-sm75-q3-q4-32.sh` is the model-free arithmetic and native-layout gate
+for the format contracts in
+[`SM75_Q3_Q4_32_DESIGN.md`](../SM75_Q3_Q4_32_DESIGN.md). It compares four
+M16xN8xK256 warp kernels with eight warps per 256-thread CTA:
+
+- the existing affine Q4_K K32 arithmetic in a 1152-byte native tile, with
+  independent scale and minimum accumulator chains;
+- standard 110-byte Q3_K, losslessly repacked into an 880-byte native tile
+  and executed exactly with K16 S8xU8 MMA plus `-4*bsum`;
+- the experimental 104-byte Q3-32 format in an 832-byte native tile, using
+  two K32 INT4 MMAs plus `-4*bsum`;
+- the experimental symmetric 136-byte Q4-32 format in a 1088-byte native
+  tile, using signed-B K32 INT4 MMA without an affine-minimum correction.
+
+The harness carries opaque FP16 headers but deliberately measures only the
+exact integer-accumulator component; it does not claim floating-output or
+quantizer-byte exactness. It exhaustively validates Q3_K unpacking and
+each Q3-32 bit plane, samples mixed Q3-32 states deterministically, checks
+canonical/native byte round trips, and compares adversarial and seeded-random
+MMA accumulators with separate scalar references. Its hot
+and L2-exceeding tests use each format's real byte footprint. The runner also
+records SASS/resource evidence, runs Compute Sanitizer when available, and
+profiles occupancy, tensor-pipe activity, memory traffic, and stalls with a
+direct harness process.
+
+This is not yet a quantizer, GGUF loader, routed-MoE dispatch, quality result,
+or end-to-end speed claim. Standard Q3_K must later match the upstream
+quantizer byte-for-byte. Q3-32 and Q4-32 require private versioned type/layout
+tags and real-weight quality gates before a full model is generated.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+./speed-bench/cuda-sm75-q3-q4-32.sh
+```
+
+Return `sm75-q3-q4-32-<timestamp>.tar.gz`. The first decision boundary is
+whether exact Q3_K and Q3-32 remain close enough to native Q4_K in both hot
+and streamed tests to justify a production-shaped routed-expert prototype.
+
 ### SM75 packed-INT4 Q4 experiment
 
 `cuda-sm75-int4-mma-experiment.sh` is a bounded, model-free screening
