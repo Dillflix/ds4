@@ -27423,6 +27423,9 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_INDEXED = 3,
 } ds4_cuda_prefill_attn_kind;
 
+static bool metal_graph_cuda_timeline_pushf(const char *fmt, ...);
+static void metal_graph_cuda_timeline_pop(bool active);
+
 static bool metal_graph_cuda_tp_prefill_heads_active(
         const ds4_gpu_graph *g,
         const ds4_layer_weights *layer,
@@ -27607,6 +27610,11 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     const uint64_t q_row_values = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t q_half_bytes = (uint64_t)rows * q_row_values * sizeof(float);
     const uint64_t topk_half_bytes = (uint64_t)rows * top_k * sizeof(uint32_t);
+    const bool timeline_range = metal_graph_cuda_timeline_pushf(
+        "ds4/prefill/attention-rows/kind=%s/layer=%u/pos=%u/tokens=%u/"
+        "home_tier=%d/partner_tier=%d/home_rows=%u/partner_rows=%u",
+        kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+        il, pos0, n_tokens, home, partner, rows, rows);
 
     ds4_gpu_tensor *home_q = metal_graph_tensor_row_range_view(
         g->batch_q_by_tier[home], 0, rows, q_row_values);
@@ -27708,6 +27716,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     ds4_gpu_tensor_free(peer_q_dst);
     ds4_gpu_tensor_free(peer_q_src);
     ds4_gpu_tensor_free(home_q);
+    metal_graph_cuda_timeline_pop(timeline_range);
     return ok;
 #endif
 }

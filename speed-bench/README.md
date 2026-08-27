@@ -1499,8 +1499,11 @@ representative early/late native-Q4 gate/down and IQ2 tile16/tile8 calls, plus
 512-token T32 and T256 dense-F16 cuBLAS calls. The reports include occupancy,
 compute/memory throughput, cache traffic, and warp-stall sections. The
 production trace separately attributes stage/device work, communication,
-activation conversion, both NVLink copies, and partner cuBLAS through existing
-NVTX correlation ranges. A 200 ms `nvidia-smi` stream records utilization,
+activation conversion, both NVLink copies, partner cuBLAS, and attention
+row-split kernels/copies through semantic NVTX correlation ranges. Its summary
+separates local FP16 GEMMs, indexer work, format/quantization/packing, norms and
+hyperconnections, RoPE, compressor work, and any genuinely unknown kernels;
+it also emits per-device/per-stage group totals. A 200 ms `nvidia-smi` stream records utilization,
 power, clocks, temperature, and memory while a device-buffer tile audit records
 real pair/tile/padding/ownership counts with one final host copy.
 At `PROFILE_TOKENS=32768`, targeted Nsight Compute is enabled automatically
@@ -1538,6 +1541,22 @@ RUN_ATTENTION_NCU=1 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-native-q4-t256-profile.sh
+```
+
+To rank the post-row-split production bottlenecks without another Nsight
+Compute pass, capture one unsynchronized 32K Systems trace. The script clears
+all inherited `DS4_*` variables, explicitly records `xdev_sync=disabled`, and
+fails unless both qualified row splits are active:
+
+```bash
+PROFILE_TOKENS=32768 \
+CTX_ALLOC=262273 \
+RUN_NCU=0 \
+RUN_ATTENTION_NCU=0 \
+NCU_USE_SUDO=0 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
 ./speed-bench/cuda-sm75-native-q4-t256-profile.sh
 ```
 
@@ -1729,7 +1748,8 @@ quality through the actual production CLI. It places a verification word before
 a long public-domain distractor, requires a prompt of at least 24K tokens, and
 greedily requests exactly that one word. No row-split enable override is set:
 the log must prove that the qualified default dispatched both indexed and mixed
-row-split attention on both stages without fallback.
+row-split attention on both stages without fallback. Cross-device synchronization
+is not forced, so the smoke preserves normal production overlap.
 
 ```bash
 cd ~/ds4-iq2-q4

@@ -16,8 +16,8 @@ SUMMARIZER = ROOT / "speed-bench" / "summarize-sm75-native-q4-t256-profile.py"
 FIELDS = [
     "trace", "kind", "start_ns", "end_ns", "duration_ns", "device",
     "stream", "bytes", "name", "stage_range", "layer_range",
-    "handoff_range", "partner_range", "wave_range", "embedding_range",
-    "output_range",
+    "handoff_range", "partner_range", "attention_rows_range", "wave_range",
+    "embedding_range", "output_range",
 ]
 
 
@@ -43,6 +43,24 @@ def main() -> int:
             operation(name="moe_down_sm75_native_q4_tile_kernel<512,16>"),
             operation(name="matmul_q8_0_mma_sm75_exact_kernel<256>"),
             operation(name="attention_exact_kernel"),
+            operation(name="turing_s1688gemm_fp16_256x128_ldg8_tn"),
+            operation(name="indexer_scores_wmma128_kernel"),
+            operation(name="q8_K_quantize_kernel"),
+            operation(name="hc_expand_kernel"),
+            operation(name="rope_tail_kernel"),
+            operation(name="compressor_set_rows_kernel"),
+            operation(name="add_kernel"),
+            operation(name="unclassified_synthetic_kernel"),
+            operation(
+                kind="memcpy",
+                name="memcpy",
+                attention_rows_range=(
+                    "ds4/prefill/attention-rows/kind=indexed/layer=2/"
+                    "pos=0/tokens=512/home_tier=0/partner_tier=2/"
+                    "home_rows=256/partner_rows=256"
+                ),
+                bytes=32 * 1024 * 1024,
+            ),
         ]
         partner = (
             "ds4/q8/partner/label=attn_output_b/"
@@ -117,7 +135,16 @@ def main() -> int:
         assert evidence["groups"]["partner_t256_cublas"]["operations"] == 84
         assert evidence["groups"]["partner_t256_memcpy"]["operations"] == 168
         assert evidence["groups"]["iq2_gate_up"]["operations"] == 2
+        assert evidence["groups"]["local_fp16_gemm"]["operations"] == 1
+        assert evidence["groups"]["indexer"]["operations"] == 1
+        assert evidence["groups"]["format_quant_pack"]["operations"] == 1
+        assert evidence["groups"]["norm_hyperconnection"]["operations"] == 1
+        assert evidence["groups"]["attention_row_split_memcpy"]["operations"] == 1
+        assert evidence["groups"]["other_unknown"]["operations"] == 1
         assert (output / "combined-kernel-groups.csv").stat().st_size > 0
+        assert (output / "kernel-name-groups.csv").stat().st_size > 0
+        assert (output / "kernel-groups-device-stage.csv").stat().st_size > 0
+        assert (output / "unknown-kernels.csv").stat().st_size > 0
         assert (output / "partner-t256-ranges.csv").stat().st_size > 0
     print("combined native-Q4/T256 profile summarizer test: OK")
     return 0

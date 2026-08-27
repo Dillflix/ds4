@@ -47,6 +47,10 @@ def classify(row: dict[str, str]) -> str:
         if "f32_to_f16_kernel" in name:
             return "partner_t256_activation_convert"
         return "partner_t256_cublas"
+    if row["kind"] == "memcpy" and row.get("attention_rows_range", ""):
+        return "attention_row_split_memcpy"
+    if row["kind"] == "memcpy" and row["handoff_range"]:
+        return "stage_handoff_memcpy"
     if row["kind"] == "memcpy":
         return "other_memcpy"
     if "moe_gate_up_mid_sm75_native_q4_tile8_kernel" in name:
@@ -58,13 +62,49 @@ def classify(row: dict[str, str]) -> str:
         return "iq2_gate_up"
     if "moe_down_sm75_native_q4_tile_kernel" in name:
         return "native_q4_down"
-    if "matmul_q8_0_mma_sm75_exact_kernel" in name:
+    if "matmul_q8_0_" in name:
         return "dense_q8_native"
     if "attention" in lower:
         return "attention"
     if "moe_" in lower:
         return "other_moe"
-    return "other"
+    if any(
+        marker in lower
+        for marker in (
+            "turing_s", "cutlass::kernel2", "cublaslt::splitkreduce",
+            "gemvx::kernel",
+        )
+    ):
+        return "local_fp16_gemm"
+    if "indexer_" in lower or "indexed_topk_" in lower:
+        return "indexer"
+    if any(
+        marker in lower
+        for marker in (
+            "f32_to_f16", "q8_k_quantize", "q8_k_pack",
+            "fp8_kv_quantize", "quantize_q8_0",
+        )
+    ):
+        return "format_quant_pack"
+    if any(
+        marker in lower
+        for marker in ("rms_norm", "hc_", "dsv4_qkv_rms")
+    ):
+        return "norm_hyperconnection"
+    if "compressor_" in lower:
+        return "compressor"
+    if "rope_" in lower:
+        return "rope"
+    if any(
+        marker in lower
+        for marker in (
+            "add_kernel", "swiglu_kernel", "router_select_",
+            "store_raw_kv_", "fill_f32_kernel", "embed_tokens_",
+            "output_hc_weights_",
+        )
+    ):
+        return "elementwise_control"
+    return "other_unknown"
 
 
 def main() -> int:
@@ -100,6 +140,12 @@ def main() -> int:
     groups: dict[str, dict[str, int]] = defaultdict(
         lambda: {"duration_ns": 0, "operations": 0, "bytes": 0}
     )
+    kernel_names: dict[tuple[str, str], dict[str, int]] = defaultdict(
+        lambda: {"duration_ns": 0, "operations": 0}
+    )
+    kernel_stage_device: dict[
+        tuple[str, int, str, str], dict[str, int]
+    ] = defaultdict(lambda: {"duration_ns": 0, "operations": 0})
     partner_ranges: dict[str, dict[str, object]] = {}
     partner_range_labels: set[str] = set()
     partner_shape_errors: list[str] = []
@@ -109,6 +155,20 @@ def main() -> int:
         values["duration_ns"] += int(row["duration_ns"])
         values["operations"] += 1
         values["bytes"] += int(row["bytes"])
+        if row["kind"] == "kernel":
+            name_values = kernel_names[(group, row["name"])]
+            name_values["duration_ns"] += int(row["duration_ns"])
+            name_values["operations"] += 1
+            stage_fields = parse_range(row["stage_range"])
+            stage_key = (
+                group,
+                int(row["device"]),
+                stage_fields.get("stage", "outside"),
+                stage_fields.get("tier", "outside"),
+            )
+            stage_values = kernel_stage_device[stage_key]
+            stage_values["duration_ns"] += int(row["duration_ns"])
+            stage_values["operations"] += 1
         range_name = row["partner_range"]
         if not range_name:
             continue
@@ -218,6 +278,64 @@ def main() -> int:
         group_rows,
     )
 
+    kernel_name_rows = [
+        {
+            "group": group,
+            "name": name,
+            "duration_ns": values["duration_ns"],
+            "kernel_time_pct": (
+                f"{100.0 * values['duration_ns'] / kernel_total_ns:.6f}"
+                if kernel_total_ns else "0.000000"
+            ),
+            "operations": values["operations"],
+        }
+        for (group, name), values in kernel_names.items()
+    ]
+    kernel_name_rows.sort(
+        key=lambda item: int(item["duration_ns"]), reverse=True
+    )
+    write_csv(
+        output / "kernel-name-groups.csv",
+        ["group", "name", "duration_ns", "kernel_time_pct", "operations"],
+        kernel_name_rows,
+    )
+    write_csv(
+        output / "unknown-kernels.csv",
+        ["group", "name", "duration_ns", "kernel_time_pct", "operations"],
+        [row for row in kernel_name_rows if row["group"] == "other_unknown"],
+    )
+
+    stage_device_rows = [
+        {
+            "group": group,
+            "device": device,
+            "stage": stage,
+            "tier": tier,
+            "duration_ns": values["duration_ns"],
+            "kernel_time_pct": (
+                f"{100.0 * values['duration_ns'] / kernel_total_ns:.6f}"
+                if kernel_total_ns else "0.000000"
+            ),
+            "operations": values["operations"],
+        }
+        for (group, device, stage, tier), values
+        in kernel_stage_device.items()
+    ]
+    stage_device_rows.sort(
+        key=lambda item: (
+            str(item["stage"]), int(item["device"]),
+            -int(item["duration_ns"]),
+        )
+    )
+    write_csv(
+        output / "kernel-groups-device-stage.csv",
+        [
+            "group", "device", "stage", "tier", "duration_ns",
+            "kernel_time_pct", "operations",
+        ],
+        stage_device_rows,
+    )
+
     partner_rows = sorted(
         partner_ranges.values(), key=lambda item: str(item["label"])
     )
@@ -267,7 +385,11 @@ def main() -> int:
             "native_q4_gate_up", "iq2_gate_up", "native_q4_down",
             "partner_t256_activation_convert", "partner_t256_cublas",
             "partner_t256_memcpy", "dense_q8_native", "attention",
-            "other_moe", "other", "other_memcpy",
+            "local_fp16_gemm", "norm_hyperconnection", "indexer",
+            "format_quant_pack", "other_moe", "elementwise_control",
+            "rope", "compressor", "other_unknown",
+            "attention_row_split_memcpy", "stage_handoff_memcpy",
+            "other_memcpy",
         ):
             row = by_name.get(name)
             if not row:
@@ -290,6 +412,11 @@ def main() -> int:
             "memory, and warp-stall evidence for the requested bounded "
             "kernel set (full routed/dense coverage or targeted 32K "
             "attention).\n"
+        )
+        handle.write(
+            "`kernel-name-groups.csv` preserves every kernel name and "
+            "`kernel-groups-device-stage.csv` exposes stage/device "
+            "asymmetry; no broad `other` kernel bucket is used.\n"
         )
     print((output / "summary.md").read_text(encoding="utf-8"), end="")
     return 0

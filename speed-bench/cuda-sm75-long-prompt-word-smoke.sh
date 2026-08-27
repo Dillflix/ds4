@@ -130,6 +130,7 @@ phase=manifest
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_alloc=%s\ngen_tokens=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
         "$CTX_ALLOC" "$GEN_TOKENS"
+    printf 'xdev_sync=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'
@@ -151,7 +152,6 @@ phase=production-generation
     DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
-    DS4_CUDA_SYNC_XDEV=1 \
     ./ds4 --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --ctx "$CTX_ALLOC" --prefill-chunk 2048 \

@@ -108,10 +108,15 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
         layer = enclosing_range(host_ranges, api_start, "ds4/prefill/layer/")
         handoff = enclosing_range(host_ranges, api_start, "ds4/prefill/handoff/")
         partner = enclosing_range(host_ranges, api_start, "ds4/q8/partner/")
+        attention_rows = enclosing_range(
+            host_ranges, api_start, "ds4/prefill/attention-rows/"
+        )
         wave = enclosing_range(host_ranges, api_start, "ds4/prefill/wave/")
         embedding = enclosing_range(host_ranges, api_start, "ds4/prefill/embedding/")
         output = enclosing_range(host_ranges, api_start, "ds4/prefill/output/")
-        if not any((stage, handoff, partner, wave, embedding, output)):
+        if not any(
+            (stage, handoff, partner, attention_rows, wave, embedding, output)
+        ):
             return
         operations.append(
             {
@@ -128,6 +133,9 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
                 "layer_range": layer.text if layer else "",
                 "handoff_range": handoff.text if handoff else "",
                 "partner_range": partner.text if partner else "",
+                "attention_rows_range": (
+                    attention_rows.text if attention_rows else ""
+                ),
                 "wave_range": wave.text if wave else "",
                 "embedding_range": embedding.text if embedding else "",
                 "output_range": output.text if output else "",
@@ -249,8 +257,8 @@ def main() -> int:
     op_fields = [
         "trace", "kind", "start_ns", "end_ns", "duration_ns", "device",
         "stream", "bytes", "name", "stage_range", "layer_range",
-        "handoff_range", "partner_range", "wave_range", "embedding_range",
-        "output_range",
+        "handoff_range", "partner_range", "attention_rows_range",
+        "wave_range", "embedding_range", "output_range",
     ]
     write_csv(output_dir / "operation-attribution.csv", op_fields, all_ops)
 
@@ -313,6 +321,11 @@ def main() -> int:
         output_dir / "handoff-device-summary.csv",
         named_fields,
         summarize_named_ranges("handoff_range"),
+    )
+    write_csv(
+        output_dir / "attention-row-split-summary.csv",
+        named_fields,
+        summarize_named_ranges("attention_rows_range"),
     )
 
     stage_mb_rows = []

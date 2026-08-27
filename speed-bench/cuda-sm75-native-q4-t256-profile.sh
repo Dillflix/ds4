@@ -314,6 +314,7 @@ phase=manifest
     printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
         "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 't256_policy=automatic-balanced\nt256_local_layers=even\nt256_partner_layers=odd\npartner_arithmetic=f16\n'
+    printf 'attention_rows_policy=automatic-qualified\nxdev_sync=disabled\n'
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\nncu_set=%s\nrun_attention_ncu=%s\n' \
         "$PROFILE_GPU" "$PROFILE_PARTNER_GPU" "$RUN_NCU" "$NCU_SET" \
         "$RUN_ATTENTION_NCU"
@@ -425,6 +426,10 @@ for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
 done
 [[ $(grep -Fc 'qualified=yes' "$base.log") == 2 ]] ||
     die "production trace did not qualify both SM75 NVLink pairs"
+[[ $(grep -Fc 'CUDA prefill attention query-row split enabled:' "$base.log") == 2 ]] ||
+    die "production trace did not enable both qualified attention row splits"
+! grep -Fq 'required but unavailable' "$base.log" ||
+    die "production trace encountered an eligible but unavailable row split"
 awk '
     /^ds4: routed-quant-audit layer=/ {
         count++
@@ -634,8 +639,10 @@ fi
 
 phase=complete
 for required in summary.md combined-profile.json combined-kernel-groups.csv \
-                partner-t256-ranges.csv stage-device-summary.csv \
-                partner-projection-summary.csv nsys/combined.nsys-rep \
+                kernel-name-groups.csv kernel-groups-device-stage.csv \
+                unknown-kernels.csv partner-t256-ranges.csv \
+                stage-device-summary.csv partner-projection-summary.csv \
+                attention-row-split-summary.csv nsys/combined.nsys-rep \
                 nsys/bindings.csv nsys/allocations.csv nsys/memory.csv \
                 nsys/plan.csv nsys/q8-cache-audit.csv \
                 nsys/routed-tile-audit.csv; do

@@ -75,6 +75,17 @@ def create_trace(path: Path, stage_devices: tuple[int, int], durations: tuple[in
                     None,
                 )
             )
+            ranges.append(
+                (
+                    base + 35,
+                    base + 590,
+                    7,
+                    "ds4/prefill/attention-rows/kind=indexed/layer=0/"
+                    "pos=0/tokens=512/home_tier=0/partner_tier=2/"
+                    "home_rows=256/partner_rows=256",
+                    None,
+                )
+            )
         db.executemany("INSERT INTO NVTX_EVENTS VALUES(?,?,?,?,?)", ranges)
         correlation = stage + 1
         db.execute(
@@ -126,6 +137,7 @@ def main() -> int:
         assert {row["role"] for row in stage_rows} == {"home"}
         assert len(read_rows(out / "layer-device-summary.csv")) == 4
         assert len(read_rows(out / "partner-projection-summary.csv")) == 2
+        assert len(read_rows(out / "attention-row-split-summary.csv")) == 2
         harness = read_rows(out / "same-work-gpu-summary.csv")
         assert len(harness) == 1
         assert math.isclose(float(harness[0]["gpu3_over_gpu0"]), 1.1)
