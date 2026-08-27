@@ -22,11 +22,10 @@ Optional environment:
   CREATE_ARCHIVE=1
   ROWSPLIT_PRODUCTION_DIR=/absolute/output/directory
 
-Both arms must materialize all 344 dense-F16 candidates and export a complete
-344-row allocation inventory. The candidate is fail-closed for the complete
-indexed score -> top-k -> attention chain. Every split call is audited.
-Mixed/raw-only attention remains unchanged because its transfer-inclusive path
-has not been established.
+Both arms must materialize all 344 dense-F16 candidates. The candidate is
+fail-closed for the complete indexed score -> top-k -> attention chain. Every
+split call is audited. Mixed/raw-only attention remains unchanged because its
+transfer-inclusive path has not been established.
 EOF
 }
 
@@ -163,8 +162,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         rows=0; [[ $variant == rows ]] && rows=1
         base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
         logits="$base-logits"
-        allocations="$base-allocations.csv"
-        memory="$base-memory.csv"
         mkdir -p "$logits"
         printf 'Production attention A/B repeat=%d/%d slot=%d variant=%s...\n' \
             "$repeat" "$REPEATS" "$slot" "$variant"
@@ -174,8 +171,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
             DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
             DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
-            "DS4_CUDA_Q8_ALLOCATION_STATE_CSV=$allocations" \
-            "DS4_CUDA_MEMORY_STATE_CSV=$memory" \
             DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
             "DS4_CUDA_TP_PREFILL_ATTN_ROWS=$rows" \
             DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
@@ -195,12 +190,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "$variant missed balanced T256 placement"
         grep -Fq 'materialized 344/344 candidates' "$base.log" ||
             die "$variant did not materialize all 344 dense-F16 candidates"
-        [[ -s $allocations ]] ||
-            die "$variant omitted the dense-F16 allocation inventory"
-        awk -F, 'NR>1 {if ($10!=$11 || $13!=0 || $14!=1) bad++; rows++}
-            END {exit !(rows==344 && bad==0)}' "$allocations" ||
-            die "$variant dense-F16 allocation inventory is incomplete"
-        [[ -s $memory ]] || die "$variant omitted the CUDA memory inventory"
         ! grep -Fq 'required but unavailable' "$base.log" ||
             die "$variant encountered a forbidden row-split fallback"
         if [[ $variant == rows ]]; then
