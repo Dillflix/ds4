@@ -31,7 +31,7 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -Werror=implicit-function-declaration -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score quality-llama-score
+.PHONY: all clean quality-score quality-llama-score test-experimental-quants
 
 all: deepseek4-quantize
 
@@ -56,6 +56,15 @@ test_quants_cuda.o: test_quants_cuda.c quants.h quants_cuda.h Makefile
 test-quants-cuda: test_quants_cuda.o quants-cuda-host.o quants_cuda.o
 	$(NVCC) $(QUANT_NVCCFLAGS) -o $@ $^ -lm
 
+test_quants_experimental.o: test_quants_experimental.c quants.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ test_quants_experimental.c
+
+test-quants-experimental: test_quants_experimental.o quants-cuda-host.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $^ -lm -pthread
+
+test-experimental-quants: test-quants-experimental
+	./test-quants-experimental
+
 quality-score:
 	$(MAKE) -C .. gguf-tools/quality-testing/score_official
 
@@ -65,5 +74,6 @@ quality-llama-score:
 clean:
 	rm -f deepseek4-quantize deepseek4-quantize-cuda deepseek4-quantize-cuda.o \
 		quants-cuda-host.o quants_cuda.o test-quants-cuda test_quants_cuda.o \
+		test-quants-experimental test_quants_experimental.o \
 		quality-testing/score_official quality-testing/score_official.o \
 		quality-testing/score_llama

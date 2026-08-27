@@ -81,6 +81,29 @@ bool ds4q_iq2_xxs_tables(const uint64_t **grid, size_t *grid_len,
                          const int **map, size_t *map_len,
                          const uint16_t **neighbours, size_t *neighbours_len);
 
+/*
+ * Bounded research API for the SM75 Q3/Q4-32 experiment.  These formats are
+ * deliberately not registered as GGUF output types: real-weight quality must
+ * clear the audit gate before either native layout becomes production data.
+ */
+typedef enum {
+    DS4Q_EXPERIMENT_Q4_K = 0,
+    DS4Q_EXPERIMENT_Q3_K,
+    DS4Q_EXPERIMENT_SM75_Q3_32,
+    DS4Q_EXPERIMENT_SM75_Q4_32,
+    DS4Q_EXPERIMENT_COUNT,
+} ds4q_experimental_format;
+
+const char *ds4q_experimental_format_name(ds4q_experimental_format format);
+size_t ds4q_experimental_block_bytes(ds4q_experimental_format format);
+bool ds4q_experimental_quantize_block(ds4q_experimental_format format,
+                                      const float src[256],
+                                      const float *imatrix,
+                                      void *dst);
+bool ds4q_experimental_dequantize_block(ds4q_experimental_format format,
+                                        const void *src,
+                                        float dst[256]);
+
 #ifdef __cplusplus
 }
 #endif

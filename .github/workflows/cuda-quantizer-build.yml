@@ -24,6 +24,7 @@ on:
       - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
       - "speed-bench/cuda-sm75-q3-q4-32.sh"
+      - "speed-bench/cuda-sm75-q3-q4-real-quality.sh"
       - "speed-bench/cuda-sm75-q4-down-native.sh"
       - "speed-bench/cuda-sm75-q4-gate-up-native.sh"
       - "speed-bench/cuda-sm75-production-scalar.sh"
@@ -115,7 +116,9 @@ jobs:
       - name: Install host compiler
         run: apt-get update && apt-get install -y --no-install-recommends build-essential python3
       - name: Build CPU and CUDA quantizers
-        run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
+        run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda test-quants-experimental CUDA_ARCH=sm_75
+      - name: Run experimental Q3/Q4 quant regressions
+        run: ./gguf-tools/test-quants-experimental
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
@@ -148,6 +151,8 @@ jobs:
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-attention-rowsplit.sh
+          test -x speed-bench/cuda-sm75-q3-q4-real-quality.sh
+          bash -n speed-bench/cuda-sm75-q3-q4-real-quality.sh
           test -x speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
           bash -n speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
           test -x speed-bench/cuda-sm75-long-prompt-word-smoke.sh
