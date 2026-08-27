@@ -18,7 +18,7 @@ static int check_zero_blocks(void) {
     float source[256] = {0};
     float weights[256];
     float decoded[256];
-    _Alignas(16) uint8_t encoded[144];
+    _Alignas(16) uint8_t encoded[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
     for (int i = 0; i < 256; i++) weights[i] = 1.0f + (float)(i % 17) / 17.0f;
     for (int f = 0; f < DS4Q_EXPERIMENT_COUNT; f++) {
         memset(encoded, 0xa5, sizeof(encoded));
@@ -44,7 +44,7 @@ static int check_q4_control_parity(void) {
     float source[2 * 256];
     float weights[256];
     uint8_t production[2 * 144];
-    _Alignas(16) uint8_t experimental[144];
+    _Alignas(16) uint8_t experimental[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
     uint32_t state = 0x243f6a88u;
     for (int i = 0; i < 2 * 256; i++) {
         source[i] = ((int32_t)(next_u32(&state) % 20001u) - 10000) / 4096.0f;
@@ -76,7 +76,7 @@ static int check_shipping_control_parity(ds4q_type production_type,
     float source[2 * 256];
     float weights[256];
     uint8_t production[2 * 144];
-    _Alignas(16) uint8_t experimental[144];
+    _Alignas(16) uint8_t experimental[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
     uint32_t state = 0xa4093822u ^ (uint32_t)format;
     for (int i = 0; i < 2 * 256; i++) {
         source[i] = ((int32_t)(next_u32(&state) % 20001u) - 10000) / 4096.0f;
@@ -133,7 +133,8 @@ static int check_iq2_runtime_codebook(void) {
 
 static int check_determinism_and_finite_decode(void) {
     float source[256], weights[256], decoded[256];
-    _Alignas(16) uint8_t first[144], second[144];
+    _Alignas(16) uint8_t first[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
+    _Alignas(16) uint8_t second[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
     uint32_t state = 0x13198a2eu;
     for (int sample = 0; sample < 64; sample++) {
         for (int i = 0; i < 256; i++) {
@@ -156,6 +157,14 @@ static int check_determinism_and_finite_decode(void) {
                         sample, f);
                 return 1;
             }
+            for (size_t i = bytes; i < sizeof(first); i++) {
+                if (first[i] != 0x5a || second[i] != 0xa5) {
+                    fprintf(stderr,
+                            "encoding exceeded block: sample=%d format=%d byte=%zu\n",
+                            sample, f, i);
+                    return 1;
+                }
+            }
             if (!ds4q_experimental_dequantize_block(format, first, decoded)) {
                 fprintf(stderr, "decode failed: sample=%d format=%d\n", sample, f);
                 return 1;
@@ -172,9 +181,47 @@ static int check_determinism_and_finite_decode(void) {
     return 0;
 }
 
+static int popcount8(uint8_t value) {
+    int count = 0;
+    for (; value; value &= (uint8_t)(value - 1)) count++;
+    return count;
+}
+
+static int check_adaptive_promotion_counts(void) {
+    float source[256], weights[256];
+    _Alignas(16) uint8_t encoded[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
+    uint32_t state = 0x082efa98u;
+    for (int i = 0; i < 256; i++) {
+        source[i] = ((int32_t)(next_u32(&state) % 20001u) - 10000) / 4096.0f;
+        weights[i] = 0.125f + (float)(next_u32(&state) % 4096u) / 1024.0f;
+    }
+    static const struct {
+        ds4q_experimental_format format;
+        size_t mask_offset;
+        int expected;
+    } cases[] = {
+        {DS4Q_EXPERIMENT_SM75_Q3Q4_32_25, 104, 2},
+        {DS4Q_EXPERIMENT_SM75_Q3Q4_32_50, 104, 4},
+        {DS4Q_EXPERIMENT_SM75_Q2Q3_32_50, 72, 4},
+        {DS4Q_EXPERIMENT_SM75_Q2Q3_32_75, 72, 6},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        memset(encoded, 0, sizeof(encoded));
+        if (!ds4q_experimental_quantize_block(cases[c].format, source,
+                                               weights, encoded) ||
+            popcount8(encoded[cases[c].mask_offset]) != cases[c].expected) {
+            fprintf(stderr, "adaptive promotion count failed: format=%d\n",
+                    cases[c].format);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     static const size_t expected[DS4Q_EXPERIMENT_COUNT] = {
-        144, 110, 104, 136, 66,
+        144, 110, 104, 136, 66, 104, 108, 112, 113, 121,
+        140, 142, 168, 89, 97,
     };
     for (int f = 0; f < DS4Q_EXPERIMENT_COUNT; f++) {
         if (!ds4q_experimental_format_name((ds4q_experimental_format)f) ||
@@ -188,6 +235,7 @@ int main(void) {
         check_shipping_control_parity(DS4Q_TYPE_IQ2_XXS,
                                       DS4Q_EXPERIMENT_IQ2_XXS, 66) ||
         check_iq2_runtime_codebook() ||
+        check_adaptive_promotion_counts() ||
         check_determinism_and_finite_decode()) {
         return 1;
     }

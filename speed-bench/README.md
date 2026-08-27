@@ -1769,21 +1769,27 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
 ```
 
 Return `sm75-attention-rowsplit-production-<timestamp>.tar.gz`.
-# SM75 routed-quant real-weight quality gate
+# SM75 routed-quant real-weight quality sweep
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and
 performance, run the real-weight/imatrix gate before adding a GGUF type or
 production dispatch. Set HF_DIR to the DeepSeek V4 Flash snapshot and IMATRIX
 to the routed-MoE calibration file, then run
-speed-bench/cuda-sm75-q3-q4-real-quality.sh.
+speed-bench/cuda-sm75-routed-quant-quality-sweep.sh.
 
-The default sample is layers 3,21,36, experts 0,127,255, all three routed
-parts, and 32 evenly spaced rows per tensor. Override it with
-QUALITY_LAYERS, QUALITY_EXPERTS, QUALITY_PARTS, or QUALITY_ROWS.
-The audit reports the tensor roles separately. Gate/up (w1+w3) compares the
-shipping IQ2_XXS control, production Q4_K, exact standard Q3_K quantization,
-SM75 Q3-32, and SM75 Q4-32 under identical expert-specific imatrix weights.
-Down (w2) compares the four Q3/Q4 formats without treating the gate/up IQ2
-kernel as a deployable down path. IQ2 down and Q2_K are intentionally outside
-this pass. The tool does not hash or quantize a full model and does not enable
-a production format.
+`QUALITY_PRESET=screen` (the default) samples layers 3,21,36, experts
+0,127,255, all three routed parts, and 32 evenly spaced rows per tensor.
+`QUALITY_PRESET=full` covers every routed layer 3 through 42 with the same
+experts and rows. Override any dimension with QUALITY_LAYERS,
+QUALITY_EXPERTS, QUALITY_PARTS, or QUALITY_ROWS.
+
+The sweep reports gate (w1), up (w3), combined gate/up, and down (w2)
+separately under identical expert-specific imatrix weights. It includes the
+shipping IQ2_XXS gate/up control, Q4_K and Q3_K controls, SM75 Q3/Q4-32,
+IQ3-32, affine Q3-32 at 3.375/3.50 bpw, fixed-quota Q3/Q4 at
+3.53125/3.78125 bpw, affine Q4-32 at 4.375/4.4375 bpw, Q5-32 at 5.25 bpw,
+and adaptive Q2/Q3 at 2.78125/3.03125 bpw. It emits per-role Pareto tables
+and a role-aware recipe frontier that can choose gate/up and down formats
+independently. IQ2 down and Q2_K remain intentionally outside this pass.
+The tool does not hash or quantize a full model and does not enable a
+production format.

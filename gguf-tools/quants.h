@@ -94,8 +94,20 @@ typedef enum {
     DS4Q_EXPERIMENT_SM75_Q3_32,
     DS4Q_EXPERIMENT_SM75_Q4_32,
     DS4Q_EXPERIMENT_IQ2_XXS,
+    DS4Q_EXPERIMENT_SM75_IQ3_32,
+    DS4Q_EXPERIMENT_SM75_Q3A_32_4,
+    DS4Q_EXPERIMENT_SM75_Q3A_32_6,
+    DS4Q_EXPERIMENT_SM75_Q3Q4_32_25,
+    DS4Q_EXPERIMENT_SM75_Q3Q4_32_50,
+    DS4Q_EXPERIMENT_SM75_Q4A_32_4,
+    DS4Q_EXPERIMENT_SM75_Q4A_32_5,
+    DS4Q_EXPERIMENT_SM75_Q5_32,
+    DS4Q_EXPERIMENT_SM75_Q2Q3_32_50,
+    DS4Q_EXPERIMENT_SM75_Q2Q3_32_75,
     DS4Q_EXPERIMENT_COUNT,
 } ds4q_experimental_format;
+
+#define DS4Q_EXPERIMENT_MAX_BLOCK_BYTES 168
 
 const char *ds4q_experimental_format_name(ds4q_experimental_format format);
 size_t ds4q_experimental_block_bytes(ds4q_experimental_format format);
