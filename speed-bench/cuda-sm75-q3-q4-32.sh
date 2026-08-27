@@ -331,9 +331,8 @@ for label in hot streamed; do
     [[ $(wc -l <"$OUTPUT_DIR/benchmark-$label.csv") -eq 5 ]] ||
         die "$label benchmark CSV does not contain all four variants"
 done
-python3 - "$OUTPUT_DIR/benchmark-hot.csv" \
-        "$OUTPUT_DIR/benchmark-streamed.csv" <<'PY' ||
-    die "benchmark summaries failed semantic validation"
+if ! python3 - "$OUTPUT_DIR/benchmark-hot.csv" \
+        "$OUTPUT_DIR/benchmark-streamed.csv" <<'PY'
 import csv
 import math
 import pathlib
@@ -381,6 +380,9 @@ for raw_path in sys.argv[1:]:
                 f"for {row['variant']}"
             )
 PY
+then
+    die "benchmark summaries failed semantic validation"
+fi
 capture_gpu_state post-benchmark
 
 if [[ $RUN_NCU == 1 ]]; then
