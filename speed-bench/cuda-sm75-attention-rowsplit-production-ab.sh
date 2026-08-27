@@ -3,8 +3,9 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run an exact-output, full-dense-cache 32K production A/B for the SM75
-indexed-chain row split.
+Run an exact-output, full-dense-cache production A/B for the SM75 indexed-chain
+row split. By default this remains the accepted single 32K check; set
+CTX_START, CTX_MAX, and STEP_MUL for a multi-frontier crossover sweep.
 
 Required environment:
   MODEL=/absolute/path/to/tagged-SM75-production.gguf
@@ -14,8 +15,11 @@ Optional environment:
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
   STAGE_SPLIT=22
-  CTX_TOKENS=32768
-  CTX_ALLOC=32769           default: measured frontier + 1
+  CTX_TOKENS=32768          legacy single-frontier shorthand
+  CTX_START=CTX_TOKENS
+  CTX_MAX=CTX_TOKENS
+  STEP_MUL=1                use 2 for 2K,4K,8K,16K,32K
+  CTX_ALLOC=CTX_MAX+1
   REPEATS=3
   RUN_HARNESS=1
   SKIP_BUILD=0
@@ -43,7 +47,10 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_TOKENS=${CTX_TOKENS:-32768}
-CTX_ALLOC=${CTX_ALLOC:-$((CTX_TOKENS+1))}
+CTX_START=${CTX_START:-$CTX_TOKENS}
+CTX_MAX=${CTX_MAX:-$CTX_TOKENS}
+STEP_MUL=${STEP_MUL:-1}
+CTX_ALLOC=${CTX_ALLOC:-$((CTX_MAX+1))}
 REPEATS=${REPEATS:-3}
 RUN_HARNESS=${RUN_HARNESS:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -53,15 +60,19 @@ OUTPUT_DIR=${ROWSPLIT_PRODUCTION_DIR:-$repo_dir/sm75-attention-rowsplit-producti
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
-            "CTX_ALLOC:$CTX_ALLOC" "REPEATS:$REPEATS" \
+            "CTX_START:$CTX_START" "CTX_MAX:$CTX_MAX" \
+            "STEP_MUL:$STEP_MUL" "CTX_ALLOC:$CTX_ALLOC" \
+            "REPEATS:$REPEATS" \
             "RUN_HARNESS:$RUN_HARNESS" "SKIP_BUILD:$SKIP_BUILD" \
             "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 &&
-   CTX_TOKENS >= 4096 && CTX_TOKENS % 2048 == 0 &&
-   CTX_ALLOC > CTX_TOKENS && REPEATS >= 2 )) || die "invalid benchmark bounds"
+   CTX_START >= 2048 && CTX_START % 2048 == 0 &&
+   CTX_MAX >= CTX_START && CTX_MAX % 2048 == 0 &&
+   STEP_MUL >= 1 && CTX_ALLOC > CTX_MAX && REPEATS >= 2 )) ||
+    die "invalid benchmark bounds"
 for flag in RUN_HARNESS SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -73,6 +84,20 @@ done
     die "output path already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"/{harness,production,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+
+if (( STEP_MUL == 1 )); then
+    step_args=(--step-incr 2048)
+else
+    step_args=(--step-mul "$STEP_MUL")
+    frontier=$CTX_START
+    while (( frontier < CTX_MAX )); do
+        next=$((frontier * STEP_MUL))
+        (( next > frontier )) || die "STEP_MUL does not advance the frontier"
+        frontier=$next
+    done
+    (( frontier == CTX_MAX )) ||
+        die "STEP_MUL does not land exactly on CTX_MAX"
+fi
 
 phase=initialization
 finish() {
@@ -118,9 +143,11 @@ phase=manifest
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nmodel_hashing=disabled\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nctx_alloc=%s\nrepeats=%s\n' \
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_start=%s\nctx_max=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
-        "$CTX_TOKENS" "$CTX_ALLOC" "$REPEATS"
+        "$CTX_START" "$CTX_MAX"
+    printf 'step_mul=%s\nctx_alloc=%s\nrepeats=%s\n' \
+        "$STEP_MUL" "$CTX_ALLOC" "$REPEATS"
     printf 'required_dense_f16_candidates=344/344\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
@@ -177,8 +204,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
-                --ctx-start "$CTX_TOKENS" --ctx-max "$CTX_TOKENS" \
-                --ctx-alloc "$CTX_ALLOC" --step-incr 2048 \
+                --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
+                --ctx-alloc "$CTX_ALLOC" "${step_args[@]}" \
                 --prefill-chunk 2048 --gen-tokens 0 --csv "$base.csv" \
                 --dump-frontier-logits-dir "$logits" \
                 >"$base.log" 2>&1 || {
@@ -193,8 +220,17 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         ! grep -Fq 'required but unavailable' "$base.log" ||
             die "$variant encountered a forbidden row-split fallback"
         if [[ $variant == rows ]]; then
-            grep -Fq 'dispatch=split kind=indexed-chain' "$base.log" ||
-                die "row candidate omitted indexed-chain split dispatch"
+            expected_dispatches=$(awk -F, '
+                NR > 1 && ($1+0) > max {max=$1+0}
+                END {
+                    total=max > 2048 ? 21 * ((max-2048)/512) : 0
+                    printf "%.0f\n", total
+                }
+            ' "$base.csv")
+            actual_dispatches=$(grep -Fc \
+                'dispatch=split kind=indexed-chain' "$base.log" || true)
+            [[ $actual_dispatches == "$expected_dispatches" ]] ||
+                die "row candidate dispatched $actual_dispatches indexed chains; expected $expected_dispatches"
             ! grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
                 die "row candidate unexpectedly split unproven mixed attention"
         else
@@ -226,21 +262,38 @@ root = pathlib.Path(sys.argv[1])
 runs = list(csv.DictReader((root / "production/runs.csv").open()))
 vals, paired = {}, {}
 for run in runs:
-    row = next(csv.DictReader(pathlib.Path(run["csv"]).open()))
-    tps = float(row["prefill_tps"])
-    vals.setdefault(run["variant"], []).append(tps)
-    paired[(int(run["repeat"]), run["variant"])] = tps
-ratios = [paired[(r, "rows")] / paired[(r, "home")]
-          for r in range(1, max(int(x["repeat"]) for x in runs) + 1)]
+    rows = list(csv.DictReader(pathlib.Path(run["csv"]).open()))
+    if not rows:
+        raise SystemExit(f'{run["variant"]} repeat {run["repeat"]} has no frontiers')
+    for row in rows:
+        ctx = int(row["ctx_tokens"])
+        tps = float(row["prefill_tps"])
+        vals.setdefault((ctx, run["variant"]), []).append(tps)
+        key = (int(run["repeat"]), ctx, run["variant"])
+        if key in paired:
+            raise SystemExit(f"duplicate benchmark key {key}")
+        paired[key] = tps
+contexts = sorted({ctx for ctx, _ in vals})
+repeats = range(1, max(int(x["repeat"]) for x in runs) + 1)
+for ctx in contexts:
+    for variant in ("home", "rows"):
+        if len(vals.get((ctx, variant), [])) != len(repeats):
+            raise SystemExit(f"incomplete {variant} measurements at context {ctx}")
 with (root / "production/summary.csv").open("w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["ctx_tokens", "home_median_tps", "rows_median_tps",
-                "paired_median_speedup", "change_pct", "logits"])
-    speed = statistics.median(ratios)
-    w.writerow([next(csv.DictReader(pathlib.Path(runs[0]["csv"]).open()))["ctx_tokens"],
-                f'{statistics.median(vals["home"]):.3f}',
-                f'{statistics.median(vals["rows"]):.3f}',
-                f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}', "bit-exact"])
+                "paired_median_speedup", "change_pct", "paired_speedup_sd",
+                "logits"])
+    for ctx in contexts:
+        ratios = [paired[(r, ctx, "rows")] / paired[(r, ctx, "home")]
+                  for r in repeats]
+        speed = statistics.median(ratios)
+        sd = statistics.stdev(ratios) if len(ratios) > 1 else 0.0
+        w.writerow([ctx,
+                    f'{statistics.median(vals[(ctx, "home")]):.3f}',
+                    f'{statistics.median(vals[(ctx, "rows")]):.3f}',
+                    f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}',
+                    f'{sd:.6f}', "bit-exact"])
 PY
 cat "$OUTPUT_DIR/production/summary.csv"
 

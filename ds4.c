@@ -15438,10 +15438,12 @@ static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
     return false;
 #else
     const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
-    /* Experimental until the production four-GPU A/B passes.  Unlike the
-     * older head split, this path partitions independent query rows and
-     * requires a partner-local raw/compressed KV mirror; it never falls back
-     * to remote cache reads. */
+    /* The full-cache 32K four-GPU A/B passed exactness at a 1.165x paired
+     * median speedup.  Keep this opt-in until the 2K..32K crossover sweep
+     * establishes the automatic dispatch threshold.  Unlike the older head
+     * split, this path partitions independent query rows and requires a
+     * partner-local raw/compressed KV mirror; it never falls back to remote
+     * cache reads. */
     return env && env[0] && strcmp(env, "0") != 0;
 #endif
 }

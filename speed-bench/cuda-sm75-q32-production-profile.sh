@@ -19,6 +19,7 @@ Optional environment:
   CTX_ALLOC=32769
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
+  ATTN_ROWSPLIT=1              profile accepted indexed-chain row split
   PROFILE_GPU=0                physical GPU for bounded NCU harnesses
   RUN_NCU=1
   NCU_USE_SUDO=1
@@ -43,6 +44,7 @@ PROFILE_TOKENS=${PROFILE_TOKENS:-32768}
 CTX_ALLOC=${CTX_ALLOC:-32769}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
+ATTN_ROWSPLIT=${ATTN_ROWSPLIT:-1}
 PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
@@ -57,7 +59,8 @@ OUTPUT_DIR=${PROFILE_DIR:-$repo_dir/sm75-q32-production-profile-$stamp}
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
-            "PIPELINE_MB:$PIPELINE_MB" "PROFILE_GPU:$PROFILE_GPU" \
+            "PIPELINE_MB:$PIPELINE_MB" "ATTN_ROWSPLIT:$ATTN_ROWSPLIT" \
+            "PROFILE_GPU:$PROFILE_GPU" \
             "RUN_NCU:$RUN_NCU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
@@ -68,7 +71,7 @@ done
 (( CTX_ALLOC > PROFILE_TOKENS && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
     die "require ctx_alloc>32768, prefill_chunk=2048, and pipeline_mb=512"
-for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
+for flag in ATTN_ROWSPLIT RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -172,6 +175,9 @@ production_env=(
     "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB"
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
+    DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
+    "DS4_CUDA_TP_PREFILL_ATTN_ROWS=$ATTN_ROWSPLIT"
+    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
 )
 
 phase=build
@@ -262,6 +268,7 @@ phase=manifest
         "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
     printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
         "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 'attention_rowsplit=%s\n' "$ATTN_ROWSPLIT"
     printf 'q3a4_layers=%s\nq4_32_gate_up_layers=remaining-28\nq4_32_down_layers=all-43\n' \
         "$Q3A4_LAYERS"
     printf 't256_policy=automatic-balanced\nprofile_gpu=%s\nrun_ncu=%s\n' \
@@ -334,6 +341,23 @@ for marker in "CUDA EP forced pipeline split 22/21" \
     grep -Fq "$marker" "$base.log" ||
         die "production trace lacks required marker: $marker"
 done
+if [[ $ATTN_ROWSPLIT == 1 ]]; then
+    for marker in \
+        'CUDA indexed score/top-k/attention query-row split enabled: tier 0' \
+        'CUDA indexed score/top-k/attention query-row split enabled: tier 1'; do
+        grep -Fq "$marker" "$base.log" ||
+            die "production trace lacks required row-split marker: $marker"
+    done
+    dispatches=$(grep -Fc \
+        'dispatch=split kind=indexed-chain' "$base.log" || true)
+    [[ $dispatches == 2520 ]] ||
+        die "production trace logged $dispatches indexed-chain splits; expected 2520 across warm-up and measured frontiers"
+    ! grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
+        die "production trace unexpectedly split unproven mixed attention"
+else
+    ! grep -Fq 'dispatch=split' "$base.log" ||
+        die "home-only production trace unexpectedly dispatched row splitting"
+fi
 for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
     grep -Fq "$route" "$base.log" || die "trace lacks direct route $route"
 done

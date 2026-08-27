@@ -91,6 +91,13 @@ def main() -> int:
     traces = read_csv(output / "trace-summary.csv")
     with (output / "profile-summary.md").open("w", encoding="utf-8") as handle:
         handle.write("# SM75 Q4-32/Q3A4 32K production profile\n\n")
+        manifest = (output / "manifest.txt").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        rowsplit = "attention_rowsplit=1" in manifest
+        handle.write(
+            f"Attention/indexer placement: **{'indexed-chain query-row split' if rowsplit else 'home-only'}**.\n\n"
+        )
         handle.write(
             "The Nsight Systems run is one genuine 32K production frontier. "
             "Kernel percentages below are sums of attributed GPU kernel time; "

@@ -1764,19 +1764,22 @@ harness does not include output-projection work or the incremental cost of
 maintaining the three partner cache mirrors.
 
 `cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed,
-full-dense-cache production pass. It interleaves the unchanged home path with the complete
-indexed score -> top-k -> attention query-row candidate at one 32K frontier,
-validates that transfer-inclusive chain on both configured NVLink pairs,
-requires audited `indexed-chain` production dispatches, and compares emitted
-frontier logits byte-for-byte for every paired repeat. A requested indexed
-split that cannot dispatch aborts; it is never replaced by peer-read or
-home-only execution. Mixed, static-mixed, and raw-only attention remain
-explicitly outside this candidate and are identical in both arms. Both arms
-must report a complete `344/344` dense-F16 materialization; the default
-allocation is therefore the measured 32K frontier plus one token, not a
-simultaneous 256K-capacity reservation. The A/B intentionally does not request
-the pre-timing allocation-state export because that export requires a second,
+full-dense-cache production pass. It interleaves the unchanged home path with
+the complete indexed score -> top-k -> attention query-row candidate, requires
+audited `indexed-chain` dispatches, and compares every emitted frontier logit
+byte-for-byte for every paired repeat. A requested indexed split that cannot
+dispatch aborts; it is never replaced by peer-read or home-only execution.
+Mixed, static-mixed, and raw-only attention remain explicitly outside this
+candidate and are identical in both arms. Both arms must report a complete
+`344/344` dense-F16 materialization. The A/B intentionally does not request the
+pre-timing allocation-state export because that export requires a second,
 untimed full-frontier prefill.
+
+`CTX_TOKENS` retains the accepted single-frontier 32K check. For the crossover
+gate, set `CTX_START=2048`, `CTX_MAX=32768`, and `STEP_MUL=2`; DS4 then advances
+one session through 2K, 4K, 8K, 16K, and 32K. The script validates the exact
+expected 1,260 indexed-chain dispatches over that cumulative sweep rather than
+incorrectly double-counting work already present at earlier frontiers.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1798,6 +1801,27 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
 
 Return `sm75-attention-rowsplit-production-<timestamp>.tar.gz`.
 
+The full crossover sweep is:
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+STEP_MUL=2 \
+CTX_ALLOC=32769 \
+REPEATS=3 \
+RUN_HARNESS=0 \
+SKIP_BUILD=1 \
+bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
+```
+
 # SM75 Q4-32/Q3A4 32K production profile
 
 `cuda-sm75-q32-production-profile.sh` captures the next evidence pass for the
@@ -1810,6 +1834,10 @@ layers, and Q4-32 down on all 43 layers.
 
 The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
+`ATTN_ROWSPLIT=1` is the default and captures the accepted indexed-chain
+candidate, not the obsolete home-only baseline. The profiler requires exactly
+1,260 audited splits in each of its untimed cache warm-up and captured 32K
+frontiers; only the second frontier lies inside the Systems capture range.
 Nsight Compute does not replay the full application: bounded exact harnesses
 capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, indexed attention, the real
 ratio-0 raw-window mixed-attention shape, the 32K WMMA indexer-score shape, and
@@ -1830,6 +1858,7 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 PROFILE_TOKENS=32768 \
 CTX_ALLOC=32769 \
+ATTN_ROWSPLIT=1 \
 PROFILE_GPU=0 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \
