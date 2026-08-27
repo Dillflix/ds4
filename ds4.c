@@ -15414,6 +15414,14 @@ static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
 #endif
 }
 
+/* Kept outside the GPU-only graph implementation so the CPU placement test
+ * can lock down the production dispatch boundary without linking CUDA. */
+static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+        uint32_t n_tokens, uint32_t n_raw) {
+    return n_tokens >= 512u && (n_tokens & 1u) == 0u &&
+           n_raw > n_tokens / 2u;
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -27527,12 +27535,6 @@ static bool metal_graph_cuda_tp_prefill_attention_launch(
     if (ds4_gpu_set_current_device(home) != 0) ok = false;
     return ok;
 #endif
-}
-
-static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
-        uint32_t n_tokens, uint32_t n_raw) {
-    return n_tokens >= 512u && (n_tokens & 1u) == 0u &&
-           n_raw > n_tokens / 2u;
 }
 
 static void metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
