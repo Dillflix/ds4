@@ -151,6 +151,7 @@ phase=production-generation
     DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
+    DS4_CUDA_SYNC_XDEV=1 \
     ./ds4 --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --ctx "$CTX_ALLOC" --prefill-chunk 2048 \
@@ -170,8 +171,11 @@ grep -Fq 'dispatch=split kind=mixed' "$OUTPUT_DIR/stderr.log" ||
     die "production generation omitted mixed row-split dispatch"
 grep -Fq 'dispatch=split kind=indexed' "$OUTPUT_DIR/stderr.log" ||
     die "production generation omitted indexed row-split dispatch"
+grep -Eq 'dispatch=home reason=shape kind=(mixed|indexed).*tokens=[0-9]+' \
+    "$OUTPUT_DIR/stderr.log" ||
+    die "long prompt did not exercise shape-dispatched home-tail attention"
 ! grep -Fq 'required but unavailable' "$OUTPUT_DIR/stderr.log" ||
-    die "production generation encountered a forbidden row-split fallback"
+    die "an eligible row-split call was missing required runtime resources"
 
 prompt_tokens=$(sed -n \
     's/.*processing \([0-9][0-9]*\) input tokens.*/\1/p' \

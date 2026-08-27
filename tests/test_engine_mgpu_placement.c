@@ -42,6 +42,8 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
+        uint32_t n_tokens, uint32_t n_raw);
 uint32_t ds4_test_q8_cache_class(const char *name);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -900,6 +902,22 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
 }
 
+static void test_cuda_tp_prefill_attn_rows_shape(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_shape\n");
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 512),
+          "512-row indexed attention is eligible for a 50/50 split");
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(2048, 2304),
+          "full prefill chunks are eligible for a 50/50 split");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(329, 457),
+          "an odd final prompt tail stays on the unchanged home path");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(328, 456),
+          "a sub-512 final prompt tail stays on the unchanged home path");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(513, 641),
+          "an odd query count is outside the exact 50/50 split domain");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 256),
+          "row split requires enough raw history for both halves");
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -1076,6 +1094,7 @@ int main(void) {
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_attn_rows_default();
+    test_cuda_tp_prefill_attn_rows_shape();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_ep_forced_stage_split();
     test_cuda_tp_output_head_moves_to_lower_half();

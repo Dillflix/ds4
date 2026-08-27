@@ -27529,6 +27529,23 @@ static bool metal_graph_cuda_tp_prefill_attention_launch(
 #endif
 }
 
+static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+        uint32_t n_tokens, uint32_t n_raw) {
+    return n_tokens >= 512u && (n_tokens & 1u) == 0u &&
+           n_raw > n_tokens / 2u;
+}
+
+static void metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
+        ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens, uint32_t n_raw) {
+    if (!getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT")) return;
+    fprintf(stderr,
+            "ds4: CUDA prefill attention row audit dispatch=home "
+            "reason=shape kind=%s layer=%u pos=%u tokens=%u raw=%u\n",
+            kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+            il, pos0, n_tokens, n_raw);
+}
+
 static bool metal_graph_cuda_tp_prefill_attention_rows_active(
         const ds4_gpu_graph *g,
         const ds4_layer_weights *layer,
@@ -27541,8 +27558,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_active(
     return false;
 #else
     if (!g || !layer || !g->cuda_tp_prefill_attn_rows ||
-        n_tokens < 512u || (n_tokens & 1u) != 0u ||
-        n_raw <= n_tokens / 2u ||
+        !metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+            n_tokens, n_raw) ||
         metal_graph_directional_steering_attn_enabled(g) ||
         metal_graph_debug_wants("kqv_out", il, pos0) ||
         metal_graph_debug_wants("kqv_back", il, pos0)) return false;
@@ -28974,7 +28991,15 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
-                    if (g->cuda_tp_prefill_attn_rows) {
+                    const bool rows_shape =
+                        metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+                            n_tokens, n_raw);
+                    if (g->cuda_tp_prefill_attn_rows && !rows_shape) {
+                        metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
+                            DS4_CUDA_PREFILL_ATTN_INDEXED, il, pos0,
+                            n_tokens, n_raw);
+                    }
+                    if (g->cuda_tp_prefill_attn_rows && rows_shape) {
                         if (!metal_graph_cuda_tp_prefill_attention_rows_active(
                                 g, layer, il, pos0, n_tokens, n_raw)) {
                             fprintf(stderr,
@@ -29031,7 +29056,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         &index_stage_t0);
                     }
                 } else {
-                    if (!use_comp_mask && g->cuda_tp_prefill_attn_rows) {
+                    const bool rows_shape =
+                        metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+                            n_tokens, n_raw);
+                    if (!use_comp_mask && g->cuda_tp_prefill_attn_rows &&
+                        !rows_shape) {
+                        metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
+                            DS4_CUDA_PREFILL_ATTN_DECODE_MIXED, il, pos0,
+                            n_tokens, n_raw);
+                    }
+                    if (!use_comp_mask && g->cuda_tp_prefill_attn_rows &&
+                        rows_shape) {
                         if (!metal_graph_cuda_tp_prefill_attention_rows_active(
                                 g, layer, il, pos0, n_tokens, n_raw)) {
                             fprintf(stderr,
@@ -29179,7 +29214,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-            } else if (ok && g->cuda_tp_prefill_attn_rows) {
+            } else if (ok && g->cuda_tp_prefill_attn_rows &&
+                       metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+                           n_tokens, n_tokens)) {
                 if (!metal_graph_cuda_tp_prefill_attention_rows_active(
                         g, layer, il, pos0, n_tokens, n_tokens)) {
                     fprintf(stderr,
@@ -29219,6 +29256,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     &index_stage_t0);
                 }
             } else if (ok) {
+                if (g->cuda_tp_prefill_attn_rows &&
+                    !metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+                        n_tokens, n_tokens)) {
+                    metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
+                        DS4_CUDA_PREFILL_ATTN_INDEXED, il, pos0,
+                        n_tokens, n_tokens);
+                }
                 ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(metal_graph_batch_heads(g),
                                                                           model->map,
                                                                           model->size,
@@ -57109,6 +57153,12 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
     return cuda_tp_prefill_attn_rows_env_enabled();
+}
+
+bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
+        uint32_t n_tokens, uint32_t n_raw) {
+    return metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
+        n_tokens, n_raw);
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {

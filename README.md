@@ -841,11 +841,14 @@ layouts. The path covers indexed and nonzero-prefix mixed attention. It
 incrementally mirrors raw and compressed KV on the NVLink partner, copies the latter half of
 Q to that partner, executes 50/50 row launches concurrently, and gathers the
 partner's full-head result before the unchanged inverse-RoPE/output projection.
-The declared indexed/mixed scope is fail-closed: a requested call that cannot
-use bidirectional peer access, its partner-local mirror, or the exact 50/50
-shape aborts instead of silently running on the home GPU. Initial static-mixed
-and raw-only attention are outside the split scope and remain on the unchanged
-home path. Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
+The declared indexed/mixed scope is fail-closed: an eligible split call that
+cannot use bidirectional peer access or its partner-local mirror aborts instead
+of silently running on the home GPU. The exact 50/50 kernel domain requires an
+even query count of at least 512 rows. Incomplete or odd final prompt chunks are
+outside that dispatch domain and select the unchanged home kernel directly;
+this is static shape dispatch, not fallback from an attempted split. Initial
+static-mixed and raw-only attention likewise remain on the unchanged home path.
+Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
 one record for every split call. Direct peer-reading of persistent KV is not a
 fallback; the bounded SM75 experiment measured that strategy slower than the
 shipping home path on both NVLink pairs.
