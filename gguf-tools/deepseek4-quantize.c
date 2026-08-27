@@ -3094,8 +3094,12 @@ static void merge_quality_stats(experimental_quality_stats *dst,
     dst->values += src->values;
 }
 
-static int quality_role_index(const char *part) {
-    return strcmp(part, "w2") == 0 ? 1 : 0;
+static int quality_part_role_index(const char *part) {
+    if (strcmp(part, "w1") == 0) return 0;
+    if (strcmp(part, "w2") == 0) return 1;
+    if (strcmp(part, "w3") == 0) return 2;
+    die("bad quality part role");
+    return -1;
 }
 
 static bool quality_format_applies(const char *part,
@@ -3113,12 +3117,13 @@ static void write_quality_csv_row(FILE *fp, const char *scope, int layer,
     const size_t block_bytes = ds4q_experimental_block_bytes(format);
     fprintf(fp,
             "%s,%d,%d,%s,%d,%" PRId64 ",%s,%zu,%.8f,%" PRIu64
-            ",%.17g,%.17g,%.17g,%.17g,%.17g\n",
+            ",%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
             scope, layer, expert, part, rows, ncols,
             ds4q_experimental_format_name(format), block_bytes,
             8.0 * block_bytes / 256.0, stats->values,
-            stats->sse, quality_nrmse(stats->sse, stats->source_energy),
-            stats->weighted_sse,
+            stats->sse, stats->source_energy,
+            quality_nrmse(stats->sse, stats->source_energy),
+            stats->weighted_sse, stats->weighted_source_energy,
             quality_nrmse(stats->weighted_sse,
                           stats->weighted_source_energy),
             stats->max_abs);
@@ -3138,10 +3143,11 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open quality output", out_path);
     fprintf(fp,
-            "scope,layer,expert,part,sampled_rows,ncols,format,block_bytes,bits_per_weight,values,sse,nrmse,weighted_sse,weighted_nrmse,max_abs\n");
+            "scope,layer,expert,part,sampled_rows,ncols,format,block_bytes,bits_per_weight,values,sse,source_energy,nrmse,weighted_sse,weighted_source_energy,weighted_nrmse,max_abs\n");
     experimental_quality_stats aggregate[DS4Q_EXPERIMENT_COUNT] = {{0}};
-    experimental_quality_stats role[2][DS4Q_EXPERIMENT_COUNT] = {{{0}}};
-    int role_rows[2] = {0, 0};
+    /* gate, down, up, and the combined gate+up role */
+    experimental_quality_stats role[4][DS4Q_EXPERIMENT_COUNT] = {{{0}}};
+    int role_rows[4] = {0, 0, 0, 0};
     int total_tensors = 0;
     int total_rows = 0;
 
@@ -3164,7 +3170,7 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                 const int sample_rows = requested_rows < nrows
                     ? requested_rows : (int)nrows;
                 experimental_quality_stats tensor[DS4Q_EXPERIMENT_COUNT] = {{0}};
-                _Alignas(16) uint8_t encoded[144];
+                _Alignas(16) uint8_t encoded[DS4Q_EXPERIMENT_MAX_BLOCK_BYTES];
                 float decoded[256];
                 for (int ri = 0; ri < sample_rows; ri++) {
                     const int64_t row = sample_rows == 1 ? 0
@@ -3194,12 +3200,16 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                     write_quality_csv_row(fp, "tensor", layers[li], experts[ei],
                                           parts[pi], sample_rows, ncols,
                                           format, &tensor[fi]);
-                    merge_quality_stats(&role[quality_role_index(parts[pi])][fi],
-                                        &tensor[fi]);
+                    const int part_role = quality_part_role_index(parts[pi]);
+                    merge_quality_stats(&role[part_role][fi], &tensor[fi]);
+                    if (part_role != 1)
+                        merge_quality_stats(&role[3][fi], &tensor[fi]);
                     if (format != DS4Q_EXPERIMENT_IQ2_XXS)
                         merge_quality_stats(&aggregate[fi], &tensor[fi]);
                 }
-                role_rows[quality_role_index(parts[pi])] += sample_rows;
+                const int part_role = quality_part_role_index(parts[pi]);
+                role_rows[part_role] += sample_rows;
+                if (part_role != 1) role_rows[3] += sample_rows;
                 total_tensors++;
                 total_rows += sample_rows;
                 fprintf(stderr,
@@ -3210,8 +3220,11 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
             }
         }
     }
-    for (int role_index = 0; role_index < 2; role_index++) {
-        const char *role_name = role_index == 0 ? "gate_up" : "down";
+    static const char *const role_names[4] = {
+        "gate", "down", "up", "gate_up",
+    };
+    for (int role_index = 0; role_index < 4; role_index++) {
+        const char *role_name = role_names[role_index];
         for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
             const ds4q_experimental_format format =
                 (ds4q_experimental_format)fi;
@@ -3221,7 +3234,8 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                                   &role[role_index][fi]);
         }
     }
-    for (int fi = 0; fi < DS4Q_EXPERIMENT_IQ2_XXS; fi++) {
+    for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+        if (fi == DS4Q_EXPERIMENT_IQ2_XXS) continue;
         write_quality_csv_row(fp, "aggregate", -1, -1, "all", total_rows,
                               0, (ds4q_experimental_format)fi,
                               &aggregate[fi]);
@@ -3268,7 +3282,7 @@ static void usage(const char *argv0) {
     printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
     printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
     printf("  --sm75-native-q4      store each routed Q4_K tensor in tagged Turing MMA-native A/W layout\n");
-    printf("  --sm75-q3-q4-quality FILE  compare Q4_K/Q3_K/Q3-32/Q4-32 on sampled HF expert rows\n");
+    printf("  --sm75-routed-quality FILE  sweep experimental SM75 2.8-5.3 bpw routed formats on sampled HF expert rows\n");
     printf("  --quality-layers CSV  quality sample layers, default 3,21,36\n");
     printf("  --quality-experts CSV quality sample expert ids, default 0,127,255\n");
     printf("  --quality-parts CSV   quality sample expert parts, default w1,w2,w3\n");
@@ -3415,7 +3429,8 @@ static params parse_args(int argc, char **argv) {
             p.quant_gpu_devices = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--sm75-native-q4") == 0) {
             p.sm75_native_q4 = true;
-        } else if (strcmp(arg, "--sm75-q3-q4-quality") == 0) {
+        } else if (strcmp(arg, "--sm75-q3-q4-quality") == 0 ||
+                   strcmp(arg, "--sm75-routed-quality") == 0) {
             p.sm75_q3_q4_quality = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--quality-layers") == 0) {
             p.quality_layers = need_value(argc, argv, &i, arg);

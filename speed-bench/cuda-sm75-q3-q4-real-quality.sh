@@ -13,14 +13,20 @@ if [[ -z "${IMATRIX:-}" ]]; then
     exit 1
 fi
 
-QUALITY_LAYERS="${QUALITY_LAYERS:-3,21,36}"
+QUALITY_PRESET="${QUALITY_PRESET:-screen}"
+case "$QUALITY_PRESET" in
+    screen) DEFAULT_QUALITY_LAYERS="3,21,36" ;;
+    full) DEFAULT_QUALITY_LAYERS="3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42" ;;
+    *) echo "error: QUALITY_PRESET must be screen or full" >&2; exit 1 ;;
+esac
+QUALITY_LAYERS="${QUALITY_LAYERS:-$DEFAULT_QUALITY_LAYERS}"
 QUALITY_EXPERTS="${QUALITY_EXPERTS:-0,127,255}"
 QUALITY_PARTS="${QUALITY_PARTS:-w1,w2,w3}"
 QUALITY_ROWS="${QUALITY_ROWS:-32}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
-QUALITY_DIR="${QUALITY_DIR:-$ROOT/sm75-q3-q4-real-quality-$STAMP}"
+QUALITY_DIR="${QUALITY_DIR:-$ROOT/sm75-routed-quant-quality-$QUALITY_PRESET-$STAMP}"
 CSV="$QUALITY_DIR/real-weight-quality.csv"
 LOG="$QUALITY_DIR/real-weight-quality.log"
 ARCHIVE="${QUALITY_DIR}.tar.gz"
@@ -37,6 +43,7 @@ archive_result() {
         printf 'hf_dir=%s\n' "$HF_DIR"
         printf 'imatrix=%s\n' "$IMATRIX"
         printf 'quality_layers=%s\n' "$QUALITY_LAYERS"
+        printf 'quality_preset=%s\n' "$QUALITY_PRESET"
         printf 'quality_experts=%s\n' "$QUALITY_EXPERTS"
         printf 'quality_parts=%s\n' "$QUALITY_PARTS"
         printf 'quality_rows=%s\n' "$QUALITY_ROWS"
@@ -82,7 +89,7 @@ gguf-tools/test-quants-experimental |
 gguf-tools/deepseek4-quantize \
     --hf "$HF_DIR" \
     --imatrix "$IMATRIX" \
-    --sm75-q3-q4-quality "$CSV" \
+    --sm75-routed-quality "$CSV" \
     --quality-layers "$QUALITY_LAYERS" \
     --quality-experts "$QUALITY_EXPERTS" \
     --quality-parts "$QUALITY_PARTS" \
@@ -98,14 +105,22 @@ from pathlib import Path
 
 csv_path, summary_path, layers_text, experts_text, parts_text = sys.argv[1:]
 rows = list(csv.DictReader(open(csv_path, newline="", encoding="utf-8")))
-common_formats = ("q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32")
-gate_formats = common_formats + ("iq2_xxs",)
+all_formats = (
+    "q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32", "iq2_xxs",
+    "sm75_iq3_32", "sm75_q3a_32_4", "sm75_q3a_32_6",
+    "sm75_q3q4_32_25", "sm75_q3q4_32_50",
+    "sm75_q4a_32_4", "sm75_q4a_32_5", "sm75_q5_32",
+    "sm75_q2q3_32_50", "sm75_q2q3_32_75",
+)
+whole_model_formats = tuple(x for x in all_formats if x != "iq2_xxs")
+gate_formats = all_formats
+down_formats = whole_model_formats
 layers = [x for x in layers_text.split(",") if x]
 experts = [x for x in experts_text.split(",") if x]
 parts = [x for x in parts_text.split(",") if x]
 expected_tensors = len(layers) * len(experts) * len(parts)
 expected_tensor_rows = len(layers) * len(experts) * sum(
-    len(gate_formats if part in ("w1", "w3") else common_formats)
+    len(gate_formats if part in ("w1", "w3") else down_formats)
     for part in parts
 )
 
@@ -116,63 +131,108 @@ if len(tensor_rows) != expected_tensor_rows:
     raise SystemExit(
         f"expected {expected_tensor_rows} tensor rows, got {len(tensor_rows)}"
     )
-if set(aggregate) != set(common_formats):
+if set(aggregate) != set(whole_model_formats):
     raise SystemExit(f"aggregate formats mismatch: {sorted(aggregate)}")
-expected_roles = ({("gate_up", name) for name in gate_formats} |
-                  {("down", name) for name in common_formats})
+expected_roles = (
+    {(role, name) for role in ("gate", "up", "gate_up") for name in gate_formats}
+    | {("down", name) for name in down_formats}
+)
 if set(role_rows) != expected_roles:
     raise SystemExit(f"role rows mismatch: {sorted(role_rows)}")
 for row in rows:
-    for field in ("nrmse", "weighted_nrmse", "max_abs"):
+    for field in ("nrmse", "weighted_nrmse", "max_abs",
+                  "source_energy", "weighted_source_energy"):
         value = float(row[field])
         if not math.isfinite(value) or value < 0:
             raise SystemExit(f"invalid {field}: {row}")
 
+def pareto_names(role, formats):
+    points = []
+    for name in formats:
+        row = role_rows[(role, name)]
+        points.append((name, float(row["bits_per_weight"]),
+                       float(row["weighted_nrmse"])))
+    keep = set()
+    for name, bits, error in points:
+        dominated = any(
+            other_bits <= bits and other_error <= error and
+            (other_bits < bits or other_error < error)
+            for other_name, other_bits, other_error in points
+            if other_name != name
+        )
+        if not dominated:
+            keep.add(name)
+    return keep
+
+def add_role_table(lines, title, role, formats):
+    q4 = float(role_rows[(role, "q4_K")]["weighted_nrmse"])
+    pareto = pareto_names(role, formats)
+    lines += [
+        f"## {title}", "",
+        "| Format | Bits/weight | NRMSE | Imatrix-weighted NRMSE | Weighted / Q4_K | Max abs | Pareto |",
+        "|---|---:|---:|---:|---:|---:|:---:|",
+    ]
+    for name in sorted(formats, key=lambda n: (
+            float(role_rows[(role, n)]["bits_per_weight"]), n)):
+        row = role_rows[(role, name)]
+        weighted = float(row["weighted_nrmse"])
+        lines.append(
+            f"| {name} | {float(row['bits_per_weight']):.5f} | "
+            f"{float(row['nrmse']):.8f} | {weighted:.8f} | "
+            f"{weighted / q4:.5f} | {float(row['max_abs']):.8g} | "
+            f"{'yes' if name in pareto else ''} |"
+        )
+    lines.append("")
+
 lines = [
-    "# SM75 routed-quant real-weight quality",
-    "",
-    f"Sampled {expected_tensors} routed-expert tensors.",
-    "",
-    "## Gate/up (w1 + w3)",
-    "",
-    "| Format | Bits/weight | NRMSE | Imatrix-weighted NRMSE | Weighted / Q4_K | Max abs |",
-    "|---|---:|---:|---:|---:|---:|",
+    "# SM75 routed-quant real-weight quality sweep", "",
+    f"Sampled {expected_tensors} routed-expert tensors across "
+    f"{len(layers)} layers, {len(experts)} experts, and {len(parts)} parts.", "",
 ]
-q4_gate = float(role_rows[("gate_up", "q4_K")]["weighted_nrmse"])
-for name in gate_formats:
-    row = role_rows[("gate_up", name)]
-    weighted = float(row["weighted_nrmse"])
-    lines.append(
-        f"| {name} | {float(row['bits_per_weight']):.3f} | "
-        f"{float(row['nrmse']):.8f} | {weighted:.8f} | "
-        f"{weighted / q4_gate:.5f} | {float(row['max_abs']):.8g} |"
-    )
+add_role_table(lines, "Gate (w1)", "gate", gate_formats)
+add_role_table(lines, "Up (w3)", "up", gate_formats)
+add_role_table(lines, "Combined gate/up (w1 + w3)", "gate_up", gate_formats)
+add_role_table(lines, "Down (w2)", "down", down_formats)
+
+# Same format for gate and up, independently selectable format for down.
+recipes = []
+for gate_name in gate_formats:
+    gate = role_rows[("gate_up", gate_name)]
+    for down_name in down_formats:
+        down = role_rows[("down", down_name)]
+        bits = (2.0 * float(gate["bits_per_weight"]) +
+                float(down["bits_per_weight"])) / 3.0
+        weighted_sse = float(gate["weighted_sse"]) + float(down["weighted_sse"])
+        weighted_energy = (float(gate["weighted_source_energy"]) +
+                           float(down["weighted_source_energy"]))
+        error = math.sqrt(weighted_sse / weighted_energy)
+        recipes.append((gate_name, down_name, bits, error))
+recipe_pareto = []
+for recipe in recipes:
+    _, _, bits, error = recipe
+    if not any(
+        obits <= bits and oerror <= error and
+        (obits < bits or oerror < error)
+        for _, _, obits, oerror in recipes
+    ):
+        recipe_pareto.append(recipe)
+recipe_pareto.sort(key=lambda r: (r[2], r[3]))
+lines += [
+    "## Role-aware routed recipe Pareto frontier", "",
+    "Gate and up share one format; down is selected independently. Bits/weight "
+    "assumes equal-sized w1, w2, and w3 matrices.", "",
+    "| Gate/up format | Down format | Routed bits/weight | Combined weighted NRMSE |",
+    "|---|---|---:|---:|",
+]
+for gate_name, down_name, bits, error in recipe_pareto:
+    lines.append(f"| {gate_name} | {down_name} | {bits:.5f} | {error:.8f} |")
 lines += [
     "",
-    "IQ2_XXS is included only here because this is its shipping DS4 role.",
+    "IQ2_XXS remains a gate/up control only. IQ2-down and Q2_K are intentionally excluded.",
     "",
-    "## Down (w2)",
-    "",
-    "| Format | Bits/weight | NRMSE | Imatrix-weighted NRMSE | Weighted / Q4_K | Max abs |",
-    "|---|---:|---:|---:|---:|---:|",
-]
-q4_down = float(role_rows[("down", "q4_K")]["weighted_nrmse"])
-for name in common_formats:
-    row = role_rows[("down", name)]
-    weighted = float(row["weighted_nrmse"])
-    lines.append(
-        f"| {name} | {float(row['bits_per_weight']):.3f} | "
-        f"{float(row['nrmse']):.8f} | {weighted:.8f} | "
-        f"{weighted / q4_down:.5f} | {float(row['max_abs']):.8g} |"
-    )
-lines += [
-    "",
-    "IQ2-down and Q2_K are intentionally excluded from this pass.",
-    "",
-    "This is a bounded real-weight/imatrix error audit. It does not alter GGUF",
-    "type registration or production dispatch, and it is not an end-to-end",
-    "model-quality score.",
-    "",
+    "This sweep measures real-weight reconstruction under expert-specific imatrix weights. "
+    "It does not register GGUF types, alter production dispatch, or substitute for the "
+    "end-to-end model quality suite.", "",
 ]
 Path(summary_path).write_text("\n".join(lines), encoding="utf-8")
 print("\n".join(lines))

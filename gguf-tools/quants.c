@@ -658,12 +658,66 @@ typedef struct {
     uint8_t qs[128];
 } ds4q_experimental_q4_32_block;
 
+typedef struct {
+    uint16_t d;
+    uint8_t scales[6];
+    uint8_t qs[160];
+} ds4q_experimental_q5_32_block;
+
 _Static_assert(sizeof(ds4q_experimental_q3_k_block) == 110,
                "standard Q3_K block size");
 _Static_assert(sizeof(ds4q_experimental_q3_32_block) == 104,
                "SM75 Q3-32 block size");
 _Static_assert(sizeof(ds4q_experimental_q4_32_block) == 136,
                "SM75 Q4-32 block size");
+_Static_assert(sizeof(ds4q_experimental_q5_32_block) == 168,
+               "SM75 Q5-32 block size");
+
+enum {
+    DS4Q_Q3A4_BYTES = 108,
+    DS4Q_Q3A6_BYTES = 112,
+    DS4Q_Q3Q4_25_BYTES = 113,
+    DS4Q_Q3Q4_50_BYTES = 121,
+    DS4Q_Q4A4_BYTES = 140,
+    DS4Q_Q4A5_BYTES = 142,
+    DS4Q_Q2Q3_50_BYTES = 89,
+    DS4Q_Q2Q3_75_BYTES = 97,
+};
+
+static void ds4q_pack_bits(const uint8_t *values, int n, int bits,
+                           uint8_t *out) {
+    const size_t bytes = ((size_t)n * (size_t)bits + 7u) / 8u;
+    memset(out, 0, bytes);
+    unsigned bit = 0;
+    for (int i = 0; i < n; i++, bit += (unsigned)bits) {
+        const unsigned byte = bit >> 3;
+        const unsigned shift = bit & 7u;
+        const unsigned value = values[i] & ((1u << bits) - 1u);
+        out[byte] |= (uint8_t)(value << shift);
+        if (shift + (unsigned)bits > 8u)
+            out[byte + 1] |= (uint8_t)(value >> (8u - shift));
+    }
+}
+
+static uint8_t ds4q_unpack_bits(const uint8_t *data, int index, int bits) {
+    const unsigned bit = (unsigned)index * (unsigned)bits;
+    const unsigned byte = bit >> 3;
+    const unsigned shift = bit & 7u;
+    unsigned value = data[byte] >> shift;
+    if (shift + (unsigned)bits > 8u)
+        value |= (unsigned)data[byte + 1] << (8u - shift);
+    return (uint8_t)(value & ((1u << bits) - 1u));
+}
+
+static void ds4q_pack_unsigned_fields(const uint8_t values[8], int bits,
+                                      uint8_t *out) {
+    ds4q_pack_bits(values, 8, bits, out);
+}
+
+static uint8_t ds4q_unpack_unsigned_field(const uint8_t *data, int index,
+                                          int bits) {
+    return ds4q_unpack_bits(data, index, bits);
+}
 
 static void ds4q_pack_signed_scales_16(const int8_t Ls[16], uint8_t out[12]) {
     memset(out, 0, 12);
@@ -815,16 +869,356 @@ static void ds4q_write_k32_signed_block(const float x[QK_K],
     }
 }
 
+static void ds4q_make_group_weights(const float x[QK_K],
+                                    const float *quant_weights,
+                                    int group, float out[32]) {
+    float sum_x2 = 0.0f;
+    for (int i = 0; i < QK_K; i++) sum_x2 += x[i] * x[i];
+    const float sigma2 = 2.0f * sum_x2 / QK_K;
+    for (int i = 0; i < 32; i++) {
+        const float xv = x[32 * group + i];
+        out[i] = quant_weights
+            ? quant_weights[32 * group + i] * sqrtf(sigma2 + xv * xv)
+            : xv * xv;
+    }
+}
+
+static float ds4q_code_error(const float *x, const float *weights,
+                             const int8_t *codes, float scale, int nmax) {
+    float error = 0.0f;
+    for (int i = 0; i < 32; i++) {
+        const float diff = scale * ((int)codes[i] - nmax) - x[i];
+        error += weights[i] * diff * diff;
+    }
+    return error;
+}
+
+static void ds4q_write_mixed_signed_block(const float x[QK_K],
+                                           const float *quant_weights,
+                                           int base_bits, int promoted_groups,
+                                           uint8_t *dst) {
+    const int base_nmax = 1 << (base_bits - 1);
+    const int promoted_nmax = base_nmax << 1;
+    int8_t base_codes[8][32], promoted_codes[8][32], scale_codes[8];
+    float base_scales[8], promoted_scales[8], final_scales[8];
+    float sw[8], gain[8];
+    uint8_t selected = 0;
+
+    for (int g = 0; g < 8; g++) {
+        float weights[32];
+        ds4q_make_group_weights(x, quant_weights, g, weights);
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) sw[g] += weights[i];
+        base_scales[g] = ds4q_make_qx_quants(
+            32, base_nmax, x + 32 * g, base_codes[g], weights);
+        promoted_scales[g] = ds4q_make_qx_quants(
+            32, promoted_nmax, x + 32 * g, promoted_codes[g], weights);
+        gain[g] = ds4q_code_error(x + 32 * g, weights, base_codes[g],
+                                  base_scales[g], base_nmax) -
+                  ds4q_code_error(x + 32 * g, weights, promoted_codes[g],
+                                  promoted_scales[g], promoted_nmax);
+    }
+    for (int pick = 0; pick < promoted_groups; pick++) {
+        int best = -1;
+        for (int g = 0; g < 8; g++)
+            if (!(selected & (1u << g)) &&
+                (best < 0 || gain[g] > gain[best])) best = g;
+        if (best >= 0) selected |= (uint8_t)(1u << best);
+    }
+    for (int g = 0; g < 8; g++)
+        final_scales[g] = (selected & (1u << g))
+            ? promoted_scales[g] : base_scales[g];
+
+    const float block_scale = ds4q_make_qx_quants(
+        8, 32, final_scales, scale_codes, sw);
+    const uint16_t d_bits = ds4q_f32_to_f16(block_scale);
+    memcpy(dst, &d_bits, 2);
+    ds4q_pack_signed_scales_8(scale_codes, dst + 2);
+    const size_t base_bytes = (size_t)base_bits * 32u;
+    uint8_t *base = dst + 8;
+    uint8_t *mask = base + base_bytes;
+    uint8_t *extra = mask + 1;
+    memset(base, 0, base_bytes);
+    *mask = selected;
+    memset(extra, 0, (size_t)promoted_groups * 4u);
+
+    const float stored_d = ds4q_f16_to_f32(d_bits);
+    int extra_group = 0;
+    for (int g = 0; g < 8; g++) {
+        const bool promoted = (selected & (1u << g)) != 0;
+        const int nmax = promoted ? promoted_nmax : base_nmax;
+        const float scale = stored_d * ds4q_unpack_signed_scale_8(dst + 2, g);
+        uint8_t codes[32];
+        for (int i = 0; i < 32; i++) {
+            int q = scale ? ds4q_nearest_int(x[32 * g + i] / scale) : 0;
+            q = DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, q));
+            const unsigned low_mask = (1u << base_bits) - 1u;
+            unsigned code;
+            if (promoted && base_bits == 3)
+                code = (unsigned)q & 15u;
+            else
+                code = (unsigned)(q + nmax);
+            codes[i] = (uint8_t)code;
+            const int global = 32 * g + i;
+            base[(unsigned)global * base_bits / 8u] |=
+                (uint8_t)((code & low_mask) <<
+                          (((unsigned)global * base_bits) & 7u));
+            if ((((unsigned)global * base_bits) & 7u) +
+                    (unsigned)base_bits > 8u)
+                base[(unsigned)global * base_bits / 8u + 1] |=
+                    (uint8_t)((code & low_mask) >>
+                              (8u - (((unsigned)global * base_bits) & 7u)));
+        }
+        if (promoted) {
+            uint8_t high[32];
+            for (int i = 0; i < 32; i++)
+                high[i] = (uint8_t)((codes[i] >> base_bits) & 1u);
+            ds4q_pack_bits(high, 32, 1, extra + 4 * extra_group++);
+        }
+    }
+}
+
+static bool ds4q_dequantize_mixed_signed_block(const uint8_t *src,
+                                                int base_bits,
+                                                float dst[QK_K]) {
+    const int base_nmax = 1 << (base_bits - 1);
+    const size_t base_bytes = (size_t)base_bits * 32u;
+    const uint8_t *base = src + 8;
+    const uint8_t selected = base[base_bytes];
+    const uint8_t *extra = base + base_bytes + 1;
+    uint16_t d_bits;
+    memcpy(&d_bits, src, 2);
+    const float d = ds4q_f16_to_f32(d_bits);
+    int extra_group = 0;
+    for (int g = 0; g < 8; g++) {
+        const bool promoted = (selected & (1u << g)) != 0;
+        const float scale = d * ds4q_unpack_signed_scale_8(src + 2, g);
+        for (int i = 0; i < 32; i++) {
+            const int global = 32 * g + i;
+            unsigned code = ds4q_unpack_bits(base, global, base_bits);
+            if (promoted)
+                code |= (unsigned)ds4q_unpack_bits(extra + 4 * extra_group,
+                                                    i, 1) << base_bits;
+            int q;
+            if (!promoted) q = (int)code - base_nmax;
+            else if (base_bits == 3)
+                q = code < 8u ? (int)code : (int)code - 16;
+            else
+                q = (int)code - (base_nmax << 1);
+            dst[global] = scale * q;
+        }
+        if (promoted) extra_group++;
+    }
+    return true;
+}
+
+static void ds4q_write_affine_block(const float x[QK_K],
+                                    const float *quant_weights,
+                                    int value_bits, int metadata_bits,
+                                    uint8_t *dst) {
+    const int qmax = (1 << value_bits) - 1;
+    const int mmax = (1 << metadata_bits) - 1;
+    const int metadata_bytes = metadata_bits;
+    uint8_t codes[QK_K], scratch[32], scale_codes[8], min_codes[8];
+    float scales[8], mins[8], sw[8];
+    for (int g = 0; g < 8; g++) {
+        float weights[32];
+        ds4q_make_group_weights(x, quant_weights, g, weights);
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) sw[g] += weights[i];
+        scales[g] = ds4q_make_qkx3_quants(
+            32, qmax, x + 32 * g, weights, codes + 32 * g,
+            &mins[g], scratch, -0.9f, 0.05f, 36, false);
+    }
+    const float d = ds4q_make_qp_quants(8, mmax, scales, scale_codes, sw);
+    const float dmin = ds4q_make_qp_quants(8, mmax, mins, min_codes, sw);
+    const uint16_t d_bits = ds4q_f32_to_f16(d);
+    const uint16_t dmin_bits = ds4q_f32_to_f16(dmin);
+    memcpy(dst, &d_bits, 2);
+    memcpy(dst + 2, &dmin_bits, 2);
+    ds4q_pack_unsigned_fields(scale_codes, metadata_bits, dst + 4);
+    ds4q_pack_unsigned_fields(min_codes, metadata_bits,
+                              dst + 4 + metadata_bytes);
+    const float stored_d = ds4q_f16_to_f32(d_bits);
+    const float stored_dmin = ds4q_f16_to_f32(dmin_bits);
+    for (int g = 0; g < 8; g++) {
+        const float scale = stored_d *
+            ds4q_unpack_unsigned_field(dst + 4, g, metadata_bits);
+        const float min = stored_dmin * ds4q_unpack_unsigned_field(
+            dst + 4 + metadata_bytes, g, metadata_bits);
+        for (int i = 0; i < 32; i++) {
+            int q = scale
+                ? ds4q_nearest_int((x[32 * g + i] + min) / scale) : 0;
+            codes[32 * g + i] = (uint8_t)DS4Q_MAX(0, DS4Q_MIN(qmax, q));
+        }
+    }
+    ds4q_pack_bits(codes, QK_K, value_bits,
+                    dst + 4 + 2 * metadata_bytes);
+}
+
+static bool ds4q_dequantize_affine_block(const uint8_t *src,
+                                          int value_bits, int metadata_bits,
+                                          float dst[QK_K]) {
+    const int metadata_bytes = metadata_bits;
+    uint16_t d_bits, dmin_bits;
+    memcpy(&d_bits, src, 2);
+    memcpy(&dmin_bits, src + 2, 2);
+    const float d = ds4q_f16_to_f32(d_bits);
+    const float dmin = ds4q_f16_to_f32(dmin_bits);
+    const uint8_t *values = src + 4 + 2 * metadata_bytes;
+    for (int g = 0; g < 8; g++) {
+        const float scale = d * ds4q_unpack_unsigned_field(
+            src + 4, g, metadata_bits);
+        const float min = dmin * ds4q_unpack_unsigned_field(
+            src + 4 + metadata_bytes, g, metadata_bits);
+        for (int i = 0; i < 32; i++)
+            dst[32 * g + i] = scale * ds4q_unpack_bits(
+                values, 32 * g + i, value_bits) - min;
+    }
+    return true;
+}
+
+static const int8_t ds4q_iq3_32_codebook[8] = {-4, -2, -1, 0, 0, 1, 2, 4};
+
+static int ds4q_nearest_iq3_code(float value) {
+    int best = 3;
+    float best_error = fabsf(value);
+    for (int code = 0; code < 8; code++) {
+        const float error = fabsf(value - ds4q_iq3_32_codebook[code]);
+        if (error < best_error) {
+            best = code;
+            best_error = error;
+        }
+    }
+    return best;
+}
+
+static float ds4q_make_iq3_quants(const float x[32], const float weights[32],
+                                  uint8_t codes[32]) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) amax = DS4Q_MAX(amax, fabsf(x[i]));
+    if (amax < DS4Q_GROUP_MAX_EPS) {
+        memset(codes, 3, 32);
+        return 0.0f;
+    }
+    float best_scale = 0.0f, best_error = INFINITY;
+    uint8_t trial[32];
+    for (int seed = -12; seed <= 12; seed++) {
+        float scale = amax / (4.0f * (1.0f + 0.025f * seed));
+        for (int iteration = 0; iteration < 6; iteration++) {
+            double sum_xq = 0.0, sum_q2 = 0.0;
+            for (int i = 0; i < 32; i++) {
+                trial[i] = (uint8_t)ds4q_nearest_iq3_code(x[i] / scale);
+                const int q = ds4q_iq3_32_codebook[trial[i]];
+                sum_xq += weights[i] * x[i] * q;
+                sum_q2 += weights[i] * q * q;
+            }
+            if (sum_q2 > 0.0) scale = (float)(sum_xq / sum_q2);
+        }
+        float error = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            trial[i] = (uint8_t)ds4q_nearest_iq3_code(x[i] / scale);
+            const float diff = scale * ds4q_iq3_32_codebook[trial[i]] - x[i];
+            error += weights[i] * diff * diff;
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_scale = scale;
+            memcpy(codes, trial, 32);
+        }
+    }
+    return best_scale;
+}
+
+static void ds4q_write_iq3_32_block(const float x[QK_K],
+                                    const float *quant_weights,
+                                    uint8_t *dst) {
+    float scales[8], sw[8];
+    int8_t scale_codes[8];
+    uint8_t codes[QK_K];
+    for (int g = 0; g < 8; g++) {
+        float weights[32];
+        ds4q_make_group_weights(x, quant_weights, g, weights);
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) sw[g] += weights[i];
+        scales[g] = ds4q_make_iq3_quants(x + 32 * g, weights,
+                                          codes + 32 * g);
+    }
+    const float d = ds4q_make_qx_quants(8, 32, scales, scale_codes, sw);
+    const uint16_t d_bits = ds4q_f32_to_f16(d);
+    memcpy(dst, &d_bits, 2);
+    ds4q_pack_signed_scales_8(scale_codes, dst + 2);
+    const float stored_d = ds4q_f16_to_f32(d_bits);
+    for (int g = 0; g < 8; g++) {
+        const float scale = stored_d * ds4q_unpack_signed_scale_8(dst + 2, g);
+        for (int i = 0; i < 32; i++)
+            codes[32 * g + i] = scale
+                ? (uint8_t)ds4q_nearest_iq3_code(x[32 * g + i] / scale) : 3;
+    }
+    ds4q_pack_bits(codes, QK_K, 3, dst + 8);
+}
+
+static bool ds4q_dequantize_iq3_32_block(const uint8_t *src,
+                                          float dst[QK_K]) {
+    uint16_t d_bits;
+    memcpy(&d_bits, src, 2);
+    const float d = ds4q_f16_to_f32(d_bits);
+    for (int g = 0; g < 8; g++) {
+        const float scale = d * ds4q_unpack_signed_scale_8(src + 2, g);
+        for (int i = 0; i < 32; i++)
+            dst[32 * g + i] = scale * ds4q_iq3_32_codebook[
+                ds4q_unpack_bits(src + 8, 32 * g + i, 3)];
+    }
+    return true;
+}
+
+static void ds4q_write_q5_32_block(const float x[QK_K],
+                                   const float *quant_weights,
+                                   ds4q_experimental_q5_32_block *dst) {
+    int8_t scale_codes[8], local_codes[32];
+    uint8_t codes[QK_K];
+    float scales[8], sw[8];
+    for (int g = 0; g < 8; g++) {
+        float weights[32];
+        ds4q_make_group_weights(x, quant_weights, g, weights);
+        sw[g] = 0.0f;
+        for (int i = 0; i < 32; i++) sw[g] += weights[i];
+        scales[g] = ds4q_make_qx_quants(32, 16, x + 32 * g,
+                                         local_codes, weights);
+    }
+    const float d = ds4q_make_qx_quants(8, 32, scales, scale_codes, sw);
+    dst->d = ds4q_f32_to_f16(d);
+    ds4q_pack_signed_scales_8(scale_codes, dst->scales);
+    const float stored_d = ds4q_f16_to_f32(dst->d);
+    for (int g = 0; g < 8; g++) {
+        const float scale = stored_d * ds4q_unpack_signed_scale_8(dst->scales, g);
+        for (int i = 0; i < 32; i++) {
+            int q = scale ? ds4q_nearest_int(x[32 * g + i] / scale) : 0;
+            q = DS4Q_MAX(-16, DS4Q_MIN(15, q));
+            codes[32 * g + i] = (uint8_t)(q + 16);
+        }
+    }
+    ds4q_pack_bits(codes, QK_K, 5, dst->qs);
+}
+
 const char *ds4q_experimental_format_name(ds4q_experimental_format format) {
     static const char *const names[DS4Q_EXPERIMENT_COUNT] = {
         "q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32", "iq2_xxs",
+        "sm75_iq3_32", "sm75_q3a_32_4", "sm75_q3a_32_6",
+        "sm75_q3q4_32_25", "sm75_q3q4_32_50",
+        "sm75_q4a_32_4", "sm75_q4a_32_5", "sm75_q5_32",
+        "sm75_q2q3_32_50", "sm75_q2q3_32_75",
     };
     return format >= 0 && format < DS4Q_EXPERIMENT_COUNT ? names[format] : NULL;
 }
 
 size_t ds4q_experimental_block_bytes(ds4q_experimental_format format) {
     static const size_t sizes[DS4Q_EXPERIMENT_COUNT] = {
-        144, 110, 104, 136, 66,
+        144, 110, 104, 136, 66, 104,
+        DS4Q_Q3A4_BYTES, DS4Q_Q3A6_BYTES,
+        DS4Q_Q3Q4_25_BYTES, DS4Q_Q3Q4_50_BYTES,
+        DS4Q_Q4A4_BYTES, DS4Q_Q4A5_BYTES, 168,
+        DS4Q_Q2Q3_50_BYTES, DS4Q_Q2Q3_75_BYTES,
     };
     return format >= 0 && format < DS4Q_EXPERIMENT_COUNT ? sizes[format] : 0;
 }
@@ -851,6 +1245,36 @@ bool ds4q_experimental_quantize_block(ds4q_experimental_format format,
             return imatrix &&
                    ds4q_quantize_chunk(DS4Q_TYPE_IQ2_XXS, src, dst, 0, 1,
                                        QK_K, imatrix) == 66;
+        case DS4Q_EXPERIMENT_SM75_IQ3_32:
+            ds4q_write_iq3_32_block(src, imatrix, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q3A_32_4:
+            ds4q_write_affine_block(src, imatrix, 3, 4, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q3A_32_6:
+            ds4q_write_affine_block(src, imatrix, 3, 6, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q3Q4_32_25:
+            ds4q_write_mixed_signed_block(src, imatrix, 3, 2, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q3Q4_32_50:
+            ds4q_write_mixed_signed_block(src, imatrix, 3, 4, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q4A_32_4:
+            ds4q_write_affine_block(src, imatrix, 4, 4, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q4A_32_5:
+            ds4q_write_affine_block(src, imatrix, 4, 5, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q5_32:
+            ds4q_write_q5_32_block(src, imatrix, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q2Q3_32_50:
+            ds4q_write_mixed_signed_block(src, imatrix, 2, 4, dst);
+            return true;
+        case DS4Q_EXPERIMENT_SM75_Q2Q3_32_75:
+            ds4q_write_mixed_signed_block(src, imatrix, 2, 6, dst);
+            return true;
         default:
             return false;
     }
@@ -954,6 +1378,34 @@ bool ds4q_experimental_dequantize_block(ds4q_experimental_format format,
         }
         return true;
     }
+    if (format == DS4Q_EXPERIMENT_SM75_IQ3_32)
+        return ds4q_dequantize_iq3_32_block(src, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q3A_32_4)
+        return ds4q_dequantize_affine_block(src, 3, 4, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q3A_32_6)
+        return ds4q_dequantize_affine_block(src, 3, 6, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q3Q4_32_25)
+        return ds4q_dequantize_mixed_signed_block(src, 3, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q3Q4_32_50)
+        return ds4q_dequantize_mixed_signed_block(src, 3, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q4A_32_4)
+        return ds4q_dequantize_affine_block(src, 4, 4, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q4A_32_5)
+        return ds4q_dequantize_affine_block(src, 4, 5, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q5_32) {
+        const ds4q_experimental_q5_32_block *block = src;
+        const float d = ds4q_f16_to_f32(block->d);
+        for (int k = 0; k < QK_K; k++) {
+            const int q = (int)ds4q_unpack_bits(block->qs, k, 5) - 16;
+            dst[k] = d * ds4q_unpack_signed_scale_8(
+                block->scales, k / 32) * q;
+        }
+        return true;
+    }
+    if (format == DS4Q_EXPERIMENT_SM75_Q2Q3_32_50)
+        return ds4q_dequantize_mixed_signed_block(src, 2, dst);
+    if (format == DS4Q_EXPERIMENT_SM75_Q2Q3_32_75)
+        return ds4q_dequantize_mixed_signed_block(src, 2, dst);
     return false;
 }
 
