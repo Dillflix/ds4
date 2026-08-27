@@ -27720,8 +27720,17 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     ds4_gpu_tensor *peer_topk_src = NULL;
     ds4_gpu_tensor *peer_topk_dst = NULL;
     bool ok = home_q && peer_q_src && peer_q_dst && home_heads && peer_heads &&
-              gather_dst && ds4_gpu_tensor_copy_xdev(
-                  peer_q_dst, peer_q_src, q_half_bytes) != 0;
+              gather_dst;
+    /* The attention kernels below execute on each device's default stream.
+     * Keep both activation handoff and result gather on that same ordering
+     * domain.  The generic xdev helper uses the engine side stream; an
+     * explicit destination-ready handshake makes partner Q consumption and
+     * scratch reuse independent of implicit legacy-default-stream behavior. */
+    if (ok) {
+        ok = ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
+             ds4_gpu_tensor_copy_xdev_default(
+                 peer_q_dst, peer_q_src, q_half_bytes) != 0;
+    }
 
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         home_topk = ds4_gpu_tensor_view((ds4_gpu_tensor *)topk, 0,
@@ -27732,8 +27741,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         peer_topk_dst = ds4_gpu_tensor_view(
             g->comp_selected_by_tier[partner], 0, topk_half_bytes);
         ok = home_topk && peer_topk_src && peer_topk_dst &&
-             ds4_gpu_tensor_copy_xdev(peer_topk_dst, peer_topk_src,
-                                      topk_half_bytes) != 0;
+             ds4_gpu_tensor_wait_xdev_default(peer_topk_dst, home) != 0 &&
+             ds4_gpu_tensor_copy_xdev_default(
+                 peer_topk_dst, peer_topk_src, topk_half_bytes) != 0;
     }
 
     if (ok) ok = ds4_gpu_set_current_device(partner) == 0;
@@ -27771,8 +27781,11 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ok) ok = ds4_gpu_tensor_copy_xdev(
-        gather_dst, peer_heads, q_half_bytes) != 0;
+    if (ok) {
+        ok = ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
+             ds4_gpu_tensor_copy_xdev_default(
+                 gather_dst, peer_heads, q_half_bytes) != 0;
+    }
 
     static uint32_t logged_home_mask = 0u;
     if (ok && home >= 0 && home < 32 &&

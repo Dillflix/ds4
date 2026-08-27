@@ -81,7 +81,11 @@ for flag in RUN_HARNESS SKIP_BUILD CREATE_ARCHIVE; do
 done
 case $AB_TARGET in
     indexed) baseline_variant=home; candidate_variant=rows ;;
-    mixed) baseline_variant=indexed; candidate_variant=indexed-mixed ;;
+    mixed)
+        [[ $RUN_HARNESS == 1 ]] ||
+            die "AB_TARGET=mixed requires the ratio-128 transfer-lifecycle harness"
+        baseline_variant=indexed; candidate_variant=indexed-mixed
+        ;;
     *) die "AB_TARGET must be indexed or mixed" ;;
 esac
 for tool in awk basename cat cmp date dirname env find git grep make mkdir nproc \

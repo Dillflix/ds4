@@ -1806,7 +1806,8 @@ the incremental decode-mixed row split. The baseline keeps the accepted
 indexed-chain split; the candidate adds only mixed-attention splitting. Both
 arms require the complete 344/344 dense-F16 cache, validate the requested paths
 on both physical NVLink pairs, and compare every frontier's logits byte for
-byte:
+byte. The mixed preflight models the real ratio-128 compressed shape and
+includes the production Q handoff and result gather; it is mandatory:
 
 ```bash
 AB_TARGET=mixed \
@@ -1859,7 +1860,7 @@ candidate, not the obsolete home-only baseline. The profiler requires exactly
 frontiers; only the second frontier lies inside the Systems capture range.
 Nsight Compute does not replay the full application: bounded exact harnesses
 capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, indexed attention, the real
-ratio-0 raw-window mixed-attention shape, the 32K WMMA indexer-score shape, and
+ratio-128 compressed mixed-attention shape, the 32K WMMA indexer-score shape, and
 the 8192-wide U16 top-k shape. This avoids seven additional 139 GB model loads
 and prevents application replay from perturbing the production trace. The
 summary classifies indexer score and selection separately instead of hiding

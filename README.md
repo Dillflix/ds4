@@ -844,10 +844,10 @@ and raw-only attention remain unchanged in the accepted path.
 `DS4_CUDA_TP_PREFILL_ATTN_ROWS_MIXED=1` is a separate evidence-only extension
 that also splits eligible decode-mixed attention over the same partner-local
 raw/compressed KV mirrors. It is deliberately not implied by the indexed flag:
-the model-free mixed harness measured the compute-only shape, while the fixed
-production A/B must still establish the cost of transferring half of Q and
-gathering half of the FP32 result. Requested mixed calls are fail-closed rather
-than silently falling back. Set
+the model-free mixed harness models the production ratio-128 compressed shape
+and includes both the half-Q handoff and half-result gather. The fixed
+production A/B must still establish its end-to-end value. Requested mixed
+calls are fail-closed rather than silently falling back. Set
 `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit one record for every split
 chain. Direct peer-reading of persistent caches is not a fallback; the bounded
 SM75 experiment measured it slower than the shipping home path on both NVLink

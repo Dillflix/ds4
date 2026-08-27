@@ -1,8 +1,10 @@
 /* Bounded SM75 two-GPU attention row-split experiment.  This is a harness,
  * not a production dispatch.  It compares the shipping 512-row launch with
  * concurrent 256/256 launches using either peer-read or mirrored partner
- * inputs.  Query rows are independent, so adjusted pos0/n_raw preserves the
- * shipping kernel's arithmetic order and permits bit-exact validation. */
+ * inputs.  The mixed scenario models the production ratio-128 compressed
+ * path and also exercises its Q handoff/result-gather lifecycle.  Query rows
+ * are independent, so adjusted pos0/n_raw preserves the shipping kernel's
+ * arithmetic order and permits bit-exact validation. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -154,11 +156,11 @@ static int run_case(int indexed) {
     const uint32_t n_raw = 2304u, home_n_raw = 2048u;
     const uint32_t raw_cap = 2304u, raw_start = 0u;
     /* At the 32K frontier ratio-4 layers with 7,936 compressed rows take the
-     * indexed path.  The production mixed kernel is the ratio-0 raw-window
-     * path.  Do not benchmark the old synthetic ratio-4/non-indexed shape. */
-    const uint32_t n_comp = indexed ? 7936u : 0u;
+     * indexed path.  Production decode-mixed dispatch is the alternating
+     * ratio-128 layer shape, with 256 compressed rows at this frontier. */
+    const uint32_t n_comp = indexed ? 7936u : 256u;
     const uint32_t top_k = indexed ? 512u : 0u;
-    const uint32_t window = 2048u, ratio = indexed ? 4u : 0u;
+    const uint32_t window = 2048u, ratio = indexed ? 4u : 128u;
     const uint32_t n_head = 64u, head_dim = 512u;
     const uint64_t row_count = (uint64_t)n_head * head_dim;
     const uint64_t q_count = (uint64_t)n_tokens * row_count;
@@ -176,7 +178,7 @@ static int run_case(int indexed) {
     float *home_host = NULL, *partner_host = NULL;
     int32_t *topk_host = NULL;
     ds4_gpu_tensor q0 = {0}, raw0 = {0}, comp0 = {0}, topk0 = {0};
-    ds4_gpu_tensor ref = {0}, home = {0}, partner = {0};
+    ds4_gpu_tensor ref = {0}, home = {0}, partner = {0}, gathered = {0};
     ds4_gpu_tensor q1 = {0}, raw1 = {0}, comp1 = {0}, topk1 = {0};
     ds4_gpu_tensor q_home = {0}, q_peer = {0};
     ds4_gpu_tensor topk_home = {0}, topk_peer = {0};
@@ -239,6 +241,8 @@ static int run_case(int indexed) {
           ds4_gpu_tensor_alloc_on(&ref, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&home, 0, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&partner, 1,
+                                  half_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&gathered, 0,
                                   half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&q1, 1, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw1, 1, raw_count * sizeof(float)) == 0 &&
@@ -347,6 +351,33 @@ static int run_case(int indexed) {
     CHECK(compare_halves(ref_host, home_host, partner_host, half_count,
                          "mirror"), "mirror exactness");
 
+    /* Exercise the production lifecycle, not only preloaded compute: copy the
+     * partner query half, launch both devices, then gather the partner result
+     * back to the home device using default-stream ordering. */
+    CHECK(ds4_gpu_tensor_wait_xdev_default(&q1, 0) &&
+          ds4_gpu_tensor_copy_xdev_default(
+              &q1, &q_peer, half_count * sizeof(float)),
+          "transfer query handoff");
+    CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
+          "transfer home launch");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          LAUNCH_PARTNER(&q1, &raw1,
+                         indexed ? &comp1 : NULL, &topk1),
+          "transfer partner launch");
+    CHECK(ds4_gpu_tensor_wait_xdev_default(&gathered, 1) &&
+          ds4_gpu_tensor_copy_xdev_default(
+              &gathered, &partner, half_count * sizeof(float)),
+          "transfer result gather");
+    CHECK(sync_tier(0) && sync_tier(1),
+          "transfer split synchronization");
+    CHECK(ds4_gpu_tensor_read(&home, 0, home_host,
+                              half_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(&gathered, 0, partner_host,
+                              half_count * sizeof(float)),
+          "transfer result read");
+    CHECK(compare_halves(ref_host, home_host, partner_host, half_count,
+                         "transfer"), "transfer exactness");
+
     double start = now_seconds();
     CHECK(ds4_gpu_set_current_device(0) == 0, "baseline timing device");
     for (uint32_t r = 0; r < repeats; r++)
@@ -386,13 +417,38 @@ static int run_case(int indexed) {
     const double mirror_ms =
         (now_seconds() - start) * 1000.0 / (double)repeats;
 
+    start = now_seconds();
+    for (uint32_t r = 0; r < repeats; r++) {
+        CHECK(ds4_gpu_tensor_wait_xdev_default(&q1, 0) &&
+              ds4_gpu_tensor_copy_xdev_default(
+                  &q1, &q_peer, half_count * sizeof(float)),
+              "transfer timed query handoff");
+        CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
+              "transfer timed home launch");
+        CHECK(ds4_gpu_set_current_device(1) == 0 &&
+              LAUNCH_PARTNER(&q1, &raw1,
+                             indexed ? &comp1 : NULL, &topk1),
+              "transfer timed partner launch");
+        CHECK(ds4_gpu_tensor_wait_xdev_default(&gathered, 1) &&
+              ds4_gpu_tensor_copy_xdev_default(
+                  &gathered, &partner, half_count * sizeof(float)),
+              "transfer timed result gather");
+    }
+    CHECK(sync_tier(0) && sync_tier(1),
+          "transfer timing synchronization");
+    const double transfer_ms =
+        (now_seconds() - start) * 1000.0 / (double)repeats;
+
     printf("scenario=attention-row-split-%s-32k\n",
-           indexed ? "indexed" : "mixed-raw");
+           indexed ? "indexed" : "mixed-ratio128");
     printf("validation=bit-exact-nonzero\nrepeats=%u\n", repeats);
-    printf("baseline_ms=%.6f\npeer_read_ms=%.6f\nmirrored_kv_ms=%.6f\n",
-           baseline_ms, peer_ms, mirror_ms);
-    printf("peer_read_speedup=%.6f\nmirrored_kv_speedup=%.6f\n",
-           baseline_ms / peer_ms, baseline_ms / mirror_ms);
+    printf("baseline_ms=%.6f\npeer_read_ms=%.6f\nmirrored_kv_ms=%.6f\n"
+           "transfer_inclusive_ms=%.6f\n",
+           baseline_ms, peer_ms, mirror_ms, transfer_ms);
+    printf("peer_read_speedup=%.6f\nmirrored_kv_speedup=%.6f\n"
+           "transfer_inclusive_speedup=%.6f\n",
+           baseline_ms / peer_ms, baseline_ms / mirror_ms,
+           baseline_ms / transfer_ms);
     printf("partner_q_bytes=%llu\npartner_attention_output_bytes=%llu\n",
            (unsigned long long)(half_count * sizeof(float)),
            (unsigned long long)(half_count * sizeof(float)));
@@ -404,6 +460,7 @@ static int run_case(int indexed) {
 #undef LAUNCH_HOME
 
 cleanup:
+    ds4_gpu_tensor_free_in_place(&gathered);
     ds4_gpu_tensor_free_in_place(&topk1);
     ds4_gpu_tensor_free_in_place(&comp1);
     ds4_gpu_tensor_free_in_place(&raw1);
