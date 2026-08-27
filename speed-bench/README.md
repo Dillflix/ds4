@@ -1748,11 +1748,18 @@ If the uninstrumented A/B does not reproduce the isolated kernel gain,
 32K production trace for each exact score tile. It retains the 256K allocation,
 balanced T256 placement, mirrored-KV attention row split, and 512-token
 pipeline microbatch. The trace comparison reports score time per stage/device,
-total score launches, pipeline GPU span, and trace throughput. This separates
-two materially different outcomes: either WMMA64 is no faster across the real
-production launch population, or its saved GPU work is overlapped and absent
-from the pipeline critical path. The synchronizing indexer stage profiler is
-not enabled.
+position/stage score time, total score launches, pipeline GPU span, and trace
+throughput. This separates two materially different outcomes: either WMMA64 is
+no faster across the real production launch population, or its saved GPU work
+is overlapped and absent from the pipeline critical path. The synchronizing
+indexer stage profiler is not enabled.
+
+The runner creates one detached Git worktree pinned to the caller's committed
+HEAD, builds there once, and uses that same binary and post-processing source
+for both captures. It records and compares the `ds4-bench` SHA-256. This is
+intentional: a paired capture lasts long enough that another experiment can
+otherwise switch or edit the shared checkout between the first and second
+post-processing pass. `SKIP_BUILD=1` is therefore rejected by this runner.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1776,7 +1783,16 @@ Return `sm75-indexer-production-trace-<timestamp>.tar.gz`. Both inner traces
 export the 32K frontier logits and must match byte-for-byte. Each trace also
 audits all indexer dispatches and rejects mixed score-kernel use. The general
 production profiler accepts `INDEXER_SCORE_TILE=128|64`; 128 remains the
-shipping default and 64 is diagnostic only.
+shipping default and 64 is diagnostic only. `score-position-stage.csv` gives
+the paired result for every real context-position/stage cell.
+
+The 2026-08-27 32K capture rejected WMMA64 as a production replacement:
+WMMA128 used 9612.942 ms for 1260 score launches and WMMA64 used 9640.108 ms
+(0.997x). WMMA64 won only 57 of 120 matched position/stage cells and was 0.995x
+at the final 32256 position. The 1.003x trace-throughput difference was not
+backed by reduced score work and is consistent with the preceding interleaved
+uninstrumented A/B. Keep WMMA128; do not base subsequent indexer work on the
+isolated WMMA64 event-timing result.
 
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode

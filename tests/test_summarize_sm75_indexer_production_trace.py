@@ -39,11 +39,13 @@ def make_variant(root: Path, variant: str, score_ns: int, span_ms: float,
         operation_fields,
         [
             [variant, "kernel", 0, half, half, 0, 1, 0, kernel,
-             "ds4/prefill/stage/stage=0/mb=0/tier=0/layers=0-22",
-             "", "", "", "", "", "", ""],
+             "ds4/prefill/stage/stage=0/mb=0/tier=0/layers=0-22/pos=32256/tokens=512",
+             "ds4/prefill/layer/stage=0/mb=0/tier=0/layer=2/pos=32256/tokens=512",
+             "", "", "", "", "", ""],
             [variant, "kernel", half, score_ns, score_ns - half, 3, 1, 0,
-             kernel, "ds4/prefill/stage/stage=1/mb=0/tier=1/layers=22-43",
-             "", "", "", "", "", "", ""],
+             kernel, "ds4/prefill/stage/stage=1/mb=0/tier=1/layers=22-43/pos=32256/tokens=512",
+             "ds4/prefill/layer/stage=1/mb=0/tier=1/layer=22/pos=32256/tokens=512",
+             "", "", "", "", "", ""],
         ],
     )
     write_csv(
@@ -73,6 +75,13 @@ def main() -> int:
         cells = list(csv.DictReader((root / "score-device-stage.csv").open()))
         assert len(cells) == 4
         assert {row["stage"] for row in cells} == {"0", "1"}
+        positions = list(csv.DictReader((root / "score-position-stage.csv").open()))
+        assert len(positions) == 2
+        assert {row["pos"] for row in positions} == {"32256"}
+        assert all(abs(float(row["wmma64_speedup"]) - 4 / 3) < 1e-9
+                   for row in positions)
+        assert comparison["wmma64_faster_position_stage_cells"] == 2
+        assert comparison["final_position"] == 32256
         assert "not reflected" in (root / "summary.md").read_text()
     print("SM75 indexer production trace summarizer test: OK")
     return 0

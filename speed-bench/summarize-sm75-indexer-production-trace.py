@@ -41,7 +41,13 @@ def parse_fields(text: str) -> dict[str, str]:
     return fields
 
 
-def summarize_variant(root: Path, variant: str) -> tuple[dict[str, object], list[dict[str, object]]]:
+def summarize_variant(
+    root: Path, variant: str
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    dict[tuple[int, int, int, int, int], dict[str, int]],
+]:
     variant_dir = root / variant
     operations = read_csv(variant_dir / "operation-attribution.csv")
     trace_rows = read_csv(variant_dir / "trace-summary.csv")
@@ -69,13 +75,24 @@ def summarize_variant(root: Path, variant: str) -> tuple[dict[str, object], list
     by_cell: dict[tuple[int, int, int], dict[str, int]] = defaultdict(
         lambda: {"duration_ns": 0, "launches": 0}
     )
+    by_position: dict[tuple[int, int, int, int, int], dict[str, int]] = defaultdict(
+        lambda: {"duration_ns": 0, "launches": 0}
+    )
     for row in score_ops:
         stage = parse_fields(row["stage_range"])
-        if "stage" not in stage or "tier" not in stage:
-            die(f"{variant} score launch is outside an attributed stage")
+        layer = parse_fields(row["layer_range"])
+        required = {"stage", "tier", "pos", "tokens"}
+        if not required.issubset(stage) or not required.issubset(layer):
+            die(f"{variant} score launch lacks stage/position attribution")
+        for field in required:
+            if stage[field] != layer[field]:
+                die(f"{variant} score launch has inconsistent {field} attribution")
         key = (int(stage["stage"]), int(stage["tier"]), int(row["device"]))
         by_cell[key]["duration_ns"] += int(row["duration_ns"])
         by_cell[key]["launches"] += 1
+        position_key = key + (int(stage["pos"]), int(stage["tokens"]))
+        by_position[position_key]["duration_ns"] += int(row["duration_ns"])
+        by_position[position_key]["launches"] += 1
 
     score_ns = sum(int(row["duration_ns"]) for row in score_ops)
     annotated_ns = round(float(trace_rows[0]["annotated_kernel_ms"]) * 1e6)
@@ -103,7 +120,7 @@ def summarize_variant(root: Path, variant: str) -> tuple[dict[str, object], list
         "score_launches": len(score_ops),
         "score_mean_us": score_ns / len(score_ops) / 1e3,
     }
-    return result, cells
+    return result, cells, by_position
 
 
 def main() -> int:
@@ -112,15 +129,54 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     summaries: dict[str, dict[str, object]] = {}
     cells: list[dict[str, object]] = []
+    position_data: dict[
+        str, dict[tuple[int, int, int, int, int], dict[str, int]]
+    ] = {}
     for variant in VARIANTS:
-        summary, variant_cells = summarize_variant(root, variant)
+        summary, variant_cells, variant_positions = summarize_variant(root, variant)
         summaries[variant] = summary
         cells.extend(variant_cells)
+        position_data[variant] = variant_positions
 
     if summaries["wmma128"]["prefill_tokens"] != summaries["wmma64"]["prefill_tokens"]:
         die("the paired traces contain different prefill work")
     if summaries["wmma128"]["score_launches"] != summaries["wmma64"]["score_launches"]:
         die("the paired traces contain different score-launch counts")
+    if position_data["wmma128"].keys() != position_data["wmma64"].keys():
+        die("the paired traces contain different score position/stage cells")
+
+    position_rows: list[dict[str, object]] = []
+    faster_cells = 0
+    final_pos = max(key[3] for key in position_data["wmma128"])
+    final_base_ns = 0
+    final_candidate_ns = 0
+    for key in sorted(position_data["wmma128"]):
+        stage, tier, device, pos, tokens = key
+        base_values = position_data["wmma128"][key]
+        candidate_values = position_data["wmma64"][key]
+        if base_values["launches"] != candidate_values["launches"]:
+            die(f"paired score launch count differs at stage={stage} pos={pos}")
+        base_ns = base_values["duration_ns"]
+        candidate_ns = candidate_values["duration_ns"]
+        speedup = base_ns / candidate_ns if candidate_ns else 0.0
+        faster_cells += int(speedup > 1.0)
+        if pos == final_pos:
+            final_base_ns += base_ns
+            final_candidate_ns += candidate_ns
+        position_rows.append(
+            {
+                "stage": stage,
+                "tier": tier,
+                "device": device,
+                "pos": pos,
+                "tokens": tokens,
+                "launches": base_values["launches"],
+                "wmma128_score_ms": base_ns / 1e6,
+                "wmma64_score_ms": candidate_ns / 1e6,
+                "wmma64_speedup": speedup,
+                "wmma64_ms_delta": (candidate_ns - base_ns) / 1e6,
+            }
+        )
 
     write_csv(
         root / "trace-comparison.csv",
@@ -135,6 +191,15 @@ def main() -> int:
         root / "score-device-stage.csv",
         ["variant", "stage", "tier", "device", "score_ms", "launches", "mean_us"],
         cells,
+    )
+    write_csv(
+        root / "score-position-stage.csv",
+        [
+            "stage", "tier", "device", "pos", "tokens", "launches",
+            "wmma128_score_ms", "wmma64_score_ms", "wmma64_speedup",
+            "wmma64_ms_delta",
+        ],
+        position_rows,
     )
 
     base = summaries["wmma128"]
@@ -152,6 +217,12 @@ def main() -> int:
         "pipeline_ms_saved": (
             float(base["pipeline_gpu_span_ms"]) -
             float(candidate["pipeline_gpu_span_ms"])
+        ),
+        "position_stage_cells": len(position_rows),
+        "wmma64_faster_position_stage_cells": faster_cells,
+        "final_position": final_pos,
+        "final_position_score_speedup": (
+            final_base_ns / final_candidate_ns if final_candidate_ns else 0.0
         ),
     }
     (root / "comparison.json").write_text(
@@ -202,6 +273,12 @@ def main() -> int:
             f"\nScore-kernel speedup: **{ratios['score_kernel_speedup']:.3f}x**. "
             f"Pipeline-span speedup: **{ratios['pipeline_span_speedup']:.3f}x**. "
             f"Trace-throughput speedup: **{ratios['trace_prefill_tps_speedup']:.3f}x**.\n\n"
+        )
+        handle.write(
+            f"WMMA64 was faster in **{faster_cells}/{len(position_rows)}** "
+            "matched position/stage cells. At the final production position "
+            f"({final_pos}), its score-kernel speedup was "
+            f"**{ratios['final_position_score_speedup']:.3f}x**.\n\n"
         )
         handle.write(f"Interpretation: {interpretation}\n")
         handle.write(
