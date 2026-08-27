@@ -105,6 +105,32 @@ static int check_shipping_control_parity(ds4q_type production_type,
     return 0;
 }
 
+static int check_iq2_runtime_codebook(void) {
+    _Alignas(16) uint8_t encoded[66] = {0};
+    float decoded[256];
+    const float one = 1.0f;
+    uint16_t one_f16;
+    ds4q_f32_to_f16_row(&one, &one_f16, 1);
+    memcpy(encoded, &one_f16, sizeof(one_f16));
+    /* Every zero grid index selects eight symbolic level-1 entries; zero
+       sign/scale words select positive signs and the first odd scale.  The
+       runtime codebook maps level 1 to 8, which cancels its 1/8 factor. */
+    if (!ds4q_experimental_dequantize_block(
+            DS4Q_EXPERIMENT_IQ2_XXS, encoded, decoded)) {
+        fprintf(stderr, "IQ2 runtime-codebook decode failed\n");
+        return 1;
+    }
+    for (int i = 0; i < 256; i++) {
+        if (decoded[i] != 1.0f) {
+            fprintf(stderr,
+                    "IQ2 runtime-codebook mismatch: index=%d expected=1 got=%g\n",
+                    i, decoded[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int check_determinism_and_finite_decode(void) {
     float source[256], weights[256], decoded[256];
     _Alignas(16) uint8_t first[144], second[144];
@@ -161,6 +187,7 @@ int main(void) {
         check_q4_control_parity() ||
         check_shipping_control_parity(DS4Q_TYPE_IQ2_XXS,
                                       DS4Q_EXPERIMENT_IQ2_XXS, 66) ||
+        check_iq2_runtime_codebook() ||
         check_determinism_and_finite_decode()) {
         return 1;
     }

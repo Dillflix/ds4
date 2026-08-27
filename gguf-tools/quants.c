@@ -938,9 +938,17 @@ bool ds4q_experimental_dequantize_block(ds4q_experimental_format format,
                     ((parity & 1u) << 7));
                 const int8_t *values = (const int8_t *)(grid + indices[l]);
                 for (int j = 0; j < 8; j++) {
+                    /* The encoder search grid uses the symbolic odd levels
+                       1/3/5.  GGML's shipping IQ2_XXS dot path uses the
+                       integer runtime codebook 8/25/43 together with the
+                       1/8 scale above. */
+                    const int runtime_value = values[j] == 1 ? 8 :
+                                              values[j] == 3 ? 25 :
+                                              values[j] == 5 ? 43 : -1;
+                    if (runtime_value < 0) return false;
                     const float sign = (sign_mask & (1u << j)) ? -1.0f : 1.0f;
                     dst[ib32 * 32 + l * 8 + j] =
-                        scale * sign * (float)values[j];
+                        scale * sign * (float)runtime_value;
                 }
             }
         }
