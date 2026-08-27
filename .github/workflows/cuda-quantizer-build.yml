@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -16,12 +16,14 @@ on:
       - "ds4_tensor_layout.h"
       - "ds4_help.c"
       - "Makefile"
+      - "SM75_Q3_Q4_32_DESIGN.md"
       - "speed-bench/cuda-prefill-audit.sh"
       - "speed-bench/cuda-prefill-deep-audit.sh"
       - "speed-bench/cuda-q4-prefill-evidence.sh"
       - "speed-bench/cuda-q4-real-histogram.sh"
       - "speed-bench/cuda-sm75-kernel-profile.sh"
       - "speed-bench/cuda-sm75-int4-mma-experiment.sh"
+      - "speed-bench/cuda-sm75-q3-q4-32.sh"
       - "speed-bench/cuda-sm75-q4-down-native.sh"
       - "speed-bench/cuda-sm75-q4-gate-up-native.sh"
       - "speed-bench/cuda-sm75-production-scalar.sh"
@@ -66,6 +68,7 @@ on:
       - "tests/cuda_long_context_smoke.c"
       - "tests/cuda_sm75_profile_harness.c"
       - "tests/cuda_sm75_int4_mma.cu"
+      - "tests/cuda_sm75_q3_q4_32.cu"
       - "tests/cuda_sm75_q4_down_native.cu"
       - "tests/cuda_sm75_q4_gate_up_native.cu"
       - "tests/cuda_sm75_native_q4_histograms.h"
@@ -109,7 +112,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev CUDA_ARCH=sm_75
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check Q8 partner A/B tooling
@@ -302,6 +305,73 @@ jobs:
           grep -q 'Function : sm75_q4_i4_mixed_standard_kernel' /tmp/sm75-int4.sass
           grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' /tmp/sm75-int4.sass
           grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' /tmp/sm75-int4.sass
+      - name: Verify SM75 Q3 and Q4-32 instructions
+        run: |
+          cuobjdump --list-elf tests/cuda_sm75_q3_q4_32 |
+            grep -Eq '\.sm_75\.cubin([[:space:]]|$)'
+          cuobjdump --dump-sass tests/cuda_sm75_q3_q4_32 > /tmp/sm75-q3-q4-32.sass
+          for kernel in \
+            sm75_q4k_native_control_kernel \
+            sm75_q3k_k16_u8_kernel \
+            sm75_q3_32_kernel \
+            sm75_q4_32_kernel; do
+            grep -q "Function : $kernel" /tmp/sm75-q3-q4-32.sass
+            awk -v wanted="$kernel" '
+              /Function : / {
+                name=$0
+                sub(/^.*Function :[[:space:]]*/, "", name)
+                sub(/[[:space:]]*$/, "", name)
+                emit=name == wanted
+              }
+              emit { print }
+            ' /tmp/sm75-q3-q4-32.sass > "/tmp/$kernel.sass"
+          done
+          grep -Eq 'IMMA\.8832\.U4\.U4' /tmp/sm75_q4k_native_control_kernel.sass
+          grep -Eq 'IMMA\.8832\.S4\.U4' /tmp/sm75_q4k_native_control_kernel.sass
+          ! grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' \
+            /tmp/sm75_q4k_native_control_kernel.sass
+          grep -Eq 'IMMA\.8816\.S8\.U8|IMMA[^[:space:]]*8816[^[:space:]]*S8[^[:space:]]*U8' \
+            /tmp/sm75_q3k_k16_u8_kernel.sass
+          ! grep -Eq 'IMMA[^[:space:]]*8832|IMMA\.8832' \
+            /tmp/sm75_q3k_k16_u8_kernel.sass
+          grep -Eq 'IMMA\.8832\.U4\.U4' /tmp/sm75_q3_32_kernel.sass
+          grep -Eq 'IMMA\.8832\.S4\.U4' /tmp/sm75_q3_32_kernel.sass
+          ! grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' \
+            /tmp/sm75_q3_32_kernel.sass
+          grep -Eq 'IMMA\.8832\.U4\.S4' /tmp/sm75_q4_32_kernel.sass
+          grep -Eq 'IMMA\.8832\.S4\.S4' /tmp/sm75_q4_32_kernel.sass
+          ! grep -Eq 'IMMA[^[:space:]]*8816|IMMA\.8816' \
+            /tmp/sm75_q4_32_kernel.sass
+          q4k_total=$(grep -Ec 'IMMA' /tmp/sm75_q4k_native_control_kernel.sass)
+          q4k_u4u4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*U4[^[:space:]]*U4' \
+            /tmp/sm75_q4k_native_control_kernel.sass)
+          q4k_s4u4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*S4[^[:space:]]*U4' \
+            /tmp/sm75_q4k_native_control_kernel.sass)
+          test "$q4k_total" -eq "$((q4k_u4u4 + q4k_s4u4))"
+          q3k_total=$(grep -Ec 'IMMA' /tmp/sm75_q3k_k16_u8_kernel.sass)
+          q3k_s8u8=$(grep -Ec 'IMMA[^[:space:]]*8816[^[:space:]]*S8[^[:space:]]*U8' \
+            /tmp/sm75_q3k_k16_u8_kernel.sass)
+          test "$q3k_total" -eq "$q3k_s8u8"
+          q3_total=$(grep -Ec 'IMMA' /tmp/sm75_q3_32_kernel.sass)
+          q3_u4u4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*U4[^[:space:]]*U4' \
+            /tmp/sm75_q3_32_kernel.sass)
+          q3_s4u4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*S4[^[:space:]]*U4' \
+            /tmp/sm75_q3_32_kernel.sass)
+          test "$q3_total" -eq "$((q3_u4u4 + q3_s4u4))"
+          q4_total=$(grep -Ec 'IMMA' /tmp/sm75_q4_32_kernel.sass)
+          q4_u4s4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*U4[^[:space:]]*S4' \
+            /tmp/sm75_q4_32_kernel.sass)
+          q4_s4s4=$(grep -Ec 'IMMA[^[:space:]]*8832[^[:space:]]*S4[^[:space:]]*S4' \
+            /tmp/sm75_q4_32_kernel.sass)
+          test "$q4_total" -eq "$((q4_u4s4 + q4_s4s4))"
+          for kernel in \
+            sm75_q4k_native_control_kernel \
+            sm75_q3k_k16_u8_kernel \
+            sm75_q3_32_kernel \
+            sm75_q4_32_kernel; do
+            ! grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' "/tmp/$kernel.sass"
+            ! grep -Eq 'IDP[.]4A|DP4A' "/tmp/$kernel.sass"
+          done
       - name: Verify production-shaped SM75 Q4-down instructions
         run: |
           cuobjdump --list-elf tests/cuda_sm75_q4_down_native | grep -Eq '\.sm_75\.cubin([[:space:]]|$)'
@@ -470,6 +540,8 @@ jobs:
           bash -n speed-bench/cuda-q4-layout-cache-ab.sh
           bash -n speed-bench/cuda-sm75-kernel-profile.sh
           bash -n speed-bench/cuda-sm75-int4-mma-experiment.sh
+          test -x speed-bench/cuda-sm75-q3-q4-32.sh
+          bash -n speed-bench/cuda-sm75-q3-q4-32.sh
           bash -n speed-bench/cuda-sm75-q4-down-native.sh
           test -x speed-bench/cuda-sm75-q4-gate-up-native.sh
           bash -n speed-bench/cuda-sm75-q4-gate-up-native.sh
