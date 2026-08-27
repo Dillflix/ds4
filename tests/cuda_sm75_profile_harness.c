@@ -12,6 +12,11 @@
 #define GIB (1024ull * 1024ull * 1024ull)
 #define PROFILE_DEVICE_LIMIT (3ull * GIB)
 #define PROFILE_SAFETY_RESERVE (256ull * 1024ull * 1024ull)
+#define PROFILE_TYPE_Q2_K 10u
+#define PROFILE_TYPE_Q4_K 12u
+#define PROFILE_TYPE_IQ2_XXS 16u
+#define PROFILE_TYPE_SM75_Q4_32 42u
+#define PROFILE_TYPE_SM75_Q3A4 43u
 
 typedef enum {
     SCENARIO_MOE_Q4_EARLY,
@@ -22,6 +27,8 @@ typedef enum {
     SCENARIO_MOE_Q2_LATE,
     SCENARIO_MOE_HYBRID_IQ2_Q4_EARLY,
     SCENARIO_MOE_HYBRID_IQ2_Q4_LATE,
+    SCENARIO_MOE_SM75_Q4_32,
+    SCENARIO_MOE_SM75_Q3A4,
     SCENARIO_Q8_Q_B,
     SCENARIO_Q8_ATTN,
     SCENARIO_Q8_SHARED,
@@ -168,6 +175,14 @@ static const scenario_spec scenarios[] = {
         hybrid_iq2_q4_late_counts,
     },
     {
+        "sm75-q4-32", SCENARIO_MOE_SM75_Q4_32, 7u,
+        1894u, 95u, 180u, 4096u, 4096u, native_q4_early_counts,
+    },
+    {
+        "sm75-q3a4", SCENARIO_MOE_SM75_Q3A4, 6u,
+        1894u, 95u, 180u, 4096u, 4096u, native_q4_early_counts,
+    },
+    {
         "q8-q-b", SCENARIO_Q8_Q_B, 9u,
         0u, 0u, 0u, 1024u, 32768u, NULL,
     },
@@ -205,7 +220,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s q4-early|q4-late|native-q4-early|native-q4-late|"
             "q2-early|q2-late|hybrid-iq2-q4-early|"
-            "hybrid-iq2-q4-late|"
+            "hybrid-iq2-q4-late|sm75-q4-32|sm75-q3a4|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b|"
             "attn-indexed-32k|attn-mixed-32k|indexer-32k\n"
             "\n"
@@ -572,8 +587,9 @@ static int confirm_device_copy(uint64_t free_before, uint64_t free_after,
     return 1;
 }
 
-static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
-                   int native_q4, uint32_t timed_repeats) {
+static int run_moe(const scenario_spec *spec, uint32_t gate_type,
+                   uint32_t down_type, uint32_t routed_layout,
+                   uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint32_t n_expert = 6u;
     const uint32_t n_total_expert = 256u;
@@ -581,10 +597,16 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
     const uint32_t in_dim = 4096u;
     const uint32_t mid_dim = 2048u;
     const uint32_t out_dim = 4096u;
-    const uint32_t gate_type = gate_iq2 ? 16u : 12u;
-    const uint32_t down_type = down_q2 ? 10u : 12u;
-    const uint64_t gate_block_bytes = gate_iq2 ? 66u : 144u;
-    const uint64_t down_block_bytes = down_q2 ? 84u : 144u;
+    const int gate_iq2 = gate_type == PROFILE_TYPE_IQ2_XXS;
+    const int down_q2 = down_type == PROFILE_TYPE_Q2_K;
+    const int native_q4 =
+        (routed_layout & DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4) != 0u;
+    const int cost_aware_layout = routed_layout != 0u;
+    const uint64_t gate_block_bytes = gate_iq2 ? 66u :
+        (gate_type == PROFILE_TYPE_SM75_Q4_32 ? 136u :
+         (gate_type == PROFILE_TYPE_SM75_Q3A4 ? 108u : 144u));
+    const uint64_t down_block_bytes = down_q2 ? 84u :
+        (down_type == PROFILE_TYPE_SM75_Q4_32 ? 136u : 144u);
     const uint64_t gate_row_bytes =
         (uint64_t)(in_dim / 256u) * gate_block_bytes;
     const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
@@ -617,12 +639,19 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
            "model_bytes=%llu\ntensor_bytes=%llu\n"
            "predicted_device_bytes=%llu\ndevice_limit_bytes=%llu\n",
            spec->name,
-            gate_iq2 && down_q2 ? "iq2_gate_up_q2_down" :
+            gate_type == PROFILE_TYPE_SM75_Q3A4 ?
+                "sm75_q3a4_gate_up_q4_32_down" :
+                (gate_type == PROFILE_TYPE_SM75_Q4_32 ?
+                 "sm75_q4_32_gate_up_down" :
+            (gate_iq2 && down_q2 ? "iq2_gate_up_q2_down" :
                 (gate_iq2 && native_q4 ? "iq2_gate_up_native_q4_down" :
                 (native_q4 ? "native_q4_gate_up_q4_down" :
-                             "q4_gate_up_q4_down")),
-            gate_iq2 ? "iq2_xxs" : "q4_k",
-            down_q2 ? "q2_k" : "q4_k",
+                             "q4_gate_up_q4_down")))),
+            gate_type == PROFILE_TYPE_SM75_Q3A4 ? "sm75_q3a4" :
+                (gate_type == PROFILE_TYPE_SM75_Q4_32 ? "sm75_q4_32" :
+                 (gate_iq2 ? "iq2_xxs" : "q4_k")),
+            down_type == PROFILE_TYPE_SM75_Q4_32 ? "sm75_q4_32" :
+                (down_q2 ? "q2_k" : "q4_k"),
            spec->layer, n_tokens, resident_experts,
            (unsigned long long)model_bytes,
            (unsigned long long)tensor_bytes,
@@ -708,8 +737,7 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
         fprintf(stderr, "error: routed-MoE input upload failed\n");
         goto cleanup;
     }
-    ds4_gpu_set_routed_q4_layout(
-        native_q4 ? DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4 : 0u);
+    ds4_gpu_set_routed_q4_layout(routed_layout);
     const uint64_t free_before = ds4_gpu_tier_free_vram(0);
     if (!ds4_gpu_set_model_map(model, model_bytes) || !ds4_gpu_synchronize()) {
         fprintf(stderr, "error: routed-MoE model device copy failed\n");
@@ -737,7 +765,7 @@ static int run_moe(const scenario_spec *spec, int gate_iq2, int down_q2,
         goto cleanup;
     }
     if (!ds4_gpu_prefill_tile_audit_write_csv(audit_path) ||
-        !verify_tile_audit(audit_path, spec, native_q4)) {
+        !verify_tile_audit(audit_path, spec, cost_aware_layout)) {
         goto cleanup;
     }
     const char *tail_env = getenv("DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75");
@@ -1681,6 +1709,8 @@ int main(int argc, char **argv) {
     const int hybrid_iq2_q4_moe =
         spec->kind == SCENARIO_MOE_HYBRID_IQ2_Q4_EARLY ||
         spec->kind == SCENARIO_MOE_HYBRID_IQ2_Q4_LATE;
+    const int sm75_q4_32_moe = spec->kind == SCENARIO_MOE_SM75_Q4_32;
+    const int sm75_q3a4_moe = spec->kind == SCENARIO_MOE_SM75_Q3A4;
     const int scalar_q4 = scalar_target == SCALAR_TARGET_Q4_GATE ||
                           scalar_target == SCALAR_TARGET_Q4_DOWN;
     const int scalar_iq2 = scalar_target == SCALAR_TARGET_IQ2_TILE16 ||
@@ -1796,13 +1826,34 @@ int main(int argc, char **argv) {
         spec->kind == SCENARIO_ATTN_INDEXED_32K ||
         spec->kind == SCENARIO_ATTN_MIXED_32K;
     const int indexer_32k = spec->kind == SCENARIO_INDEXER_32K;
-    const int ok = q4_moe ?
-        run_moe(spec, 0, 0, native_q4_moe, timed_repeats) :
-        (q2_moe ? run_moe(spec, 1, 1, 0, timed_repeats) :
-         (hybrid_iq2_q4_moe ? run_moe(spec, 1, 0, 1, timed_repeats) :
-          (attention_32k ? run_attention_32k(spec, timed_repeats) :
-           (indexer_32k ? run_indexer_32k(spec, timed_repeats) :
-                          run_q8(spec, timed_repeats)))));
+    const uint32_t private_q32_layout = DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                                        DS4_TENSOR_LAYOUT_SM75_Q3A4;
+    int ok;
+    if (q4_moe) {
+        ok = run_moe(spec, PROFILE_TYPE_Q4_K, PROFILE_TYPE_Q4_K,
+                     native_q4_moe ? DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4 : 0u,
+                     timed_repeats);
+    } else if (q2_moe) {
+        ok = run_moe(spec, PROFILE_TYPE_IQ2_XXS, PROFILE_TYPE_Q2_K,
+                     0u, timed_repeats);
+    } else if (hybrid_iq2_q4_moe) {
+        ok = run_moe(spec, PROFILE_TYPE_IQ2_XXS, PROFILE_TYPE_Q4_K,
+                     DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4, timed_repeats);
+    } else if (sm75_q4_32_moe) {
+        ok = run_moe(spec, PROFILE_TYPE_SM75_Q4_32,
+                     PROFILE_TYPE_SM75_Q4_32, private_q32_layout,
+                     timed_repeats);
+    } else if (sm75_q3a4_moe) {
+        ok = run_moe(spec, PROFILE_TYPE_SM75_Q3A4,
+                     PROFILE_TYPE_SM75_Q4_32, private_q32_layout,
+                     timed_repeats);
+    } else if (attention_32k) {
+        ok = run_attention_32k(spec, timed_repeats);
+    } else if (indexer_32k) {
+        ok = run_indexer_32k(spec, timed_repeats);
+    } else {
+        ok = run_q8(spec, timed_repeats);
+    }
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;
