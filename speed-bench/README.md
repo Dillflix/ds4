@@ -1743,6 +1743,41 @@ Return `sm75-indexer-wmma64-production-<timestamp>.tar.gz`. A harness-only
 gain is not sufficient to change the production dispatch; promotion requires
 the exact interleaved full-model result.
 
+If the uninstrumented A/B does not reproduce the isolated kernel gain,
+`cuda-sm75-indexer-production-trace.sh` captures one genuine, unsynchronized
+32K production trace for each exact score tile. It retains the 256K allocation,
+balanced T256 placement, mirrored-KV attention row split, and 512-token
+pipeline microbatch. The trace comparison reports score time per stage/device,
+total score launches, pipeline GPU span, and trace throughput. This separates
+two materially different outcomes: either WMMA64 is no faster across the real
+production launch population, or its saved GPU work is overlapped and absent
+from the pipeline critical path. The synchronizing indexer stage profiler is
+not enabled.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_ALLOC=262273 \
+PROFILE_GPU=0 \
+PROFILE_PARTNER_GPU=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-indexer-production-trace.sh
+```
+
+Return `sm75-indexer-production-trace-<timestamp>.tar.gz`. Both inner traces
+export the 32K frontier logits and must match byte-for-byte. Each trace also
+audits all indexer dispatches and rejects mixed score-kernel use. The general
+production profiler accepts `INDEXER_SCORE_TILE=128|64`; 128 remains the
+shipping default and 64 is diagnostic only.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it

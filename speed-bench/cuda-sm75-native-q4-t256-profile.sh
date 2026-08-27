@@ -21,6 +21,7 @@ Optional environment:
   CTX_ALLOC=262273
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
+  INDEXER_SCORE_TILE=128       128 (shipping) or 64 (exact diagnostic)
   PROFILE_GPU=0                physical GPU for native-Q4 NCU harnesses
   PROFILE_PARTNER_GPU=1        its NVLink partner for T256 cuBLAS NCU
   RUN_NCU=1
@@ -55,6 +56,7 @@ PROFILE_TOKENS=${PROFILE_TOKENS:-8192}
 CTX_ALLOC=${CTX_ALLOC:-262273}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
+INDEXER_SCORE_TILE=${INDEXER_SCORE_TILE:-128}
 PROFILE_GPU=${PROFILE_GPU:-0}
 PROFILE_PARTNER_GPU=${PROFILE_PARTNER_GPU:-1}
 RUN_NCU=${RUN_NCU:-1}
@@ -86,6 +88,8 @@ fi
     die "RUN_ATTENTION_NCU must be auto, 0, or 1"
 [[ $NCU_SET == full || $NCU_SET == attention ]] ||
     die "NCU_SET must be full or attention"
+[[ $INDEXER_SCORE_TILE == 128 || $INDEXER_SCORE_TILE == 64 ]] ||
+    die "INDEXER_SCORE_TILE must be 128 or 64"
 if [[ $NCU_SET == attention && $RUN_NCU == 1 && $RUN_ATTENTION_NCU == 0 ]]; then
     die "NCU_SET=attention requires RUN_ATTENTION_NCU=1"
 fi
@@ -96,6 +100,7 @@ fi
    CTX_ALLOC > PROFILE_TOKENS && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
     die "require profile_tokens>=2048, a 2048-token chunk, 512-token pipeline, and ctx_alloc>profile_tokens"
+printf -v frontier_tag '%06d' "$PROFILE_TOKENS"
 for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -154,6 +159,7 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
     require_reuse_value ctx_alloc "$CTX_ALLOC"
     require_reuse_value prefill_chunk "$PREFILL_CHUNK"
     require_reuse_value pipeline_mb "$PIPELINE_MB"
+    require_reuse_value indexer_score_tile "$INDEXER_SCORE_TILE"
     require_reuse_value t256_policy automatic-balanced
 fi
 if [[ -n $REUSE_Q4_NCU_DIR ]]; then
@@ -204,6 +210,7 @@ done
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"/{nsys,ncu,validation,telemetry,provenance}
+mkdir -p "$OUTPUT_DIR/nsys/frontier-logits"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -250,6 +257,9 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
+if [[ $INDEXER_SCORE_TILE == 64 ]]; then
+    production_env+=(DS4_CUDA_NO_INDEXER_WMMA128=1)
+fi
 
 summary_schema=$(python3 \
     "$repo_dir/speed-bench/summarize-sm75-native-q4-t256-profile.py" \
@@ -317,8 +327,9 @@ phase=manifest
     printf 'prompt=%s\ngpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
         "$PROMPT" "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" \
         "$((43-STAGE_SPLIT))"
-    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
-        "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\nindexer_score_tile=%s\n' \
+        "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB" \
+        "$INDEXER_SCORE_TILE"
     printf 't256_policy=automatic-balanced\nt256_local_layers=even\nt256_partner_layers=odd\npartner_arithmetic=f16\n'
     printf 'attention_rows_policy=automatic-qualified\nxdev_sync=disabled\n'
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\nncu_set=%s\nrun_attention_ncu=%s\n' \
@@ -384,6 +395,7 @@ temperature.gpu,clocks.current.sm,clocks.current.memory \
     run_rc=0
     "${production_env[@]}" \
         DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
+        DS4_CUDA_INDEXER_SCORE_AUDIT=1 \
         DS4_CUDA_CRITICAL_PATH_NVTX=1 \
         "DS4_CUDA_PREFILL_TILE_AUDIT_CSV=$tile_audit" \
         DS4_CUDA_PREFILL_TILE_AUDIT_CAPACITY=32768 \
@@ -406,6 +418,7 @@ temperature.gpu,clocks.current.sm,clocks.current.memory \
                 --ctx-alloc "$CTX_ALLOC" \
                 --step-incr "$PROFILE_TOKENS" --prefill-chunk "$PREFILL_CHUNK" \
                 --gen-tokens 0 --csv "$base-benchmark.csv" \
+                --dump-frontier-logits-dir "$OUTPUT_DIR/nsys/frontier-logits" \
                 >"$base.log" 2>&1 || run_rc=$?
     cleanup_sampler
     (( run_rc == 0 )) || {
@@ -415,6 +428,9 @@ temperature.gpu,clocks.current.sm,clocks.current.memory \
 fi
 [[ -s $base.nsys-rep && -s $base-benchmark.csv ]] ||
     die "Nsight Systems omitted its report or benchmark"
+[[ -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.f32 &&
+   -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.json ]] ||
+    die "production trace omitted the ${PROFILE_TOKENS}-token frontier logits"
 grep -Fqx 'ds4: SM75 native routed-Q4 layout enabled (packed A/W, planner=cost, gate=tile8, down=full-stage)' \
     "$base.log" || die "production trace did not use the accepted native-Q4 path"
 for marker in "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
@@ -436,6 +452,23 @@ done
     die "production trace did not enable both qualified attention row splits"
 ! grep -Fq 'required but unavailable' "$base.log" ||
     die "production trace encountered an eligible but unavailable row split"
+expected_indexer_dispatch=wmma$INDEXER_SCORE_TILE
+for dispatch in direct-one wmma128 wmma64 wmma32 wmma16 generic; do
+    audit_line=$(grep -F "ds4: CUDA indexer score audit dispatch=$dispatch " \
+        "$base.log" || true)
+    [[ $(printf '%s\n' "$audit_line" | grep -c .) == 1 ]] ||
+        die "production trace lacks one unambiguous $dispatch indexer audit record"
+    audit_launches=${audit_line##*launches=}
+    [[ $audit_launches =~ ^[0-9]+$ ]] ||
+        die "production trace has invalid $dispatch indexer audit count"
+    if [[ $dispatch == "$expected_indexer_dispatch" ]]; then
+        (( audit_launches > 0 )) ||
+            die "production trace did not dispatch $expected_indexer_dispatch"
+    else
+        (( audit_launches == 0 )) ||
+            die "production trace unexpectedly dispatched $dispatch $audit_launches times"
+    fi
+done
 awk '
     /^ds4: routed-quant-audit layer=/ {
         count++
