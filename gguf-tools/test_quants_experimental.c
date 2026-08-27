@@ -70,6 +70,41 @@ static int check_q4_control_parity(void) {
     return 0;
 }
 
+static int check_shipping_control_parity(ds4q_type production_type,
+                                         ds4q_experimental_format format,
+                                         size_t block_bytes) {
+    float source[2 * 256];
+    float weights[256];
+    uint8_t production[2 * 144];
+    _Alignas(16) uint8_t experimental[144];
+    uint32_t state = 0xa4093822u ^ (uint32_t)format;
+    for (int i = 0; i < 2 * 256; i++) {
+        source[i] = ((int32_t)(next_u32(&state) % 20001u) - 10000) / 4096.0f;
+    }
+    for (int i = 0; i < 256; i++) {
+        weights[i] = 0.125f + (float)(next_u32(&state) % 4096u) / 1024.0f;
+    }
+    ds4q_quantize_init(production_type);
+    const size_t written = ds4q_quantize_chunk(
+        production_type, source, production, 0, 2, 256, weights);
+    if (written != 2 * block_bytes) {
+        fprintf(stderr, "unexpected production byte count: type=%d got=%zu\n",
+                production_type, written);
+        return 1;
+    }
+    for (int row = 0; row < 2; row++) {
+        if (!ds4q_experimental_quantize_block(
+                format, source + row * 256, weights, experimental) ||
+            memcmp(experimental, production + row * block_bytes,
+                   block_bytes) != 0) {
+            fprintf(stderr, "experimental shipping control differs: format=%d row=%d\n",
+                    format, row);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int check_determinism_and_finite_decode(void) {
     float source[256], weights[256], decoded[256];
     _Alignas(16) uint8_t first[144], second[144];
@@ -112,7 +147,9 @@ static int check_determinism_and_finite_decode(void) {
 }
 
 int main(void) {
-    static const size_t expected[DS4Q_EXPERIMENT_COUNT] = {144, 110, 104, 136};
+    static const size_t expected[DS4Q_EXPERIMENT_COUNT] = {
+        144, 110, 104, 136, 66,
+    };
     for (int f = 0; f < DS4Q_EXPERIMENT_COUNT; f++) {
         if (!ds4q_experimental_format_name((ds4q_experimental_format)f) ||
             ds4q_experimental_block_bytes((ds4q_experimental_format)f) != expected[f]) {
@@ -122,9 +159,11 @@ int main(void) {
     }
     if (check_zero_blocks() ||
         check_q4_control_parity() ||
+        check_shipping_control_parity(DS4Q_TYPE_IQ2_XXS,
+                                      DS4Q_EXPERIMENT_IQ2_XXS, 66) ||
         check_determinism_and_finite_decode()) {
         return 1;
     }
-    printf("experimental Q3/Q4 quant tests: OK\n");
+    printf("experimental routed-quant tests: OK\n");
     return 0;
 }

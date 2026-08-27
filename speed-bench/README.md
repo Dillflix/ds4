@@ -2133,7 +2133,7 @@ bash ./speed-bench/cuda-sm75-long-prompt-word-smoke.sh
 
 Return `sm75-long-prompt-word-smoke-<timestamp>.tar.gz`.
 
-# SM75 Q3/Q4 real-weight quality gate
+# SM75 routed-quant real-weight quality gate
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and
 performance, run the real-weight/imatrix gate before adding a GGUF type or
@@ -2144,7 +2144,10 @@ speed-bench/cuda-sm75-q3-q4-real-quality.sh.
 The default sample is layers 3,21,36, experts 0,127,255, all three routed
 parts, and 32 evenly spaced rows per tensor. Override it with
 QUALITY_LAYERS, QUALITY_EXPERTS, QUALITY_PARTS, or QUALITY_ROWS.
-The audit compares production Q4_K, exact standard Q3_K quantization,
+The audit reports the tensor roles separately. Gate/up (w1+w3) compares the
+shipping IQ2_XXS control, production Q4_K, exact standard Q3_K quantization,
 SM75 Q3-32, and SM75 Q4-32 under identical expert-specific imatrix weights.
-It does not hash or quantize a full model and does not enable a production
-format.
+Down (w2) compares the four Q3/Q4 formats without treating the gate/up IQ2
+kernel as a deployable down path. IQ2 down and Q2_K are intentionally outside
+this pass. The tool does not hash or quantize a full model and does not enable
+a production format.

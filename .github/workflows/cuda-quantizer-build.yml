@@ -117,7 +117,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends build-essential python3
       - name: Build CPU and CUDA quantizers
         run: make -C gguf-tools deepseek4-quantize deepseek4-quantize-cuda test-quants-cuda test-quants-experimental CUDA_ARCH=sm_75
-      - name: Run experimental Q3/Q4 quant regressions
+      - name: Run experimental routed-quant regressions
         run: ./gguf-tools/test-quants-experimental
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75

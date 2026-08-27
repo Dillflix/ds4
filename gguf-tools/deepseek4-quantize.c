@@ -3084,6 +3084,27 @@ static double quality_nrmse(double sse, double energy) {
     return energy > 0.0 ? sqrt(sse / energy) : 0.0;
 }
 
+static void merge_quality_stats(experimental_quality_stats *dst,
+                                const experimental_quality_stats *src) {
+    dst->sse += src->sse;
+    dst->source_energy += src->source_energy;
+    dst->weighted_sse += src->weighted_sse;
+    dst->weighted_source_energy += src->weighted_source_energy;
+    if (src->max_abs > dst->max_abs) dst->max_abs = src->max_abs;
+    dst->values += src->values;
+}
+
+static int quality_role_index(const char *part) {
+    return strcmp(part, "w2") == 0 ? 1 : 0;
+}
+
+static bool quality_format_applies(const char *part,
+                                   ds4q_experimental_format format) {
+    /* IQ2_XXS is a shipping gate/up format.  IQ2 down is deliberately out of
+       scope until there is a production down dispatch to evaluate. */
+    return format != DS4Q_EXPERIMENT_IQ2_XXS || strcmp(part, "w2") != 0;
+}
+
 static void write_quality_csv_row(FILE *fp, const char *scope, int layer,
                                   int expert, const char *part, int rows,
                                   int64_t ncols,
@@ -3119,6 +3140,8 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
     fprintf(fp,
             "scope,layer,expert,part,sampled_rows,ncols,format,block_bytes,bits_per_weight,values,sse,nrmse,weighted_sse,weighted_nrmse,max_abs\n");
     experimental_quality_stats aggregate[DS4Q_EXPERIMENT_COUNT] = {{0}};
+    experimental_quality_stats role[2][DS4Q_EXPERIMENT_COUNT] = {{{0}}};
+    int role_rows[2] = {0, 0};
     int total_tensors = 0;
     int total_rows = 0;
 
@@ -3151,6 +3174,7 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                         for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
                             const ds4q_experimental_format format =
                                 (ds4q_experimental_format)fi;
+                            if (!quality_format_applies(parts[pi], format)) continue;
                             if (!ds4q_experimental_quantize_block(
                                     format, row_data + col, weights + col,
                                     encoded) ||
@@ -3164,19 +3188,18 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                     }
                 }
                 for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+                    const ds4q_experimental_format format =
+                        (ds4q_experimental_format)fi;
+                    if (!quality_format_applies(parts[pi], format)) continue;
                     write_quality_csv_row(fp, "tensor", layers[li], experts[ei],
                                           parts[pi], sample_rows, ncols,
-                                          (ds4q_experimental_format)fi,
-                                          &tensor[fi]);
-                    aggregate[fi].sse += tensor[fi].sse;
-                    aggregate[fi].source_energy += tensor[fi].source_energy;
-                    aggregate[fi].weighted_sse += tensor[fi].weighted_sse;
-                    aggregate[fi].weighted_source_energy +=
-                        tensor[fi].weighted_source_energy;
-                    if (tensor[fi].max_abs > aggregate[fi].max_abs)
-                        aggregate[fi].max_abs = tensor[fi].max_abs;
-                    aggregate[fi].values += tensor[fi].values;
+                                          format, &tensor[fi]);
+                    merge_quality_stats(&role[quality_role_index(parts[pi])][fi],
+                                        &tensor[fi]);
+                    if (format != DS4Q_EXPERIMENT_IQ2_XXS)
+                        merge_quality_stats(&aggregate[fi], &tensor[fi]);
                 }
+                role_rows[quality_role_index(parts[pi])] += sample_rows;
                 total_tensors++;
                 total_rows += sample_rows;
                 fprintf(stderr,
@@ -3187,7 +3210,18 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
             }
         }
     }
-    for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+    for (int role_index = 0; role_index < 2; role_index++) {
+        const char *role_name = role_index == 0 ? "gate_up" : "down";
+        for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+            const ds4q_experimental_format format =
+                (ds4q_experimental_format)fi;
+            if (role_index == 1 && format == DS4Q_EXPERIMENT_IQ2_XXS) continue;
+            write_quality_csv_row(fp, "role", -1, -1, role_name,
+                                  role_rows[role_index], 0, format,
+                                  &role[role_index][fi]);
+        }
+    }
+    for (int fi = 0; fi < DS4Q_EXPERIMENT_IQ2_XXS; fi++) {
         write_quality_csv_row(fp, "aggregate", -1, -1, "all", total_rows,
                               0, (ds4q_experimental_format)fi,
                               &aggregate[fi]);

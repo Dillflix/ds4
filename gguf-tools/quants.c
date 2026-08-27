@@ -817,13 +817,15 @@ static void ds4q_write_k32_signed_block(const float x[QK_K],
 
 const char *ds4q_experimental_format_name(ds4q_experimental_format format) {
     static const char *const names[DS4Q_EXPERIMENT_COUNT] = {
-        "q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32",
+        "q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32", "iq2_xxs",
     };
     return format >= 0 && format < DS4Q_EXPERIMENT_COUNT ? names[format] : NULL;
 }
 
 size_t ds4q_experimental_block_bytes(ds4q_experimental_format format) {
-    static const size_t sizes[DS4Q_EXPERIMENT_COUNT] = { 144, 110, 104, 136 };
+    static const size_t sizes[DS4Q_EXPERIMENT_COUNT] = {
+        144, 110, 104, 136, 66,
+    };
     return format >= 0 && format < DS4Q_EXPERIMENT_COUNT ? sizes[format] : 0;
 }
 
@@ -845,6 +847,10 @@ bool ds4q_experimental_quantize_block(ds4q_experimental_format format,
         case DS4Q_EXPERIMENT_SM75_Q4_32:
             ds4q_write_k32_signed_block(src, imatrix, 8, dst);
             return true;
+        case DS4Q_EXPERIMENT_IQ2_XXS:
+            return imatrix &&
+                   ds4q_quantize_chunk(DS4Q_TYPE_IQ2_XXS, src, dst, 0, 1,
+                                       QK_K, imatrix) == 66;
         default:
             return false;
     }
@@ -902,6 +908,41 @@ bool ds4q_experimental_dequantize_block(ds4q_experimental_format format,
             const int code = (block->qs[k / 2] >> (4 * (k & 1))) & 15;
             const int q = code < 8 ? code : code - 16;
             dst[k] = d * ds4q_unpack_signed_scale_8(block->scales, k / 32) * q;
+        }
+        return true;
+    }
+    if (format == DS4Q_EXPERIMENT_IQ2_XXS) {
+        const uint64_t *grid = NULL;
+        size_t grid_len = 0;
+        if (!ds4q_iq2_xxs_tables(&grid, &grid_len, NULL, NULL, NULL, NULL) ||
+            grid_len != 256) {
+            return false;
+        }
+        const uint8_t *block = src;
+        uint16_t d_bits;
+        memcpy(&d_bits, block, sizeof(d_bits));
+        const float d = ds4q_f16_to_f32(d_bits);
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, block + 2 + (size_t)ib32 * 8u, sizeof(aux32));
+            const uint8_t *indices = (const uint8_t *)aux32;
+            const float scale = 0.125f * d *
+                (float)(2u * (aux32[1] >> 28) + 1u);
+            for (int l = 0; l < 4; l++) {
+                const unsigned sign_index = (aux32[1] >> (7 * l)) & 127u;
+                unsigned parity = sign_index;
+                parity ^= parity >> 4;
+                parity ^= parity >> 2;
+                parity ^= parity >> 1;
+                const uint8_t sign_mask = (uint8_t)(sign_index |
+                    ((parity & 1u) << 7));
+                const int8_t *values = (const int8_t *)(grid + indices[l]);
+                for (int j = 0; j < 8; j++) {
+                    const float sign = (sign_mask & (1u << j)) ? -1.0f : 1.0f;
+                    dst[ib32 * 32 + l * 8 + j] =
+                        scale * sign * (float)values[j];
+                }
+            }
         }
         return true;
     }
