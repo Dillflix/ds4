@@ -1692,15 +1692,16 @@ is justified only if one of the exact candidates wins in both indexed and
 mixed attention; the harness result does not include output-projection work or
 the incremental cost of maintaining a partner KV mirror.
 
-`cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed
-production pass. It interleaves the unchanged home path with the mirrored-KV
-query-row candidate at one 32K frontier, validates the bounded indexed and
-mixed harnesses on both configured NVLink pairs, requires audited production
-dispatches of both target kernels, and compares the emitted frontier logits
-byte-for-byte for every paired repeat. A requested indexed/nonzero-mixed split
-that cannot dispatch aborts; it is never replaced by peer-read or home-only
-execution. Initial static-mixed/raw-only work remains explicitly outside this
-first production candidate and is identical in both arms.
+`cuda-sm75-attention-rowsplit-production-ab.sh` is the fail-closed production
+promotion gate. It interleaves the unchanged home path with the mirrored-KV
+query-row candidate at 2K, 4K, 8K, 16K, and 32K frontiers, validates the
+bounded indexed and mixed harnesses on both configured NVLink pairs, requires
+audited production dispatches of both target kernels, and compares the emitted
+frontier logits byte-for-byte for every paired repeat. A requested
+indexed/nonzero-mixed split that cannot dispatch aborts; it is never replaced
+by peer-read or home-only execution. Initial static-mixed/raw-only work remains
+explicitly outside this first production candidate and is identical in both
+arms.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1712,7 +1713,8 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
-CTX_TOKENS=32768 \
+CTX_START=2048 \
+CTX_MAX=32768 \
 CTX_ALLOC=262273 \
 REPEATS=3 \
 RUN_HARNESS=1 \

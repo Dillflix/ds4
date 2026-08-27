@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run an exact-output 32K production A/B for SM75 mirrored-KV query-row split.
+Run an exact-output production sweep for SM75 mirrored-KV query-row split.
 
 Required environment:
   MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
@@ -13,7 +13,9 @@ Optional environment:
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
   STAGE_SPLIT=22
-  CTX_TOKENS=32768
+  CTX_START=2048
+  CTX_MAX=32768
+  CTX_TOKENS=             compatibility shorthand setting start=max
   CTX_ALLOC=262273
   REPEATS=3
   RUN_HARNESS=1
@@ -40,7 +42,8 @@ PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
-CTX_TOKENS=${CTX_TOKENS:-32768}
+CTX_START=${CTX_START:-${CTX_TOKENS:-2048}}
+CTX_MAX=${CTX_MAX:-${CTX_TOKENS:-32768}}
 CTX_ALLOC=${CTX_ALLOC:-262273}
 REPEATS=${REPEATS:-3}
 RUN_HARNESS=${RUN_HARNESS:-1}
@@ -50,7 +53,8 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${ROWSPLIT_PRODUCTION_DIR:-$repo_dir/sm75-attention-rowsplit-production-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
-for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
+for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
+            "CTX_MAX:$CTX_MAX" \
             "CTX_ALLOC:$CTX_ALLOC" "REPEATS:$REPEATS" \
             "RUN_HARNESS:$RUN_HARNESS" "SKIP_BUILD:$SKIP_BUILD" \
             "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
@@ -58,8 +62,13 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 &&
-   CTX_TOKENS >= 4096 && CTX_TOKENS % 2048 == 0 &&
-   CTX_ALLOC > CTX_TOKENS && REPEATS >= 2 )) || die "invalid benchmark bounds"
+   CTX_START >= 2048 && CTX_START % 2048 == 0 &&
+   CTX_MAX >= CTX_START && CTX_MAX % 2048 == 0 &&
+   CTX_ALLOC > CTX_MAX && REPEATS >= 2 )) || die "invalid benchmark bounds"
+ctx_ratio=$((CTX_MAX / CTX_START))
+(( CTX_MAX % CTX_START == 0 &&
+   (ctx_ratio & (ctx_ratio - 1)) == 0 )) ||
+    die "CTX_MAX/CTX_START must be an integer power of two"
 for flag in RUN_HARNESS SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -116,9 +125,9 @@ phase=manifest
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nmodel_hashing=disabled\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nctx_alloc=%s\nrepeats=%s\n' \
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
-        "$CTX_TOKENS" "$CTX_ALLOC" "$REPEATS"
+        "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'
@@ -175,8 +184,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                 --model "$MODEL" --prompt-file "$PROMPT" \
-                --ctx-start "$CTX_TOKENS" --ctx-max "$CTX_TOKENS" \
-                --ctx-alloc "$CTX_ALLOC" --step-incr 2048 \
+                --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
+                --ctx-alloc "$CTX_ALLOC" --step-mul 2 \
                 --prefill-chunk 2048 --gen-tokens 0 --csv "$base.csv" \
                 --dump-frontier-logits-dir "$logits" \
                 >"$base.log" 2>&1 || {
@@ -222,21 +231,26 @@ root = pathlib.Path(sys.argv[1])
 runs = list(csv.DictReader((root / "production/runs.csv").open()))
 vals, paired = {}, {}
 for run in runs:
-    row = next(csv.DictReader(pathlib.Path(run["csv"]).open()))
-    tps = float(row["prefill_tps"])
-    vals.setdefault(run["variant"], []).append(tps)
-    paired[(int(run["repeat"]), run["variant"])] = tps
-ratios = [paired[(r, "rows")] / paired[(r, "home")]
-          for r in range(1, max(int(x["repeat"]) for x in runs) + 1)]
+    for row in csv.DictReader(pathlib.Path(run["csv"]).open()):
+        ctx = int(row["ctx_tokens"])
+        tps = float(row["prefill_tps"])
+        vals.setdefault((run["variant"], ctx), []).append(tps)
+        paired[(int(run["repeat"]), run["variant"], ctx)] = tps
+contexts = sorted({ctx for _, ctx in vals})
+n_repeats = max(int(x["repeat"]) for x in runs)
 with (root / "production/summary.csv").open("w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["ctx_tokens", "home_median_tps", "rows_median_tps",
                 "paired_median_speedup", "change_pct", "logits"])
-    speed = statistics.median(ratios)
-    w.writerow([next(csv.DictReader(pathlib.Path(runs[0]["csv"]).open()))["ctx_tokens"],
-                f'{statistics.median(vals["home"]):.3f}',
-                f'{statistics.median(vals["rows"]):.3f}',
-                f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}', "bit-exact"])
+    for ctx in contexts:
+        ratios = [paired[(r, "rows", ctx)] / paired[(r, "home", ctx)]
+                  for r in range(1, n_repeats + 1)]
+        speed = statistics.median(ratios)
+        w.writerow([ctx,
+                    f'{statistics.median(vals[("home", ctx)]):.3f}',
+                    f'{statistics.median(vals[("rows", ctx)]):.3f}',
+                    f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}',
+                    "bit-exact"])
 PY
 cat "$OUTPUT_DIR/production/summary.csv"
 
