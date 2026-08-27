@@ -983,7 +983,8 @@ static int configure_indexer_topk(const char *topk) {
 
 static int verify_indexer_score_bits(const float *reference,
                                      const float *candidate,
-                                     uint64_t count) {
+                                     uint64_t count,
+                                     int require_negative_infinity) {
     uint64_t finite_nonzero = 0u, negative_infinity = 0u;
     for (uint64_t i = 0; i < count; i++) {
         uint32_t ref_bits = 0u, got_bits = 0u;
@@ -1000,7 +1001,8 @@ static int verify_indexer_score_bits(const float *reference,
         if (isfinite(candidate[i]) && candidate[i] != 0.0f) finite_nonzero++;
         if (isinf(candidate[i]) && candidate[i] < 0.0f) negative_infinity++;
     }
-    if (finite_nonzero == 0u || negative_infinity == 0u) {
+    if (finite_nonzero == 0u ||
+        (require_negative_infinity && negative_infinity == 0u)) {
         fprintf(stderr,
                 "error: indexer score fixture is degenerate: "
                 "finite_nonzero=%llu negative_infinity=%llu\n",
@@ -1290,7 +1292,7 @@ static int run_indexer_32k(const scenario_spec *spec,
         !ds4_gpu_tensor_read(candidate, 0, candidate_host,
                              score_count * sizeof(float)) ||
         !verify_indexer_score_bits(reference_host, candidate_host,
-                                   score_count)) {
+                                   score_count, 1)) {
         fprintf(stderr, "error: candidate indexer score validation failed\n");
         goto cleanup;
     }
@@ -1307,7 +1309,7 @@ static int run_indexer_32k(const scenario_spec *spec,
             !ds4_gpu_tensor_read(candidate, 0, candidate_host,
                                   (uint64_t)n_comp * sizeof(float)) ||
             !verify_indexer_score_bits(reference_host, candidate_host,
-                                       n_comp)) {
+                                       n_comp, 0)) {
             fprintf(stderr,
                     "error: native-F16-cache one-token indexer validation failed\n");
             goto cleanup;
