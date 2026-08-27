@@ -23,6 +23,7 @@ Optional environment:
   RUN_WORD_SMOKE=1
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
+  REUSE_LEGACY_QUALITY_DIR=/absolute/path/to/prior/quality
   INDEXER_NATIVE_AB_DIR=/absolute/output/directory
 
 The legacy arm stores indexer K in F32 and dispatches shipping WMMA128. The
@@ -55,12 +56,19 @@ RUN_QUALITY=${RUN_QUALITY:-1}
 RUN_WORD_SMOKE=${RUN_WORD_SMOKE:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+REUSE_LEGACY_QUALITY_DIR=${REUSE_LEGACY_QUALITY_DIR:-}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${INDEXER_NATIVE_AB_DIR:-$repo_dir/sm75-indexer-native-cache-production-$stamp}
 
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 [[ $QUALITY_MANIFEST == /* && -f $QUALITY_MANIFEST ]] ||
     die "QUALITY_MANIFEST must name an existing absolute file"
+if [[ -n $REUSE_LEGACY_QUALITY_DIR ]]; then
+    [[ $REUSE_LEGACY_QUALITY_DIR == /* &&
+       -f $REUSE_LEGACY_QUALITY_DIR/legacy-f32.tsv &&
+       -f $REUSE_LEGACY_QUALITY_DIR/legacy-f32.log ]] ||
+        die "REUSE_LEGACY_QUALITY_DIR must contain legacy-f32.tsv and legacy-f32.log"
+fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
             "CTX_MAX:$CTX_MAX" "CTX_ALLOC:$CTX_ALLOC" \
             "REPEATS:$REPEATS" "RUN_QUALITY:$RUN_QUALITY" \
@@ -76,7 +84,7 @@ for flag in RUN_QUALITY RUN_WORD_SMOKE SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
-for tool in awk basename cat cmp date dirname env find git grep make mkdir mv \
+for tool in awk basename cat cmp cp date dirname env find git grep make mkdir mv \
             nproc nvidia-smi python3 rm sort stat tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -160,6 +168,7 @@ phase=manifest
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
     printf 'quality_manifest=%s\ngpu_devices=%s\nstage_split=%s/%s\n' \
         "$QUALITY_MANIFEST" "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
+    printf 'reuse_legacy_quality_dir=%s\n' "${REUSE_LEGACY_QUALITY_DIR:-none}"
     printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
@@ -220,7 +229,8 @@ audit_launches() {
 }
 
 validate_variant_log() {
-    local variant=$1 log=$2 score_official=${3:-0} expected unexpected count
+    local variant=$1 log=$2 score_official=${3:-0} require_dispatch=${4:-1}
+    local expected unexpected count
     if [[ $score_official == 1 ]]; then
         grep -Fq 'score_official: runtime_path=production' "$log" ||
             die "$variant did not execute the production runtime path"
@@ -240,14 +250,19 @@ validate_variant_log() {
         ! grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' "$log" ||
             die "legacy arm unexpectedly enabled the native indexer cache"
     fi
-    count=$(audit_launches "$log" "$expected")
-    (( count > 0 )) || die "$variant did not dispatch $expected"
-    count=$(audit_launches "$log" "$unexpected")
-    (( count == 0 )) || die "$variant unexpectedly dispatched $unexpected"
-    for dispatch in wmma64 wmma32 wmma16 generic; do
-        count=$(audit_launches "$log" "$dispatch")
-        (( count == 0 )) || die "$variant unexpectedly dispatched $dispatch"
-    done
+    if [[ $require_dispatch == 1 ]]; then
+        count=$(audit_launches "$log" "$expected")
+        (( count > 0 )) || die "$variant did not dispatch $expected"
+        count=$(audit_launches "$log" "$unexpected")
+        (( count == 0 )) || die "$variant unexpectedly dispatched $unexpected"
+        for dispatch in wmma64 wmma32 wmma16 generic; do
+            count=$(audit_launches "$log" "$dispatch")
+            (( count == 0 )) || die "$variant unexpectedly dispatched $dispatch"
+        done
+    else
+        ! grep -Fq 'ds4: CUDA indexer score audit dispatch=' "$log" ||
+            die "$variant short-prompt quality fixture unexpectedly launched the indexer scorer"
+    fi
     grep -Fq 't256-placement=balanced' "$log" ||
         die "$variant missed balanced T256 placement"
 }
@@ -258,19 +273,25 @@ if [[ $RUN_QUALITY == 1 ]]; then
         mapfile -d '' -t mode_env < <(variant_env "$variant")
         out="$OUTPUT_DIR/quality/$variant.tsv"
         log="$OUTPUT_DIR/quality/$variant.log"
-        printf 'Scoring 100 production cases: %s...\n' "$variant"
-        "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
-            ./gguf-tools/quality-testing/score_official \
-                "$MODEL" "$QUALITY_MANIFEST" "$out" 32769 \
-                --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-                --cuda-tensor-parallel --warm-weights --production-path \
-                >"$log" 2>&1 || {
-                    tail -n 220 "$log" >&2
-                    die "$variant quality suite failed"
-                }
+        if [[ $variant == legacy-f32 && -n $REUSE_LEGACY_QUALITY_DIR ]]; then
+            printf 'Reusing completed legacy-f32 100-case quality result...\n'
+            cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.tsv" "$out"
+            cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.log" "$log"
+        else
+            printf 'Scoring 100 production cases: %s...\n' "$variant"
+            "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
+                ./gguf-tools/quality-testing/score_official \
+                    "$MODEL" "$QUALITY_MANIFEST" "$out" 32769 \
+                    --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+                    --cuda-tensor-parallel --warm-weights --production-path \
+                    >"$log" 2>&1 || {
+                        tail -n 220 "$log" >&2
+                        die "$variant quality suite failed"
+                    }
+        fi
         awk -F'\t' 'NR > 1 {n++} END {exit n == 100 ? 0 : 1}' "$out" ||
             die "$variant quality output does not contain exactly 100 cases"
-        validate_variant_log "$variant" "$log" 1
+        validate_variant_log "$variant" "$log" 1 0
     done
     cmp -s "$OUTPUT_DIR/quality/legacy-f32.tsv" \
            "$OUTPUT_DIR/quality/native-f16.tsv" ||
