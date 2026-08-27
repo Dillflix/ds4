@@ -4,8 +4,9 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Build, validate, benchmark, disassemble, and optionally profile the bounded
-SM75 Q3_K/Q3-32/Q4-32 arithmetic and layout experiment. No GGUF is opened and
-no production dispatch is changed.
+SM75 routed-quant arithmetic and layout screen. It covers Q2/Q3-50,
+Q2/Q3-75, Q3-32, Q3A4, Q3A6, Q3/Q4-50, Q4-32, Q5-32, Q3_K, and Q4_K.
+No GGUF is opened and no production dispatch is changed.
 
 Optional environment:
   PROFILE_GPU=0
@@ -16,9 +17,11 @@ Optional environment:
   BENCH_ROUNDS=9
   STREAM_WEIGHT_CASES=16384
   PROFILE_REPEATS=128
+  IQ2_TIMING_REPEATS=10
   SKIP_BUILD=0
   RUN_SANITIZER=1
   RUN_NCU=1
+  RUN_IQ2_CONTROL=1
   NCU_USE_SUDO=0
   CREATE_ARCHIVE=1
   Q3_Q4_32_DIR=/absolute/output/directory
@@ -38,13 +41,45 @@ binary_rel=tests/cuda_sm75_q3_q4_32
 design_rel=SM75_Q3_Q4_32_DESIGN.md
 makefile_rel=Makefile
 validator_rel=speed-bench/validate-ncu-capture.py
+readme_rel=speed-bench/README.md
+iq2_source_rel=tests/cuda_sm75_profile_harness.c
+iq2_binary_rel=tests/cuda_sm75_profile_harness
 
-variants=(q4k-native-control q3k-k16-u8 sm75-q3-32 sm75-q4-32)
+variants=(
+    q4k-native-control
+    q3k-k16-u8
+    sm75-q3-32
+    sm75-q4-32
+    sm75-q2q3-32-50
+    sm75-q2q3-32-75
+    sm75-q3a-32-4
+    sm75-q3a-32-6
+    sm75-q3q4-32-50
+    sm75-q5-32
+)
 kernels=(
     sm75_q4k_native_control_kernel
     sm75_q3k_k16_u8_kernel
     sm75_q3_32_kernel
     sm75_q4_32_kernel
+    sm75_q2q3_32_50_kernel
+    sm75_q2q3_32_75_kernel
+    sm75_q3a_32_4_kernel
+    sm75_q3a_32_6_kernel
+    sm75_q3q4_32_50_kernel
+    sm75_q5_32_kernel
+)
+gate_up_kernels=(
+    sm75_q4k_native_control_gate_up_kernel
+    sm75_q3k_k16_u8_gate_up_kernel
+    sm75_q3_32_gate_up_kernel
+    sm75_q4_32_gate_up_kernel
+    sm75_q2q3_32_50_gate_up_kernel
+    sm75_q2q3_32_75_gate_up_kernel
+    sm75_q3a_32_4_gate_up_kernel
+    sm75_q3a_32_6_gate_up_kernel
+    sm75_q3q4_32_50_gate_up_kernel
+    sm75_q5_32_gate_up_kernel
 )
 
 PROFILE_GPU=${PROFILE_GPU:-0}
@@ -55,9 +90,11 @@ BENCH_LAUNCHES=${BENCH_LAUNCHES:-20}
 BENCH_ROUNDS=${BENCH_ROUNDS:-9}
 STREAM_WEIGHT_CASES=${STREAM_WEIGHT_CASES:-16384}
 PROFILE_REPEATS=${PROFILE_REPEATS:-128}
+IQ2_TIMING_REPEATS=${IQ2_TIMING_REPEATS:-10}
 SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
 RUN_NCU=${RUN_NCU:-1}
+RUN_IQ2_CONTROL=${RUN_IQ2_CONTROL:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 OUTPUT_DIR=${Q3_Q4_32_DIR:-$repo_dir/sm75-q3-q4-32-$(date -u +%Y%m%dT%H%M%SZ)}
@@ -66,13 +103,14 @@ OUTPUT_DIR=${Q3_Q4_32_DIR:-$repo_dir/sm75-q3-q4-32-$(date -u +%Y%m%dT%H%M%SZ)}
 [[ $CUDA_ARCH == sm_75 ]] || die "CUDA_ARCH must be exactly sm_75"
 [[ $OUTPUT_DIR == /* ]] || die "Q3_Q4_32_DIR must be an absolute path"
 for name in EXACT_CASES BENCH_REPEATS BENCH_LAUNCHES BENCH_ROUNDS \
-        STREAM_WEIGHT_CASES PROFILE_REPEATS; do
+        STREAM_WEIGHT_CASES PROFILE_REPEATS IQ2_TIMING_REPEATS; do
     value=${!name}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 done
-(( STREAM_WEIGHT_CASES >= 8192 )) ||
-    die "STREAM_WEIGHT_CASES must be at least 8192 to exceed RTX 8000 L2"
-for name in SKIP_BUILD RUN_SANITIZER RUN_NCU NCU_USE_SUDO CREATE_ARCHIVE; do
+(( STREAM_WEIGHT_CASES >= 9000 )) ||
+    die "STREAM_WEIGHT_CASES must be at least 9000 to exceed RTX 8000 L2 for the smallest format"
+for name in SKIP_BUILD RUN_SANITIZER RUN_NCU RUN_IQ2_CONTROL NCU_USE_SUDO \
+        CREATE_ARCHIVE; do
     value=${!name}
     [[ $value == 0 || $value == 1 ]] || die "$name must be 0 or 1"
 done
@@ -83,6 +121,8 @@ done
 [[ -f $source_rel ]] || die "missing $source_rel"
 [[ -f $design_rel ]] || die "missing $design_rel"
 [[ -f $validator_rel ]] || die "missing $validator_rel"
+[[ -f $readme_rel ]] || die "missing $readme_rel"
+[[ -f $iq2_source_rel ]] || die "missing $iq2_source_rel"
 compute_cap=$(nvidia-smi -i "$PROFILE_GPU" --query-gpu=compute_cap \
     --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]')
 [[ $compute_cap == 7.5 ]] ||
@@ -146,14 +186,17 @@ trap 'caught_signal=INT; exit 130' INT
 trap 'caught_signal=TERM; exit 143' TERM
 trap 'caught_signal=HUP; exit 129' HUP
 
-cp -- "$script_rel" "$source_rel" "$design_rel" "$makefile_rel" \
+cp -- "$script_rel" "$source_rel" "$iq2_source_rel" "$design_rel" \
+    "$readme_rel" "$makefile_rel" \
     "$validator_rel" \
     "$OUTPUT_DIR/provenance/"
-sha256sum "$script_rel" "$source_rel" "$design_rel" "$makefile_rel" \
+sha256sum "$script_rel" "$source_rel" "$iq2_source_rel" "$design_rel" \
+    "$readme_rel" "$makefile_rel" \
     "$validator_rel" \
     >"$OUTPUT_DIR/provenance/source-sha256.txt"
 git diff --no-ext-diff --binary HEAD -- \
-    "$script_rel" "$source_rel" "$design_rel" "$makefile_rel" \
+    "$script_rel" "$source_rel" "$iq2_source_rel" "$design_rel" \
+    "$readme_rel" "$makefile_rel" \
     "$validator_rel" \
     >"$OUTPUT_DIR/provenance/tracked-working-tree.patch" || true
 
@@ -176,6 +219,8 @@ capture_gpu_state() {
         "$EXACT_CASES" "$BENCH_REPEATS" "$BENCH_LAUNCHES" "$BENCH_ROUNDS"
     printf 'hot_weight_cases=16\nstream_weight_cases=%s\nprofile_repeats=%s\n' \
         "$STREAM_WEIGHT_CASES" "$PROFILE_REPEATS"
+    printf 'run_iq2_control=%s\niq2_timing_repeats=%s\n' \
+        "$RUN_IQ2_CONTROL" "$IQ2_TIMING_REPEATS"
     printf 'full_model_loaded=false\nproduction_dispatch_changed=false\n'
     printf '\n[gpu]\n'
     nvidia-smi -i "$PROFILE_GPU" \
@@ -190,15 +235,17 @@ capture_gpu_state() {
 capture_gpu_state initialization
 
 current_phase=build
+build_targets=("$binary_rel")
+[[ $RUN_IQ2_CONTROL == 0 ]] || build_targets+=("$iq2_binary_rel")
 if [[ $SKIP_BUILD == 0 ]]; then
-    make -B "$binary_rel" CUDA_ARCH="$CUDA_ARCH" \
+    make -B "${build_targets[@]}" CUDA_ARCH="$CUDA_ARCH" \
         >"$OUTPUT_DIR/build.log" 2>&1 || {
             tail -n 160 "$OUTPUT_DIR/build.log" >&2 || true
             die "SM75 Q3/Q4-32 harness build failed"
         }
 else
     set +e
-    make -q "$binary_rel" CUDA_ARCH="$CUDA_ARCH" \
+    make -q "${build_targets[@]}" CUDA_ARCH="$CUDA_ARCH" \
         >"$OUTPUT_DIR/build.log" 2>&1
     query_rc=$?
     set -e
@@ -210,6 +257,11 @@ else
 fi
 [[ -x $binary_rel ]] || die "$binary_rel is missing"
 sha256sum "$binary_rel" >"$OUTPUT_DIR/provenance/binary-sha256.txt"
+if [[ $RUN_IQ2_CONTROL == 1 ]]; then
+    [[ -x $iq2_binary_rel ]] || die "$iq2_binary_rel is missing"
+    sha256sum "$iq2_binary_rel" \
+        >"$OUTPUT_DIR/provenance/iq2-control-binary-sha256.txt"
+fi
 
 current_phase=sass
 cuobjdump --list-elf "$binary_rel" >"$OUTPUT_DIR/elf-list.txt" 2>&1
@@ -256,7 +308,7 @@ for i in "${!variants[@]}"; do
         "$lop3" "$prmt" "$shf" "$bfe" "$iadd3" \
         >>"$OUTPUT_DIR/sass-summary.csv"
     case $variant in
-        q4k-native-control|sm75-q3-32)
+        q4k-native-control|sm75-q3-32|sm75-q2q3-32-50|sm75-q2q3-32-75|sm75-q3a-32-4|sm75-q3a-32-6|sm75-q3q4-32-50|sm75-q5-32)
             (( u4u4 > 0 && s4u4 > 0 && i16 == 0 &&
                imma == u4u4 + s4u4 )) ||
                 die "$kernel is not exclusively the required U4xU4/S4xU4 K32 pair" ;;
@@ -274,13 +326,66 @@ for i in "${!variants[@]}"; do
         die "$kernel unexpectedly contains DP4A instead of the required MMA path"
 done
 
+# Gate/up retains two projection chains and may legitimately use more
+# registers than the down-like microkernel. Record any local-memory traffic
+# instead of rejecting the candidate here; Nsight and timing decide its cost.
+for i in "${!variants[@]}"; do
+    variant=gate-up-${variants[$i]}
+    base_variant=${variants[$i]}
+    kernel=${gate_up_kernels[$i]}
+    section=$OUTPUT_DIR/sass-kernels/$variant.sass.txt
+    awk -v wanted="$kernel" '
+        /Function : / {
+            name=$0; sub(/^.*Function :[[:space:]]*/, "", name)
+            sub(/[[:space:]]*$/, "", name); emit=name == wanted
+        }
+        emit { print }
+    ' "$OUTPUT_DIR/sass.txt" >"$section"
+    [[ -s $section ]] || die "SASS contains no function section for $kernel"
+    imma=$(grep -Ec 'IMMA' "$section" || true)
+    i16=$(grep -Ec 'IMMA[^[:space:]]*8816|IMMA\.8816' "$section" || true)
+    i32=$(grep -Ec 'IMMA[^[:space:]]*8832|IMMA\.8832' "$section" || true)
+    s8u8=$(grep -Eic 'IMMA[^[:space:]]*8816[^[:space:]]*S8[^[:space:]]*U8' "$section" || true)
+    u4u4=$(grep -Eic 'IMMA[^[:space:]]*8832[^[:space:]]*U4[^[:space:]]*U4' "$section" || true)
+    s4u4=$(grep -Eic 'IMMA[^[:space:]]*8832[^[:space:]]*S4[^[:space:]]*U4' "$section" || true)
+    u4s4=$(grep -Eic 'IMMA[^[:space:]]*8832[^[:space:]]*U4[^[:space:]]*S4' "$section" || true)
+    s4s4=$(grep -Eic 'IMMA[^[:space:]]*8832[^[:space:]]*S4[^[:space:]]*S4' "$section" || true)
+    ldl=$(grep -Ec '(^|[[:space:]])LDL([[:space:].]|$)' "$section" || true)
+    stl=$(grep -Ec '(^|[[:space:]])STL([[:space:].]|$)' "$section" || true)
+    lop3=$(grep -Ec 'LOP3' "$section" || true)
+    prmt=$(grep -Ec 'PRMT' "$section" || true)
+    shf=$(grep -Ec 'SHF' "$section" || true)
+    bfe=$(grep -Ec 'BFE' "$section" || true)
+    iadd3=$(grep -Ec 'IADD3' "$section" || true)
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$variant" "$kernel" "$imma" "$i16" "$i32" "$s8u8" \
+        "$u4u4" "$s4u4" "$u4s4" "$s4s4" "$ldl" "$stl" \
+        "$lop3" "$prmt" "$shf" "$bfe" "$iadd3" \
+        >>"$OUTPUT_DIR/sass-summary.csv"
+    case $base_variant in
+        q3k-k16-u8)
+            (( s8u8 > 0 && i32 == 0 && imma == s8u8 )) ||
+                die "$kernel is not exclusively S8xU8 K16 IMMA" ;;
+        sm75-q4-32)
+            (( u4s4 > 0 && s4s4 > 0 && i16 == 0 &&
+               imma == u4s4 + s4s4 )) ||
+                die "$kernel is not exclusively the required U4xS4/S4xS4 K32 pair" ;;
+        *)
+            (( u4u4 > 0 && s4u4 > 0 && i16 == 0 &&
+               imma == u4u4 + s4u4 )) ||
+                die "$kernel is not exclusively the required U4xU4/S4xU4 K32 pair" ;;
+    esac
+    ! grep -Eq 'IDP[.]4A|DP4A' "$section" ||
+        die "$kernel unexpectedly contains DP4A instead of the required MMA path"
+done
+
 current_phase=correctness
 capture_gpu_state pre-correctness
 env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
     "$binary_rel" --device 0 --cases "$EXACT_CASES" --correctness-only \
         >"$OUTPUT_DIR/correctness.log" 2>&1 || {
             cat "$OUTPUT_DIR/correctness.log" >&2 || true
-            die "Q3/Q4-32 exactness or round-trip gate failed"
+            die "routed-quant exactness or round-trip gate failed"
         }
 for marker in canonical_fixture_status unpack_status layout_status \
         roundtrip_status exact_status harness_status; do
@@ -312,40 +417,50 @@ env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         --repeats "$BENCH_REPEATS" --launches "$BENCH_LAUNCHES" \
         >"$OUTPUT_DIR/benchmark.log" 2>&1 || {
             cat "$OUTPUT_DIR/benchmark.log" >&2 || true
-            die "Q3/Q4-32 benchmark failed"
+            die "routed-quant benchmark failed"
         }
-[[ $(grep -c '^benchmark_summary_begin$' "$OUTPUT_DIR/benchmark.log") -eq 2 &&
-   $(grep -c '^benchmark_summary_end$' "$OUTPUT_DIR/benchmark.log") -eq 2 ]] ||
-    die "benchmark output does not contain exactly two complete summaries"
+[[ $(grep -c '^benchmark_summary_begin$' "$OUTPUT_DIR/benchmark.log") -eq 4 &&
+   $(grep -c '^benchmark_summary_end$' "$OUTPUT_DIR/benchmark.log") -eq 4 ]] ||
+    die "benchmark output does not contain exactly four complete summaries"
 grep -q '^benchmark_layout_status=ok$' "$OUTPUT_DIR/benchmark.log" ||
     die "benchmark harness did not validate every native layout"
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/benchmark.log" ||
     die "benchmark harness did not report harness_status=ok"
-for label in hot streamed; do
+for label in down-hot down-streamed gate-up-hot gate-up-streamed; do
     awk -F, -v wanted="$label" '
         /^benchmark_summary_begin$/ { summary=1; next }
         /^benchmark_summary_end$/ { summary=0 }
         summary && /^mode,variant,/ { if (!header) { print; header=1 }; next }
         summary && $1 == wanted { print }
     ' "$OUTPUT_DIR/benchmark.log" >"$OUTPUT_DIR/benchmark-$label.csv"
-    [[ $(wc -l <"$OUTPUT_DIR/benchmark-$label.csv") -eq 5 ]] ||
-        die "$label benchmark CSV does not contain all four variants"
+    [[ $(wc -l <"$OUTPUT_DIR/benchmark-$label.csv") -eq 11 ]] ||
+        die "$label benchmark CSV does not contain all ten variants"
 done
-if ! python3 - "$OUTPUT_DIR/benchmark-hot.csv" \
-        "$OUTPUT_DIR/benchmark-streamed.csv" <<'PY'
+if ! python3 - "$OUTPUT_DIR/benchmark-down-hot.csv" \
+        "$OUTPUT_DIR/benchmark-down-streamed.csv" \
+        "$OUTPUT_DIR/benchmark-gate-up-hot.csv" \
+        "$OUTPUT_DIR/benchmark-gate-up-streamed.csv" <<'PY'
 import csv
 import math
 import pathlib
 import sys
 
 expected = {
-    "q4k-native-control", "q3k-k16-u8", "sm75-q3-32", "sm75-q4-32"
+    "q4k-native-control", "q3k-k16-u8", "sm75-q3-32", "sm75-q4-32",
+    "sm75-q2q3-32-50", "sm75-q2q3-32-75", "sm75-q3a-32-4",
+    "sm75-q3a-32-6", "sm75-q3q4-32-50", "sm75-q5-32",
 }
 tile_bytes = {
     "q4k-native-control": 1152,
     "q3k-k16-u8": 880,
     "sm75-q3-32": 832,
     "sm75-q4-32": 1088,
+    "sm75-q2q3-32-50": 712,
+    "sm75-q2q3-32-75": 776,
+    "sm75-q3a-32-4": 864,
+    "sm75-q3a-32-6": 896,
+    "sm75-q3q4-32-50": 968,
+    "sm75-q5-32": 1344,
 }
 numeric = (
     "weight_cases", "weight_footprint_bytes", "median_ms", "min_ms",
@@ -355,12 +470,12 @@ for raw_path in sys.argv[1:]:
     path = pathlib.Path(raw_path)
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    if len(rows) != 4:
-        raise SystemExit(f"{path}: expected four rows, found {len(rows)}")
+    if len(rows) != 10:
+        raise SystemExit(f"{path}: expected ten rows, found {len(rows)}")
     names = [row.get("variant", "") for row in rows]
     if set(names) != expected or len(names) != len(set(names)):
         raise SystemExit(f"{path}: invalid variant inventory: {names}")
-    wanted_mode = "streamed" if "streamed" in path.name else "hot"
+    wanted_mode = path.name.removeprefix("benchmark-").removesuffix(".csv")
     for row in rows:
         if row.get("mode") != wanted_mode:
             raise SystemExit(f"{path}: invalid mode {row.get('mode')!r}")
@@ -384,6 +499,51 @@ then
     die "benchmark summaries failed semantic validation"
 fi
 capture_gpu_state post-benchmark
+
+current_phase=iq2-production-control
+if [[ $RUN_IQ2_CONTROL == 1 ]]; then
+    printf 'scenario,layer,timed_repeats,timed_total_ms,timed_per_call_ms\n' \
+        >"$OUTPUT_DIR/iq2-production-control.csv"
+    for scenario in hybrid-iq2-q4-early hybrid-iq2-q4-late; do
+        log=$OUTPUT_DIR/iq2-production-control-$scenario.log
+        env -u DS4_PROFILE_SCALAR_TARGET -u DS4_PROFILE_SCALAR \
+            -u DS4_CUDA_MOE_IQ2_SCALAR_SM75 \
+            CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+            DS4_PROFILE_REPEATS="$IQ2_TIMING_REPEATS" \
+            DS4_PROFILE_IQ2_TAIL8_ALL=1 \
+            "$iq2_binary_rel" "$scenario" >"$log" 2>&1 || {
+                tail -n 160 "$log" >&2 || true
+                die "IQ2 production control failed for $scenario"
+            }
+        grep -Fxq 'harness_status=ok' "$log" ||
+            die "IQ2 production control omitted success for $scenario"
+        python3 - "$log" "$OUTPUT_DIR/iq2-production-control.csv" <<'PY'
+import sys
+
+log_path, csv_path = sys.argv[1:]
+wanted = {"scenario", "layer", "timed_repeats", "timed_total_ms",
+          "timed_per_call_ms"}
+values = {}
+with open(log_path, encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        key, sep, value = line.strip().partition("=")
+        if sep and key in wanted:
+            values[key] = value
+if set(values) != wanted:
+    raise SystemExit(f"incomplete IQ2 production timing in {log_path}: {values}")
+if int(values["timed_repeats"]) <= 0 or float(values["timed_total_ms"]) <= 0 \
+        or float(values["timed_per_call_ms"]) <= 0:
+    raise SystemExit(f"invalid IQ2 production timing in {log_path}: {values}")
+with open(csv_path, "a", encoding="utf-8", newline="") as handle:
+    handle.write(",".join(values[key] for key in
+        ("scenario", "layer", "timed_repeats", "timed_total_ms",
+         "timed_per_call_ms")) + "\n")
+PY
+    done
+else
+    printf 'skipped explicitly: RUN_IQ2_CONTROL=0\n' \
+        >"$OUTPUT_DIR/iq2-production-control.log"
+fi
 
 if [[ $RUN_NCU == 1 ]]; then
     current_phase=nsight
@@ -549,52 +709,61 @@ with open(path, newline="", encoding="utf-8-sig") as handle:
         raise SystemExit(f"metric {metric} is non-finite: {value!r}")
 PY
     }
-    for i in "${!variants[@]}"; do
-        variant=${variants[$i]}
-        kernel=${kernels[$i]}
-        base=$OUTPUT_DIR/ncu/$variant
-        printf 'Nsight Compute: %s...\n' "$variant"
-        rc=0
-        env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-            "${ncu_command[@]}" --config-file off \
-                --target-processes application-only --devices 0 \
-                --kernel-name-base function --kernel-name "$kernel" \
-                --launch-count 1 --replay-mode kernel --cache-control none \
-                --clock-control none --force-overwrite --export "$base" \
-                --metrics "$metrics" --disable-extra-suffixes \
-                "$binary_rel" --device 0 --profile "$variant" \
-                    --bench-cases "$STREAM_WEIGHT_CASES" \
-                    --repeats "$PROFILE_REPEATS" \
-                >"$base.log" 2>&1 || rc=$?
-        take_output_ownership
-        if (( rc != 0 )); then
-            tail -n 160 "$base.log" >&2 || true
-            die "Nsight Compute failed for $variant (exit $rc)"
-        fi
-        grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
-            "$base.log" && die "Nsight Compute captured no valid kernel for $variant"
-        grep -Fxq 'profile_status=ok' "$base.log" ||
-            die "profile harness omitted profile_status=ok for $variant"
-        grep -Fxq 'harness_status=ok' "$base.log" ||
-            die "profile harness omitted harness_status=ok for $variant"
-        [[ -s $base.ncu-rep ]] || die "missing Nsight report for $variant"
-        "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
-            >"$base.csv" 2>"$base-import.log" ||
-            die "could not import Nsight report for $variant"
-        [[ -s $base.csv ]] || die "empty Nsight CSV for $variant"
-        python3 "$validator_rel" "$base.csv" "$kernel" 0 \
-            --process cuda_sm75_q3_q4_32 --block-size 256 \
-            >"$base-validation.txt" 2>&1 || {
-                cat "$base-validation.txt" >&2 || true
-                die "Nsight capture identity validation failed for $variant"
-            }
-        for metric in "${required_metric_names[@]}"; do
-            validate_ncu_metric_value "$base.csv" "$metric" ||
-                die "Nsight report has no value for required metric $metric ($variant)"
+    for shape in down gate-up; do
+        for i in "${!variants[@]}"; do
+            variant=${variants[$i]}
+            if [[ $shape == down ]]; then
+                kernel=${kernels[$i]}
+            else
+                kernel=${gate_up_kernels[$i]}
+            fi
+            base=$OUTPUT_DIR/ncu/$shape-$variant
+            printf 'Nsight Compute: %s %s...\n' "$shape" "$variant"
+            rc=0
+            env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+                "${ncu_command[@]}" --config-file off \
+                    --target-processes application-only --devices 0 \
+                    --kernel-name-base function --kernel-name "$kernel" \
+                    --launch-count 1 --replay-mode kernel --cache-control none \
+                    --clock-control none --force-overwrite --export "$base" \
+                    --metrics "$metrics" --disable-extra-suffixes \
+                    "$binary_rel" --device 0 --profile "$variant" \
+                        --profile-shape "$shape" \
+                        --bench-cases "$STREAM_WEIGHT_CASES" \
+                        --repeats "$PROFILE_REPEATS" \
+                    >"$base.log" 2>&1 || rc=$?
+            take_output_ownership
+            if (( rc != 0 )); then
+                tail -n 160 "$base.log" >&2 || true
+                die "Nsight Compute failed for $shape $variant (exit $rc)"
+            fi
+            grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
+                "$base.log" &&
+                die "Nsight Compute captured no valid kernel for $shape $variant"
+            grep -Fxq 'profile_status=ok' "$base.log" ||
+                die "profile harness omitted profile_status=ok for $shape $variant"
+            grep -Fxq 'harness_status=ok' "$base.log" ||
+                die "profile harness omitted harness_status=ok for $shape $variant"
+            [[ -s $base.ncu-rep ]] ||
+                die "missing Nsight report for $shape $variant"
+            "$ncu_bin" --config-file off --import "$base.ncu-rep" \
+                --csv --page raw >"$base.csv" 2>"$base-import.log" ||
+                die "could not import Nsight report for $shape $variant"
+            [[ -s $base.csv ]] || die "empty Nsight CSV for $shape $variant"
+            python3 "$validator_rel" "$base.csv" "$kernel" 0 \
+                --process cuda_sm75_q3_q4_32 --block-size 256 \
+                >"$base-validation.txt" 2>&1 || {
+                    cat "$base-validation.txt" >&2 || true
+                    die "Nsight capture identity validation failed for $shape $variant"
+                }
+            for metric in "${required_metric_names[@]}"; do
+                validate_ncu_metric_value "$base.csv" "$metric" ||
+                    die "Nsight report has no value for required metric $metric ($shape $variant)"
+            done
         done
     done
 fi
 
 current_phase=complete
 capture_gpu_state final
-printf 'SM75 Q3/Q4-32 experiment complete: %s\n' "$OUTPUT_DIR"
+printf 'SM75 routed-quant performance screen complete: %s\n' "$OUTPUT_DIR"

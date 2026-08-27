@@ -1125,11 +1125,11 @@ templates. It deliberately repeats T64/T128 because changes to the common Q8
 loader can change every template's memory instruction stream.
 `NCU_SET=targeted` or `NCU_SET=full` are slower opt-ins.
 
-### SM75 Q3_K, Q3-32, and Q4-32 experiment
+### SM75 routed-quant performance screen
 
 `cuda-sm75-q3-q4-32.sh` is the model-free arithmetic and native-layout gate
 for the format contracts in
-[`SM75_Q3_Q4_32_DESIGN.md`](../SM75_Q3_Q4_32_DESIGN.md). It compares four
+[`SM75_Q3_Q4_32_DESIGN.md`](../SM75_Q3_Q4_32_DESIGN.md). It compares ten
 M16xN8xK256 warp kernels with eight warps per 256-thread CTA:
 
 - the existing affine Q4_K K32 arithmetic in a 1152-byte native tile, with
@@ -1140,17 +1140,27 @@ M16xN8xK256 warp kernels with eight warps per 256-thread CTA:
   two K32 INT4 MMAs plus `-4*bsum`;
 - the experimental symmetric 136-byte Q4-32 format in a 1088-byte native
   tile, using signed-B K32 INT4 MMA without an affine-minimum correction.
+- Q2/Q3-50, Q2/Q3-75, Q3A4, Q3A6, Q3/Q4-50, and Q5-32, each in an exact
+  size-neutral native tile matching the corresponding quality-screen law.
 
 The harness carries opaque FP16 headers but deliberately measures only the
 exact integer-accumulator component; it does not claim floating-output or
 quantizer-byte exactness. It exhaustively validates Q3_K unpacking and
 each Q3-32 bit plane, samples mixed Q3-32 states deterministically, checks
 canonical/native byte round trips, and compares adversarial and seeded-random
-MMA accumulators with separate scalar references. Its hot
-and L2-exceeding tests use each format's real byte footprint. The runner also
-records SASS/resource evidence, runs Compute Sanitizer when available, and
-profiles occupancy, tensor-pipe activity, memory traffic, and stalls with a
-direct harness process.
+MMA accumulators with separate scalar references. It reports both a
+single-projection down-like shape and a dual-projection gate/up shape that
+retains both accumulator chains and executes the SiLU-times-up epilogue.
+Each has hot and L2-exceeding streamed-weight modes using the format's real
+byte footprint. The runner records SASS/resource evidence, runs Compute
+Sanitizer when available, and profiles both shapes for occupancy, tensor-pipe
+activity, memory traffic, and stalls with a direct harness process.
+
+IQ2_XXS is not forced into this linear-format harness. Instead, the runner
+times the real early/late hybrid IQ2 gate/up + Q4 down production calls and
+writes them to `iq2-production-control.csv`. Those absolute production times
+are a separately labelled control, not a ratio against the bounded K256
+tables.
 
 This is not yet a quantizer, GGUF loader, routed-MoE dispatch, quality result,
 or end-to-end speed claim. Standard Q3_K must later match the upstream
@@ -1169,9 +1179,11 @@ RUN_NCU=1 \
 ./speed-bench/cuda-sm75-q3-q4-32.sh
 ```
 
-Return `sm75-q3-q4-32-<timestamp>.tar.gz`. The first decision boundary is
-whether exact Q3_K and Q3-32 remain close enough to native Q4_K in both hot
-and streamed tests to justify a production-shaped routed-expert prototype.
+Return `sm75-q3-q4-32-<timestamp>.tar.gz`. The archive contains four timing
+tables (`down-hot`, `down-streamed`, `gate-up-hot`, and
+`gate-up-streamed`), exact layout/arithmetic gates for all ten linear formats,
+the production IQ2 control, and per-shape Nsight reports. This pass ranks
+formats only; it does not choose a deployment recipe.
 
 ### SM75 packed-INT4 Q4 experiment
 

@@ -1,5 +1,7 @@
 /*
- * Bounded SM75 arithmetic/layout harness for Q4_K, Q3_K, Q3-32, and Q4-32.
+ * Bounded SM75 arithmetic/layout harness for the routed-quant performance
+ * screen.  It covers the standard Q3_K/Q4_K controls plus the compact K32
+ * candidates that survived the real-weight quality gate.
  *
  * This file intentionally contains no quantizer.  Opaque fp16 headers are
  * carried only to prove the byte layouts; all checked arithmetic is integer.
@@ -8,6 +10,7 @@
 
 #include <cuda_runtime.h>
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,6 +65,52 @@ struct SM75Q4_32Block {
     uint8_t qs[128];
 };
 
+struct __attribute__((packed)) SM75Q2Q3_50Block {
+    uint16_t d_bits;
+    uint8_t scales[6];
+    uint8_t low2[64];
+    uint8_t promoted_mask;
+    uint8_t high[16];
+};
+
+struct __attribute__((packed)) SM75Q2Q3_75Block {
+    uint16_t d_bits;
+    uint8_t scales[6];
+    uint8_t low2[64];
+    uint8_t promoted_mask;
+    uint8_t high[24];
+};
+
+struct SM75Q3A4Block {
+    uint16_t d_bits;
+    uint16_t dmin_bits;
+    uint8_t scales[4];
+    uint8_t mins[4];
+    uint8_t qs[96];
+};
+
+struct SM75Q3A6Block {
+    uint16_t d_bits;
+    uint16_t dmin_bits;
+    uint8_t scales[6];
+    uint8_t mins[6];
+    uint8_t qs[96];
+};
+
+struct __attribute__((packed)) SM75Q3Q4_50Block {
+    uint16_t d_bits;
+    uint8_t scales[6];
+    uint8_t low3[96];
+    uint8_t promoted_mask;
+    uint8_t high[16];
+};
+
+struct SM75Q5_32Block {
+    uint16_t d_bits;
+    uint8_t scales[6];
+    uint8_t qs[160];
+};
+
 struct alignas(16) NativeQ4KHeader {
     uint16_t d_bits;
     uint16_t dmin_bits;
@@ -96,6 +145,62 @@ struct alignas(16) NativeQ4_32Tile {
     uint32_t b[K32_GROUPS][WARP_SIZE_];
 };
 
+/* Q2/Q3 and Q3/Q4 use a sparse high plane.  The masks are per output row;
+ * promoted groups remain compact and are found with popcount at execution.
+ * These types deliberately have no alignas attribute because their exact
+ * eight-row sizes are not multiples of 16.  cudaMalloc aligns the first tile;
+ * the alternating alignment of streamed tiles is part of the real format
+ * cost rather than hidden padding. */
+struct NativeQ2Q3_50Tile {
+    uint16_t d_bits[TILE_N];
+    uint8_t scales[TILE_N][6];
+    uint8_t promoted_mask[TILE_N];
+    uint16_t low2[K32_GROUPS][WARP_SIZE_];
+    uint8_t high[TILE_N][16];
+};
+
+struct NativeQ2Q3_75Tile {
+    uint16_t d_bits[TILE_N];
+    uint8_t scales[TILE_N][6];
+    uint8_t promoted_mask[TILE_N];
+    uint16_t low2[K32_GROUPS][WARP_SIZE_];
+    uint8_t high[TILE_N][24];
+};
+
+struct alignas(16) NativeQ3A4Tile {
+    uint16_t d_bits[TILE_N];
+    uint16_t dmin_bits[TILE_N];
+    uint8_t scales[TILE_N][4];
+    uint8_t mins[TILE_N][4];
+    uint16_t low2[K32_GROUPS][WARP_SIZE_];
+    uint8_t high[K32_GROUPS][WARP_SIZE_];
+};
+
+struct alignas(16) NativeQ3A6Tile {
+    uint16_t d_bits[TILE_N];
+    uint16_t dmin_bits[TILE_N];
+    uint8_t scales[TILE_N][6];
+    uint8_t mins[TILE_N][6];
+    uint16_t low2[K32_GROUPS][WARP_SIZE_];
+    uint8_t high[K32_GROUPS][WARP_SIZE_];
+};
+
+struct NativeQ3Q4_50Tile {
+    uint16_t d_bits[TILE_N];
+    uint8_t scales[TILE_N][6];
+    uint8_t promoted_mask[TILE_N];
+    uint16_t low2[K32_GROUPS][WARP_SIZE_];
+    uint8_t high3[K32_GROUPS][WARP_SIZE_];
+    uint8_t high4_biased[TILE_N][16];
+};
+
+struct alignas(16) NativeQ5_32Tile {
+    uint16_t d_bits[TILE_N];
+    uint8_t scales[TILE_N][6];
+    uint32_t low4[K32_GROUPS][WARP_SIZE_];
+    uint8_t high[K32_GROUPS][WARP_SIZE_];
+};
+
 struct ActivationCase {
     int8_t q8[TILE_M][TILE_K];
     int16_t bsums[TILE_M][K16_GROUPS];
@@ -105,6 +210,12 @@ static_assert(sizeof(Q4KBlock) == 144, "canonical Q4_K block must be 144 bytes")
 static_assert(sizeof(Q3KBlock) == 110, "canonical Q3_K block must be 110 bytes");
 static_assert(sizeof(SM75Q3_32Block) == 104, "canonical Q3-32 block must be 104 bytes");
 static_assert(sizeof(SM75Q4_32Block) == 136, "canonical Q4-32 block must be 136 bytes");
+static_assert(sizeof(SM75Q2Q3_50Block) == 89, "canonical Q2/Q3-50 block size");
+static_assert(sizeof(SM75Q2Q3_75Block) == 97, "canonical Q2/Q3-75 block size");
+static_assert(sizeof(SM75Q3A4Block) == 108, "canonical Q3A4 block size");
+static_assert(sizeof(SM75Q3A6Block) == 112, "canonical Q3A6 block size");
+static_assert(sizeof(SM75Q3Q4_50Block) == 121, "canonical Q3/Q4-50 block size");
+static_assert(sizeof(SM75Q5_32Block) == 168, "canonical Q5-32 block size");
 static_assert(offsetof(Q3KBlock, d_bits) == 108, "canonical Q3_K fp16 offset");
 static_assert(offsetof(SM75Q3_32Block, qs) == 8, "canonical Q3-32 payload offset");
 static_assert(offsetof(SM75Q4_32Block, qs) == 8, "canonical Q4-32 payload offset");
@@ -151,12 +262,39 @@ static_assert(sizeof(((NativeQ4_32Tile *)0)->b) == 1024,
               "native Q4-32 value payload");
 static_assert(sizeof(((NativeQ4KTile *)0)->b) == 1024,
               "native Q4_K value payload");
+static_assert(sizeof(NativeQ2Q3_50Tile) == 712, "native Q2/Q3-50 tile size");
+static_assert(sizeof(NativeQ2Q3_75Tile) == 776, "native Q2/Q3-75 tile size");
+static_assert(sizeof(NativeQ3A4Tile) == 864, "native Q3A4 tile size");
+static_assert(sizeof(NativeQ3A6Tile) == 896, "native Q3A6 tile size");
+static_assert(sizeof(NativeQ3Q4_50Tile) == 968, "native Q3/Q4-50 tile size");
+static_assert(sizeof(NativeQ5_32Tile) == 1344, "native Q5-32 tile size");
+static_assert(sizeof(NativeQ2Q3_50Tile) ==
+              TILE_N * sizeof(SM75Q2Q3_50Block),
+              "native Q2/Q3-50 must be size-neutral");
+static_assert(sizeof(NativeQ2Q3_75Tile) ==
+              TILE_N * sizeof(SM75Q2Q3_75Block),
+              "native Q2/Q3-75 must be size-neutral");
+static_assert(sizeof(NativeQ3A4Tile) == TILE_N * sizeof(SM75Q3A4Block),
+              "native Q3A4 must be size-neutral");
+static_assert(sizeof(NativeQ3A6Tile) == TILE_N * sizeof(SM75Q3A6Block),
+              "native Q3A6 must be size-neutral");
+static_assert(sizeof(NativeQ3Q4_50Tile) ==
+              TILE_N * sizeof(SM75Q3Q4_50Block),
+              "native Q3/Q4-50 must be size-neutral");
+static_assert(sizeof(NativeQ5_32Tile) == TILE_N * sizeof(SM75Q5_32Block),
+              "native Q5-32 must be size-neutral");
 
 enum Variant {
     VAR_Q4K_NATIVE_CONTROL = 0,
     VAR_Q3K_K16_U8,
     VAR_SM75_Q3_32,
     VAR_SM75_Q4_32,
+    VAR_SM75_Q2Q3_50,
+    VAR_SM75_Q2Q3_75,
+    VAR_SM75_Q3A4,
+    VAR_SM75_Q3A6,
+    VAR_SM75_Q3Q4_50,
+    VAR_SM75_Q5_32,
     VARIANT_COUNT,
 };
 
@@ -165,6 +303,12 @@ static const char *const variant_names[VARIANT_COUNT] = {
     "q3k-k16-u8",
     "sm75-q3-32",
     "sm75-q4-32",
+    "sm75-q2q3-32-50",
+    "sm75-q2q3-32-75",
+    "sm75-q3a-32-4",
+    "sm75-q3a-32-6",
+    "sm75-q3q4-32-50",
+    "sm75-q5-32",
 };
 
 struct CanonicalWeights {
@@ -172,6 +316,12 @@ struct CanonicalWeights {
     Q3KBlock q3k[TILE_N];
     SM75Q3_32Block q3_32[TILE_N];
     SM75Q4_32Block q4_32[TILE_N];
+    SM75Q2Q3_50Block q2q3_50[TILE_N];
+    SM75Q2Q3_75Block q2q3_75[TILE_N];
+    SM75Q3A4Block q3a4[TILE_N];
+    SM75Q3A6Block q3a6[TILE_N];
+    SM75Q3Q4_50Block q3q4_50[TILE_N];
+    SM75Q5_32Block q5_32[TILE_N];
 };
 
 struct HostWeights {
@@ -179,6 +329,12 @@ struct HostWeights {
     NativeQ3KTile *q3k;
     NativeQ3_32Tile *q3_32;
     NativeQ4_32Tile *q4_32;
+    NativeQ2Q3_50Tile *q2q3_50;
+    NativeQ2Q3_75Tile *q2q3_75;
+    NativeQ3A4Tile *q3a4;
+    NativeQ3A6Tile *q3a6;
+    NativeQ3Q4_50Tile *q3q4_50;
+    NativeQ5_32Tile *q5_32;
 };
 
 struct DeviceWeights {
@@ -186,6 +342,12 @@ struct DeviceWeights {
     NativeQ3KTile *q3k;
     NativeQ3_32Tile *q3_32;
     NativeQ4_32Tile *q4_32;
+    NativeQ2Q3_50Tile *q2q3_50;
+    NativeQ2Q3_75Tile *q2q3_75;
+    NativeQ3A4Tile *q3a4;
+    NativeQ3A6Tile *q3a6;
+    NativeQ3Q4_50Tile *q3q4_50;
+    NativeQ5_32Tile *q5_32;
 };
 
 struct TileI32 {
@@ -213,6 +375,11 @@ static uint32_t rng_next(uint32_t *state) {
     x ^= x << 5;
     *state = x;
     return x;
+}
+
+static uint8_t rotate_mask8(uint8_t mask, uint32_t shift) {
+    shift &= 7u;
+    return shift ? (uint8_t)((mask << shift) | (mask >> (8u - shift))) : mask;
 }
 
 __host__ __device__ __forceinline__ static int32_t decode_q3k_scale(
@@ -255,6 +422,48 @@ static void encode_scale6_8(const int8_t scales[K32_GROUPS],
         packed[4u + (j >> 2u)] |=
             (uint8_t)((code >> 4u) << (2u * (j & 3u)));
     }
+}
+
+__host__ __device__ __forceinline__ static uint32_t unpack_bits(
+        const uint8_t *packed, uint32_t index, uint32_t bits) {
+    const uint32_t bit = index * bits;
+    const uint32_t byte = bit >> 3u;
+    const uint32_t shift = bit & 7u;
+    uint32_t value = packed[byte] >> shift;
+    if (shift + bits > 8u)
+        value |= (uint32_t)packed[byte + 1u] << (8u - shift);
+    return value & ((1u << bits) - 1u);
+}
+
+static void pack_bits(const uint8_t *values, uint32_t count, uint32_t bits,
+                      uint8_t *packed) {
+    const size_t bytes = ((size_t)count * bits + 7u) / 8u;
+    memset(packed, 0, bytes);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t bit = i * bits;
+        const uint32_t byte = bit >> 3u;
+        const uint32_t shift = bit & 7u;
+        const uint32_t value = values[i] & ((1u << bits) - 1u);
+        packed[byte] |= (uint8_t)(value << shift);
+        if (shift + bits > 8u)
+            packed[byte + 1u] |= (uint8_t)(value >> (8u - shift));
+    }
+}
+
+__host__ __device__ __forceinline__ static uint32_t popcount8(uint8_t value) {
+    uint32_t count = 0;
+    for (; value; value &= (uint8_t)(value - 1u)) count++;
+    return count;
+}
+
+__host__ __device__ __forceinline__ static uint32_t decode_unsigned_field8(
+        const uint8_t *packed, uint32_t bits, uint32_t group) {
+    return unpack_bits(packed, group, bits);
+}
+
+static void encode_unsigned_fields8(const uint8_t values[K32_GROUPS],
+                                    uint32_t bits, uint8_t *packed) {
+    pack_bits(values, K32_GROUPS, bits, packed);
 }
 
 __host__ __device__ __forceinline__ static void decode_q4k_scale_min(
@@ -356,6 +565,45 @@ static void set_canonical_q4_32_value(SM75Q4_32Block *block, uint32_t k,
     else *byte = (uint8_t)((*byte & 0xf0u) | code);
 }
 
+static uint32_t sparse_high_bit(const uint8_t *high, uint8_t promoted_mask,
+                                uint32_t group, uint32_t index_in_group) {
+    if (!(promoted_mask & (1u << group))) return 0u;
+    const uint32_t ordinal = popcount8(
+        (uint8_t)(promoted_mask & ((1u << group) - 1u)));
+    return (high[ordinal * 4u + index_in_group / 8u] >>
+            (index_in_group & 7u)) & 1u;
+}
+
+static int8_t canonical_q2q3_value(const uint8_t *low2,
+                                   uint8_t promoted_mask,
+                                   const uint8_t *high, uint32_t k) {
+    const uint32_t group = k / K32;
+    uint32_t code = unpack_bits(low2, k, 2u);
+    if (promoted_mask & (1u << group))
+        code |= sparse_high_bit(high, promoted_mask, group, k & 31u) << 2u;
+    const int32_t bias = (promoted_mask & (1u << group)) ? 4 : 2;
+    return (int8_t)((int32_t)code - bias);
+}
+
+static int8_t canonical_q3q4_value(const SM75Q3Q4_50Block *block,
+                                   uint32_t k) {
+    const uint32_t group = k / K32;
+    uint32_t code = unpack_bits(block->low3, k, 3u);
+    if (!(block->promoted_mask & (1u << group)))
+        return (int8_t)((int32_t)code - 4);
+    code |= sparse_high_bit(block->high, block->promoted_mask,
+                            group, k & 31u) << 3u;
+    return (int8_t)(code < 8u ? (int32_t)code : (int32_t)code - 16);
+}
+
+static uint8_t canonical_affine_value(const uint8_t qs[96], uint32_t k) {
+    return (uint8_t)unpack_bits(qs, k, 3u);
+}
+
+static int8_t canonical_q5_value(const SM75Q5_32Block *block, uint32_t k) {
+    return (int8_t)((int32_t)unpack_bits(block->qs, k, 5u) - 16);
+}
+
 static void encode_q4k_block(Q4KBlock *block, const uint8_t values[TILE_K],
                              const uint8_t scales[K32_GROUPS],
                              const uint8_t mins[K32_GROUPS], uint16_t d_bits,
@@ -398,6 +646,86 @@ static void encode_q4_32_block(SM75Q4_32Block *block,
     encode_scale6_8(scales, block->scales);
     for (uint32_t k = 0; k < TILE_K; k++)
         set_canonical_q4_32_value(block, k, values[k]);
+}
+
+template <typename Block>
+static void encode_q2q3_block(Block *block, const int8_t values[TILE_K],
+                              const int8_t scales[K32_GROUPS],
+                              uint8_t promoted_mask, uint16_t d_bits) {
+    memset(block, 0, sizeof(*block));
+    block->d_bits = d_bits;
+    block->promoted_mask = promoted_mask;
+    encode_scale6_8(scales, block->scales);
+    uint8_t low[TILE_K];
+    uint32_t ordinal = 0;
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        const bool promoted = (promoted_mask & (1u << group)) != 0;
+        for (uint32_t i = 0; i < K32; i++) {
+            const uint32_t k = group * K32 + i;
+            const uint32_t code = (uint32_t)((int32_t)values[k] +
+                                              (promoted ? 4 : 2));
+            low[k] = (uint8_t)(code & 3u);
+            if (promoted && (code & 4u))
+                block->high[ordinal * 4u + i / 8u] |=
+                    (uint8_t)(1u << (i & 7u));
+        }
+        if (promoted) ordinal++;
+    }
+    pack_bits(low, TILE_K, 2u, block->low2);
+}
+
+template <typename Block>
+static void encode_q3a_block(Block *block, const uint8_t values[TILE_K],
+                             const uint8_t scales[K32_GROUPS],
+                             const uint8_t mins[K32_GROUPS],
+                             uint32_t metadata_bits, uint16_t d_bits,
+                             uint16_t dmin_bits) {
+    memset(block, 0, sizeof(*block));
+    block->d_bits = d_bits;
+    block->dmin_bits = dmin_bits;
+    encode_unsigned_fields8(scales, metadata_bits, block->scales);
+    encode_unsigned_fields8(mins, metadata_bits, block->mins);
+    pack_bits(values, TILE_K, 3u, block->qs);
+}
+
+static void encode_q3q4_50_block(SM75Q3Q4_50Block *block,
+                                 const int8_t values[TILE_K],
+                                 const int8_t scales[K32_GROUPS],
+                                 uint8_t promoted_mask, uint16_t d_bits) {
+    memset(block, 0, sizeof(*block));
+    block->d_bits = d_bits;
+    block->promoted_mask = promoted_mask;
+    encode_scale6_8(scales, block->scales);
+    uint8_t low[TILE_K];
+    uint32_t ordinal = 0;
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        const bool promoted = (promoted_mask & (1u << group)) != 0;
+        for (uint32_t i = 0; i < K32; i++) {
+            const uint32_t k = group * K32 + i;
+            const uint32_t code = promoted
+                ? ((uint32_t)(uint8_t)values[k] & 15u)
+                : (uint32_t)((int32_t)values[k] + 4);
+            low[k] = (uint8_t)(code & 7u);
+            if (promoted && (code & 8u))
+                block->high[ordinal * 4u + i / 8u] |=
+                    (uint8_t)(1u << (i & 7u));
+        }
+        if (promoted) ordinal++;
+    }
+    pack_bits(low, TILE_K, 3u, block->low3);
+}
+
+static void encode_q5_32_block(SM75Q5_32Block *block,
+                               const int8_t values[TILE_K],
+                               const int8_t scales[K32_GROUPS],
+                               uint16_t d_bits) {
+    memset(block, 0, sizeof(*block));
+    block->d_bits = d_bits;
+    encode_scale6_8(scales, block->scales);
+    uint8_t codes[TILE_K];
+    for (uint32_t k = 0; k < TILE_K; k++)
+        codes[k] = (uint8_t)((int32_t)values[k] + 16);
+    pack_bits(codes, TILE_K, 5u, block->qs);
 }
 
 static uint32_t host_pack_nibbles8(const uint8_t values[8]) {
@@ -498,6 +826,122 @@ static void repack_q4_32_native(const SM75Q4_32Block canonical[TILE_N],
     }
 }
 
+template <typename Canonical, typename Native>
+static void repack_q2q3_native(const Canonical canonical[TILE_N],
+                               Native *native) {
+    memset(native, 0, sizeof(*native));
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        native->d_bits[col] = canonical[col].d_bits;
+        memcpy(native->scales[col], canonical[col].scales, 6);
+        native->promoted_mask[col] = canonical[col].promoted_mask;
+        memcpy(native->high[col], canonical[col].high,
+               sizeof(native->high[col]));
+    }
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        for (uint32_t lane = 0; lane < WARP_SIZE_; lane++) {
+            const uint32_t col = lane >> 2u;
+            const uint32_t k0 = group * K32 + (lane & 3u) * 8u;
+            uint16_t low = 0;
+            for (uint32_t i = 0; i < 8; i++)
+                low |= (uint16_t)(unpack_bits(canonical[col].low2,
+                                              k0 + i, 2u) << (2u * i));
+            native->low2[group][lane] = low;
+        }
+    }
+}
+
+template <typename Canonical, typename Native>
+static void repack_q3a_native(const Canonical canonical[TILE_N],
+                              Native *native) {
+    memset(native, 0, sizeof(*native));
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        native->d_bits[col] = canonical[col].d_bits;
+        native->dmin_bits[col] = canonical[col].dmin_bits;
+        memcpy(native->scales[col], canonical[col].scales,
+               sizeof(native->scales[col]));
+        memcpy(native->mins[col], canonical[col].mins,
+               sizeof(native->mins[col]));
+    }
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        for (uint32_t lane = 0; lane < WARP_SIZE_; lane++) {
+            const uint32_t col = lane >> 2u;
+            const uint32_t k0 = group * K32 + (lane & 3u) * 8u;
+            uint16_t low = 0;
+            uint8_t high = 0;
+            for (uint32_t i = 0; i < 8; i++) {
+                const uint32_t code = unpack_bits(canonical[col].qs,
+                                                  k0 + i, 3u);
+                low |= (uint16_t)((code & 3u) << (2u * i));
+                high |= (uint8_t)(((code >> 2u) & 1u) << i);
+            }
+            native->low2[group][lane] = low;
+            native->high[group][lane] = high;
+        }
+    }
+}
+
+static void repack_q3q4_50_native(
+        const SM75Q3Q4_50Block canonical[TILE_N],
+        NativeQ3Q4_50Tile *native) {
+    memset(native, 0, sizeof(*native));
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        native->d_bits[col] = canonical[col].d_bits;
+        memcpy(native->scales[col], canonical[col].scales, 6);
+        native->promoted_mask[col] = canonical[col].promoted_mask;
+    }
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        for (uint32_t lane = 0; lane < WARP_SIZE_; lane++) {
+            const uint32_t col = lane >> 2u;
+            const bool promoted =
+                (canonical[col].promoted_mask & (1u << group)) != 0;
+            const uint32_t k0 = group * K32 + (lane & 3u) * 8u;
+            uint16_t low = 0;
+            uint8_t high3 = 0, high4 = 0;
+            for (uint32_t i = 0; i < 8; i++) {
+                const int32_t q = canonical_q3q4_value(
+                    &canonical[col], k0 + i);
+                const uint32_t biased = (uint32_t)(q + (promoted ? 8 : 4));
+                low |= (uint16_t)((biased & 3u) << (2u * i));
+                high3 |= (uint8_t)(((biased >> 2u) & 1u) << i);
+                high4 |= (uint8_t)(((biased >> 3u) & 1u) << i);
+            }
+            native->low2[group][lane] = low;
+            native->high3[group][lane] = high3;
+            if (promoted) {
+                const uint32_t ordinal = popcount8((uint8_t)(
+                    canonical[col].promoted_mask & ((1u << group) - 1u)));
+                native->high4_biased[col][ordinal * 4u + (lane & 3u)] =
+                    high4;
+            }
+        }
+    }
+}
+
+static void repack_q5_32_native(const SM75Q5_32Block canonical[TILE_N],
+                                NativeQ5_32Tile *native) {
+    memset(native, 0, sizeof(*native));
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        native->d_bits[col] = canonical[col].d_bits;
+        memcpy(native->scales[col], canonical[col].scales, 6);
+    }
+    for (uint32_t group = 0; group < K32_GROUPS; group++) {
+        for (uint32_t lane = 0; lane < WARP_SIZE_; lane++) {
+            const uint32_t col = lane >> 2u;
+            const uint32_t k0 = group * K32 + (lane & 3u) * 8u;
+            uint8_t low[8];
+            uint8_t high = 0;
+            for (uint32_t i = 0; i < 8; i++) {
+                const uint32_t code = (uint32_t)(
+                    (int32_t)canonical_q5_value(&canonical[col], k0 + i) + 16);
+                low[i] = (uint8_t)(code & 15u);
+                high |= (uint8_t)(((code >> 4u) & 1u) << i);
+            }
+            native->low4[group][lane] = host_pack_nibbles8(low);
+            native->high[group][lane] = high;
+        }
+    }
+}
+
 static uint8_t native_q4k_value(const NativeQ4KTile *native,
                                 uint32_t col, uint32_t k) {
     const uint32_t lane = col * 4u + (k % K32) / 8u;
@@ -529,6 +973,65 @@ static int8_t native_q4_32_value(const NativeQ4_32Tile *native,
     const uint32_t code =
         (native->b[k / K32][lane] >> (4u * (k & 7u))) & 15u;
     return (int8_t)(code < 8u ? (int32_t)code : (int32_t)code - 16);
+}
+
+template <typename Native>
+static int8_t native_q2q3_value(const Native *native, uint32_t col,
+                                uint32_t k) {
+    const uint32_t group = k / K32;
+    const uint32_t lane = col * 4u + (k % K32) / 8u;
+    const uint32_t i = k & 7u;
+    uint32_t code = (native->low2[group][lane] >> (2u * i)) & 3u;
+    const bool promoted =
+        (native->promoted_mask[col] & (1u << group)) != 0;
+    if (promoted) {
+        const uint32_t ordinal = popcount8((uint8_t)(
+            native->promoted_mask[col] & ((1u << group) - 1u)));
+        code |= ((native->high[col][ordinal * 4u + (lane & 3u)] >> i) &
+                 1u) << 2u;
+    }
+    return (int8_t)((int32_t)code - (promoted ? 4 : 2));
+}
+
+template <typename Native>
+static uint8_t native_q3a_value(const Native *native, uint32_t col,
+                                uint32_t k) {
+    const uint32_t group = k / K32;
+    const uint32_t lane = col * 4u + (k % K32) / 8u;
+    const uint32_t i = k & 7u;
+    const uint32_t low = (native->low2[group][lane] >> (2u * i)) & 3u;
+    const uint32_t high = (native->high[group][lane] >> i) & 1u;
+    return (uint8_t)(low | (high << 2u));
+}
+
+static int8_t native_q3q4_50_value(const NativeQ3Q4_50Tile *native,
+                                   uint32_t col, uint32_t k) {
+    const uint32_t group = k / K32;
+    const uint32_t lane = col * 4u + (k % K32) / 8u;
+    const uint32_t i = k & 7u;
+    const bool promoted =
+        (native->promoted_mask[col] & (1u << group)) != 0;
+    uint32_t biased =
+        ((native->low2[group][lane] >> (2u * i)) & 3u) |
+        (((native->high3[group][lane] >> i) & 1u) << 2u);
+    if (promoted) {
+        const uint32_t ordinal = popcount8((uint8_t)(
+            native->promoted_mask[col] & ((1u << group) - 1u)));
+        biased |= ((native->high4_biased[col][ordinal * 4u +
+                    (lane & 3u)] >> i) & 1u) << 3u;
+    }
+    return (int8_t)((int32_t)biased - (promoted ? 8 : 4));
+}
+
+static int8_t native_q5_32_value(const NativeQ5_32Tile *native,
+                                 uint32_t col, uint32_t k) {
+    const uint32_t group = k / K32;
+    const uint32_t lane = col * 4u + (k % K32) / 8u;
+    const uint32_t i = k & 7u;
+    const uint32_t code =
+        ((native->low4[group][lane] >> (4u * i)) & 15u) |
+        (((native->high[group][lane] >> i) & 1u) << 4u);
+    return (int8_t)((int32_t)code - 16);
 }
 
 static void unpack_q4k_native(const NativeQ4KTile *native,
@@ -580,11 +1083,99 @@ static void unpack_q4_32_native(const NativeQ4_32Tile *native,
     }
 }
 
+template <typename Canonical, typename Native>
+static void unpack_q2q3_native(const Native *native,
+                               Canonical canonical[TILE_N]) {
+    memset(canonical, 0, sizeof(Canonical) * TILE_N);
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        canonical[col].d_bits = native->d_bits[col];
+        memcpy(canonical[col].scales, native->scales[col], 6);
+        canonical[col].promoted_mask = native->promoted_mask[col];
+        memcpy(canonical[col].high, native->high[col],
+               sizeof(canonical[col].high));
+        uint8_t low[TILE_K];
+        for (uint32_t k = 0; k < TILE_K; k++) {
+            const uint32_t group = k / K32;
+            const uint32_t lane = col * 4u + (k % K32) / 8u;
+            low[k] = (uint8_t)((native->low2[group][lane] >>
+                                (2u * (k & 7u))) & 3u);
+        }
+        pack_bits(low, TILE_K, 2u, canonical[col].low2);
+    }
+}
+
+template <typename Canonical, typename Native>
+static void unpack_q3a_native(const Native *native,
+                              Canonical canonical[TILE_N]) {
+    memset(canonical, 0, sizeof(Canonical) * TILE_N);
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        canonical[col].d_bits = native->d_bits[col];
+        canonical[col].dmin_bits = native->dmin_bits[col];
+        memcpy(canonical[col].scales, native->scales[col],
+               sizeof(canonical[col].scales));
+        memcpy(canonical[col].mins, native->mins[col],
+               sizeof(canonical[col].mins));
+        uint8_t codes[TILE_K];
+        for (uint32_t k = 0; k < TILE_K; k++)
+            codes[k] = native_q3a_value(native, col, k);
+        pack_bits(codes, TILE_K, 3u, canonical[col].qs);
+    }
+}
+
+static void unpack_q3q4_50_native(const NativeQ3Q4_50Tile *native,
+                                  SM75Q3Q4_50Block canonical[TILE_N]) {
+    memset(canonical, 0, sizeof(SM75Q3Q4_50Block) * TILE_N);
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        canonical[col].d_bits = native->d_bits[col];
+        memcpy(canonical[col].scales, native->scales[col], 6);
+        canonical[col].promoted_mask = native->promoted_mask[col];
+        uint8_t low[TILE_K];
+        uint32_t ordinal = 0;
+        for (uint32_t group = 0; group < K32_GROUPS; group++) {
+            const bool promoted =
+                (canonical[col].promoted_mask & (1u << group)) != 0;
+            for (uint32_t i = 0; i < K32; i++) {
+                const uint32_t k = group * K32 + i;
+                const int32_t q = native_q3q4_50_value(native, col, k);
+                const uint32_t code = promoted
+                    ? ((uint32_t)q & 15u) : (uint32_t)(q + 4);
+                low[k] = (uint8_t)(code & 7u);
+                if (promoted && (code & 8u))
+                    canonical[col].high[ordinal * 4u + i / 8u] |=
+                        (uint8_t)(1u << (i & 7u));
+            }
+            if (promoted) ordinal++;
+        }
+        pack_bits(low, TILE_K, 3u, canonical[col].low3);
+    }
+}
+
+static void unpack_q5_32_native(const NativeQ5_32Tile *native,
+                                SM75Q5_32Block canonical[TILE_N]) {
+    memset(canonical, 0, sizeof(SM75Q5_32Block) * TILE_N);
+    for (uint32_t col = 0; col < TILE_N; col++) {
+        canonical[col].d_bits = native->d_bits[col];
+        memcpy(canonical[col].scales, native->scales[col], 6);
+        uint8_t codes[TILE_K];
+        for (uint32_t k = 0; k < TILE_K; k++)
+            codes[k] = (uint8_t)((int32_t)native_q5_32_value(
+                native, col, k) + 16);
+        pack_bits(codes, TILE_K, 5u, canonical[col].qs);
+    }
+}
+
 static int layout_gate(const CanonicalWeights *canonical,
                        const NativeQ4KTile *q4k,
                        const NativeQ3KTile *q3k,
                        const NativeQ3_32Tile *q3_32,
-                       const NativeQ4_32Tile *q4_32, uint32_t case_id) {
+                       const NativeQ4_32Tile *q4_32,
+                       const NativeQ2Q3_50Tile *q2q3_50,
+                       const NativeQ2Q3_75Tile *q2q3_75,
+                       const NativeQ3A4Tile *q3a4,
+                       const NativeQ3A6Tile *q3a6,
+                       const NativeQ3Q4_50Tile *q3q4_50,
+                       const NativeQ5_32Tile *q5_32,
+                       uint32_t case_id) {
     for (uint32_t col = 0; col < TILE_N; col++) {
         for (uint32_t k = 0; k < TILE_K; k++) {
             if (canonical_q4k_value(&canonical->q4k[col], k) !=
@@ -595,7 +1186,23 @@ static int layout_gate(const CanonicalWeights *canonical,
                     &canonical->q3_32[col], k) - 4) !=
                     native_q3_32_value(q3_32, col, k) ||
                 canonical_q4_32_value(&canonical->q4_32[col], k) !=
-                    native_q4_32_value(q4_32, col, k)) {
+                    native_q4_32_value(q4_32, col, k) ||
+                canonical_q2q3_value(canonical->q2q3_50[col].low2,
+                    canonical->q2q3_50[col].promoted_mask,
+                    canonical->q2q3_50[col].high, k) !=
+                    native_q2q3_value(q2q3_50, col, k) ||
+                canonical_q2q3_value(canonical->q2q3_75[col].low2,
+                    canonical->q2q3_75[col].promoted_mask,
+                    canonical->q2q3_75[col].high, k) !=
+                    native_q2q3_value(q2q3_75, col, k) ||
+                canonical_affine_value(canonical->q3a4[col].qs, k) !=
+                    native_q3a_value(q3a4, col, k) ||
+                canonical_affine_value(canonical->q3a6[col].qs, k) !=
+                    native_q3a_value(q3a6, col, k) ||
+                canonical_q3q4_value(&canonical->q3q4_50[col], k) !=
+                    native_q3q4_50_value(q3q4_50, col, k) ||
+                canonical_q5_value(&canonical->q5_32[col], k) !=
+                    native_q5_32_value(q5_32, col, k)) {
                 fprintf(stderr,
                     "layout decode failure: case=%u col=%u k=%u\n",
                     case_id, col, k);
@@ -618,7 +1225,23 @@ static int layout_gate(const CanonicalWeights *canonical,
                 decode_scale6_8(canonical->q3_32[col].scales, j) !=
                     decode_scale6_8(q3_32->scales[col], j) ||
                 decode_scale6_8(canonical->q4_32[col].scales, j) !=
-                    decode_scale6_8(q4_32->scales[col], j)) {
+                    decode_scale6_8(q4_32->scales[col], j) ||
+                decode_scale6_8(canonical->q2q3_50[col].scales, j) !=
+                    decode_scale6_8(q2q3_50->scales[col], j) ||
+                decode_scale6_8(canonical->q2q3_75[col].scales, j) !=
+                    decode_scale6_8(q2q3_75->scales[col], j) ||
+                decode_scale6_8(canonical->q3q4_50[col].scales, j) !=
+                    decode_scale6_8(q3q4_50->scales[col], j) ||
+                decode_scale6_8(canonical->q5_32[col].scales, j) !=
+                    decode_scale6_8(q5_32->scales[col], j) ||
+                decode_unsigned_field8(canonical->q3a4[col].scales, 4u, j) !=
+                    decode_unsigned_field8(q3a4->scales[col], 4u, j) ||
+                decode_unsigned_field8(canonical->q3a4[col].mins, 4u, j) !=
+                    decode_unsigned_field8(q3a4->mins[col], 4u, j) ||
+                decode_unsigned_field8(canonical->q3a6[col].scales, 6u, j) !=
+                    decode_unsigned_field8(q3a6->scales[col], 6u, j) ||
+                decode_unsigned_field8(canonical->q3a6[col].mins, 6u, j) !=
+                    decode_unsigned_field8(q3a6->mins[col], 6u, j)) {
                 fprintf(stderr, "K32 metadata decode failure: case=%u\n", case_id);
                 return 1;
             }
@@ -630,7 +1253,30 @@ static int layout_gate(const CanonicalWeights *canonical,
     unpack_q3k_native(q3k, roundtrip.q3k);
     unpack_q3_32_native(q3_32, roundtrip.q3_32);
     unpack_q4_32_native(q4_32, roundtrip.q4_32);
-    if (memcmp(&roundtrip, canonical, sizeof(roundtrip)) != 0) {
+    unpack_q2q3_native(q2q3_50, roundtrip.q2q3_50);
+    unpack_q2q3_native(q2q3_75, roundtrip.q2q3_75);
+    unpack_q3a_native(q3a4, roundtrip.q3a4);
+    unpack_q3a_native(q3a6, roundtrip.q3a6);
+    unpack_q3q4_50_native(q3q4_50, roundtrip.q3q4_50);
+    unpack_q5_32_native(q5_32, roundtrip.q5_32);
+    if (memcmp(roundtrip.q4k, canonical->q4k, sizeof(roundtrip.q4k)) != 0 ||
+        memcmp(roundtrip.q3k, canonical->q3k, sizeof(roundtrip.q3k)) != 0 ||
+        memcmp(roundtrip.q3_32, canonical->q3_32,
+               sizeof(roundtrip.q3_32)) != 0 ||
+        memcmp(roundtrip.q4_32, canonical->q4_32,
+               sizeof(roundtrip.q4_32)) != 0 ||
+        memcmp(roundtrip.q2q3_50, canonical->q2q3_50,
+               sizeof(roundtrip.q2q3_50)) != 0 ||
+        memcmp(roundtrip.q2q3_75, canonical->q2q3_75,
+               sizeof(roundtrip.q2q3_75)) != 0 ||
+        memcmp(roundtrip.q3a4, canonical->q3a4,
+               sizeof(roundtrip.q3a4)) != 0 ||
+        memcmp(roundtrip.q3a6, canonical->q3a6,
+               sizeof(roundtrip.q3a6)) != 0 ||
+        memcmp(roundtrip.q3q4_50, canonical->q3q4_50,
+               sizeof(roundtrip.q3q4_50)) != 0 ||
+        memcmp(roundtrip.q5_32, canonical->q5_32,
+               sizeof(roundtrip.q5_32)) != 0) {
         fprintf(stderr, "canonical/native roundtrip failure: case=%u\n", case_id);
         return 1;
     }
@@ -678,33 +1324,99 @@ static void fill_weights(CanonicalWeights *weights, uint32_t case_id) {
         int8_t q3k_values[TILE_K], q3k_scales[K16_GROUPS];
         int8_t q3_values[TILE_K], q3_scales[K32_GROUPS];
         int8_t q4_values[TILE_K], q4_scales[K32_GROUPS];
+        int8_t q2q3_50_values[TILE_K], q2q3_75_values[TILE_K];
+        int8_t q3q4_50_values[TILE_K], q5_values[TILE_K];
+        uint8_t q3a4_values[TILE_K], q3a6_values[TILE_K];
+        uint8_t q3a4_scales[K32_GROUPS], q3a4_mins[K32_GROUPS];
+        uint8_t q3a6_scales[K32_GROUPS], q3a6_mins[K32_GROUPS];
+        const uint8_t q2q3_50_mask = rotate_mask8(
+            0x0fu, col + case_id * 3u);
+        const uint8_t q2q3_75_mask = rotate_mask8(
+            0x3fu, col * 3u + case_id);
+        const uint8_t q3q4_50_mask = rotate_mask8(
+            0x33u, col * 5u + case_id);
         for (uint32_t k = 0; k < TILE_K; k++) {
+            const uint32_t group = k / K32;
+            const bool q2q3_50_promoted =
+                (q2q3_50_mask & (1u << group)) != 0;
+            const bool q2q3_75_promoted =
+                (q2q3_75_mask & (1u << group)) != 0;
+            const bool q3q4_50_promoted =
+                (q3q4_50_mask & (1u << group)) != 0;
             if (case_id == 0) {
                 q4k_values[k] = 0;
                 q3k_values[k] = -4;
                 q3_values[k] = -4;
                 q4_values[k] = -8;
+                q2q3_50_values[k] = (int8_t)(q2q3_50_promoted ? -4 : -2);
+                q2q3_75_values[k] = (int8_t)(q2q3_75_promoted ? -4 : -2);
+                q3a4_values[k] = q3a6_values[k] = 0;
+                q3q4_50_values[k] =
+                    (int8_t)(q3q4_50_promoted ? -8 : -4);
+                q5_values[k] = -16;
             } else if (case_id == 1) {
                 q4k_values[k] = 15;
                 q3k_values[k] = 3;
                 q3_values[k] = 3;
                 q4_values[k] = 7;
+                q2q3_50_values[k] = (int8_t)(q2q3_50_promoted ? 3 : 1);
+                q2q3_75_values[k] = (int8_t)(q2q3_75_promoted ? 3 : 1);
+                q3a4_values[k] = q3a6_values[k] = 7;
+                q3q4_50_values[k] =
+                    (int8_t)(q3q4_50_promoted ? 7 : 3);
+                q5_values[k] = 15;
             } else if (case_id == 2) {
                 q4k_values[k] = (uint8_t)(((col + k) & 1u) ? 15u : 0u);
                 q3k_values[k] = q3_edges[(col * 3u + k) & 7u];
                 q3_values[k] = q3_edges[(col * 5u + k) & 7u];
                 q4_values[k] = q4_edges[(col * 7u + k) & 15u];
+                q2q3_50_values[k] = q2q3_50_promoted
+                    ? q3_edges[(col + k) & 7u]
+                    : (int8_t)(((col + k) & 3u) - 2);
+                q2q3_75_values[k] = q2q3_75_promoted
+                    ? q3_edges[(col * 3u + k) & 7u]
+                    : (int8_t)(((col * 3u + k) & 3u) - 2);
+                q3a4_values[k] = (uint8_t)((col * 5u + k) & 7u);
+                q3a6_values[k] = (uint8_t)((col * 7u + k * 3u) & 7u);
+                q3q4_50_values[k] = q3q4_50_promoted
+                    ? q4_edges[(col * 11u + k) & 15u]
+                    : q3_edges[(col * 13u + k) & 7u];
+                q5_values[k] = (int8_t)(((col * 17u + k) & 31u) - 16);
             } else if (case_id == 3) {
                 q4k_values[k] = (uint8_t)((col * 13u + k * 7u +
                                            (k >> 5u) * 5u) & 15u);
                 q3k_values[k] = (int8_t)(((col * 5u + k * 3u) & 7u) - 4);
                 q3_values[k] = (int8_t)(((col * 7u + k * 5u) & 7u) - 4);
                 q4_values[k] = (int8_t)(((col * 11u + k * 9u) & 15u) - 8);
+                q2q3_50_values[k] = q2q3_50_promoted
+                    ? (int8_t)(((col * 7u + k * 5u) & 7u) - 4)
+                    : (int8_t)(((col * 7u + k * 5u) & 3u) - 2);
+                q2q3_75_values[k] = q2q3_75_promoted
+                    ? (int8_t)(((col * 5u + k * 11u) & 7u) - 4)
+                    : (int8_t)(((col * 5u + k * 11u) & 3u) - 2);
+                q3a4_values[k] = (uint8_t)((col * 13u + k * 3u) & 7u);
+                q3a6_values[k] = (uint8_t)((col * 3u + k * 13u) & 7u);
+                q3q4_50_values[k] = q3q4_50_promoted
+                    ? (int8_t)(((col * 19u + k * 7u) & 15u) - 8)
+                    : (int8_t)(((col * 19u + k * 7u) & 7u) - 4);
+                q5_values[k] = (int8_t)(((col * 23u + k * 17u) & 31u) - 16);
             } else {
                 q4k_values[k] = (uint8_t)(rng_next(&state) & 15u);
                 q3k_values[k] = (int8_t)((rng_next(&state) & 7u) - 4);
                 q3_values[k] = (int8_t)((rng_next(&state) & 7u) - 4);
                 q4_values[k] = (int8_t)((rng_next(&state) & 15u) - 8);
+                q2q3_50_values[k] = q2q3_50_promoted
+                    ? (int8_t)((rng_next(&state) & 7u) - 4)
+                    : (int8_t)((rng_next(&state) & 3u) - 2);
+                q2q3_75_values[k] = q2q3_75_promoted
+                    ? (int8_t)((rng_next(&state) & 7u) - 4)
+                    : (int8_t)((rng_next(&state) & 3u) - 2);
+                q3a4_values[k] = (uint8_t)(rng_next(&state) & 7u);
+                q3a6_values[k] = (uint8_t)(rng_next(&state) & 7u);
+                q3q4_50_values[k] = q3q4_50_promoted
+                    ? (int8_t)((rng_next(&state) & 15u) - 8)
+                    : (int8_t)((rng_next(&state) & 7u) - 4);
+                q5_values[k] = (int8_t)((rng_next(&state) & 31u) - 16);
             }
         }
         for (uint32_t j = 0; j < K16_GROUPS; j++) {
@@ -718,20 +1430,32 @@ static void fill_weights(CanonicalWeights *weights, uint32_t case_id) {
             if (case_id == 0) {
                 q4k_scales[j] = q4k_mins[j] = 0;
                 q3_scales[j] = q4_scales[j] = 0;
+                q3a4_scales[j] = q3a4_mins[j] = 0;
+                q3a6_scales[j] = q3a6_mins[j] = 0;
             } else if (case_id == 1) {
                 q4k_scales[j] = q4k_mins[j] = 63;
                 q3_scales[j] = (j & 1u) ? 31 : -32;
                 q4_scales[j] = (j & 1u) ? -32 : 31;
+                q3a4_scales[j] = q3a4_mins[j] = 15;
+                q3a6_scales[j] = q3a6_mins[j] = 63;
             } else if (case_id < 4) {
                 q4k_scales[j] = (uint8_t)((col * 11u + j * 7u) & 63u);
                 q4k_mins[j] = (uint8_t)((col * 3u + j * 19u) & 63u);
                 q3_scales[j] = (int8_t)(((col * 7u + j * 13u) & 63u) - 32);
                 q4_scales[j] = (int8_t)(((col * 17u + j * 5u) & 63u) - 32);
+                q3a4_scales[j] = (uint8_t)((col * 5u + j * 11u) & 15u);
+                q3a4_mins[j] = (uint8_t)((col * 13u + j * 3u) & 15u);
+                q3a6_scales[j] = (uint8_t)((col * 7u + j * 17u) & 63u);
+                q3a6_mins[j] = (uint8_t)((col * 19u + j * 5u) & 63u);
             } else {
                 q4k_scales[j] = (uint8_t)(rng_next(&state) & 63u);
                 q4k_mins[j] = (uint8_t)(rng_next(&state) & 63u);
                 q3_scales[j] = (int8_t)((rng_next(&state) & 63u) - 32);
                 q4_scales[j] = (int8_t)((rng_next(&state) & 63u) - 32);
+                q3a4_scales[j] = (uint8_t)(rng_next(&state) & 15u);
+                q3a4_mins[j] = (uint8_t)(rng_next(&state) & 15u);
+                q3a6_scales[j] = (uint8_t)(rng_next(&state) & 63u);
+                q3a6_mins[j] = (uint8_t)(rng_next(&state) & 63u);
             }
         }
         const uint16_t header = (uint16_t)(0x3c00u ^
@@ -744,16 +1468,46 @@ static void fill_weights(CanonicalWeights *weights, uint32_t case_id) {
                            (uint16_t)(header ^ 0x2222u));
         encode_q4_32_block(&weights->q4_32[col], q4_values, q4_scales,
                            (uint16_t)(header ^ 0x3333u));
+        encode_q2q3_block(&weights->q2q3_50[col], q2q3_50_values,
+                          q3_scales, q2q3_50_mask,
+                          (uint16_t)(header ^ 0x4444u));
+        encode_q2q3_block(&weights->q2q3_75[col], q2q3_75_values,
+                          q3_scales, q2q3_75_mask,
+                          (uint16_t)(header ^ 0x5555u));
+        encode_q3a_block(&weights->q3a4[col], q3a4_values,
+                         q3a4_scales, q3a4_mins, 4u,
+                         (uint16_t)(header ^ 0x6666u),
+                         (uint16_t)(header ^ 0x7777u));
+        encode_q3a_block(&weights->q3a6[col], q3a6_values,
+                         q3a6_scales, q3a6_mins, 6u,
+                         (uint16_t)(header ^ 0x8888u),
+                         (uint16_t)(header ^ 0x9999u));
+        encode_q3q4_50_block(&weights->q3q4_50[col], q3q4_50_values,
+                             q3_scales, q3q4_50_mask,
+                             (uint16_t)(header ^ 0xaaaau));
+        encode_q5_32_block(&weights->q5_32[col], q5_values, q4_scales,
+                           (uint16_t)(header ^ 0xbbbbu));
     }
 }
 
 static void repack_all(const CanonicalWeights *canonical,
                        NativeQ4KTile *q4k, NativeQ3KTile *q3k,
-                       NativeQ3_32Tile *q3_32, NativeQ4_32Tile *q4_32) {
+                       NativeQ3_32Tile *q3_32, NativeQ4_32Tile *q4_32,
+                       NativeQ2Q3_50Tile *q2q3_50,
+                       NativeQ2Q3_75Tile *q2q3_75,
+                       NativeQ3A4Tile *q3a4, NativeQ3A6Tile *q3a6,
+                       NativeQ3Q4_50Tile *q3q4_50,
+                       NativeQ5_32Tile *q5_32) {
     repack_q4k_native(canonical->q4k, q4k);
     repack_q3k_native(canonical->q3k, q3k);
     repack_q3_32_native(canonical->q3_32, q3_32);
     repack_q4_32_native(canonical->q4_32, q4_32);
+    repack_q2q3_native(canonical->q2q3_50, q2q3_50);
+    repack_q2q3_native(canonical->q2q3_75, q2q3_75);
+    repack_q3a_native(canonical->q3a4, q3a4);
+    repack_q3a_native(canonical->q3a6, q3a6);
+    repack_q3q4_50_native(canonical->q3q4_50, q3q4_50);
+    repack_q5_32_native(canonical->q5_32, q5_32);
 }
 
 __device__ __forceinline__ static void mma_m8n8k16_s8_u8(
@@ -865,6 +1619,34 @@ __host__ __device__ __forceinline__ static uint32_t dilate_q3_32_u4(
     high = (high | (high << 6u)) & 0x03030303u;
     high = (high | (high << 3u)) & 0x11111111u;
     return low | (high << 2u);
+}
+
+__host__ __device__ __forceinline__ static uint32_t dilate_high1_u4(
+        uint8_t high8) {
+    uint32_t high = high8;
+    high = (high | (high << 12u)) & 0x000f000fu;
+    high = (high | (high << 6u)) & 0x03030303u;
+    high = (high | (high << 3u)) & 0x11111111u;
+    return high;
+}
+
+template <typename Native>
+__device__ __forceinline__ static uint8_t sparse_high_fragment(
+        const Native *weights, uint32_t col, uint32_t group,
+        uint32_t segment) {
+    if (!(weights->promoted_mask[col] & (1u << group))) return 0u;
+    const uint32_t ordinal = popcount8((uint8_t)(
+        weights->promoted_mask[col] & ((1u << group) - 1u)));
+    return weights->high[col][ordinal * 4u + segment];
+}
+
+__device__ __forceinline__ static uint8_t q3q4_high4_fragment(
+        const NativeQ3Q4_50Tile *weights, uint32_t col,
+        uint32_t group, uint32_t segment) {
+    if (!(weights->promoted_mask[col] & (1u << group))) return 0u;
+    const uint32_t ordinal = popcount8((uint8_t)(
+        weights->promoted_mask[col] & ((1u << group) - 1u)));
+    return weights->high4_biased[col][ordinal * 4u + segment];
 }
 
 __device__ __forceinline__ static TileI32 compute_q4k_native(
@@ -998,6 +1780,160 @@ __device__ __forceinline__ static TileI32 compute_q4_32(
     return out;
 }
 
+
+template <typename Native>
+__device__ __forceinline__ static TileI32 compute_q2q3(
+        const ActivationCase *activation, const Native *weights,
+        uint32_t lane) {
+    const uint32_t row0 = lane >> 2u;
+    const uint32_t col0 = (lane & 3u) * 2u;
+    TileI32 out = {};
+#pragma unroll
+    for (uint32_t j = 0; j < K32_GROUPS; j++) {
+        const uint32_t b = dilate_q3_32_u4(
+            weights->low2[j][lane], sparse_high_fragment(
+                weights, lane >> 2u, j, lane & 3u));
+        const int32_t scale0 = decode_scale6_8(weights->scales[col0], j);
+        const int32_t scale1 = decode_scale6_8(weights->scales[col0 + 1u], j);
+        const int32_t bias0 =
+            (weights->promoted_mask[col0] & (1u << j)) ? 4 : 2;
+        const int32_t bias1 =
+            (weights->promoted_mask[col0 + 1u] & (1u << j)) ? 4 : 2;
+#pragma unroll
+        for (uint32_t a_tile = 0; a_tile < A_TILES; a_tile++) {
+            uint32_t a_low, a_high;
+            activation_k32_fragments(activation, a_tile, j, lane,
+                                     &a_low, &a_high);
+            int32_t lo0 = 0, lo1 = 0, hi0 = 0, hi1 = 0;
+            mma_m8n8k32_u4_u4(lo0, lo1, a_low, b);
+            mma_m8n8k32_s4_u4(hi0, hi1, a_high, b);
+            const uint32_t row = a_tile * MMA_M + row0;
+            const int32_t bsum = (int32_t)activation->bsums[row][2u * j] +
+                                 (int32_t)activation->bsums[row][2u * j + 1u];
+            out.v[2u * a_tile] +=
+                scale0 * (lo0 + 16 * hi0 - bias0 * bsum);
+            out.v[2u * a_tile + 1u] +=
+                scale1 * (lo1 + 16 * hi1 - bias1 * bsum);
+        }
+    }
+    return out;
+}
+
+template <typename Native, uint32_t METADATA_BITS>
+__device__ __forceinline__ static TileI32 compute_q3a(
+        const ActivationCase *activation, const Native *weights,
+        uint32_t lane) {
+    const uint32_t row0 = lane >> 2u;
+    const uint32_t col0 = (lane & 3u) * 2u;
+    TileI32 out = {};
+#pragma unroll
+    for (uint32_t j = 0; j < K32_GROUPS; j++) {
+        const uint32_t b = dilate_q3_32_u4(
+            weights->low2[j][lane], weights->high[j][lane]);
+        const int32_t scale0 = (int32_t)decode_unsigned_field8(
+            weights->scales[col0], METADATA_BITS, j);
+        const int32_t scale1 = (int32_t)decode_unsigned_field8(
+            weights->scales[col0 + 1u], METADATA_BITS, j);
+        const int32_t min0 = (int32_t)decode_unsigned_field8(
+            weights->mins[col0], METADATA_BITS, j);
+        const int32_t min1 = (int32_t)decode_unsigned_field8(
+            weights->mins[col0 + 1u], METADATA_BITS, j);
+#pragma unroll
+        for (uint32_t a_tile = 0; a_tile < A_TILES; a_tile++) {
+            uint32_t a_low, a_high;
+            activation_k32_fragments(activation, a_tile, j, lane,
+                                     &a_low, &a_high);
+            int32_t lo0 = 0, lo1 = 0, hi0 = 0, hi1 = 0;
+            mma_m8n8k32_u4_u4(lo0, lo1, a_low, b);
+            mma_m8n8k32_s4_u4(hi0, hi1, a_high, b);
+            const uint32_t row = a_tile * MMA_M + row0;
+            const int32_t bsum = (int32_t)activation->bsums[row][2u * j] +
+                                 (int32_t)activation->bsums[row][2u * j + 1u];
+            out.v[2u * a_tile] += scale0 * (lo0 + 16 * hi0);
+            out.v[2u * a_tile + 1u] += scale1 * (lo1 + 16 * hi1);
+            out.correction[2u * a_tile] += min0 * bsum;
+            out.correction[2u * a_tile + 1u] += min1 * bsum;
+        }
+    }
+    return out;
+}
+
+__device__ __forceinline__ static TileI32 compute_q3q4_50(
+        const ActivationCase *activation,
+        const NativeQ3Q4_50Tile *weights, uint32_t lane) {
+    const uint32_t row0 = lane >> 2u;
+    const uint32_t col0 = (lane & 3u) * 2u;
+    const uint32_t bcol = lane >> 2u;
+    TileI32 out = {};
+#pragma unroll
+    for (uint32_t j = 0; j < K32_GROUPS; j++) {
+        uint32_t b = dilate_q3_32_u4(
+            weights->low2[j][lane], weights->high3[j][lane]);
+        b |= dilate_high1_u4(q3q4_high4_fragment(
+            weights, bcol, j, lane & 3u)) << 3u;
+        const int32_t scale0 = decode_scale6_8(weights->scales[col0], j);
+        const int32_t scale1 = decode_scale6_8(weights->scales[col0 + 1u], j);
+        const int32_t bias0 =
+            (weights->promoted_mask[col0] & (1u << j)) ? 8 : 4;
+        const int32_t bias1 =
+            (weights->promoted_mask[col0 + 1u] & (1u << j)) ? 8 : 4;
+#pragma unroll
+        for (uint32_t a_tile = 0; a_tile < A_TILES; a_tile++) {
+            uint32_t a_low, a_high;
+            activation_k32_fragments(activation, a_tile, j, lane,
+                                     &a_low, &a_high);
+            int32_t lo0 = 0, lo1 = 0, hi0 = 0, hi1 = 0;
+            mma_m8n8k32_u4_u4(lo0, lo1, a_low, b);
+            mma_m8n8k32_s4_u4(hi0, hi1, a_high, b);
+            const uint32_t row = a_tile * MMA_M + row0;
+            const int32_t bsum = (int32_t)activation->bsums[row][2u * j] +
+                                 (int32_t)activation->bsums[row][2u * j + 1u];
+            out.v[2u * a_tile] +=
+                scale0 * (lo0 + 16 * hi0 - bias0 * bsum);
+            out.v[2u * a_tile + 1u] +=
+                scale1 * (lo1 + 16 * hi1 - bias1 * bsum);
+        }
+    }
+    return out;
+}
+
+__device__ __forceinline__ static TileI32 compute_q5_32(
+        const ActivationCase *activation, const NativeQ5_32Tile *weights,
+        uint32_t lane) {
+    const uint32_t row0 = lane >> 2u;
+    const uint32_t col0 = (lane & 3u) * 2u;
+    TileI32 out = {};
+#pragma unroll
+    for (uint32_t j = 0; j < K32_GROUPS; j++) {
+        const uint32_t b_low = weights->low4[j][lane];
+        const uint32_t b_high = dilate_high1_u4(weights->high[j][lane]);
+        const int32_t scale0 = decode_scale6_8(weights->scales[col0], j);
+        const int32_t scale1 = decode_scale6_8(weights->scales[col0 + 1u], j);
+#pragma unroll
+        for (uint32_t a_tile = 0; a_tile < A_TILES; a_tile++) {
+            uint32_t a_low, a_high;
+            activation_k32_fragments(activation, a_tile, j, lane,
+                                     &a_low, &a_high);
+            int32_t l0 = 0, l1 = 0, lh0 = 0, lh1 = 0;
+            int32_t h0 = 0, h1 = 0, hh0 = 0, hh1 = 0;
+            mma_m8n8k32_u4_u4(l0, l1, a_low, b_low);
+            mma_m8n8k32_s4_u4(lh0, lh1, a_high, b_low);
+            mma_m8n8k32_u4_u4(h0, h1, a_low, b_high);
+            mma_m8n8k32_s4_u4(hh0, hh1, a_high, b_high);
+            const uint32_t row = a_tile * MMA_M + row0;
+            const int32_t bsum = (int32_t)activation->bsums[row][2u * j] +
+                                 (int32_t)activation->bsums[row][2u * j + 1u];
+            const int32_t dot0 = l0 + 16 * lh0 + 16 * (h0 + 16 * hh0) -
+                                 16 * bsum;
+            const int32_t dot1 = l1 + 16 * lh1 + 16 * (h1 + 16 * hh1) -
+                                 16 * bsum;
+            out.v[2u * a_tile] += scale0 * dot0;
+            out.v[2u * a_tile + 1u] += scale1 * dot1;
+        }
+    }
+    return out;
+}
+
 template <Variant V, typename Weight> struct VariantCompute;
 
 template <> struct VariantCompute<VAR_Q4K_NATIVE_CONTROL, NativeQ4KTile> {
@@ -1029,6 +1965,54 @@ template <> struct VariantCompute<VAR_SM75_Q4_32, NativeQ4_32Tile> {
             const ActivationCase *activation, const NativeQ4_32Tile *weights,
             uint32_t lane) {
         return compute_q4_32(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q2Q3_50, NativeQ2Q3_50Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation,
+            const NativeQ2Q3_50Tile *weights, uint32_t lane) {
+        return compute_q2q3(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q2Q3_75, NativeQ2Q3_75Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation,
+            const NativeQ2Q3_75Tile *weights, uint32_t lane) {
+        return compute_q2q3(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q3A4, NativeQ3A4Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation, const NativeQ3A4Tile *weights,
+            uint32_t lane) {
+        return compute_q3a<NativeQ3A4Tile, 4u>(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q3A6, NativeQ3A6Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation, const NativeQ3A6Tile *weights,
+            uint32_t lane) {
+        return compute_q3a<NativeQ3A6Tile, 6u>(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q3Q4_50, NativeQ3Q4_50Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation,
+            const NativeQ3Q4_50Tile *weights, uint32_t lane) {
+        return compute_q3q4_50(activation, weights, lane);
+    }
+};
+
+template <> struct VariantCompute<VAR_SM75_Q5_32, NativeQ5_32Tile> {
+    __device__ __forceinline__ static TileI32 run(
+            const ActivationCase *activation, const NativeQ5_32Tile *weights,
+            uint32_t lane) {
+        return compute_q5_32(activation, weights, lane);
     }
 };
 
@@ -1084,6 +2068,67 @@ __device__ __forceinline__ static void run_kernel_body(
     checksums[work_id * WARP_SIZE_ + lane] = check;
 }
 
+/* A bounded fused gate/up shape.  It deliberately uses two disjoint weight
+ * cases, retains both complete accumulator chains, and performs the shipping
+ * SiLU*up epilogue once per M16xN8 result.  This is still a K256 arithmetic
+ * screen rather than the full K4096 expert kernel; its purpose is to expose
+ * the format-dependent register/issue cost of retaining both projections. */
+template <Variant V, typename Weight>
+__device__ __forceinline__ static void run_gate_up_kernel_body(
+        const ActivationCase *activations, const Weight *weights,
+        int32_t *exact, uint32_t *checksums, uint32_t repeats,
+        uint32_t activation_case_count, uint32_t weight_case_count,
+        uint32_t case_offset) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t work_id =
+        (uint64_t)blockIdx.x * WARPS_PER_CTA + warp;
+    uint32_t activation_ci = (uint32_t)(work_id % activation_case_count);
+    uint32_t gate_ci =
+        (uint32_t)((work_id + case_offset) % weight_case_count);
+    const uint32_t up_delta = weight_case_count > 1u
+        ? (weight_case_count >> 1u) : 0u;
+    const uint64_t work_count = (uint64_t)gridDim.x * WARPS_PER_CTA;
+    uint32_t weight_step = (uint32_t)(work_count % weight_case_count);
+    if (!weight_step) weight_step = 1u;
+    const uint32_t weight_wrap = weight_case_count - weight_step;
+    uint32_t check = 0x517cc1b7u ^
+        ((uint32_t)work_id * 0x9e3779b9u + lane);
+    TileI32 gate = {}, up = {};
+    for (uint32_t r = 0; r < repeats; r++) {
+        uint32_t up_ci = gate_ci + up_delta;
+        if (up_ci >= weight_case_count) up_ci -= weight_case_count;
+        gate = compute_variant<V>(activations + activation_ci,
+                                  weights + gate_ci, lane);
+        up = compute_variant<V>(activations + activation_ci,
+                                weights + up_ci, lane);
+#pragma unroll
+        for (uint32_t i = 0; i < 2u * A_TILES; i++) {
+            /* Keep expf in a numerically tame range.  The opaque fp16 block
+             * factors are intentionally outside this integer screen. */
+            const float g = (float)tile_value(gate, i) * 0x1p-20f;
+            const float u = (float)tile_value(up, i) * 0x1p-20f;
+            const float mid = (g / (1.0f + expf(-g))) * u;
+            check = (check << 7u) | (check >> 25u);
+            check ^= __float_as_uint(mid) + i * 0x85ebca6bu;
+        }
+        if (++activation_ci == activation_case_count) activation_ci = 0;
+        gate_ci = gate_ci >= weight_wrap
+            ? gate_ci - weight_wrap : gate_ci + weight_step;
+    }
+    if (work_id == 0) {
+        const uint32_t col0 = (lane & 3u) * 2u;
+#pragma unroll
+        for (uint32_t a_tile = 0; a_tile < A_TILES; a_tile++) {
+            const uint32_t row = a_tile * MMA_M + (lane >> 2u);
+            exact[row * TILE_N + col0] = tile_value(gate, 2u * a_tile);
+            exact[row * TILE_N + col0 + 1u] =
+                tile_value(up, 2u * a_tile + 1u);
+        }
+    }
+    checksums[work_id * WARP_SIZE_ + lane] = check;
+}
+
 extern "C" __global__ void sm75_q4k_native_control_kernel(
         const ActivationCase *activations, const NativeQ4KTile *weights,
         int32_t *exact, uint32_t *checksums, uint32_t repeats,
@@ -1123,6 +2168,66 @@ extern "C" __global__ void sm75_q4_32_kernel(
         activations, weights, exact, checksums, repeats,
         activation_case_count, weight_case_count, case_offset);
 }
+
+#define DEFINE_SCREEN_KERNEL(NAME, VARIANT, TYPE) \
+extern "C" __global__ void NAME( \
+        const ActivationCase *activations, const TYPE *weights, \
+        int32_t *exact, uint32_t *checksums, uint32_t repeats, \
+        uint32_t activation_case_count, uint32_t weight_case_count, \
+        uint32_t case_offset) { \
+    run_kernel_body<VARIANT>( \
+        activations, weights, exact, checksums, repeats, \
+        activation_case_count, weight_case_count, case_offset); \
+}
+
+DEFINE_SCREEN_KERNEL(sm75_q2q3_32_50_kernel, VAR_SM75_Q2Q3_50,
+                     NativeQ2Q3_50Tile)
+DEFINE_SCREEN_KERNEL(sm75_q2q3_32_75_kernel, VAR_SM75_Q2Q3_75,
+                     NativeQ2Q3_75Tile)
+DEFINE_SCREEN_KERNEL(sm75_q3a_32_4_kernel, VAR_SM75_Q3A4,
+                     NativeQ3A4Tile)
+DEFINE_SCREEN_KERNEL(sm75_q3a_32_6_kernel, VAR_SM75_Q3A6,
+                     NativeQ3A6Tile)
+DEFINE_SCREEN_KERNEL(sm75_q3q4_32_50_kernel, VAR_SM75_Q3Q4_50,
+                     NativeQ3Q4_50Tile)
+DEFINE_SCREEN_KERNEL(sm75_q5_32_kernel, VAR_SM75_Q5_32,
+                     NativeQ5_32Tile)
+
+#undef DEFINE_SCREEN_KERNEL
+
+#define DEFINE_GATE_UP_SCREEN_KERNEL(NAME, VARIANT, TYPE) \
+extern "C" __global__ void NAME( \
+        const ActivationCase *activations, const TYPE *weights, \
+        int32_t *exact, uint32_t *checksums, uint32_t repeats, \
+        uint32_t activation_case_count, uint32_t weight_case_count, \
+        uint32_t case_offset) { \
+    run_gate_up_kernel_body<VARIANT>( \
+        activations, weights, exact, checksums, repeats, \
+        activation_case_count, weight_case_count, case_offset); \
+}
+
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q4k_native_control_gate_up_kernel,
+    VAR_Q4K_NATIVE_CONTROL, NativeQ4KTile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q3k_k16_u8_gate_up_kernel,
+    VAR_Q3K_K16_U8, NativeQ3KTile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q3_32_gate_up_kernel,
+    VAR_SM75_Q3_32, NativeQ3_32Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q4_32_gate_up_kernel,
+    VAR_SM75_Q4_32, NativeQ4_32Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q2q3_32_50_gate_up_kernel,
+    VAR_SM75_Q2Q3_50, NativeQ2Q3_50Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q2q3_32_75_gate_up_kernel,
+    VAR_SM75_Q2Q3_75, NativeQ2Q3_75Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q3a_32_4_gate_up_kernel,
+    VAR_SM75_Q3A4, NativeQ3A4Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q3a_32_6_gate_up_kernel,
+    VAR_SM75_Q3A6, NativeQ3A6Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q3q4_32_50_gate_up_kernel,
+    VAR_SM75_Q3Q4_50, NativeQ3Q4_50Tile)
+DEFINE_GATE_UP_SCREEN_KERNEL(sm75_q5_32_gate_up_kernel,
+    VAR_SM75_Q5_32, NativeQ5_32Tile)
+
+#undef DEFINE_GATE_UP_SCREEN_KERNEL
 
 static void reference_q4k(const ActivationCase *activation,
                           const Q4KBlock weights[TILE_N],
@@ -1205,6 +2310,92 @@ static void reference_q4_32(const ActivationCase *activation,
     }
 }
 
+template <typename Block>
+static void reference_q2q3(const ActivationCase *activation,
+                           const Block weights[TILE_N],
+                           int32_t out[TILE_M][TILE_N]) {
+    for (uint32_t row = 0; row < TILE_M; row++) {
+        for (uint32_t col = 0; col < TILE_N; col++) {
+            int32_t total = 0;
+            for (uint32_t j = 0; j < K32_GROUPS; j++) {
+                int32_t dot = 0;
+                for (uint32_t i = 0; i < K32; i++)
+                    dot += (int32_t)activation->q8[row][j * K32 + i] *
+                           (int32_t)canonical_q2q3_value(
+                               weights[col].low2,
+                               weights[col].promoted_mask,
+                               weights[col].high, j * K32 + i);
+                total += decode_scale6_8(weights[col].scales, j) * dot;
+            }
+            out[row][col] = total;
+        }
+    }
+}
+
+template <typename Block, uint32_t METADATA_BITS>
+static void reference_q3a(const ActivationCase *activation,
+                          const Block weights[TILE_N],
+                          int32_t out[TILE_M][TILE_N]) {
+    for (uint32_t row = 0; row < TILE_M; row++) {
+        for (uint32_t col = 0; col < TILE_N; col++) {
+            int32_t total = 0;
+            for (uint32_t j = 0; j < K32_GROUPS; j++) {
+                int32_t dot = 0, sum = 0;
+                for (uint32_t i = 0; i < K32; i++) {
+                    const int32_t a = activation->q8[row][j * K32 + i];
+                    dot += a * canonical_affine_value(
+                        weights[col].qs, j * K32 + i);
+                    sum += a;
+                }
+                const int32_t scale = (int32_t)decode_unsigned_field8(
+                    weights[col].scales, METADATA_BITS, j);
+                const int32_t minimum = (int32_t)decode_unsigned_field8(
+                    weights[col].mins, METADATA_BITS, j);
+                total += scale * dot - minimum * sum;
+            }
+            out[row][col] = total;
+        }
+    }
+}
+
+static void reference_q3q4_50(const ActivationCase *activation,
+                              const SM75Q3Q4_50Block weights[TILE_N],
+                              int32_t out[TILE_M][TILE_N]) {
+    for (uint32_t row = 0; row < TILE_M; row++) {
+        for (uint32_t col = 0; col < TILE_N; col++) {
+            int32_t total = 0;
+            for (uint32_t j = 0; j < K32_GROUPS; j++) {
+                int32_t dot = 0;
+                for (uint32_t i = 0; i < K32; i++)
+                    dot += (int32_t)activation->q8[row][j * K32 + i] *
+                           (int32_t)canonical_q3q4_value(
+                               &weights[col], j * K32 + i);
+                total += decode_scale6_8(weights[col].scales, j) * dot;
+            }
+            out[row][col] = total;
+        }
+    }
+}
+
+static void reference_q5_32(const ActivationCase *activation,
+                            const SM75Q5_32Block weights[TILE_N],
+                            int32_t out[TILE_M][TILE_N]) {
+    for (uint32_t row = 0; row < TILE_M; row++) {
+        for (uint32_t col = 0; col < TILE_N; col++) {
+            int32_t total = 0;
+            for (uint32_t j = 0; j < K32_GROUPS; j++) {
+                int32_t dot = 0;
+                for (uint32_t i = 0; i < K32; i++)
+                    dot += (int32_t)activation->q8[row][j * K32 + i] *
+                           (int32_t)canonical_q5_value(
+                               &weights[col], j * K32 + i);
+                total += decode_scale6_8(weights[col].scales, j) * dot;
+            }
+            out[row][col] = total;
+        }
+    }
+}
+
 static void reference_variant(Variant variant, const ActivationCase *activation,
                               const CanonicalWeights *weights,
                               int32_t out[TILE_M][TILE_N]) {
@@ -1217,6 +2408,18 @@ static void reference_variant(Variant variant, const ActivationCase *activation,
         reference_q3_32(activation, weights->q3_32, out); break;
     case VAR_SM75_Q4_32:
         reference_q4_32(activation, weights->q4_32, out); break;
+    case VAR_SM75_Q2Q3_50:
+        reference_q2q3(activation, weights->q2q3_50, out); break;
+    case VAR_SM75_Q2Q3_75:
+        reference_q2q3(activation, weights->q2q3_75, out); break;
+    case VAR_SM75_Q3A4:
+        reference_q3a<SM75Q3A4Block, 4u>(activation, weights->q3a4, out); break;
+    case VAR_SM75_Q3A6:
+        reference_q3a<SM75Q3A6Block, 6u>(activation, weights->q3a6, out); break;
+    case VAR_SM75_Q3Q4_50:
+        reference_q3q4_50(activation, weights->q3q4_50, out); break;
+    case VAR_SM75_Q5_32:
+        reference_q5_32(activation, weights->q5_32, out); break;
     default: abort();
     }
 }
@@ -1227,6 +2430,12 @@ static size_t native_tile_bytes(Variant variant) {
     case VAR_Q3K_K16_U8: return sizeof(NativeQ3KTile);
     case VAR_SM75_Q3_32: return sizeof(NativeQ3_32Tile);
     case VAR_SM75_Q4_32: return sizeof(NativeQ4_32Tile);
+    case VAR_SM75_Q2Q3_50: return sizeof(NativeQ2Q3_50Tile);
+    case VAR_SM75_Q2Q3_75: return sizeof(NativeQ2Q3_75Tile);
+    case VAR_SM75_Q3A4: return sizeof(NativeQ3A4Tile);
+    case VAR_SM75_Q3A6: return sizeof(NativeQ3A6Tile);
+    case VAR_SM75_Q3Q4_50: return sizeof(NativeQ3Q4_50Tile);
+    case VAR_SM75_Q5_32: return sizeof(NativeQ5_32Tile);
     default: abort();
     }
 }
@@ -1237,6 +2446,12 @@ static size_t canonical_block_bytes(Variant variant) {
     case VAR_Q3K_K16_U8: return sizeof(Q3KBlock);
     case VAR_SM75_Q3_32: return sizeof(SM75Q3_32Block);
     case VAR_SM75_Q4_32: return sizeof(SM75Q4_32Block);
+    case VAR_SM75_Q2Q3_50: return sizeof(SM75Q2Q3_50Block);
+    case VAR_SM75_Q2Q3_75: return sizeof(SM75Q2Q3_75Block);
+    case VAR_SM75_Q3A4: return sizeof(SM75Q3A4Block);
+    case VAR_SM75_Q3A6: return sizeof(SM75Q3A6Block);
+    case VAR_SM75_Q3Q4_50: return sizeof(SM75Q3Q4_50Block);
+    case VAR_SM75_Q5_32: return sizeof(SM75Q5_32Block);
     default: abort();
     }
 }
@@ -1265,8 +2480,69 @@ static void launch_variant(Variant variant, uint32_t blocks, uint32_t repeats,
         sm75_q4_32_kernel<<<grid, block, 0, stream>>>(
             activations, weights.q4_32, exact, checksums, repeats,
             activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q2Q3_50:
+        sm75_q2q3_32_50_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q2q3_50, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q2Q3_75:
+        sm75_q2q3_32_75_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q2q3_75, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q3A4:
+        sm75_q3a_32_4_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q3a4, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q3A6:
+        sm75_q3a_32_6_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q3a6, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q3Q4_50:
+        sm75_q3q4_32_50_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q3q4_50, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
+    case VAR_SM75_Q5_32:
+        sm75_q5_32_kernel<<<grid, block, 0, stream>>>(
+            activations, weights.q5_32, exact, checksums, repeats,
+            activation_case_count, weight_case_count, case_offset); break;
     default: abort();
     }
+}
+
+static void launch_gate_up_variant(
+        Variant variant, uint32_t blocks, uint32_t repeats,
+        uint32_t activation_case_count, uint32_t weight_case_count,
+        uint32_t case_offset, const ActivationCase *activations,
+        const DeviceWeights &weights, int32_t *exact,
+        uint32_t *checksums, cudaStream_t stream) {
+    const dim3 grid(blocks), block(THREADS_PER_CTA);
+#define LAUNCH_GATE_UP(KERNEL, FIELD) \
+    KERNEL<<<grid, block, 0, stream>>>( \
+        activations, weights.FIELD, exact, checksums, repeats, \
+        activation_case_count, weight_case_count, case_offset)
+    switch (variant) {
+    case VAR_Q4K_NATIVE_CONTROL:
+        LAUNCH_GATE_UP(sm75_q4k_native_control_gate_up_kernel, q4k); break;
+    case VAR_Q3K_K16_U8:
+        LAUNCH_GATE_UP(sm75_q3k_k16_u8_gate_up_kernel, q3k); break;
+    case VAR_SM75_Q3_32:
+        LAUNCH_GATE_UP(sm75_q3_32_gate_up_kernel, q3_32); break;
+    case VAR_SM75_Q4_32:
+        LAUNCH_GATE_UP(sm75_q4_32_gate_up_kernel, q4_32); break;
+    case VAR_SM75_Q2Q3_50:
+        LAUNCH_GATE_UP(sm75_q2q3_32_50_gate_up_kernel, q2q3_50); break;
+    case VAR_SM75_Q2Q3_75:
+        LAUNCH_GATE_UP(sm75_q2q3_32_75_gate_up_kernel, q2q3_75); break;
+    case VAR_SM75_Q3A4:
+        LAUNCH_GATE_UP(sm75_q3a_32_4_gate_up_kernel, q3a4); break;
+    case VAR_SM75_Q3A6:
+        LAUNCH_GATE_UP(sm75_q3a_32_6_gate_up_kernel, q3a6); break;
+    case VAR_SM75_Q3Q4_50:
+        LAUNCH_GATE_UP(sm75_q3q4_32_50_gate_up_kernel, q3q4_50); break;
+    case VAR_SM75_Q5_32:
+        LAUNCH_GATE_UP(sm75_q5_32_gate_up_kernel, q5_32); break;
+    default: abort();
+    }
+#undef LAUNCH_GATE_UP
 }
 
 static uint32_t scalar_q3k_u8(uint8_t low2, uint8_t high4) {
@@ -1459,9 +2735,13 @@ static int run_correctness(uint32_t n_cases, ActivationCase *h_activation,
     for (uint32_t case_id = 0; case_id < n_cases; case_id++) {
         fill_activation(h_activation, case_id);
         fill_weights(&canonical, case_id);
-        repack_all(&canonical, host.q4k, host.q3k, host.q3_32, host.q4_32);
+        repack_all(&canonical, host.q4k, host.q3k, host.q3_32, host.q4_32,
+                   host.q2q3_50, host.q2q3_75, host.q3a4, host.q3a6,
+                   host.q3q4_50, host.q5_32);
         if (layout_gate(&canonical, host.q4k, host.q3k,
-                        host.q3_32, host.q4_32, case_id)) return 1;
+                        host.q3_32, host.q4_32, host.q2q3_50,
+                        host.q2q3_75, host.q3a4, host.q3a6,
+                        host.q3q4_50, host.q5_32, case_id)) return 1;
         die_cuda(cudaMemcpy(d_activation, h_activation, sizeof(*h_activation),
                             cudaMemcpyHostToDevice), "copy correctness activation");
         die_cuda(cudaMemcpy(device.q4k, host.q4k, sizeof(*host.q4k),
@@ -1472,6 +2752,21 @@ static int run_correctness(uint32_t n_cases, ActivationCase *h_activation,
                             cudaMemcpyHostToDevice), "copy correctness Q3-32");
         die_cuda(cudaMemcpy(device.q4_32, host.q4_32, sizeof(*host.q4_32),
                             cudaMemcpyHostToDevice), "copy correctness Q4-32");
+        die_cuda(cudaMemcpy(device.q2q3_50, host.q2q3_50,
+                            sizeof(*host.q2q3_50), cudaMemcpyHostToDevice),
+                 "copy correctness Q2/Q3-50");
+        die_cuda(cudaMemcpy(device.q2q3_75, host.q2q3_75,
+                            sizeof(*host.q2q3_75), cudaMemcpyHostToDevice),
+                 "copy correctness Q2/Q3-75");
+        die_cuda(cudaMemcpy(device.q3a4, host.q3a4, sizeof(*host.q3a4),
+                            cudaMemcpyHostToDevice), "copy correctness Q3A4");
+        die_cuda(cudaMemcpy(device.q3a6, host.q3a6, sizeof(*host.q3a6),
+                            cudaMemcpyHostToDevice), "copy correctness Q3A6");
+        die_cuda(cudaMemcpy(device.q3q4_50, host.q3q4_50,
+                            sizeof(*host.q3q4_50), cudaMemcpyHostToDevice),
+                 "copy correctness Q3/Q4-50");
+        die_cuda(cudaMemcpy(device.q5_32, host.q5_32, sizeof(*host.q5_32),
+                            cudaMemcpyHostToDevice), "copy correctness Q5-32");
         for (int v = 0; v < VARIANT_COUNT; v++) {
             reference_variant((Variant)v, h_activation, &canonical, expected);
             launch_variant((Variant)v, 1, 1, 1, 1, 0, d_activation, device,
@@ -1507,9 +2802,15 @@ static int prepare_benchmark_cases(uint32_t weight_cases,
     for (uint32_t i = 0; i < weight_cases; i++) {
         fill_weights(&canonical, 0x5a170000u + i);
         repack_all(&canonical, host.q4k + i, host.q3k + i,
-                   host.q3_32 + i, host.q4_32 + i);
+                   host.q3_32 + i, host.q4_32 + i,
+                   host.q2q3_50 + i, host.q2q3_75 + i,
+                   host.q3a4 + i, host.q3a6 + i,
+                   host.q3q4_50 + i, host.q5_32 + i);
         if (layout_gate(&canonical, host.q4k + i, host.q3k + i,
                         host.q3_32 + i, host.q4_32 + i,
+                        host.q2q3_50 + i, host.q2q3_75 + i,
+                        host.q3a4 + i, host.q3a6 + i,
+                        host.q3q4_50 + i, host.q5_32 + i,
                         0x5a170000u + i)) return 1;
     }
     return 0;
@@ -1535,6 +2836,24 @@ static void copy_benchmark_cases(uint32_t weight_cases,
     die_cuda(cudaMemcpy(device.q4_32, host.q4_32,
                         sizeof(NativeQ4_32Tile) * (size_t)weight_cases,
                         cudaMemcpyHostToDevice), "copy benchmark Q4-32");
+    die_cuda(cudaMemcpy(device.q2q3_50, host.q2q3_50,
+                        sizeof(NativeQ2Q3_50Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q2/Q3-50");
+    die_cuda(cudaMemcpy(device.q2q3_75, host.q2q3_75,
+                        sizeof(NativeQ2Q3_75Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q2/Q3-75");
+    die_cuda(cudaMemcpy(device.q3a4, host.q3a4,
+                        sizeof(NativeQ3A4Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q3A4");
+    die_cuda(cudaMemcpy(device.q3a6, host.q3a6,
+                        sizeof(NativeQ3A6Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q3A6");
+    die_cuda(cudaMemcpy(device.q3q4_50, host.q3q4_50,
+                        sizeof(NativeQ3Q4_50Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q3/Q4-50");
+    die_cuda(cudaMemcpy(device.q5_32, host.q5_32,
+                        sizeof(NativeQ5_32Tile) * (size_t)weight_cases,
+                        cudaMemcpyHostToDevice), "copy benchmark Q5-32");
 }
 
 static int compare_double(const void *lhs, const void *rhs) {
@@ -1543,7 +2862,8 @@ static int compare_double(const void *lhs, const void *rhs) {
     return (a > b) - (a < b);
 }
 
-static void run_benchmark_mode(const char *mode, uint32_t weight_cases,
+static void run_benchmark_mode(const char *mode, int gate_up,
+                               uint32_t weight_cases,
                                uint32_t blocks, uint32_t repeats,
                                uint32_t launches, uint32_t rounds,
                                const ActivationCase *d_activations,
@@ -1560,10 +2880,18 @@ static void run_benchmark_mode(const char *mode, uint32_t weight_cases,
     die_cuda(cudaEventCreate(&start), "create benchmark start event");
     die_cuda(cudaEventCreate(&stop), "create benchmark stop event");
     for (int v = 0; v < VARIANT_COUNT; v++) {
-        for (uint32_t warm = 0; warm < 2; warm++)
-            launch_variant((Variant)v, blocks, repeats, HOT_ACTIVATION_CASES,
-                           weight_cases, 0, d_activations, device,
-                           d_exact, d_checksums, 0);
+        for (uint32_t warm = 0; warm < 2; warm++) {
+            if (gate_up)
+                launch_gate_up_variant(
+                    (Variant)v, blocks, repeats, HOT_ACTIVATION_CASES,
+                    weight_cases, 0, d_activations, device,
+                    d_exact, d_checksums, 0);
+            else
+                launch_variant((Variant)v, blocks, repeats,
+                               HOT_ACTIVATION_CASES, weight_cases, 0,
+                               d_activations, device, d_exact,
+                               d_checksums, 0);
+        }
     }
     die_cuda(cudaDeviceSynchronize(), "benchmark warmup");
 
@@ -1579,9 +2907,16 @@ static void run_benchmark_mode(const char *mode, uint32_t weight_cases,
             for (uint32_t launch = 0; launch < launches; launch++) {
                 const uint32_t offset = (uint32_t)(
                     ((uint64_t)launch * work_per_launch) % weight_cases);
-                launch_variant((Variant)v, blocks, repeats,
-                               HOT_ACTIVATION_CASES, weight_cases, offset,
-                               d_activations, device, d_exact, d_checksums, 0);
+                if (gate_up)
+                    launch_gate_up_variant(
+                        (Variant)v, blocks, repeats, HOT_ACTIVATION_CASES,
+                        weight_cases, offset, d_activations, device,
+                        d_exact, d_checksums, 0);
+                else
+                    launch_variant((Variant)v, blocks, repeats,
+                                   HOT_ACTIVATION_CASES, weight_cases, offset,
+                                   d_activations, device, d_exact,
+                                   d_checksums, 0);
             }
             die_cuda(cudaEventRecord(stop), "record benchmark stop");
             die_cuda(cudaEventSynchronize(stop), "synchronize benchmark");
@@ -1593,7 +2928,7 @@ static void run_benchmark_mode(const char *mode, uint32_t weight_cases,
     }
 
     const double logical_macs = (double)launches * blocks * WARPS_PER_CTA *
-        repeats * TILE_M * TILE_N * TILE_K;
+        repeats * TILE_M * TILE_N * TILE_K * (gate_up ? 2.0 : 1.0);
     printf("benchmark_samples_begin\n");
     printf("mode,round,slot,variant,canonical_block_bytes,native_tile_bytes,"
            "weight_cases,weight_footprint_bytes,total_ms,us_per_launch,"
@@ -1682,7 +3017,8 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s [--device N] [--cases N] [--blocks N] [--repeats N] "
         "[--launches N] [--bench-cases N] [--rounds N] "
-        "[--correctness-only | --benchmark-only | --profile VARIANT]\n",
+        "[--correctness-only | --benchmark-only | --profile VARIANT] "
+        "[--profile-shape down|gate-up]\n",
         argv0);
 }
 
@@ -1705,6 +3041,7 @@ int main(int argc, char **argv) {
     uint32_t bench_cases = 0;
     uint32_t rounds = 9;
     int do_correctness = 1, do_benchmark = 1, profile = 0;
+    int profile_gate_up = 0;
     Variant profile_variant = VAR_Q4K_NATIVE_CONTROL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--device") == 0 && i + 1 < argc)
@@ -1728,6 +3065,14 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
             profile_variant = parse_variant(argv[++i]);
             do_correctness = 0; do_benchmark = 0; profile = 1;
+        } else if (strcmp(argv[i], "--profile-shape") == 0 && i + 1 < argc) {
+            const char *shape = argv[++i];
+            if (strcmp(shape, "down") == 0) profile_gate_up = 0;
+            else if (strcmp(shape, "gate-up") == 0) profile_gate_up = 1;
+            else {
+                fprintf(stderr, "error: invalid profile shape: %s\n", shape);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -1752,6 +3097,17 @@ int main(int argc, char **argv) {
         bench_cases = (uint32_t)((target + sizeof(NativeQ3_32Tile) - 1u) /
                                  sizeof(NativeQ3_32Tile));
         if (!bench_cases) bench_cases = 1;
+    }
+    if ((do_benchmark || profile) &&
+        (uint64_t)bench_cases * sizeof(NativeQ2Q3_50Tile) <=
+            (uint64_t)prop.l2CacheSize) {
+        fprintf(stderr,
+            "error: --bench-cases=%u leaves the smallest format within "
+            "L2 (%llu <= %d bytes)\n", bench_cases,
+            (unsigned long long)((uint64_t)bench_cases *
+                                 sizeof(NativeQ2Q3_50Tile)),
+            prop.l2CacheSize);
+        return 2;
     }
     const uint64_t work_per_kernel =
         (uint64_t)blocks * WARPS_PER_CTA * repeats;
@@ -1793,6 +3149,24 @@ int main(int argc, char **argv) {
             sizeof(NativeQ3_32Tile) * (size_t)allocated_weight_cases, "Q3-32 tiles"),
         (NativeQ4_32Tile *)checked_malloc(
             sizeof(NativeQ4_32Tile) * (size_t)allocated_weight_cases, "Q4-32 tiles"),
+        (NativeQ2Q3_50Tile *)checked_malloc(
+            sizeof(NativeQ2Q3_50Tile) * (size_t)allocated_weight_cases,
+            "Q2/Q3-50 tiles"),
+        (NativeQ2Q3_75Tile *)checked_malloc(
+            sizeof(NativeQ2Q3_75Tile) * (size_t)allocated_weight_cases,
+            "Q2/Q3-75 tiles"),
+        (NativeQ3A4Tile *)checked_malloc(
+            sizeof(NativeQ3A4Tile) * (size_t)allocated_weight_cases,
+            "Q3A4 tiles"),
+        (NativeQ3A6Tile *)checked_malloc(
+            sizeof(NativeQ3A6Tile) * (size_t)allocated_weight_cases,
+            "Q3A6 tiles"),
+        (NativeQ3Q4_50Tile *)checked_malloc(
+            sizeof(NativeQ3Q4_50Tile) * (size_t)allocated_weight_cases,
+            "Q3/Q4-50 tiles"),
+        (NativeQ5_32Tile *)checked_malloc(
+            sizeof(NativeQ5_32Tile) * (size_t)allocated_weight_cases,
+            "Q5-32 tiles"),
     };
     ActivationCase *d_activations = NULL;
     DeviceWeights device = {};
@@ -1809,6 +3183,21 @@ int main(int argc, char **argv) {
                         (size_t)allocated_weight_cases), "allocate Q3-32 tiles");
     die_cuda(cudaMalloc(&device.q4_32, sizeof(NativeQ4_32Tile) *
                         (size_t)allocated_weight_cases), "allocate Q4-32 tiles");
+    die_cuda(cudaMalloc(&device.q2q3_50, sizeof(NativeQ2Q3_50Tile) *
+                        (size_t)allocated_weight_cases),
+             "allocate Q2/Q3-50 tiles");
+    die_cuda(cudaMalloc(&device.q2q3_75, sizeof(NativeQ2Q3_75Tile) *
+                        (size_t)allocated_weight_cases),
+             "allocate Q2/Q3-75 tiles");
+    die_cuda(cudaMalloc(&device.q3a4, sizeof(NativeQ3A4Tile) *
+                        (size_t)allocated_weight_cases), "allocate Q3A4 tiles");
+    die_cuda(cudaMalloc(&device.q3a6, sizeof(NativeQ3A6Tile) *
+                        (size_t)allocated_weight_cases), "allocate Q3A6 tiles");
+    die_cuda(cudaMalloc(&device.q3q4_50, sizeof(NativeQ3Q4_50Tile) *
+                        (size_t)allocated_weight_cases),
+             "allocate Q3/Q4-50 tiles");
+    die_cuda(cudaMalloc(&device.q5_32, sizeof(NativeQ5_32Tile) *
+                        (size_t)allocated_weight_cases), "allocate Q5-32 tiles");
     die_cuda(cudaMalloc(&d_exact, TILE_M * TILE_N * sizeof(int32_t)),
              "allocate exact output");
     die_cuda(cudaMalloc(&d_checksums, (uint64_t)blocks * WARPS_PER_CTA *
@@ -1834,21 +3223,36 @@ int main(int argc, char **argv) {
                blocks, repeats, launches, rounds, bench_cases);
         const uint32_t hot_weight_cases = bench_cases < HOT_WEIGHT_CASES
             ? bench_cases : HOT_WEIGHT_CASES;
-        run_benchmark_mode("hot", hot_weight_cases,
+        run_benchmark_mode("down-hot", 0, hot_weight_cases,
                            blocks, repeats, launches, rounds,
                            d_activations, device, d_exact, d_checksums);
-        run_benchmark_mode("streamed", bench_cases, blocks, repeats,
+        run_benchmark_mode("down-streamed", 0, bench_cases,
+                           blocks, repeats, launches, rounds,
+                           d_activations, device, d_exact, d_checksums);
+        run_benchmark_mode("gate-up-hot", 1, hot_weight_cases,
+                           blocks, repeats, launches, rounds,
+                           d_activations, device, d_exact, d_checksums);
+        run_benchmark_mode("gate-up-streamed", 1, bench_cases,
+                           blocks, repeats,
                            launches, rounds, d_activations, device,
                            d_exact, d_checksums);
     }
     if (!rc && profile) {
-        printf("profile_variant=%s\nprofile_blocks=%u\nprofile_repeats=%u\n"
-               "profile_weight_cases=%u\n", variant_names[profile_variant],
+        printf("profile_variant=%s\nprofile_shape=%s\nprofile_blocks=%u\n"
+               "profile_repeats=%u\nprofile_weight_cases=%u\n",
+               variant_names[profile_variant],
+               profile_gate_up ? "gate-up" : "down",
                blocks, repeats, bench_cases);
         /* Deliberately exactly one launch for ncu/nsys process profiling. */
-        launch_variant(profile_variant, blocks, repeats, HOT_ACTIVATION_CASES,
-                       bench_cases, 0, d_activations, device,
-                       d_exact, d_checksums, 0);
+        if (profile_gate_up)
+            launch_gate_up_variant(
+                profile_variant, blocks, repeats, HOT_ACTIVATION_CASES,
+                bench_cases, 0, d_activations, device,
+                d_exact, d_checksums, 0);
+        else
+            launch_variant(profile_variant, blocks, repeats,
+                           HOT_ACTIVATION_CASES, bench_cases, 0,
+                           d_activations, device, d_exact, d_checksums, 0);
         die_cuda(cudaGetLastError(), "launch profiled kernel");
         die_cuda(cudaDeviceSynchronize(), "synchronize profiled kernel");
         printf("profile_status=ok\n");
@@ -1856,11 +3260,23 @@ int main(int argc, char **argv) {
 
     cudaFree(d_checksums);
     cudaFree(d_exact);
+    cudaFree(device.q5_32);
+    cudaFree(device.q3q4_50);
+    cudaFree(device.q3a6);
+    cudaFree(device.q3a4);
+    cudaFree(device.q2q3_75);
+    cudaFree(device.q2q3_50);
     cudaFree(device.q4_32);
     cudaFree(device.q3_32);
     cudaFree(device.q3k);
     cudaFree(device.q4k);
     cudaFree(d_activations);
+    free(host.q5_32);
+    free(host.q3q4_50);
+    free(host.q3a6);
+    free(host.q3a4);
+    free(host.q2q3_75);
+    free(host.q2q3_50);
     free(host.q4_32);
     free(host.q3_32);
     free(host.q3k);

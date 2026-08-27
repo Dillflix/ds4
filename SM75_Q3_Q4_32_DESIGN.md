@@ -8,9 +8,10 @@ quantizer, or production dispatch accepts them.
 ## Invariants
 
 - One super-block contains 256 weights.
-- All multi-byte scalar fields are little-endian.  Every native eight-row tile
-  starts at a 16-byte boundary; the byte offsets below are part of the tagged
-  layout contract, not implementation suggestions.
+- All multi-byte scalar fields are little-endian.  Dense native eight-row
+  tiles start at a 16-byte boundary. Sparse mixed-format tiles remain exactly
+  size-neutral, so successive streamed tiles may alternate alignment; that
+  alignment cost is measured instead of being hidden by padding.
 - Activations remain DS4 Q8_K.  No additional activation approximation is
   permitted.
 - Every integer kernel must reproduce its scalar Q8 dot exactly.  For the
@@ -29,6 +30,23 @@ quantizer, or production dispatch accepts them.
 | Standard Q3_K | 110 | 880 | K16 symmetric | 16 K16 INT8 | `-4 * bsum` |
 | SM75 Q3-32 v1 | 104 | 832 | K32 symmetric | 16 K32 INT4 | `-4 * bsum` |
 | SM75 Q4-32 v1 | 136 | 1088 | K32 symmetric | 16 K32 INT4 | none |
+
+The quality-screen survivors extend the performance matrix without implying
+any deployment recipe:
+
+| Format | Canonical bytes / K256 | Native bytes / 8 rows | K32 law | Measured MMA work |
+| --- | ---: | ---: | --- | --- |
+| Q2/Q3-50 | 89 | 712 | four Q2 + four Q3 groups | two INT4 MMA chains/group |
+| Q2/Q3-75 | 97 | 776 | two Q2 + six Q3 groups | two INT4 MMA chains/group |
+| Q3A4 | 108 | 864 | affine Q3, 4-bit scale/min | two MMA plus distinct minimum chain |
+| Q3A6 | 112 | 896 | affine Q3, 6-bit scale/min | two MMA plus distinct minimum chain |
+| Q3/Q4-50 | 121 | 968 | four Q3 + four Q4 groups | two MMA plus sparse high-plane merge |
+| Q5-32 | 168 | 1344 | symmetric Q5 | four INT4 MMA chains/group |
+
+The `50` and `75` suffixes mean the exact fraction of K32 groups promoted in
+each K256 block, not a model-level tensor allocation. Promotion masks are
+stored per output row and are rotated by the correctness generator so every
+group position is exercised.
 
 ## Standard Q3_K, exact K16 execution
 
@@ -223,7 +241,8 @@ unknown-tag refusal in tests.
 ## Experiment gates
 
 The first harness compares current native Q4_K, exact native-layout Q3_K,
-Q3-32, and Q4-32 at identical M16xN8xK256 shapes.  The Q4_K control retains
+Q3-32, Q4-32, Q2/Q3-50, Q2/Q3-75, Q3A4, Q3A6, Q3/Q4-50, and Q5-32 at
+identical M16xN8xK256 shapes.  The Q4_K control retains
 separate integer accumulation chains for its scale and affine-minimum terms,
 matching the register/dependency requirement imposed
 by distinct FP16 `d` and `dmin` values in production.  This first harness
@@ -231,16 +250,22 @@ treats all FP16 headers as opaque and compares the two integer chains by their
 difference only after both have completed; it does not claim floating Q4_K
 bit equivalence.
 
-That M16xN8xK256 result is a **single-projection/down-like arithmetic test**.
-It is not a gate/up throughput comparison: production gate/up computes two
-projections, applies clamp + SiLU + multiply + route weight, and uses a fused
-expert-tile dispatch.  In particular, its Q4/Q3 timings cannot be compared
-directly with DS4's shipping fused IQ2_XXS gate/up kernel.  The real-weight
-quality gate therefore reports w1+w3 separately and includes IQ2_XXS as the
-shipping gate/up control.  Before selecting a gate/up format from performance,
-a second production-shaped harness must compare fused IQ2_XXS, Q4_K, Q3_K,
-Q3-32, and Q4-32 over the same real routing histogram and tile plan.  IQ2 down
-and Q2_K are outside this experiment.
+The harness reports two distinct arithmetic shapes. `down-*` is the original
+single projection. `gate-up-*` retains two disjoint weight streams and two
+complete accumulator chains, then evaluates the shipping SiLU-times-up
+epilogue once per M16xN8 result. Both hot and L2-exceeding streamed modes are
+reported. This exposes format-dependent dual-projection register and issue
+cost without pretending that K256 is the complete K4096 routed-expert launch.
+
+The gate/up screen is therefore a **bounded ranking test**, not an end-to-end
+throughput claim: it does not reproduce the real expert histogram, tile tails,
+K4096 reduction schedule, or inter-GPU execution. DS4's shipping IQ2_XXS
+gate/up cannot be represented by the same linear block format, so the script
+also records early/late calls through the real hybrid IQ2-gate/up + Q4-down
+production harness in a separately labelled CSV. Those absolute times must
+not be divided by the bounded arithmetic times. Any survivor must next enter
+the real production-shaped histogram harness before dispatch work begins.
+IQ2 down and Q2_K remain outside this experiment.
 
 Required evidence:
 
