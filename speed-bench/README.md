@@ -1763,15 +1763,18 @@ is justified only by the exact, transfer-inclusive complete-chain result. The
 harness does not include output-projection work or the incremental cost of
 maintaining the three partner cache mirrors.
 
-`cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed
-production pass. It interleaves the unchanged home path with the complete
+`cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed,
+full-dense-cache production pass. It interleaves the unchanged home path with the complete
 indexed score -> top-k -> attention query-row candidate at one 32K frontier,
 validates that transfer-inclusive chain on both configured NVLink pairs,
 requires audited `indexed-chain` production dispatches, and compares emitted
 frontier logits byte-for-byte for every paired repeat. A requested indexed
 split that cannot dispatch aborts; it is never replaced by peer-read or
 home-only execution. Mixed, static-mixed, and raw-only attention remain
-explicitly outside this candidate and are identical in both arms.
+explicitly outside this candidate and are identical in both arms. Both arms
+must materialize and export a complete `344/344` dense-F16 allocation; the
+default allocation is therefore the measured 32K frontier plus one token, not
+a simultaneous 256K-capacity reservation.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1784,7 +1787,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 CTX_TOKENS=32768 \
-CTX_ALLOC=262273 \
+CTX_ALLOC=32769 \
 REPEATS=3 \
 RUN_HARNESS=1 \
 SKIP_BUILD=0 \
