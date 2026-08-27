@@ -9,6 +9,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+SCHEMA_VERSION = "post-row-split-v2"
+
 
 def die(message: str) -> None:
     raise SystemExit(f"error: {message}")
@@ -108,8 +110,14 @@ def classify(row: dict[str, str]) -> str:
 
 
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--schema":
+        print(SCHEMA_VERSION)
+        return 0
     if len(sys.argv) != 2:
-        die("usage: summarize-sm75-native-q4-t256-profile.py OUTPUT_DIR")
+        die(
+            "usage: summarize-sm75-native-q4-t256-profile.py "
+            "OUTPUT_DIR|--schema"
+        )
     output = Path(sys.argv[1]).resolve()
     operations = read_csv(output / "operation-attribution.csv")
     benchmark = read_csv(output / "nsys" / "combined-benchmark.csv")

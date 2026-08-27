@@ -251,6 +251,12 @@ production_env=(
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
 
+summary_schema=$(python3 \
+    "$repo_dir/speed-bench/summarize-sm75-native-q4-t256-profile.py" \
+    --schema)
+[[ $summary_schema == post-row-split-v2 ]] ||
+    die "unexpected profile summarizer schema: $summary_schema"
+
 phase=build
 targets=(ds4-bench tests/cuda_long_context_smoke
          tests/test_engine_mgpu_placement tests/test_gpu_xdev
@@ -480,9 +486,10 @@ for report in cuda_gpu_kern_sum cuda_gpu_mem_time_sum cuda_api_sum \
     nsys stats --report "$report" --format csv "$base.nsys-rep" \
         >"$base-$report.csv" 2>"$base-$report.log" || true
 done
-python3 speed-bench/summarize-cuda-critical-path.py "$OUTPUT_DIR" \
+python3 "$repo_dir/speed-bench/summarize-cuda-critical-path.py" "$OUTPUT_DIR" \
     | tee "$OUTPUT_DIR/critical-path-summary.txt"
-python3 speed-bench/summarize-sm75-native-q4-t256-profile.py "$OUTPUT_DIR" \
+python3 "$repo_dir/speed-bench/summarize-sm75-native-q4-t256-profile.py" \
+    "$OUTPUT_DIR" \
     | tee "$OUTPUT_DIR/combined-summary.txt"
 
 if [[ $RUN_NCU == 1 ]]; then

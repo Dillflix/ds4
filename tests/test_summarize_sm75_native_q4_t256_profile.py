@@ -33,6 +33,13 @@ def operation(**values: object) -> dict[str, object]:
 
 
 def main() -> int:
+    schema = subprocess.run(
+        [sys.executable, str(SUMMARIZER), "--schema"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert schema.stdout.strip() == "post-row-split-v2"
     with tempfile.TemporaryDirectory(prefix="ds4-combined-profile-test-") as temp:
         output = Path(temp)
         (output / "nsys").mkdir()
