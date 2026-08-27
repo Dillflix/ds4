@@ -2257,9 +2257,14 @@ typedef struct {
     char *imatrix_file;
     char *quant_backend;
     char *quant_gpu_devices;
+    char *sm75_q3_q4_quality;
+    char *quality_layers;
+    char *quality_experts;
+    char *quality_parts;
     quant_policy policy;
     int n_experts;
     int n_threads;
+    int quality_rows;
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
@@ -2958,6 +2963,240 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
     memset(plan, 0, sizeof(*plan));
 }
 
+typedef struct {
+    double sse;
+    double source_energy;
+    double weighted_sse;
+    double weighted_source_energy;
+    double max_abs;
+    uint64_t values;
+} experimental_quality_stats;
+
+static int parse_bounded_int_csv(const char *text, int *values, int capacity,
+                                 const char *what) {
+    char *copy = xstrdup(text);
+    char *save = NULL;
+    int count = 0;
+    for (char *item = strtok_r(copy, ",", &save); item;
+         item = strtok_r(NULL, ",", &save)) {
+        if (count == capacity) {
+            fprintf(stderr, "error: too many %s entries (maximum %d)\n",
+                    what, capacity);
+            exit(1);
+        }
+        errno = 0;
+        char *end = NULL;
+        const long value = strtol(item, &end, 10);
+        if (errno || end == item || *end || value < 0 || value > INT_MAX) {
+            fprintf(stderr, "error: bad %s entry: %s\n", what, item);
+            exit(1);
+        }
+        values[count++] = (int)value;
+    }
+    free(copy);
+    if (!count) {
+        fprintf(stderr, "error: empty %s list\n", what);
+        exit(1);
+    }
+    return count;
+}
+
+static int parse_quality_parts(const char *text, const char **parts, int capacity) {
+    char *copy = xstrdup(text);
+    char *save = NULL;
+    int count = 0;
+    for (char *item = strtok_r(copy, ",", &save); item;
+         item = strtok_r(NULL, ",", &save)) {
+        if (count == capacity) die("too many quality parts");
+        if (strcmp(item, "w1") == 0) parts[count++] = "w1";
+        else if (strcmp(item, "w2") == 0) parts[count++] = "w2";
+        else if (strcmp(item, "w3") == 0) parts[count++] = "w3";
+        else {
+            fprintf(stderr, "error: bad quality part: %s (expected w1,w2,w3)\n", item);
+            exit(1);
+        }
+    }
+    free(copy);
+    if (!count) die("empty quality part list");
+    return count;
+}
+
+static const char *quality_gguf_part(const char *part) {
+    if (strcmp(part, "w1") == 0) return "gate";
+    if (strcmp(part, "w2") == 0) return "down";
+    if (strcmp(part, "w3") == 0) return "up";
+    die("bad quality expert part");
+    return NULL;
+}
+
+static float *read_quality_expert(st_db *db, int layer, int expert,
+                                  const char *part, int64_t *nrows_out,
+                                  int64_t *ncols_out, char weight_name[320]) {
+    snprintf(weight_name, 320, "layers.%d.ffn.experts.%d.%s.weight",
+             layer, expert, part);
+    st_value w = db_read(db, weight_name);
+    if (w.n_dims != 2) die("quality expert tensor is not 2D");
+    int64_t n = 0;
+    float *f32 = NULL;
+    if (strcmp(w.dtype, "I8") == 0) {
+        char scale_name[320];
+        snprintf(scale_name, sizeof(scale_name),
+                 "layers.%d.ffn.experts.%d.%s.scale", layer, expert, part);
+        st_value scale = db_read(db, scale_name);
+        f32 = dequant_fp4_weight(&w, &scale, &n);
+        *nrows_out = w.shape[0];
+        *ncols_out = w.shape[1] * 2;
+        st_value_free(&scale);
+    } else {
+        f32 = tensor_to_f32(&w, &n);
+        *nrows_out = w.shape[0];
+        *ncols_out = w.shape[1];
+    }
+    st_value_free(&w);
+    if (*nrows_out * *ncols_out != n || *ncols_out % 256 != 0) {
+        die("quality expert tensor has unsupported shape");
+    }
+    return f32;
+}
+
+static void update_quality_stats(experimental_quality_stats *stats,
+                                 const float source[256],
+                                 const float decoded[256],
+                                 const float *imatrix) {
+    for (int i = 0; i < 256; i++) {
+        const double x = source[i];
+        const double error = decoded[i] - x;
+        const double abs_error = fabs(error);
+        const double weight = imatrix[i];
+        if (!isfinite(weight) || weight < 0.0) {
+            die("quality imatrix contains a negative or non-finite weight");
+        }
+        stats->sse += error * error;
+        stats->source_energy += x * x;
+        stats->weighted_sse += weight * error * error;
+        stats->weighted_source_energy += weight * x * x;
+        if (abs_error > stats->max_abs) stats->max_abs = abs_error;
+        stats->values++;
+    }
+}
+
+static double quality_nrmse(double sse, double energy) {
+    return energy > 0.0 ? sqrt(sse / energy) : 0.0;
+}
+
+static void write_quality_csv_row(FILE *fp, const char *scope, int layer,
+                                  int expert, const char *part, int rows,
+                                  int64_t ncols,
+                                  ds4q_experimental_format format,
+                                  const experimental_quality_stats *stats) {
+    const size_t block_bytes = ds4q_experimental_block_bytes(format);
+    fprintf(fp,
+            "%s,%d,%d,%s,%d,%" PRId64 ",%s,%zu,%.8f,%" PRIu64
+            ",%.17g,%.17g,%.17g,%.17g,%.17g\n",
+            scope, layer, expert, part, rows, ncols,
+            ds4q_experimental_format_name(format), block_bytes,
+            8.0 * block_bytes / 256.0, stats->values,
+            stats->sse, quality_nrmse(stats->sse, stats->source_energy),
+            stats->weighted_sse,
+            quality_nrmse(stats->weighted_sse,
+                          stats->weighted_source_energy),
+            stats->max_abs);
+}
+
+static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
+                                   const char *out_path, const char *layers_text,
+                                   const char *experts_text,
+                                   const char *parts_text, int requested_rows) {
+    int layers[32], experts[32];
+    const char *parts[3];
+    const int n_layers = parse_bounded_int_csv(layers_text, layers, 32, "quality layer");
+    const int n_experts = parse_bounded_int_csv(experts_text, experts, 32, "quality expert");
+    const int n_parts = parse_quality_parts(parts_text, parts, 3);
+    if (requested_rows < 1) die("--quality-rows must be positive");
+
+    FILE *fp = fopen(out_path, "wb");
+    if (!fp) die_errno("open quality output", out_path);
+    fprintf(fp,
+            "scope,layer,expert,part,sampled_rows,ncols,format,block_bytes,bits_per_weight,values,sse,nrmse,weighted_sse,weighted_nrmse,max_abs\n");
+    experimental_quality_stats aggregate[DS4Q_EXPERIMENT_COUNT] = {{0}};
+    int total_tensors = 0;
+    int total_rows = 0;
+
+    for (int li = 0; li < n_layers; li++) {
+        for (int ei = 0; ei < n_experts; ei++) {
+            for (int pi = 0; pi < n_parts; pi++) {
+                char hf_name[320];
+                int64_t nrows = 0, ncols = 0;
+                float *source = read_quality_expert(db, layers[li], experts[ei],
+                                                    parts[pi], &nrows, &ncols,
+                                                    hf_name);
+                char gguf_name[256];
+                snprintf(gguf_name, sizeof(gguf_name),
+                         "blk.%d.ffn_%s_exps.weight", layers[li],
+                         quality_gguf_part(parts[pi]));
+                const char *names[2] = { gguf_name, hf_name };
+                const float *weights = imatrix_find(imatrix, names, 2, ncols,
+                                                     experts[ei], 256);
+                if (!weights) die("quality audit requires matching imatrix data");
+                const int sample_rows = requested_rows < nrows
+                    ? requested_rows : (int)nrows;
+                experimental_quality_stats tensor[DS4Q_EXPERIMENT_COUNT] = {{0}};
+                _Alignas(16) uint8_t encoded[144];
+                float decoded[256];
+                for (int ri = 0; ri < sample_rows; ri++) {
+                    const int64_t row = sample_rows == 1 ? 0
+                        : (int64_t)ri * (nrows - 1) / (sample_rows - 1);
+                    const float *row_data = source + (size_t)row * (size_t)ncols;
+                    for (int64_t col = 0; col < ncols; col += 256) {
+                        for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+                            const ds4q_experimental_format format =
+                                (ds4q_experimental_format)fi;
+                            if (!ds4q_experimental_quantize_block(
+                                    format, row_data + col, weights + col,
+                                    encoded) ||
+                                !ds4q_experimental_dequantize_block(
+                                    format, encoded, decoded)) {
+                                die("experimental quality encode/decode failed");
+                            }
+                            update_quality_stats(&tensor[fi], row_data + col,
+                                                 decoded, weights + col);
+                        }
+                    }
+                }
+                for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+                    write_quality_csv_row(fp, "tensor", layers[li], experts[ei],
+                                          parts[pi], sample_rows, ncols,
+                                          (ds4q_experimental_format)fi,
+                                          &tensor[fi]);
+                    aggregate[fi].sse += tensor[fi].sse;
+                    aggregate[fi].source_energy += tensor[fi].source_energy;
+                    aggregate[fi].weighted_sse += tensor[fi].weighted_sse;
+                    aggregate[fi].weighted_source_energy +=
+                        tensor[fi].weighted_source_energy;
+                    if (tensor[fi].max_abs > aggregate[fi].max_abs)
+                        aggregate[fi].max_abs = tensor[fi].max_abs;
+                    aggregate[fi].values += tensor[fi].values;
+                }
+                total_tensors++;
+                total_rows += sample_rows;
+                fprintf(stderr,
+                        "quality sample %d: layer=%d expert=%d part=%s rows=%d dims=%" PRId64 "x%" PRId64 "\n",
+                        total_tensors, layers[li], experts[ei], parts[pi],
+                        sample_rows, nrows, ncols);
+                free(source);
+            }
+        }
+    }
+    for (int fi = 0; fi < DS4Q_EXPERIMENT_COUNT; fi++) {
+        write_quality_csv_row(fp, "aggregate", -1, -1, "all", total_rows,
+                              0, (ds4q_experimental_format)fi,
+                              &aggregate[fi]);
+    }
+    if (fclose(fp) != 0) die_errno("close quality output", out_path);
+    fprintf(stderr, "quality audit wrote %s (%d tensors, %d sampled rows)\n",
+            out_path, total_tensors, total_rows);
+}
+
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
     printf("       %s --repack-sm75-native-q4 MODEL.gguf --out OUT.gguf\n", argv0);
@@ -2995,6 +3234,11 @@ static void usage(const char *argv0) {
     printf("  --quant-backend MODE   tensor encoder: cpu or cuda, default cpu\n");
     printf("  --quant-gpu-devices CSV  CUDA device indexes, default every visible GPU\n");
     printf("  --sm75-native-q4      store each routed Q4_K tensor in tagged Turing MMA-native A/W layout\n");
+    printf("  --sm75-q3-q4-quality FILE  compare Q4_K/Q3_K/Q3-32/Q4-32 on sampled HF expert rows\n");
+    printf("  --quality-layers CSV  quality sample layers, default 3,21,36\n");
+    printf("  --quality-experts CSV quality sample expert ids, default 0,127,255\n");
+    printf("  --quality-parts CSV   quality sample expert parts, default w1,w2,w3\n");
+    printf("  --quality-rows N      evenly-spaced rows per sampled tensor, default 32\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
@@ -3056,6 +3300,10 @@ static params parse_args(int argc, char **argv) {
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
     p.n_threads = 8;
+    p.quality_layers = "3,21,36";
+    p.quality_experts = "0,127,255";
+    p.quality_parts = "w1,w2,w3";
+    p.quality_rows = 32;
     dspark_support_defaults(&p.dspark);
 
     for (int i = 1; i < argc; i++) {
@@ -3133,10 +3381,42 @@ static params parse_args(int argc, char **argv) {
             p.quant_gpu_devices = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--sm75-native-q4") == 0) {
             p.sm75_native_q4 = true;
+        } else if (strcmp(arg, "--sm75-q3-q4-quality") == 0) {
+            p.sm75_q3_q4_quality = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--quality-layers") == 0) {
+            p.quality_layers = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--quality-experts") == 0) {
+            p.quality_experts = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--quality-parts") == 0) {
+            p.quality_parts = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--quality-rows") == 0) {
+            p.quality_rows = (int)parse_u32_arg(
+                need_value(argc, argv, &i, arg), arg);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
         }
+    }
+    if (p.sm75_q3_q4_quality) {
+        if (!p.hf_dir) die("--hf is required");
+        if (!p.imatrix_file) die("--sm75-q3-q4-quality requires --imatrix");
+        if (p.template_gguf || p.repack_sm75_q4 || p.out_gguf ||
+            p.compare_gguf || p.compare_tensor || p.dspark_manifest ||
+            p.dspark_support || p.dry_run || p.sm75_native_q4 ||
+            p.quant_backend || p.quant_gpu_devices || p.policy.n_overrides ||
+            p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
+            p.policy.attention_proj != DS4Q_TYPE_COUNT ||
+            p.policy.attention != DS4Q_TYPE_COUNT ||
+            p.policy.shared != DS4Q_TYPE_COUNT ||
+            p.policy.embedding != DS4Q_TYPE_COUNT ||
+            p.policy.output != DS4Q_TYPE_COUNT ||
+            p.policy.dense != DS4Q_TYPE_COUNT) {
+            die("--sm75-q3-q4-quality cannot be combined with GGUF output options");
+        }
+        p.imatrix_strict = true;
+        return p;
     }
     if (p.repack_sm75_q4) {
         if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
@@ -3386,6 +3666,16 @@ int main(int argc, char **argv) {
 
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+    if (p.sm75_q3_q4_quality) {
+        st_db db;
+        db_open(&db, p.hf_dir);
+        run_sm75_q3_q4_quality(&db, &imatrix, p.sm75_q3_q4_quality,
+                               p.quality_layers, p.quality_experts,
+                               p.quality_parts, p.quality_rows);
+        db_close(&db);
+        imatrix_free(&imatrix);
+        return 0;
+    }
     if (!p.dry_run) configure_quant_backend(&p);
 
     if (p.dspark_support) {
