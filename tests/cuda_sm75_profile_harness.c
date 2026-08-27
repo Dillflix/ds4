@@ -35,6 +35,8 @@ typedef enum {
     SCENARIO_Q8_OUT_B,
     SCENARIO_ATTN_INDEXED_32K,
     SCENARIO_ATTN_MIXED_32K,
+    SCENARIO_INDEXER_SCORE_32K,
+    SCENARIO_INDEXER_TOPK_32K,
 } scenario_kind;
 
 typedef enum {
@@ -205,6 +207,14 @@ static const scenario_spec scenarios[] = {
         "attn-mixed-32k", SCENARIO_ATTN_MIXED_32K, 27u,
         0u, 0u, 0u, 512u, 64u, NULL,
     },
+    {
+        "indexer-score-32k", SCENARIO_INDEXER_SCORE_32K, 27u,
+        0u, 0u, 0u, 512u, 64u, NULL,
+    },
+    {
+        "indexer-topk-32k", SCENARIO_INDEXER_TOPK_32K, 27u,
+        0u, 0u, 0u, 512u, 64u, NULL,
+    },
 };
 
 /* The host mapping must outlive ds4_gpu_cleanup even when a requested device
@@ -217,7 +227,8 @@ static void usage(const char *argv0) {
             "q2-early|q2-late|hybrid-iq2-q4-early|"
             "hybrid-iq2-q4-late|sm75-q4-32|sm75-q3a4|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b|"
-            "attn-indexed-32k|attn-mixed-32k\n"
+            "attn-indexed-32k|attn-mixed-32k|"
+            "indexer-score-32k|indexer-topk-32k\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
@@ -964,10 +975,17 @@ static int run_attention_32k(const scenario_spec *spec,
     const uint32_t n_raw = 2304u;
     const uint32_t raw_cap = 2304u;
     const uint32_t raw_start = 0u;
-    const uint32_t n_comp = 7936u;
-    const uint32_t top_k = 512u;
+    const int indexed = spec->kind == SCENARIO_ATTN_INDEXED_32K;
+    /* Ratio-4 prefill with 7,936 compressed rows dispatches through indexed
+     * attention in production.  The shipping mixed kernel at this frontier is
+     * the ratio-0 raw-window path and therefore has no compressed rows.  Keep
+     * the two harness scenarios semantically reachable by the production
+     * dispatcher instead of profiling a synthetic mixed call that can never
+     * occur at 32K. */
+    const uint32_t n_comp = indexed ? 7936u : 0u;
+    const uint32_t top_k = indexed ? 512u : 0u;
     const uint32_t window = 2048u;
-    const uint32_t ratio = 4u;
+    const uint32_t ratio = indexed ? 4u : 0u;
     const uint32_t n_head = 64u;
     const uint32_t head_dim = 512u;
     const uint64_t q_count =
@@ -982,7 +1000,6 @@ static int run_attention_32k(const scenario_spec *spec,
         topk_count * sizeof(int32_t);
     const uint64_t predicted =
         model_bytes + tensor_bytes + PROFILE_SAFETY_RESERVE;
-    const int indexed = spec->kind == SCENARIO_ATTN_INDEXED_32K;
     printf("scenario=%s\nprofile_kind=attention_sm75_32k\n"
            "attention_path=%s\nn_tokens=%u\npos0=%u\nn_raw=%u\n"
            "raw_cap=%u\nraw_start=%u\nn_comp=%u\ntop_k=%u\n"
@@ -1021,12 +1038,15 @@ static int run_attention_32k(const scenario_spec *spec,
     q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
     heads = ds4_gpu_tensor_alloc(heads_count * sizeof(float));
     raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
-    comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    if (comp_count != 0u)
+        comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
     if (indexed) topk = ds4_gpu_tensor_alloc(topk_count * sizeof(int32_t));
-    if (!q || !heads || !raw || !comp || (indexed && !topk) ||
+    if (!q || !heads || !raw || (comp_count != 0u && !comp) ||
+        (indexed && !topk) ||
         !ds4_gpu_tensor_fill_f32(q, 0.0f, q_count) ||
         !ds4_gpu_tensor_fill_f32(raw, 0.0f, raw_count) ||
-        !ds4_gpu_tensor_fill_f32(comp, 0.0f, comp_count) ||
+        (comp_count != 0u &&
+         !ds4_gpu_tensor_fill_f32(comp, 0.0f, comp_count)) ||
         (indexed && !ds4_gpu_tensor_write(
             topk, 0, topk_host, topk_count * sizeof(int32_t)))) {
         fprintf(stderr, "error: attention device allocation/input failed\n");
@@ -1086,6 +1106,166 @@ cleanup:
     ds4_gpu_tensor_free(q);
     free(heads_host);
     free(topk_host);
+    return ok;
+}
+
+static int run_indexer_32k(const scenario_spec *spec,
+                           uint32_t timed_repeats) {
+    const uint32_t n_tokens = 512u;
+    const uint32_t pos0 = 31744u;
+    const uint32_t n_comp = 7936u;
+    const uint32_t top_k = 512u;
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 128u;
+    const uint32_t ratio = 4u;
+    const float scale = 1.0f / sqrtf((float)(n_head * head_dim));
+    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t weight_count = (uint64_t)n_tokens * n_head;
+    const uint64_t index_count = (uint64_t)n_comp * head_dim;
+    const uint64_t score_count = (uint64_t)n_tokens * n_comp;
+    const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+    const uint64_t tensor_bytes =
+        (q_count + weight_count + index_count + score_count) * sizeof(float) +
+        selected_count * sizeof(uint32_t);
+    const uint64_t predicted = tensor_bytes + PROFILE_SAFETY_RESERVE;
+    const int score_only = spec->kind == SCENARIO_INDEXER_SCORE_32K;
+    float *scores_host = NULL;
+    uint32_t *selected_host = NULL;
+    ds4_gpu_tensor *q = NULL, *weights = NULL, *index_comp = NULL;
+    ds4_gpu_tensor *scores = NULL, *selected = NULL;
+    int ok = 0;
+
+    printf("scenario=%s\nprofile_kind=indexer_sm75_32k\n"
+           "indexer_path=%s\nn_tokens=%u\npos0=%u\nn_comp=%u\n"
+           "top_k=%u\nn_head=%u\nhead_dim=%u\nratio=%u\n"
+           "tensor_bytes=%llu\npredicted_device_bytes=%llu\n"
+           "device_limit_bytes=%llu\n",
+           spec->name, score_only ? "score-wmma128" : "topk-u16",
+           n_tokens, pos0, n_comp, top_k, n_head, head_dim, ratio,
+           (unsigned long long)tensor_bytes,
+           (unsigned long long)predicted,
+           (unsigned long long)PROFILE_DEVICE_LIMIT);
+    if (predicted > PROFILE_DEVICE_LIMIT) {
+        fprintf(stderr,
+                "error: predicted indexer state exceeds the 3 GiB ceiling\n");
+        return 0;
+    }
+
+    scores_host = (float *)malloc((size_t)score_count * sizeof(float));
+    if (!score_only)
+        selected_host = (uint32_t *)malloc(
+            (size_t)selected_count * sizeof(uint32_t));
+    if (!scores_host || (!score_only && !selected_host)) {
+        fprintf(stderr, "error: host indexer allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t c = 0; c < n_comp; c++) {
+            /* Avoid all-tie top-k behavior while keeping values exactly
+             * representable and deterministic across profiler replays. */
+            const uint32_t rank = (c * 131u + t * 17u) % n_comp;
+            scores_host[(uint64_t)t * n_comp + c] =
+                (float)rank / 8192.0f;
+        }
+    }
+
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    weights = ds4_gpu_tensor_alloc(weight_count * sizeof(float));
+    index_comp = ds4_gpu_tensor_alloc(index_count * sizeof(float));
+    scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    if (!q || !weights || !index_comp || !scores || !selected ||
+        !ds4_gpu_tensor_fill_f32(q, 0.0f, q_count) ||
+        !ds4_gpu_tensor_fill_f32(weights, 0.0f, weight_count) ||
+        !ds4_gpu_tensor_fill_f32(index_comp, 0.0f, index_count) ||
+        (!score_only &&
+         !ds4_gpu_tensor_write(scores, 0, scores_host,
+                               score_count * sizeof(float)))) {
+        fprintf(stderr, "error: indexer device allocation/input failed\n");
+        goto cleanup;
+    }
+
+#define DS4_RUN_INDEXER_SCORE() \
+    ds4_gpu_indexer_scores_decode_batch_tensor( \
+        scores, q, weights, index_comp, n_comp, n_tokens, pos0, \
+        n_head, head_dim, ratio, scale)
+#define DS4_RUN_INDEXER_TOPK() \
+    ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k)
+
+    if ((score_only ? !DS4_RUN_INDEXER_SCORE() : !DS4_RUN_INDEXER_TOPK()) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: indexer production kernel validation failed\n");
+        goto cleanup;
+    }
+    if (score_only) {
+        if (!ds4_gpu_tensor_read(scores, 0, scores_host,
+                                 score_count * sizeof(float)) ||
+            !verify_zero_f32(scores_host, score_count, spec->name)) {
+            fprintf(stderr, "error: indexer score output validation failed\n");
+            goto cleanup;
+        }
+        printf("output_values_checked=%llu\noutput_validation=exact-zero\n",
+               (unsigned long long)score_count);
+    } else {
+        if (!ds4_gpu_tensor_read(selected, 0, selected_host,
+                                 selected_count * sizeof(uint32_t))) {
+            fprintf(stderr, "error: indexer top-k read failed\n");
+            goto cleanup;
+        }
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t k = 0; k < top_k; k++) {
+                const uint32_t idx = selected_host[(uint64_t)t * top_k + k];
+                const uint32_t rank =
+                    idx < n_comp ? (idx * 131u + t * 17u) % n_comp : 0u;
+                const uint32_t expected_rank = n_comp - 1u - k;
+                if (idx >= n_comp || rank != expected_rank) {
+                    fprintf(stderr,
+                            "error: indexer top-k mismatch at token=%u "
+                            "position=%u index=%u score-rank=%u "
+                            "expected-rank=%u\n",
+                            t, k, idx, rank, expected_rank);
+                    goto cleanup;
+                }
+            }
+        }
+        printf("output_values_checked=%llu\n"
+               "output_validation=exact-topk-order\n",
+               (unsigned long long)selected_count);
+    }
+
+    if (timed_repeats > 0u) {
+        const double start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (score_only ? !DS4_RUN_INDEXER_SCORE() :
+                             !DS4_RUN_INDEXER_TOPK()) {
+                fprintf(stderr, "error: indexer timed launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: indexer timed synchronization failed\n");
+            goto cleanup;
+        }
+        const double elapsed_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        printf("timed_repeats=%u\ntimed_total_ms=%.6f\n"
+               "timed_per_call_ms=%.6f\n",
+               timed_repeats, elapsed_ms,
+               elapsed_ms / (double)timed_repeats);
+    }
+    ok = 1;
+
+#undef DS4_RUN_INDEXER_TOPK
+#undef DS4_RUN_INDEXER_SCORE
+
+cleanup:
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(scores);
+    ds4_gpu_tensor_free(index_comp);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(q);
+    free(selected_host);
+    free(scores_host);
     return ok;
 }
 
@@ -1257,6 +1437,9 @@ int main(int argc, char **argv) {
     const int attention_32k =
         spec->kind == SCENARIO_ATTN_INDEXED_32K ||
         spec->kind == SCENARIO_ATTN_MIXED_32K;
+    const int indexer_32k =
+        spec->kind == SCENARIO_INDEXER_SCORE_32K ||
+        spec->kind == SCENARIO_INDEXER_TOPK_32K;
     const uint32_t private_q32_layout = DS4_TENSOR_LAYOUT_SM75_Q4_32 |
                                         DS4_TENSOR_LAYOUT_SM75_Q3A4;
     const int ok = q4_moe ?
@@ -1278,7 +1461,8 @@ int main(int argc, char **argv) {
                         PROFILE_TYPE_SM75_Q4_32, private_q32_layout,
                         timed_repeats) :
             (attention_32k ? run_attention_32k(spec, timed_repeats) :
-                             run_q8(spec, timed_repeats))))));
+             (indexer_32k ? run_indexer_32k(spec, timed_repeats) :
+                            run_q8(spec, timed_repeats)))))));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;

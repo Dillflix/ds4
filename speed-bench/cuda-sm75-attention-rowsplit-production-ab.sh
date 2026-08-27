@@ -134,15 +134,18 @@ if [[ $RUN_HARNESS == 1 ]]; then
     phase=bounded-exact-harness
     for pair in "${gpu_ids[0]},${gpu_ids[2]}" "${gpu_ids[1]},${gpu_ids[3]}"; do
         name=${pair/,/-}
-        CUDA_VISIBLE_DEVICES=$pair DS4_ROWSPLIT_REPEATS=3 \
-            ./tests/cuda_attention_rowsplit_xdev \
-            >"$OUTPUT_DIR/harness/pair-$name.log" 2>&1 || {
-                tail -n 160 "$OUTPUT_DIR/harness/pair-$name.log" >&2
-                die "row-split harness failed for physical pair $pair"
-            }
+        : >"$OUTPUT_DIR/harness/pair-$name.log"
+        for scenario in mixed indexed indexed-pipeline; do
+            CUDA_VISIBLE_DEVICES=$pair DS4_ROWSPLIT_REPEATS=3 \
+                ./tests/cuda_attention_rowsplit_xdev "$scenario" \
+                >>"$OUTPUT_DIR/harness/pair-$name.log" 2>&1 || {
+                    tail -n 160 "$OUTPUT_DIR/harness/pair-$name.log" >&2
+                    die "row-split $scenario harness failed for physical pair $pair"
+                }
+        done
         [[ $(grep -Fc 'validation=bit-exact-nonzero' \
-            "$OUTPUT_DIR/harness/pair-$name.log") == 2 ]] ||
-            die "pair $pair did not validate both mixed and indexed paths"
+            "$OUTPUT_DIR/harness/pair-$name.log") == 3 ]] ||
+            die "pair $pair did not validate all attention/indexer paths"
     done
 fi
 

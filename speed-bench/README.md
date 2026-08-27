@@ -1732,6 +1732,17 @@ partner variant is measured both by directly peer-reading home Q/KV/top-k and
 by using locally mirrored inputs. Both variants must reproduce non-zero
 shipping-kernel output bit-for-bit before timings are reported.
 
+The experiment also measures the complete indexed score -> top-k -> attention
+chain. Its 256/256 candidate computes the partner half's indexer scores and
+top-k locally against a mirrored index cache instead of first performing all
+indexer work on the home GPU. It reports both a pre-mirrored compute ceiling
+and a transfer-inclusive boundary that moves the partner indexer query,
+indexer weights, and attention query and gathers the final attention output.
+The raw/compressed attention caches and index cache remain persistent mirrors
+outside the timed region. The `mixed` scenario is the real ratio-0 raw-window
+production shape; the old unreachable ratio-4/non-indexed synthetic shape is
+not measured.
+
 This is intentionally not the older head split and not a split-KV reduction.
 Every query row retains the same kernel and online-softmax operation order; the
 harness only changes which GPU executes the row. No GGUF is opened.
@@ -1748,9 +1759,9 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit.sh
 ```
 
 Return `sm75-attention-rowsplit-<timestamp>.tar.gz`. A production integration
-is justified only if one of the exact candidates wins in both indexed and
-mixed attention; the harness result does not include output-projection work or
-the incremental cost of maintaining a partner KV mirror.
+is justified only by the exact, transfer-inclusive complete-chain result. The
+harness does not include output-projection work or the incremental cost of
+maintaining the three partner cache mirrors.
 
 `cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed
 production pass. It interleaves the unchanged home path with the mirrored-KV
@@ -1795,9 +1806,12 @@ layers, and Q4-32 down on all 43 layers.
 The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
 Nsight Compute does not replay the full application: bounded exact harnesses
-capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, and both indexed and mixed
-long-context attention shapes. This avoids five additional 139 GB model loads
-and prevents application replay from perturbing the production trace.
+capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, indexed attention, the real
+ratio-0 raw-window mixed-attention shape, the 32K WMMA indexer-score shape, and
+the 8192-wide U16 top-k shape. This avoids seven additional 139 GB model loads
+and prevents application replay from perturbing the production trace. The
+summary classifies indexer score and selection separately instead of hiding
+them under `other`.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1822,7 +1836,7 @@ bash ./speed-bench/cuda-sm75-q32-production-profile.sh
 Return `sm75-q32-production-profile-<timestamp>.tar.gz`. The primary results
 are `profile-summary.md`, `stage-device-summary.csv`,
 `stage-microbatch-device.csv`, `kernel-family-summary.csv`, the genuine
-`nsys/combined.nsys-rep`, and the five validated reports under `ncu/`.
+`nsys/combined.nsys-rep`, and the seven validated reports under `ncu/`.
 
 # SM75 routed-quant real-weight quality sweep
 

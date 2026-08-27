@@ -8,6 +8,7 @@
 #include "ds4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,13 +95,70 @@ static int compare_halves(const float *ref, const float *home,
     return 0;
 }
 
+static int compare_u32_halves(const uint32_t *ref, const uint32_t *home,
+                              const uint32_t *partner,
+                              uint64_t half_count, const char *label) {
+    const size_t bytes = (size_t)half_count * sizeof(uint32_t);
+    if (memcmp(ref, home, bytes) == 0 &&
+        memcmp(ref + half_count, partner, bytes) == 0) return 1;
+    for (uint64_t i = 0; i < half_count; i++) {
+        if (ref[i] != home[i]) {
+            fprintf(stderr,
+                    "FAIL: %s home[%llu] reference=%u candidate=%u\n",
+                    label, (unsigned long long)i, ref[i], home[i]);
+            return 0;
+        }
+        if (ref[half_count + i] != partner[i]) {
+            fprintf(stderr,
+                    "FAIL: %s partner[%llu] reference=%u candidate=%u\n",
+                    label, (unsigned long long)i,
+                    ref[half_count + i], partner[i]);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int any_nonzero_f32(const float *values, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        if (values[i] != 0.0f) return 1;
+    }
+    return 0;
+}
+
+static int launch_indexer_attention_chain(
+        ds4_gpu_tensor *scores, ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *heads, const void *model, uint64_t model_bytes,
+        const ds4_gpu_tensor *index_q, const ds4_gpu_tensor *index_weights,
+        const ds4_gpu_tensor *index_comp, const ds4_gpu_tensor *attention_q,
+        const ds4_gpu_tensor *raw, const ds4_gpu_tensor *comp,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t top_k, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t index_dim, uint32_t attention_dim) {
+    const float scale = 1.0f / sqrtf((float)(n_head * index_dim));
+    return ds4_gpu_indexer_scores_decode_batch_tensor(
+               scores, index_q, index_weights, index_comp, n_comp,
+               n_tokens, pos0, n_head, index_dim, ratio, scale) &&
+           ds4_gpu_indexer_topk_tensor(
+               selected, scores, n_comp, n_tokens, top_k) &&
+           ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+               heads, model, model_bytes, 0u, attention_q, raw, comp, 0u,
+               selected, n_tokens, pos0, n_raw, raw_cap, raw_start,
+               n_comp, top_k, window, ratio, n_head, attention_dim);
+}
+
 static int run_case(int indexed) {
     const uint32_t n_tokens = 512u, half_tokens = 256u;
     const uint32_t pos0 = 31744u, partner_pos0 = 32000u;
     const uint32_t n_raw = 2304u, home_n_raw = 2048u;
     const uint32_t raw_cap = 2304u, raw_start = 0u;
-    const uint32_t n_comp = 7936u, top_k = 512u;
-    const uint32_t window = 2048u, ratio = 4u;
+    /* At the 32K frontier ratio-4 layers with 7,936 compressed rows take the
+     * indexed path.  The production mixed kernel is the ratio-0 raw-window
+     * path.  Do not benchmark the old synthetic ratio-4/non-indexed shape. */
+    const uint32_t n_comp = indexed ? 7936u : 0u;
+    const uint32_t top_k = indexed ? 512u : 0u;
+    const uint32_t window = 2048u, ratio = indexed ? 4u : 0u;
     const uint32_t n_head = 64u, head_dim = 512u;
     const uint64_t row_count = (uint64_t)n_head * head_dim;
     const uint64_t q_count = (uint64_t)n_tokens * row_count;
@@ -131,13 +189,15 @@ static int run_case(int indexed) {
     model = (float *)malloc((size_t)model_bytes);
     q_host = (float *)malloc((size_t)q_count * sizeof(float));
     raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
-    comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    if (comp_count != 0u)
+        comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
     ref_host = (float *)malloc((size_t)q_count * sizeof(float));
     home_host = (float *)malloc((size_t)half_count * sizeof(float));
     partner_host = (float *)malloc((size_t)half_count * sizeof(float));
     if (indexed)
         topk_host = (int32_t *)malloc((size_t)topk_count * sizeof(int32_t));
-    CHECK(model && q_host && raw_host && comp_host && ref_host && home_host &&
+    CHECK(model && q_host && raw_host && (!comp_count || comp_host) &&
+          ref_host && home_host &&
           partner_host && (!indexed || topk_host), "host allocations");
 
     for (uint32_t h = 0; h < n_head; h++)
@@ -148,9 +208,11 @@ static int run_case(int indexed) {
     for (uint64_t i = 0; i < raw_count; i++)
         raw_host[i] = (float)((int)((i * 13u + 5u) % 29u) - 14) /
                       512.0f;
-    for (uint64_t i = 0; i < comp_count; i++)
-        comp_host[i] = (float)((int)((i * 11u + 7u) % 27u) - 13) /
-                       512.0f;
+    if (comp_host) {
+        for (uint64_t i = 0; i < comp_count; i++)
+            comp_host[i] = (float)((int)((i * 11u + 7u) % 27u) - 13) /
+                           512.0f;
+    }
     if (indexed) {
         for (uint32_t t = 0; t < n_tokens; t++)
             for (uint32_t k = 0; k < top_k; k++)
@@ -171,15 +233,18 @@ static int run_case(int indexed) {
 
     CHECK(ds4_gpu_tensor_alloc_on(&q0, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw0, 0, raw_count * sizeof(float)) == 0 &&
-          ds4_gpu_tensor_alloc_on(&comp0, 0, comp_count * sizeof(float)) == 0 &&
+          (!comp_count ||
+           ds4_gpu_tensor_alloc_on(&comp0, 0,
+                                   comp_count * sizeof(float)) == 0) &&
           ds4_gpu_tensor_alloc_on(&ref, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&home, 0, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&partner, 1,
                                   half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&q1, 1, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw1, 1, raw_count * sizeof(float)) == 0 &&
-          ds4_gpu_tensor_alloc_on(&comp1, 1,
-                                  comp_count * sizeof(float)) == 0,
+          (!comp_count ||
+           ds4_gpu_tensor_alloc_on(&comp1, 1,
+                                   comp_count * sizeof(float)) == 0),
           "device allocations");
     if (indexed) {
         CHECK(ds4_gpu_tensor_alloc_on(&topk0, 0,
@@ -193,14 +258,16 @@ static int run_case(int indexed) {
                                q_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw0, 0, raw_host,
                                raw_count * sizeof(float)) &&
-          ds4_gpu_tensor_write(&comp0, 0, comp_host,
-                               comp_count * sizeof(float)) &&
+          (!comp_count ||
+           ds4_gpu_tensor_write(&comp0, 0, comp_host,
+                                comp_count * sizeof(float))) &&
           ds4_gpu_tensor_write(&q1, 0, q_host + half_count,
                                half_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw1, 0, raw_host,
                                raw_count * sizeof(float)) &&
-          ds4_gpu_tensor_write(&comp1, 0, comp_host,
-                               comp_count * sizeof(float)) &&
+          (!comp_count ||
+           ds4_gpu_tensor_write(&comp1, 0, comp_host,
+                                comp_count * sizeof(float))) &&
           (!indexed ||
            (ds4_gpu_tensor_write(&topk0, 0, topk_host,
                                  topk_count * sizeof(int32_t)) &&
@@ -231,7 +298,8 @@ static int run_case(int indexed) {
 
 #define LAUNCH_HOME() \
     launch_attention(indexed, &home, model, model_bytes, &q_home, &raw0, \
-                     &comp0, indexed ? &topk_home : NULL, half_tokens, pos0, \
+                     indexed ? &comp0 : NULL, \
+                     indexed ? &topk_home : NULL, half_tokens, pos0, \
                      home_n_raw, raw_cap, raw_start, n_comp, top_k, window, \
                      ratio, n_head, head_dim)
 #define LAUNCH_PARTNER(q_, raw_, comp_, topk_) \
@@ -242,17 +310,20 @@ static int run_case(int indexed) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           launch_attention(indexed, &ref, model, model_bytes, &q0, &raw0,
-                           &comp0, indexed ? &topk0 : NULL, n_tokens, pos0,
+                           indexed ? &comp0 : NULL,
+                           indexed ? &topk0 : NULL, n_tokens, pos0,
                            n_raw, raw_cap, raw_start, n_comp, top_k, window,
                            ratio, n_head, head_dim) && sync_tier(0),
           "baseline launch");
     CHECK(ds4_gpu_tensor_read(&ref, 0, ref_host,
                               q_count * sizeof(float)), "baseline read");
+    CHECK(any_nonzero_f32(ref_host, q_count), "baseline output is non-zero");
 
     CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
           "peer home launch");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
-          LAUNCH_PARTNER(&q_peer, &raw0, &comp0, &topk_peer),
+          LAUNCH_PARTNER(&q_peer, &raw0,
+                         indexed ? &comp0 : NULL, &topk_peer),
           "peer partner launch");
     CHECK(sync_tier(0) && sync_tier(1), "peer split synchronization");
     CHECK(ds4_gpu_tensor_read(&home, 0, home_host,
@@ -265,7 +336,8 @@ static int run_case(int indexed) {
     CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
           "mirror home launch");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
-          LAUNCH_PARTNER(&q1, &raw1, &comp1, &topk1),
+          LAUNCH_PARTNER(&q1, &raw1,
+                         indexed ? &comp1 : NULL, &topk1),
           "mirror partner launch");
     CHECK(sync_tier(0) && sync_tier(1), "mirror split synchronization");
     CHECK(ds4_gpu_tensor_read(&home, 0, home_host,
@@ -279,7 +351,8 @@ static int run_case(int indexed) {
     CHECK(ds4_gpu_set_current_device(0) == 0, "baseline timing device");
     for (uint32_t r = 0; r < repeats; r++)
         CHECK(launch_attention(indexed, &ref, model, model_bytes, &q0, &raw0,
-                               &comp0, indexed ? &topk0 : NULL, n_tokens,
+                               indexed ? &comp0 : NULL,
+                               indexed ? &topk0 : NULL, n_tokens,
                                pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
                                window, ratio, n_head, head_dim),
               "baseline timed launch");
@@ -292,7 +365,8 @@ static int run_case(int indexed) {
         CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
               "peer timed home launch");
         CHECK(ds4_gpu_set_current_device(1) == 0 &&
-              LAUNCH_PARTNER(&q_peer, &raw0, &comp0, &topk_peer),
+              LAUNCH_PARTNER(&q_peer, &raw0,
+                             indexed ? &comp0 : NULL, &topk_peer),
               "peer timed partner launch");
     }
     CHECK(sync_tier(0) && sync_tier(1), "peer timing synchronization");
@@ -304,7 +378,8 @@ static int run_case(int indexed) {
         CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
               "mirror timed home launch");
         CHECK(ds4_gpu_set_current_device(1) == 0 &&
-              LAUNCH_PARTNER(&q1, &raw1, &comp1, &topk1),
+              LAUNCH_PARTNER(&q1, &raw1,
+                             indexed ? &comp1 : NULL, &topk1),
               "mirror timed partner launch");
     }
     CHECK(sync_tier(0) && sync_tier(1), "mirror timing synchronization");
@@ -312,7 +387,7 @@ static int run_case(int indexed) {
         (now_seconds() - start) * 1000.0 / (double)repeats;
 
     printf("scenario=attention-row-split-%s-32k\n",
-           indexed ? "indexed" : "mixed");
+           indexed ? "indexed" : "mixed-raw");
     printf("validation=bit-exact-nonzero\nrepeats=%u\n", repeats);
     printf("baseline_ms=%.6f\npeer_read_ms=%.6f\nmirrored_kv_ms=%.6f\n",
            baseline_ms, peer_ms, mirror_ms);
@@ -352,10 +427,389 @@ cleanup:
     return ok;
 }
 
+/* Production-shaped indexed prefill experiment.  The control executes the
+ * complete 512-token score -> top-k -> indexed-attention chain on the home
+ * GPU.  The candidate gives each NVLink peer 256 query rows, including its
+ * own score and top-k work.  Persistent index/raw/compressed caches are
+ * mirrored.  No reduction order changes because query rows are independent.
+ *
+ * Two timings are reported:
+ *   - mirrored_compute: all per-microbatch inputs already local;
+ *   - transfer_inclusive: copy the partner query/indexer inputs and gather
+ *     the partner attention result on every repeat.
+ * This keeps the optimistic compute ceiling separate from the deployable
+ * communication boundary. */
+static int run_indexed_pipeline_case(void) {
+    const uint32_t n_tokens = 512u, half_tokens = 256u;
+    const uint32_t pos0 = 31744u, partner_pos0 = 32000u;
+    const uint32_t n_raw = 2304u, home_n_raw = 2048u;
+    const uint32_t raw_cap = 2304u, raw_start = 0u;
+    const uint32_t n_comp = 7936u, top_k = 512u;
+    const uint32_t window = 2048u, ratio = 4u;
+    const uint32_t n_head = 64u, index_dim = 128u;
+    const uint32_t attention_dim = 512u;
+    const uint64_t index_q_row = (uint64_t)n_head * index_dim;
+    const uint64_t attention_q_row = (uint64_t)n_head * attention_dim;
+    const uint64_t index_q_count = (uint64_t)n_tokens * index_q_row;
+    const uint64_t index_q_half = (uint64_t)half_tokens * index_q_row;
+    const uint64_t index_weight_count = (uint64_t)n_tokens * n_head;
+    const uint64_t index_weight_half = (uint64_t)half_tokens * n_head;
+    const uint64_t index_cache_count = (uint64_t)n_comp * index_dim;
+    const uint64_t score_count = (uint64_t)n_tokens * n_comp;
+    const uint64_t score_half = (uint64_t)half_tokens * n_comp;
+    const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+    const uint64_t selected_half = (uint64_t)half_tokens * top_k;
+    const uint64_t attention_q_count =
+        (uint64_t)n_tokens * attention_q_row;
+    const uint64_t attention_half =
+        (uint64_t)half_tokens * attention_q_row;
+    const uint64_t raw_count = (uint64_t)raw_cap * attention_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * attention_dim;
+    const uint64_t model_bytes = (uint64_t)n_head * sizeof(float);
+    const uint32_t repeats = get_repeats();
+    int ok = 0, initialized = 0;
+
+    float *model = NULL, *index_q_host = NULL, *index_weight_host = NULL;
+    float *index_cache_host = NULL, *attention_q_host = NULL;
+    float *raw_host = NULL, *comp_host = NULL;
+    float *heads_ref_host = NULL, *heads_home_host = NULL;
+    float *heads_partner_host = NULL;
+    uint32_t *selected_ref_host = NULL, *selected_home_host = NULL;
+    uint32_t *selected_partner_host = NULL;
+
+    ds4_gpu_tensor index_q0 = {0}, index_weight0 = {0};
+    ds4_gpu_tensor index_cache0 = {0}, scores0 = {0}, selected0 = {0};
+    ds4_gpu_tensor attention_q0 = {0}, raw0 = {0}, comp0 = {0};
+    ds4_gpu_tensor heads_ref0 = {0}, heads_split0 = {0};
+    ds4_gpu_tensor index_q1 = {0}, index_weight1 = {0};
+    ds4_gpu_tensor index_cache1 = {0}, scores1 = {0}, selected1 = {0};
+    ds4_gpu_tensor attention_q1 = {0}, raw1 = {0}, comp1 = {0};
+    ds4_gpu_tensor heads1 = {0};
+
+    ds4_gpu_tensor index_q_home = {0}, index_q_partner_src = {0};
+    ds4_gpu_tensor index_weight_home = {0}, index_weight_partner_src = {0};
+    ds4_gpu_tensor scores_home = {0}, selected_home = {0};
+    ds4_gpu_tensor attention_q_home = {0}, attention_q_partner_src = {0};
+    ds4_gpu_tensor heads_home = {0}, heads_partner_dst = {0};
+
+    if (!repeats) {
+        fprintf(stderr,
+                "error: DS4_ROWSPLIT_REPEATS must be an integer from 1 to 50\n");
+        return 0;
+    }
+
+    model = (float *)malloc((size_t)model_bytes);
+    index_q_host = (float *)malloc((size_t)index_q_count * sizeof(float));
+    index_weight_host =
+        (float *)malloc((size_t)index_weight_count * sizeof(float));
+    index_cache_host =
+        (float *)malloc((size_t)index_cache_count * sizeof(float));
+    attention_q_host =
+        (float *)malloc((size_t)attention_q_count * sizeof(float));
+    raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
+    comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    heads_ref_host =
+        (float *)malloc((size_t)attention_q_count * sizeof(float));
+    heads_home_host =
+        (float *)malloc((size_t)attention_half * sizeof(float));
+    heads_partner_host =
+        (float *)malloc((size_t)attention_half * sizeof(float));
+    selected_ref_host =
+        (uint32_t *)malloc((size_t)selected_count * sizeof(uint32_t));
+    selected_home_host =
+        (uint32_t *)malloc((size_t)selected_half * sizeof(uint32_t));
+    selected_partner_host =
+        (uint32_t *)malloc((size_t)selected_half * sizeof(uint32_t));
+    CHECK(model && index_q_host && index_weight_host && index_cache_host &&
+          attention_q_host && raw_host && comp_host && heads_ref_host &&
+          heads_home_host && heads_partner_host && selected_ref_host &&
+          selected_home_host && selected_partner_host, "pipeline host allocations");
+
+    for (uint32_t h = 0; h < n_head; h++)
+        model[h] = (float)((int)(h % 9u) - 4) * 0.03125f;
+    for (uint64_t i = 0; i < index_q_count; i++)
+        index_q_host[i] =
+            (float)((int)((i * 17u + 3u) % 31u) - 15) / 512.0f;
+    for (uint64_t i = 0; i < index_weight_count; i++)
+        index_weight_host[i] =
+            (float)((int)((i * 19u + 5u) % 23u) - 11) / 64.0f;
+    for (uint64_t i = 0; i < index_cache_count; i++)
+        index_cache_host[i] =
+            (float)((int)((i * 29u + 7u) % 37u) - 18) / 256.0f;
+    for (uint64_t i = 0; i < attention_q_count; i++)
+        attention_q_host[i] =
+            (float)((int)((i * 23u + 9u) % 41u) - 20) / 1024.0f;
+    for (uint64_t i = 0; i < raw_count; i++)
+        raw_host[i] =
+            (float)((int)((i * 13u + 5u) % 29u) - 14) / 512.0f;
+    for (uint64_t i = 0; i < comp_count; i++)
+        comp_host[i] =
+            (float)((int)((i * 11u + 7u) % 27u) - 13) / 512.0f;
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    CHECK(ds4_gpu_init_multi(&cfg), "pipeline two-GPU initialization");
+    initialized = 1;
+    CHECK(g_gpu_peer_ok[0][1] && g_gpu_peer_ok[1][0],
+          "pipeline bidirectional peer access is required");
+
+#define ALLOC_ON(t_, tier_, count_, type_) \
+    (ds4_gpu_tensor_alloc_on(&(t_), (tier_), \
+                             (count_) * sizeof(type_)) == 0)
+    CHECK(ALLOC_ON(index_q0, 0, index_q_count, float) &&
+          ALLOC_ON(index_weight0, 0, index_weight_count, float) &&
+          ALLOC_ON(index_cache0, 0, index_cache_count, float) &&
+          ALLOC_ON(scores0, 0, score_count, float) &&
+          ALLOC_ON(selected0, 0, selected_count, uint32_t) &&
+          ALLOC_ON(attention_q0, 0, attention_q_count, float) &&
+          ALLOC_ON(raw0, 0, raw_count, float) &&
+          ALLOC_ON(comp0, 0, comp_count, float) &&
+          ALLOC_ON(heads_ref0, 0, attention_q_count, float) &&
+          ALLOC_ON(heads_split0, 0, attention_q_count, float) &&
+          ALLOC_ON(index_q1, 1, index_q_half, float) &&
+          ALLOC_ON(index_weight1, 1, index_weight_half, float) &&
+          ALLOC_ON(index_cache1, 1, index_cache_count, float) &&
+          ALLOC_ON(scores1, 1, score_half, float) &&
+          ALLOC_ON(selected1, 1, selected_half, uint32_t) &&
+          ALLOC_ON(attention_q1, 1, attention_half, float) &&
+          ALLOC_ON(raw1, 1, raw_count, float) &&
+          ALLOC_ON(comp1, 1, comp_count, float) &&
+          ALLOC_ON(heads1, 1, attention_half, float),
+          "pipeline device allocations");
+#undef ALLOC_ON
+
+#define WRITE_TENSOR(t_, src_, count_, type_) \
+    ds4_gpu_tensor_write(&(t_), 0u, (src_), (count_) * sizeof(type_))
+    CHECK(WRITE_TENSOR(index_q0, index_q_host, index_q_count, float) &&
+          WRITE_TENSOR(index_weight0, index_weight_host,
+                       index_weight_count, float) &&
+          WRITE_TENSOR(index_cache0, index_cache_host,
+                       index_cache_count, float) &&
+          WRITE_TENSOR(attention_q0, attention_q_host,
+                       attention_q_count, float) &&
+          WRITE_TENSOR(raw0, raw_host, raw_count, float) &&
+          WRITE_TENSOR(comp0, comp_host, comp_count, float) &&
+          WRITE_TENSOR(index_q1, index_q_host + index_q_half,
+                       index_q_half, float) &&
+          WRITE_TENSOR(index_weight1,
+                       index_weight_host + index_weight_half,
+                       index_weight_half, float) &&
+          WRITE_TENSOR(index_cache1, index_cache_host,
+                       index_cache_count, float) &&
+          WRITE_TENSOR(attention_q1, attention_q_host + attention_half,
+                       attention_half, float) &&
+          WRITE_TENSOR(raw1, raw_host, raw_count, float) &&
+          WRITE_TENSOR(comp1, comp_host, comp_count, float),
+          "pipeline device input writes");
+#undef WRITE_TENSOR
+
+    CHECK(ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_set_model_map(model, model_bytes),
+          "pipeline model-map setup");
+    ds4_tensor_range sink0 = {0u, model_bytes, 0};
+    ds4_tensor_range sink1 = {0u, model_bytes, 1};
+    CHECK(ds4_gpu_device_cache_tensors(0, &sink0, 1) == 0 &&
+          ds4_gpu_device_cache_tensors(1, &sink1, 1) == 0,
+          "pipeline sink cache on both devices");
+    CHECK(sync_tier(0) && sync_tier(1),
+          "pipeline initial synchronization");
+
+    borrow_view(&index_q_home, &index_q0, 0u,
+                index_q_half * sizeof(float));
+    borrow_view(&index_q_partner_src, &index_q0,
+                index_q_half * sizeof(float),
+                index_q_half * sizeof(float));
+    borrow_view(&index_weight_home, &index_weight0, 0u,
+                index_weight_half * sizeof(float));
+    borrow_view(&index_weight_partner_src, &index_weight0,
+                index_weight_half * sizeof(float),
+                index_weight_half * sizeof(float));
+    borrow_view(&scores_home, &scores0, 0u, score_half * sizeof(float));
+    borrow_view(&selected_home, &selected0, 0u,
+                selected_half * sizeof(uint32_t));
+    borrow_view(&attention_q_home, &attention_q0, 0u,
+                attention_half * sizeof(float));
+    borrow_view(&attention_q_partner_src, &attention_q0,
+                attention_half * sizeof(float),
+                attention_half * sizeof(float));
+    borrow_view(&heads_home, &heads_split0, 0u,
+                attention_half * sizeof(float));
+    borrow_view(&heads_partner_dst, &heads_split0,
+                attention_half * sizeof(float),
+                attention_half * sizeof(float));
+
+#define LAUNCH_BASELINE() \
+    launch_indexer_attention_chain( \
+        &scores0, &selected0, &heads_ref0, model, model_bytes, \
+        &index_q0, &index_weight0, &index_cache0, &attention_q0, \
+        &raw0, &comp0, n_tokens, pos0, n_raw, raw_cap, raw_start, \
+        n_comp, top_k, window, ratio, n_head, index_dim, attention_dim)
+#define LAUNCH_HOME_CHAIN() \
+    launch_indexer_attention_chain( \
+        &scores_home, &selected_home, &heads_home, model, model_bytes, \
+        &index_q_home, &index_weight_home, &index_cache0, \
+        &attention_q_home, &raw0, &comp0, half_tokens, pos0, home_n_raw, \
+        raw_cap, raw_start, n_comp, top_k, window, ratio, n_head, \
+        index_dim, attention_dim)
+#define LAUNCH_PARTNER_CHAIN() \
+    launch_indexer_attention_chain( \
+        &scores1, &selected1, &heads1, model, model_bytes, \
+        &index_q1, &index_weight1, &index_cache1, &attention_q1, \
+        &raw1, &comp1, half_tokens, partner_pos0, n_raw, raw_cap, \
+        raw_start, n_comp, top_k, window, ratio, n_head, index_dim, \
+        attention_dim)
+
+    CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_BASELINE() &&
+          sync_tier(0), "pipeline baseline launch");
+    CHECK(ds4_gpu_tensor_read(&selected0, 0u, selected_ref_host,
+                              selected_count * sizeof(uint32_t)) &&
+          ds4_gpu_tensor_read(&heads_ref0, 0u, heads_ref_host,
+                              attention_q_count * sizeof(float)),
+          "pipeline baseline result read");
+    CHECK(any_nonzero_f32(heads_ref_host, attention_q_count),
+          "pipeline baseline output is non-zero");
+
+    CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME_CHAIN(),
+          "pipeline split home launch");
+    CHECK(ds4_gpu_set_current_device(1) == 0 && LAUNCH_PARTNER_CHAIN(),
+          "pipeline split partner launch");
+    CHECK(sync_tier(0) && sync_tier(1),
+          "pipeline split synchronization");
+    CHECK(ds4_gpu_tensor_read(&selected_home, 0u, selected_home_host,
+                              selected_half * sizeof(uint32_t)) &&
+          ds4_gpu_tensor_read(&selected1, 0u, selected_partner_host,
+                              selected_half * sizeof(uint32_t)) &&
+          ds4_gpu_tensor_read(&heads_home, 0u, heads_home_host,
+                              attention_half * sizeof(float)) &&
+          ds4_gpu_tensor_read(&heads1, 0u, heads_partner_host,
+                              attention_half * sizeof(float)),
+          "pipeline split result read");
+    CHECK(compare_u32_halves(selected_ref_host, selected_home_host,
+                             selected_partner_host, selected_half,
+                             "pipeline top-k"),
+          "pipeline top-k exactness");
+    CHECK(compare_halves(heads_ref_host, heads_home_host,
+                         heads_partner_host, attention_half,
+                         "pipeline attention"),
+          "pipeline attention exactness");
+
+    double start = now_seconds();
+    CHECK(ds4_gpu_set_current_device(0) == 0,
+          "pipeline baseline timing device");
+    for (uint32_t r = 0; r < repeats; r++)
+        CHECK(LAUNCH_BASELINE(), "pipeline baseline timed launch");
+    CHECK(sync_tier(0), "pipeline baseline timing synchronization");
+    const double baseline_ms =
+        (now_seconds() - start) * 1000.0 / (double)repeats;
+
+    start = now_seconds();
+    for (uint32_t r = 0; r < repeats; r++) {
+        CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME_CHAIN(),
+              "pipeline mirrored timed home launch");
+        CHECK(ds4_gpu_set_current_device(1) == 0 && LAUNCH_PARTNER_CHAIN(),
+              "pipeline mirrored timed partner launch");
+    }
+    CHECK(sync_tier(0) && sync_tier(1),
+          "pipeline mirrored timing synchronization");
+    const double mirrored_ms =
+        (now_seconds() - start) * 1000.0 / (double)repeats;
+
+    start = now_seconds();
+    for (uint32_t r = 0; r < repeats; r++) {
+        CHECK(ds4_gpu_tensor_copy_xdev3_default_dst(
+                  &index_q1, &index_q_partner_src,
+                  index_q_half * sizeof(float),
+                  &index_weight1, &index_weight_partner_src,
+                  index_weight_half * sizeof(float),
+                  &attention_q1, &attention_q_partner_src,
+                  attention_half * sizeof(float)),
+              "pipeline activation handoff");
+        CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME_CHAIN(),
+              "pipeline transfer timed home launch");
+        CHECK(ds4_gpu_set_current_device(1) == 0 && LAUNCH_PARTNER_CHAIN(),
+              "pipeline transfer timed partner launch");
+        CHECK(ds4_gpu_tensor_copy_xdev(
+                  &heads_partner_dst, &heads1,
+                  attention_half * sizeof(float)),
+              "pipeline attention result gather");
+    }
+    CHECK(sync_tier(0) && sync_tier(1),
+          "pipeline transfer timing synchronization");
+    const double transfer_ms =
+        (now_seconds() - start) * 1000.0 / (double)repeats;
+
+    printf("scenario=indexer-attention-row-split-indexed-32k\n");
+    printf("validation=bit-exact-nonzero\nrepeats=%u\n", repeats);
+    printf("baseline_ms=%.6f\nmirrored_compute_ms=%.6f\n"
+           "transfer_inclusive_ms=%.6f\n",
+           baseline_ms, mirrored_ms, transfer_ms);
+    printf("mirrored_compute_speedup=%.6f\n"
+           "transfer_inclusive_speedup=%.6f\n",
+           baseline_ms / mirrored_ms, baseline_ms / transfer_ms);
+    printf("partner_index_q_bytes=%llu\n"
+           "partner_index_weight_bytes=%llu\n"
+           "partner_attention_q_bytes=%llu\n"
+           "partner_attention_output_bytes=%llu\n",
+           (unsigned long long)(index_q_half * sizeof(float)),
+           (unsigned long long)(index_weight_half * sizeof(float)),
+           (unsigned long long)(attention_half * sizeof(float)),
+           (unsigned long long)(attention_half * sizeof(float)));
+    printf("persistent_partner_index_cache_bytes=%llu\n"
+           "persistent_partner_attention_kv_bytes=%llu\n",
+           (unsigned long long)(index_cache_count * sizeof(float)),
+           (unsigned long long)((raw_count + comp_count) * sizeof(float)));
+    ok = 1;
+
+#undef LAUNCH_PARTNER_CHAIN
+#undef LAUNCH_HOME_CHAIN
+#undef LAUNCH_BASELINE
+
+cleanup:
+    ds4_gpu_tensor_free_in_place(&heads1);
+    ds4_gpu_tensor_free_in_place(&comp1);
+    ds4_gpu_tensor_free_in_place(&raw1);
+    ds4_gpu_tensor_free_in_place(&attention_q1);
+    ds4_gpu_tensor_free_in_place(&selected1);
+    ds4_gpu_tensor_free_in_place(&scores1);
+    ds4_gpu_tensor_free_in_place(&index_cache1);
+    ds4_gpu_tensor_free_in_place(&index_weight1);
+    ds4_gpu_tensor_free_in_place(&index_q1);
+    ds4_gpu_tensor_free_in_place(&heads_split0);
+    ds4_gpu_tensor_free_in_place(&heads_ref0);
+    ds4_gpu_tensor_free_in_place(&comp0);
+    ds4_gpu_tensor_free_in_place(&raw0);
+    ds4_gpu_tensor_free_in_place(&attention_q0);
+    ds4_gpu_tensor_free_in_place(&selected0);
+    ds4_gpu_tensor_free_in_place(&scores0);
+    ds4_gpu_tensor_free_in_place(&index_cache0);
+    ds4_gpu_tensor_free_in_place(&index_weight0);
+    ds4_gpu_tensor_free_in_place(&index_q0);
+    if (initialized) ds4_gpu_cleanup();
+    free(selected_partner_host);
+    free(selected_home_host);
+    free(selected_ref_host);
+    free(heads_partner_host);
+    free(heads_home_host);
+    free(heads_ref_host);
+    free(comp_host);
+    free(raw_host);
+    free(attention_q_host);
+    free(index_cache_host);
+    free(index_weight_host);
+    free(index_q_host);
+    free(model);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 ||
-        (strcmp(argv[1], "mixed") && strcmp(argv[1], "indexed"))) {
-        fprintf(stderr, "Usage: %s mixed|indexed\n", argv[0]);
+        (strcmp(argv[1], "mixed") && strcmp(argv[1], "indexed") &&
+         strcmp(argv[1], "indexed-pipeline"))) {
+        fprintf(stderr, "Usage: %s mixed|indexed|indexed-pipeline\n",
+                argv[0]);
         return 2;
     }
     int count = 0;
@@ -363,5 +817,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: two visible CUDA devices are required\n");
         return 2;
     }
+    if (strcmp(argv[1], "indexed-pipeline") == 0)
+        return run_indexed_pipeline_case() ? 0 : 1;
     return run_case(strcmp(argv[1], "indexed") == 0) ? 0 : 1;
 }

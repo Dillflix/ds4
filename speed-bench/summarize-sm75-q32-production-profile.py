@@ -37,6 +37,10 @@ def family_of(row: dict[str, str]) -> str:
         return "attention_indexed"
     if "attention_decode_mixed" in name:
         return "attention_mixed"
+    if "indexer_scores" in name:
+        return "indexer_score"
+    if "indexer_topk" in name:
+        return "indexer_select"
     if "attention" in name:
         return "attention_other"
     if "matmul_q8" in name or "gemm" in name.lower():
@@ -122,7 +126,8 @@ def main() -> int:
         handle.write(
             "\nTargeted Nsight Compute reports are under `ncu/`; the routed "
             "captures use bounded exact production-dispatch harnesses, while the "
-            "attention captures reproduce the 32K indexed and mixed-score shapes.\n"
+            "attention/indexer captures reproduce the 32K indexed, raw-window "
+            "mixed, WMMA score, and 8192-wide top-k shapes.\n"
         )
     print((output / "profile-summary.md").read_text(encoding="utf-8"), end="")
     return 0

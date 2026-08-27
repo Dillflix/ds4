@@ -422,6 +422,12 @@ if [[ $RUN_NCU == 1 ]]; then
     profile_one attention-mixed-32k attn-mixed-32k \
         '^attention_decode_mixed_heads8_online_kernel.*' \
         'attention_decode_mixed_heads8_online_kernel' 256
+    profile_one indexer-score-32k indexer-score-32k \
+        '^indexer_scores_wmma128_kernel.*' \
+        'indexer_scores_wmma128_kernel' 256
+    profile_one indexer-topk-32k indexer-topk-32k \
+        '^indexer_topk_pow2_u16_kernel.*' \
+        'indexer_topk_pow2_u16_kernel' 1024
 fi
 
 phase=complete
@@ -435,7 +441,9 @@ required=(profile-summary.md kernel-family-summary.csv
 if [[ $RUN_NCU == 1 ]]; then
     required+=(ncu/q4-32-gate-up.ncu-rep ncu/q4-32-down.ncu-rep
                ncu/q3a4-gate-up.ncu-rep ncu/attention-indexed-32k.ncu-rep
-               ncu/attention-mixed-32k.ncu-rep)
+               ncu/attention-mixed-32k.ncu-rep
+               ncu/indexer-score-32k.ncu-rep
+               ncu/indexer-topk-32k.ncu-rep)
 fi
 for item in "${required[@]}"; do
     [[ -s $OUTPUT_DIR/$item ]] || die "missing final evidence: $item"

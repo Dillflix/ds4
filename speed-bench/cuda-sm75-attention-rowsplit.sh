@@ -65,6 +65,7 @@ run_case() {
 
 run_case mixed
 run_case indexed
+run_case indexed-pipeline
 
 python3 - "$OUTPUT_DIR" <<'PY'
 import pathlib, sys
@@ -93,6 +94,27 @@ for name, v in rows:
         f"{float(v['peer_read_ms']):.3f} | {float(v['peer_read_speedup']):.3f}x | "
         f"{float(v['mirrored_kv_ms']):.3f} | {float(v['mirrored_kv_speedup']):.3f}x |"
     )
+values = {}
+for line in (root / "indexed-pipeline.txt").read_text().splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        values[key] = value
+lines.extend([
+    "",
+    "## Complete indexed score -> top-k -> attention chain",
+    "",
+    "The transfer-inclusive result copies the partner indexer query, indexer weights, "
+    "and attention query on every repeat, then gathers the partner attention output. "
+    "Persistent index/raw/compressed caches are mirrored outside the timed region.",
+    "",
+    "| Baseline ms | Mirrored compute ms | Compute speedup | Transfer-inclusive ms | Transfer-inclusive speedup |",
+    "|---:|---:|---:|---:|---:|",
+    f"| {float(values['baseline_ms']):.3f} | "
+    f"{float(values['mirrored_compute_ms']):.3f} | "
+    f"{float(values['mirrored_compute_speedup']):.3f}x | "
+    f"{float(values['transfer_inclusive_ms']):.3f} | "
+    f"{float(values['transfer_inclusive_speedup']):.3f}x |",
+])
 (root / "summary.md").write_text("\n".join(lines) + "\n")
 PY
 
