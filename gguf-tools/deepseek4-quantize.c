@@ -3133,10 +3133,13 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
                                    const char *out_path, const char *layers_text,
                                    const char *experts_text,
                                    const char *parts_text, int requested_rows) {
-    int layers[32], experts[32];
+    enum { MAX_QUALITY_LAYERS = 64, MAX_QUALITY_EXPERTS = 32 };
+    int layers[MAX_QUALITY_LAYERS], experts[MAX_QUALITY_EXPERTS];
     const char *parts[3];
-    const int n_layers = parse_bounded_int_csv(layers_text, layers, 32, "quality layer");
-    const int n_experts = parse_bounded_int_csv(experts_text, experts, 32, "quality expert");
+    const int n_layers = parse_bounded_int_csv(
+        layers_text, layers, MAX_QUALITY_LAYERS, "quality layer");
+    const int n_experts = parse_bounded_int_csv(
+        experts_text, experts, MAX_QUALITY_EXPERTS, "quality expert");
     const int n_parts = parse_quality_parts(parts_text, parts, 3);
     if (requested_rows < 1) die("--quality-rows must be positive");
 
