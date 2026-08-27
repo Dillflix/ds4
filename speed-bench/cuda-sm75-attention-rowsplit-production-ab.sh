@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run an exact-output 32K production A/B for SM75 mirrored-KV query-row split.
+Run an exact-output 32K production A/B for the SM75 indexed-chain row split.
 
 Required environment:
-  MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
+  MODEL=/absolute/path/to/tagged-SM75-production.gguf
 
 Optional environment:
   PROMPT=...                 default: speed-bench/promessi_sposi.txt
@@ -21,9 +21,9 @@ Optional environment:
   CREATE_ARCHIVE=1
   ROWSPLIT_PRODUCTION_DIR=/absolute/output/directory
 
-The candidate is fail-closed for indexed and nonzero-prefix mixed attention.
-Every split call is audited. Initial static-mixed/raw-only work is outside the
-first candidate scope and remains unchanged in both arms.
+The candidate is fail-closed for the complete indexed score -> top-k ->
+attention chain. Every split call is audited. Mixed/raw-only attention remains
+unchanged because its transfer-inclusive path has not been established.
 EOF
 }
 
@@ -35,7 +35,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 MODEL=${MODEL:-}
 [[ $MODEL == /* && -f $MODEL ]] ||
-    die "MODEL must name the existing absolute tagged mixed-Q4/IQ2 model"
+    die "MODEL must name the existing absolute tagged SM75 production model"
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
@@ -135,7 +135,7 @@ if [[ $RUN_HARNESS == 1 ]]; then
     for pair in "${gpu_ids[0]},${gpu_ids[2]}" "${gpu_ids[1]},${gpu_ids[3]}"; do
         name=${pair/,/-}
         : >"$OUTPUT_DIR/harness/pair-$name.log"
-        for scenario in mixed indexed indexed-pipeline; do
+        for scenario in indexed-pipeline; do
             CUDA_VISIBLE_DEVICES=$pair DS4_ROWSPLIT_REPEATS=3 \
                 ./tests/cuda_attention_rowsplit_xdev "$scenario" \
                 >>"$OUTPUT_DIR/harness/pair-$name.log" 2>&1 || {
@@ -144,8 +144,8 @@ if [[ $RUN_HARNESS == 1 ]]; then
                 }
         done
         [[ $(grep -Fc 'validation=bit-exact-nonzero' \
-            "$OUTPUT_DIR/harness/pair-$name.log") == 3 ]] ||
-            die "pair $pair did not validate all attention/indexer paths"
+            "$OUTPUT_DIR/harness/pair-$name.log") == 1 ]] ||
+            die "pair $pair did not validate the complete indexed chain"
     done
 fi
 
@@ -188,10 +188,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         ! grep -Fq 'required but unavailable' "$base.log" ||
             die "$variant encountered a forbidden row-split fallback"
         if [[ $variant == rows ]]; then
-            grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
-                die "row candidate omitted indexed split dispatch"
-            grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
-                die "row candidate omitted mixed split dispatch"
+            grep -Fq 'dispatch=split kind=indexed-chain' "$base.log" ||
+                die "row candidate omitted indexed-chain split dispatch"
+            ! grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
+                die "row candidate unexpectedly split unproven mixed attention"
         else
             ! grep -Fq 'dispatch=split' "$base.log" ||
                 die "home control unexpectedly dispatched row splitting"

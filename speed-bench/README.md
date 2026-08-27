@@ -1764,20 +1764,20 @@ harness does not include output-projection work or the incremental cost of
 maintaining the three partner cache mirrors.
 
 `cuda-sm75-attention-rowsplit-production-ab.sh` is the next fail-closed
-production pass. It interleaves the unchanged home path with the mirrored-KV
-query-row candidate at one 32K frontier, validates the bounded indexed and
-mixed harnesses on both configured NVLink pairs, requires audited production
-dispatches of both target kernels, and compares the emitted frontier logits
-byte-for-byte for every paired repeat. A requested indexed/nonzero-mixed split
-that cannot dispatch aborts; it is never replaced by peer-read or home-only
-execution. Initial static-mixed/raw-only work remains explicitly outside this
-first production candidate and is identical in both arms.
+production pass. It interleaves the unchanged home path with the complete
+indexed score -> top-k -> attention query-row candidate at one 32K frontier,
+validates that transfer-inclusive chain on both configured NVLink pairs,
+requires audited `indexed-chain` production dispatches, and compares emitted
+frontier logits byte-for-byte for every paired repeat. A requested indexed
+split that cannot dispatch aborts; it is never replaced by peer-read or
+home-only execution. Mixed, static-mixed, and raw-only attention remain
+explicitly outside this candidate and are identical in both arms.
 
 ```bash
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 GPU_DEVICES=0,3,1,2 \
