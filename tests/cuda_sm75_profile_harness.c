@@ -225,9 +225,9 @@ static void usage(const char *argv0) {
             "(default), 64, 32, or 16. DS4_PROFILE_INDEXER_TOPK selects the\n"
             "8192-entry top-k implementation: monolithic (default) or\n"
             "chunked. DS4_PROFILE_INDEXER_OPERANDS=materialized compares the\n"
-            "diagnostic FP16-input WMMA128 path, including Q-materialization\n"
-            "cost, against shipping inline conversion. The indexer scenario\n"
-            "compares every score bit against shipping WMMA128 before timing.\n",
+            "diagnostic FP16-input WMMA128 path; streaming64 selects the low-\n"
+            "shared-memory FP16 WMMA64 experiment. Both include Q conversion\n"
+            "cost and compare every score bit against shipping WMMA128.\n",
             argv0);
 }
 
@@ -1070,6 +1070,29 @@ static int verify_indexer_topk(const uint32_t *selected,
     return 1;
 }
 
+static int launch_indexer_f16_candidate(
+        int streaming64,
+        ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q_f16,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *cache_f16,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale) {
+    if (streaming64) {
+        return ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
+            scores, q_f16, weights, cache_f16, n_comp, n_tokens, pos0,
+            n_head, head_dim, ratio, scale);
+    }
+    return ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+        scores, q_f16, weights, cache_f16, n_comp, n_tokens, pos0,
+        n_head, head_dim, ratio, scale);
+}
+
 static int run_indexer_32k(const scenario_spec *spec,
                            uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
@@ -1086,15 +1109,23 @@ static int run_indexer_32k(const scenario_spec *spec,
     if (!tile || !tile[0]) tile = "128";
     if (!topk || !topk[0]) topk = "monolithic";
     if (!operands || !operands[0]) operands = "inline";
-    const int materialized = strcmp(operands, "materialized") == 0;
+    const int streaming64 = strcmp(operands, "streaming64") == 0;
+    const int materialized =
+        streaming64 || strcmp(operands, "materialized") == 0;
     if (!materialized && strcmp(operands, "inline") != 0) {
         fprintf(stderr,
-                "error: DS4_PROFILE_INDEXER_OPERANDS must be inline or materialized\n");
+                "error: DS4_PROFILE_INDEXER_OPERANDS must be inline, "
+                "materialized, or streaming64\n");
         return 0;
     }
-    if (materialized && strcmp(tile, "128") != 0) {
+    if (materialized && !streaming64 && strcmp(tile, "128") != 0) {
         fprintf(stderr,
                 "error: materialized indexer operands require tile 128\n");
+        return 0;
+    }
+    if (streaming64 && strcmp(tile, "64") != 0) {
+        fprintf(stderr,
+                "error: streaming64 indexer operands require tile 64\n");
         return 0;
     }
     if (!configure_indexer_score_tile(tile)) {
@@ -1239,8 +1270,8 @@ static int run_indexer_32k(const scenario_spec *spec,
     }
     if ((!materialized && !configure_indexer_score_tile(tile)) ||
         !(materialized
-              ? ds4_gpu_indexer_scores_decode_batch_f16_tensor(
-                    candidate, q_f16, weights, cache_f16,
+              ? launch_indexer_f16_candidate(
+                    streaming64, candidate, q_f16, weights, cache_f16,
                     n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale)
               : ds4_gpu_indexer_scores_decode_batch_tensor(
                     candidate, q, weights, cache, n_comp, n_tokens, pos0,
@@ -1290,10 +1321,10 @@ static int run_indexer_32k(const scenario_spec *spec,
                 const double start = monotonic_seconds();
                 for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
                     const int launched = run_materialized
-                        ? ds4_gpu_indexer_scores_decode_batch_f16_tensor(
-                            candidate, q_f16, weights, cache_f16,
-                            n_comp, n_tokens, pos0, n_head, head_dim,
-                            ratio, scale)
+                        ? launch_indexer_f16_candidate(
+                            streaming64, candidate, q_f16, weights,
+                            cache_f16, n_comp, n_tokens, pos0, n_head,
+                            head_dim, ratio, scale)
                         : ds4_gpu_indexer_scores_decode_batch_tensor(
                             reference, q, weights, cache,
                             n_comp, n_tokens, pos0, n_head, head_dim,
@@ -1338,8 +1369,8 @@ static int run_indexer_32k(const scenario_spec *spec,
             for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
                 if (!ds4_gpu_tensor_copy_f32_to_f16(
                         q_f16, 0u, q, 0u, q_count) ||
-                    !ds4_gpu_indexer_scores_decode_batch_f16_tensor(
-                        candidate, q_f16, weights, cache_f16,
+                    !launch_indexer_f16_candidate(
+                        streaming64, candidate, q_f16, weights, cache_f16,
                         n_comp, n_tokens, pos0, n_head, head_dim,
                         ratio, scale)) {
                     fprintf(stderr,

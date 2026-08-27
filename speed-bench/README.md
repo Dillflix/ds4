@@ -1823,6 +1823,34 @@ diagnostic: no production storage or dispatch changes are made. At 256K, the
 8 MiB on the executing tier. Promotion requires a subsequent full-model exact
 frontier-logit and interleaved throughput A/B.
 
+The standalone FP16-operand result showed that conversion/DRAM reduction by
+itself is not material: its paired median was approximately 1.004x end to end.
+`CANDIDATE=streaming64` therefore tests a separate SM75 mechanism. Each warp
+loads its eight FP16 K fragments once and retains them across the ordered
+64-head reduction; the kernel removes shared K and accumulator storage and
+warp-broadcasts the 16 unique scalar weights. The runner records a failed
+production-resource gate for local-memory traffic, more than 128 registers per
+thread, or more than 16 KiB static shared memory—the envelope needed for at least
+four 128-thread CTAs on Turing—but still collects exactness, timing, and Nsight
+evidence so a compiler-resource failure is itself diagnosable.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+CANDIDATE=streaming64 \
+PROFILE_GPU=0 \
+TIMING_ROUNDS=5 \
+TIMING_REPEATS=10 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-f16-operands.sh
+```
+
+Return `sm75-indexer-streaming64-<timestamp>.tar.gz`. The candidate remains
+diagnostic and cannot affect the production graph.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it

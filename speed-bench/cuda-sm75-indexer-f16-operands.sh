@@ -3,8 +3,9 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Measure pre-materialized FP16 operands for the retained SM75 indexer WMMA128
-kernel without opening a GGUF.
+Measure either pre-materialized FP16 operands for the retained SM75 WMMA128
+kernel or the exact low-shared-memory streaming WMMA64 candidate without
+opening a GGUF.
 
 The final production-shaped 512-token microbatch at 32K is used. Every score
 bit and the ordered top-512 set must match shipping inline-conversion WMMA128.
@@ -14,6 +15,7 @@ reported separately because production would update that sidecar at cache
 write time, not reconvert the full history for each score call.
 
 Optional environment:
+  CANDIDATE=materialized|streaming64
   PROFILE_GPU=0
   CUDA_ARCH=sm_75
   TIMING_ROUNDS=5
@@ -34,6 +36,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 PROFILE_GPU=${PROFILE_GPU:-0}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
+CANDIDATE=${CANDIDATE:-materialized}
 TIMING_ROUNDS=${TIMING_ROUNDS:-5}
 TIMING_REPEATS=${TIMING_REPEATS:-10}
 RUN_NCU=${RUN_NCU:-1}
@@ -41,7 +44,18 @@ NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-OUTPUT_DIR=${INDEXER_F16_DIR:-$repo_dir/sm75-indexer-f16-operands-$stamp}
+if [[ $CANDIDATE == streaming64 ]]; then
+    output_prefix=sm75-indexer-streaming64
+    candidate_tile=64
+    candidate_kernel='indexer_scores_wmma64_f16_streaming_kernel.*'
+elif [[ $CANDIDATE == materialized ]]; then
+    output_prefix=sm75-indexer-f16-operands
+    candidate_tile=128
+    candidate_kernel='indexer_scores_wmma128_f16_kernel.*'
+else
+    die "CANDIDATE must be materialized or streaming64"
+fi
+OUTPUT_DIR=${INDEXER_F16_DIR:-$repo_dir/$output_prefix-$stamp}
 
 for item in "PROFILE_GPU:$PROFILE_GPU" "TIMING_ROUNDS:$TIMING_ROUNDS" \
             "TIMING_REPEATS:$TIMING_REPEATS" "RUN_NCU:$RUN_NCU" \
@@ -63,6 +77,11 @@ for tool in awk bash basename date dirname git grep id make mkdir mv nproc \
             nvidia-smi python3 sort tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
+if [[ $CANDIDATE == streaming64 ]]; then
+    for tool in c++filt cuobjdump; do
+        command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
+    done
+fi
 git diff --quiet && git diff --cached --quiet ||
     die "tracked source changes are present; test an exact committed tree"
 compute_cap=$(nvidia-smi -i "$PROFILE_GPU" --query-gpu=compute_cap \
@@ -112,6 +131,67 @@ else
 fi
 [[ -x tests/cuda_sm75_profile_harness ]] || die "profile harness is missing"
 
+if [[ $CANDIDATE == streaming64 ]]; then
+    phase=resource-validation
+    cuobjdump --dump-resource-usage tests/cuda_sm75_profile_harness |
+        c++filt >"$OUTPUT_DIR/validation/resources.txt"
+    cuobjdump --dump-sass tests/cuda_sm75_profile_harness |
+        c++filt >"$OUTPUT_DIR/validation/all.sass"
+    awk -v wanted=indexer_scores_wmma64_f16_streaming_kernel '
+        /Function : / { emit = index($0, wanted) != 0 }
+        emit { print }
+    ' "$OUTPUT_DIR/validation/all.sass" \
+        >"$OUTPUT_DIR/validation/streaming64.sass"
+    [[ -s $OUTPUT_DIR/validation/streaming64.sass ]] ||
+        die "streaming64 SASS record is missing"
+    if grep -Eq '(^|[[:space:]])(LDL|STL)([[:space:].]|$)' \
+            "$OUTPUT_DIR/validation/streaming64.sass"; then
+        die "streaming64 contains local-memory load/store instructions"
+    fi
+    python3 - "$OUTPUT_DIR/validation/resources.txt" \
+            "$OUTPUT_DIR/validation/resources.csv" <<'PY'
+import csv
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+needle = "indexer_scores_wmma64_f16_streaming_kernel"
+records = []
+for index, line in enumerate(source):
+    if "Function" not in line or needle not in line:
+        continue
+    record = next((item for item in source[index + 1:index + 8]
+                   if re.match(r"\s*REG:", item)), "")
+    values = {key: int(value) for key, value in
+              re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", record)}
+    if set(values) != {"REG", "STACK", "SHARED", "LOCAL"}:
+        raise SystemExit(f"missing streaming64 resource fields: {record}")
+    records.append({"kernel": line.strip(), **values})
+if len(records) != 1:
+    raise SystemExit(f"expected one streaming64 resource record: {records}")
+row = records[0]
+reasons = []
+if row["REG"] > 128:
+    reasons.append(f'registers={row["REG"]}>128')
+if row["STACK"] or row["LOCAL"]:
+    reasons.append(
+        f'local(stack={row["STACK"]};local={row["LOCAL"]})')
+if row["SHARED"] > 16384:
+    reasons.append(f'shared={row["SHARED"]}>16384')
+row["four_cta_resource_gate"] = "pass" if not reasons else "fail"
+row["reason"] = ";".join(reasons) if reasons else "none"
+with Path(sys.argv[2]).open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=row.keys())
+    writer.writeheader()
+    writer.writerow(row)
+print(row)
+PY
+    if grep -q ',fail,' "$OUTPUT_DIR/validation/resources.csv"; then
+        printf 'warning: streaming64 failed the four-CTA production resource gate; retaining exactness, timing, and Nsight evidence\n' >&2
+    fi
+fi
+
 phase=manifest
 {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
@@ -122,7 +202,7 @@ phase=manifest
     printf 'free_mib_at_preflight=%s\ntiming_rounds=%s\ntiming_repeats=%s\n' \
         "$free_mib" "$TIMING_ROUNDS" "$TIMING_REPEATS"
     printf 'shape=512x64x128-by-8192\nposition=32256\ntop_k=512\n'
-    printf 'reference=shipping-inline-wmma128\ncandidate=materialized-f16-wmma128\n'
+    printf 'reference=shipping-inline-wmma128\ncandidate=%s\n' "$CANDIDATE"
     printf 'candidate_q_conversion=included\ncandidate_full_k_reconversion=excluded\n'
     printf 'run_ncu=%s\nncu_use_sudo=%s\n\n[gpu]\n' \
         "$RUN_NCU" "$NCU_USE_SUDO"
@@ -139,24 +219,24 @@ value_from_log() {
 }
 
 phase=paired-timing
-printf 'round,order,inline_score_ms,materialized_score_ms,q_materialize_ms,materialized_e2e_ms,persistent_k_once_ms,kernel_speedup,e2e_speedup\n' \
+printf 'round,order,inline_score_ms,candidate_score_ms,q_materialize_ms,candidate_e2e_ms,persistent_k_once_ms,kernel_speedup,e2e_speedup\n' \
     >"$OUTPUT_DIR/timing.csv"
 for ((round=1; round<=TIMING_ROUNDS; round++)); do
     if (( round % 2 == 1 )); then order=inline-first; else order=materialized-first; fi
     log="$OUTPUT_DIR/timing/round-$round-$order.log"
-    printf 'Timing exact materialized operands round=%s/%s order=%s...\n' \
-        "$round" "$TIMING_ROUNDS" "$order"
+    printf 'Timing exact %s operands round=%s/%s order=%s...\n' \
+        "$CANDIDATE" "$round" "$TIMING_ROUNDS" "$order"
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-        DS4_PROFILE_INDEXER_TILE=128 \
+        DS4_PROFILE_INDEXER_TILE="$candidate_tile" \
         DS4_PROFILE_INDEXER_TOPK=monolithic \
-        DS4_PROFILE_INDEXER_OPERANDS=materialized \
+        DS4_PROFILE_INDEXER_OPERANDS="$CANDIDATE" \
         DS4_PROFILE_INDEXER_MATERIALIZED_TIMING_ORDER="$order" \
         DS4_PROFILE_REPEATS="$TIMING_REPEATS" \
         ./tests/cuda_sm75_profile_harness indexer-32k >"$log" 2>&1 || {
             tail -n 160 "$log" >&2 || true
-            die "materialized-operand harness failed in round $round"
+            die "$CANDIDATE harness failed in round $round"
         }
-    for marker in 'operand_path=materialized' 'score_validation=bit-exact' \
+    for marker in "operand_path=$CANDIDATE" 'score_validation=bit-exact' \
                   'topk_validation=exact-order-and-set' 'harness_status=ok'; do
         grep -Fqx "$marker" "$log" ||
             die "round $round lacks required marker: $marker"
@@ -199,9 +279,9 @@ if [[ $RUN_NCU == 1 ]]; then
         local base="$OUTPUT_DIR/ncu/$label" rc=0
         printf 'Nsight Compute: %s...\n' "$label"
         env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-            DS4_PROFILE_INDEXER_TILE=128 \
+            DS4_PROFILE_INDEXER_TILE="$candidate_tile" \
             DS4_PROFILE_INDEXER_TOPK=monolithic \
-            DS4_PROFILE_INDEXER_OPERANDS=materialized \
+            DS4_PROFILE_INDEXER_OPERANDS="$CANDIDATE" \
             DS4_PROFILE_REPEATS=0 \
             "${ncu_cmd[@]}" --config-file off \
                 --target-processes application-only --devices 0 \
@@ -233,8 +313,7 @@ if [[ $RUN_NCU == 1 ]]; then
 
     profile_one inline-wmma128 'indexer_scores_wmma128_kernel.*' 0 \
         'indexer_scores_wmma128_kernel.*'
-    profile_one materialized-wmma128 'indexer_scores_wmma128_f16_kernel.*' 0 \
-        'indexer_scores_wmma128_f16_kernel.*'
+    profile_one candidate "$candidate_kernel" 0 "$candidate_kernel"
     profile_one persistent-k-materialize 'f32_to_f16_kernel.*' 0 \
         'f32_to_f16_kernel.*'
     profile_one q-materialize 'f32_to_f16_kernel.*' 1 \
@@ -246,12 +325,18 @@ for required in manifest.txt timing.csv summary.md comparison.json \
                 timing/round-1-inline-first.log; do
     [[ -s $OUTPUT_DIR/$required ]] || die "missing final evidence: $required"
 done
+if [[ $CANDIDATE == streaming64 ]]; then
+    [[ -s $OUTPUT_DIR/validation/resources.csv &&
+       -s $OUTPUT_DIR/validation/streaming64.sass ]] ||
+        die "missing final streaming64 resource evidence"
+fi
 if [[ $RUN_NCU == 1 ]]; then
-    for report in inline-wmma128 materialized-wmma128 \
+    for report in inline-wmma128 candidate \
                   persistent-k-materialize q-materialize; do
         [[ -s $OUTPUT_DIR/ncu/$report.ncu-rep &&
            -s $OUTPUT_DIR/ncu/$report.csv ]] ||
             die "missing final Nsight evidence: $report"
     done
 fi
-printf 'SM75 indexer FP16-operand experiment complete: %s\n' "$OUTPUT_DIR"
+printf 'SM75 indexer %s experiment complete: %s\n' \
+    "$CANDIDATE" "$OUTPUT_DIR"

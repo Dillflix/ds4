@@ -26,13 +26,17 @@ def main() -> int:
     if len(rows) < 3:
         die("at least three paired timing rounds are required")
 
+    candidate_score_field = (
+        "candidate_score_ms" if "candidate_score_ms" in rows[0]
+        else "materialized_score_ms"
+    )
+    candidate_e2e_field = (
+        "candidate_e2e_ms" if "candidate_e2e_ms" in rows[0]
+        else "materialized_e2e_ms"
+    )
     numeric_fields = [
-        "inline_score_ms",
-        "materialized_score_ms",
-        "q_materialize_ms",
-        "materialized_e2e_ms",
-        "persistent_k_once_ms",
-        "kernel_speedup",
+        "inline_score_ms", candidate_score_field, "q_materialize_ms",
+        candidate_e2e_field, "persistent_k_once_ms", "kernel_speedup",
         "e2e_speedup",
     ]
     values: dict[str, list[float]] = {
@@ -42,13 +46,34 @@ def main() -> int:
     if not orders.issubset({"inline-first", "materialized-first"}) or len(orders) != 2:
         die("timing rounds must contain both alternating execution orders")
     if any(float(row["inline_score_ms"]) <= 0.0 or
-           float(row["materialized_score_ms"]) <= 0.0 or
-           float(row["materialized_e2e_ms"]) <= 0.0
+           float(row[candidate_score_field]) <= 0.0 or
+           float(row[candidate_e2e_field]) <= 0.0
            for row in rows):
         die("timing input contains a non-positive duration")
 
     medians = {field: statistics.median(samples)
                for field, samples in values.items()}
+    candidate = "materialized"
+    manifest_path = root / "manifest.txt"
+    if manifest_path.is_file():
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("candidate="):
+                candidate = line.split("=", 1)[1]
+                break
+    if candidate not in {"materialized", "streaming64"}:
+        die(f"unknown candidate in manifest: {candidate}")
+    candidate_label = (
+        "Streaming FP16 WMMA64" if candidate == "streaming64"
+        else "Materialized-input WMMA128"
+    )
+    resource = None
+    resource_path = root / "validation" / "resources.csv"
+    if resource_path.is_file() and resource_path.stat().st_size:
+        with resource_path.open(newline="", encoding="utf-8") as handle:
+            resource_rows = list(csv.DictReader(handle))
+        if len(resource_rows) != 1:
+            die("streaming resource evidence must contain exactly one record")
+        resource = resource_rows[0]
     # DeepSeek-V4 Flash uses ratio-4 indexers in even layers 2..42.  The
     # production 22/21 split therefore places layers 2..20 (10) in stage 0
     # and layers 22..42 (11) in stage 1.
@@ -60,34 +85,46 @@ def main() -> int:
         "persistent_f16_k_stage1_bytes": 11 * 65536 * 128 * 2,
         "f16_q_live_512_bytes": 512 * 64 * 128 * 2,
         "arithmetic": "bit-exact-required",
+        "candidate": candidate,
+        "resource": resource,
     }
     (root / "comparison.json").write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
     )
 
     with (root / "summary.md").open("w", encoding="utf-8") as handle:
-        handle.write("# SM75 indexer FP16-operand experiment\n\n")
-        handle.write(
-            "The candidate retains the shipping WMMA128 accumulation and "
-            "epilogue. It moves the existing `__float2half` Q/K rounding out "
-            "of every score tile. Candidate end-to-end time includes one Q "
-            "materialization per 512-token microbatch; persistent-K "
-            "materialization is reported separately.\n\n"
-        )
+        handle.write(f"# SM75 indexer {candidate} experiment\n\n")
+        if candidate == "streaming64":
+            handle.write(
+                "The candidate retains each warp's FP16 K fragments in "
+                "registers across the exact ordered 64-head reduction, uses "
+                "about 8 KiB of shared Q/output scratch, and warp-broadcasts "
+                "the 16 unique per-head weights. Candidate end-to-end time "
+                "includes one Q materialization per 512-token microbatch; "
+                "persistent-K materialization is reported separately.\n\n"
+            )
+        else:
+            handle.write(
+                "The candidate retains the shipping WMMA128 accumulation and "
+                "epilogue. It moves the existing `__float2half` Q/K rounding "
+                "out of every score tile. Candidate end-to-end time includes "
+                "one Q materialization per 512-token microbatch; persistent-K "
+                "materialization is reported separately.\n\n"
+            )
         handle.write("| Measurement | Paired median |\n|---|---:|\n")
         handle.write(
             f"| Shipping inline WMMA128 | {medians['inline_score_ms']:.6f} ms |\n"
         )
         handle.write(
-            f"| Materialized-input kernel | "
-            f"{medians['materialized_score_ms']:.6f} ms |\n"
+            f"| {candidate_label} kernel | "
+            f"{medians[candidate_score_field]:.6f} ms |\n"
         )
         handle.write(
             f"| Q materialization | {medians['q_materialize_ms']:.6f} ms |\n"
         )
         handle.write(
             f"| Candidate Q-pack + score | "
-            f"{medians['materialized_e2e_ms']:.6f} ms |\n"
+            f"{medians[candidate_e2e_field]:.6f} ms |\n"
         )
         handle.write(
             f"| Kernel-only speedup | {medians['kernel_speedup']:.6f}x |\n"
@@ -99,6 +136,15 @@ def main() -> int:
             f"| One full 8192-row K conversion | "
             f"{medians['persistent_k_once_ms']:.6f} ms |\n\n"
         )
+        if resource is not None:
+            handle.write(
+                "| Streaming resource | Value |\n|---|---:|\n"
+                f"| Registers/thread | {resource['REG']} |\n"
+                f"| Static shared memory | {resource['SHARED']} bytes |\n"
+                f"| Stack/local bytes | {resource['STACK']}/{resource['LOCAL']} |\n"
+                f"| Four-CTA resource gate | "
+                f"{resource['four_cta_resource_gate']} |\n\n"
+            )
         handle.write(
             "A production 256K sidecar would consume **336 MiB** total: "
             "160 MiB for the ten stage-0 indexer layers and 176 MiB for the "

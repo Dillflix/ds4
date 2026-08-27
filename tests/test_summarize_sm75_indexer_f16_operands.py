@@ -43,6 +43,35 @@ def main() -> int:
         assert "not a production promotion gate" in (
             root / "summary.md"
         ).read_text(encoding="utf-8")
+        (root / "manifest.txt").write_text(
+            "candidate=streaming64\n", encoding="utf-8"
+        )
+        timing = (root / "timing.csv").read_text(encoding="utf-8")
+        timing = timing.replace("materialized_score_ms", "candidate_score_ms")
+        timing = timing.replace("materialized_e2e_ms", "candidate_e2e_ms")
+        (root / "timing.csv").write_text(timing, encoding="utf-8")
+        (root / "validation").mkdir()
+        with (root / "validation" / "resources.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=(
+                "kernel", "REG", "STACK", "SHARED", "LOCAL",
+                "four_cta_resource_gate", "reason",
+            ))
+            writer.writeheader()
+            writer.writerow({
+                "kernel": "streaming64", "REG": 96, "STACK": 0,
+                "SHARED": 8192, "LOCAL": 0,
+                "four_cta_resource_gate": "pass", "reason": "none",
+            })
+        subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+        result = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+        assert result["candidate"] == "streaming64"
+        assert abs(result["medians"]["candidate_score_ms"] - 7.0) < 1e-9
+        assert result["resource"]["four_cta_resource_gate"] == "pass"
+        assert "Streaming FP16 WMMA64" in (
+            root / "summary.md"
+        ).read_text(encoding="utf-8")
     print("SM75 indexer FP16-operand summarizer test: OK")
     return 0
 
