@@ -41,6 +41,7 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 uint32_t ds4_test_q8_cache_class(const char *name);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -844,6 +845,25 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS", old);
 }
 
+static void test_cuda_tp_prefill_attn_rows_default(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
+    char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
+          "CUDA TP query-row splitting remains off before production A/B");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
+          "CUDA TP query-row splitting accepts an explicit opt-in");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
+          "CUDA TP query-row splitting accepts an explicit zero");
+
+    restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -1019,6 +1039,7 @@ int main(void) {
     test_glm_per_layer_cache_accounting();
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
+    test_cuda_tp_prefill_attn_rows_default();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_ep_forced_stage_split();
     test_cuda_tp_output_head_moves_to_lower_half();

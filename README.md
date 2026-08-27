@@ -831,6 +831,19 @@ halves concurrently, gathers the packed low-rank halves, and runs one full
 cached output-B GEMM. It is not the performance default because both tested
 output strategies regressed prefill by roughly 20% across 2K..65K on the
 4x RTX 8000 NVLink-pair target.
+`DS4_CUDA_TP_PREFILL_ATTN_ROWS=1` selects the separate SM75 query-row
+experiment for indexed and nonzero-prefix mixed attention. It incrementally
+mirrors raw and compressed KV on the NVLink partner, copies the latter half of
+Q to that partner, executes 50/50 row launches concurrently, and gathers the
+partner's full-head result before the unchanged inverse-RoPE/output projection.
+The declared indexed/mixed scope is fail-closed: a requested call that cannot
+use bidirectional peer access, its partner-local mirror, or the exact 50/50
+shape aborts instead of silently running on the home GPU. Initial static-mixed
+and raw-only attention are outside this first production experiment and remain
+identical in both A/B arms. Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
+one record for every split call. Direct peer-reading of persistent KV is not a
+fallback; the bounded SM75 experiment measured that strategy slower than the
+shipping home path on both NVLink pairs.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.

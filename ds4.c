@@ -15378,6 +15378,19 @@ static bool cuda_tp_prefill_attn_heads_env_enabled(void) {
 #endif
 }
 
+static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    /* Experimental until the production four-GPU A/B passes.  Unlike the
+     * older head split, this path partitions independent query rows and
+     * requires a partner-local raw/compressed KV mirror; it never falls back
+     * to remote cache reads. */
+    return env && env[0] && strcmp(env, "0") != 0;
+#endif
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -15664,6 +15677,7 @@ typedef struct {
     bool cuda_tp_prefill_ffn;
     bool cuda_tp_prefill_attn_output;
     bool cuda_tp_prefill_attn_heads;
+    bool cuda_tp_prefill_attn_rows;
     bool cuda_q_norm_rope_fuse;
     bool cuda_qkv_kv_rope_fuse;
     bool cuda_qkv_pair;
@@ -17226,6 +17240,14 @@ static bool metal_graph_cuda_tp_prefill_attn_heads_requested(void) {
 #endif
 }
 
+static bool metal_graph_cuda_tp_prefill_attn_rows_requested(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    return cuda_tp_prefill_attn_rows_env_enabled();
+#endif
+}
+
 static uint32_t metal_graph_cuda_prefill_pipeline_microbatch(void) {
     const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_MB");
     if (env && env[0]) {
@@ -17300,8 +17322,11 @@ static bool metal_graph_alloc_raw_cap(
     g->cuda_tp_attn = g->cuda_tp_decode && metal_graph_cuda_tp_attn_requested();
     g->cuda_tp_attn_peer_read = metal_graph_cuda_tp_attn_peer_read_requested();
     g->cuda_tp_attn_heads = g->cuda_tp_decode && metal_graph_cuda_tp_attn_heads_requested();
-    g->cuda_tp_attn_cache_dup = g->cuda_tp_attn_heads &&
-                                metal_graph_cuda_tp_attn_cache_dup_requested();
+    g->cuda_tp_prefill_attn_rows =
+        g->cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_rows_requested();
+    g->cuda_tp_attn_cache_dup =
+        (g->cuda_tp_attn_heads && metal_graph_cuda_tp_attn_cache_dup_requested()) ||
+        g->cuda_tp_prefill_attn_rows;
     g->cuda_tp_moe = g->cuda_tp_decode && metal_graph_cuda_tp_moe_requested();
     g->cuda_tp_ep = g->cuda_tp_moe && cuda_tensor_parallel;
     g->cuda_tp_ep_pack_exact =
@@ -20375,6 +20400,12 @@ static uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
 }
 
+static bool metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       first_row,
+        uint32_t       rows);
+
 static bool metal_graph_commit_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -20444,6 +20475,45 @@ static bool metal_graph_cuda_tp_attn_cache_copy_row(
     ds4_gpu_tensor_free(src);
     ds4_gpu_tensor_free(dst);
     return ok;
+}
+
+static bool metal_graph_cuda_tp_attn_cache_sync_raw_rows(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       first_pos,
+        uint32_t       rows) {
+    if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) return true;
+    if (rows == 0) return true;
+    if (g->raw_cap == 0 || rows > g->raw_cap) return false;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t first_row = first_pos % g->raw_cap;
+    const uint32_t first_rows = rows < g->raw_cap - first_row
+        ? rows : g->raw_cap - first_row;
+    if (!metal_graph_cuda_tp_attn_cache_copy_row(
+            g->layer_raw_cache_tp[il], g->layer_raw_cache[il],
+            (uint64_t)first_row * row_bytes,
+            (uint64_t)first_rows * row_bytes)) return false;
+    const uint32_t wrapped_rows = rows - first_rows;
+    return wrapped_rows == 0 || metal_graph_cuda_tp_attn_cache_copy_row(
+        g->layer_raw_cache_tp[il], g->layer_raw_cache[il], 0,
+        (uint64_t)wrapped_rows * row_bytes);
+}
+
+static bool metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       first_row,
+        uint32_t       rows) {
+    if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) return true;
+    if (rows == 0) return true;
+    if (first_row > g->layer_comp_cap[il] ||
+        rows > g->layer_comp_cap[il] - first_row) return false;
+    const uint64_t row_bytes = metal_graph_attn_comp_cache_row_bytes();
+    return metal_graph_cuda_tp_attn_cache_copy_row(
+        g->layer_attn_comp_cache_tp[il],
+        g->layer_attn_comp_cache[il],
+        (uint64_t)first_row * row_bytes,
+        (uint64_t)rows * row_bytes);
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_raw_row(
@@ -22473,6 +22543,8 @@ static bool metal_graph_encode_decode_layer_phase(
             ds4_gpu_tensor_free(comp_row_view);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_quantize");
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+            if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+                g, il, comp_row, 1);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_commit");
         }
         if (ok && emit) g->layer_n_comp[il]++;
@@ -27434,6 +27506,170 @@ static bool metal_graph_cuda_tp_prefill_attention_launch(
 #endif
 }
 
+static bool metal_graph_cuda_tp_prefill_attention_rows_active(
+        const ds4_gpu_graph *g,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t n_raw) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU)
+    (void)g; (void)layer; (void)il; (void)pos0; (void)n_tokens; (void)n_raw;
+    return false;
+#else
+    if (!g || !layer || !g->cuda_tp_prefill_attn_rows ||
+        n_tokens < 512u || (n_tokens & 1u) != 0u ||
+        n_raw <= n_tokens / 2u ||
+        metal_graph_directional_steering_attn_enabled(g) ||
+        metal_graph_debug_wants("kqv_out", il, pos0) ||
+        metal_graph_debug_wants("kqv_back", il, pos0)) return false;
+    const int home = g->active_tier;
+    const int partner = metal_graph_cuda_tp_partner_tier(home);
+    return partner >= 0 &&
+        g_gpu_peer_ok[partner][home] && g_gpu_peer_ok[home][partner] &&
+        metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il) &&
+        g->batch_q_by_tier[home] && g->batch_q_by_tier[partner] &&
+        g->batch_heads_by_tier[home] && g->batch_heads_by_tier[partner] &&
+        g->comp_selected_by_tier[partner];
+#endif
+}
+
+/* Split independent query rows 50/50 across one NVLink pair.  The partner
+ * consumes only partner-local raw/compressed KV; direct remote reads are
+ * deliberately not a fallback because the SM75 harness measured them at
+ * 0.38x-0.65x of the shipping single-GPU launch.  Attention output rows are
+ * gathered before inverse RoPE, leaving every downstream arithmetic path
+ * byte-for-byte identical to the unsplit production path. */
+static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
+        ds4_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *layer, uint32_t il,
+        ds4_cuda_prefill_attn_kind kind, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t top_k, uint32_t window, uint32_t ratio) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU)
+    (void)g; (void)model; (void)layer; (void)il; (void)kind; (void)topk;
+    (void)n_tokens; (void)pos0; (void)n_raw; (void)raw_cap;
+    (void)raw_start; (void)n_comp; (void)top_k; (void)window; (void)ratio;
+    return false;
+#else
+    if (kind != DS4_CUDA_PREFILL_ATTN_INDEXED &&
+        kind != DS4_CUDA_PREFILL_ATTN_DECODE_MIXED) return false;
+    if (!metal_graph_cuda_tp_prefill_attention_rows_active(
+            g, layer, il, pos0, n_tokens, n_raw)) return false;
+
+    const int home = g->active_tier;
+    const int partner = metal_graph_cuda_tp_partner_tier(home);
+    const uint32_t rows = n_tokens / 2u;
+    const uint32_t home_n_raw = n_raw - rows;
+    const uint64_t q_row_values = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t q_half_bytes = (uint64_t)rows * q_row_values * sizeof(float);
+    const uint64_t topk_half_bytes = (uint64_t)rows * top_k * sizeof(uint32_t);
+
+    ds4_gpu_tensor *home_q = metal_graph_tensor_row_range_view(
+        g->batch_q_by_tier[home], 0, rows, q_row_values);
+    ds4_gpu_tensor *peer_q_src = metal_graph_tensor_row_range_view(
+        g->batch_q_by_tier[home], rows, rows, q_row_values);
+    ds4_gpu_tensor *peer_q_dst = metal_graph_tensor_row_range_view(
+        g->batch_q_by_tier[partner], 0, rows, q_row_values);
+    ds4_gpu_tensor *home_heads = metal_graph_tensor_row_range_view(
+        g->batch_heads_by_tier[home], 0, rows, q_row_values);
+    ds4_gpu_tensor *peer_heads = metal_graph_tensor_row_range_view(
+        g->batch_heads_by_tier[partner], 0, rows, q_row_values);
+    ds4_gpu_tensor *gather_dst = metal_graph_tensor_row_range_view(
+        g->batch_heads_by_tier[home], rows, rows, q_row_values);
+    ds4_gpu_tensor *home_topk = NULL;
+    ds4_gpu_tensor *peer_topk_src = NULL;
+    ds4_gpu_tensor *peer_topk_dst = NULL;
+    bool ok = home_q && peer_q_src && peer_q_dst && home_heads && peer_heads &&
+              gather_dst && ds4_gpu_tensor_copy_xdev(
+                  peer_q_dst, peer_q_src, q_half_bytes) != 0;
+
+    if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
+        home_topk = ds4_gpu_tensor_view((ds4_gpu_tensor *)topk, 0,
+                                       topk_half_bytes);
+        peer_topk_src = ds4_gpu_tensor_view((ds4_gpu_tensor *)topk,
+                                           topk_half_bytes,
+                                           topk_half_bytes);
+        peer_topk_dst = ds4_gpu_tensor_view(
+            g->comp_selected_by_tier[partner], 0, topk_half_bytes);
+        ok = home_topk && peer_topk_src && peer_topk_dst &&
+             ds4_gpu_tensor_copy_xdev(peer_topk_dst, peer_topk_src,
+                                      topk_half_bytes) != 0;
+    }
+
+    if (ok) ok = ds4_gpu_set_current_device(partner) == 0;
+    if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
+        ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
+            peer_q_dst, g->layer_raw_cache_tp[il],
+            g->layer_attn_comp_cache_tp[il],
+            metal_graph_attn_comp_cache_is_f16(), peer_topk_dst, rows,
+            pos0 + rows, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+            peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
+            peer_q_dst, g->layer_raw_cache_tp[il],
+            g->layer_attn_comp_cache_tp[il],
+            metal_graph_attn_comp_cache_is_f16(), NULL, 0u, rows,
+            pos0 + rows, n_raw, raw_cap, raw_start, n_comp, window,
+            ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+    }
+
+    if (ds4_gpu_set_current_device(home) != 0) ok = false;
+    if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
+        ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            home_heads, model->map, model->size, layer->attn_sinks->abs_offset,
+            home_q, g->layer_raw_cache[il], g->layer_attn_comp_cache[il],
+            metal_graph_attn_comp_cache_is_f16(), home_topk, rows, pos0,
+            home_n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio,
+            DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+            home_heads, model->map, model->size, layer->attn_sinks->abs_offset,
+            home_q, g->layer_raw_cache[il], g->layer_attn_comp_cache[il],
+            metal_graph_attn_comp_cache_is_f16(), NULL, 0u, rows, pos0,
+            home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
+            DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+    }
+    if (ok) ok = ds4_gpu_tensor_copy_xdev(
+        gather_dst, peer_heads, q_half_bytes) != 0;
+
+    static uint32_t logged_home_mask = 0u;
+    if (ok && home >= 0 && home < 32 &&
+        (logged_home_mask & (1u << (uint32_t)home)) == 0u) {
+        logged_home_mask |= 1u << (uint32_t)home;
+        fprintf(stderr,
+                "ds4: CUDA prefill attention query-row split enabled: "
+                "tier %d rows [0,%u), tier %d rows [%u,%u); "
+                "partner-local mirrored KV, full-head gather to home\n",
+                home, rows, partner, rows, n_tokens);
+    }
+    if (ok && getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT")) {
+        fprintf(stderr,
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d "
+                "q_bytes=%llu result_bytes=%llu\n",
+                kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+                il, pos0, n_tokens, home, partner,
+                (unsigned long long)q_half_bytes,
+                (unsigned long long)q_half_bytes);
+    }
+
+    ds4_gpu_tensor_free(peer_topk_dst);
+    ds4_gpu_tensor_free(peer_topk_src);
+    ds4_gpu_tensor_free(home_topk);
+    ds4_gpu_tensor_free(gather_dst);
+    ds4_gpu_tensor_free(peer_heads);
+    ds4_gpu_tensor_free(home_heads);
+    ds4_gpu_tensor_free(peer_q_dst);
+    ds4_gpu_tensor_free(peer_q_src);
+    ds4_gpu_tensor_free(home_q);
+    return ok;
+#endif
+}
+
 static bool metal_graph_cuda_tp_prefill_attention_output(
         ds4_gpu_graph *g, const ds4_model *model,
         const ds4_layer_weights *layer, uint32_t n_tokens,
@@ -27567,6 +27803,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     const bool cuda_tp_prefill_heads =
         !tp_row_split_attn &&
+        !g->cuda_tp_prefill_attn_rows &&
         metal_graph_cuda_tp_prefill_heads_active(g, layer, il, pos0, n_tokens);
     bool cuda_tp_prefill_heads_done = false;
     enum { stack_count_cap = 16 };
@@ -27912,12 +28149,16 @@ static bool metal_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
-    if (ok && zero_prefix) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                                    metal_graph_batch_kv(g),
-                                                                    g->raw_cap,
-                                                                    pos0,
-                                                                    n_tokens,
-                                                                    DS4_N_HEAD_DIM) != 0;
+    if (ok && zero_prefix) {
+        ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+                                                metal_graph_batch_kv(g),
+                                                g->raw_cap,
+                                                pos0,
+                                                n_tokens,
+                                                DS4_N_HEAD_DIM) != 0;
+        if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_raw_rows(
+            g, il, pos0, n_tokens);
+    }
     if (!ok) {
         fprintf(stderr, "ds4: gpu layer %u raw KV batch store failed\n", il);
     }
@@ -27978,6 +28219,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                  pos0,
                                                  n_tokens,
                                                  DS4_N_HEAD_DIM) != 0;
+        if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_raw_rows(
+            g, il, pos0, n_tokens);
         if (ok) {
             metal_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
@@ -28103,6 +28346,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 DS4_METAL_PROFILE_ATTN_STAGE("compressor_prefill");
                 if (ok && n_comp != 0) {
                     ok = metal_graph_commit_attn_comp_stage(g, il, 0, n_comp);
+                    if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+                        g, il, 0, n_comp);
                 }
                 DS4_METAL_PROFILE_ATTN_STAGE("compressor_commit");
                 if (ok && ratio == 4) {
@@ -28218,6 +28463,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 if (ok && comp_chunk != 0) {
                     ok = metal_graph_commit_attn_comp_stage(g, il, comp_before, comp_chunk);
+                    if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+                        g, il, comp_before, comp_chunk);
                 }
                 if (ok && ratio == 4) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -28257,6 +28504,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 metal_graph_attn_comp_prefill_target_free(attn_comp_target);
             } else {
+                const uint32_t comp_sync_first = g->layer_n_comp[il];
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
                     const bool emit = ((pos + 1u) % ratio) == 0u;
@@ -28316,6 +28564,11 @@ static bool metal_graph_encode_layer_attention_batch(
                     if (ok && t == 0) ok = metal_graph_capture_prefix1_attn_state(g, il);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
+                }
+                if (ok && g->layer_n_comp[il] > comp_sync_first) {
+                    ok = metal_graph_cuda_tp_attn_cache_sync_comp_rows(
+                        g, il, comp_sync_first,
+                        g->layer_n_comp[il] - comp_sync_first);
                 }
             }
             n_comp = g->layer_n_comp[il];
@@ -28631,6 +28884,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM) != 0;
+            if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_raw_rows(
+                g, il, pos0, n_tokens);
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
@@ -28696,7 +28951,24 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
-                    if (cuda_tp_prefill_heads) {
+                    if (g->cuda_tp_prefill_attn_rows) {
+                        if (!metal_graph_cuda_tp_prefill_attention_rows_active(
+                                g, layer, il, pos0, n_tokens, n_raw)) {
+                            fprintf(stderr,
+                                    "ds4: CUDA prefill attention query-row split "
+                                    "required but unavailable for indexed layer=%u "
+                                    "pos=%u tokens=%u raw=%u\n",
+                                    il, pos0, n_tokens, n_raw);
+                            ok = false;
+                        } else {
+                            ok = metal_graph_cuda_tp_prefill_attention_rows_launch(
+                                    g, model, layer, il,
+                                    DS4_CUDA_PREFILL_ATTN_INDEXED,
+                                    metal_graph_comp_selected(g), n_tokens, pos0,
+                                    n_raw, g->raw_cap, raw_start, n_comp,
+                                    DS4_N_INDEXER_TOP_K, g->raw_window, ratio);
+                        }
+                    } else if (cuda_tp_prefill_heads) {
                         ok = metal_graph_cuda_tp_prefill_attention_launch(
                                 g, model, layer, DS4_CUDA_PREFILL_ATTN_INDEXED,
                                 g->layer_raw_cache[il],
@@ -28736,7 +29008,23 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         &index_stage_t0);
                     }
                 } else {
-                    if (cuda_tp_prefill_heads && !use_comp_mask) {
+                    if (!use_comp_mask && g->cuda_tp_prefill_attn_rows) {
+                        if (!metal_graph_cuda_tp_prefill_attention_rows_active(
+                                g, layer, il, pos0, n_tokens, n_raw)) {
+                            fprintf(stderr,
+                                    "ds4: CUDA prefill attention query-row split "
+                                    "required but unavailable for mixed layer=%u "
+                                    "pos=%u tokens=%u raw=%u\n",
+                                    il, pos0, n_tokens, n_raw);
+                            ok = false;
+                        } else {
+                            ok = metal_graph_cuda_tp_prefill_attention_rows_launch(
+                                    g, model, layer, il,
+                                    DS4_CUDA_PREFILL_ATTN_DECODE_MIXED, NULL,
+                                    n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                                    n_comp, 0u, g->raw_window, ratio);
+                        }
+                    } else if (cuda_tp_prefill_heads && !use_comp_mask) {
                         ok = metal_graph_cuda_tp_prefill_attention_launch(
                                 g, model, layer, DS4_CUDA_PREFILL_ATTN_DECODE_MIXED,
                                 g->layer_raw_cache[il],
@@ -28867,6 +29155,28 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_tokens,
                                                                     n_comp,
                                                                     &index_stage_t0);
+                }
+            } else if (ok && g->cuda_tp_prefill_attn_rows) {
+                if (!metal_graph_cuda_tp_prefill_attention_rows_active(
+                        g, layer, il, pos0, n_tokens, n_tokens)) {
+                    fprintf(stderr,
+                            "ds4: CUDA prefill attention query-row split "
+                            "required but unavailable for indexed layer=%u "
+                            "pos=%u tokens=%u raw=%u\n",
+                            il, pos0, n_tokens, n_tokens);
+                    ok = false;
+                } else {
+                    ok = metal_graph_cuda_tp_prefill_attention_rows_launch(
+                            g, model, layer, il,
+                            DS4_CUDA_PREFILL_ATTN_INDEXED,
+                            metal_graph_comp_selected(g), n_tokens, pos0,
+                            n_tokens, g->raw_cap, 0u, n_comp,
+                            DS4_N_INDEXER_TOP_K, g->raw_window, ratio);
+                    if (ok && index_stage_profile) {
+                        ok = metal_graph_indexer_stage_profile_boundary(
+                            "attention", il, pos0, n_tokens, n_comp,
+                            &index_stage_t0);
+                    }
                 }
             } else if (ok && cuda_tp_prefill_heads) {
                 ok = metal_graph_cuda_tp_prefill_attention_launch(
@@ -29055,6 +29365,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        g->raw_cap,
                                                        pos % g->raw_cap,
                                                        DS4_N_HEAD_DIM) != 0;
+                    if (ok) ok = metal_graph_cuda_tp_attn_cache_sync_raw_row(
+                        g, il, pos % g->raw_cap);
                 }
                 if (ok && comp_mask != NULL && n_selected != 0) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
@@ -33634,10 +33946,11 @@ static void metal_graph_report_cuda_prefill_audit(
             "ds4: CUDA prefill audit tokens=%u microbatch_cap=%u microbatches=%u stages=%u waves=%u\n",
             n_tokens, mb_cap, n_mb, n_stages, waves);
     fprintf(stderr,
-            "ds4: CUDA prefill audit features pipeline=1 expert_parallel=%d q8_f16_cache=%d attention_head_split=%d\n",
+            "ds4: CUDA prefill audit features pipeline=1 expert_parallel=%d q8_f16_cache=%d attention_head_split=%d attention_row_split=%d\n",
             g->cuda_tp_ep ? 1 : 0,
             metal_graph_cuda_prefill_pipeline_q8_cache_requested() ? 1 : 0,
-            g->cuda_tp_prefill_attn_heads ? 1 : 0);
+            g->cuda_tp_prefill_attn_heads ? 1 : 0,
+            g->cuda_tp_prefill_attn_rows ? 1 : 0);
     for (uint32_t s = 0; s < n_stages; s++) {
         const uint32_t layers = stages[s].end_layer - stages[s].first_layer;
         const int partner = metal_graph_cuda_tp_partner_tier(stages[s].tier);
@@ -56769,6 +57082,10 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void) {
     return cuda_tp_prefill_attn_heads_env_enabled();
+}
+
+bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
+    return cuda_tp_prefill_attn_rows_env_enabled();
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
