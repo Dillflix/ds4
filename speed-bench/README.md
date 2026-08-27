@@ -1723,3 +1723,28 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
 ```
 
 Return `sm75-attention-rowsplit-production-<timestamp>.tar.gz`.
+
+After promotion, `cuda-sm75-long-prompt-word-smoke.sh` checks early user-visible
+quality through the actual production CLI. It places a verification word before
+a long public-domain distractor, requires a prompt of at least 24K tokens, and
+greedily requests exactly that one word. No row-split enable override is set:
+the log must prove that the qualified default dispatched both indexed and mixed
+row-split attention on both stages without fallback.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_ALLOC=262273 \
+EXPECTED_WORD=LANTERN \
+PAD_LINES=2200 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-long-prompt-word-smoke.sh
+```
+
+Return `sm75-long-prompt-word-smoke-<timestamp>.tar.gz`.

@@ -848,19 +848,55 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    const int old_n_gpus = g_n_gpus;
+    ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
+    int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+    double old_peer_speed[DS4_MAX_GPUS][DS4_MAX_GPUS];
+    memcpy(old_gpu, g_gpu, sizeof(old_gpu));
+    memcpy(old_peer_ok, g_gpu_peer_ok, sizeof(old_peer_ok));
+    memcpy(old_peer_speed, g_gpu_peer_gib_per_sec, sizeof(old_peer_speed));
+
+    memset(g_gpu, 0, sizeof(old_gpu));
+    memset(g_gpu_peer_ok, 0, sizeof(old_peer_ok));
+    memset(g_gpu_peer_gib_per_sec, 0, sizeof(old_peer_speed));
+    g_n_gpus = 4;
+    for (int i = 0; i < g_n_gpus; i++) {
+        g_gpu[i].compute_major = 7;
+        g_gpu[i].compute_minor = 5;
+    }
+    for (int home = 0; home < 2; home++) {
+        const int partner = home + 2;
+        g_gpu_peer_ok[home][partner] = 1;
+        g_gpu_peer_ok[partner][home] = 1;
+        g_gpu_peer_gib_per_sec[home][partner] = 18.0;
+        g_gpu_peer_gib_per_sec[partner][home] = 18.0;
+    }
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
+          "qualified four-GPU SM75 NVLink layout enables query-row splitting");
+
+    g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
-          "CUDA TP query-row splitting remains off before production A/B");
+          "automatic query-row splitting stays scoped to measured four-GPU layout");
+    g_n_gpus = 4;
+
+    g_gpu_peer_gib_per_sec[3][1] = 17.999;
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
+          "automatic query-row splitting requires both qualified pairs");
 
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "1", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
-          "CUDA TP query-row splitting accepts an explicit opt-in");
+          "explicit query-row opt-in remains available for experiments");
 
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
-          "CUDA TP query-row splitting accepts an explicit zero");
+          "CUDA TP query-row splitting accepts a diagnostic rollback");
 
+    g_n_gpus = old_n_gpus;
+    memcpy(g_gpu, old_gpu, sizeof(old_gpu));
+    memcpy(g_gpu_peer_ok, old_peer_ok, sizeof(old_peer_ok));
+    memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
 }
 

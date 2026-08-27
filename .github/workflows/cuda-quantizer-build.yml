@@ -44,6 +44,7 @@ on:
       - "speed-bench/cuda-sm75-critical-path-audit.sh"
       - "speed-bench/cuda-sm75-attention-rowsplit.sh"
       - "speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh"
+      - "speed-bench/cuda-sm75-long-prompt-word-smoke.sh"
       - "speed-bench/cuda-sm75-q4-clock-audit.sh"
       - "speed-bench/summarize-cuda-critical-path.py"
       - "speed-bench/summarize-sm75-q4-clock-audit.py"
@@ -136,6 +137,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-attention-rowsplit.sh
           test -x speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
           bash -n speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
+          test -x speed-bench/cuda-sm75-long-prompt-word-smoke.sh
+          bash -n speed-bench/cuda-sm75-long-prompt-word-smoke.sh
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-production.py

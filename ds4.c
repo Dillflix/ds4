@@ -3037,7 +3037,7 @@ static uint32_t accelerator_q8_cache_candidate_copies(
         ? 3u : 1u;
 }
 
-static bool accelerator_q8_cache_implicit_default_qualified(
+static bool cuda_sm75_fast_peer_pair_qualified(
         int home_major,
         int home_minor,
         int partner_major,
@@ -15378,16 +15378,39 @@ static bool cuda_tp_prefill_attn_heads_env_enabled(void) {
 #endif
 }
 
+static bool cuda_tp_prefill_attn_rows_default_qualified(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    /* The production result is specific to two logical 2-GPU stages on four
+     * SM75 devices, with a fast bidirectional link inside each stage.  Keep
+     * other CUDA layouts opt-in until measured rather than generalizing a
+     * topology-sensitive win. */
+    if (g_n_gpus != 4) return false;
+    const int half = g_n_gpus / 2;
+    for (int home = 0; home < half; home++) {
+        const int partner = home + half;
+        if (!g_gpu_peer_ok[home][partner] ||
+            !g_gpu_peer_ok[partner][home] ||
+            !cuda_sm75_fast_peer_pair_qualified(
+                g_gpu[home].compute_major,
+                g_gpu[home].compute_minor,
+                g_gpu[partner].compute_major,
+                g_gpu[partner].compute_minor,
+                g_gpu_peer_gib_per_sec[home][partner],
+                g_gpu_peer_gib_per_sec[partner][home])) return false;
+    }
+    return true;
+#endif
+}
+
 static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
 #if defined(__APPLE__)
     return false;
 #else
     const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
-    /* Experimental until the production four-GPU A/B passes.  Unlike the
-     * older head split, this path partitions independent query rows and
-     * requires a partner-local raw/compressed KV mirror; it never falls back
-     * to remote cache reads. */
-    return env && env[0] && strcmp(env, "0") != 0;
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return cuda_tp_prefill_attn_rows_default_qualified();
 #endif
 }
 
@@ -56292,7 +56315,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     for (int home_tier = 0; home_tier < tp_half; home_tier++) {
         const int partner_tier = home_tier + tp_half;
         implicit_partner_qualified[home_tier] =
-            accelerator_q8_cache_implicit_default_qualified(
+            cuda_sm75_fast_peer_pair_qualified(
                 g_gpu[home_tier].compute_major,
                 g_gpu[home_tier].compute_minor,
                 g_gpu[partner_tier].compute_major,
@@ -57050,7 +57073,7 @@ int ds4_test_q8_cache_implicit_default_qualified(
         int partner_minor,
         double forward_gib_per_sec,
         double reverse_gib_per_sec) {
-    return accelerator_q8_cache_implicit_default_qualified(
+    return cuda_sm75_fast_peer_pair_qualified(
         home_major, home_minor, partner_major, partner_minor,
         forward_gib_per_sec, reverse_gib_per_sec) ? 1 : 0;
 }

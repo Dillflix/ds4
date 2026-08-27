@@ -824,23 +824,28 @@ four-way local/partner A/B establishes an end-to-end win; use
 `DS4_CUDA_NO_T32_F16_FUSED=1` as an explicit diagnostic override.
 `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables the complete cache for
 memory-pressure diagnosis; it is not the performance default.
-Prefill attention remains on the home GPU by default. The experimental 32/32
-head split can be enabled with `DS4_CUDA_TP_PREFILL_ATTN_HEADS=1`; it keeps raw
+The experimental 32/32 head split can be enabled with
+`DS4_CUDA_TP_PREFILL_ATTN_HEADS=1`; it keeps raw
 and compressed KV single-copy on the home GPU, runs the two attention/output-A
 halves concurrently, gathers the packed low-rank halves, and runs one full
 cached output-B GEMM. It is not the performance default because both tested
 output strategies regressed prefill by roughly 20% across 2K..65K on the
 4x RTX 8000 NVLink-pair target.
-`DS4_CUDA_TP_PREFILL_ATTN_ROWS=1` selects the separate SM75 query-row
-experiment for indexed and nonzero-prefix mixed attention. It incrementally
-mirrors raw and compressed KV on the NVLink partner, copies the latter half of
+Query-row splitting is the production default when CUDA TP resolves to exactly
+four SM75 devices and both logical pairs have validated bidirectional links of
+at least 18 GiB/s. It improved bit-exact production prefill by 4.25% at 2K,
+8.95% at 4K, 9.13% at 8K, 10.43% at 16K, and 12.39% at 32K on the qualified
+4x RTX 8000 NVLink-pair target. `DS4_CUDA_TP_PREFILL_ATTN_ROWS=0` is the
+diagnostic rollback; `=1` is an explicit strict opt-in for other measured
+layouts. The path covers indexed and nonzero-prefix mixed attention. It
+incrementally mirrors raw and compressed KV on the NVLink partner, copies the latter half of
 Q to that partner, executes 50/50 row launches concurrently, and gathers the
 partner's full-head result before the unchanged inverse-RoPE/output projection.
 The declared indexed/mixed scope is fail-closed: a requested call that cannot
 use bidirectional peer access, its partner-local mirror, or the exact 50/50
 shape aborts instead of silently running on the home GPU. Initial static-mixed
-and raw-only attention are outside this first production experiment and remain
-identical in both A/B arms. Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
+and raw-only attention are outside the split scope and remain on the unchanged
+home path. Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
 one record for every split call. Direct peer-reading of persistent KV is not a
 fallback; the bounded SM75 experiment measured that strategy slower than the
 shipping home path on both NVLink pairs.
