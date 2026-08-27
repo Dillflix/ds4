@@ -28,6 +28,7 @@ typedef enum {
     SCENARIO_Q8_OUT_B,
     SCENARIO_ATTN_INDEXED_32K,
     SCENARIO_ATTN_MIXED_32K,
+    SCENARIO_INDEXER_32K,
 } scenario_kind;
 
 typedef enum {
@@ -190,6 +191,10 @@ static const scenario_spec scenarios[] = {
         "attn-mixed-32k", SCENARIO_ATTN_MIXED_32K, 27u,
         0u, 0u, 0u, 512u, 64u, NULL,
     },
+    {
+        "indexer-32k", SCENARIO_INDEXER_32K, 27u,
+        0u, 0u, 0u, 128u, 8192u, NULL,
+    },
 };
 
 /* The host mapping must outlive ds4_gpu_cleanup even when a requested device
@@ -202,7 +207,7 @@ static void usage(const char *argv0) {
             "q2-early|q2-late|hybrid-iq2-q4-early|"
             "hybrid-iq2-q4-late|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b|"
-            "attn-indexed-32k|attn-mixed-32k\n"
+            "attn-indexed-32k|attn-mixed-32k|indexer-32k\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
@@ -215,7 +220,12 @@ static void usage(const char *argv0) {
             "DS4_PROFILE_IQ2_TAIL8_ALL=1 selects the production IQ2 tail8\n"
             "policy, while 0 forces the retained tail4 rollback. Tail8 replaces\n"
             "IQ2 residual 1..4 tail4 work with the exact tile8 path while\n"
-            "leaving native-Q4 down's 16/8/4 plan unchanged.\n",
+            "leaving native-Q4 down's 16/8/4 plan unchanged.\n"
+            "DS4_PROFILE_INDEXER_TILE selects the indexer score tile: 128\n"
+            "(default), 64, 32, or 16. DS4_PROFILE_INDEXER_TOPK selects the\n"
+            "8192-entry top-k implementation: monolithic (default) or\n"
+            "chunked. The indexer scenario compares every score bit against\n"
+            "the shipping WMMA128 path before timing the selected path.\n",
             argv0);
 }
 
@@ -929,6 +939,334 @@ cleanup:
     return ok;
 }
 
+static int configure_indexer_score_tile(const char *tile) {
+    if (!tile || !tile[0] || strcmp(tile, "128") == 0) {
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA128");
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA64");
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA32");
+        return 1;
+    }
+    (void)setenv("DS4_CUDA_NO_INDEXER_WMMA128", "1", 1);
+    if (strcmp(tile, "64") == 0) {
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA64");
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA32");
+        return 1;
+    }
+    (void)setenv("DS4_CUDA_NO_INDEXER_WMMA64", "1", 1);
+    if (strcmp(tile, "32") == 0) {
+        (void)unsetenv("DS4_CUDA_NO_INDEXER_WMMA32");
+        return 1;
+    }
+    (void)setenv("DS4_CUDA_NO_INDEXER_WMMA32", "1", 1);
+    return strcmp(tile, "16") == 0;
+}
+
+static int configure_indexer_topk(const char *topk) {
+    if (!topk || !topk[0] || strcmp(topk, "monolithic") == 0) {
+        (void)unsetenv("DS4_CUDA_NO_TOPK2048");
+        (void)unsetenv("DS4_CUDA_NO_TOPK8192");
+        (void)unsetenv("DS4_CUDA_NO_TOPK_CHUNKED");
+        return 1;
+    }
+    if (strcmp(topk, "chunked") == 0) {
+        (void)unsetenv("DS4_CUDA_NO_TOPK2048");
+        (void)setenv("DS4_CUDA_NO_TOPK8192", "1", 1);
+        (void)unsetenv("DS4_CUDA_NO_TOPK_CHUNKED");
+        return 1;
+    }
+    return 0;
+}
+
+static int verify_indexer_score_bits(const float *reference,
+                                     const float *candidate,
+                                     uint64_t count) {
+    uint64_t finite_nonzero = 0u, negative_infinity = 0u;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t ref_bits = 0u, got_bits = 0u;
+        memcpy(&ref_bits, reference + i, sizeof(ref_bits));
+        memcpy(&got_bits, candidate + i, sizeof(got_bits));
+        if (ref_bits != got_bits) {
+            fprintf(stderr,
+                    "error: indexer score mismatch at %llu: "
+                    "reference=%g (0x%08x) candidate=%g (0x%08x)\n",
+                    (unsigned long long)i, reference[i], ref_bits,
+                    candidate[i], got_bits);
+            return 0;
+        }
+        if (isfinite(candidate[i]) && candidate[i] != 0.0f) finite_nonzero++;
+        if (isinf(candidate[i]) && candidate[i] < 0.0f) negative_infinity++;
+    }
+    if (finite_nonzero == 0u || negative_infinity == 0u) {
+        fprintf(stderr,
+                "error: indexer score fixture is degenerate: "
+                "finite_nonzero=%llu negative_infinity=%llu\n",
+                (unsigned long long)finite_nonzero,
+                (unsigned long long)negative_infinity);
+        return 0;
+    }
+    printf("score_values_checked=%llu\nscore_finite_nonzero=%llu\n"
+           "score_negative_infinity=%llu\nscore_validation=bit-exact\n",
+           (unsigned long long)count,
+           (unsigned long long)finite_nonzero,
+           (unsigned long long)negative_infinity);
+    return 1;
+}
+
+static int verify_indexer_topk(const uint32_t *selected,
+                               const float *scores,
+                               uint32_t n_comp,
+                               uint32_t n_tokens,
+                               uint32_t top_k) {
+    unsigned char *seen = (unsigned char *)malloc(n_comp);
+    if (!seen) return 0;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        memset(seen, 0, n_comp);
+        const float *row = scores + (uint64_t)t * n_comp;
+        const uint32_t *sel = selected + (uint64_t)t * top_k;
+        for (uint32_t k = 0; k < top_k; k++) {
+            const uint32_t idx = sel[k];
+            if (idx >= n_comp || seen[idx]) {
+                fprintf(stderr,
+                        "error: invalid indexer top-k entry token=%u rank=%u "
+                        "index=%u duplicate=%u\n",
+                        t, k, idx, idx < n_comp ? (unsigned)seen[idx] : 0u);
+                free(seen);
+                return 0;
+            }
+            seen[idx] = 1u;
+            if (k != 0u) {
+                const uint32_t prev = sel[k - 1u];
+                if (row[idx] > row[prev] ||
+                    (row[idx] == row[prev] && idx < prev)) {
+                    fprintf(stderr,
+                            "error: unsorted indexer top-k token=%u rank=%u "
+                            "previous=(%g,%u) current=(%g,%u)\n",
+                            t, k, row[prev], prev, row[idx], idx);
+                    free(seen);
+                    return 0;
+                }
+            }
+        }
+        const uint32_t threshold_idx = sel[top_k - 1u];
+        const float threshold = row[threshold_idx];
+        for (uint32_t c = 0; c < n_comp; c++) {
+            if (!seen[c] &&
+                (row[c] > threshold ||
+                 (row[c] == threshold && c < threshold_idx))) {
+                fprintf(stderr,
+                        "error: indexer top-k omitted better value token=%u "
+                        "candidate=(%g,%u) threshold=(%g,%u)\n",
+                        t, row[c], c, threshold, threshold_idx);
+                free(seen);
+                return 0;
+            }
+        }
+    }
+    free(seen);
+    printf("topk_values_checked=%llu\ntopk_validation=exact-order-and-set\n",
+           (unsigned long long)n_tokens * top_k);
+    return 1;
+}
+
+static int run_indexer_32k(const scenario_spec *spec,
+                           uint32_t timed_repeats) {
+    const uint32_t n_tokens = 512u;
+    const uint32_t pos0 = 32256u;
+    const uint32_t n_comp = 8192u;
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 128u;
+    const uint32_t ratio = 4u;
+    const uint32_t top_k = 512u;
+    const float scale = 1.0f / sqrtf((float)(n_head * head_dim));
+    const char *tile = getenv("DS4_PROFILE_INDEXER_TILE");
+    const char *topk = getenv("DS4_PROFILE_INDEXER_TOPK");
+    if (!tile || !tile[0]) tile = "128";
+    if (!topk || !topk[0]) topk = "monolithic";
+    if (!configure_indexer_score_tile(tile)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_INDEXER_TILE must be 128, 64, 32, or 16\n");
+        return 0;
+    }
+    if (!configure_indexer_topk(topk)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_INDEXER_TOPK must be monolithic or chunked\n");
+        return 0;
+    }
+
+    const uint64_t q_count =
+        (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t weight_count = (uint64_t)n_tokens * n_head;
+    const uint64_t cache_count = (uint64_t)n_comp * head_dim;
+    const uint64_t score_count = (uint64_t)n_tokens * n_comp;
+    const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+    const uint64_t tensor_bytes =
+        (q_count + weight_count + cache_count + 2u * score_count) *
+            sizeof(float) +
+        selected_count * sizeof(uint32_t);
+    const uint64_t predicted = tensor_bytes + PROFILE_SAFETY_RESERVE;
+    printf("scenario=%s\nprofile_kind=indexer_sm75_32k\nlayer=%u\n"
+           "score_tile=%s\ntopk_path=%s\nn_tokens=%u\npos0=%u\n"
+           "n_comp=%u\nn_head=%u\nhead_dim=%u\nratio=%u\ntop_k=%u\n"
+           "tensor_bytes=%llu\npredicted_device_bytes=%llu\n"
+           "device_limit_bytes=%llu\n",
+           spec->name, spec->layer, tile, topk, n_tokens, pos0,
+           n_comp, n_head, head_dim, ratio, top_k,
+           (unsigned long long)tensor_bytes,
+           (unsigned long long)predicted,
+           (unsigned long long)PROFILE_DEVICE_LIMIT);
+    if (predicted > PROFILE_DEVICE_LIMIT) {
+        fprintf(stderr,
+                "error: predicted indexer state exceeds the 3 GiB ceiling\n");
+        return 0;
+    }
+
+    float *q_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *weights_host =
+        (float *)malloc((size_t)weight_count * sizeof(float));
+    float *cache_host =
+        (float *)malloc((size_t)cache_count * sizeof(float));
+    float *reference_host =
+        (float *)malloc((size_t)score_count * sizeof(float));
+    float *candidate_host =
+        (float *)malloc((size_t)score_count * sizeof(float));
+    uint32_t *selected_host =
+        (uint32_t *)malloc((size_t)selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *q = NULL, *weights = NULL, *cache = NULL;
+    ds4_gpu_tensor *reference = NULL, *candidate = NULL, *selected = NULL;
+    int ok = 0;
+    if (!q_host || !weights_host || !cache_host || !reference_host ||
+        !candidate_host || !selected_host) {
+        fprintf(stderr, "error: host allocation failed for indexer harness\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < q_count; i++) {
+        const int value = (int)((i * 17u + (i >> 7u) * 13u) % 251u) - 125;
+        q_host[i] = (float)value / 191.0f;
+    }
+    for (uint64_t i = 0; i < weight_count; i++) {
+        const int value = (int)((i * 19u + (i >> 5u) * 7u) % 97u) - 48;
+        weights_host[i] = (float)value / 113.0f;
+    }
+    for (uint64_t i = 0; i < cache_count; i++) {
+        const int value = (int)((i * 23u + (i >> 6u) * 5u) % 257u) - 128;
+        cache_host[i] = (float)value / 211.0f;
+    }
+
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    weights = ds4_gpu_tensor_alloc(weight_count * sizeof(float));
+    cache = ds4_gpu_tensor_alloc(cache_count * sizeof(float));
+    reference = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    candidate = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    if (!q || !weights || !cache || !reference || !candidate || !selected ||
+        !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(weights, 0, weights_host,
+                              weight_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(cache, 0, cache_host,
+                              cache_count * sizeof(float))) {
+        fprintf(stderr,
+                "error: indexer device allocation/input upload failed\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_dsv4_indexer_qat_tensor(
+            q, n_tokens * n_head, head_dim) ||
+        !ds4_gpu_dsv4_indexer_qat_tensor(cache, n_comp, head_dim) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "error: production indexer QAT fixture preparation failed\n");
+        goto cleanup;
+    }
+
+    if (!configure_indexer_score_tile("128") ||
+        !ds4_gpu_indexer_scores_decode_batch_tensor(
+            reference, q, weights, cache, n_comp, n_tokens, pos0,
+            n_head, head_dim, ratio, scale) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(reference, 0, reference_host,
+                             score_count * sizeof(float))) {
+        fprintf(stderr, "error: shipping indexer score reference failed\n");
+        goto cleanup;
+    }
+    if (!configure_indexer_score_tile(tile) ||
+        !ds4_gpu_indexer_scores_decode_batch_tensor(
+            candidate, q, weights, cache, n_comp, n_tokens, pos0,
+            n_head, head_dim, ratio, scale) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(candidate, 0, candidate_host,
+                             score_count * sizeof(float)) ||
+        !verify_indexer_score_bits(reference_host, candidate_host,
+                                   score_count)) {
+        fprintf(stderr, "error: candidate indexer score validation failed\n");
+        goto cleanup;
+    }
+    if (!configure_indexer_topk(topk) ||
+        !ds4_gpu_indexer_topk_tensor(selected, candidate,
+                                     n_comp, n_tokens, top_k) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(selected, 0, selected_host,
+                             selected_count * sizeof(uint32_t)) ||
+        !verify_indexer_topk(selected_host, candidate_host,
+                             n_comp, n_tokens, top_k)) {
+        fprintf(stderr, "error: candidate indexer top-k validation failed\n");
+        goto cleanup;
+    }
+
+    if (timed_repeats > 0u) {
+        double start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                    candidate, q, weights, cache, n_comp, n_tokens, pos0,
+                    n_head, head_dim, ratio, scale)) {
+                fprintf(stderr, "error: timed indexer score launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: timed indexer score sync failed\n");
+            goto cleanup;
+        }
+        const double score_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        start = monotonic_seconds();
+        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+            if (!ds4_gpu_indexer_topk_tensor(
+                    selected, candidate, n_comp, n_tokens, top_k)) {
+                fprintf(stderr, "error: timed indexer top-k launch failed\n");
+                goto cleanup;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: timed indexer top-k sync failed\n");
+            goto cleanup;
+        }
+        const double topk_ms =
+            (monotonic_seconds() - start) * 1000.0;
+        printf("timed_repeats=%u\nscore_timed_total_ms=%.6f\n"
+               "score_timed_per_call_ms=%.6f\n"
+               "topk_timed_total_ms=%.6f\n"
+               "topk_timed_per_call_ms=%.6f\n",
+               timed_repeats, score_ms,
+               score_ms / (double)timed_repeats,
+               topk_ms, topk_ms / (double)timed_repeats);
+    }
+    ok = 1;
+
+cleanup:
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(cache);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(q);
+    free(selected_host);
+    free(candidate_host);
+    free(reference_host);
+    free(cache_host);
+    free(weights_host);
+    free(q_host);
+    return ok;
+}
+
 static int run_attention_32k(const scenario_spec *spec,
                              uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
@@ -1227,12 +1565,14 @@ int main(int argc, char **argv) {
     const int attention_32k =
         spec->kind == SCENARIO_ATTN_INDEXED_32K ||
         spec->kind == SCENARIO_ATTN_MIXED_32K;
+    const int indexer_32k = spec->kind == SCENARIO_INDEXER_32K;
     const int ok = q4_moe ?
         run_moe(spec, 0, 0, native_q4_moe, timed_repeats) :
         (q2_moe ? run_moe(spec, 1, 1, 0, timed_repeats) :
          (hybrid_iq2_q4_moe ? run_moe(spec, 1, 0, 1, timed_repeats) :
           (attention_32k ? run_attention_32k(spec, timed_repeats) :
-                           run_q8(spec, timed_repeats))));
+           (indexer_32k ? run_indexer_32k(spec, timed_repeats) :
+                          run_q8(spec, timed_repeats)))));
     ds4_gpu_cleanup();
     free(model_storage);
     model_storage = NULL;

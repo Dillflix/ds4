@@ -1682,6 +1682,37 @@ idle state whose supported graphics ceiling is also low. In that case the
 script records `outcome=not-applicable` and exits successfully without changing
 clocks; forcing the idle memory state is not a useful power-headroom test.
 
+### SM75 32K indexer audit
+
+`cuda-sm75-indexer-audit.sh` isolates the ratio-4 indexer at the final
+production 512-token chunk of a 32K prefill. It does not open a GGUF. Every
+existing WMMA score tile (128/64/32/16) must reproduce the shipping WMMA128
+scores bit-for-bit, including the causal `-inf` region. Both the shipping
+8192-entry top-k and its existing chunked-tree alternative must return the
+exact ordered top-512 set.
+
+The timing pass reports score and top-k costs separately. The optional Nsight
+Compute pass records launch resources, occupancy, FP16 Tensor Core activity,
+memory hierarchy traffic, and barrier/scoreboard/MIO stalls. Optional metrics
+are selected from the installed Nsight version instead of making a renamed
+counter abort the whole audit.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+TIMING_REPEATS=10 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-audit.sh
+```
+
+Return `sm75-indexer-audit-<timestamp>.tar.gz`. This pass compares existing
+exact paths before any persistent-F16 cache or SM75-specific accumulator
+epilogue is admitted to production.
+
 ### SM75 32K attention query-row split experiment
 
 `cuda-sm75-attention-rowsplit.sh` is a model-free, two-GPU experiment for the
