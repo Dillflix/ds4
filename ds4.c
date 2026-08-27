@@ -2037,6 +2037,8 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [42] = {"sm75_q4_32", 256, 136},
+    [43] = {"sm75_q3a4",  256, 108},
 };
 
 enum {
@@ -2051,6 +2053,8 @@ enum {
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_SM75_Q4_32 = 42,
+    DS4_TENSOR_SM75_Q3A4  = 43,
 };
 
 /* Kept outside DS4_NO_GPU so CPU-only placement tests exercise the exact
@@ -2061,9 +2065,12 @@ static bool cuda_routed_moe_quant_types_supported(
         uint32_t down_type) {
     return gate_type == up_type &&
            (gate_type == DS4_TENSOR_IQ2_XXS ||
-            gate_type == DS4_TENSOR_Q4_K) &&
+            gate_type == DS4_TENSOR_Q4_K ||
+            gate_type == DS4_TENSOR_SM75_Q4_32 ||
+            gate_type == DS4_TENSOR_SM75_Q3A4) &&
            (down_type == DS4_TENSOR_Q2_K ||
-            down_type == DS4_TENSOR_Q4_K);
+            down_type == DS4_TENSOR_Q4_K ||
+            down_type == DS4_TENSOR_SM75_Q4_32);
 }
 
 typedef struct {
@@ -2095,6 +2102,7 @@ typedef struct {
     uint64_t tensor_data_pos;
     uint64_t max_tensor_bytes;
     uint32_t q4_routed_layout;
+    uint32_t sm75_q32_layouts;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
@@ -2498,6 +2506,49 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         m->q4_routed_layout = DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4;
     } else if (model_find_kv(m, "ds4.routed_expert.q4.layout_version")) {
         ds4_die("routed Q4 layout version exists without a layout tag");
+    }
+
+    ds4_str sm75_layout = {0};
+    uint32_t sm75_layout_version = 0;
+    if (model_get_string(m, DS4_KV_SM75_ROUTED_LAYOUT, &sm75_layout)) {
+        if (!ds4_streq(sm75_layout,
+                       DS4_SM75_ROUTED_LAYOUT_Q4_32_Q3A4) ||
+            !model_get_u32(m, DS4_KV_SM75_ROUTED_LAYOUT_VERSION,
+                           &sm75_layout_version) ||
+            sm75_layout_version != 1u) {
+            ds4_die("unsupported SM75 routed-expert layout metadata");
+        }
+        m->sm75_q32_layouts = DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                              DS4_TENSOR_LAYOUT_SM75_Q3A4;
+    } else if (model_find_kv(m, DS4_KV_SM75_ROUTED_LAYOUT_VERSION)) {
+        ds4_die("SM75 routed layout version exists without a layout tag");
+    }
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *tensor = &m->tensors[i];
+        const uint32_t type = tensor->type;
+        const bool private_q32 = type == DS4_TENSOR_SM75_Q4_32 ||
+                                 type == DS4_TENSOR_SM75_Q3A4;
+        const bool routed_gate =
+            ds4_str_contains(tensor->name, ".ffn_gate_exps.weight");
+        const bool routed_up =
+            ds4_str_contains(tensor->name, ".ffn_up_exps.weight");
+        const bool routed_down =
+            ds4_str_contains(tensor->name, ".ffn_down_exps.weight");
+        if (private_q32 && m->sm75_q32_layouts == 0u) {
+            ds4_die("SM75 private routed tensor type lacks its layout tag");
+        }
+        if (private_q32 &&
+            (!routed_gate && !routed_up && !routed_down)) {
+            ds4_die("SM75 private tensor type is valid only for routed experts");
+        }
+        if (private_q32 &&
+            (tensor->ndim != 3u || tensor->dim[0] % 256u != 0u ||
+             tensor->dim[1] % 8u != 0u)) {
+            ds4_die("SM75 private routed tensor is not K256/M8 aligned");
+        }
+        if (type == DS4_TENSOR_SM75_Q3A4 && routed_down) {
+            ds4_die("SM75 Q3A4 is valid only for routed gate/up tensors");
+        }
     }
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
@@ -4851,6 +4902,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_SM75_Q4_32 ||
+           type == DS4_TENSOR_SM75_Q3A4 ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K;
 }
@@ -4861,6 +4914,8 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    case DS4_TENSOR_SM75_Q4_32: return 136;
+    case DS4_TENSOR_SM75_Q3A4:  return 108;
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     default:                 ds4_die("unsupported routed expert tensor type");
@@ -50679,12 +50734,23 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    int result = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
-        return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+        /* Q3A4 can be assigned to an arbitrary layer subset. Scan every
+         * routed layer so the public compatibility value does not depend on
+         * which routed layer happens to appear first. Existing KV stores
+         * accept only 2/4 and therefore safely decline Q3A4 checkpoints. */
+        if (gate->type == DS4_TENSOR_SM75_Q3A4) return 3;
+        if (gate->type == DS4_TENSOR_SM75_Q4_32 ||
+            gate->type == DS4_TENSOR_Q4_K) {
+            result = 4;
+        } else if (result == 0 && gate->type == DS4_TENSOR_IQ2_XXS) {
+            result = 2;
+        }
     }
-    return 0;
+    return result;
 }
 
 void ds4_engine_log_routed_quant_audit(ds4_engine *e) {
@@ -57412,19 +57478,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
-    if (e->model.q4_routed_layout != 0u &&
+    if ((e->model.q4_routed_layout != 0u ||
+         e->model.sm75_q32_layouts != 0u) &&
         opt->backend != DS4_BACKEND_CUDA) {
         fprintf(stderr,
-                "ds4: this GGUF stores routed Q4 tensors in the tagged "
-                "SM75-native layout and requires --cuda on Turing; ordinary "
-                "Q4_K GGUFs remain portable\n");
+                "ds4: this GGUF stores routed experts in an SM75-native "
+                "layout and requires --cuda on Turing\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
     }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (opt->backend == DS4_BACKEND_CUDA) {
-        ds4_gpu_set_routed_q4_layout(e->model.q4_routed_layout);
+        ds4_gpu_set_routed_q4_layout(e->model.q4_routed_layout |
+                                     e->model.sm75_q32_layouts);
     }
 #endif
     if (load_slice && load_layer_end == UINT32_MAX) {

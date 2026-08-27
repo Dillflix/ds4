@@ -234,6 +234,10 @@ int main(void) {
         check_q4_control_parity() ||
         check_shipping_control_parity(DS4Q_TYPE_IQ2_XXS,
                                       DS4Q_EXPERIMENT_IQ2_XXS, 66) ||
+        check_shipping_control_parity(DS4Q_TYPE_SM75_Q4_32,
+                                      DS4Q_EXPERIMENT_SM75_Q4_32, 136) ||
+        check_shipping_control_parity(DS4Q_TYPE_SM75_Q3A4,
+                                      DS4Q_EXPERIMENT_SM75_Q3A_32_4, 108) ||
         check_iq2_runtime_codebook() ||
         check_adaptive_promotion_counts() ||
         check_determinism_and_finite_decode()) {

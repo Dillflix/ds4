@@ -153,16 +153,39 @@ before retrying. No model hash is calculated.
 Tagged files are deliberately accepted only by the SM75 CUDA path. Untagged
 Q4_K files retain the existing CUDA/Metal/CPU/ROCm implementations.
 
-The CUDA routed-MoE path supports the full gate/up-by-down matrix below. Gate
-and up must use the same type because they are fused; down is selected
-independently.
+The CUDA routed-MoE path supports the Cartesian product below. Gate and up
+must use the same type because they are fused; down is selected independently.
 
-| Gate/up | Down |
+| Role | Supported types |
 | --- | --- |
-| `iq2_xxs` | `q2_k` |
-| `iq2_xxs` | `q4_k` |
-| `q4_k` | `q2_k` |
-| `q4_k` | `q4_k` |
+| Gate/up | `iq2_xxs`, `q4_k`, `sm75_q4_32`, `sm75_q3a4` |
+| Down | `q2_k`, `q4_k`, `sm75_q4_32` |
+
+The last two rows are architecture-private production formats. They use GGUF
+type IDs 42/43 plus the mandatory versioned
+`sm75_m8n8k32_q4_32_q3a4_native_aw_v1` metadata tag. DS4 accepts them only as
+aligned routed-expert tensors on the CUDA SM75 path. Q3A4 is gate/up-only;
+Q4-32 supports gate/up and down. Ordinary Q4_K files and every other backend
+retain their existing interpretation and dispatch.
+
+Q3A4 is 108 bytes per K256 block, exactly 3.375 bits/weight. Its native M8
+record is 864 bytes. It therefore reads 20.6% fewer weight bytes than Q4-32
+(4.25 bpw) and 25% fewer than Q4_K (4.5 bpw), before cache-line and scheduling
+effects. For one Flash routed tensor with 256 x 2048 x 4096 weights, those
+figures are 864 MiB for Q3A4, 1088 MiB for Q4-32, and 1152 MiB for Q4_K.
+
+Use the guarded production wrapper to make an explicit per-layer allocation:
+
+```sh
+Q3A4_LAYERS=3,7,12-18,42 \
+QUANTIZE_ONLY=1 \
+bash produce-sm75-q4-32-q3a4.sh HF_DIR OUTPUT.gguf
+```
+
+`Q3A4_LAYERS=none` makes all gate/up Q4-32; `all` makes all gate/up Q3A4.
+Down is always Q4-32. The wrapper rejects the generic routed-type and
+per-tensor override variables so a model from this workflow cannot silently
+contain IQ2, Q2_K, Q3_K, or Q4_K expert tensors.
 
 The two hybrid recipes can be generated with the existing family overrides:
 
@@ -187,8 +210,8 @@ make -C gguf-tools deepseek4-quantize-cuda test-quants-cuda CUDA_ARCH=sm_75
 gguf-tools/test-quants-cuda 0,2,1,3
 ```
 
-The CUDA encoder implements imatrix-weighted `iq2_xxs`, `q4_k`, and `q2_k`,
-covering every routed type in the supported 2x2 inference matrix. Each host
+The CUDA encoder implements imatrix-weighted `iq2_xxs`, `q4_k`, `q2_k`,
+`sm75_q4_32`, and `sm75_q3a4`. Each host
 worker decodes an expert from the source safetensors and submits its independent
 256-value blocks to a persistent CUDA stream. Workers are distributed across
 the selected devices, allowing source decode, transfer, and encoding to overlap.
@@ -203,8 +226,8 @@ gguf-tools/deepseek4-quantize-cuda \
   --quant-gpu-devices 0,2,1,3
 ```
 
-`test-quants-cuda` byte-compares small CPU and CUDA encodes for all three
-formats before a long conversion. The one-step IQ2/IQ2/Q4 runner builds and
+`test-quants-cuda` byte-compares small CPU and CUDA encodes, including the
+native Q4-32/Q3A4 records, before a long conversion. The one-step runners build and
 runs this check automatically.
 
 For the four-card RTX 8000 target, the repository includes a one-step producer

@@ -34,8 +34,28 @@ static int test_type(ds4q_type type, int device,
         return 1;
     }
     ds4q_quantize_init(type);
-    const size_t cpu_bytes = ds4q_quantize_chunk(type, src, cpu, 0,
-                                                 nrows, ncols, weights);
+    size_t cpu_bytes = 0;
+    if (type == DS4Q_TYPE_SM75_Q4_32 ||
+        type == DS4Q_TYPE_SM75_Q3A4) {
+        uint8_t *canonical = calloc(1, bytes);
+        if (!canonical) {
+            fprintf(stderr, "canonical allocation failed\n");
+            free(cpu);
+            free(gpu);
+            return 1;
+        }
+        const size_t encoded = ds4q_quantize_chunk(
+            type, src, canonical, 0, nrows, ncols, weights);
+        cpu_bytes = encoded == bytes
+            ? (type == DS4Q_TYPE_SM75_Q4_32
+                ? ds4q_repack_sm75_q4_32(canonical, cpu, nrows, ncols)
+                : ds4q_repack_sm75_q3a4(canonical, cpu, nrows, ncols))
+            : 0;
+        free(canonical);
+    } else {
+        cpu_bytes = ds4q_quantize_chunk(type, src, cpu, 0,
+                                        nrows, ncols, weights);
+    }
     char error[256];
     const size_t gpu_bytes = ds4q_cuda_quantize_chunk(type, src, gpu,
                                                        nrows, ncols, weights,
@@ -137,7 +157,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s CUDA_DEVICE_CSV\n", argv[0]);
         return 2;
     }
-    const int64_t nrows = 2;
+    const int64_t nrows = 8;
     const int64_t ncols = 512;
     float *src = malloc((size_t)nrows * (size_t)ncols * sizeof(float));
     float *weights = malloc((size_t)ncols * sizeof(float));
@@ -162,6 +182,10 @@ int main(int argc, char **argv) {
         failed |= test_type(DS4Q_TYPE_Q4_K, (int)device,
                             src, weights, nrows, ncols);
         failed |= test_type(DS4Q_TYPE_Q2_K, (int)device,
+                            src, weights, nrows, ncols);
+        failed |= test_type(DS4Q_TYPE_SM75_Q4_32, (int)device,
+                            src, weights, nrows, ncols);
+        failed |= test_type(DS4Q_TYPE_SM75_Q3A4, (int)device,
                             src, weights, nrows, ncols);
         failed |= test_sm75_q4_repack((int)device);
     }

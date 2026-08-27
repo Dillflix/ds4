@@ -119,6 +119,8 @@ size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 #define DS4_TENSOR_Q2_K_LOCAL 10u
 #define DS4_TENSOR_Q4_K_LOCAL 12u
 #define DS4_TENSOR_IQ2_XXS_LOCAL 16u
+#define DS4_TENSOR_SM75_Q4_32_LOCAL 42u
+#define DS4_TENSOR_SM75_Q3A4_LOCAL 43u
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -136,17 +138,20 @@ static void test_cuda_routed_moe_quant_matrix(void) {
     const uint32_t gate_types[] = {
         DS4_TENSOR_IQ2_XXS_LOCAL,
         DS4_TENSOR_Q4_K_LOCAL,
+        DS4_TENSOR_SM75_Q4_32_LOCAL,
+        DS4_TENSOR_SM75_Q3A4_LOCAL,
     };
     const uint32_t down_types[] = {
         DS4_TENSOR_Q2_K_LOCAL,
         DS4_TENSOR_Q4_K_LOCAL,
+        DS4_TENSOR_SM75_Q4_32_LOCAL,
     };
 
-    for (size_t gate = 0; gate < 2; gate++) {
-        for (size_t down = 0; down < 2; down++) {
+    for (size_t gate = 0; gate < sizeof(gate_types) / sizeof(gate_types[0]); gate++) {
+        for (size_t down = 0; down < sizeof(down_types) / sizeof(down_types[0]); down++) {
             CHECK(ds4_test_cuda_routed_moe_quant_types_supported(
                           gate_types[gate], gate_types[gate], down_types[down]),
-                  "IQ2/Q4 gate-up x Q2/Q4 down matrix entry is supported");
+                  "production gate/up x down quant matrix entry is supported");
         }
     }
     CHECK(!ds4_test_cuda_routed_moe_quant_types_supported(
@@ -164,6 +169,11 @@ static void test_cuda_routed_moe_quant_matrix(void) {
                   DS4_TENSOR_Q4_K_LOCAL,
                   DS4_TENSOR_IQ2_XXS_LOCAL),
           "unsupported down type remains rejected");
+    CHECK(!ds4_test_cuda_routed_moe_quant_types_supported(
+                  DS4_TENSOR_SM75_Q3A4_LOCAL,
+                  DS4_TENSOR_SM75_Q3A4_LOCAL,
+                  DS4_TENSOR_SM75_Q3A4_LOCAL),
+          "Q3A4 remains rejected for the down projection");
 }
 
 static void test_q8_cache_benefit_order(void) {
