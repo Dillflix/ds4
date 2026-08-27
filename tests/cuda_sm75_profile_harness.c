@@ -224,8 +224,10 @@ static void usage(const char *argv0) {
             "DS4_PROFILE_INDEXER_TILE selects the indexer score tile: 128\n"
             "(default), 64, 32, or 16. DS4_PROFILE_INDEXER_TOPK selects the\n"
             "8192-entry top-k implementation: monolithic (default) or\n"
-            "chunked. The indexer scenario compares every score bit against\n"
-            "the shipping WMMA128 path before timing the selected path.\n",
+            "chunked. DS4_PROFILE_INDEXER_OPERANDS=materialized compares the\n"
+            "diagnostic FP16-input WMMA128 path, including Q-materialization\n"
+            "cost, against shipping inline conversion. The indexer scenario\n"
+            "compares every score bit against shipping WMMA128 before timing.\n",
             argv0);
 }
 
@@ -1080,8 +1082,21 @@ static int run_indexer_32k(const scenario_spec *spec,
     const float scale = 1.0f / sqrtf((float)(n_head * head_dim));
     const char *tile = getenv("DS4_PROFILE_INDEXER_TILE");
     const char *topk = getenv("DS4_PROFILE_INDEXER_TOPK");
+    const char *operands = getenv("DS4_PROFILE_INDEXER_OPERANDS");
     if (!tile || !tile[0]) tile = "128";
     if (!topk || !topk[0]) topk = "monolithic";
+    if (!operands || !operands[0]) operands = "inline";
+    const int materialized = strcmp(operands, "materialized") == 0;
+    if (!materialized && strcmp(operands, "inline") != 0) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_INDEXER_OPERANDS must be inline or materialized\n");
+        return 0;
+    }
+    if (materialized && strcmp(tile, "128") != 0) {
+        fprintf(stderr,
+                "error: materialized indexer operands require tile 128\n");
+        return 0;
+    }
     if (!configure_indexer_score_tile(tile)) {
         fprintf(stderr,
                 "error: DS4_PROFILE_INDEXER_TILE must be 128, 64, 32, or 16\n");
@@ -1102,14 +1117,15 @@ static int run_indexer_32k(const scenario_spec *spec,
     const uint64_t tensor_bytes =
         (q_count + weight_count + cache_count + 2u * score_count) *
             sizeof(float) +
-        selected_count * sizeof(uint32_t);
+        selected_count * sizeof(uint32_t) +
+        (materialized ? (q_count + cache_count) * sizeof(uint16_t) : 0u);
     const uint64_t predicted = tensor_bytes + PROFILE_SAFETY_RESERVE;
     printf("scenario=%s\nprofile_kind=indexer_sm75_32k\nlayer=%u\n"
-           "score_tile=%s\ntopk_path=%s\nn_tokens=%u\npos0=%u\n"
+           "score_tile=%s\ntopk_path=%s\noperand_path=%s\nn_tokens=%u\npos0=%u\n"
            "n_comp=%u\nn_head=%u\nhead_dim=%u\nratio=%u\ntop_k=%u\n"
            "tensor_bytes=%llu\npredicted_device_bytes=%llu\n"
            "device_limit_bytes=%llu\n",
-           spec->name, spec->layer, tile, topk, n_tokens, pos0,
+           spec->name, spec->layer, tile, topk, operands, n_tokens, pos0,
            n_comp, n_head, head_dim, ratio, top_k,
            (unsigned long long)tensor_bytes,
            (unsigned long long)predicted,
@@ -1132,6 +1148,7 @@ static int run_indexer_32k(const scenario_spec *spec,
     uint32_t *selected_host =
         (uint32_t *)malloc((size_t)selected_count * sizeof(uint32_t));
     ds4_gpu_tensor *q = NULL, *weights = NULL, *cache = NULL;
+    ds4_gpu_tensor *q_f16 = NULL, *cache_f16 = NULL;
     ds4_gpu_tensor *reference = NULL, *candidate = NULL, *selected = NULL;
     int ok = 0;
     if (!q_host || !weights_host || !cache_host || !reference_host ||
@@ -1158,7 +1175,12 @@ static int run_indexer_32k(const scenario_spec *spec,
     reference = ds4_gpu_tensor_alloc(score_count * sizeof(float));
     candidate = ds4_gpu_tensor_alloc(score_count * sizeof(float));
     selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    if (materialized) {
+        q_f16 = ds4_gpu_tensor_alloc(q_count * sizeof(uint16_t));
+        cache_f16 = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+    }
     if (!q || !weights || !cache || !reference || !candidate || !selected ||
+        (materialized && (!q_f16 || !cache_f16)) ||
         !ds4_gpu_tensor_write(q, 0, q_host, q_count * sizeof(float)) ||
         !ds4_gpu_tensor_write(weights, 0, weights_host,
                               weight_count * sizeof(float)) ||
@@ -1176,6 +1198,34 @@ static int run_indexer_32k(const scenario_spec *spec,
                 "error: production indexer QAT fixture preparation failed\n");
         goto cleanup;
     }
+    if (materialized) {
+        const double cache_start = monotonic_seconds();
+        if (!ds4_gpu_tensor_copy_f32_to_f16(
+                cache_f16, 0u, cache, 0u, cache_count) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: persistent indexer K materialization failed\n");
+            goto cleanup;
+        }
+        const double cache_ms =
+            (monotonic_seconds() - cache_start) * 1000.0;
+        if (!ds4_gpu_tensor_copy_f32_to_f16(
+                q_f16, 0u, q, 0u, q_count) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: indexer Q materialization failed\n");
+            goto cleanup;
+        }
+        printf("persistent_k_materialize_values=%llu\n"
+               "persistent_k_materialize_bytes=%llu\n"
+               "persistent_k_materialize_once_ms=%.6f\n"
+               "q_materialize_values=%llu\nq_materialize_bytes=%llu\n",
+               (unsigned long long)cache_count,
+               (unsigned long long)(cache_count * sizeof(uint16_t)),
+               cache_ms,
+               (unsigned long long)q_count,
+               (unsigned long long)(q_count * sizeof(uint16_t)));
+    }
 
     if (!configure_indexer_score_tile("128") ||
         !ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -1187,10 +1237,14 @@ static int run_indexer_32k(const scenario_spec *spec,
         fprintf(stderr, "error: shipping indexer score reference failed\n");
         goto cleanup;
     }
-    if (!configure_indexer_score_tile(tile) ||
-        !ds4_gpu_indexer_scores_decode_batch_tensor(
-            candidate, q, weights, cache, n_comp, n_tokens, pos0,
-            n_head, head_dim, ratio, scale) ||
+    if ((!materialized && !configure_indexer_score_tile(tile)) ||
+        !(materialized
+              ? ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+                    candidate, q_f16, weights, cache_f16,
+                    n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale)
+              : ds4_gpu_indexer_scores_decode_batch_tensor(
+                    candidate, q, weights, cache, n_comp, n_tokens, pos0,
+                    n_head, head_dim, ratio, scale)) ||
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(candidate, 0, candidate_host,
                              score_count * sizeof(float)) ||
@@ -1212,22 +1266,113 @@ static int run_indexer_32k(const scenario_spec *spec,
     }
 
     if (timed_repeats > 0u) {
-        double start = monotonic_seconds();
-        for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
-            if (!ds4_gpu_indexer_scores_decode_batch_tensor(
-                    candidate, q, weights, cache, n_comp, n_tokens, pos0,
-                    n_head, head_dim, ratio, scale)) {
-                fprintf(stderr, "error: timed indexer score launch failed\n");
+        double score_ms = 0.0;
+        double inline_score_ms = 0.0;
+        double materialized_score_ms = 0.0;
+        double q_materialize_ms = 0.0;
+        double materialized_e2e_ms = 0.0;
+        if (materialized) {
+            const char *order = getenv(
+                "DS4_PROFILE_INDEXER_MATERIALIZED_TIMING_ORDER");
+            if (!order || !order[0]) order = "inline-first";
+            const int materialized_first =
+                strcmp(order, "materialized-first") == 0;
+            if (!materialized_first && strcmp(order, "inline-first") != 0) {
+                fprintf(stderr,
+                        "error: materialized timing order must be inline-first "
+                        "or materialized-first\n");
                 goto cleanup;
             }
+            printf("materialized_timing_order=%s\n", order);
+            for (uint32_t pass = 0; pass < 2u; pass++) {
+                const int run_materialized =
+                    materialized_first ? pass == 0u : pass == 1u;
+                const double start = monotonic_seconds();
+                for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+                    const int launched = run_materialized
+                        ? ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+                            candidate, q_f16, weights, cache_f16,
+                            n_comp, n_tokens, pos0, n_head, head_dim,
+                            ratio, scale)
+                        : ds4_gpu_indexer_scores_decode_batch_tensor(
+                            reference, q, weights, cache,
+                            n_comp, n_tokens, pos0, n_head, head_dim,
+                            ratio, scale);
+                    if (!launched) {
+                        fprintf(stderr,
+                                "error: timed %s indexer score launch failed\n",
+                                run_materialized ? "materialized" : "inline");
+                        goto cleanup;
+                    }
+                }
+                if (!ds4_gpu_synchronize()) {
+                    fprintf(stderr,
+                            "error: timed %s indexer score sync failed\n",
+                            run_materialized ? "materialized" : "inline");
+                    goto cleanup;
+                }
+                const double elapsed =
+                    (monotonic_seconds() - start) * 1000.0;
+                if (run_materialized) materialized_score_ms = elapsed;
+                else inline_score_ms = elapsed;
+            }
+
+            double start = monotonic_seconds();
+            for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+                if (!ds4_gpu_tensor_copy_f32_to_f16(
+                        q_f16, 0u, q, 0u, q_count)) {
+                    fprintf(stderr,
+                            "error: timed indexer Q materialization failed\n");
+                    goto cleanup;
+                }
+            }
+            if (!ds4_gpu_synchronize()) {
+                fprintf(stderr,
+                        "error: timed indexer Q materialization sync failed\n");
+                goto cleanup;
+            }
+            q_materialize_ms =
+                (monotonic_seconds() - start) * 1000.0;
+
+            start = monotonic_seconds();
+            for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+                if (!ds4_gpu_tensor_copy_f32_to_f16(
+                        q_f16, 0u, q, 0u, q_count) ||
+                    !ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+                        candidate, q_f16, weights, cache_f16,
+                        n_comp, n_tokens, pos0, n_head, head_dim,
+                        ratio, scale)) {
+                    fprintf(stderr,
+                            "error: timed materialized indexer end-to-end launch failed\n");
+                    goto cleanup;
+                }
+            }
+            if (!ds4_gpu_synchronize()) {
+                fprintf(stderr,
+                        "error: timed materialized indexer end-to-end sync failed\n");
+                goto cleanup;
+            }
+            materialized_e2e_ms =
+                (monotonic_seconds() - start) * 1000.0;
+            score_ms = materialized_score_ms;
+        } else {
+            const double start = monotonic_seconds();
+            for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
+                if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                        candidate, q, weights, cache, n_comp, n_tokens, pos0,
+                        n_head, head_dim, ratio, scale)) {
+                    fprintf(stderr,
+                            "error: timed indexer score launch failed\n");
+                    goto cleanup;
+                }
+            }
+            if (!ds4_gpu_synchronize()) {
+                fprintf(stderr, "error: timed indexer score sync failed\n");
+                goto cleanup;
+            }
+            score_ms = (monotonic_seconds() - start) * 1000.0;
         }
-        if (!ds4_gpu_synchronize()) {
-            fprintf(stderr, "error: timed indexer score sync failed\n");
-            goto cleanup;
-        }
-        const double score_ms =
-            (monotonic_seconds() - start) * 1000.0;
-        start = monotonic_seconds();
+        double start = monotonic_seconds();
         for (uint32_t repeat = 0; repeat < timed_repeats; repeat++) {
             if (!ds4_gpu_indexer_topk_tensor(
                     selected, candidate, n_comp, n_tokens, top_k)) {
@@ -1248,6 +1393,24 @@ static int run_indexer_32k(const scenario_spec *spec,
                timed_repeats, score_ms,
                score_ms / (double)timed_repeats,
                topk_ms, topk_ms / (double)timed_repeats);
+        if (materialized) {
+            printf("inline_score_timed_total_ms=%.6f\n"
+                   "inline_score_timed_per_call_ms=%.6f\n"
+                   "materialized_score_timed_total_ms=%.6f\n"
+                   "materialized_score_timed_per_call_ms=%.6f\n"
+                   "q_materialize_timed_total_ms=%.6f\n"
+                   "q_materialize_timed_per_call_ms=%.6f\n"
+                   "materialized_e2e_timed_total_ms=%.6f\n"
+                   "materialized_e2e_timed_per_call_ms=%.6f\n",
+                   inline_score_ms,
+                   inline_score_ms / (double)timed_repeats,
+                   materialized_score_ms,
+                   materialized_score_ms / (double)timed_repeats,
+                   q_materialize_ms,
+                   q_materialize_ms / (double)timed_repeats,
+                   materialized_e2e_ms,
+                   materialized_e2e_ms / (double)timed_repeats);
+        }
     }
     ok = 1;
 
@@ -1255,6 +1418,8 @@ cleanup:
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(candidate);
     ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(cache_f16);
+    ds4_gpu_tensor_free(q_f16);
     ds4_gpu_tensor_free(cache);
     ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(q);

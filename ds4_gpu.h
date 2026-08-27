@@ -492,6 +492,23 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+/* Diagnostic exact-WMMA path for measuring pre-materialized FP16 indexer
+ * operands. Q and index_comp contain the same __float2half-rounded values the
+ * shipping WMMA128 kernel creates inside every score tile. This is not a
+ * production-dispatch API. */
+int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q_f16,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_f16,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
+
 int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         const ds4_gpu_tensor *logits_row,
                                         const void *model_map,

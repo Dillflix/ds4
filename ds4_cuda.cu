@@ -13206,6 +13206,137 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* Exact diagnostic companion to indexer_scores_wmma128_kernel. The shipping
+ * kernel rounds every F32 Q/K operand with __float2half while staging each
+ * score tile. This version consumes those rounded values from persistent or
+ * per-microbatch FP16 tensors, leaving accumulation order and the epilogue
+ * unchanged. It exists to measure the value of operand materialization before
+ * changing any production graph storage or dispatch. */
+__global__ static void indexer_scores_wmma128_f16_kernel(
+        float *scores,
+        const __half *q,
+        const float *weights,
+        const __half *index_comp,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 128u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 256u || head_dim != 128u) return;
+
+    if (causal) {
+        const uint32_t last_token = min(tile_t + 16u, n_tokens);
+        const uint32_t max_visible = last_token > tile_t
+            ? min((pos0 + last_token) / ratio, n_comp)
+            : 0u;
+        if (tile_c >= max_visible) {
+            for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+                const uint32_t r = i >> 7u;
+                const uint32_t c = i & 127u;
+                const uint32_t token = tile_t + r;
+                const uint32_t comp = tile_c + c;
+                if (token < n_tokens && comp < n_comp) {
+                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
+
+    __shared__ __half a_sh[16 * 128];
+    __shared__ __half b_sh[128 * 128];
+    __shared__ float c_sh[8 * 16 * 16];
+
+    float acc[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
+
+    for (uint32_t i = tid; i < 128u * 128u; i += 256u) {
+        const uint32_t c = i >> 7u;
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        b_sh[d + c * 128u] = comp < n_comp
+            ? index_comp[(uint64_t)comp * head_dim + d]
+            : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+            const uint32_t r = i >> 7u;
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            a_sh[i] = token < n_tokens
+                ? q[((uint64_t)token * n_head + h) * head_dim + d]
+                : __float2half(0.0f);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                       wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                       wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        const uint32_t col0 = warp * 16u;
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16,
+                                wmma::mem_row_major);
+        __syncthreads();
+
+        const uint32_t local0 = tid & 255u;
+        const uint32_t token0 = tile_t + (local0 >> 4u);
+        const float w0 = token0 < n_tokens
+            ? weights[(uint64_t)token0 * n_head + h] : 0.0f;
+        uint32_t slot = 0;
+        for (uint32_t i = tid; i < 8u * 16u * 16u;
+             i += 256u, slot++) {
+            const uint32_t wtile = i >> 8u;
+            const uint32_t local = i & 255u;
+            const uint32_t r = local >> 4u;
+            const uint32_t c = local & 15u;
+            const uint32_t token = tile_t + r;
+            const uint32_t comp = tile_c + wtile * 16u + c;
+            if (token < n_tokens && comp < n_comp) {
+                acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
+            }
+        }
+        __syncthreads();
+    }
+
+    uint32_t slot = 0;
+    for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
+        const uint32_t wtile = i >> 8u;
+        const uint32_t local = i & 255u;
+        const uint32_t r = local >> 4u;
+        const uint32_t c = local & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp = tile_c + wtile * 16u + c;
+        if (token < n_tokens && comp < n_comp) {
+            float out = acc[slot] * scale;
+            if (causal) {
+                const uint32_t visible = (pos0 + token + 1u) / ratio;
+                if (comp >= visible) out = -INFINITY;
+            }
+            scores[(uint64_t)token * n_comp + comp] = out;
+        }
+    }
+#endif
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -14120,6 +14251,45 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1);
+}
+
+extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q_f16,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_f16,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    if (!scores || !q_f16 || !weights || !index_comp_f16 ||
+        n_comp == 0u || n_tokens == 0u || n_head != 64u ||
+        head_dim != 128u || ratio == 0u ||
+        q_f16->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(__half) ||
+        weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+        index_comp_f16->bytes < (uint64_t)n_comp * head_dim * sizeof(__half) ||
+        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(scores);
+    if (ds4_tensor_device_idx(q_f16) != tier ||
+        ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(index_comp_f16) != tier ||
+        ds4_gpu_set_current_device(tier) != 0) {
+        return 0;
+    }
+    dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1u);
+    indexer_scores_wmma128_f16_kernel<<<grid, 256>>>(
+            (float *)scores->ptr,
+            (const __half *)q_f16->ptr,
+            (const float *)weights->ptr,
+            (const __half *)index_comp_f16->ptr,
+            n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale, 1);
+    return cuda_ok(cudaGetLastError(),
+                   "indexer scores pre-materialized f16 wmma128 launch");
 }
 
 extern "C" int ds4_gpu_dspark_markov_argmax_tensor(

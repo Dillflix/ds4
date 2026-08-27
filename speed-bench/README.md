@@ -1794,6 +1794,35 @@ backed by reduced score work and is consistent with the preceding interleaved
 uninstrumented A/B. Keep WMMA128; do not base subsequent indexer work on the
 isolated WMMA64 event-timing result.
 
+With WMMA128 retained, `cuda-sm75-indexer-f16-operands.sh` evaluates the next
+mechanism independently: move the exact FP16 rounding already performed inside
+every WMMA128 score tile into reusable operand tensors. The bounded harness
+keeps the WMMA accumulation order and epilogue unchanged, requires bit-exact
+scores and ordered top-512 selection, alternates paired timing order, and
+includes one Q materialization in candidate end-to-end time. Full-history K
+conversion is reported separately because a production sidecar would be
+updated when each compressed row is written.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+TIMING_ROUNDS=5 \
+TIMING_REPEATS=10 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-f16-operands.sh
+```
+
+Return `sm75-indexer-f16-operands-<timestamp>.tar.gz`. The candidate is still
+diagnostic: no production storage or dispatch changes are made. At 256K, the
+21 ratio-4 indexer layers would need 336 MiB of persistent FP16 K storage
+(160 MiB in stage 0 and 176 MiB in stage 1); a live 512-token FP16 Q operand is
+8 MiB on the executing tier. Promotion requires a subsequent full-model exact
+frontier-logit and interleaved throughput A/B.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it
