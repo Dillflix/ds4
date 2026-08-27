@@ -98,44 +98,76 @@ from pathlib import Path
 
 csv_path, summary_path, layers_text, experts_text, parts_text = sys.argv[1:]
 rows = list(csv.DictReader(open(csv_path, newline="", encoding="utf-8")))
-formats = ("q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32")
+common_formats = ("q4_K", "q3_K", "sm75_q3_32", "sm75_q4_32")
+gate_formats = common_formats + ("iq2_xxs",)
 layers = [x for x in layers_text.split(",") if x]
 experts = [x for x in experts_text.split(",") if x]
 parts = [x for x in parts_text.split(",") if x]
 expected_tensors = len(layers) * len(experts) * len(parts)
+expected_tensor_rows = len(layers) * len(experts) * sum(
+    len(gate_formats if part in ("w1", "w3") else common_formats)
+    for part in parts
+)
 
 tensor_rows = [r for r in rows if r["scope"] == "tensor"]
 aggregate = {r["format"]: r for r in rows if r["scope"] == "aggregate"}
-if len(tensor_rows) != expected_tensors * len(formats):
+role_rows = {(r["part"], r["format"]): r for r in rows if r["scope"] == "role"}
+if len(tensor_rows) != expected_tensor_rows:
     raise SystemExit(
-        f"expected {expected_tensors * len(formats)} tensor rows, got {len(tensor_rows)}"
+        f"expected {expected_tensor_rows} tensor rows, got {len(tensor_rows)}"
     )
-if set(aggregate) != set(formats):
+if set(aggregate) != set(common_formats):
     raise SystemExit(f"aggregate formats mismatch: {sorted(aggregate)}")
+expected_roles = ({("gate_up", name) for name in gate_formats} |
+                  {("down", name) for name in common_formats})
+if set(role_rows) != expected_roles:
+    raise SystemExit(f"role rows mismatch: {sorted(role_rows)}")
 for row in rows:
     for field in ("nrmse", "weighted_nrmse", "max_abs"):
         value = float(row[field])
         if not math.isfinite(value) or value < 0:
             raise SystemExit(f"invalid {field}: {row}")
 
-q4 = float(aggregate["q4_K"]["weighted_nrmse"])
 lines = [
-    "# SM75 Q3/Q4 real-weight quality",
+    "# SM75 routed-quant real-weight quality",
     "",
     f"Sampled {expected_tensors} routed-expert tensors.",
+    "",
+    "## Gate/up (w1 + w3)",
     "",
     "| Format | Bits/weight | NRMSE | Imatrix-weighted NRMSE | Weighted / Q4_K | Max abs |",
     "|---|---:|---:|---:|---:|---:|",
 ]
-for name in formats:
-    row = aggregate[name]
+q4_gate = float(role_rows[("gate_up", "q4_K")]["weighted_nrmse"])
+for name in gate_formats:
+    row = role_rows[("gate_up", name)]
     weighted = float(row["weighted_nrmse"])
     lines.append(
         f"| {name} | {float(row['bits_per_weight']):.3f} | "
         f"{float(row['nrmse']):.8f} | {weighted:.8f} | "
-        f"{weighted / q4:.5f} | {float(row['max_abs']):.8g} |"
+        f"{weighted / q4_gate:.5f} | {float(row['max_abs']):.8g} |"
     )
 lines += [
+    "",
+    "IQ2_XXS is included only here because this is its shipping DS4 role.",
+    "",
+    "## Down (w2)",
+    "",
+    "| Format | Bits/weight | NRMSE | Imatrix-weighted NRMSE | Weighted / Q4_K | Max abs |",
+    "|---|---:|---:|---:|---:|---:|",
+]
+q4_down = float(role_rows[("down", "q4_K")]["weighted_nrmse"])
+for name in common_formats:
+    row = role_rows[("down", name)]
+    weighted = float(row["weighted_nrmse"])
+    lines.append(
+        f"| {name} | {float(row['bits_per_weight']):.3f} | "
+        f"{float(row['nrmse']):.8f} | {weighted:.8f} | "
+        f"{weighted / q4_down:.5f} | {float(row['max_abs']):.8g} |"
+    )
+lines += [
+    "",
+    "IQ2-down and Q2_K are intentionally excluded from this pass.",
     "",
     "This is a bounded real-weight/imatrix error audit. It does not alter GGUF",
     "type registration or production dispatch, and it is not an end-to-end",
@@ -146,4 +178,4 @@ Path(summary_path).write_text("\n".join(lines), encoding="utf-8")
 print("\n".join(lines))
 PY
 
-echo "SM75 Q3/Q4 real-weight quality audit complete: $QUALITY_DIR"
+echo "SM75 routed-quant real-weight quality audit complete: $QUALITY_DIR"

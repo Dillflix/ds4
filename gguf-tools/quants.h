@@ -82,15 +82,18 @@ bool ds4q_iq2_xxs_tables(const uint64_t **grid, size_t *grid_len,
                          const uint16_t **neighbours, size_t *neighbours_len);
 
 /*
- * Bounded research API for the SM75 Q3/Q4-32 experiment.  These formats are
- * deliberately not registered as GGUF output types: real-weight quality must
- * clear the audit gate before either native layout becomes production data.
+ * Bounded research API for the SM75 Q3/Q4-32 experiment.  The shipping
+ * IQ2_XXS gate/up format is included as a comparison control.  The new
+ * formats are deliberately not registered as GGUF output types: real-weight
+ * quality must clear the audit gate before either native layout becomes
+ * production data.
  */
 typedef enum {
     DS4Q_EXPERIMENT_Q4_K = 0,
     DS4Q_EXPERIMENT_Q3_K,
     DS4Q_EXPERIMENT_SM75_Q3_32,
     DS4Q_EXPERIMENT_SM75_Q4_32,
+    DS4Q_EXPERIMENT_IQ2_XXS,
     DS4Q_EXPERIMENT_COUNT,
 } ds4q_experimental_format;
 

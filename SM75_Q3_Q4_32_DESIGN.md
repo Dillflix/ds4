@@ -231,6 +231,17 @@ treats all FP16 headers as opaque and compares the two integer chains by their
 difference only after both have completed; it does not claim floating Q4_K
 bit equivalence.
 
+That M16xN8xK256 result is a **single-projection/down-like arithmetic test**.
+It is not a gate/up throughput comparison: production gate/up computes two
+projections, applies clamp + SiLU + multiply + route weight, and uses a fused
+expert-tile dispatch.  In particular, its Q4/Q3 timings cannot be compared
+directly with DS4's shipping fused IQ2_XXS gate/up kernel.  The real-weight
+quality gate therefore reports w1+w3 separately and includes IQ2_XXS as the
+shipping gate/up control.  Before selecting a gate/up format from performance,
+a second production-shaped harness must compare fused IQ2_XXS, Q4_K, Q3_K,
+Q3-32, and Q4-32 over the same real routing histogram and tile plan.  IQ2 down
+and Q2_K are outside this experiment.
+
 Required evidence:
 
 - edge/adversarial and seeded-random accumulator equality;
