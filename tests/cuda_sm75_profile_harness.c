@@ -227,7 +227,9 @@ static void usage(const char *argv0) {
             "chunked. DS4_PROFILE_INDEXER_OPERANDS=materialized compares the\n"
             "diagnostic FP16-input WMMA128 path; streaming64 selects the low-\n"
             "shared-memory FP16 WMMA64 experiment. Both include Q conversion\n"
-            "cost and compare every score bit against shipping WMMA128.\n",
+            "cost and compare every score bit against shipping WMMA128.\n"
+            "DS4_PROFILE_INDEXER_N_COMP overrides the live compressed-row\n"
+            "count (default 8192) so native-cache tail handling can be tested.\n",
             argv0);
 }
 
@@ -1097,7 +1099,7 @@ static int run_indexer_32k(const scenario_spec *spec,
                            uint32_t timed_repeats) {
     const uint32_t n_tokens = 512u;
     const uint32_t pos0 = 32256u;
-    const uint32_t n_comp = 8192u;
+    uint32_t n_comp = 8192u;
     const uint32_t n_head = 64u;
     const uint32_t head_dim = 128u;
     const uint32_t ratio = 4u;
@@ -1106,6 +1108,12 @@ static int run_indexer_32k(const scenario_spec *spec,
     const char *tile = getenv("DS4_PROFILE_INDEXER_TILE");
     const char *topk = getenv("DS4_PROFILE_INDEXER_TOPK");
     const char *operands = getenv("DS4_PROFILE_INDEXER_OPERANDS");
+    if (!parse_env_u32("DS4_PROFILE_INDEXER_N_COMP", 8192u, 65536u,
+                       &n_comp) || n_comp < top_k) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_INDEXER_N_COMP must be in 512..65536\n");
+        return 0;
+    }
     if (!tile || !tile[0]) tile = "128";
     if (!topk || !topk[0]) topk = "monolithic";
     if (!operands || !operands[0]) operands = "inline";
@@ -1143,13 +1151,15 @@ static int run_indexer_32k(const scenario_spec *spec,
         (uint64_t)n_tokens * n_head * head_dim;
     const uint64_t weight_count = (uint64_t)n_tokens * n_head;
     const uint64_t cache_count = (uint64_t)n_comp * head_dim;
+    const uint64_t cache_f16_rows = ((uint64_t)n_comp + 63ull) & ~63ull;
+    const uint64_t cache_f16_count = cache_f16_rows * head_dim;
     const uint64_t score_count = (uint64_t)n_tokens * n_comp;
     const uint64_t selected_count = (uint64_t)n_tokens * top_k;
     const uint64_t tensor_bytes =
         (q_count + weight_count + cache_count + 2u * score_count) *
             sizeof(float) +
         selected_count * sizeof(uint32_t) +
-        (materialized ? (q_count + cache_count) * sizeof(uint16_t) : 0u);
+        (materialized ? (q_count + cache_f16_count) * sizeof(uint16_t) : 0u);
     const uint64_t predicted = tensor_bytes + PROFILE_SAFETY_RESERVE;
     printf("scenario=%s\nprofile_kind=indexer_sm75_32k\nlayer=%u\n"
            "score_tile=%s\ntopk_path=%s\noperand_path=%s\nn_tokens=%u\npos0=%u\n"
@@ -1208,7 +1218,7 @@ static int run_indexer_32k(const scenario_spec *spec,
     selected = ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
     if (materialized) {
         q_f16 = ds4_gpu_tensor_alloc(q_count * sizeof(uint16_t));
-        cache_f16 = ds4_gpu_tensor_alloc(cache_count * sizeof(uint16_t));
+        cache_f16 = ds4_gpu_tensor_alloc(cache_f16_count * sizeof(uint16_t));
     }
     if (!q || !weights || !cache || !reference || !candidate || !selected ||
         (materialized && (!q_f16 || !cache_f16)) ||
@@ -1283,6 +1293,28 @@ static int run_indexer_32k(const scenario_spec *spec,
                                    score_count)) {
         fprintf(stderr, "error: candidate indexer score validation failed\n");
         goto cleanup;
+    }
+    if (streaming64) {
+        if (!ds4_gpu_indexer_score_one_tensor(
+                    reference, q, weights, cache, n_comp,
+                    n_head, head_dim, scale) ||
+            !ds4_gpu_indexer_score_one_f16_cache_tensor(
+                    candidate, q, weights, cache_f16, n_comp,
+                    n_head, head_dim, scale) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(reference, 0, reference_host,
+                                  (uint64_t)n_comp * sizeof(float)) ||
+            !ds4_gpu_tensor_read(candidate, 0, candidate_host,
+                                  (uint64_t)n_comp * sizeof(float)) ||
+            !verify_indexer_score_bits(reference_host, candidate_host,
+                                       n_comp)) {
+            fprintf(stderr,
+                    "error: native-F16-cache one-token indexer validation failed\n");
+            goto cleanup;
+        }
+        printf("direct_one_values_checked=%u\n"
+               "direct_one_validation=bit-exact\n",
+               n_comp);
     }
     if (!configure_indexer_topk(topk) ||
         !ds4_gpu_indexer_topk_tensor(selected, candidate,

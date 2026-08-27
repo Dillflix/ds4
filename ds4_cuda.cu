@@ -318,6 +318,12 @@ static int cuda_sm75_mma_ok(void) {
     return major == 7 && minor == 5;
 }
 
+extern "C" int ds4_gpu_sm75_indexer_native_supported(void) {
+    return !g_quality_mode &&
+           getenv("DS4_CUDA_NO_INDEXER_STREAMING64") == NULL &&
+           cuda_sm75_mma_ok();
+}
+
 
 
 
@@ -12744,6 +12750,54 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
+/* Native-cache companion to the shipping one-token path. It expands the
+ * persistent F16 K row to F32, then preserves the direct-one path's reduction
+ * order and F32 arithmetic. End-to-end decode exactness is a promotion gate. */
+__global__ static void indexer_score_one_direct_f16_cache_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const __half *index_comp,
+        uint32_t n_comp,
+        uint32_t pos0,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+    const uint32_t c = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (c >= n_comp || tid >= 128u) return;
+    if (causal) {
+        const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_comp;
+        if (c >= visible) {
+            if (tid == 0) scores[c] = -INFINITY;
+            return;
+        }
+    }
+
+    __shared__ float krow[128];
+    __shared__ float partial[4];
+    if (tid < 128u) {
+        krow[tid] = __half2float(index_comp[(uint64_t)c * 128u + tid]);
+    }
+    __syncthreads();
+
+    float total = 0.0f;
+    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
+        const uint32_t h = h0 + warp;
+        const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+        const float4 kv = ((const float4 *)krow)[lane];
+        float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        dot = warp_sum_f32(dot);
+        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
+        __syncthreads();
+        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
+        __syncthreads();
+    }
+    if (tid == 0) scores[c] = total;
+}
+
 __global__ static void indexer_scores_wmma_kernel(
         float *scores,
         const float *q,
@@ -14227,6 +14281,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
 
 typedef enum {
     INDEXER_SCORE_DISPATCH_DIRECT_ONE = 0,
+    INDEXER_SCORE_DISPATCH_STREAMING64_NATIVE,
     INDEXER_SCORE_DISPATCH_WMMA128,
     INDEXER_SCORE_DISPATCH_WMMA64,
     INDEXER_SCORE_DISPATCH_WMMA32,
@@ -14241,7 +14296,8 @@ static std::atomic<bool> g_indexer_score_audit_registered = false;
 
 static void indexer_score_audit_report(void) {
     static const char *names[INDEXER_SCORE_DISPATCH_COUNT] = {
-        "direct-one", "wmma128", "wmma64", "wmma32", "wmma16", "generic",
+        "direct-one", "streaming64-native", "wmma128", "wmma64", "wmma32",
+        "wmma16", "generic",
     };
     for (uint32_t i = 0; i < INDEXER_SCORE_DISPATCH_COUNT; i++) {
         fprintf(stderr,
@@ -14393,6 +14449,41 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
+extern "C" int ds4_gpu_indexer_score_one_f16_cache_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_f16,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale) {
+    if (!scores || !q || !weights || !index_comp_f16 || n_comp == 0u ||
+        n_head != 64u || head_dim != 128u ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        weights->bytes < (uint64_t)n_head * sizeof(float) ||
+        index_comp_f16->bytes < (uint64_t)n_comp * head_dim * sizeof(__half) ||
+        scores->bytes < (uint64_t)n_comp * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(scores);
+    if (ds4_tensor_device_idx(q) != tier ||
+        ds4_tensor_device_idx(weights) != tier ||
+        ds4_tensor_device_idx(index_comp_f16) != tier ||
+        ds4_gpu_set_current_device(tier) != 0 || !cuda_sm75_mma_ok()) {
+        return 0;
+    }
+    indexer_score_audit_record(INDEXER_SCORE_DISPATCH_DIRECT_ONE);
+    indexer_score_one_direct_f16_cache_kernel<<<n_comp, 128>>>(
+            (float *)scores->ptr,
+            (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const __half *)index_comp_f16->ptr,
+            n_comp, 0u, 1u, scale, 0);
+    return cuda_ok(cudaGetLastError(),
+                   "indexer score one native f16 cache launch");
+}
+
 extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q_f16,
@@ -14444,12 +14535,13 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    const uint64_t padded_comp = ((uint64_t)n_comp + 63ull) & ~63ull;
     if (!scores || !q_f16 || !weights || !index_comp_f16 ||
-        n_comp == 0u || (n_comp & 63u) != 0u || n_tokens == 0u ||
+        n_comp == 0u || n_tokens == 0u ||
         n_head != 64u || head_dim != 128u || ratio == 0u ||
         q_f16->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(__half) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
-        index_comp_f16->bytes < (uint64_t)n_comp * head_dim * sizeof(__half) ||
+        index_comp_f16->bytes < padded_comp * head_dim * sizeof(__half) ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
         return 0;
     }
@@ -14460,7 +14552,8 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
         ds4_gpu_set_current_device(tier) != 0 || !cuda_sm75_mma_ok()) {
         return 0;
     }
-    dim3 grid(n_comp / 64u, (n_tokens + 15u) / 16u, 1u);
+    indexer_score_audit_record(INDEXER_SCORE_DISPATCH_STREAMING64_NATIVE);
+    dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1u);
     indexer_scores_wmma64_f16_streaming_kernel<<<grid, 128>>>(
             (float *)scores->ptr,
             (const __half *)q_f16->ptr,

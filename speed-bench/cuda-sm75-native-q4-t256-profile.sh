@@ -21,7 +21,8 @@ Optional environment:
   CTX_ALLOC=262273
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
-  INDEXER_SCORE_TILE=128       128 (shipping) or 64 (exact diagnostic)
+  INDEXER_NATIVE_CACHE=1      1 for native F16/streaming64; 0 for legacy F32
+  INDEXER_SCORE_TILE=64       native requires 64; legacy accepts 128 or 64
   PROFILE_GPU=0                physical GPU for native-Q4 NCU harnesses
   PROFILE_PARTNER_GPU=1        its NVLink partner for T256 cuBLAS NCU
   RUN_NCU=1
@@ -56,7 +57,8 @@ PROFILE_TOKENS=${PROFILE_TOKENS:-8192}
 CTX_ALLOC=${CTX_ALLOC:-262273}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
-INDEXER_SCORE_TILE=${INDEXER_SCORE_TILE:-128}
+INDEXER_NATIVE_CACHE=${INDEXER_NATIVE_CACHE:-1}
+INDEXER_SCORE_TILE=${INDEXER_SCORE_TILE:-64}
 PROFILE_GPU=${PROFILE_GPU:-0}
 PROFILE_PARTNER_GPU=${PROFILE_PARTNER_GPU:-1}
 RUN_NCU=${RUN_NCU:-1}
@@ -90,6 +92,10 @@ fi
     die "NCU_SET must be full or attention"
 [[ $INDEXER_SCORE_TILE == 128 || $INDEXER_SCORE_TILE == 64 ]] ||
     die "INDEXER_SCORE_TILE must be 128 or 64"
+[[ $INDEXER_NATIVE_CACHE == 0 || $INDEXER_NATIVE_CACHE == 1 ]] ||
+    die "INDEXER_NATIVE_CACHE must be 0 or 1"
+[[ $INDEXER_NATIVE_CACHE == 0 || $INDEXER_SCORE_TILE == 64 ]] ||
+    die "INDEXER_NATIVE_CACHE=1 requires INDEXER_SCORE_TILE=64"
 if [[ $NCU_SET == attention && $RUN_NCU == 1 && $RUN_ATTENTION_NCU == 0 ]]; then
     die "NCU_SET=attention requires RUN_ATTENTION_NCU=1"
 fi
@@ -160,6 +166,7 @@ if [[ -n $REUSE_NSYS_DIR ]]; then
     require_reuse_value prefill_chunk "$PREFILL_CHUNK"
     require_reuse_value pipeline_mb "$PIPELINE_MB"
     require_reuse_value indexer_score_tile "$INDEXER_SCORE_TILE"
+    require_reuse_value indexer_native_cache "$INDEXER_NATIVE_CACHE"
     require_reuse_value t256_policy automatic-balanced
 fi
 if [[ -n $REUSE_Q4_NCU_DIR ]]; then
@@ -257,7 +264,10 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
-if [[ $INDEXER_SCORE_TILE == 64 ]]; then
+if [[ $INDEXER_NATIVE_CACHE == 0 ]]; then
+    production_env+=(DS4_CUDA_NO_INDEXER_STREAMING64=1)
+fi
+if [[ $INDEXER_NATIVE_CACHE == 0 && $INDEXER_SCORE_TILE == 64 ]]; then
     production_env+=(DS4_CUDA_NO_INDEXER_WMMA128=1)
 fi
 
@@ -327,9 +337,9 @@ phase=manifest
     printf 'prompt=%s\ngpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
         "$PROMPT" "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" \
         "$((43-STAGE_SPLIT))"
-    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\nindexer_score_tile=%s\n' \
+    printf 'profile_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_mb=%s\nindexer_score_tile=%s\nindexer_native_cache=%s\n' \
         "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB" \
-        "$INDEXER_SCORE_TILE"
+        "$INDEXER_SCORE_TILE" "$INDEXER_NATIVE_CACHE"
     printf 't256_policy=automatic-balanced\nt256_local_layers=even\nt256_partner_layers=odd\npartner_arithmetic=f16\n'
     printf 'attention_rows_policy=automatic-qualified\nxdev_sync=disabled\n'
     printf 'profile_gpu=%s\nprofile_partner_gpu=%s\nrun_ncu=%s\nncu_set=%s\nrun_attention_ncu=%s\n' \
@@ -452,8 +462,12 @@ done
     die "production trace did not enable both qualified attention row splits"
 ! grep -Fq 'required but unavailable' "$base.log" ||
     die "production trace encountered an eligible but unavailable row split"
-expected_indexer_dispatch=wmma$INDEXER_SCORE_TILE
-for dispatch in direct-one wmma128 wmma64 wmma32 wmma16 generic; do
+if [[ $INDEXER_NATIVE_CACHE == 1 ]]; then
+    expected_indexer_dispatch=streaming64-native
+else
+    expected_indexer_dispatch=wmma$INDEXER_SCORE_TILE
+fi
+for dispatch in direct-one streaming64-native wmma128 wmma64 wmma32 wmma16 generic; do
     audit_line=$(grep -F "ds4: CUDA indexer score audit dispatch=$dispatch " \
         "$base.log" || true)
     [[ $(printf '%s\n' "$audit_line" | grep -c .) == 1 ]] ||

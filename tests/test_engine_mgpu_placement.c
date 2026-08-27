@@ -112,6 +112,9 @@ uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
+size_t ds4_test_deepseek_per_layer_kv_bytes(
+        uint32_t layer, int ctx_size, uint32_t prefill_chunk,
+        bool index_cache_f16);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -902,6 +905,27 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
 }
 
+static void test_sm75_native_indexer_cache_accounting(void) {
+    fprintf(stderr, "RUN: test_sm75_native_indexer_cache_accounting\n");
+    ds4_test_seed_compress_ratios();
+    const int ctx = 262273;
+    const uint32_t layer = 2u; /* Flash ratio-4/indexer layer. */
+    const uint32_t comp_cap = (uint32_t)ctx / 4u + 2u;
+    const uint32_t padded_cap = (comp_cap + 63u) & ~63u;
+    const size_t f32 = ds4_test_deepseek_per_layer_kv_bytes(
+            layer, ctx, 2048u, false);
+    const size_t f16 = ds4_test_deepseek_per_layer_kv_bytes(
+            layer, ctx, 2048u, true);
+    const size_t expected_saving =
+        (size_t)comp_cap * 128u * sizeof(float) -
+        (size_t)padded_cap * 128u * sizeof(uint16_t);
+    CHECK(f32 > f16,
+          "native F16 indexer cache reduces ratio-4 per-layer KV bytes");
+    CHECK(f32 - f16 == expected_saving,
+          "native F16 indexer cache planner includes exact 64-row padding");
+    ds4_test_clear_compress_ratios();
+}
+
 static void test_cuda_tp_prefill_attn_rows_shape(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_shape\n");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 512),
@@ -1091,6 +1115,7 @@ int main(void) {
     test_pertier_overhead_pushes_to_spill();
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
+    test_sm75_native_indexer_cache_accounting();
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_attn_rows_default();

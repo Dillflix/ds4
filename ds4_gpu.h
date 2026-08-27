@@ -492,6 +492,20 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+/* SM75 production capability and native-F16-cache decode scorer. The cache
+ * stores QAT-processed indexer K rows in the same F16 operand format consumed
+ * by WMMA prefill; decode retains the shipping F32 reduction order. */
+int ds4_gpu_sm75_indexer_native_supported(void);
+int ds4_gpu_indexer_score_one_f16_cache_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_f16,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale);
+
 /* Diagnostic exact-WMMA path for measuring pre-materialized FP16 indexer
  * operands. Q and index_comp contain the same __float2half-rounded values the
  * shipping WMMA128 kernel creates inside every score tile. This is not a
@@ -509,10 +523,11 @@ int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
         uint32_t                ratio,
         float                   scale);
 
-/* Diagnostic SM75 WMMA64 path. K fragments remain register-resident across
+/* SM75 WMMA64 production kernel. K fragments remain register-resident across
  * all 64 heads, Q and the WMMA accumulator/output scratch are the only shared
- * tensors, and per-head scalar weights are warp-broadcast. The launcher
- * deliberately rejects non-SM75 and non-production-aligned shapes. */
+ * tensors, and per-head scalar weights are warp-broadcast. The F16 K tensor
+ * must have storage padded to a 64-row boundary; n_comp remains the live row
+ * count and tail outputs are discarded. */
 int ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q_f16,

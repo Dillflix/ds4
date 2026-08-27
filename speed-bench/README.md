@@ -1851,6 +1851,48 @@ bash ./speed-bench/cuda-sm75-indexer-f16-operands.sh
 Return `sm75-indexer-streaming64-<timestamp>.tar.gz`. The candidate remains
 diagnostic and cannot affect the production graph.
 
+The accepted systemic SM75 direction changes the persistent ratio-4 indexer
+cache itself to F16 and makes streaming64 the default scorer. Compressor and
+FP4-QAT arithmetic remain F32; each completed K row is rounded once when it is
+committed. This matches the F16 operands that shipping WMMA prefill previously
+created inside every score tile, eliminates the repeated K conversion, and
+reduces the 21-layer 256K indexer cache from about 672 MiB to 336 MiB. Session
+payloads remain F32 so checkpoint files are backend-independent. Set
+`DS4_CUDA_NO_INDEXER_STREAMING64=1` only to obtain the exact legacy-F32
+production control; it is not an automatic runtime fallback on a qualifying
+SM75 graph.
+
+`cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
+tests aligned and 63-row-tail streaming tiles, compares the native one-token
+F16-cache reader with the legacy F32 reader, runs the fixed 100-case production
+quality suite, interleaves 2K--32K throughput sweeps under the 256K allocation,
+byte-compares all frontier logits, and finishes with the long-prompt one-word
+decode smoke.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+CTX_ALLOC=262273 \
+REPEATS=3 \
+RUN_QUALITY=1 \
+RUN_WORD_SMOKE=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-native-cache-production-ab.sh
+```
+
+Return `sm75-indexer-native-cache-production-<timestamp>.tar.gz`. A mismatch
+in any quality score, score bit, top-k ordering, frontier logit, or retrieval
+answer fails the run before promotion evidence is accepted.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it
