@@ -13954,6 +13954,42 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 
+typedef enum {
+    INDEXER_SCORE_DISPATCH_DIRECT_ONE = 0,
+    INDEXER_SCORE_DISPATCH_WMMA128,
+    INDEXER_SCORE_DISPATCH_WMMA64,
+    INDEXER_SCORE_DISPATCH_WMMA32,
+    INDEXER_SCORE_DISPATCH_WMMA16,
+    INDEXER_SCORE_DISPATCH_GENERIC,
+    INDEXER_SCORE_DISPATCH_COUNT,
+} indexer_score_dispatch;
+
+static std::atomic<unsigned long long>
+    g_indexer_score_dispatch_counts[INDEXER_SCORE_DISPATCH_COUNT];
+static std::atomic<bool> g_indexer_score_audit_registered = false;
+
+static void indexer_score_audit_report(void) {
+    static const char *names[INDEXER_SCORE_DISPATCH_COUNT] = {
+        "direct-one", "wmma128", "wmma64", "wmma32", "wmma16", "generic",
+    };
+    for (uint32_t i = 0; i < INDEXER_SCORE_DISPATCH_COUNT; i++) {
+        fprintf(stderr,
+                "ds4: CUDA indexer score audit dispatch=%s launches=%llu\n",
+                names[i],
+                g_indexer_score_dispatch_counts[i].load(std::memory_order_relaxed));
+    }
+}
+
+static void indexer_score_audit_record(indexer_score_dispatch dispatch) {
+    if (getenv("DS4_CUDA_INDEXER_SCORE_AUDIT") == NULL) return;
+    if (!g_indexer_score_audit_registered.exchange(
+            true, std::memory_order_acq_rel)) {
+        atexit(indexer_score_audit_report);
+    }
+    g_indexer_score_dispatch_counts[dispatch].fetch_add(
+        1ull, std::memory_order_relaxed);
+}
+
 static int indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -13978,6 +14014,7 @@ static int indexer_scores_launch(
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
+        indexer_score_audit_record(INDEXER_SCORE_DISPATCH_DIRECT_ONE);
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
@@ -13989,6 +14026,7 @@ static int indexer_scores_launch(
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
+            indexer_score_audit_record(INDEXER_SCORE_DISPATCH_WMMA128);
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -13998,6 +14036,7 @@ static int indexer_scores_launch(
                                                          head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
+            indexer_score_audit_record(INDEXER_SCORE_DISPATCH_WMMA64);
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
                                                         (const float *)q->ptr,
@@ -14007,6 +14046,7 @@ static int indexer_scores_launch(
                                                         head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
+            indexer_score_audit_record(INDEXER_SCORE_DISPATCH_WMMA32);
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
                                                        (const float *)q->ptr,
@@ -14016,6 +14056,7 @@ static int indexer_scores_launch(
                                                        head_dim, ratio, scale, causal ? 1 : 0);
             return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
         } else {
+            indexer_score_audit_record(INDEXER_SCORE_DISPATCH_WMMA16);
             dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
             indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,
@@ -14026,6 +14067,7 @@ static int indexer_scores_launch(
             return cuda_ok(cudaGetLastError(), "indexer scores wmma launch");
         }
     }
+    indexer_score_audit_record(INDEXER_SCORE_DISPATCH_GENERIC);
     dim3 grid(n_comp, n_tokens, 1);
     indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
                                          (const float *)q->ptr,

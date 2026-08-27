@@ -1713,6 +1713,36 @@ Return `sm75-indexer-audit-<timestamp>.tar.gz`. This pass compares existing
 exact paths before any persistent-F16 cache or SM75-specific accumulator
 epilogue is admitted to production.
 
+`cuda-sm75-indexer-wmma64-production-ab.sh` is the production transfer gate
+for the best existing score tile found by that audit. It interleaves the
+shipping WMMA128 path with WMMA64 at 2K, 4K, 8K, 16K, and 32K under the fixed
+256K allocation. The script validates both kernels against WMMA128 in the
+bounded harness, audits every production score dispatch, requires identical
+dispatch counts, and compares every frontier-logit file byte-for-byte.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+CTX_ALLOC=262273 \
+REPEATS=3 \
+RUN_HARNESS=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-wmma64-production-ab.sh
+```
+
+Return `sm75-indexer-wmma64-production-<timestamp>.tar.gz`. A harness-only
+gain is not sufficient to change the production dispatch; promotion requires
+the exact interleaved full-model result.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it
