@@ -1781,6 +1781,49 @@ bash ./speed-bench/cuda-sm75-attention-rowsplit-production-ab.sh
 ```
 
 Return `sm75-attention-rowsplit-production-<timestamp>.tar.gz`.
+
+# SM75 Q4-32/Q3A4 32K production profile
+
+`cuda-sm75-q32-production-profile.sh` captures the next evidence pass for the
+tagged Q4-32/Q3A4 model. It accepts only a genuine single 32768-token
+production frontier with the fixed 22/21 stage split, balanced T256 placement,
+all 344 dense-F16 candidates resident, and the exact routed recipe used by
+`DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf`: Q3A4 gate/up on layers
+6,8,10,12,14,16,18,20,30,32,34,36,38,40,42, Q4-32 gate/up on the other 28
+layers, and Q4-32 down on all 43 layers.
+
+The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
+to per-device stage, microbatch, layer, handoff, and partner-projection tables.
+Nsight Compute does not replay the full application: bounded exact harnesses
+capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, and both indexed and mixed
+long-context attention shapes. This avoids five additional 139 GB model loads
+and prevents application replay from perturbing the production trace.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+PROFILE_TOKENS=32768 \
+CTX_ALLOC=32769 \
+PROFILE_GPU=0 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q32-production-profile.sh
+```
+
+Return `sm75-q32-production-profile-<timestamp>.tar.gz`. The primary results
+are `profile-summary.md`, `stage-device-summary.csv`,
+`stage-microbatch-device.csv`, `kernel-family-summary.csv`, the genuine
+`nsys/combined.nsys-rep`, and the five validated reports under `ncu/`.
+
 # SM75 routed-quant real-weight quality sweep
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and
