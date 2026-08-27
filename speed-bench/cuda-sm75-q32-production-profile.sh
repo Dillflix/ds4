@@ -116,8 +116,12 @@ for pair in 0:2 1:3; do
     home=${gpu_ids[${pair%%:*}]}; partner=${gpu_ids[${pair#*:}]}
     fwd=$(topology_link "$home" "$partner")
     rev=$(topology_link "$partner" "$home")
-    [[ $fwd =~ ^NV[0-9]+$ && $rev =~ ^NV[0-9]+$ ]] ||
-        die "physical pair $home<->$partner is not bidirectional NVLink: ${fwd:-missing}/${rev:-missing}"
+    [[ $fwd =~ ^NV[0-9]+$ || $rev =~ ^NV[0-9]+$ ]] ||
+        die "physical pair $home<->$partner has no NVLink topology cell: ${fwd:-missing}/${rev:-missing}"
+    [[ -z $fwd || $fwd =~ ^NV[0-9]+$ ]] ||
+        die "physical pair $home<->$partner has a non-NVLink forward cell: $fwd/${rev:-missing}"
+    [[ -z $rev || $rev =~ ^NV[0-9]+$ ]] ||
+        die "physical pair $home<->$partner has a non-NVLink reverse cell: ${fwd:-missing}/$rev"
 done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
