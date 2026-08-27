@@ -1713,6 +1713,25 @@ Return `sm75-indexer-audit-<timestamp>.tar.gz`. This pass compares existing
 exact paths before any persistent-F16 cache or SM75-specific accumulator
 epilogue is admitted to production.
 
+If a completed score pass stops during one of the top-k Nsight captures, keep
+the original directory and resume only the three top-k captures. Resume mode
+requires the validated timing CSVs and all four score-kernel Nsight CSVs; it
+will not silently reuse a partial score pass.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export INDEXER_AUDIT_DIR="$PWD/sm75-indexer-audit-<timestamp>"
+
+PROFILE_GPU=0 \
+RESUME=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=1 \
+bash ./speed-bench/cuda-sm75-indexer-audit.sh
+```
+
 ### SM75 32K attention query-row split experiment
 
 `cuda-sm75-attention-rowsplit.sh` is a model-free, two-GPU experiment for the

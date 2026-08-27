@@ -21,6 +21,7 @@ Optional environment:
   NCU_USE_SUDO=0
   NCU_SET=focused          focused, targeted, or full
   SKIP_BUILD=0
+  RESUME=0                reuse timing/score NCU results in INDEXER_AUDIT_DIR
   CREATE_ARCHIVE=1
   INDEXER_AUDIT_DIR=/absolute/output/directory
 EOF
@@ -40,6 +41,7 @@ RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 NCU_SET=${NCU_SET:-focused}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 OUTPUT_DIR=${INDEXER_AUDIT_DIR:-$repo_dir/sm75-indexer-audit-$(date -u +%Y%m%dT%H%M%SZ)}
 
@@ -49,6 +51,7 @@ OUTPUT_DIR=${INDEXER_AUDIT_DIR:-$repo_dir/sm75-indexer-audit-$(date -u +%Y%m%dT%
 [[ $RUN_NCU == 0 || $RUN_NCU == 1 ]] || die "RUN_NCU must be 0 or 1"
 [[ $NCU_USE_SUDO == 0 || $NCU_USE_SUDO == 1 ]] || die "NCU_USE_SUDO must be 0 or 1"
 [[ $SKIP_BUILD == 0 || $SKIP_BUILD == 1 ]] || die "SKIP_BUILD must be 0 or 1"
+[[ $RESUME == 0 || $RESUME == 1 ]] || die "RESUME must be 0 or 1"
 [[ $CREATE_ARCHIVE == 0 || $CREATE_ARCHIVE == 1 ]] || die "CREATE_ARCHIVE must be 0 or 1"
 [[ $NCU_SET == focused || $NCU_SET == targeted || $NCU_SET == full ]] ||
     die "NCU_SET must be focused, targeted, or full"
@@ -75,8 +78,22 @@ fi
 [[ -x tests/cuda_sm75_profile_harness ]] ||
     die "profile harness is missing; rerun with SKIP_BUILD=0"
 
-[[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+if [[ $RESUME == 1 ]]; then
+    [[ -n ${INDEXER_AUDIT_DIR:-} ]] ||
+        die "RESUME=1 requires an explicit INDEXER_AUDIT_DIR"
+    [[ -d $OUTPUT_DIR ]] || die "resume directory does not exist: $OUTPUT_DIR"
+    for required in score-tile-timing.csv topk-timing.csv \
+            timing/score-tile-128.log timing/score-tile-64.log \
+            timing/score-tile-32.log timing/score-tile-16.log \
+            ncu/score-wmma128.csv ncu/score-wmma64.csv \
+            ncu/score-wmma32.csv ncu/score-wmma16.csv; do
+        [[ -s $OUTPUT_DIR/$required ]] ||
+            die "resume evidence is missing or empty: $OUTPUT_DIR/$required"
+    done
+else
+    [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+fi
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 current_phase=initialization
@@ -101,22 +118,28 @@ finalize() {
 }
 trap finalize EXIT
 
-{
-    printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
-    printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
-    printf 'profile_gpu_physical=%s\nprofile_gpu_logical=0\n' "$PROFILE_GPU"
-    printf 'cuda_arch=%s\ncompute_capability=%s\nfree_mib_at_preflight=%s\n' \
-        "$CUDA_ARCH" "$compute_cap" "$free_mib"
-    printf 'timing_repeats=%s\nrun_ncu=%s\nncu_set=%s\n' \
-        "$TIMING_REPEATS" "$RUN_NCU" "$NCU_SET"
-    printf 'shape=512x64x128-by-8192\nposition=32256\ntop_k=512\n'
-    printf 'full_model_loaded=false\nscore_reference=shipping-wmma128\n'
-    printf '\n[gpu]\n'
-    nvidia-smi -i "$PROFILE_GPU" \
-        --query-gpu=index,name,pci.bus_id,memory.total,memory.free,ecc.mode.current,driver_version \
-        --format=csv
-    printf '\n[git status]\n'; git status --short
-} >"$OUTPUT_DIR/manifest.txt"
+if [[ $RESUME == 0 ]]; then
+    {
+        printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
+        printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
+        printf 'profile_gpu_physical=%s\nprofile_gpu_logical=0\n' "$PROFILE_GPU"
+        printf 'cuda_arch=%s\ncompute_capability=%s\nfree_mib_at_preflight=%s\n' \
+            "$CUDA_ARCH" "$compute_cap" "$free_mib"
+        printf 'timing_repeats=%s\nrun_ncu=%s\nncu_set=%s\n' \
+            "$TIMING_REPEATS" "$RUN_NCU" "$NCU_SET"
+        printf 'shape=512x64x128-by-8192\nposition=32256\ntop_k=512\n'
+        printf 'full_model_loaded=false\nscore_reference=shipping-wmma128\n'
+        printf '\n[gpu]\n'
+        nvidia-smi -i "$PROFILE_GPU" \
+            --query-gpu=index,name,pci.bus_id,memory.total,memory.free,ecc.mode.current,driver_version \
+            --format=csv
+        printf '\n[git status]\n'; git status --short
+    } >"$OUTPUT_DIR/manifest.txt"
+else
+    printf 'date_utc=%s\nresume=true\ngit_commit=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+        >"$OUTPUT_DIR/resume-manifest.txt"
+fi
 
 value_from_log() {
     local key=$1 file=$2
@@ -143,39 +166,44 @@ run_timing() {
         die "harness success marker missing for tile=$tile topk=$topk"
 }
 
-current_phase=timing-score-tiles
-printf 'tile,score_ms,speedup_vs_128\n' >"$OUTPUT_DIR/score-tile-timing.csv"
-for tile in 128 64 32 16; do
-    run_timing "$tile" monolithic "score-tile-$tile"
-done
-base_score_ms=$(value_from_log score_timed_per_call_ms \
-    "$OUTPUT_DIR/timing/score-tile-128.log")
-for tile in 128 64 32 16; do
-    score_ms=$(value_from_log score_timed_per_call_ms \
-        "$OUTPUT_DIR/timing/score-tile-$tile.log")
-    speedup=$(awk -v base="$base_score_ms" -v value="$score_ms" \
-        'BEGIN { printf "%.6f", base / value }')
-    printf '%s,%s,%s\n' "$tile" "$score_ms" "$speedup" \
-        >>"$OUTPUT_DIR/score-tile-timing.csv"
-done
+if [[ $RESUME == 0 ]]; then
+    current_phase=timing-score-tiles
+    printf 'tile,score_ms,speedup_vs_128\n' >"$OUTPUT_DIR/score-tile-timing.csv"
+    for tile in 128 64 32 16; do
+        run_timing "$tile" monolithic "score-tile-$tile"
+    done
+    base_score_ms=$(value_from_log score_timed_per_call_ms \
+        "$OUTPUT_DIR/timing/score-tile-128.log")
+    for tile in 128 64 32 16; do
+        score_ms=$(value_from_log score_timed_per_call_ms \
+            "$OUTPUT_DIR/timing/score-tile-$tile.log")
+        speedup=$(awk -v base="$base_score_ms" -v value="$score_ms" \
+            'BEGIN { printf "%.6f", base / value }')
+        printf '%s,%s,%s\n' "$tile" "$score_ms" "$speedup" \
+            >>"$OUTPUT_DIR/score-tile-timing.csv"
+    done
 
-current_phase=timing-topk
-run_timing 128 chunked topk-chunked
-printf 'path,topk_ms,speedup_vs_monolithic\n' >"$OUTPUT_DIR/topk-timing.csv"
-base_topk_ms=$(value_from_log topk_timed_per_call_ms \
-    "$OUTPUT_DIR/timing/score-tile-128.log")
-for path in monolithic chunked; do
-    if [[ $path == monolithic ]]; then
-        log="$OUTPUT_DIR/timing/score-tile-128.log"
-    else
-        log="$OUTPUT_DIR/timing/topk-chunked.log"
-    fi
-    topk_ms=$(value_from_log topk_timed_per_call_ms "$log")
-    speedup=$(awk -v base="$base_topk_ms" -v value="$topk_ms" \
-        'BEGIN { printf "%.6f", base / value }')
-    printf '%s,%s,%s\n' "$path" "$topk_ms" "$speedup" \
-        >>"$OUTPUT_DIR/topk-timing.csv"
-done
+    current_phase=timing-topk
+    run_timing 128 chunked topk-chunked
+    printf 'path,topk_ms,speedup_vs_monolithic\n' >"$OUTPUT_DIR/topk-timing.csv"
+    base_topk_ms=$(value_from_log topk_timed_per_call_ms \
+        "$OUTPUT_DIR/timing/score-tile-128.log")
+    for path in monolithic chunked; do
+        if [[ $path == monolithic ]]; then
+            log="$OUTPUT_DIR/timing/score-tile-128.log"
+        else
+            log="$OUTPUT_DIR/timing/topk-chunked.log"
+        fi
+        topk_ms=$(value_from_log topk_timed_per_call_ms "$log")
+        speedup=$(awk -v base="$base_topk_ms" -v value="$topk_ms" \
+            'BEGIN { printf "%.6f", base / value }')
+        printf '%s,%s,%s\n' "$path" "$topk_ms" "$speedup" \
+            >>"$OUTPUT_DIR/topk-timing.csv"
+    done
+else
+    current_phase=reuse-timing-and-score-ncu
+    printf 'Reusing validated timing and score Nsight results in %s\n' "$OUTPUT_DIR"
+fi
 
 if [[ $RUN_NCU == 0 ]]; then
     current_phase=complete-without-ncu
@@ -337,19 +365,21 @@ profile_one() {
     cat "$base-validation.txt"
 }
 
-current_phase=nsight-score-tiles
-profile_one score-wmma128 128 monolithic \
-    'regex:indexer_scores_wmma128_kernel.*' 'indexer_scores_wmma128_kernel.*'
-profile_one score-wmma64 64 monolithic \
-    'regex:indexer_scores_wmma64_kernel.*' 'indexer_scores_wmma64_kernel.*'
-profile_one score-wmma32 32 monolithic \
-    'regex:indexer_scores_wmma32_kernel.*' 'indexer_scores_wmma32_kernel.*'
-profile_one score-wmma16 16 monolithic \
-    'regex:indexer_scores_wmma_kernel.*' 'indexer_scores_wmma_kernel.*'
+if [[ $RESUME == 0 ]]; then
+    current_phase=nsight-score-tiles
+    profile_one score-wmma128 128 monolithic \
+        'regex:indexer_scores_wmma128_kernel.*' 'indexer_scores_wmma128_kernel.*'
+    profile_one score-wmma64 64 monolithic \
+        'regex:indexer_scores_wmma64_kernel.*' 'indexer_scores_wmma64_kernel.*'
+    profile_one score-wmma32 32 monolithic \
+        'regex:indexer_scores_wmma32_kernel.*' 'indexer_scores_wmma32_kernel.*'
+    profile_one score-wmma16 16 monolithic \
+        'regex:indexer_scores_wmma_kernel.*' 'indexer_scores_wmma_kernel.*'
+fi
 
 current_phase=nsight-topk
 profile_one topk-monolithic 128 monolithic \
-    'regex:indexer_topk_.*8192.*' 'indexer_topk_.*8192.*'
+    'regex:indexer_topk_.*' 'indexer_topk_.*'
 profile_one topk-chunk 128 chunked \
     'regex:indexer_topk_chunk_pow2_kernel.*' \
     'indexer_topk_chunk_pow2_kernel.*'
