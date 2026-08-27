@@ -42,6 +42,7 @@ on:
       - "speed-bench/cuda-q8-partner-native-exact.sh"
       - "speed-bench/cuda-q8-t32-fused-ab.sh"
       - "speed-bench/cuda-sm75-critical-path-audit.sh"
+      - "speed-bench/cuda-sm75-attention-rowsplit.sh"
       - "speed-bench/cuda-sm75-q4-clock-audit.sh"
       - "speed-bench/summarize-cuda-critical-path.py"
       - "speed-bench/summarize-sm75-q4-clock-audit.py"
@@ -71,6 +72,7 @@ on:
       - "speed-bench/cuda-sm75-q4-persistent.sh"
       - "tests/test_engine_mgpu_placement.c"
       - "tests/test_gpu_xdev.c"
+      - "tests/cuda_attention_rowsplit_xdev.c"
       - "tests/test_summarize_q8_partner_offload_ab.py"
       - "tests/test_summarize_q8_partner_production.py"
       - "tests/test_summarize_sm75_native_q4_t256_ab.py"
@@ -106,7 +108,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev CUDA_ARCH=sm_75
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check Q8 partner A/B tooling
@@ -130,6 +132,7 @@ jobs:
           bash -n speed-bench/cuda-sm75-iq2-next-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
           bash -n speed-bench/cuda-sm75-critical-path-audit.sh
+          bash -n speed-bench/cuda-sm75-attention-rowsplit.sh
           python3 -m py_compile speed-bench/q8_partner_audit.py
           python3 -m py_compile speed-bench/summarize-q8-partner-offload-ab.py
           python3 -m py_compile speed-bench/summarize-q8-partner-production.py

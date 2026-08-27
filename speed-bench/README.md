@@ -1662,3 +1662,32 @@ Some Turing boards expose only a full-performance memory state and a 405 MHz
 idle state whose supported graphics ceiling is also low. In that case the
 script records `outcome=not-applicable` and exits successfully without changing
 clocks; forcing the idle memory state is not a useful power-headroom test.
+
+### SM75 32K attention query-row split experiment
+
+`cuda-sm75-attention-rowsplit.sh` is a model-free, two-GPU experiment for the
+measured 32K production attention shapes. It compares the shipping 512-row
+kernel with concurrent 256/256 query-row execution across one NVLink pair. The
+partner variant is measured both by directly peer-reading home Q/KV/top-k and
+by using locally mirrored inputs. Both variants must reproduce non-zero
+shipping-kernel output bit-for-bit before timings are reported.
+
+This is intentionally not the older head split and not a split-KV reduction.
+Every query row retains the same kernel and online-softmax operation order; the
+harness only changes which GPU executes the row. No GGUF is opened.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+PROFILE_GPU=0 \
+PROFILE_PARTNER_GPU=1 \
+REPEATS=5 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-attention-rowsplit.sh
+```
+
+Return `sm75-attention-rowsplit-<timestamp>.tar.gz`. A production integration
+is justified only if one of the exact candidates wins in both indexed and
+mixed attention; the harness result does not include output-projection work or
+the incremental cost of maintaining a partner KV mirror.

@@ -305,6 +305,12 @@ tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/cuda_attention_rowsplit_xdev.o: tests/cuda_attention_rowsplit_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/cuda_attention_rowsplit_xdev: tests/cuda_attention_rowsplit_xdev.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
@@ -421,4 +427,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
