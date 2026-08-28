@@ -6,7 +6,7 @@ usage() {
 Run one production-path long-prompt retrieval and early-decode quality smoke.
 
 Required environment:
-  MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
+  MODEL=/absolute/path/to/production-model.gguf
 
 Optional environment:
   CORPUS=...                 default: speed-bench/promessi_sposi.txt
@@ -37,7 +37,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 MODEL=${MODEL:-}
 [[ $MODEL == /* && -f $MODEL ]] ||
-    die "MODEL must name the existing absolute tagged Q4-32/Q3A4 GGUF"
+    die "MODEL must name an existing absolute production GGUF"
 CORPUS=${CORPUS:-$repo_dir/speed-bench/promessi_sposi.txt}
 EXPECTED_WORD=${EXPECTED_WORD:-LANTERN}
 PAD_LINES=${PAD_LINES:-2200}
@@ -49,7 +49,6 @@ CTX_ALLOC=${CTX_ALLOC:-65537}
 GEN_TOKENS=${GEN_TOKENS:-8}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
-Q3A4_LAYERS=6,8,10,12,14,16,18,20,30,32,34,36,38,40,42
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${WORD_SMOKE_DIR:-$repo_dir/sm75-long-prompt-word-smoke-$stamp}
 
@@ -131,8 +130,7 @@ phase=manifest
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_alloc=%s\ngen_tokens=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
         "$CTX_ALLOC" "$GEN_TOKENS"
-    printf 'q3a4_layers=%s\ndense_f16_admission=344/344\nt256_policy=balanced-43/43\n' \
-        "$Q3A4_LAYERS"
+    printf 'dense_f16_admission=344/344\nt256_policy=balanced-43/43\n'
     printf 'attention_rows_policy=automatic-qualified\nindexer_cache=native-f16\nindexer_scorer=streaming64\nxdev_sync=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
@@ -156,7 +154,6 @@ phase=production-generation
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
     DS4_CUDA_INDEXER_SCORE_AUDIT=1 \
-    DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
     ./ds4 --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --ctx "$CTX_ALLOC" --prefill-chunk 2048 \
@@ -172,11 +169,6 @@ grep -Fq 'materialized 344/344 candidates' "$OUTPUT_DIR/stderr.log" ||
     die "production generation did not materialize every dense-F16 candidate"
 grep -Fq 'T256-output_b=43/43' "$OUTPUT_DIR/stderr.log" ||
     die "production generation did not materialize every T256 projection"
-grep -Fq 'ds4: SM75 routed Q32 layout enabled ' "$OUTPUT_DIR/stderr.log" ||
-    die "production generation did not enable the tagged Q32 path"
-python3 speed-bench/validate-sm75-q32-production-log.py \
-    "$OUTPUT_DIR/stderr.log" "$Q3A4_LAYERS" >/dev/null ||
-    die "production generation did not use the exact Q4-32/Q3A4 recipe"
 grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' \
     "$OUTPUT_DIR/stderr.log" ||
     die "production generation did not enable the native indexer path"

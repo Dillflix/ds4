@@ -2000,15 +2000,17 @@ The model, prompt, topology order, stage split, context sweep, and fixed
 indexer controls must match the prior manifest. Partially present arms are
 rejected rather than silently rerun or mixed with new evidence.
 
-`cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
+`cuda-sm75-indexer-native-cache-production-ab.sh` is the indexer promotion
+gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token
 F16-cache reader with the legacy F32 reader, runs the fixed 100-case production
 quality suite, interleaves genuine 32K production runs under the exact 32K
 frontier allocation, byte-compares their frontier logits, and finishes with a
 separate 64K-allocation long-prompt one-word decode smoke. Both arms must prove
-the exact Q4-32/Q3A4 routed recipe, 344/344 dense-F16 admission, balanced 43/43
-T256 placement, and automatic selection of both qualified attention row
-splits.
+344/344 dense-F16 admission, balanced 43/43 T256 placement, and automatic
+selection of both qualified attention row splits. Because both arms open the
+same immutable GGUF, this gate does not re-audit or score the model's routed
+quantization recipe; that is a separate model-production concern.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2035,12 +2037,16 @@ Return `sm75-indexer-native-cache-production-<timestamp>.tar.gz`. A mismatch
 in any quality score, score bit, top-k ordering, frontier logit, or retrieval
 answer fails the run before promotion evidence is accepted.
 
+The accepted 32K result is 612.43 tokens/s for native F16/streaming64 versus
+582.90 tokens/s for legacy F32/WMMA128, a 1.049768x paired-median speedup.
+Every frontier logit was bit-identical and the two 100-case quality TSVs were
+byte-identical. Native F16/streaming64 is therefore the production default on
+qualifying SM75 graphs; the legacy arm remains only a diagnostic control.
+
 If a prior run completed the legacy 100-case arm before a later validation
 failure, extract its archive and pass the extracted `quality/` directory as
 `REUSE_LEGACY_QUALITY_DIR`. The reused log must still prove its production
-runtime, full dense cache, T256 placement, and Q32 dispatch. The newly run
-native arm supplies the exact per-layer routed-recipe audit before the two TSVs
-are compared.
+runtime, full dense cache, and T256 placement before the two TSVs are compared.
 
 If both 100-case arms completed, pass that `quality/` directory as
 `REUSE_QUALITY_DIR`. The gate copies and revalidates both TSV/log pairs, then

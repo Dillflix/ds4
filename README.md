@@ -857,6 +857,16 @@ Set `DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1` to emit
 one record for every split call. Direct peer-reading of persistent KV is not a
 fallback; the bounded SM75 experiment measured that strategy slower than the
 shipping home path on both NVLink pairs.
+
+The SM75 production graph also stores the ratio-4 indexer cache natively in
+F16 and uses the streaming WMMA64 scorer by default. Against the legacy F32
+cache/WMMA128 path, the fixed 32K production A/B measured 612.43 versus 582.90
+tokens/s (+4.977%), with byte-identical frontier logits and byte-identical
+100-case production quality output. `DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE=1`
+retains the legacy path strictly as a diagnostic control;
+`DS4_CUDA_NO_INDEXER_STREAMING64=1` isolates the native cache with the
+F16-input WMMA128 scorer.
+
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.
