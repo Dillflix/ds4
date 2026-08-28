@@ -270,8 +270,8 @@ phase=manifest
         "$Q3A4_LAYERS"
     printf 'dense_f16_policy=stage-aware-fixed-22-21\nprofile_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$RUN_NCU"
-    printf 'dense_f16_admission=344/344\nattention_rows_policy=dynamic-pair-calibrated\n'
-    printf 'indexer_rows_policy=pair-split-follow-attention-calibration\n'
+    printf 'dense_f16_admission=344/344\nattention_rows_policy=fixed-50-50\n'
+    printf 'indexer_rows_policy=fixed-50-50-pair-split\n'
     printf 'indexer_cache=native-f16\nindexer_scorer=streaming64\nxdev_sync=disabled\n'
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
@@ -359,8 +359,10 @@ done
     die "trace did not select both production row-split stages"
 [[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' "$base.log") == 2 ]] ||
     die "trace did not split indexer score/top-k on both production stages"
-[[ $(grep -Fc 'CUDA prefill attention row calibration kind=indexed' "$base.log") == 2 ]] ||
-    die "trace did not calibrate indexed attention on both NVLink pairs"
+[[ $(grep -Fc 'rows [0,256), tier ' "$base.log") == 4 ]] ||
+    die "trace did not use fixed 256/256 indexer and attention ownership on both pairs"
+! grep -Fq 'CUDA prefill attention row calibration' "$base.log" ||
+    die "trace unexpectedly used removed runtime row calibration"
 grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
     die "trace omitted mixed row-split attention"
 grep -Fq 'dispatch=split kind=indexed' "$base.log" ||

@@ -44,10 +44,7 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         uint32_t n_tokens, uint32_t n_raw);
-uint32_t ds4_test_cuda_tp_prefill_rows_for_share(
-        uint32_t n_tokens, uint32_t home_permille);
-uint32_t ds4_test_cuda_tp_prefill_calibrated_permille(
-        float home_ms, float partner_ms);
+uint32_t ds4_test_cuda_tp_prefill_fixed_half_rows(uint32_t n_tokens);
 uint32_t ds4_test_q8_cache_class(const char *name);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -946,7 +943,7 @@ static void test_cuda_tp_prefill_attn_rows_shape(void) {
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 512),
           "512-row indexed attention is eligible for pair-row dispatch");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(2048, 2304),
-          "full prefill chunks are eligible for calibrated pair-row dispatch");
+          "full prefill chunks are eligible for fixed pair-row dispatch");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(329, 457),
           "an odd final prompt tail stays on the unchanged home path");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(328, 456),
@@ -955,16 +952,12 @@ static void test_cuda_tp_prefill_attn_rows_shape(void) {
           "a non-64-aligned query count stays on the home path");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 256),
           "row split requires enough raw history for both halves");
-    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 500) == 1024,
-          "uncalibrated row split is exactly half at a full chunk");
-    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 600) == 1216,
-          "calibrated row split rounds to the nearest 64-row boundary");
-    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 900) == 1536,
-          "row balancing clamps either device to at least one quarter");
-    CHECK(ds4_test_cuda_tp_prefill_calibrated_permille(10.0f, 15.0f) == 600,
-          "equal-row timing converts into the correct home work share");
-    CHECK(ds4_test_cuda_tp_prefill_calibrated_permille(0.0f, 15.0f) == 500,
-          "invalid timing falls back to an even split");
+    CHECK(ds4_test_cuda_tp_prefill_fixed_half_rows(512) == 256,
+          "a production 512-row chunk is split exactly in half");
+    CHECK(ds4_test_cuda_tp_prefill_fixed_half_rows(2048) == 1024,
+          "a production 2048-row chunk is split exactly in half");
+    CHECK(ds4_test_cuda_tp_prefill_fixed_half_rows(576) == 320,
+          "an unusual aligned tail uses the nearest 64-row boundary");
 }
 
 static void test_cuda_tp_prefill_default_accounting(void) {

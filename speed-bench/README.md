@@ -2186,8 +2186,8 @@ The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
 The trace uses the exact 32K frontier allocation and must prove complete
 dense-F16 admission, stage-aware placement inside both logical 22/21 NVLink
-pairs, both dynamically calibrated attention row splits, score/top-k indexer
-splits on both pairs, the native-F16 streaming64 indexer, and a saved 32K
+pairs, fixed 50/50 attention and score/top-k indexer row splits on both pairs,
+the native-F16 streaming64 indexer, and a saved 32K
 frontier-logit artifact. The stage-aware planner uses only logical stage roles,
 live per-device headroom, and projected dense work; it contains no physical GPU
 ID or layer-parity policy. It is rejected for every placement other than the

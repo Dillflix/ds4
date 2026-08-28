@@ -15481,36 +15481,19 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
            n_raw > n_tokens / 2u;
 }
 
-/* Pure policy helpers remain outside the GPU graph implementation so the CPU
- * placement binary compiles and tests the exact production row math. */
-static uint32_t metal_graph_cuda_tp_prefill_rows_for_share(
-        uint32_t n_tokens,
-        uint32_t home_permille) {
+/* Keep production row ownership deterministic. Full 512/2048-token chunks
+ * divide exactly in half; an unusual 64-row-aligned tail uses the nearest
+ * 64-row boundary. This helper stays outside the GPU-only implementation so
+ * the CPU placement test locks down the production policy. */
+static uint32_t metal_graph_cuda_tp_prefill_fixed_half_rows(
+        uint32_t n_tokens) {
     if (n_tokens < 256u) return n_tokens / 2u;
-    if (home_permille == 0u) home_permille = 500u;
-    if (home_permille < 250u) home_permille = 250u;
-    if (home_permille > 750u) home_permille = 750u;
-    uint64_t wanted = ((uint64_t)n_tokens * home_permille + 500u) / 1000u;
-    uint32_t rows = (uint32_t)((wanted + 32u) & ~UINT64_C(63));
+    uint32_t rows = ((n_tokens / 2u) + 32u) & ~63u;
     uint32_t min_rows = 128u;
     if (min_rows * 2u > n_tokens) min_rows = n_tokens / 4u;
     if (rows < min_rows) rows = min_rows;
     if (rows > n_tokens - min_rows) rows = n_tokens - min_rows;
     return rows;
-}
-
-static uint32_t metal_graph_cuda_tp_prefill_calibrated_permille(
-        float home_ms,
-        float partner_ms) {
-    if (!(home_ms > 0.0f) || !(partner_ms > 0.0f) ||
-        !isfinite(home_ms) || !isfinite(partner_ms)) return 500u;
-    /* Equal calibration rows imply rate_h/rate_p == partner_ms/home_ms. */
-    const double share = (double)partner_ms /
-                         ((double)home_ms + (double)partner_ms);
-    uint32_t permille = (uint32_t)llround(share * 1000.0);
-    if (permille < 250u) permille = 250u;
-    if (permille > 750u) permille = 750u;
-    return permille;
 }
 
 #ifndef DS4_NO_GPU
@@ -15806,11 +15789,6 @@ typedef struct {
     bool cuda_tp_prefill_attn_heads;
     bool cuda_tp_prefill_attn_rows;
     bool cuda_tp_prefill_indexer_rows;
-    /* Calibrated independently for indexed and mixed attention. Values are
-     * home-row shares in permille; zero means the pair/kind has not yet run
-     * its one-shot default-stream calibration. Only lower-half home tiers are
-     * indexed. */
-    uint16_t cuda_tp_attn_home_permille[DS4_MAX_GPUS][2];
     /* A pair-split indexer launch leaves each row range's selected indices on
      * its executing device. The immediately following indexed-attention
      * launch consumes this ticket and avoids a partner->home->partner top-k
@@ -21104,11 +21082,7 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
             g, il, pos0, n_tokens, n_comp)) return false;
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
-    const uint32_t home_permille =
-        g->cuda_tp_attn_home_permille[home][0]
-            ? g->cuda_tp_attn_home_permille[home][0] : 500u;
-    uint32_t home_rows = metal_graph_cuda_tp_prefill_rows_for_share(
-        n_tokens, home_permille);
+    uint32_t home_rows = metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
     if (n_raw <= n_tokens) {
         uint32_t min_home = n_tokens - n_raw + 64u;
         min_home = (min_home + 63u) & ~63u;
@@ -28227,12 +28201,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_active(
 #endif
 }
 
-/* Split independent query rows across one NVLink pair. The first eligible
- * launch for each pair/kind runs 50/50 and times both default streams. Later
- * launches use the measured per-device row rates, aligned to 64 rows. The
- * policy follows logical stage roles and live execution rates; it never names
- * or assumes a physical GPU. The partner
- * consumes only partner-local raw/compressed KV; direct remote reads are
+/* Split independent query rows 50/50 across one NVLink pair. The fixed policy
+ * is deterministic across graph lifetimes and homogeneous physical devices.
+ * The partner consumes only partner-local raw/compressed KV; remote reads are
  * deliberately not a fallback because the SM75 harness measured them at
  * 0.38x-0.65x of the shipping single-GPU launch.  Attention output rows are
  * gathered before inverse RoPE, leaving every downstream arithmetic path
@@ -28257,19 +28228,10 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
 
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
-    const uint32_t kind_slot =
-        kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? 0u : 1u;
-    const bool calibrate = home >= 0 && home < DS4_MAX_GPUS &&
-        g->cuda_tp_attn_home_permille[home][kind_slot] == 0u &&
-        getenv("DS4_CUDA_NO_TP_PREFILL_ATTN_CALIBRATION") == NULL;
-    const uint32_t home_permille = home >= 0 && home < DS4_MAX_GPUS &&
-        g->cuda_tp_attn_home_permille[home][kind_slot]
-            ? g->cuda_tp_attn_home_permille[home][kind_slot] : 500u;
-    uint32_t home_rows = metal_graph_cuda_tp_prefill_rows_for_share(
-        n_tokens, home_permille);
+    uint32_t home_rows = metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
     /* home_n_raw below removes the partner's trailing query rows from the
      * linearized raw span. Keep at least one aligned raw row on home even if a
-     * later calibration requests the 25% clamp at a short-history frontier. */
+     * fixed half split at a short-history frontier. */
     if (n_raw <= n_tokens) {
         uint32_t min_home = n_tokens - n_raw + 64u;
         min_home = (min_home + 63u) & ~63u;
@@ -28354,12 +28316,6 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     }
 
     if (ok) ok = ds4_gpu_set_current_device(partner) == 0;
-    ds4_gpu_timer *partner_timer = NULL;
-    ds4_gpu_timer *home_timer = NULL;
-    if (ok && calibrate) {
-        partner_timer = ds4_gpu_timer_create();
-        if (partner_timer) ok = ds4_gpu_timer_record_start(partner_timer) != 0;
-    }
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
@@ -28377,13 +28333,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             pos0 + home_rows, n_raw, raw_cap, raw_start, n_comp, window,
             ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ok && partner_timer) ok = ds4_gpu_timer_record_end(partner_timer) != 0;
-
     if (ds4_gpu_set_current_device(home) != 0) ok = false;
-    if (ok && calibrate) {
-        home_timer = ds4_gpu_timer_create();
-        if (home_timer) ok = ds4_gpu_timer_record_start(home_timer) != 0;
-    }
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             home_heads, model->map, model->size, layer->attn_sinks->abs_offset,
@@ -28399,31 +28349,6 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ok && home_timer) ok = ds4_gpu_timer_record_end(home_timer) != 0;
-    if (ok && calibrate && home_timer && partner_timer) {
-        float home_ms = 0.0f;
-        float partner_ms = 0.0f;
-        ok = ds4_gpu_timer_elapsed_ms(partner_timer, &partner_ms) != 0 &&
-             ds4_gpu_timer_elapsed_ms(home_timer, &home_ms) != 0;
-        if (ok) {
-            const uint32_t calibrated =
-                metal_graph_cuda_tp_prefill_calibrated_permille(
-                    home_ms, partner_ms);
-            g->cuda_tp_attn_home_permille[home][kind_slot] =
-                (uint16_t)calibrated;
-            fprintf(stderr,
-                    "ds4: CUDA prefill attention row calibration kind=%s "
-                    "home=%d partner=%d home_ms=%.4f partner_ms=%.4f "
-                    "next_home_share=%u/1000\n",
-                    kind == DS4_CUDA_PREFILL_ATTN_INDEXED
-                        ? "indexed" : "mixed",
-                    home, partner, home_ms, partner_ms, calibrated);
-        }
-    } else if (ok && calibrate) {
-        g->cuda_tp_attn_home_permille[home][kind_slot] = 500u;
-    }
-    ds4_gpu_timer_free(home_timer);
-    ds4_gpu_timer_free(partner_timer);
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
              ds4_gpu_tensor_copy_xdev_default(
@@ -57991,16 +57916,8 @@ bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         n_tokens, n_raw);
 }
 
-uint32_t ds4_test_cuda_tp_prefill_rows_for_share(
-        uint32_t n_tokens, uint32_t home_permille) {
-    return metal_graph_cuda_tp_prefill_rows_for_share(
-        n_tokens, home_permille);
-}
-
-uint32_t ds4_test_cuda_tp_prefill_calibrated_permille(
-        float home_ms, float partner_ms) {
-    return metal_graph_cuda_tp_prefill_calibrated_permille(
-        home_ms, partner_ms);
+uint32_t ds4_test_cuda_tp_prefill_fixed_half_rows(uint32_t n_tokens) {
+    return metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
 }
 
 int ds4_test_tensor_to_entry(const char *name, int name_len) {
