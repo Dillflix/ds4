@@ -33,6 +33,7 @@ Optional environment:
   RUN_EXACT=1
   RUN_NSYS=1
   SKIP_BUILD=0
+  RESUME=0
   CREATE_ARCHIVE=1
   DECODE_EVIDENCE_DIR=...      output directory
 EOF
@@ -62,6 +63,7 @@ RUN_AB=${RUN_AB:-1}
 RUN_EXACT=${RUN_EXACT:-1}
 RUN_NSYS=${RUN_NSYS:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${DECODE_EVIDENCE_DIR:-$repo_dir/sm75-decode-evidence-$stamp}
@@ -76,7 +78,8 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "AB_PP:$AB_PP" "AB_TG:$AB_TG" \
             "TRACE_SKIP:$TRACE_SKIP" "TRACE_TOKENS:$TRACE_TOKENS" \
             "PREFILL_CHUNK:$PREFILL_CHUNK" "PIPELINE_MB:$PIPELINE_MB" \
             "RUN_AB:$RUN_AB" "RUN_EXACT:$RUN_EXACT" "RUN_NSYS:$RUN_NSYS" \
-            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BUILD:$SKIP_BUILD" "RESUME:$RESUME" \
+            "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -88,7 +91,7 @@ done
    TRACE_SKIP >= 1 && TRACE_TOKENS >= 1 && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
     die "require PP4096, AB_TG>=64, repeats>=2, exact_tg>=2, and fixed production chunks"
-for flag in RUN_AB RUN_EXACT RUN_NSYS SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_AB RUN_EXACT RUN_NSYS SKIP_BUILD RESUME CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 (( RUN_AB || RUN_EXACT || RUN_NSYS )) || die "all evidence phases are disabled"
@@ -120,8 +123,12 @@ for gpu in "${gpu_ids[@]}"; do
     [[ $cap == 7.5 ]] || die "GPU $gpu is compute capability ${cap:-unknown}, not SM75"
 done
 
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
+if (( RESUME )); then
+    [[ -d $OUTPUT_DIR ]] || die "resume directory not found: $OUTPUT_DIR"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+fi
 mkdir -p "$OUTPUT_DIR"/{ab,exact,nsys,summary,telemetry,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
@@ -166,8 +173,8 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE=1
     "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB"
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
-    # Deliberately leave DS4_CUDA_Q8_T256_PLACEMENT unset.  Production's
-    # default is balanced plus stage-aware-fixed-22-21; explicitly selecting
+    # Deliberately leave DS4_CUDA_Q8_T256_PLACEMENT unset. Production's
+    # default is the fixed-22/21 stage-aware planner; explicitly selecting
     # balanced invokes the older legacy-class-policy planner.
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
@@ -194,7 +201,8 @@ phase=manifest
         "$AB_PP" "$AB_TG" "$AB_REPEATS" "$EXACT_TG"
     printf 'trace_contexts=%s\ntrace_skip=%s\ntrace_tokens=%s\n' \
         "$TRACE_CONTEXTS" "$TRACE_SKIP" "$TRACE_TOKENS"
-    printf 'dense_f16_admission=344/344-required\nq8_t256_placement=balanced\n'
+    printf 'resume=%s\n' "$RESUME"
+    printf 'dense_f16_admission=344/344-required\nq8_t256_placement=stage-aware\n'
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
         --format=csv
@@ -210,7 +218,7 @@ validate_production_log() {
     local log=$1 threshold=$2
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   'dense-placement=stage-aware-fixed-22-21' \
-                  't256-placement=balanced' \
+                  't256-placement=stage-aware' \
                   'materialized 344/344 candidates' \
                   'SM75 routed Q32 layout enabled' \
                   "decode indexer sparse threshold=$threshold compressed rows (explicit)"; do
@@ -232,6 +240,25 @@ validate_production_log() {
         return 1
     fi
     return 0
+}
+
+validate_benchmark_csv() {
+    local csv=$1 pp=$2 tg=$3
+    [[ -s $csv ]] || return 1
+    awk -F, -v pp="$pp" -v tg="$tg" '
+        NR == 1 {
+            good_header = ($1 == "ctx_tokens" && $4 == "gen_tokens" &&
+                           $8 == "gen_steady_tps")
+            next
+        }
+        NR == 2 {
+            rows++
+            good_row = ($1 == pp && $4 == tg && ($8 + 0.0) > 0.0)
+            next
+        }
+        { rows++ }
+        END { exit !(good_header && rows == 1 && good_row) }
+    ' "$csv"
 }
 
 run_bench() {
@@ -265,10 +292,17 @@ if (( RUN_AB )); then
             slot=$((slot + 1))
             [[ $variant == indexed1024 ]] && threshold=1024 || threshold=4096
             base="$OUTPUT_DIR/ab/r${repeat}-${variant}"
-            printf 'Decode threshold A/B repeat=%d/%d slot=%d/2 variant=%s...\n' \
-                "$repeat" "$AB_REPEATS" "$slot" "$variant"
-            run_bench "$threshold" "$AB_PP" "$AB_TG" "$base.csv" "$base.log" ||
-                die "$variant throughput run failed"
+            if (( RESUME )) &&
+               validate_benchmark_csv "$base.csv" "$AB_PP" "$AB_TG" &&
+               validate_production_log "$base.log" "$threshold"; then
+                printf 'Reusing decode threshold A/B repeat=%d/%d slot=%d/2 variant=%s...\n' \
+                    "$repeat" "$AB_REPEATS" "$slot" "$variant"
+            else
+                printf 'Decode threshold A/B repeat=%d/%d slot=%d/2 variant=%s...\n' \
+                    "$repeat" "$AB_REPEATS" "$slot" "$variant"
+                run_bench "$threshold" "$AB_PP" "$AB_TG" "$base.csv" "$base.log" ||
+                    die "$variant throughput run failed"
+            fi
             printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
                 "$repeat" "$slot" "$variant" "$threshold" "$AB_PP" "$AB_TG" \
                 "$base.csv" "$base.log" >>"$OUTPUT_DIR/ab/runs.csv"

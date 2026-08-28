@@ -2331,7 +2331,8 @@ cases are reused; incomplete or invalid cases are rerun. Return the generated
 
 `cuda-sm75-decode-evidence.sh` is the first attribution pass after the broad
 decode baseline. It keeps the production model, device order, 22/21 split,
-balanced dense-F16 placement, and complete 344/344 admission fixed.
+stage-aware fixed-22/21 dense-F16 placement, and complete 344/344 admission
+fixed.
 
 The throughput experiment isolates the implementation transition observed
 between PP2048 and PP4096: PP4096 is run with the production 1024-compressed-row
@@ -2369,6 +2370,11 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-decode-evidence.sh
 ```
+
+To continue an interrupted run, keep every original setting and set
+`RESUME=1` plus `DECODE_EVIDENCE_DIR` to its existing output directory.
+Completed threshold samples are reused only after their CSV shape and every
+production-path marker validate; missing or invalid samples are rerun.
 
 Return `sm75-decode-evidence-<timestamp>.tar.gz`. The primary products are the
 paired threshold result in `summary/summary.md`, exactness record under
