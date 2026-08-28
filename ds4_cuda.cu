@@ -177,6 +177,7 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
+static int g_cuda_moe_q32_decode_graph;
 static uint32_t g_cuda_routed_q4_layout;
 static std::atomic<bool> g_cuda_native_q4_logged = false;
 static std::atomic<bool> g_cuda_q32_logged = false;
@@ -311,6 +312,61 @@ typedef struct {
 } cuda_moe_decode_graph_cache;
 
 static cuda_moe_decode_graph_cache g_moe_decode_graph[DS4_MAX_GPUS];
+
+/* The production SM75 Q4-32/Q3A4 decode path has three independent binary
+ * choices which change a graph node's kernel signature or output geometry:
+ * Q4-32 versus Q3A4 gate/up, ordinary versus fused Q8_K+Q8_0 input
+ * quantization, and six-slot versus fixed-three packed down output.  Cache an
+ * executable for each exact layer/tier binding.  That avoids six graph-node
+ * parameter updates on every layer while also preventing reuse across an
+ * ABI-incompatible fused-quantizer boundary. */
+enum { CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES = 64 };
+typedef struct {
+    cudaGraph_t     graph;
+    cudaGraphExec_t exec;
+    cudaGraphNode_t xq_node;
+    cudaGraphNode_t xpack_node;
+    cudaGraphNode_t gate_node;
+    cudaGraphNode_t midq_node;
+    cudaGraphNode_t midpack_node;
+    cudaGraphNode_t down_node;
+    uint32_t        expert_in_dim;
+    uint32_t        expert_mid_dim;
+    uint32_t        out_dim;
+    uint32_t        resident_expert_base;
+    uint32_t        resident_expert_count;
+    uint32_t        variant;
+    float           clamp;
+    float          *down_dst;
+    float          *mid_out;
+    cuda_block_q8_K *xq;
+    cuda_block_q8_K *midq;
+    const char     *gate_w;
+    const char     *up_w;
+    const char     *down_w;
+    const int32_t  *selected;
+    const float    *weights;
+    const float    *x;
+    int8_t         *shared_xq;
+    float          *shared_scale;
+    int             valid;
+} cuda_moe_q32_decode_graph_cache;
+
+static cuda_moe_q32_decode_graph_cache
+    g_moe_q32_decode_graph[DS4_MAX_GPUS][CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES];
+static std::atomic<uint64_t> g_moe_q32_graph_calls = 0;
+static std::atomic<uint64_t> g_moe_q32_graph_launches = 0;
+static std::atomic<uint64_t> g_moe_q32_graph_hits = 0;
+static std::atomic<uint64_t> g_moe_q32_graph_creates = 0;
+static std::atomic<uint64_t> g_moe_q32_graph_fallbacks = 0;
+static void routed_moe_decode_q32_graph_destroy_one(int logical_tier);
+
+/* Kept out of the public backend header: the CUDA regression binary uses this
+ * only to produce an independent non-graph control inside one initialized
+ * process. */
+extern "C" void ds4_gpu_test_set_moe_q32_decode_graph(int enabled) {
+    g_cuda_moe_q32_decode_graph = enabled != 0;
+}
 
 static int cuda_q4_mma_ok(void) {
     /* Cached once: all tiers on this host are the same GPU model. */
@@ -451,6 +507,9 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_exact_score_split_fuse_inv_rope =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL;
     g_cuda_moe_decode_graph = getenv("DS4_CUDA_MOE_DECODE_GRAPH") != NULL;
+    g_cuda_moe_q32_decode_graph =
+        getenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH") != NULL &&
+        getenv("DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH") == NULL;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -3661,6 +3720,23 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)t32_fused_partner);
     }
 
+    if (g_cuda_moe_q32_decode_graph &&
+        getenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH_AUDIT") != NULL) {
+        fprintf(stderr,
+                "ds4: SM75 Q32 decode graph audit calls=%llu launches=%llu "
+                "hits=%llu creates=%llu fallbacks=%llu\n",
+                (unsigned long long)g_moe_q32_graph_calls.load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q32_graph_launches.load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q32_graph_hits.load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q32_graph_creates.load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q32_graph_fallbacks.load(
+                    std::memory_order_relaxed));
+    }
+
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
     for (int i = 0; i < g_n_gpus; i++) {
@@ -3668,6 +3744,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaSetDevice(c->device_id);
         attention_decode_score_split_graph_destroy_one(i);
         routed_moe_decode_graph_destroy_one(i);
+        routed_moe_decode_q32_graph_destroy_one(i);
         if (c->boundary_event) {
             (void)cudaEventDestroy((cudaEvent_t)c->boundary_event);
             c->boundary_event = NULL;
@@ -28573,6 +28650,253 @@ static int routed_moe_launch(
     return ok;
 }
 
+static void routed_moe_decode_q32_graph_destroy_entry(
+        int logical_tier, uint32_t entry) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS ||
+        entry >= CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES) return;
+    cuda_moe_q32_decode_graph_cache *c =
+        &g_moe_q32_decode_graph[logical_tier][entry];
+    if (c->exec) (void)cudaGraphExecDestroy(c->exec);
+    if (c->graph) (void)cudaGraphDestroy(c->graph);
+    memset(c, 0, sizeof(*c));
+}
+
+static void routed_moe_decode_q32_graph_destroy_one(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) return;
+    for (uint32_t e = 0; e < CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES; e++)
+        routed_moe_decode_q32_graph_destroy_entry(logical_tier, e);
+}
+
+/* Launch the exact production owned-expert sequence as one CUDA Graph:
+ *
+ *   Q8_K quantize -> native-A pack -> fused gate/up -> Q8_K quantize
+ *       -> native-A pack -> Q4-32 down
+ *
+ * This deliberately stops before the cross-device owned-slot combine.  That
+ * combine is scheduled by ds4.c after both GPUs have produced their halves;
+ * hiding it in a single-device graph would alter the established pair
+ * synchronization boundary. */
+static int routed_moe_decode_q32_owned_graph_launch(
+        int logical_tier,
+        float *down_dst,
+        float *mid_out,
+        cuda_block_q8_K *xq,
+        cuda_block_q8_K *midq,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        const int32_t *selected,
+        const float *weights,
+        const float *x,
+        int8_t *shared_xq,
+        float *shared_scale,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t resident_expert_base,
+        uint32_t resident_expert_count,
+        float clamp,
+        bool gate_q3a4,
+        bool pack_fixed3,
+        bool fused_shared_prequant) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) return 0;
+    const uint32_t variant = (gate_q3a4 ? 1u : 0u) |
+                             (fused_shared_prequant ? 2u : 0u) |
+                             (pack_fixed3 ? 4u : 0u);
+    uint32_t entry = CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES;
+    uint32_t free_entry = CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES;
+    for (uint32_t e = 0; e < CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES; e++) {
+        cuda_moe_q32_decode_graph_cache *candidate =
+            &g_moe_q32_decode_graph[logical_tier][e];
+        if (!candidate->valid) {
+            if (free_entry == CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES) free_entry = e;
+            continue;
+        }
+        if (candidate->variant == variant &&
+            candidate->expert_in_dim == expert_in_dim &&
+            candidate->expert_mid_dim == expert_mid_dim &&
+            candidate->out_dim == out_dim &&
+            candidate->resident_expert_base == resident_expert_base &&
+            candidate->resident_expert_count == resident_expert_count &&
+            candidate->clamp == clamp &&
+            candidate->down_dst == down_dst &&
+            candidate->mid_out == mid_out &&
+            candidate->xq == xq && candidate->midq == midq &&
+            candidate->gate_w == gate_w && candidate->up_w == up_w &&
+            candidate->down_w == down_w &&
+            candidate->selected == selected &&
+            candidate->weights == weights && candidate->x == x &&
+            candidate->shared_xq == shared_xq &&
+            candidate->shared_scale == shared_scale) {
+            entry = e;
+            break;
+        }
+    }
+    if (entry == CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES) entry = free_entry;
+    if (entry == CUDA_MOE_Q32_GRAPH_CACHE_ENTRIES) {
+        g_moe_q32_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    cuda_moe_q32_decode_graph_cache *c =
+        &g_moe_q32_decode_graph[logical_tier][entry];
+
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    uint32_t x_rows = 1u;
+    uint32_t mid_rows = 6u;
+    uint64_t xpack_blocks = xq_blocks;
+    uint64_t midpack_blocks = 6ull * midq_blocks;
+    dim3 xq_grid(xq_blocks, 1u, 1u);
+    dim3 xpack_grid((unsigned)((xpack_blocks + 7u) / 8u), 1u, 1u);
+    dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
+    dim3 midq_grid(midq_blocks, 6u, 1u);
+    dim3 midpack_grid((unsigned)((midpack_blocks + 7u) / 8u), 1u, 1u);
+    dim3 down_grid((out_dim + 31u) / 32u,
+                   pack_fixed3 ? 4u : 6u, 1u);
+    dim3 block(256u, 1u, 1u);
+
+    void *xq_plain_args[] = {
+        &xq, &x, &expert_in_dim, &x_rows
+    };
+    void *xq_fused_args[] = {
+        &xq, &shared_xq, &shared_scale, &x, &expert_in_dim, &x_rows
+    };
+    cudaKernelNodeParams xq_params;
+    memset(&xq_params, 0, sizeof(xq_params));
+    xq_params.func = fused_shared_prequant
+        ? (void *)q8_K_q8_0_quantize_kernel
+        : (void *)q8_K_quantize_kernel;
+    xq_params.gridDim = xq_grid;
+    xq_params.blockDim = block;
+    xq_params.kernelParams = fused_shared_prequant
+        ? xq_fused_args : xq_plain_args;
+
+    void *xpack_args[] = { &xq, &xpack_blocks };
+    cudaKernelNodeParams xpack_params;
+    memset(&xpack_params, 0, sizeof(xpack_params));
+    xpack_params.func = (void *)q8_K_pack_sm75_native_inplace_kernel;
+    xpack_params.gridDim = xpack_grid;
+    xpack_params.blockDim = block;
+    xpack_params.kernelParams = xpack_args;
+
+    void *gate_args[] = {
+        &mid_out, &gate_w, &up_w, &xq, &selected, &weights,
+        &xq_blocks, &expert_mid_dim, &resident_expert_base,
+        &resident_expert_count, &clamp
+    };
+    cudaKernelNodeParams gate_params;
+    memset(&gate_params, 0, sizeof(gate_params));
+    gate_params.func = gate_q3a4
+        ? (void *)moe_gate_up_mid_decode_sm75_q32_owned_kernel<true>
+        : (void *)moe_gate_up_mid_decode_sm75_q32_owned_kernel<false>;
+    gate_params.gridDim = gate_grid;
+    gate_params.blockDim = block;
+    gate_params.kernelParams = gate_args;
+
+    void *midq_args[] = {
+        &midq, &mid_out, &expert_mid_dim, &mid_rows
+    };
+    cudaKernelNodeParams midq_params;
+    memset(&midq_params, 0, sizeof(midq_params));
+    midq_params.func = (void *)q8_K_quantize_kernel;
+    midq_params.gridDim = midq_grid;
+    midq_params.blockDim = block;
+    midq_params.kernelParams = midq_args;
+
+    void *midpack_args[] = { &midq, &midpack_blocks };
+    cudaKernelNodeParams midpack_params;
+    memset(&midpack_params, 0, sizeof(midpack_params));
+    midpack_params.func = (void *)q8_K_pack_sm75_native_inplace_kernel;
+    midpack_params.gridDim = midpack_grid;
+    midpack_params.blockDim = block;
+    midpack_params.kernelParams = midpack_args;
+
+    void *down_args[] = {
+        &down_dst, &down_w, &midq, &selected, &midq_blocks, &out_dim,
+        &resident_expert_base, &resident_expert_count
+    };
+    cudaKernelNodeParams down_params;
+    memset(&down_params, 0, sizeof(down_params));
+    down_params.func = pack_fixed3
+        ? (void *)moe_down_sm75_q4_32_owned_packed_kernel
+        : (void *)moe_down_sm75_q4_32_owned_slots_kernel;
+    down_params.gridDim = down_grid;
+    down_params.blockDim = block;
+    down_params.kernelParams = down_args;
+
+    cudaError_t err = cudaSuccess;
+    if (!c->valid) {
+        err = cudaGraphCreate(&c->graph, 0);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->xq_node, c->graph, NULL, 0,
+                                         &xq_params);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->xpack_node, c->graph,
+                                         &c->xq_node, 1, &xpack_params);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->gate_node, c->graph,
+                                         &c->xpack_node, 1, &gate_params);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->midq_node, c->graph,
+                                         &c->gate_node, 1, &midq_params);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->midpack_node, c->graph,
+                                         &c->midq_node, 1, &midpack_params);
+        if (err == cudaSuccess)
+            err = cudaGraphAddKernelNode(&c->down_node, c->graph,
+                                         &c->midpack_node, 1, &down_params);
+        if (err == cudaSuccess)
+            err = cudaGraphInstantiate(&c->exec, c->graph, NULL, NULL, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: SM75 Q32 owned decode graph instantiate failed: %s\n",
+                    cudaGetErrorString(err));
+            routed_moe_decode_q32_graph_destroy_entry(logical_tier, entry);
+            return -1;
+        }
+        c->expert_in_dim = expert_in_dim;
+        c->expert_mid_dim = expert_mid_dim;
+        c->out_dim = out_dim;
+        c->resident_expert_base = resident_expert_base;
+        c->resident_expert_count = resident_expert_count;
+        c->variant = variant;
+        c->clamp = clamp;
+        c->down_dst = down_dst;
+        c->mid_out = mid_out;
+        c->xq = xq;
+        c->midq = midq;
+        c->gate_w = gate_w;
+        c->up_w = up_w;
+        c->down_w = down_w;
+        c->selected = selected;
+        c->weights = weights;
+        c->x = x;
+        c->shared_xq = shared_xq;
+        c->shared_scale = shared_scale;
+        c->valid = 1;
+        g_moe_q32_graph_creates.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_moe_q32_graph_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    err = cudaGraphLaunch(c->exec, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: SM75 Q32 owned decode graph launch failed: %s\n",
+                cudaGetErrorString(err));
+        routed_moe_decode_q32_graph_destroy_entry(logical_tier, entry);
+        return -1;
+    }
+    g_moe_q32_graph_launches.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr,
+                "ds4: SM75 Q32 owned decode CUDA Graph enabled "
+                "(quantize/pack/gate-up/quantize/pack/down)\n");
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -28730,6 +29054,27 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     float *down_dst = (float *)(down_output ? down_output->ptr : down->ptr);
     cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
     cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
+
+    if (g_cuda_moe_q32_decode_graph && gate_q32 && down_q4_32) {
+        g_moe_q32_graph_calls.fetch_add(1, std::memory_order_relaxed);
+        int8_t *shared_xq = shared_prequant
+            ? (int8_t *)shared_prequant->ptr : NULL;
+        float *shared_scale = shared_prequant
+            ? (float *)((char *)shared_prequant->ptr + shared_scale_offset)
+            : NULL;
+        const int grc = routed_moe_decode_q32_owned_graph_launch(
+                logical_tier, down_dst, (float *)mid->ptr, xq, midq,
+                gate_w, up_w, down_w,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                (const float *)x->ptr,
+                shared_xq, shared_scale,
+                expert_in_dim, expert_mid_dim, out_dim,
+                resident_expert_base, resident_expert_count, clamp,
+                gate_q3a4, pack_fixed3, shared_prequant != NULL);
+        if (grc == 1) return 1;
+        if (grc < 0) return 0;
+    }
 
     dim3 xq_grid(xq_blocks, 1, 1);
     if (shared_prequant) {

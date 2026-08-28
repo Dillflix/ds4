@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+extern void ds4_gpu_test_set_moe_q32_decode_graph(int enabled);
+
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
 
@@ -1079,6 +1081,150 @@ static int check_sm75_q32_production_exact(void) {
     return rc;
 }
 
+/* Exercise the exact six-node production CUDA Graph through the real
+ * owned-expert API.  The full-expert dispatcher is the independent reference;
+ * home slots plus fixed-three partner output are combined exactly as ds4.c
+ * does for the two-GPU decode path.  A second input validates executable
+ * reuse rather than only graph instantiation. */
+static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
+                                           const char *label) {
+    const uint32_t n_total = 8u, n_expert = 6u;
+    const uint32_t in_dim = 256u, mid_dim = 256u, out_dim = 256u;
+    const uint32_t in_blocks = 1u, mid_blocks = 1u;
+    const uint64_t gate_block = gate_type == 43u ? 108u : 136u;
+    const uint64_t gate_row = gate_block * in_blocks;
+    const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
+    const uint64_t down_row = 136u * mid_blocks;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    const uint64_t gate_off = 0u;
+    const uint64_t up_off = gate_expert * n_total;
+    const uint64_t down_off = up_off + gate_expert * n_total;
+    const uint64_t model_bytes = down_off + down_expert * n_total;
+    const uint64_t slot_bytes = 6ull * out_dim * sizeof(float);
+    const uint64_t packed_bytes = 4ull * out_dim * sizeof(float);
+    const uint64_t mid_bytes = 6ull * mid_dim * sizeof(float);
+    const uint64_t shared_prequant_bytes =
+        (uint64_t)(in_dim / 32u) * 32u +
+        (uint64_t)(in_dim / 32u) * sizeof(float);
+    unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
+    float *xh = (float *)malloc((size_t)in_dim * sizeof(float));
+    float *refh = (float *)malloc((size_t)out_dim * sizeof(float));
+    float *goth = (float *)malloc((size_t)out_dim * sizeof(float));
+    const int32_t selh[6] = {0, 4, 1, 5, 2, 6};
+    const float wh[6] = {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f};
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(sizeof(selh));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(sizeof(wh));
+    ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *got = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *tmp_out = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(slot_bytes);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(slot_bytes);
+    ds4_gpu_tensor *home_slots = ds4_gpu_tensor_alloc(slot_bytes);
+    ds4_gpu_tensor *peer_packed = ds4_gpu_tensor_alloc(packed_bytes);
+    ds4_gpu_tensor *shared_prequant =
+        ds4_gpu_tensor_alloc(shared_prequant_bytes);
+    int rc = 1;
+    if (!model || !xh || !refh || !goth || !x || !selected || !weights ||
+        !ref || !got || !tmp_out || !gate || !up || !mid || !down ||
+        !home_slots || !peer_packed || !shared_prequant) goto cleanup;
+    if (gate_type == 43u) {
+        fill_sm75_q3a4_tensor(model + gate_off, 0u, n_total,
+                              mid_dim, in_blocks);
+        fill_sm75_q3a4_tensor(model + up_off, 1u, n_total,
+                              mid_dim, in_blocks);
+    } else {
+        fill_sm75_q4_32_tensor(model + gate_off, 0u, n_total,
+                               mid_dim, in_blocks);
+        fill_sm75_q4_32_tensor(model + up_off, 1u, n_total,
+                               mid_dim, in_blocks);
+    }
+    fill_sm75_q4_32_tensor(model + down_off, 2u, n_total,
+                           out_dim, mid_blocks);
+    ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                                  DS4_TENSOR_LAYOUT_SM75_Q3A4);
+    if (!ds4_gpu_set_model_map(model, model_bytes) ||
+        !ds4_gpu_tensor_write(selected, 0, selh, sizeof(selh)) ||
+        !ds4_gpu_tensor_write(weights, 0, wh, sizeof(wh))) goto cleanup;
+
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t i = 0; i < in_dim; i++)
+            xh[i] = (float)((int)((i * 29u + pass * 37u) % 211u) - 105) /
+                109.0f;
+        if (!ds4_gpu_tensor_write(x, 0, xh, in_dim * sizeof(float)))
+            goto cleanup;
+        ds4_gpu_test_set_moe_q32_decode_graph(0);
+        if (!ds4_gpu_routed_moe_one_owned_tensor(
+                tmp_out, gate, up, mid, down, model, model_bytes,
+                gate_off, up_off, down_off, gate_type, 42u,
+                gate_expert, gate_row, down_expert, down_row,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total, n_expert, 0u, 4u, 10.0f, x,
+                home_slots, false, shared_prequant) ||
+            !ds4_gpu_routed_moe_one_owned_tensor(
+                tmp_out, gate, up, mid, down, model, model_bytes,
+                gate_off, up_off, down_off, gate_type, 42u,
+                gate_expert, gate_row, down_expert, down_row,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total, n_expert, 4u, 4u, 10.0f, x,
+                peer_packed, true, NULL) ||
+            !ds4_gpu_routed_moe_owned_packed_combine_tensor(
+                ref, home_slots, peer_packed, selected, out_dim, 4u) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(ref, 0, refh,
+                                 out_dim * sizeof(float))) goto cleanup;
+
+        ds4_gpu_test_set_moe_q32_decode_graph(1);
+        if (!ds4_gpu_routed_moe_one_owned_tensor(
+                tmp_out, gate, up, mid, down, model, model_bytes,
+                gate_off, up_off, down_off, gate_type, 42u,
+                gate_expert, gate_row, down_expert, down_row,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total, n_expert, 0u, 4u, 10.0f, x,
+                home_slots, false, shared_prequant) ||
+            !ds4_gpu_routed_moe_one_owned_tensor(
+                tmp_out, gate, up, mid, down, model, model_bytes,
+                gate_off, up_off, down_off, gate_type, 42u,
+                gate_expert, gate_row, down_expert, down_row,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total, n_expert, 4u, 4u, 10.0f, x,
+                peer_packed, true, NULL) ||
+            !ds4_gpu_routed_moe_owned_packed_combine_tensor(
+                got, home_slots, peer_packed, selected, out_dim, 4u) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(got, 0, goth,
+                                 out_dim * sizeof(float)) ||
+            !compare_exact_f32("SM75 Q32 owned graph output",
+                               refh, goth, out_dim)) goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 %s owned decode CUDA Graph exact/reuse\n",
+            label);
+    rc = 0;
+
+cleanup:
+    ds4_gpu_test_set_moe_q32_decode_graph(1);
+    ds4_gpu_set_routed_q4_layout(0u);
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(shared_prequant);
+    ds4_gpu_tensor_free(peer_packed); ds4_gpu_tensor_free(home_slots);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(tmp_out); ds4_gpu_tensor_free(got);
+    ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
+    free(goth); free(refh); free(xh); free(model);
+    return rc;
+}
+
+static int check_sm75_q32_owned_graph(void) {
+    int rc = check_sm75_q32_owned_graph_case(42u, "Q4-32");
+    if (check_sm75_q32_owned_graph_case(43u, "Q3A4") != 0) rc = 1;
+    return rc;
+}
+
 /* This is the production API, not an isolated microkernel comparison.  It
  * proves exact standard-vs-tagged output for a prefill histogram containing
  * full 16s plus true 8/4 tails and for the direct six-expert decode route. */
@@ -1743,6 +1889,7 @@ int main(void) {
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_IQ2_SCALAR_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH", "1", 1);
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
     if (!ds4_gpu_init()) {
@@ -1758,6 +1905,7 @@ int main(void) {
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
     if (check_sm75_q32_production_exact() != 0) rc = 1;
+    if (check_sm75_q32_owned_graph() != 0) rc = 1;
     if (check_sm75_native_q4_layout_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;

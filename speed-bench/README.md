@@ -2474,3 +2474,51 @@ To resume, preserve the original settings and set `RESUME=1` plus
 `DECODE_INDEXER_AB_DIR="$PWD/sm75-decode-indexer-production-<timestamp>"`.
 Return the generated archive; the decision table is `summary/summary.md` and
 the exact-output gate is `exact/verification.txt`.
+
+# SM75 production Q32 decode CUDA Graph A/B
+
+`cuda-sm75-decode-graph-ab.sh` tests graph coverage for the routed kernels
+that the production Q4-32/Q3A4 model actually executes. The candidate replaces
+each owned expert half's six host submissions—Q8_K quantize, native activation
+pack, fused Q4-32/Q3A4 gate/up, mid quantize, native activation pack, and
+Q4-32 down—with one CUDA Graph launch. It deliberately leaves the cross-GPU
+owned-slot combine outside the graph, preserving the established NVLink and
+synchronization boundary.
+
+Graph executables are cached per exact layer/tier binding after the untimed
+warmup. Separate entries cover Q4-32 versus Q3A4, fused shared-Q8
+prequantization versus ordinary Q8_K quantization, and six-slot home versus
+fixed-three partner down output. The timed path therefore does not perform six
+node-parameter updates per layer. If the bounded cache cannot represent a
+binding, that call uses the unchanged launch path.
+
+The CUDA smoke test compares the graph-owned home/partner result against the
+independent full-expert production dispatcher for both gate formats and two
+successive inputs. The production test then runs paired, order-reversed decode
+A/B samples at PP512/2048/4096/32768 and requires byte-identical full-vocabulary
+logits before reporting a speedup.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CONTEXTS=512,2048,4096,32768 \
+TG_TOKENS=256 \
+REPEATS=3 \
+EXACT_CONTEXT=4096 \
+EXACT_TOKENS=16 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-graph-ab.sh
+```
+
+To resume, preserve the original settings and set `RESUME=1` plus
+`DECODE_GRAPH_AB_DIR="$PWD/sm75-decode-graph-ab-<timestamp>"`. Return the
+generated archive. The decision table is `summary/summary.md`; exactness is
+recorded in `exact/verification.txt`.
