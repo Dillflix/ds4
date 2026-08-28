@@ -38,6 +38,8 @@ def family_of(row: dict[str, str]) -> str:
         return "partner_t256_cublas"
     if row["kind"] == "memcpy" and row.get("attention_rows_range", ""):
         return "attention_row_split_memcpy"
+    if row["kind"] == "memcpy" and row.get("indexer_rows_range", ""):
+        return "indexer_row_split_memcpy"
     if row["kind"] == "memcpy" and row.get("handoff_range", ""):
         return "stage_handoff_memcpy"
     if row["kind"] == "memcpy":

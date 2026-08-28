@@ -739,15 +739,18 @@ output sharding, pipelined prefill, and compatible grouped decode are selected
 by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
 Pipelined prefill enables the selective Q8-to-F16 weight cache by default and
 uses cuBLAS for eligible dense and shared-expert projections. Cache growth stops
-at the CUDA VRAM reserve. On the qualified four-SM75 production topology, the
-43 expensive T256 `attn_output_b` projections use the balanced policy by
-default: even layers execute from 22 home-local F16 expansions and odd layers
-execute from 21 partner-local expansions. FP16 activations move to the NVLink
-partner, cuBLAS executes against its local F16 weight, and the FP32 result
+at the CUDA VRAM reserve. On the qualified four-SM75 production topology,
+dense-F16 placement is planned independently inside each logical NVLink pair
+for the fixed 22/21 transformer split. The planner prices immovable consumers
+first, then places movable T32, T256, and shared-down projections from live
+post-allocation headroom and projected dense work. It does not use physical GPU
+IDs or layer parity. FP16 activations move only when the selected weight is
+partner-local, cuBLAS executes against its local F16 weight, and the result
 returns to the home GPU. The path never peer-reads weights and never uses the
-pinned-host bounce route. Balanced placement is exact and fail-closed: if a
-required partner, scratch reservation, or F16 expansion cannot be admitted,
-model startup fails instead of silently changing the production policy.
+pinned-host bounce route. Stage-aware placement is exact and fail-closed: it is
+rejected outside the four-GPU 22/21 layout, and a required partner, scratch
+reservation, or F16 expansion failure aborts startup rather than changing the
+production policy silently.
 `DS4_CUDA_Q8_F16_CACHE_MB` is a
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing; pair it with an explicit
@@ -772,7 +775,7 @@ timed sweep. Native-Q8 selective-cache slabs, graph scratch, CUDA allocator
 overhead, and cuBLAS workspaces are outside this table. The existing cache-state
 CSV schema is unchanged. Binding-state rows gain `allocation_id`, `used_calls`,
 and `live`; the separate allocation table reports aliases, aggregate warm-up
-uses, resident bytes, and dead bytes. Deliberate balanced/all-partner T256
+uses, resident bytes, and dead bytes. Deliberate stage-aware/balanced/all-partner
 placement is admitted in ranked phase one with partner scratch reserved, and
 has one logical binding backed by one physical weight per layer rather than a
 dead fixed partner-consumer duplicate. A requested forced placement that cannot
@@ -789,7 +792,7 @@ tokens, matching CUDA TP's default prefill chunk;
 `DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=N` changes that bound to a positive token
 count. A larger runtime
 microbatch safely uses the native local path instead of allocating mid-graph.
-Automatic balanced admission requires both members of each home/partner pair
+Automatic stage-aware admission requires both members of each home/partner pair
 to be compute capability 7.5 and startup peer-bandwidth measurements of at
 least 18 GiB/s in both directions. A validated `DIRECT` CUDA peer route alone
 does not satisfy this gate. On a topology that does not meet those requirements,
@@ -804,21 +807,23 @@ bidirectional direct-peer, scratch-size, cache-capacity, or runtime-shape
 safety checks. Within
 each home-device bucket, at equal benefit per byte, fixed/home-only candidates
 rank before candidates eligible for partner placement. The selector can
-therefore change which tied class occupies constrained home cache: the measured
+therefore change which tied class occupies constrained home cache: the legacy
 T256 policy keeps the much more expensive-to-transfer T32 projection local and
-lets T256 overflow. Shared-down
-is not enabled by default or by the legacy policy.
+lets T256 overflow. The stage-aware production default exposes T32, T256, and
+shared-down to the pair planner; explicit class selectors remain measurement
+overrides.
 The partner A/B treats validated CUDA peer access and physical NVLink topology
 as separate requirements: both logical directions must be `DIRECT`, and each
 homes-first physical pair must be reported as `NV#` by `nvidia-smi topo -m`.
 It records that mapping and requires a nonzero, class-pure audit sample on one
 or both configured partners. An asymmetric stage split may need overflow on
 only the tighter stage; the bounded audit records which partner(s) it observed.
-`DS4_CUDA_Q8_T256_PLACEMENT=overflow|all-local|balanced|all-partner` exposes the
-four measured execution placements for controlled A/B work. Unset selects
-`balanced`; the other modes are explicit diagnostics. The production mixed
-Q4/IQ2 model is sized for complete dense F16 coverage at 256K allocation, so
-balanced placement is not a cache-hit subset or an overflow heuristic.
+`DS4_CUDA_Q8_T256_PLACEMENT=stage-aware|overflow|all-local|balanced|all-partner`
+exposes the production planner and four historical execution placements.
+Unset selects `stage-aware`; the other modes are explicit diagnostics.
+Stage-aware is accepted only for the fixed four-GPU 22/21 layout. The
+production mixed model is sized for complete dense-F16 coverage at its target
+allocation, so this is not a cache-hit subset or overflow heuristic.
 The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 `DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
 existing half-size Q scratch and then performs head RMS normalization plus

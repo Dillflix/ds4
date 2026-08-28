@@ -2176,7 +2176,7 @@ Return `sm75-long-prompt-word-smoke-<timestamp>.tar.gz`.
 
 `cuda-sm75-q32-production-profile.sh` captures the next evidence pass for the
 tagged Q4-32/Q3A4 model. It accepts only a genuine single 32768-token
-production frontier with the fixed 22/21 stage split, balanced T256 placement,
+production frontier with the fixed 22/21 stage split, stage-aware dense-F16 placement,
 all 344 dense-F16 candidates resident, and the exact routed recipe used by
 `DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf`: Q3A4 gate/up on layers
 6,8,10,12,14,16,18,20,30,32,34,36,38,40,42, Q4-32 gate/up on the other 28
@@ -2185,9 +2185,13 @@ layers, and Q4-32 down on all 43 layers.
 The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
 The trace uses the exact 32K frontier allocation and must prove complete
-dense-F16 admission, balanced T256 execution, both automatically selected
-attention row splits, the native-F16 streaming64 indexer, and a saved 32K
-frontier-logit artifact.
+dense-F16 admission, stage-aware placement inside both logical 22/21 NVLink
+pairs, both dynamically calibrated attention row splits, score/top-k indexer
+splits on both pairs, the native-F16 streaming64 indexer, and a saved 32K
+frontier-logit artifact. The stage-aware planner uses only logical stage roles,
+live per-device headroom, and projected dense work; it contains no physical GPU
+ID or layer-parity policy. It is rejected for every placement other than the
+fixed four-GPU 22/21 production layout.
 Nsight Compute does not replay the full application: bounded exact harnesses
 capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, and both indexed and mixed
 long-context attention shapes. This avoids five additional 139 GB model loads

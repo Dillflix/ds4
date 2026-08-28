@@ -97,11 +97,21 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
-/* Nsight capture control.  These wrappers exist only in the CUDA build;
- * callers must keep them behind the same platform guards.  Stop synchronizes
- * the selected CUDA context so asynchronous launches remain inside the
- * explicit profiler range.  The wrappers are used only by opt-in diagnostics. */
+/* CUDA-only timing and profiler helpers. Callers must keep them behind the
+ * same platform guards. */
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+typedef struct ds4_gpu_timer ds4_gpu_timer;
+/* One-shot default-stream timer used by topology-neutral runtime calibration.
+ * Creation and record calls apply to the currently selected CUDA device.
+ * elapsed synchronizes only the timer's end event. */
+ds4_gpu_timer *ds4_gpu_timer_create(void);
+void ds4_gpu_timer_free(ds4_gpu_timer *timer);
+int ds4_gpu_timer_record_start(ds4_gpu_timer *timer);
+int ds4_gpu_timer_record_end(ds4_gpu_timer *timer);
+int ds4_gpu_timer_elapsed_ms(ds4_gpu_timer *timer, float *elapsed_ms);
+/* Nsight stop synchronizes the selected CUDA context so asynchronous launches
+ * remain inside the explicit profiler range. These two controls are used only
+ * by opt-in diagnostics. */
 int ds4_gpu_profiler_start(void);
 int ds4_gpu_profiler_stop(void);
 /* Opt-in Nsight Systems timeline annotations.  These wrappers are no-ops

@@ -151,6 +151,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             DS4_CUDA_PREFILL_PIPELINE=1 \
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
             DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
+            DS4_CUDA_Q8_T256_PLACEMENT=balanced \
+            DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256 \
             DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
             "DS4_CUDA_MOE_IQ2_TAIL8_ALL_SM75=$tail8" \
             ./ds4-bench --cuda --cuda-tensor-parallel \

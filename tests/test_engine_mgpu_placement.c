@@ -44,6 +44,10 @@ bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         uint32_t n_tokens, uint32_t n_raw);
+uint32_t ds4_test_cuda_tp_prefill_rows_for_share(
+        uint32_t n_tokens, uint32_t home_permille);
+uint32_t ds4_test_cuda_tp_prefill_calibrated_permille(
+        float home_ms, float partner_ms);
 uint32_t ds4_test_q8_cache_class(const char *name);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -265,13 +269,14 @@ static void test_q8_cache_partner_mapping(void) {
           ds4_test_q8_t256_placement_valid("overflow") == 1 &&
           ds4_test_q8_t256_placement_valid("all-local") == 1 &&
           ds4_test_q8_t256_placement_valid("balanced") == 1 &&
-          ds4_test_q8_t256_placement_valid("all-partner") == 1,
+          ds4_test_q8_t256_placement_valid("all-partner") == 1 &&
+          ds4_test_q8_t256_placement_valid("stage-aware") == 1,
           "all declared T256 placement policies are accepted");
     CHECK(ds4_test_q8_t256_placement_valid("local") == 0 &&
           ds4_test_q8_t256_placement_valid("alternating") == 0,
           "undeclared T256 placement policies are rejected");
-    CHECK(ds4_test_q8_t256_placement_matches(NULL, "balanced") == 1,
-          "unset T256 placement selects the production balanced policy");
+    CHECK(ds4_test_q8_t256_placement_matches(NULL, "stage-aware") == 1,
+          "unset T256 placement selects the fixed-22/21 stage-aware policy");
     CHECK(ds4_test_q8_t256_placement_matches("overflow", "overflow") == 1,
           "the legacy overflow policy remains an explicit diagnostic");
 
@@ -324,8 +329,8 @@ static void test_q8_cache_partner_mapping(void) {
         q_b, 4, 0, 1, 1, 0);
     const int out_partner = ds4_test_q8_cache_partner_tier(
         out_b, 4, 1, 1, 1, 0);
-    CHECK(q_partner == -1,
-          "measured default excludes the higher-transfer T32 partner path");
+    CHECK(q_partner == 2,
+          "qualified default exposes T32 to the stage-aware pair planner");
     CHECK(out_partner == 3,
           "qualified default admits T256 on its measured fast peer");
     CHECK(ds4_test_q8_cache_implicit_default_qualified(
@@ -349,8 +354,8 @@ static void test_q8_cache_partner_mapping(void) {
     CHECK(ds4_test_q8_cache_partner_tier_qualified(
               out_b, 4, 1, 1, 1, 0, 0) == -1,
           "unqualified pair cannot use implicit T256 partner placement");
-    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == -1,
-          "implicit policy does not partner-offload shared-down");
+    CHECK(ds4_test_q8_cache_partner_tier(shared, 4, 0, 1, 1, 0) == 2,
+          "qualified default exposes shared-down to the stage-aware planner");
     (void)setenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES", "t256", 1);
     CHECK(ds4_test_q8_cache_partner_tier_qualified(
               out_b, 4, 1, 1, 1, 0, 0) == 3,
@@ -939,17 +944,27 @@ static void test_sm75_native_indexer_cache_accounting(void) {
 static void test_cuda_tp_prefill_attn_rows_shape(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_shape\n");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 512),
-          "512-row indexed attention is eligible for a 50/50 split");
+          "512-row indexed attention is eligible for pair-row dispatch");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(2048, 2304),
-          "full prefill chunks are eligible for a 50/50 split");
+          "full prefill chunks are eligible for calibrated pair-row dispatch");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(329, 457),
           "an odd final prompt tail stays on the unchanged home path");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(328, 456),
           "a sub-512 final prompt tail stays on the unchanged home path");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(513, 641),
-          "an odd query count is outside the exact 50/50 split domain");
+          "a non-64-aligned query count stays on the home path");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 256),
           "row split requires enough raw history for both halves");
+    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 500) == 1024,
+          "uncalibrated row split is exactly half at a full chunk");
+    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 600) == 1216,
+          "calibrated row split rounds to the nearest 64-row boundary");
+    CHECK(ds4_test_cuda_tp_prefill_rows_for_share(2048, 900) == 1536,
+          "row balancing clamps either device to at least one quarter");
+    CHECK(ds4_test_cuda_tp_prefill_calibrated_permille(10.0f, 15.0f) == 600,
+          "equal-row timing converts into the correct home work share");
+    CHECK(ds4_test_cuda_tp_prefill_calibrated_permille(0.0f, 15.0f) == 500,
+          "invalid timing falls back to an even split");
 }
 
 static void test_cuda_tp_prefill_default_accounting(void) {

@@ -219,6 +219,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             DS4_CUDA_PREFILL_PIPELINE=1 \
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
             DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
+            DS4_CUDA_Q8_T256_PLACEMENT=balanced \
+            DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256 \
             DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
             DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
             DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <new>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -2166,6 +2167,17 @@ static int cuda_q8_f16_plan_materialize_partner_candidate(
     return 1;
 }
 
+static uint64_t cuda_q8_plan_label_benefit(const char *label) {
+    if (!label) return 0u;
+    if (strstr(label, ".attn_output_b.weight") ||
+        strstr(label, ".attn_q_b.weight")) return 19000u;
+    if (strstr(label, ".attn_output_a.weight") ||
+        strstr(label, ".ffn_down_shexp.weight")) return 800u;
+    if (strstr(label, ".ffn_gate_shexp.weight") ||
+        strstr(label, ".ffn_up_shexp.weight")) return 200u;
+    return 100u;
+}
+
 static void cuda_q8_f16_plan_materialize(void) {
     if (!g_q8_f16_plan_finalized || g_q8_f16_plan_materialized ||
         g_q8_f16_plan_materializing) return;
@@ -2218,12 +2230,111 @@ static void cuda_q8_f16_plan_materialize(void) {
     const bool force_all_t256_partner = t256_placement_env &&
         strcmp(t256_placement_env, "all-partner") == 0;
     const bool force_balanced_t256_partner =
-        !t256_placement_env || !t256_placement_env[0] ||
+        t256_placement_env &&
         strcmp(t256_placement_env, "balanced") == 0;
+    const bool force_stage_aware =
+        !t256_placement_env || !t256_placement_env[0] ||
+        strcmp(t256_placement_env, "stage-aware") == 0;
     const char *plan_audit_path = getenv("DS4_CUDA_Q8_PLAN_AUDIT_CSV");
     const bool allow_forced_capacity_miss_for_audit =
         plan_audit_path && plan_audit_path[0] &&
         getenv("DS4_CUDA_Q8_CAPACITY_CALIBRATION") != NULL;
+
+    /* The fixed 22/21 transformer placement defines two independent NVLink
+     * stages. Plan movable dense-F16 weights independently inside each pair,
+     * using current post-selective-cache headroom as the primary signal and
+     * projected saved native-Q8 work as the tie-break. This is deliberately
+     * topology-neutral: physical IDs and layer parity never enter the choice.
+     * Explicit legacy placement modes bypass this planner. */
+    std::vector<unsigned char> stage_aware_partner(
+        g_q8_f16_plan.size(), 0u);
+    if (force_stage_aware) {
+        std::unordered_map<int, uint64_t> projected_free;
+        std::unordered_map<int, uint64_t> projected_work;
+        auto ensure_device = [&](int device) -> bool {
+            if (device < 0) return false;
+            if (projected_free.find(device) != projected_free.end()) return true;
+            if (cudaSetDevice(device) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return false;
+            }
+            size_t free_b = 0u;
+            size_t total_b = 0u;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return false;
+            }
+            const uint64_t reserve =
+                cuda_q8_f16_cache_reserve_bytes((uint64_t)total_b);
+            projected_free[device] = (uint64_t)free_b > reserve
+                ? (uint64_t)free_b - reserve : 0u;
+            projected_work[device] = 0u;
+            return true;
+        };
+        for (const cuda_q8_f16_plan_candidate &c : g_q8_f16_plan) {
+            if (!ensure_device(c.physical_device) ||
+                (c.fallback_physical_device >= 0 &&
+                 !ensure_device(c.fallback_physical_device))) {
+                plan_failed = 1;
+                failure_reason = "stage-aware device query failed";
+                break;
+            }
+        }
+        /* Price fixed consumers first so movable projections see the memory
+         * and compute that cannot leave the home device. */
+        for (const cuda_q8_f16_plan_candidate &c : g_q8_f16_plan) {
+            if (c.fallback_physical_device >= 0) continue;
+            const uint64_t bytes = c.in_dim * c.out_dim * sizeof(__half);
+            uint64_t &free_b = projected_free[c.physical_device];
+            free_b = free_b > bytes ? free_b - bytes : 0u;
+            projected_work[c.physical_device] +=
+                cuda_q8_plan_label_benefit(c.label);
+        }
+        uint64_t moved = 0u;
+        uint64_t movable = 0u;
+        for (size_t i = 0; !plan_failed && i < g_q8_f16_plan.size(); i++) {
+            const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
+            if (c.fallback_physical_device < 0) continue;
+            movable++;
+            const int home_device = c.physical_device;
+            const int partner_device = c.fallback_physical_device;
+            const uint64_t bytes = c.in_dim * c.out_dim * sizeof(__half);
+            const uint64_t home_free = projected_free[home_device];
+            const uint64_t partner_free = projected_free[partner_device];
+            const bool home_fits = home_free >= bytes;
+            const bool partner_fits = partner_free >= bytes;
+            bool choose_partner = false;
+            if (!home_fits && partner_fits) choose_partner = true;
+            else if (home_fits && !partner_fits) choose_partner = false;
+            else if (partner_free > home_free + bytes / 2u)
+                choose_partner = true;
+            else if (home_free > partner_free + bytes / 2u)
+                choose_partner = false;
+            else
+                choose_partner = projected_work[partner_device] <
+                                 projected_work[home_device];
+            const int target = choose_partner ? partner_device : home_device;
+            uint64_t &target_free = projected_free[target];
+            target_free = target_free > bytes ? target_free - bytes : 0u;
+            projected_work[target] += cuda_q8_plan_label_benefit(c.label);
+            if (choose_partner) {
+                stage_aware_partner[i] = 1u;
+                moved++;
+            }
+        }
+        if (!plan_failed) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 stage-aware 22/21 planner selected "
+                    "%llu/%llu movable projections for partner execution\n",
+                    (unsigned long long)moved,
+                    (unsigned long long)movable);
+        }
+        if (saved_device >= 0 && cudaSetDevice(saved_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            plan_failed = 1;
+            failure_reason = "stage-aware device restoration failed";
+        }
+    }
     for (size_t i = 0; !plan_failed && i < g_q8_f16_plan.size(); i++) {
         const cuda_q8_f16_plan_candidate &c = g_q8_f16_plan[i];
         candidate_target[i] = c.physical_device;
@@ -2233,11 +2344,14 @@ static void cuda_q8_f16_plan_materialize(void) {
          * carries one logical home consumer only; no dead peer-consumer copy
          * is needed to anchor the physical allocation. */
         const uint32_t t256_layer = cuda_q8_plan_label_layer(c.label);
-        if ((force_all_t256_partner ||
+        const bool stage_aware_move = force_stage_aware &&
+            stage_aware_partner[i] != 0u;
+        if ((stage_aware_move || force_all_t256_partner ||
              (force_balanced_t256_partner &&
               t256_layer != UINT_MAX && (t256_layer & 1u) != 0u)) &&
             c.fallback_physical_device >= 0 &&
-            strstr(c.label, ".attn_output_b.weight") != NULL) {
+            (stage_aware_move ||
+             strstr(c.label, ".attn_output_b.weight") != NULL)) {
             candidate_target[i] = c.fallback_physical_device;
             candidate_target_locked[i] = 1u;
             const int partner_rc =
@@ -4834,6 +4948,81 @@ extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+struct ds4_gpu_timer {
+    int device_id;
+    cudaEvent_t start;
+    cudaEvent_t end;
+};
+
+extern "C" ds4_gpu_timer *ds4_gpu_timer_create(void) {
+    int device_id = -1;
+    if (cudaGetDevice(&device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    ds4_gpu_timer *timer = new (std::nothrow) ds4_gpu_timer();
+    if (!timer) return NULL;
+    timer->device_id = device_id;
+    timer->start = NULL;
+    timer->end = NULL;
+    if (cudaEventCreate(&timer->start) != cudaSuccess ||
+        cudaEventCreate(&timer->end) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (timer->start) (void)cudaEventDestroy(timer->start);
+        if (timer->end) (void)cudaEventDestroy(timer->end);
+        delete timer;
+        return NULL;
+    }
+    return timer;
+}
+
+extern "C" void ds4_gpu_timer_free(ds4_gpu_timer *timer) {
+    if (!timer) return;
+    int saved = -1;
+    if (cudaGetDevice(&saved) == cudaSuccess &&
+        cudaSetDevice(timer->device_id) == cudaSuccess) {
+        if (timer->start) (void)cudaEventDestroy(timer->start);
+        if (timer->end) (void)cudaEventDestroy(timer->end);
+        (void)cudaSetDevice(saved);
+    } else {
+        (void)cudaGetLastError();
+    }
+    delete timer;
+}
+
+extern "C" int ds4_gpu_timer_record_start(ds4_gpu_timer *timer) {
+    if (!timer) return 0;
+    return cuda_ok(cudaEventRecord(timer->start, 0), "timer start record");
+}
+
+extern "C" int ds4_gpu_timer_record_end(ds4_gpu_timer *timer) {
+    if (!timer) return 0;
+    return cuda_ok(cudaEventRecord(timer->end, 0), "timer end record");
+}
+
+extern "C" int ds4_gpu_timer_elapsed_ms(ds4_gpu_timer *timer,
+                                          float *elapsed_ms) {
+    if (!timer || !elapsed_ms) return 0;
+    int saved = -1;
+    if (cudaGetDevice(&saved) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(timer->device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const int ok =
+        cuda_ok(cudaEventSynchronize(timer->end), "timer end synchronize") &&
+        cuda_ok(cudaEventElapsedTime(elapsed_ms, timer->start, timer->end),
+                "timer elapsed");
+    if (cudaSetDevice(saved) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return ok;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

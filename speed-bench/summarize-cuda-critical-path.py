@@ -111,11 +111,15 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
         attention_rows = enclosing_range(
             host_ranges, api_start, "ds4/prefill/attention-rows/"
         )
+        indexer_rows = enclosing_range(
+            host_ranges, api_start, "ds4/prefill/indexer-rows/"
+        )
         wave = enclosing_range(host_ranges, api_start, "ds4/prefill/wave/")
         embedding = enclosing_range(host_ranges, api_start, "ds4/prefill/embedding/")
         output = enclosing_range(host_ranges, api_start, "ds4/prefill/output/")
         if not any(
-            (stage, handoff, partner, attention_rows, wave, embedding, output)
+            (stage, handoff, partner, attention_rows, indexer_rows, wave,
+             embedding, output)
         ):
             return
         operations.append(
@@ -136,6 +140,7 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
                 "attention_rows_range": (
                     attention_rows.text if attention_rows else ""
                 ),
+                "indexer_rows_range": indexer_rows.text if indexer_rows else "",
                 "wave_range": wave.text if wave else "",
                 "embedding_range": embedding.text if embedding else "",
                 "output_range": output.text if output else "",
@@ -258,6 +263,7 @@ def main() -> int:
         "trace", "kind", "start_ns", "end_ns", "duration_ns", "device",
         "stream", "bytes", "name", "stage_range", "layer_range",
         "handoff_range", "partner_range", "attention_rows_range",
+        "indexer_rows_range",
         "wave_range", "embedding_range", "output_range",
     ]
     write_csv(output_dir / "operation-attribution.csv", op_fields, all_ops)
@@ -326,6 +332,11 @@ def main() -> int:
         output_dir / "attention-row-split-summary.csv",
         named_fields,
         summarize_named_ranges("attention_rows_range"),
+    )
+    write_csv(
+        output_dir / "indexer-row-split-summary.csv",
+        named_fields,
+        summarize_named_ranges("indexer_rows_range"),
     )
 
     stage_mb_rows = []

@@ -268,9 +268,10 @@ phase=manifest
         "$PROFILE_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 'q3a4_layers=%s\nq4_32_gate_up_layers=remaining-28\nq4_32_down_layers=all-43\n' \
         "$Q3A4_LAYERS"
-    printf 't256_policy=automatic-balanced\nprofile_gpu=%s\nrun_ncu=%s\n' \
+    printf 'dense_f16_policy=stage-aware-fixed-22-21\nprofile_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$RUN_NCU"
-    printf 'dense_f16_admission=344/344\nattention_rows_policy=automatic-qualified\n'
+    printf 'dense_f16_admission=344/344\nattention_rows_policy=dynamic-pair-calibrated\n'
+    printf 'indexer_rows_policy=pair-split-follow-attention-calibration\n'
     printf 'indexer_cache=native-f16\nindexer_scorer=streaming64\nxdev_sync=disabled\n'
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
@@ -338,8 +339,12 @@ cleanup_sampler
    -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.json ]] ||
     die "production trace omitted the ${PROFILE_TOKENS}-token frontier logits"
 for marker in "CUDA EP forced pipeline split 22/21" \
-              't256-placement=balanced' 'materialized 344/344 candidates' \
-              'T256-output_b=43/43' 'partner=21 partner-arithmetic=f16' \
+              'partner-classes=automatic:t32,t256,shared_down' \
+              't256-placement=stage-aware' \
+              'dense-placement=stage-aware-fixed-22-21' \
+              'CUDA q8 fp16 stage-aware 22/21 planner selected' \
+              'materialized 344/344 candidates' \
+              'T256-output_b=43/43' \
               'SM75 routed Q32 layout enabled' \
               'CUDA q8 fp16 partner summary: calls='; do
     grep -Fq "$marker" "$base.log" ||
@@ -352,6 +357,10 @@ done
     die "trace did not qualify both SM75 NVLink pairs"
 [[ $(grep -Fc 'CUDA prefill attention query-row split enabled:' "$base.log") == 2 ]] ||
     die "trace did not select both production row-split stages"
+[[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' "$base.log") == 2 ]] ||
+    die "trace did not split indexer score/top-k on both production stages"
+[[ $(grep -Fc 'CUDA prefill attention row calibration kind=indexed' "$base.log") == 2 ]] ||
+    die "trace did not calibrate indexed attention on both NVLink pairs"
 grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
     die "trace omitted mixed row-split attention"
 grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
@@ -391,6 +400,9 @@ awk -F, 'NR>1 {if ($3+0 < 512*1048576) bad++; rows++}
     die "trace left less than 512 MiB free on a CUDA device"
 cmp -s "$cache_before" "$cache_after" ||
     die "dense-F16 cache state changed during the measured frontier"
+python3 speed-bench/validate-sm75-stage-aware-plan.py \
+    "$plan" "$bindings" "$GPU_DEVICES" \
+    "$OUTPUT_DIR/dense-stage-aware-summary.csv"
 
 phase=nsight-systems-export
 nsys export --type sqlite --force-overwrite=true \
@@ -467,6 +479,8 @@ required=(profile-summary.md kernel-family-summary.csv kernel-family-total.csv
           operation-attribution.csv stage-microbatch-device.csv
           stage-device-summary.csv layer-device-summary.csv
           partner-projection-summary.csv handoff-device-summary.csv
+          attention-row-split-summary.csv indexer-row-split-summary.csv
+          dense-stage-aware-summary.csv
           trace-summary.csv nsys/combined.nsys-rep nsys/combined.sqlite
           nsys/combined-benchmark.csv nsys/routed-tile-audit.csv
           nsys/bindings.csv nsys/allocations.csv nsys/memory.csv

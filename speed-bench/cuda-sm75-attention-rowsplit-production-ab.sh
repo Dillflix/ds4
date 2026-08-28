@@ -16,7 +16,7 @@ Optional environment:
   CTX_START=2048
   CTX_MAX=32768
   CTX_TOKENS=             compatibility shorthand setting start=max
-  CTX_ALLOC=262273
+  CTX_ALLOC=CTX_MAX+1           preserves complete dense-F16 admission
   REPEATS=3
   RUN_HARNESS=1
   SKIP_BUILD=0
@@ -44,7 +44,7 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_START=${CTX_START:-${CTX_TOKENS:-2048}}
 CTX_MAX=${CTX_MAX:-${CTX_TOKENS:-32768}}
-CTX_ALLOC=${CTX_ALLOC:-262273}
+CTX_ALLOC=${CTX_ALLOC:-$((CTX_MAX + 1))}
 REPEATS=${REPEATS:-3}
 RUN_HARNESS=${RUN_HARNESS:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -61,7 +61,7 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
-(( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 &&
+(( STAGE_SPLIT == 22 &&
    CTX_START >= 2048 && CTX_START % 2048 == 0 &&
    CTX_MAX >= CTX_START && CTX_MAX % 2048 == 0 &&
    CTX_ALLOC > CTX_MAX && REPEATS >= 2 )) || die "invalid benchmark bounds"
@@ -193,8 +193,12 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     die "$variant production run failed"
                 }
         [[ -s $base.csv ]] || die "$variant omitted benchmark CSV"
-        grep -Fq 't256-placement=balanced' "$base.log" ||
-            die "$variant missed balanced T256 placement"
+        grep -Fq 't256-placement=stage-aware' "$base.log" ||
+            die "$variant missed fixed-22/21 stage-aware dense placement"
+        grep -Fq 'dense-placement=stage-aware-fixed-22-21' "$base.log" ||
+            die "$variant missed the fixed-22/21 dense placement marker"
+        grep -Fq 'materialized 344/344 candidates' "$base.log" ||
+            die "$variant did not retain complete dense-F16 admission"
         ! grep -Fq 'required but unavailable' "$base.log" ||
             die "$variant encountered a forbidden row-split fallback"
         if [[ $variant == rows ]]; then
@@ -202,9 +206,15 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 die "row candidate omitted indexed split dispatch"
             grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
                 die "row candidate omitted mixed split dispatch"
+            [[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' \
+                    "$base.log") == 2 ]] ||
+                die "row candidate did not split indexer score/top-k on both pairs"
         else
             ! grep -Fq 'dispatch=split' "$base.log" ||
                 die "home control unexpectedly dispatched row splitting"
+            ! grep -Fq 'CUDA prefill indexer score/top-k row split enabled:' \
+                    "$base.log" ||
+                die "home control unexpectedly split indexer score/top-k"
         fi
         printf '%s,%s,%s,%s,%s,%s\n' "$repeat" "$slot" "$variant" \
             "$base.csv" "$base.log" "$logits" \

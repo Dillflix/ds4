@@ -63,7 +63,7 @@ for item in "PAD_LINES:$PAD_LINES" "MIN_PROMPT_TOKENS:$MIN_PROMPT_TOKENS" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( PAD_LINES >= 1000 && MIN_PROMPT_TOKENS >= 16000 &&
-   STAGE_SPLIT > 0 && STAGE_SPLIT < 43 && CTX_ALLOC > MIN_PROMPT_TOKENS &&
+   STAGE_SPLIT == 22 && CTX_ALLOC > MIN_PROMPT_TOKENS &&
    GEN_TOKENS > 0 && SKIP_BUILD <= 1 && CREATE_ARCHIVE <= 1 )) ||
     die "invalid smoke-test bounds"
 for tool in awk basename cat date dirname env git grep head make mkdir nproc \
@@ -163,8 +163,10 @@ phase=production-generation
             die "production generation failed"
         }
 
-grep -Fq 't256-placement=balanced' "$OUTPUT_DIR/stderr.log" ||
-    die "production generation missed balanced T256 placement"
+grep -Fq 't256-placement=stage-aware' "$OUTPUT_DIR/stderr.log" ||
+    die "production generation missed stage-aware dense placement"
+grep -Fq 'dense-placement=stage-aware-fixed-22-21' "$OUTPUT_DIR/stderr.log" ||
+    die "production generation missed the fixed-22/21 dense placement marker"
 grep -Fq 'materialized 344/344 candidates' "$OUTPUT_DIR/stderr.log" ||
     die "production generation did not materialize every dense-F16 candidate"
 grep -Fq 'T256-output_b=43/43' "$OUTPUT_DIR/stderr.log" ||
