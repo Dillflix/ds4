@@ -2522,3 +2522,25 @@ To resume, preserve the original settings and set `RESUME=1` plus
 `DECODE_GRAPH_AB_DIR="$PWD/sm75-decode-graph-ab-<timestamp>"`. Return the
 generated archive. The decision table is `summary/summary.md`; exactness is
 recorded in `exact/verification.txt`.
+# SM75 decode packed-weight profiling
+
+`cuda-sm75-decode-weight-profile.sh` profiles the actual one-token decode
+dispatch for routed Q4-32/Q3A4 gate/up, the distinct packed-Q8 projection
+shapes seen in the 32K production trace, and all observed ordered F16
+compressor-pair widths.  It opens no GGUF and validates exact-zero outputs from
+synthetic zero weights before collecting one precisely filtered kernel per
+scenario.  The default `NCU_CACHE_CONTROL=all` represents cold per-layer
+weight streams; use `none` only for an explicitly replay-warm L2 comparison.
+
+```bash
+PROFILE_GPU=0 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-decode-weight-profile.sh
+```
+
+The resulting `summary.csv` and `summary.md` report achieved DRAM bandwidth,
+DRAM peak utilization, L2 hit/throughput, global-load efficiency,
+sectors/request, long-scoreboard and MIO stalls, and achieved occupancy.  A
+subset can be captured with `PROFILE_SET=routed`, `q8`, or `f16`, or with an
+explicit comma-separated `SCENARIOS` list.
