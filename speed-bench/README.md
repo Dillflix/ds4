@@ -2266,3 +2266,46 @@ and a role-aware recipe frontier that can choose gate/up and down formats
 independently. IQ2 down and Q2_K remain intentionally outside this pass.
 The tool does not hash or quantize a full model and does not enable a
 production format.
+
+# SM75 Q3A4 gate/up kernel candidate
+
+`cuda-sm75-q3a4-kernel.sh` measures a Q3A4-specific production-kernel
+candidate against the retained baseline. The candidate fuses gate and up
+block evaluation so both projections share packed activation fragments and
+Q3A4 correction sums. It preserves the four m8n8k32 MMA operations, each
+projection's integer group order, the scalar slot reductions, and the final
+floating-point expressions. It does not require another GGUF layout or model.
+
+The candidate is opt-in only:
+
+```bash
+DS4_CUDA_MOE_Q3A4_PAIR_FUSED_SM75=1
+```
+
+The evidence runner first requires bit-exact nonzero production output for
+real 16/8/4 expert populations, rejects local-memory SASS, and then runs a
+balanced baseline/candidate timing comparison using the captured production
+expert histogram. Optional Nsight Compute captures compare registers, shared
+memory, achieved occupancy, eligible warps, tensor utilization, cache/DRAM
+behavior, and scoreboard/MIO stalls. No full model is loaded in this first
+gate.
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-q3a4-kernel
+git pull --ff-only
+
+PROFILE_GPU=0 \
+TIMING_ROUNDS=4 \
+TIMING_REPEATS=10 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q3a4-kernel.sh
+```
+
+Return `sm75-q3a4-kernel-<timestamp>.tar.gz`. The candidate remains disabled
+until this bounded A/B is positive; only then should it advance to a full
+Q4-32/Q3A4 production tokens/s A/B.

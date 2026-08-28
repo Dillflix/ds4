@@ -244,7 +244,9 @@ static void usage(const char *argv0) {
             "shared-memory FP16 WMMA64 experiment. Both include Q conversion\n"
             "cost and compare every score bit against shipping WMMA128.\n"
             "DS4_PROFILE_INDEXER_N_COMP overrides the live compressed-row\n"
-            "count (default 8192) so native-cache tail handling can be tested.\n",
+            "count (default 8192) so native-cache tail handling can be tested.\n"
+            "DS4_CUDA_MOE_Q3A4_PAIR_FUSED_SM75=1 selects the opt-in Q3A4\n"
+            "shared-activation/correction gate/up evaluator.\n",
             argv0);
 }
 
@@ -1803,9 +1805,12 @@ int main(int argc, char **argv) {
             break;
     }
     printf("scalar_target=%s\nscalar_enabled=%u\n"
-           "iq2_tail8_all=%u\ntimed_repeats=%u\n",
+           "iq2_tail8_all=%u\ntimed_repeats=%u\n"
+           "q3a4_pair_fused_sm75=%u\n",
            scalar_target_name(scalar_target), scalar_enabled,
-           iq2_tail8_all, timed_repeats);
+           iq2_tail8_all, timed_repeats,
+           (unsigned)(getenv("DS4_CUDA_MOE_Q3A4_PAIR_FUSED_SM75") != NULL &&
+               strcmp(getenv("DS4_CUDA_MOE_Q3A4_PAIR_FUSED_SM75"), "0") != 0));
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");

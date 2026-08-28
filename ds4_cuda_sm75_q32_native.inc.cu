@@ -152,6 +152,73 @@ template <> struct sm75_q32_ops<true> {
     }
 };
 
+/* Gate and up consume the same packed activation record. The generic path
+ * deliberately retains the two independent calls used by the production
+ * baseline. The Q3A4 specialization shares activation fragments and
+ * correction sums while preserving each projection's group accumulation
+ * order and final float expression exactly. */
+template <bool Q3A, bool PAIR_FUSED> struct sm75_q32_gate_pair_ops {
+    typedef typename sm75_q32_ops<Q3A>::tile_type tile_type;
+    __device__ __forceinline__ static void mma_pair_block(
+            const tile_type *gw, const tile_type *uw,
+            const cuda_sm75_native_q8_K *a,
+            uint32_t lane, uint32_t n0,
+            float *g0, float *g1, float *u0, float *u1) {
+        sm75_q32_ops<Q3A>::mma_block(gw, a, lane, n0, g0, g1);
+        sm75_q32_ops<Q3A>::mma_block(uw, a, lane, n0, u0, u1);
+    }
+};
+
+template <> struct sm75_q32_gate_pair_ops<true, true> {
+    typedef cuda_sm75_q3a4_tile tile_type;
+    __device__ __forceinline__ static void mma_pair_block(
+            const tile_type *gw, const tile_type *uw,
+            const cuda_sm75_native_q8_K *a,
+            uint32_t lane, uint32_t n0,
+            float *g0, float *g1, float *u0, float *u1) {
+        int gi0 = 0, gi1 = 0, gm0 = 0, gm1 = 0;
+        int ui0 = 0, ui1 = 0, um0 = 0, um1 = 0;
+#pragma unroll
+        for (uint32_t group = 0; group < 8u; group++) {
+            const uint32_t al = a->low[group][lane & 3u];
+            const uint32_t ah = a->high_signed[group][lane & 3u];
+            const int bsum = (int)a->bsums[2u * group] +
+                             (int)a->bsums[2u * group + 1u];
+            int l0 = 0, l1 = 0, h0 = 0, h1 = 0;
+            uint32_t b = sm75_q32_dilate_q3(
+                gw->low2[group][lane], gw->high[group][lane]);
+            mma_m8n8k32_u4_u4(l0, l1, al, b);
+            mma_m8n8k32_s4_u4(h0, h1, ah, b);
+            gi0 += (int)sm75_q32_u4(gw->scales[n0], group) *
+                   (l0 + 16 * h0);
+            gi1 += (int)sm75_q32_u4(gw->scales[n0 + 1u], group) *
+                   (l1 + 16 * h1);
+            gm0 += (int)sm75_q32_u4(gw->mins[n0], group) * bsum;
+            gm1 += (int)sm75_q32_u4(gw->mins[n0 + 1u], group) * bsum;
+
+            b = sm75_q32_dilate_q3(
+                uw->low2[group][lane], uw->high[group][lane]);
+            l0 = 0; l1 = 0; h0 = 0; h1 = 0;
+            mma_m8n8k32_u4_u4(l0, l1, al, b);
+            mma_m8n8k32_s4_u4(h0, h1, ah, b);
+            ui0 += (int)sm75_q32_u4(uw->scales[n0], group) *
+                   (l0 + 16 * h0);
+            ui1 += (int)sm75_q32_u4(uw->scales[n0 + 1u], group) *
+                   (l1 + 16 * h1);
+            um0 += (int)sm75_q32_u4(uw->mins[n0], group) * bsum;
+            um1 += (int)sm75_q32_u4(uw->mins[n0 + 1u], group) * bsum;
+        }
+        *g0 = a->d * (dev_f16_to_f32(gw->d[n0]) * (float)gi0 -
+                      dev_f16_to_f32(gw->dmin[n0]) * (float)gm0);
+        *g1 = a->d * (dev_f16_to_f32(gw->d[n0 + 1u]) * (float)gi1 -
+                      dev_f16_to_f32(gw->dmin[n0 + 1u]) * (float)gm1);
+        *u0 = a->d * (dev_f16_to_f32(uw->d[n0]) * (float)ui0 -
+                      dev_f16_to_f32(uw->dmin[n0]) * (float)um0);
+        *u1 = a->d * (dev_f16_to_f32(uw->d[n0 + 1u]) * (float)ui1 -
+                      dev_f16_to_f32(uw->dmin[n0 + 1u]) * (float)um1);
+    }
+};
+
 template <bool Q3A>
 __global__ static void moe_gate_up_mid_decode_sm75_q32_kernel(
         float *gate_out, float *up_out, float *mid_out,
@@ -360,7 +427,8 @@ __global__ static void moe_down_sm75_q4_32_owned_packed_kernel(
     (O)=(_a0+_a2)+(_a1+_a3); \
 } while (0)
 
-template <uint32_t ROW_SPAN, uint32_t TILE_DELTA, bool Q3A>
+template <uint32_t ROW_SPAN, uint32_t TILE_DELTA, bool Q3A,
+          bool PAIR_FUSED>
 __global__ static void moe_gate_up_mid_sm75_q32_tile8_kernel(
         float *gate_out, float *up_out, float *mid_out,
         const char *gate_base, const char *up_base,
@@ -424,8 +492,8 @@ __global__ static void moe_gate_up_mid_sm75_q32_tile8_kernel(
                 (const typename sm75_q32_ops<Q3A>::tile_type *)up_base +
                 nt * xq_blocks + b;
             float g0, g1, u0, u1;
-            sm75_q32_ops<Q3A>::mma_block(gw, a + b, lane, n0, &g0, &g1);
-            sm75_q32_ops<Q3A>::mma_block(uw, a + b, lane, n0, &u0, &u1);
+            sm75_q32_gate_pair_ops<Q3A, PAIR_FUSED>::mma_pair_block(
+                gw, uw, a + b, lane, n0, &g0, &g1, &u0, &u1);
             switch (b & 7u) {
                 DS4_SM75_Q32_SLOT4_ADD(0,g0,g1,u0,u1);
                 DS4_SM75_Q32_SLOT4_ADD(1,g0,g1,u0,u1);

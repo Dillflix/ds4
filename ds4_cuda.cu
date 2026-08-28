@@ -26475,6 +26475,8 @@ static int routed_moe_launch(
     const int gate_q4_32 = gate_type == 42u;
     const int gate_q3a4 = gate_type == 43u;
     const int gate_q32 = gate_q4_32 || gate_q3a4;
+    const uint32_t use_q3a4_pair_fused = gate_q3a4 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_Q3A4_PAIR_FUSED_SM75", 0);
     const int down_q4k = down_type == 12u;
     const int down_q2k = down_type == 10u;
     const int down_q4_32 = down_type == 42u;
@@ -26563,6 +26565,13 @@ static int routed_moe_launch(
                 "(gate/up=%s, down=%s, packed A/W, exact 16/8/4 tails)\n",
                 gate_q3a4 ? "q3a4" : (gate_q4_32 ? "q4-32" : "other"),
                 down_q4_32 ? "q4-32" : "other");
+    }
+    if (use_q3a4_pair_fused) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr,
+                    "ds4: SM75 Q3A4 gate/up candidate selected: "
+                    "shared activation/correction evaluation\n");
     }
     if (any_native_q4 && !g_cuda_native_q4_logged.exchange(
             true, std::memory_order_relaxed)) {
@@ -27130,11 +27139,12 @@ static int routed_moe_launch(
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (gate_q32) {
-#define DS4_Q32_GATE_LIST(RS, TOTAL, EXPERTS, STARTS, CAP, DELTA, Q3A) \
+#define DS4_Q32_GATE_LIST(RS, TOTAL, EXPERTS, STARTS, CAP, DELTA, Q3A, FUSED) \
                     do { \
                         dim3 ng((expert_mid_dim + (RS) - 1u) / (RS), \
                                 (CAP), 1u); \
-                        moe_gate_up_mid_sm75_q32_tile8_kernel<RS, DELTA, Q3A> \
+                        moe_gate_up_mid_sm75_q32_tile8_kernel< \
+                            RS, DELTA, Q3A, FUSED> \
                             <<<ng, 512>>>( \
                                 (float *)gate->ptr, (float *)up->ptr, \
                                 (float *)mid->ptr, gate_w, up_w, \
@@ -27144,28 +27154,37 @@ static int routed_moe_launch(
                                 (const float *)weights->ptr, xq_blocks, \
                                 expert_mid_dim, n_expert, write_gate_up, clamp); \
                     } while (0)
-#define DS4_Q32_GATE_ALL(RS, Q3A) \
+#define DS4_Q32_GATE_ALL(RS, Q3A, FUSED) \
                     do { \
                         DS4_Q32_GATE_LIST(RS, tile16_total, tile16_experts, \
-                            tile16_starts, tile16_capacity, 0, Q3A); \
+                            tile16_starts, tile16_capacity, 0, Q3A, FUSED); \
                         DS4_Q32_GATE_LIST(RS, tile16_total, tile16_experts, \
-                            tile16_starts, tile16_capacity, 8, Q3A); \
+                            tile16_starts, tile16_capacity, 8, Q3A, FUSED); \
                         DS4_Q32_GATE_LIST(RS, tail8_total, tail8_experts, \
-                            tail8_starts, tail8_capacity, 0, Q3A); \
+                            tail8_starts, tail8_capacity, 0, Q3A, FUSED); \
                         DS4_Q32_GATE_LIST(RS, tail4_total, tail4_experts, \
-                            tail4_starts, tail4_capacity, 0, Q3A); \
+                            tail4_starts, tail4_capacity, 0, Q3A, FUSED); \
                     } while (0)
                     if (!tile16_total || !tail8_total || !tail4_total) {
                         ok = 0;
                     } else if (gate_row_span == 1024u) {
-                        if (gate_q3a4) DS4_Q32_GATE_ALL(1024, true);
-                        else DS4_Q32_GATE_ALL(1024, false);
+                        if (use_q3a4_pair_fused)
+                            DS4_Q32_GATE_ALL(1024, true, true);
+                        else if (gate_q3a4)
+                            DS4_Q32_GATE_ALL(1024, true, false);
+                        else DS4_Q32_GATE_ALL(1024, false, false);
                     } else if (gate_row_span == 2048u) {
-                        if (gate_q3a4) DS4_Q32_GATE_ALL(2048, true);
-                        else DS4_Q32_GATE_ALL(2048, false);
+                        if (use_q3a4_pair_fused)
+                            DS4_Q32_GATE_ALL(2048, true, true);
+                        else if (gate_q3a4)
+                            DS4_Q32_GATE_ALL(2048, true, false);
+                        else DS4_Q32_GATE_ALL(2048, false, false);
                     } else {
-                        if (gate_q3a4) DS4_Q32_GATE_ALL(512, true);
-                        else DS4_Q32_GATE_ALL(512, false);
+                        if (use_q3a4_pair_fused)
+                            DS4_Q32_GATE_ALL(512, true, true);
+                        else if (gate_q3a4)
+                            DS4_Q32_GATE_ALL(512, true, false);
+                        else DS4_Q32_GATE_ALL(512, false, false);
                     }
 #undef DS4_Q32_GATE_ALL
 #undef DS4_Q32_GATE_LIST
