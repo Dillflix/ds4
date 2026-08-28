@@ -2242,6 +2242,51 @@ from the original invocation. Resume validates the saved production artifacts,
 reuses the SQLite export and Nsight Systems reports, regenerates attribution,
 then continues with the bounded Nsight Compute captures.
 
+## SM75 512-versus-1024 prefill microbatch A/B
+
+`cuda-sm75-prefill-microbatch-ab.sh` isolates the CUDA stage-pipeline
+microbatch size. Both arms use the same 2048-token prefill chunk, fixed 22/21
+stage split, stage-aware 344/344 dense-F16 inventory, fixed 50/50 attention and
+indexer row splits, Q8-cache policy, context allocation, GPU order, and tagged
+Q4-32/Q3A4 model. Only `DS4_CUDA_PREFILL_PIPELINE_MB` changes. The runner
+requires DS4's structural audit to prove that 512 executes four microbatches in
+five waves and 1024 executes two microbatches in three waves. Every frontier's
+logits must match byte-for-byte for every paired repeat.
+
+The timed A/B is free of tile instrumentation. By default, two additional
+single-frontier runs collect deferred, non-perturbing routed-expert tile audits
+after the timing comparison so that expert padding and tile utilization can be
+compared without contaminating throughput. Set `RUN_TILE_AUDIT=0` only for the
+shortest throughput-only pass.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=32768 \
+CTX_ALLOC=32769 \
+PREFILL_CHUNK=2048 \
+REPEATS=3 \
+RUN_TILE_AUDIT=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-prefill-microbatch-ab.sh
+```
+
+Return `sm75-prefill-microbatch-ab-<timestamp>.tar.gz`. The principal result
+is `performance/summary.csv`; raw paired runs, exact frontier logits,
+structural pipeline audits, and optional per-format tile summaries are retained
+in the same archive. This runner does not test a 4096-token prefill chunk,
+because that would change a second independent variable and currently bypasses
+the production stage-major pipeline guard.
+
 # SM75 routed-quant real-weight quality sweep
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and
