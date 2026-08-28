@@ -1927,6 +1927,18 @@ bash ./speed-bench/cuda-sm75-xdev-feature-isolation.sh
 Return `sm75-xdev-feature-isolation-<timestamp>.tar.gz`. If the host resets
 before the archive is created, preserve the matching unarchived directory;
 `active-arm.txt`, `run-journal.tsv`, and `telemetry/` identify the failing arm.
+After a script or validator failure, a new invocation can reuse complete arms
+without modifying the original evidence:
+
+```bash
+REUSE_XDEV_DIR="$PWD/sm75-xdev-feature-isolation-<prior-timestamp>" \
+SKIP_BUILD=1 \
+bash ./speed-bench/cuda-sm75-xdev-feature-isolation.sh
+```
+
+The model, prompt, topology order, stage split, context sweep, and fixed
+indexer controls must match the prior manifest. Partially present arms are
+rejected rather than silently rerun or mixed with new evidence.
 
 `cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token

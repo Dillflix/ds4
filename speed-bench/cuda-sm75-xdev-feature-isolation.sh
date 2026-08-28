@@ -32,6 +32,12 @@ Optional environment:
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   XDEV_ISOLATION_DIR=/absolute/output/directory
+  REUSE_XDEV_DIR=/absolute/completed-or-partial/prior-output
+
+REUSE_XDEV_DIR is fail-closed: an arm is reused only when its CSV, log,
+frontier logits, and telemetry are all present and pass the same production
+path validation as a newly executed arm. Missing arms run normally into a new
+output directory; the prior directory and archive are never modified.
 EOF
 }
 
@@ -55,6 +61,7 @@ REPEATS=${REPEATS:-1}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-1000}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+REUSE_XDEV_DIR=${REUSE_XDEV_DIR:-}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${XDEV_ISOLATION_DIR:-$repo_dir/sm75-xdev-feature-isolation-$stamp}
 
@@ -75,6 +82,11 @@ for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+if [[ -n $REUSE_XDEV_DIR ]]; then
+    [[ $REUSE_XDEV_DIR == /* && -d $REUSE_XDEV_DIR ]] ||
+        die "REUSE_XDEV_DIR must name an existing absolute output directory"
+    REUSE_XDEV_DIR=$(cd "$REUSE_XDEV_DIR" && pwd)
+fi
 
 expected_contexts=()
 ctx=$CTX_START
@@ -87,7 +99,7 @@ done
     die "CTX_MAX must be reachable from CTX_START by doubling"
 expected_frontier_files=$((2 * ${#expected_contexts[@]}))
 
-for tool in awk basename cat cmp date dirname env find git grep kill make \
+for tool in awk basename cat cmp cp date dirname env find git grep kill make \
             mkdir mv nproc nvidia-smi python3 rm sleep sort stat sync tail tar \
             tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -98,6 +110,8 @@ git diff --quiet && git diff --cached --quiet ||
     die "output path already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"/{production,provenance,telemetry}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+[[ -z $REUSE_XDEV_DIR || $REUSE_XDEV_DIR != "$OUTPUT_DIR" ]] ||
+    die "REUSE_XDEV_DIR and XDEV_ISOLATION_DIR must differ"
 printf 'Diagnostic directory: %s\n' "$OUTPUT_DIR"
 
 phase=initialization
@@ -173,6 +187,21 @@ fi
     }
 
 phase=manifest
+if [[ -n $REUSE_XDEV_DIR ]]; then
+    [[ -s $REUSE_XDEV_DIR/manifest.txt ]] ||
+        die "reuse manifest is missing: $REUSE_XDEV_DIR/manifest.txt"
+    for expected in "model=$MODEL" "prompt=$PROMPT" \
+                    "gpu_devices=$GPU_DEVICES" \
+                    "stage_split=$STAGE_SPLIT/$((43-STAGE_SPLIT))" \
+                    "ctx_start=$CTX_START" "ctx_max=$CTX_MAX" \
+                    "ctx_alloc=$CTX_ALLOC" "repeats=$REPEATS" \
+                    "indexer_cache=native-f16" \
+                    "indexer_scorer=streaming64" \
+                    "arm_order=neither,partner-only,rows-only,both"; do
+        grep -Fxq "$expected" "$REUSE_XDEV_DIR/manifest.txt" ||
+            die "reuse manifest does not match this run: $expected"
+    done
+fi
 {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
@@ -185,6 +214,7 @@ phase=manifest
         "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
     printf 'indexer_cache=native-f16\nindexer_scorer=streaming64\n'
     printf 'arm_order=neither,partner-only,rows-only,both\n'
+    printf 'reuse_xdev_dir=%s\n' "${REUSE_XDEV_DIR:-none}"
     printf 'telemetry_interval_ms=%s\n' "$TELEMETRY_INTERVAL_MS"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
@@ -265,8 +295,10 @@ validate_variant_log() {
             die "$variant did not enable partner execution"
         line=$(grep -F 'CUDA q8 fp16 partner summary:' "$log" | tail -n 1 || true)
         [[ -n $line ]] || die "$variant omitted the partner execution summary"
-        calls=${line##*calls=}; calls=${calls%% *}
-        [[ $calls =~ ^[0-9]+$ ]] && (( calls > 0 )) ||
+        [[ $line =~ partner[[:space:]]summary:[[:space:]]calls=([0-9]+) ]] ||
+            die "$variant reported an unparsable partner call count"
+        calls=${BASH_REMATCH[1]}
+        (( calls > 0 )) ||
             die "$variant reported an invalid partner call count"
         ! grep -Fq 'partner execution-only diagnostic:' "$log" ||
             die "$variant unexpectedly suppressed partner execution"
@@ -325,25 +357,55 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
         logits="$base-logits"
         telemetry="$OUTPUT_DIR/telemetry/r${repeat}-s${slot}-$variant.csv"
-        mkdir -p "$logits"
-        printf 'Cross-device isolation repeat=%d/%d slot=%d/4 variant=%s...\n' \
-            "$repeat" "$REPEATS" "$slot" "$variant"
-        record_arm_state "$repeat" "$slot" "$variant" "$partner" "$rows" starting
-        start_telemetry "$telemetry"
-        if "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
-                ./ds4-bench --cuda --cuda-tensor-parallel \
-                    --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-                    --model "$MODEL" --prompt-file "$PROMPT" \
-                    --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
-                    --ctx-alloc "$CTX_ALLOC" --step-mul 2 \
-                    --prefill-chunk 2048 --gen-tokens 0 --csv "$base.csv" \
-                    --dump-frontier-logits-dir "$logits" \
-                    >"$base.log" 2>&1; then
-            run_status=0
-        else
-            run_status=$?
+        reused=0
+        if [[ -n $REUSE_XDEV_DIR ]]; then
+            source_base="$REUSE_XDEV_DIR/production/r${repeat}-s${slot}-$variant"
+            source_logits="$source_base-logits"
+            source_telemetry="$REUSE_XDEV_DIR/telemetry/r${repeat}-s${slot}-$variant.csv"
+            reuse_present=0
+            for source in "$source_base.csv" "$source_base.log" \
+                          "$source_logits" "$source_telemetry"; do
+                [[ -e $source ]] && reuse_present=$((reuse_present + 1))
+            done
+            if (( reuse_present != 0 && reuse_present != 4 )); then
+                die "partial reuse artifacts found for repeat $repeat $variant"
+            fi
+            if (( reuse_present == 4 )); then
+                printf 'Reusing cross-device isolation repeat=%d/%d slot=%d/4 variant=%s...\n' \
+                    "$repeat" "$REPEATS" "$slot" "$variant"
+                record_arm_state "$repeat" "$slot" "$variant" \
+                    "$partner" "$rows" reusing
+                cp -a -- "$source_base.csv" "$base.csv"
+                cp -a -- "$source_base.log" "$base.log"
+                cp -a -- "$source_logits" "$logits"
+                cp -a -- "$source_telemetry" "$telemetry"
+                reused=1
+            fi
         fi
-        stop_telemetry
+        if (( reused == 0 )); then
+            mkdir -p "$logits"
+            printf 'Cross-device isolation repeat=%d/%d slot=%d/4 variant=%s...\n' \
+                "$repeat" "$REPEATS" "$slot" "$variant"
+            record_arm_state "$repeat" "$slot" "$variant" \
+                "$partner" "$rows" starting
+            start_telemetry "$telemetry"
+            if "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
+                    ./ds4-bench --cuda --cuda-tensor-parallel \
+                        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+                        --model "$MODEL" --prompt-file "$PROMPT" \
+                        --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
+                        --ctx-alloc "$CTX_ALLOC" --step-mul 2 \
+                        --prefill-chunk 2048 --gen-tokens 0 --csv "$base.csv" \
+                        --dump-frontier-logits-dir "$logits" \
+                        >"$base.log" 2>&1; then
+                run_status=0
+            else
+                run_status=$?
+            fi
+            stop_telemetry
+        else
+            run_status=0
+        fi
         if (( run_status != 0 )); then
             record_arm_state "$repeat" "$slot" "$variant" "$partner" "$rows" \
                 "failed-exit-$run_status"
@@ -401,7 +463,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             "$repeat" "$slot" "$variant" "$partner" "$rows" \
             "$base.csv" "$base.log" "$logits" "$telemetry" \
             >>"$OUTPUT_DIR/production/runs.csv"
-        record_arm_state "$repeat" "$slot" "$variant" "$partner" "$rows" completed
+        if (( reused == 1 )); then
+            record_arm_state "$repeat" "$slot" "$variant" \
+                "$partner" "$rows" completed-reused
+        else
+            record_arm_state "$repeat" "$slot" "$variant" \
+                "$partner" "$rows" completed
+        fi
     done
 done
 
