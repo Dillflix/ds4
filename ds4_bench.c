@@ -53,6 +53,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_decode_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
@@ -275,6 +276,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-decode-logits-dir")) {
+            c.dump_decode_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -522,6 +525,75 @@ static int write_frontier_logits_json(
     return 0;
 }
 
+/* Correctness-only decode evidence.  The caller records token timing before
+ * entering this function, so filesystem work cannot inflate that token's
+ * latency sample.  It can still perturb later samples and is therefore kept
+ * out of every throughput run by the evidence driver. */
+static int write_decode_logits_raw(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        ds4_session        *session,
+        int                 frontier,
+        int                 decode_step) {
+    if (!cfg->dump_decode_logits_dir) return 0;
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        fprintf(stderr, "ds4-bench: out of memory copying decode logits\n");
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr,
+                "ds4-bench: failed to copy decode logits at frontier %d step %d\n",
+                frontier,
+                decode_step);
+        free(logits);
+        return 1;
+    }
+    for (int i = 0; i < vocab; i++) {
+        if (!isfinite(logits[i])) {
+            fprintf(stderr,
+                    "ds4-bench: non-finite decode logit at frontier %d "
+                    "step %d (vocab index %d)\n",
+                    frontier,
+                    decode_step,
+                    i);
+            free(logits);
+            return 1;
+        }
+    }
+
+    char path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%06d.decode_%06d.logits.f32",
+                           cfg->dump_decode_logits_dir,
+                           frontier,
+                           decode_step);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: decode logits path is too long\n");
+        free(logits);
+        return 1;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                path, strerror(errno));
+        free(logits);
+        return 1;
+    }
+    const size_t written =
+        fwrite(logits, sizeof(logits[0]), (size_t)vocab, fp);
+    const int close_rc = fclose(fp);
+    free(logits);
+    if (written != (size_t)vocab || close_rc != 0) {
+        fprintf(stderr, "ds4-bench: failed to write %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
 static int next_frontier(const bench_config *c, int cur) {
     if (cur >= c->ctx_max) return c->ctx_max;
     int next;
@@ -630,6 +702,8 @@ int main(int argc, char **argv) {
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     int untimed_warmup_tokens = 0;
+    int nsys_decode_skip = -1;
+    int nsys_decode_tokens = 0;
     const char *q8_cache_pretiming_state_csv =
         getenv("DS4_CUDA_Q8_CACHE_PRETIMING_STATE_CSV");
     const char *q8_binding_state_csv =
@@ -660,6 +734,58 @@ int main(int argc, char **argv) {
             return 2;
         }
         untimed_warmup_tokens = (int)parsed;
+    }
+    const char *decode_skip_env = getenv("DS4_NSYS_CAPTURE_DECODE_SKIP");
+    const char *decode_tokens_env = getenv("DS4_NSYS_CAPTURE_DECODE_TOKENS");
+    if ((decode_skip_env && decode_skip_env[0]) ||
+        (decode_tokens_env && decode_tokens_env[0])) {
+        if (!decode_skip_env || !decode_skip_env[0] ||
+            !decode_tokens_env || !decode_tokens_env[0]) {
+            fprintf(stderr,
+                    "ds4-bench: DS4_NSYS_CAPTURE_DECODE_SKIP and "
+                    "DS4_NSYS_CAPTURE_DECODE_TOKENS must be set together\n");
+            return 2;
+        }
+        errno = 0;
+        char *skip_end = NULL;
+        const long parsed_skip = strtol(decode_skip_env, &skip_end, 10);
+        const int skip_errno = errno;
+        errno = 0;
+        char *tokens_end = NULL;
+        const long parsed_tokens = strtol(decode_tokens_env, &tokens_end, 10);
+        const int tokens_errno = errno;
+        if (skip_errno != 0 || skip_end == decode_skip_env ||
+            !skip_end || *skip_end != '\0' || parsed_skip < 0 ||
+            parsed_skip > INT_MAX || tokens_errno != 0 ||
+            tokens_end == decode_tokens_env || !tokens_end ||
+            *tokens_end != '\0' || parsed_tokens <= 0 ||
+            parsed_tokens > INT_MAX ||
+            parsed_skip > INT_MAX - parsed_tokens ||
+            parsed_skip + parsed_tokens > cfg.gen_tokens) {
+            fprintf(stderr,
+                    "ds4-bench: invalid bounded decode capture skip=%s "
+                    "tokens=%s for --gen-tokens=%d\n",
+                    decode_skip_env,
+                    decode_tokens_env,
+                    cfg.gen_tokens);
+            return 2;
+        }
+        if (cfg.backend != DS4_BACKEND_CUDA ||
+            cfg.dist.role != DS4_DISTRIBUTED_NONE ||
+            cfg.ctx_start != cfg.ctx_max) {
+            fprintf(stderr,
+                    "ds4-bench: bounded decode capture requires local CUDA "
+                    "and one context frontier\n");
+            return 2;
+        }
+        if (getenv("DS4_NSYS_CAPTURE_PREFILL") != NULL) {
+            fprintf(stderr,
+                    "ds4-bench: prefill and decode profiler captures are "
+                    "mutually exclusive\n");
+            return 2;
+        }
+        nsys_decode_skip = (int)parsed_skip;
+        nsys_decode_tokens = (int)parsed_tokens;
     }
     if (((q8_cache_pretiming_state_csv && q8_cache_pretiming_state_csv[0]) ||
          (q8_binding_state_csv && q8_binding_state_csv[0]) ||
@@ -893,6 +1019,8 @@ int main(int argc, char **argv) {
         cfg.backend == DS4_BACKEND_CUDA &&
         getenv("DS4_NSYS_CAPTURE_PREFILL") != NULL;
     bool nsys_capture_done = false;
+    bool nsys_decode_capture_active = false;
+    bool nsys_decode_capture_done = false;
     const char *tile_audit_csv = cfg.backend == DS4_BACKEND_CUDA
         ? getenv("DS4_CUDA_PREFILL_TILE_AUDIT_CSV") : NULL;
     bool tile_audit_done = false;
@@ -1039,17 +1167,68 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (nsys_decode_tokens > 0 && !nsys_decode_capture_done &&
+                i == nsys_decode_skip) {
+                fprintf(stderr,
+                        "ds4-bench: starting Nsight CUDA capture for decode "
+                        "frontier %d steps %d..%d\n",
+                        frontier,
+                        i + 1,
+                        i + nsys_decode_tokens);
+                if (!ds4_gpu_profiler_start()) {
+                    fprintf(stderr,
+                            "ds4-bench: failed to start bounded decode capture\n");
+                    rc = 1;
+                    break;
+                }
+                nsys_decode_capture_active = true;
+            }
+#endif
             const double token_t0 = bench_now_sec();
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                if (nsys_decode_capture_active) {
+                    (void)ds4_gpu_profiler_stop();
+                    nsys_decode_capture_active = false;
+                }
+#endif
                 rc = 1;
                 break;
             }
             const double token_t1 = bench_now_sec();
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (nsys_decode_capture_active &&
+                i + 1 == nsys_decode_skip + nsys_decode_tokens) {
+                if (!ds4_gpu_profiler_stop()) {
+                    fprintf(stderr,
+                            "ds4-bench: failed to stop bounded decode capture\n");
+                    nsys_decode_capture_active = false;
+                    rc = 1;
+                    break;
+                }
+                nsys_decode_capture_active = false;
+                nsys_decode_capture_done = true;
+                fprintf(stderr,
+                        "ds4-bench: stopped Nsight CUDA capture for decode "
+                        "frontier %d after %d tokens\n",
+                        frontier,
+                        nsys_decode_tokens);
+            }
+#endif
             if (i == 0) gen_first_sec = token_t1 - token_t0;
             else gen_steady_sec += token_t1 - token_t0;
             if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
             gen_done++;
+            if (write_decode_logits_raw(&cfg,
+                                        engine,
+                                        session,
+                                        frontier,
+                                        i + 1) != 0) {
+                rc = 1;
+                break;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -1067,6 +1246,15 @@ int main(int argc, char **argv) {
         }
         free(gen_token_buf);
         if (rc != 0) break;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (nsys_decode_tokens > 0 && !nsys_decode_capture_done) {
+            fprintf(stderr,
+                    "ds4-bench: bounded decode capture did not reach its "
+                    "requested token window\n");
+            rc = 1;
+            break;
+        }
+#endif
 
         if (!need_restore_after_generation) {
             /* Nothing later depends on the frontier state. */

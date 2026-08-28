@@ -20277,6 +20277,7 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
 static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     (void)g;
     static int parsed = -1;
+    static int reported = 0;
     static uint32_t cached = 0;
     if (parsed < 0) {
         parsed = 0;
@@ -20300,7 +20301,7 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
         }
 #endif
     }
-    if (parsed > 0) return cached;
+    uint32_t threshold = parsed > 0 ? cached : 1024u;
 
     /* Keep dense attention longer than the legacy 512-row window by default.
      * Around the 2K frontier the sparse path's score/top-k setup dominates
@@ -20308,7 +20309,15 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
      * selection defined by DS4_N_INDEXER_TOP_K. */
-    return 1024u;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr,
+                "ds4: decode indexer sparse threshold=%u compressed rows "
+                "(%s)\n",
+                threshold,
+                parsed > 0 ? "explicit" : "default");
+    }
+    return threshold;
 }
 
 /* =========================================================================
@@ -22824,10 +22833,22 @@ static bool metal_graph_encode_decode_layer_phase(
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
+    const bool decode_timeline_full = phase == METAL_DECODE_LAYER_FULL;
+    bool decode_timeline_stage = decode_timeline_full
+        ? metal_graph_cuda_timeline_pushf(
+                "ds4/decode/stage/name=attention/layer=%u/pos=%u/tier=%d",
+                il,
+                pos,
+                g->active_tier)
+        : false;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
+    } while (0)
+#define DS4_DECODE_TIMELINE_RETURN(value) do { \
+        metal_graph_cuda_timeline_pop(decode_timeline_stage); \
+        return (value); \
     } while (0)
     const bool tp_ablate_hcpre = metal_graph_tp_ablate("hcpre");
     if (phase != METAL_DECODE_LAYER_FROM_ROUTER) {
@@ -22917,7 +22938,9 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", metal_graph_attn_norm(g), DS4_N_EMBD, il, pos);
     }
-    if (phase == METAL_DECODE_LAYER_TO_QKV) return ok;
+    if (phase == METAL_DECODE_LAYER_TO_QKV) {
+        DS4_DECODE_TIMELINE_RETURN(ok);
+    }
     }
     if (!resume_after_attn) {
     if (!resume_after_qkv) {
@@ -23458,7 +23481,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
-    if (stop_before_attn) return ok;
+    if (stop_before_attn) DS4_DECODE_TIMELINE_RETURN(ok);
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         const bool indexed_attention = n_comp != 0 && comp_selected != NULL && n_selected != 0;
@@ -23969,6 +23992,14 @@ static bool metal_graph_encode_decode_layer_phase(
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
+    metal_graph_cuda_timeline_pop(decode_timeline_stage);
+    decode_timeline_stage = ok && decode_timeline_full
+        ? metal_graph_cuda_timeline_pushf(
+                "ds4/decode/stage/name=ffn/layer=%u/pos=%u/tier=%d",
+                il,
+                pos,
+                g->active_tier)
+        : false;
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_after_attn_hc(g), hc_dim, il, pos);
     }
@@ -24074,7 +24105,9 @@ static bool metal_graph_encode_decode_layer_phase(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_router_selected(g), DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_router_weights(g), DS4_N_EXPERT_USED, il, pos);
     }
-    if (phase == METAL_DECODE_LAYER_TO_ROUTER) return ok;
+    if (phase == METAL_DECODE_LAYER_TO_ROUTER) {
+        DS4_DECODE_TIMELINE_RETURN(ok);
+    }
     }
     const bool external_routed = phase == METAL_DECODE_LAYER_FROM_ROUTER;
     const bool fuse_shared_gate_up =
@@ -24702,7 +24735,7 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok) {
             metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
         }
-        return ok;
+        DS4_DECODE_TIMELINE_RETURN(ok);
     }
     if (overlap_selected_shared) {
         uint64_t selected_event = 0;
@@ -24900,7 +24933,7 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok) {
             metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
         }
-        return ok;
+        DS4_DECODE_TIMELINE_RETURN(ok);
     }
     /* Under the TP split the routed experts run after the shared expert so
      * the sum6 kernel can fold the shared partial and write the slab slot
@@ -24950,7 +24983,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (phase == METAL_DECODE_LAYER_TO_SHARED_MID ||
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
-        return ok;
+        DS4_DECODE_TIMELINE_RETURN(ok);
     }
     if (ok && tp_split_shared) {
         /* Shared expert lane slice: the fused gate/up/swiglu kernel covers
@@ -25245,7 +25278,10 @@ static bool metal_graph_encode_decode_layer_phase(
                                                   DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+    metal_graph_cuda_timeline_pop(decode_timeline_stage);
+    decode_timeline_stage = false;
 #undef DS4_METAL_PROFILE_DECODE_STAGE
+#undef DS4_DECODE_TIMELINE_RETURN
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
     }
@@ -27489,8 +27525,15 @@ static bool metal_graph_encode_token_raw_swa(
     /* write the embedded token on the embedding tier. Single-
      * tier: emb_tier == 0 == active_tier; no-op. Multi-tier: switch to
      * emb_tier (no cross-device copy needed — embed writes from scratch). */
+    const bool embedding_range = metal_graph_cuda_timeline_pushf(
+            "ds4/decode/embedding/pos=%u/tier=%d",
+            pos,
+            g->emb_tier);
     if (g->placement) {
-        if (!metal_graph_set_active_tier_decode(g, g->emb_tier)) return false;
+        if (!metal_graph_set_active_tier_decode(g, g->emb_tier)) {
+            metal_graph_cuda_timeline_pop(embedding_range);
+            return false;
+        }
     }
     bool ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                               model->map,
@@ -27500,6 +27543,7 @@ static bool metal_graph_encode_token_raw_swa(
                                               (uint32_t)token,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    metal_graph_cuda_timeline_pop(embedding_range);
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -27511,6 +27555,14 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t split_after_layers = metal_graph_token_split_after_layers();
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const int layer_tier = g->placement
+            ? g->placement[il + 1u]
+            : g->active_tier;
+        const bool layer_range = metal_graph_cuda_timeline_pushf(
+                "ds4/decode/layer/layer=%u/pos=%u/tier=%d",
+                il,
+                pos,
+                layer_tier);
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -27521,6 +27573,7 @@ static bool metal_graph_encode_token_raw_swa(
                                              raw_row,
                                              n_raw,
                                              token);
+        metal_graph_cuda_timeline_pop(layer_range);
         ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
@@ -27537,7 +27590,12 @@ static bool metal_graph_encode_token_raw_swa(
     }
 
     if (ok && need_logits) {
+        const bool output_range = metal_graph_cuda_timeline_pushf(
+                "ds4/decode/output/pos=%u/tier=%d",
+                pos,
+                g->head_tier);
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        metal_graph_cuda_timeline_pop(output_range);
     }
     return ok;
 }
@@ -31236,6 +31294,10 @@ static bool metal_graph_eval_token_raw_swa(
                               "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const bool token_range = metal_graph_cuda_timeline_pushf(
+            "ds4/decode/token/pos=%u/token=%d",
+            pos,
+            token);
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
@@ -31262,6 +31324,7 @@ static bool metal_graph_eval_token_raw_swa(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
+    metal_graph_cuda_timeline_pop(token_range);
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {

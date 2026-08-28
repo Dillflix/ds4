@@ -2326,3 +2326,51 @@ run, keep its original settings and set `RESUME=1` plus
 cases are reused; incomplete or invalid cases are rerun. Return the generated
 `sm75-decode-baseline-<timestamp>.tar.gz`. The primary results are
 `summary/summary.csv`, `summary/summary.md`, and `summary/samples.csv`.
+
+# SM75 production decode evidence
+
+`cuda-sm75-decode-evidence.sh` is the first attribution pass after the broad
+decode baseline. It keeps the production model, device order, 22/21 split,
+balanced dense-F16 placement, and complete 344/344 admission fixed.
+
+The throughput experiment isolates the implementation transition observed
+between PP2048 and PP4096: PP4096 is run with the production 1024-compressed-row
+indexing threshold and with a forced 4096-row dense threshold. Runs are paired
+and order-reversed. A separate correctness pass writes every full-vocabulary
+FP32 logit vector for eight generated tokens and requires byte identity; its
+filesystem work is never used as a throughput sample.
+
+Nsight Systems captures begin after prefill and sixteen unprofiled decode
+tokens. Only the next sixteen tokens are recorded. Opt-in NVTX ranges identify
+the complete token, embedding, each layer and logical tier, attention and FFN
+halves, and output head. They add no CUDA event, stream wait, or device
+synchronization. The captured contexts are PP2048, PP4096, and PP32768, plus a
+PP4096 forced-dense trace. Aggregate GPU work is reported separately from the
+wall-clock GPU envelope because work on partner devices overlaps.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+AB_REPEATS=3 \
+TRACE_CONTEXTS=2048,4096,32768 \
+TRACE_SKIP=16 \
+TRACE_TOKENS=16 \
+RUN_AB=1 \
+RUN_EXACT=1 \
+RUN_NSYS=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-evidence.sh
+```
+
+Return `sm75-decode-evidence-<timestamp>.tar.gz`. The primary products are the
+paired threshold result in `summary/summary.md`, exactness record under
+`exact/`, the four bounded `.nsys-rep` files, and the operation, stage/device,
+layer/device, kernel/device, and trace summaries under `summary/`.
