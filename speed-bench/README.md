@@ -2433,3 +2433,44 @@ bash ./speed-bench/cuda-sm75-decode-pair-next.sh
 Return `sm75-decode-pair-next-<timestamp>.tar.gz`. A fast first check can use
 `RUN_PRODUCTION=0 RUN_NCU=0 REPEATS=25`; it still enforces exact operation
 outputs, but does not claim an end-to-end result.
+
+# SM75 production decode indexer-score A/B
+
+`cuda-sm75-decode-indexer-production-ab.sh` advances only the successful part
+of the one-token pair experiment. It partitions each native-F16 indexer score
+vector 50/50 across the layer's NVLink pair, gathers the partner score half,
+and runs the unchanged deterministic top-k on the home GPU. The candidate
+reuses the index-cache mirror already required by production prefill row
+splitting; it allocates no additional persistent cache. The rejected decode
+attention head split is explicitly disabled in both variants.
+
+Every sample requires the fixed 22/21 placement, stage-aware complete 344/344
+dense-F16 admission, tagged SM75 Q32 tensors, direct pair routes, and the
+production prefill indexer row split. Runs are paired and order-reversed.
+Full-vocabulary FP32 logits for eight decode steps must be byte-identical before
+the report is accepted.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CONTEXTS=2048,32768 \
+TG_TOKENS=256 \
+REPEATS=3 \
+EXACT_CONTEXT=32768 \
+EXACT_TOKENS=8 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-indexer-production-ab.sh
+```
+
+To resume, preserve the original settings and set `RESUME=1` plus
+`DECODE_INDEXER_AB_DIR="$PWD/sm75-decode-indexer-production-<timestamp>"`.
+Return the generated archive; the decision table is `summary/summary.md` and
+the exact-output gate is `exact/verification.txt`.
