@@ -19244,26 +19244,32 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
-            dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
-                                                                               sinks,
-                                                                               (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               0,
-                                                                               n_head,
-                                                                               n_head,
-                                                                               head_dim);
+            const int sm75_heads8 = cuda_sm75_mma_ok() &&
+                cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
+            if (sm75_heads8) {
+                static std::atomic<bool> logged = false;
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    fprintf(stderr,
+                            "ds4: SM75 indexed attention selected: "
+                            "8 heads / 256 threads\n");
+            }
+            dim3 grid(n_tokens,
+                      sm75_heads8 ? (n_head + 7u) / 8u :
+                                    (n_head + 15u) / 16u,
+                      1);
+#define DS4_INDEXED_ONLINE_ARGS \
+                (float *)heads->ptr, sinks, (const float *)q->ptr, \
+                (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
+                topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
+                top_k, window, ratio, 0, n_head, n_head, head_dim
+            if (sm75_heads8) {
+                attention_indexed_mixed_heads8_online_kernel<8, 8>
+                    <<<grid, 256>>>(DS4_INDEXED_ONLINE_ARGS);
+            } else {
+                attention_indexed_mixed_heads8_online_kernel<8, 16>
+                    <<<grid, 512>>>(DS4_INDEXED_ONLINE_ARGS);
+            }
+#undef DS4_INDEXED_ONLINE_ARGS
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -19346,12 +19352,32 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
                      "indexed attention shard topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    dim3 grid(n_tokens, (n_head_work + 15u) / 16u, 1u);
-    attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
-            (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
-            topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-            top_k, window, ratio, head0, n_head_work, n_head_total, head_dim);
+    const int sm75_heads8 = cuda_sm75_mma_ok() &&
+        cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
+    if (sm75_heads8) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr,
+                    "ds4: SM75 indexed attention shard selected: "
+                    "8 heads / 256 threads\n");
+    }
+    dim3 grid(n_tokens,
+              sm75_heads8 ? (n_head_work + 7u) / 8u :
+                            (n_head_work + 15u) / 16u,
+              1u);
+#define DS4_INDEXED_SHARD_ARGS \
+        (float *)heads->ptr, sinks, (const float *)q->ptr, \
+        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
+        topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
+        top_k, window, ratio, head0, n_head_work, n_head_total, head_dim
+    if (sm75_heads8) {
+        attention_indexed_mixed_heads8_online_kernel<8, 8><<<grid, 256>>>(
+            DS4_INDEXED_SHARD_ARGS);
+    } else {
+        attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
+            DS4_INDEXED_SHARD_ARGS);
+    }
+#undef DS4_INDEXED_SHARD_ARGS
     return cuda_ok(cudaGetLastError(), "attention indexed head shard launch");
 }
 

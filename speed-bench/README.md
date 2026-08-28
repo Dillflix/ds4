@@ -2266,3 +2266,20 @@ and a role-aware recipe frontier that can choose gate/up and down formats
 independently. IQ2 down and Q2_K remain intentionally outside this pass.
 The tool does not hash or quantize a full model and does not enable a
 production format.
+
+# SM75 indexed-attention production dispatch
+
+SM75 indexed attention uses eight heads in a 256-thread CTA by default.
+`DS4_CUDA_INDEXED_HEADS8_SM75=0` is retained only as the exact-output and
+performance control for the former sixteen-head, 512-thread dispatch. Per-head
+row order and online-softmax arithmetic are unchanged.
+
+Two fixed 22/21 full-production A/B passes with complete 344/344 dense-F16
+admission and byte-identical frontier logits independently measured indexed8
+gains of +1.07%/+1.33% and +1.57%/+1.31% at 8K/32K. The SM75 production
+profiler therefore expects the indexed-attention kernel to use 256 threads.
+
+The Q4-32-down stage8 and compact-tile16 experiments are abandoned. Although
+their isolated harnesses improved, they regressed the full production path by
+roughly 2% and 5.6-5.9%, respectively. Neither implementation, dispatch flag,
+nor experimental runner is retained.
