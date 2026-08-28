@@ -166,7 +166,9 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE=1
     "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB"
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
-    DS4_CUDA_Q8_T256_PLACEMENT=balanced
+    # Deliberately leave DS4_CUDA_Q8_T256_PLACEMENT unset.  Production's
+    # default is balanced plus stage-aware-fixed-22-21; explicitly selecting
+    # balanced invokes the older legacy-class-policy planner.
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
 
@@ -212,12 +214,24 @@ validate_production_log() {
                   'materialized 344/344 candidates' \
                   'SM75 routed Q32 layout enabled' \
                   "decode indexer sparse threshold=$threshold compressed rows (explicit)"; do
-        grep -Fq "$marker" "$log" || return 1
+        grep -Fq "$marker" "$log" || {
+            printf 'error: production log missing required marker: %s\n' \
+                "$marker" >&2
+            return 1
+        }
     done
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
-        grep -Fq "$route" "$log" || return 1
+        grep -Fq "$route" "$log" || {
+            printf 'error: production log missing direct route: %s\n' \
+                "$route" >&2
+            return 1
+        }
     done
-    ! grep -Fq 'required but unavailable' "$log"
+    if grep -Fq 'required but unavailable' "$log"; then
+        printf 'error: production log reports a required unavailable path\n' >&2
+        return 1
+    fi
+    return 0
 }
 
 run_bench() {
