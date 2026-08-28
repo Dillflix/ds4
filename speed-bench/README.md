@@ -2003,11 +2003,12 @@ rejected rather than silently rerun or mixed with new evidence.
 `cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token
 F16-cache reader with the legacy F32 reader, runs the fixed 100-case production
-quality suite, interleaves genuine 32K production runs under the 256K
-allocation, byte-compares their frontier logits, and finishes with the
-long-prompt one-word decode smoke. Both arms must prove the exact Q4-32/Q3A4
-routed recipe, 344/344 dense-F16 admission, balanced 43/43 T256 placement, and
-automatic selection of both qualified attention row splits.
+quality suite, interleaves genuine 32K production runs under the exact 32K
+frontier allocation, byte-compares their frontier logits, and finishes with a
+separate 64K-allocation long-prompt one-word decode smoke. Both arms must prove
+the exact Q4-32/Q3A4 routed recipe, 344/344 dense-F16 admission, balanced 43/43
+T256 placement, and automatic selection of both qualified attention row
+splits.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2021,7 +2022,8 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 CTX_START=32768 \
 CTX_MAX=32768 \
-CTX_ALLOC=262273 \
+CTX_ALLOC=32769 \
+WORD_CTX_ALLOC=65537 \
 REPEATS=3 \
 RUN_QUALITY=1 \
 RUN_WORD_SMOKE=1 \
@@ -2039,6 +2041,16 @@ failure, extract its archive and pass the extracted `quality/` directory as
 runtime, full dense cache, T256 placement, and Q32 dispatch. The newly run
 native arm supplies the exact per-layer routed-recipe audit before the two TSVs
 are compared.
+
+If both 100-case arms completed, pass that `quality/` directory as
+`REUSE_QUALITY_DIR`. The gate copies and revalidates both TSV/log pairs, then
+starts at the production A/B. Do not use `REUSE_QUALITY_DIR` together with
+`REUSE_LEGACY_QUALITY_DIR`.
+
+The 32K performance allocation is deliberate. A 256K allocation on the
+current 4 x 48 GiB layout materializes only 271/344 dense-F16 candidates, so
+it is a capacity/admission experiment rather than a valid full-cache
+performance control.
 
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
@@ -2145,7 +2157,7 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
-CTX_ALLOC=262273 \
+CTX_ALLOC=65537 \
 EXPECTED_WORD=LANTERN \
 PAD_LINES=2200 \
 SKIP_BUILD=0 \
@@ -2166,9 +2178,10 @@ layers, and Q4-32 down on all 43 layers.
 
 The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
-The trace uses the 256K allocation and must prove complete dense-F16 admission,
-balanced T256 execution, both automatically selected attention row splits,
-the native-F16 streaming64 indexer, and a saved 32K frontier-logit artifact.
+The trace uses the exact 32K frontier allocation and must prove complete
+dense-F16 admission, balanced T256 execution, both automatically selected
+attention row splits, the native-F16 streaming64 indexer, and a saved 32K
+frontier-logit artifact.
 Nsight Compute does not replay the full application: bounded exact harnesses
 capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, and both indexed and mixed
 long-context attention shapes. This avoids five additional 139 GB model loads
@@ -2185,7 +2198,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 PROFILE_TOKENS=32768 \
-CTX_ALLOC=262273 \
+CTX_ALLOC=32769 \
 PROFILE_GPU=0 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \

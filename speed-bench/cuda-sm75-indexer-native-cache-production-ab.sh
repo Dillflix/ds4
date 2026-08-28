@@ -17,19 +17,21 @@ Optional environment:
   STAGE_SPLIT=22
   CTX_START=32768
   CTX_MAX=32768
-  CTX_ALLOC=262273
+  CTX_ALLOC=32769
+  WORD_CTX_ALLOC=65537
   REPEATS=3
   RUN_QUALITY=1
   RUN_WORD_SMOKE=1
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   REUSE_LEGACY_QUALITY_DIR=/absolute/path/to/prior/quality
+  REUSE_QUALITY_DIR=/absolute/path/to/prior/quality
   INDEXER_NATIVE_AB_DIR=/absolute/output/directory
 
 The legacy arm stores indexer K in F32 and dispatches shipping WMMA128. The
 native arm commits QAT-completed rows once to an F16 cache and dispatches the
 SM75 streaming64 kernel. Both arms otherwise use the complete production
-configuration: Q4-32/Q3A4 routed experts, all 344 dense-F16 candidates,
+32K production configuration: Q4-32/Q3A4 routed experts, all 344 dense-F16 candidates,
 balanced T256 partner execution, and default-qualified query-row attention
 splitting. Advancement requires exact bounded score/top-k and one-token
 results, identical 100-case production scores, byte-identical 32K frontier
@@ -53,13 +55,15 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_START=${CTX_START:-32768}
 CTX_MAX=${CTX_MAX:-32768}
-CTX_ALLOC=${CTX_ALLOC:-262273}
+CTX_ALLOC=${CTX_ALLOC:-32769}
+WORD_CTX_ALLOC=${WORD_CTX_ALLOC:-65537}
 REPEATS=${REPEATS:-3}
 RUN_QUALITY=${RUN_QUALITY:-1}
 RUN_WORD_SMOKE=${RUN_WORD_SMOKE:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 REUSE_LEGACY_QUALITY_DIR=${REUSE_LEGACY_QUALITY_DIR:-}
+REUSE_QUALITY_DIR=${REUSE_QUALITY_DIR:-}
 Q3A4_LAYERS=6,8,10,12,14,16,18,20,30,32,34,36,38,40,42
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${INDEXER_NATIVE_AB_DIR:-$repo_dir/sm75-indexer-native-cache-production-$stamp}
@@ -73,8 +77,19 @@ if [[ -n $REUSE_LEGACY_QUALITY_DIR ]]; then
        -f $REUSE_LEGACY_QUALITY_DIR/legacy-f32.log ]] ||
         die "REUSE_LEGACY_QUALITY_DIR must contain legacy-f32.tsv and legacy-f32.log"
 fi
+if [[ -n $REUSE_QUALITY_DIR ]]; then
+    [[ -z $REUSE_LEGACY_QUALITY_DIR ]] ||
+        die "set only one of REUSE_QUALITY_DIR and REUSE_LEGACY_QUALITY_DIR"
+    [[ $REUSE_QUALITY_DIR == /* ]] ||
+        die "REUSE_QUALITY_DIR must be absolute"
+    for file in legacy-f32.tsv legacy-f32.log native-f16.tsv native-f16.log; do
+        [[ -f $REUSE_QUALITY_DIR/$file ]] ||
+            die "REUSE_QUALITY_DIR is missing $file"
+    done
+fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
             "CTX_MAX:$CTX_MAX" "CTX_ALLOC:$CTX_ALLOC" \
+            "WORD_CTX_ALLOC:$WORD_CTX_ALLOC" \
             "REPEATS:$REPEATS" "RUN_QUALITY:$RUN_QUALITY" \
             "RUN_WORD_SMOKE:$RUN_WORD_SMOKE" "SKIP_BUILD:$SKIP_BUILD" \
             "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
@@ -82,8 +97,9 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 &&
-   CTX_START == 32768 && CTX_MAX == 32768 && CTX_ALLOC == 262273 &&
-   REPEATS >= 2 )) || die "production gate requires one 32K frontier, 256K allocation, and at least two repeats"
+   CTX_START == 32768 && CTX_MAX == 32768 && CTX_ALLOC == 32769 &&
+   WORD_CTX_ALLOC == 65537 && REPEATS >= 2 )) ||
+    die "production gate requires a 32K A/B allocation, 64K word-smoke allocation, and at least two repeats"
 for flag in RUN_QUALITY RUN_WORD_SMOKE SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -173,8 +189,9 @@ phase=manifest
     printf 'quality_manifest=%s\ngpu_devices=%s\nstage_split=%s/%s\n' \
         "$QUALITY_MANIFEST" "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
     printf 'reuse_legacy_quality_dir=%s\n' "${REUSE_LEGACY_QUALITY_DIR:-none}"
-    printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
-        "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
+    printf 'reuse_quality_dir=%s\n' "${REUSE_QUALITY_DIR:-none}"
+    printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nword_ctx_alloc=%s\nrepeats=%s\n' \
+        "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$WORD_CTX_ALLOC" "$REPEATS"
     printf 'q3a4_layers=%s\ndense_f16_admission=344/344\nt256_policy=balanced-43/43\n' \
         "$Q3A4_LAYERS"
     printf 'attention_rows_policy=automatic-qualified\nindexer_cache=native-f16-ab\nindexer_scorer=streaming64-ab\nxdev_sync=disabled\n'
@@ -303,7 +320,12 @@ if [[ $RUN_QUALITY == 1 ]]; then
         out="$OUTPUT_DIR/quality/$variant.tsv"
         log="$OUTPUT_DIR/quality/$variant.log"
         require_recipe=1
-        if [[ $variant == legacy-f32 && -n $REUSE_LEGACY_QUALITY_DIR ]]; then
+        if [[ -n $REUSE_QUALITY_DIR ]]; then
+            printf 'Reusing completed %s 100-case quality result...\n' "$variant"
+            cp -- "$REUSE_QUALITY_DIR/$variant.tsv" "$out"
+            cp -- "$REUSE_QUALITY_DIR/$variant.log" "$log"
+            if [[ $variant == legacy-f32 ]]; then require_recipe=0; fi
+        elif [[ $variant == legacy-f32 && -n $REUSE_LEGACY_QUALITY_DIR ]]; then
             printf 'Reusing completed legacy-f32 100-case quality result...\n'
             cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.tsv" "$out"
             cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.log" "$log"
@@ -312,7 +334,7 @@ if [[ $RUN_QUALITY == 1 ]]; then
             printf 'Scoring 100 production cases: %s...\n' "$variant"
             "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
                 ./gguf-tools/quality-testing/score_official \
-                    "$MODEL" "$QUALITY_MANIFEST" "$out" 32769 \
+                    "$MODEL" "$QUALITY_MANIFEST" "$out" "$CTX_ALLOC" \
                     --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                     --cuda-tensor-parallel --warm-weights --production-path \
                     >"$log" 2>&1 || {
@@ -413,7 +435,7 @@ if [[ $RUN_WORD_SMOKE == 1 ]]; then
     phase=long-prompt-word-smoke
     MODEL="$MODEL" CORPUS="$PROMPT" GPU_DEVICES="$GPU_DEVICES" \
         GPU_VRAM="$GPU_VRAM" STAGE_SPLIT="$STAGE_SPLIT" \
-        CTX_ALLOC="$CTX_ALLOC" MIN_PROMPT_TOKENS=24000 GEN_TOKENS=8 \
+        CTX_ALLOC="$WORD_CTX_ALLOC" MIN_PROMPT_TOKENS=24000 GEN_TOKENS=8 \
         SKIP_BUILD=1 CREATE_ARCHIVE=0 \
         WORD_SMOKE_DIR="$OUTPUT_DIR/long-prompt-word-smoke" \
         bash ./speed-bench/cuda-sm75-long-prompt-word-smoke.sh

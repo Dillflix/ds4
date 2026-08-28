@@ -16,7 +16,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   PROFILE_TOKENS=32768         fixed to 32768 for this evidence pass
-  CTX_ALLOC=262273
+  CTX_ALLOC=32769
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
   PROFILE_GPU=0                physical GPU for bounded NCU harnesses
@@ -40,7 +40,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 PROFILE_TOKENS=${PROFILE_TOKENS:-32768}
-CTX_ALLOC=${CTX_ALLOC:-262273}
+CTX_ALLOC=${CTX_ALLOC:-32769}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
 PROFILE_GPU=${PROFILE_GPU:-0}
@@ -65,9 +65,9 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
 done
 (( STAGE_SPLIT == 22 )) || die "this fixed production profile requires STAGE_SPLIT=22"
 (( PROFILE_TOKENS == 32768 )) || die "PROFILE_TOKENS must be exactly 32768"
-(( CTX_ALLOC == 262273 && PREFILL_CHUNK == 2048 &&
+(( CTX_ALLOC == 32769 && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
-    die "require ctx_alloc=262273, prefill_chunk=2048, and pipeline_mb=512"
+    die "require ctx_alloc=32769, prefill_chunk=2048, and pipeline_mb=512"
 printf -v frontier_tag '%06d' "$PROFILE_TOKENS"
 for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
