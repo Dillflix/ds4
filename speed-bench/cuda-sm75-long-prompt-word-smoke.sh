@@ -6,7 +6,7 @@ usage() {
 Run one production-path long-prompt retrieval and early-decode quality smoke.
 
 Required environment:
-  MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
+  MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
 
 Optional environment:
   CORPUS=...                 default: speed-bench/promessi_sposi.txt
@@ -37,7 +37,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 MODEL=${MODEL:-}
 [[ $MODEL == /* && -f $MODEL ]] ||
-    die "MODEL must name an existing absolute GGUF"
+    die "MODEL must name the existing absolute tagged Q4-32/Q3A4 GGUF"
 CORPUS=${CORPUS:-$repo_dir/speed-bench/promessi_sposi.txt}
 EXPECTED_WORD=${EXPECTED_WORD:-LANTERN}
 PAD_LINES=${PAD_LINES:-2200}
@@ -49,6 +49,7 @@ CTX_ALLOC=${CTX_ALLOC:-262273}
 GEN_TOKENS=${GEN_TOKENS:-8}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+Q3A4_LAYERS=6,8,10,12,14,16,18,20,30,32,34,36,38,40,42
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${WORD_SMOKE_DIR:-$repo_dir/sm75-long-prompt-word-smoke-$stamp}
 
@@ -67,7 +68,7 @@ done
    GEN_TOKENS > 0 && SKIP_BUILD <= 1 && CREATE_ARCHIVE <= 1 )) ||
     die "invalid smoke-test bounds"
 for tool in awk basename cat date dirname env git grep head make mkdir nproc \
-            nvidia-smi sed sort stat tail tar tee tr; do
+            nvidia-smi python3 sed sort stat tail tar tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
@@ -130,7 +131,9 @@ phase=manifest
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_alloc=%s\ngen_tokens=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
         "$CTX_ALLOC" "$GEN_TOKENS"
-    printf 'xdev_sync=disabled\n'
+    printf 'q3a4_layers=%s\ndense_f16_admission=344/344\nt256_policy=balanced-43/43\n' \
+        "$Q3A4_LAYERS"
+    printf 'attention_rows_policy=automatic-qualified\nindexer_cache=native-f16\nindexer_scorer=streaming64\nxdev_sync=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'
@@ -152,6 +155,8 @@ phase=production-generation
     DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
+    DS4_CUDA_INDEXER_SCORE_AUDIT=1 \
+    DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
     ./ds4 --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --ctx "$CTX_ALLOC" --prefill-chunk 2048 \
@@ -163,6 +168,33 @@ phase=production-generation
 
 grep -Fq 't256-placement=balanced' "$OUTPUT_DIR/stderr.log" ||
     die "production generation missed balanced T256 placement"
+grep -Fq 'materialized 344/344 candidates' "$OUTPUT_DIR/stderr.log" ||
+    die "production generation did not materialize every dense-F16 candidate"
+grep -Fq 'T256-output_b=43/43' "$OUTPUT_DIR/stderr.log" ||
+    die "production generation did not materialize every T256 projection"
+grep -Fq 'ds4: SM75 routed Q32 layout enabled ' "$OUTPUT_DIR/stderr.log" ||
+    die "production generation did not enable the tagged Q32 path"
+python3 speed-bench/validate-sm75-q32-production-log.py \
+    "$OUTPUT_DIR/stderr.log" "$Q3A4_LAYERS" >/dev/null ||
+    die "production generation did not use the exact Q4-32/Q3A4 recipe"
+grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' \
+    "$OUTPUT_DIR/stderr.log" ||
+    die "production generation did not enable the native indexer path"
+for dispatch in direct-one streaming64-native wmma128-f16-native wmma128 \
+                wmma64 wmma32 wmma16 generic; do
+    line=$(grep -F "ds4: CUDA indexer score audit dispatch=$dispatch " \
+        "$OUTPUT_DIR/stderr.log" || true)
+    [[ $(printf '%s\n' "$line" | grep -c .) == 1 ]] ||
+        die "production generation lacks one $dispatch indexer audit record"
+    launches=${line##*launches=}
+    [[ $launches =~ ^[0-9]+$ ]] ||
+        die "production generation has an invalid $dispatch audit count"
+    if [[ $dispatch == streaming64-native || $dispatch == direct-one ]]; then
+        (( launches > 0 )) || die "required indexer dispatch was absent: $dispatch"
+    else
+        (( launches == 0 )) || die "unexpected indexer dispatch: $dispatch"
+    fi
+done
 [[ $(grep -Fc 'qualified=yes' "$OUTPUT_DIR/stderr.log") == 2 ]] ||
     die "production generation did not qualify both SM75 NVLink pairs"
 [[ $(grep -Fc 'query-row split enabled:' "$OUTPUT_DIR/stderr.log") == 2 ]] ||

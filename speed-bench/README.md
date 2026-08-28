@@ -2003,21 +2003,23 @@ rejected rather than silently rerun or mixed with new evidence.
 `cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token
 F16-cache reader with the legacy F32 reader, runs the fixed 100-case production
-quality suite, interleaves 2K--32K throughput sweeps under the 256K allocation,
-byte-compares all frontier logits, and finishes with the long-prompt one-word
-decode smoke.
+quality suite, interleaves genuine 32K production runs under the 256K
+allocation, byte-compares their frontier logits, and finishes with the
+long-prompt one-word decode smoke. Both arms must prove the exact Q4-32/Q3A4
+routed recipe, 344/344 dense-F16 admission, balanced 43/43 T256 placement, and
+automatic selection of both qualified attention row splits.
 
 ```bash
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
-CTX_START=2048 \
+CTX_START=32768 \
 CTX_MAX=32768 \
 CTX_ALLOC=262273 \
 REPEATS=3 \
@@ -2131,7 +2133,7 @@ is not forced, so the smoke preserves normal production overlap.
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
@@ -2157,6 +2159,9 @@ layers, and Q4-32 down on all 43 layers.
 
 The GGUF is opened once under Nsight Systems. DS4 NVTX ranges are then reduced
 to per-device stage, microbatch, layer, handoff, and partner-projection tables.
+The trace uses the 256K allocation and must prove complete dense-F16 admission,
+balanced T256 execution, both automatically selected attention row splits,
+the native-F16 streaming64 indexer, and a saved 32K frontier-logit artifact.
 Nsight Compute does not replay the full application: bounded exact harnesses
 capture Q4-32 gate/up, Q4-32 down, Q3A4 gate/up, and both indexed and mixed
 long-context attention shapes. This avoids five additional 139 GB model loads
@@ -2173,7 +2178,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 PROFILE_TOKENS=32768 \
-CTX_ALLOC=32769 \
+CTX_ALLOC=262273 \
 PROFILE_GPU=0 \
 RUN_NCU=1 \
 NCU_USE_SUDO=1 \
@@ -2184,7 +2189,8 @@ bash ./speed-bench/cuda-sm75-q32-production-profile.sh
 
 Return `sm75-q32-production-profile-<timestamp>.tar.gz`. The primary results
 are `profile-summary.md`, `stage-device-summary.csv`,
-`stage-microbatch-device.csv`, `kernel-family-summary.csv`, the genuine
+`stage-microbatch-device.csv`, `kernel-family-summary.csv`,
+`kernel-family-total.csv`, `operation-family-summary.csv`, the genuine
 `nsys/combined.nsys-rep`, and the five validated reports under `ncu/`.
 
 # SM75 routed-quant real-weight quality sweep

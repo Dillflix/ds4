@@ -16,7 +16,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   PROFILE_TOKENS=32768         fixed to 32768 for this evidence pass
-  CTX_ALLOC=32769
+  CTX_ALLOC=262273
   PREFILL_CHUNK=2048
   PIPELINE_MB=512
   PROFILE_GPU=0                physical GPU for bounded NCU harnesses
@@ -40,7 +40,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 PROFILE_TOKENS=${PROFILE_TOKENS:-32768}
-CTX_ALLOC=${CTX_ALLOC:-32769}
+CTX_ALLOC=${CTX_ALLOC:-262273}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
 PROFILE_GPU=${PROFILE_GPU:-0}
@@ -65,9 +65,10 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
 done
 (( STAGE_SPLIT == 22 )) || die "this fixed production profile requires STAGE_SPLIT=22"
 (( PROFILE_TOKENS == 32768 )) || die "PROFILE_TOKENS must be exactly 32768"
-(( CTX_ALLOC > PROFILE_TOKENS && PREFILL_CHUNK == 2048 &&
+(( CTX_ALLOC == 262273 && PREFILL_CHUNK == 2048 &&
    PIPELINE_MB == 512 )) ||
-    die "require ctx_alloc>32768, prefill_chunk=2048, and pipeline_mb=512"
+    die "require ctx_alloc=262273, prefill_chunk=2048, and pipeline_mb=512"
+printf -v frontier_tag '%06d' "$PROFILE_TOKENS"
 for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -126,7 +127,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{nsys,ncu,validation,telemetry,provenance}
+mkdir -p "$OUTPUT_DIR"/{nsys/frontier-logits,ncu,validation,telemetry,provenance}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -172,6 +173,9 @@ production_env=(
     "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB"
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
+    DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
+    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
+    DS4_CUDA_INDEXER_SCORE_AUDIT=1
 )
 
 phase=build
@@ -266,6 +270,8 @@ phase=manifest
         "$Q3A4_LAYERS"
     printf 't256_policy=automatic-balanced\nprofile_gpu=%s\nrun_ncu=%s\n' \
         "$PROFILE_GPU" "$RUN_NCU"
+    printf 'dense_f16_admission=344/344\nattention_rows_policy=automatic-qualified\n'
+    printf 'indexer_cache=native-f16\nindexer_scorer=streaming64\nxdev_sync=disabled\n'
     printf '\n[gpu inventory]\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
         --format=csv
@@ -318,7 +324,9 @@ run_rc=0
             --ctx-start "$PROFILE_TOKENS" --ctx-max "$PROFILE_TOKENS" \
             --ctx-alloc "$CTX_ALLOC" --step-incr "$PROFILE_TOKENS" \
             --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
-            --csv "$base-benchmark.csv" >"$base.log" 2>&1 || run_rc=$?
+            --csv "$base-benchmark.csv" \
+            --dump-frontier-logits-dir "$OUTPUT_DIR/nsys/frontier-logits" \
+            >"$base.log" 2>&1 || run_rc=$?
 cleanup_sampler
 (( run_rc == 0 )) || {
     tail -n 220 "$base.log" >&2 || true
@@ -326,6 +334,9 @@ cleanup_sampler
 }
 [[ -s $base.nsys-rep && -s $base-benchmark.csv ]] ||
     die "Nsight Systems omitted its report or benchmark"
+[[ -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.f32 &&
+   -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.json ]] ||
+    die "production trace omitted the ${PROFILE_TOKENS}-token frontier logits"
 for marker in "CUDA EP forced pipeline split 22/21" \
               't256-placement=balanced' 'materialized 344/344 candidates' \
               'T256-output_b=43/43' 'partner=21 partner-arithmetic=f16' \
@@ -339,6 +350,32 @@ for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
 done
 [[ $(grep -Fc 'qualified=yes' "$base.log") == 2 ]] ||
     die "trace did not qualify both SM75 NVLink pairs"
+[[ $(grep -Fc 'CUDA prefill attention query-row split enabled:' "$base.log") == 2 ]] ||
+    die "trace did not select both production row-split stages"
+grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
+    die "trace omitted mixed row-split attention"
+grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
+    die "trace omitted indexed row-split attention"
+! grep -Fq 'required but unavailable' "$base.log" ||
+    die "trace encountered an unavailable eligible row split"
+grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' \
+    "$base.log" || die "trace did not enable the native indexer path"
+for dispatch in direct-one streaming64-native wmma128-f16-native wmma128 \
+                wmma64 wmma32 wmma16 generic; do
+    audit_line=$(grep -F "ds4: CUDA indexer score audit dispatch=$dispatch " \
+        "$base.log" || true)
+    [[ $(printf '%s\n' "$audit_line" | grep -c .) == 1 ]] ||
+        die "trace lacks one unambiguous $dispatch indexer audit record"
+    audit_launches=${audit_line##*launches=}
+    [[ $audit_launches =~ ^[0-9]+$ ]] ||
+        die "trace has an invalid $dispatch indexer audit count"
+    if [[ $dispatch == streaming64-native ]]; then
+        (( audit_launches > 0 )) || die "trace did not dispatch streaming64-native"
+    else
+        (( audit_launches == 0 )) ||
+            die "trace unexpectedly dispatched $dispatch $audit_launches times"
+    fi
+done
 python3 speed-bench/validate-sm75-q32-production-log.py \
     "$base.log" "$Q3A4_LAYERS"
 awk -F, -v want="$PROFILE_TOKENS" '
@@ -425,13 +462,16 @@ if [[ $RUN_NCU == 1 ]]; then
 fi
 
 phase=complete
-required=(profile-summary.md kernel-family-summary.csv
+required=(profile-summary.md kernel-family-summary.csv kernel-family-total.csv
+          operation-family-summary.csv
           operation-attribution.csv stage-microbatch-device.csv
           stage-device-summary.csv layer-device-summary.csv
           partner-projection-summary.csv handoff-device-summary.csv
           trace-summary.csv nsys/combined.nsys-rep nsys/combined.sqlite
           nsys/combined-benchmark.csv nsys/routed-tile-audit.csv
-          nsys/bindings.csv nsys/allocations.csv nsys/memory.csv)
+          nsys/bindings.csv nsys/allocations.csv nsys/memory.csv
+          nsys/frontier-logits/frontier_${frontier_tag}.logits.f32
+          nsys/frontier-logits/frontier_${frontier_tag}.logits.json)
 if [[ $RUN_NCU == 1 ]]; then
     required+=(ncu/q4-32-gate-up.ncu-rep ncu/q4-32-down.ncu-rep
                ncu/q3a4-gate-up.ncu-rep ncu/attention-indexed-32k.ncu-rep

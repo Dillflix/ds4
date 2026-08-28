@@ -7,7 +7,7 @@ Run the fail-closed production gate for the SM75-native persistent-F16
 indexer cache and streaming WMMA64 scorer.
 
 Required environment:
-  MODEL=/absolute/path/to/tagged-SM75-mixed-Q4-IQ2.gguf
+  MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
 
 Optional environment:
   PROMPT=...                 default: speed-bench/promessi_sposi.txt
@@ -15,7 +15,7 @@ Optional environment:
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
   STAGE_SPLIT=22
-  CTX_START=2048
+  CTX_START=32768
   CTX_MAX=32768
   CTX_ALLOC=262273
   REPEATS=3
@@ -28,9 +28,12 @@ Optional environment:
 
 The legacy arm stores indexer K in F32 and dispatches shipping WMMA128. The
 native arm commits QAT-completed rows once to an F16 cache and dispatches the
-SM75 streaming64 kernel. Advancement requires exact bounded score/top-k and
-one-token results, identical 100-case production scores, byte-identical
-frontier logits, and a passing long-prompt early-decode smoke.
+SM75 streaming64 kernel. Both arms otherwise use the complete production
+configuration: Q4-32/Q3A4 routed experts, all 344 dense-F16 candidates,
+balanced T256 partner execution, and default-qualified query-row attention
+splitting. Advancement requires exact bounded score/top-k and one-token
+results, identical 100-case production scores, byte-identical 32K frontier
+logits, and a passing long-prompt early-decode smoke.
 EOF
 }
 
@@ -42,13 +45,13 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 MODEL=${MODEL:-}
 [[ $MODEL == /* && -f $MODEL ]] ||
-    die "MODEL must name the existing absolute tagged mixed-Q4/IQ2 model"
+    die "MODEL must name the existing absolute tagged Q4-32/Q3A4 model"
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 QUALITY_MANIFEST=${QUALITY_MANIFEST:-$repo_dir/gguf-tools/quality-testing/data/flash/manifest.tsv}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
-CTX_START=${CTX_START:-2048}
+CTX_START=${CTX_START:-32768}
 CTX_MAX=${CTX_MAX:-32768}
 CTX_ALLOC=${CTX_ALLOC:-262273}
 REPEATS=${REPEATS:-3}
@@ -57,6 +60,7 @@ RUN_WORD_SMOKE=${RUN_WORD_SMOKE:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 REUSE_LEGACY_QUALITY_DIR=${REUSE_LEGACY_QUALITY_DIR:-}
+Q3A4_LAYERS=6,8,10,12,14,16,18,20,30,32,34,36,38,40,42
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${INDEXER_NATIVE_AB_DIR:-$repo_dir/sm75-indexer-native-cache-production-$stamp}
 
@@ -78,8 +82,8 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( STAGE_SPLIT > 0 && STAGE_SPLIT < 43 &&
-   CTX_START == 2048 && CTX_MAX == 32768 && CTX_ALLOC == 262273 &&
-   REPEATS >= 2 )) || die "production gate requires 2K..32K, 256K allocation, and at least two repeats"
+   CTX_START == 32768 && CTX_MAX == 32768 && CTX_ALLOC == 262273 &&
+   REPEATS >= 2 )) || die "production gate requires one 32K frontier, 256K allocation, and at least two repeats"
 for flag in RUN_QUALITY RUN_WORD_SMOKE SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -171,6 +175,9 @@ phase=manifest
     printf 'reuse_legacy_quality_dir=%s\n' "${REUSE_LEGACY_QUALITY_DIR:-none}"
     printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
+    printf 'q3a4_layers=%s\ndense_f16_admission=344/344\nt256_policy=balanced-43/43\n' \
+        "$Q3A4_LAYERS"
+    printf 'attention_rows_policy=automatic-qualified\nindexer_cache=native-f16-ab\nindexer_scorer=streaming64-ab\nxdev_sync=disabled\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'
@@ -208,8 +215,9 @@ common_env=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
-    DS4_CUDA_TP_PREFILL_ATTN_ROWS=1
+    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
     DS4_CUDA_INDEXER_SCORE_AUDIT=1
+    DS4_BENCH_ROUTED_QUANT_AUDIT=1
 )
 
 variant_env() {
@@ -238,8 +246,11 @@ validate_variant_log() {
     fi
     grep -Fq "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
         "$log" || die "$variant did not use the fixed production split"
-    grep -Fqx 'ds4: SM75 native routed-Q4 layout enabled (packed A/W, planner=cost, gate=tile8, down=full-stage)' \
-        "$log" || die "$variant did not use the accepted native-Q4 path"
+    grep -Fq 'ds4: SM75 routed Q32 layout enabled ' "$log" ||
+        die "$variant did not enable the tagged Q4-32/Q3A4 path"
+    python3 speed-bench/validate-sm75-q32-production-log.py \
+        "$log" "$Q3A4_LAYERS" >/dev/null ||
+        die "$variant did not use the exact Q4-32/Q3A4 routed recipe"
     if [[ $variant == native-f16 ]]; then
         expected=streaming64-native
         unexpected=(wmma128 wmma128-f16-native)
@@ -264,6 +275,22 @@ validate_variant_log() {
     fi
     grep -Fq 't256-placement=balanced' "$log" ||
         die "$variant missed balanced T256 placement"
+    grep -Fq 'materialized 344/344 candidates' "$log" ||
+        die "$variant did not materialize every dense-F16 candidate"
+    grep -Fq 'T256-output_b=43/43' "$log" ||
+        die "$variant did not materialize every T256 output projection"
+    if [[ $require_dispatch == 1 ]]; then
+        [[ $(grep -Fc 'qualified=yes' "$log") == 2 ]] ||
+            die "$variant did not qualify both SM75 NVLink pairs"
+        [[ $(grep -Fc 'CUDA prefill attention query-row split enabled:' "$log") == 2 ]] ||
+            die "$variant did not select both production row-split stages"
+        grep -Fq 'dispatch=split kind=mixed' "$log" ||
+            die "$variant omitted mixed row-split attention"
+        grep -Fq 'dispatch=split kind=indexed' "$log" ||
+            die "$variant omitted indexed row-split attention"
+        ! grep -Fq 'required but unavailable' "$log" ||
+            die "$variant encountered an unavailable eligible row split"
+    fi
 }
 
 if [[ $RUN_QUALITY == 1 ]]; then
@@ -334,7 +361,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         "$OUTPUT_DIR/production/runs.csv")
     mapfile -t legacy_files < <(find "$legacy_logits" -maxdepth 1 -type f -printf '%f\n' | sort)
     mapfile -t native_files < <(find "$native_logits" -maxdepth 1 -type f -printf '%f\n' | sort)
-    [[ ${#legacy_files[@]} == 10 && "${legacy_files[*]}" == "${native_files[*]}" ]] ||
+    [[ ${#legacy_files[@]} == 2 && "${legacy_files[*]}" == "${native_files[*]}" ]] ||
         die "repeat $repeat frontier-logit inventory is incomplete or different"
     for file in "${legacy_files[@]}"; do
         cmp -s "$legacy_logits/$file" "$native_logits/$file" ||
@@ -347,7 +374,7 @@ import csv, pathlib, statistics, sys
 root = pathlib.Path(sys.argv[1])
 runs = list(csv.DictReader((root / "production/runs.csv").open()))
 values, paired = {}, {}
-expected = [2048, 4096, 8192, 16384, 32768]
+expected = [32768]
 for run in runs:
     rows = list(csv.DictReader(pathlib.Path(run["csv"]).open()))
     contexts = [int(row["ctx_tokens"]) for row in rows]
