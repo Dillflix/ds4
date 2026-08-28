@@ -626,6 +626,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         die("failed to open model");
     }
+    if (getenv("DS4_BENCH_ROUTED_QUANT_AUDIT") != NULL) {
+        ds4_engine_log_routed_quant_audit(engine);
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");

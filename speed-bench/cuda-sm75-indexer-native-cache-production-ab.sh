@@ -238,6 +238,7 @@ audit_launches() {
 
 validate_variant_log() {
     local variant=$1 log=$2 score_official=${3:-0} require_dispatch=${4:-1}
+    local require_recipe=${5:-1}
     local expected count dispatch
     local -a unexpected
     if [[ $score_official == 1 ]]; then
@@ -248,9 +249,11 @@ validate_variant_log() {
         "$log" || die "$variant did not use the fixed production split"
     grep -Fq 'ds4: SM75 routed Q32 layout enabled ' "$log" ||
         die "$variant did not enable the tagged Q4-32/Q3A4 path"
-    python3 speed-bench/validate-sm75-q32-production-log.py \
-        "$log" "$Q3A4_LAYERS" >/dev/null ||
-        die "$variant did not use the exact Q4-32/Q3A4 routed recipe"
+    if [[ $require_recipe == 1 ]]; then
+        python3 speed-bench/validate-sm75-q32-production-log.py \
+            "$log" "$Q3A4_LAYERS" >/dev/null ||
+            die "$variant did not use the exact Q4-32/Q3A4 routed recipe"
+    fi
     if [[ $variant == native-f16 ]]; then
         expected=streaming64-native
         unexpected=(wmma128 wmma128-f16-native)
@@ -299,10 +302,12 @@ if [[ $RUN_QUALITY == 1 ]]; then
         mapfile -d '' -t mode_env < <(variant_env "$variant")
         out="$OUTPUT_DIR/quality/$variant.tsv"
         log="$OUTPUT_DIR/quality/$variant.log"
+        require_recipe=1
         if [[ $variant == legacy-f32 && -n $REUSE_LEGACY_QUALITY_DIR ]]; then
             printf 'Reusing completed legacy-f32 100-case quality result...\n'
             cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.tsv" "$out"
             cp -- "$REUSE_LEGACY_QUALITY_DIR/legacy-f32.log" "$log"
+            require_recipe=0
         else
             printf 'Scoring 100 production cases: %s...\n' "$variant"
             "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
@@ -317,8 +322,11 @@ if [[ $RUN_QUALITY == 1 ]]; then
         fi
         awk -F'\t' 'NR > 1 {n++} END {exit n == 100 ? 0 : 1}' "$out" ||
             die "$variant quality output does not contain exactly 100 cases"
-        validate_variant_log "$variant" "$log" 1 0
+        validate_variant_log "$variant" "$log" 1 0 "$require_recipe"
     done
+    python3 speed-bench/validate-sm75-q32-production-log.py \
+        "$OUTPUT_DIR/quality/native-f16.log" "$Q3A4_LAYERS" >/dev/null ||
+        die "native quality arm did not prove the exact Q4-32/Q3A4 recipe"
     cmp -s "$OUTPUT_DIR/quality/legacy-f32.tsv" \
            "$OUTPUT_DIR/quality/native-f16.tsv" ||
         die "native-F16 production quality scores differ from legacy F32"

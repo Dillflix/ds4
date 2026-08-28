@@ -2033,6 +2033,13 @@ Return `sm75-indexer-native-cache-production-<timestamp>.tar.gz`. A mismatch
 in any quality score, score bit, top-k ordering, frontier logit, or retrieval
 answer fails the run before promotion evidence is accepted.
 
+If a prior run completed the legacy 100-case arm before a later validation
+failure, extract its archive and pass the extracted `quality/` directory as
+`REUSE_LEGACY_QUALITY_DIR`. The reused log must still prove its production
+runtime, full dense cache, T256 placement, and Q32 dispatch. The newly run
+native arm supplies the exact per-layer routed-recipe audit before the two TSVs
+are compared.
+
 If a completed score pass stops during one of the top-k Nsight captures, keep
 the original directory and resume only the three top-k captures. Resume mode
 requires the validated timing CSVs and all four score-kernel Nsight CSVs; it
