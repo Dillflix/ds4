@@ -1894,6 +1894,40 @@ bash ./speed-bench/cuda-sm75-indexer-native-controls.sh
 
 Return `sm75-indexer-native-controls-<timestamp>.tar.gz`.
 
+After the cache/scorer controls are separated, use
+`cuda-sm75-xdev-feature-isolation.sh` to reintroduce the two high-volume
+cross-device mechanisms independently. It fixes the native F16 cache and
+streaming64 scorer, then runs `neither`, `partner-only`, `rows-only`, and
+`both` in a fixed safety order. Every arm records per-GPU telemetry and a
+durable active-arm journal before launch; successful arms must expose their
+requested runtime paths. Row splitting must remain byte-exact within each
+partner-arithmetic state (`neither` versus `rows-only`, and `partner-only`
+versus `both`). The partner toggle is recorded but is not exactness-gated,
+because native-Q8 fallback and FP16-expanded cuBLAS are intentionally different
+arithmetic paths.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=16384 \
+CTX_ALLOC=262273 \
+REPEATS=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-xdev-feature-isolation.sh
+```
+
+Return `sm75-xdev-feature-isolation-<timestamp>.tar.gz`. If the host resets
+before the archive is created, preserve the matching unarchived directory;
+`active-arm.txt`, `run-journal.tsv`, and `telemetry/` identify the failing arm.
+
 `cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token
 F16-cache reader with the legacy F32 reader, runs the fixed 100-case production
