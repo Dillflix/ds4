@@ -15487,7 +15487,9 @@ static uint32_t metal_graph_cuda_tp_prefill_rows_for_share(
         uint32_t n_tokens,
         uint32_t home_permille) {
     if (n_tokens < 256u) return n_tokens / 2u;
-    if (home_permille < 250u || home_permille > 750u) home_permille = 500u;
+    if (home_permille == 0u) home_permille = 500u;
+    if (home_permille < 250u) home_permille = 250u;
+    if (home_permille > 750u) home_permille = 750u;
     uint64_t wanted = ((uint64_t)n_tokens * home_permille + 500u) / 1000u;
     uint32_t rows = (uint32_t)((wanted + 32u) & ~UINT64_C(63));
     uint32_t min_rows = 128u;
