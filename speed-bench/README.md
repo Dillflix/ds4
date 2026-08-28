@@ -2283,3 +2283,46 @@ The Q4-32-down stage8 and compact-tile16 experiments are abandoned. Although
 their isolated harnesses improved, they regressed the full production path by
 roughly 2% and 5.6-5.9%, respectively. Neither implementation, dispatch flag,
 nor experimental runner is retained.
+
+# SM75 production decode baseline
+
+`cuda-sm75-decode-baseline.sh` establishes the canonical decode baseline for
+the fixed SM75 production configuration. The full matrix is pp512/tg256,
+pp512/tg512, pp2048/tg256, pp2048/tg512, pp4096/tg256, pp4096/tg512,
+pp32768/tg256, and pp32768/tg512. Every case runs in a separate process with
+`ctx_alloc=pp+tg+1`; short-prompt results therefore do not sacrifice dense-F16
+cache coverage merely to reserve the 32K case's context buffers.
+
+An untimed 512-token prefill materializes all 344 dense-F16 candidates before
+each measured case. The runner rejects incomplete admission, a stage split
+other than 22/21, device order other than 0,3,1,2, a missing direct peer route,
+a prompt other than the fixed `promessi_sposi.txt` corpus, a non-SM75 routed
+layout, or any required-path fallback.
+Inherited `DS4_*` variables are removed, so experimental decode paths cannot
+silently contaminate the production baseline. No model hash, Nsight capture,
+GPU sampler, or logits dump is performed.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CASES=all \
+REPEATS=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-baseline.sh
+```
+
+Later passes can select a stable subset without redefining the matrix, for
+example `CASES=pp512-tg256,pp2048-tg512,pp32768-tg512`. To resume an interrupted
+run, keep its original settings and set `RESUME=1` plus
+`DECODE_BASELINE_DIR="$PWD/sm75-decode-baseline-<timestamp>"`. Valid completed
+cases are reused; incomplete or invalid cases are rerun. Return the generated
+`sm75-decode-baseline-<timestamp>.tar.gz`. The primary results are
+`summary/summary.csv`, `summary/summary.md`, and `summary/samples.csv`.

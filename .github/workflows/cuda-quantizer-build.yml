@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -36,6 +36,7 @@ on:
       - "speed-bench/cuda-sm75-indexer-production-trace.sh"
       - "speed-bench/cuda-sm75-indexer-f16-operands.sh"
       - "speed-bench/cuda-sm75-q32-production-profile.sh"
+      - "speed-bench/cuda-sm75-decode-baseline.sh"
       - "speed-bench/cuda-sm75-iq2-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
@@ -61,6 +62,7 @@ on:
       - "speed-bench/summarize-sm75-indexer-production-trace.py"
       - "speed-bench/summarize-sm75-indexer-f16-operands.py"
       - "speed-bench/summarize-sm75-q32-production-profile.py"
+      - "speed-bench/summarize-sm75-decode-baseline.py"
       - "speed-bench/validate-sm75-q32-production-log.py"
       - "speed-bench/summarize-q8-partner-quality-isolation.py"
       - "speed-bench/summarize-q8-fp16-full-quality.py"
@@ -100,6 +102,7 @@ on:
       - "tests/test_summarize_q8_t32_fused_ab.py"
       - "tests/test_summarize_cuda_critical_path.py"
       - "tests/test_summarize_q4_real_histogram.py"
+      - "tests/test_summarize_sm75_decode_baseline.py"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
       - "produce-verify-q4-iq2-full-f16-256k.sh"
@@ -151,6 +154,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-indexer-f16-operands.sh
           test -x speed-bench/cuda-sm75-q32-production-profile.sh
           bash -n speed-bench/cuda-sm75-q32-production-profile.sh
+          test -x speed-bench/cuda-sm75-decode-baseline.sh
+          bash -n speed-bench/cuda-sm75-decode-baseline.sh
           test -x speed-bench/cuda-sm75-iq2-next-ab.sh
           bash -n speed-bench/cuda-sm75-iq2-next-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
@@ -174,6 +179,7 @@ jobs:
           python3 -m py_compile speed-bench/summarize-sm75-indexer-production-trace.py
           python3 -m py_compile speed-bench/summarize-sm75-indexer-f16-operands.py
           python3 -m py_compile speed-bench/summarize-sm75-q32-production-profile.py
+          python3 -m py_compile speed-bench/summarize-sm75-decode-baseline.py
           python3 -m py_compile speed-bench/validate-sm75-q32-production-log.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_production.py
@@ -185,6 +191,7 @@ jobs:
           python3 -m py_compile tests/test_summarize_sm75_native_q4_t256_profile.py
           python3 -m py_compile tests/test_summarize_sm75_indexer_production_trace.py
           python3 -m py_compile tests/test_summarize_sm75_indexer_f16_operands.py
+          python3 -m py_compile tests/test_summarize_sm75_decode_baseline.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_q8_partner_quality_isolation.py
@@ -195,6 +202,7 @@ jobs:
           python3 tests/test_summarize_sm75_native_q4_t256_profile.py
           python3 tests/test_summarize_sm75_indexer_production_trace.py
           python3 tests/test_summarize_sm75_indexer_f16_operands.py
+          python3 tests/test_summarize_sm75_decode_baseline.py
       - name: Verify production tagged-Q4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'
