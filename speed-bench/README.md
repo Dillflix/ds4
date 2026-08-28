@@ -2266,3 +2266,47 @@ and a role-aware recipe frontier that can choose gate/up and down formats
 independently. IQ2 down and Q2_K remain intentionally outside this pass.
 The tool does not hash or quantize a full model and does not enable a
 production format.
+
+# SM75 indexed-attention and Q4-32-down candidates
+
+`cuda-sm75-indexed-q4down-next.sh` measures two opt-in candidates against the
+fixed production configuration:
+
+- `DS4_CUDA_INDEXED_HEADS8_SM75=1` changes indexed attention from sixteen
+  heads in a 512-thread CTA to eight heads in a 256-thread CTA. Per-head row
+  order and online-softmax arithmetic are unchanged. The smaller CTA trades
+  duplicated L2-resident KV staging for more resident warps.
+- `DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=1` retains tile16 scheduling but stages
+  its activations as two exact eight-pair phases, reducing shared memory from
+  approximately 37.6 KiB to 18.8 KiB.
+
+Neither candidate is a production default. The runner first requires exact
+nonzero indexed-attention output and exact Q4-32 16/8/4 production output,
+then records bounded harness timings. Its optional full-model pass compares
+control, each candidate independently, and both together while holding fixed
+22/21 placement, complete 344/344 dense-F16 admission, and 50/50 indexer and
+attention row splitting. Frontier logits must be byte-identical.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=8192 \
+CTX_MAX=32768 \
+CTX_ALLOC=32769 \
+STEP_MUL=4 \
+REPEATS=2 \
+HARNESS_REPEATS=7 \
+SKIP_BUILD=0 \
+RUN_PRODUCTION=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-indexed-q4down-next.sh
+```
+
+Set `RUN_PRODUCTION=0` for the quick exact-output and bounded-harness gate.
+Return `sm75-indexed-q4down-next-<timestamp>.tar.gz`.

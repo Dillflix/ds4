@@ -19244,26 +19244,32 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
-            dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
-                                                                               sinks,
-                                                                               (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               0,
-                                                                               n_head,
-                                                                               n_head,
-                                                                               head_dim);
+            const int sm75_heads8 = cuda_sm75_mma_ok() &&
+                cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 0);
+            if (sm75_heads8) {
+                static std::atomic<bool> logged = false;
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    fprintf(stderr,
+                            "ds4: SM75 indexed attention candidate selected: "
+                            "8 heads / 256 threads\n");
+            }
+            dim3 grid(n_tokens,
+                      sm75_heads8 ? (n_head + 7u) / 8u :
+                                    (n_head + 15u) / 16u,
+                      1);
+#define DS4_INDEXED_ONLINE_ARGS \
+                (float *)heads->ptr, sinks, (const float *)q->ptr, \
+                (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
+                topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
+                top_k, window, ratio, 0, n_head, n_head, head_dim
+            if (sm75_heads8) {
+                attention_indexed_mixed_heads8_online_kernel<8, 8>
+                    <<<grid, 256>>>(DS4_INDEXED_ONLINE_ARGS);
+            } else {
+                attention_indexed_mixed_heads8_online_kernel<8, 16>
+                    <<<grid, 512>>>(DS4_INDEXED_ONLINE_ARGS);
+            }
+#undef DS4_INDEXED_ONLINE_ARGS
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -19346,12 +19352,32 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
                      "indexed attention shard topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    dim3 grid(n_tokens, (n_head_work + 15u) / 16u, 1u);
-    attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
-            (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
-            topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-            top_k, window, ratio, head0, n_head_work, n_head_total, head_dim);
+    const int sm75_heads8 = cuda_sm75_mma_ok() &&
+        cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 0);
+    if (sm75_heads8) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr,
+                    "ds4: SM75 indexed attention shard candidate selected: "
+                    "8 heads / 256 threads\n");
+    }
+    dim3 grid(n_tokens,
+              sm75_heads8 ? (n_head_work + 7u) / 8u :
+                            (n_head_work + 15u) / 16u,
+              1u);
+#define DS4_INDEXED_SHARD_ARGS \
+        (float *)heads->ptr, sinks, (const float *)q->ptr, \
+        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
+        topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
+        top_k, window, ratio, head0, n_head_work, n_head_total, head_dim
+    if (sm75_heads8) {
+        attention_indexed_mixed_heads8_online_kernel<8, 8><<<grid, 256>>>(
+            DS4_INDEXED_SHARD_ARGS);
+    } else {
+        attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>(
+            DS4_INDEXED_SHARD_ARGS);
+    }
+#undef DS4_INDEXED_SHARD_ARGS
     return cuda_ok(cudaGetLastError(), "attention indexed head shard launch");
 }
 
@@ -26489,6 +26515,8 @@ static int routed_moe_launch(
     const int native_down_q4 = tagged_native_q4 && down_q4k;
     const int any_native_q4 = native_gate_q4 || native_down_q4;
     const int any_q32 = gate_q32 || down_q4_32;
+    const uint32_t use_q32_down_stage8 = down_q4_32 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", 0);
     const int any_native_layout = any_native_q4 || any_q32;
     const uint32_t use_native_q4_cost_tiles = any_native_layout &&
         !cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES", 0);
@@ -26562,7 +26590,14 @@ static int routed_moe_launch(
                 "ds4: SM75 routed Q32 layout enabled "
                 "(gate/up=%s, down=%s, packed A/W, exact 16/8/4 tails)\n",
                 gate_q3a4 ? "q3a4" : (gate_q4_32 ? "q4-32" : "other"),
-                down_q4_32 ? "q4-32" : "other");
+                 down_q4_32 ? "q4-32" : "other");
+    }
+    if (use_q32_down_stage8) {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr,
+                    "ds4: SM75 Q4-32 down candidate selected: "
+                    "tile16 stage8\n");
     }
     if (any_native_q4 && !g_cuda_native_q4_logged.exchange(
             true, std::memory_order_relaxed)) {
@@ -28059,10 +28094,31 @@ static int routed_moe_launch(
                             sorted_pairs, sorted_offsets, sorted_counts, \
                             (TOTAL), (EXPERTS), (STARTS), midq_blocks, out_dim); \
                     } while (0)
+#define DS4_Q32_DOWN_TILE16(RS) \
+                    do { \
+                        dim3 ng((out_dim + (RS) - 1u) / (RS), \
+                                tile16_capacity, 1u); \
+                        if (use_q32_down_stage8) { \
+                            moe_down_sm75_q4_32_tile16_stage8_kernel<RS> \
+                                <<<ng, 256>>>( \
+                                    (float *)down->ptr, down_w, \
+                                    (const cuda_sm75_native_q8_K *)midq, \
+                                    sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    midq_blocks, out_dim); \
+                        } else { \
+                            moe_down_sm75_q4_32_tile_kernel<RS, 16> \
+                                <<<ng, 256>>>( \
+                                    (float *)down->ptr, down_w, \
+                                    (const cuda_sm75_native_q8_K *)midq, \
+                                    sorted_pairs, sorted_offsets, sorted_counts, \
+                                    tile16_total, tile16_experts, tile16_starts, \
+                                    midq_blocks, out_dim); \
+                        } \
+                    } while (0)
 #define DS4_Q32_DOWN_ALL(RS) \
                     do { \
-                        DS4_Q32_DOWN_LIST(RS, 16, tile16_total, \
-                            tile16_experts, tile16_starts, tile16_capacity); \
+                        DS4_Q32_DOWN_TILE16(RS); \
                         DS4_Q32_DOWN_LIST(RS, 8, tail8_total, \
                             tail8_experts, tail8_starts, tail8_capacity); \
                         DS4_Q32_DOWN_LIST(RS, 4, tail4_total, \
@@ -28078,6 +28134,7 @@ static int routed_moe_launch(
                         DS4_Q32_DOWN_ALL(512);
                     }
 #undef DS4_Q32_DOWN_ALL
+#undef DS4_Q32_DOWN_TILE16
 #undef DS4_Q32_DOWN_LIST
                 } else if (down_q4k) {
                     if (native_down_q4) {

@@ -1022,6 +1022,7 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
     }
     ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
                                   DS4_TENSOR_LAYOUT_SM75_Q3A4);
+    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", "0", 1);
     if (!ds4_gpu_set_model_map(model, model_bytes)) goto cleanup;
     bool mid_is_f16 = false;
 #define RUN_Q32(NTOK, MID_DST, OUT_DST) \
@@ -1055,13 +1056,20 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
                            mid_ref, mid_got, mid_count) ||
         !compare_exact_f32("SM75 Q32 production prefill output",
                            out_ref, out_got, out_count)) goto cleanup;
+    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", "1", 1);
+    if (!RUN_Q32(n_tokens, mid_got, out_got) ||
+        !compare_exact_f32("SM75 Q32 stage8 prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("SM75 Q32 stage8 prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
     fprintf(stderr,
             "cuda-regression: SM75 %s gate/up + Q4-32 down production "
-            "16/8/4 prefill/direct-decode exact\n", label);
+            "16/8/4 prefill/direct-decode and tile16-stage8 exact\n", label);
     rc = 0;
 #undef RUN_Q32
 
 cleanup:
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75");
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
@@ -1604,6 +1612,99 @@ cleanup:
     return rc;
 }
 
+static int check_sm75_indexed_attention_heads8_exact(void) {
+    const uint32_t n_tokens = 128u, pos0 = 31744u;
+    const uint32_t n_raw = 2304u, raw_cap = 2304u, raw_start = 0u;
+    const uint32_t n_comp = 7936u, top_k = 512u;
+    const uint32_t window = 2048u, ratio = 4u;
+    const uint32_t n_head = 16u, head_dim = 512u;
+    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t topk_count = (uint64_t)n_tokens * top_k;
+    float *sinks = (float *)calloc(n_head, sizeof(float));
+    int32_t *topk_host = (int32_t *)malloc(
+        (size_t)topk_count * sizeof(int32_t));
+    float *reference = (float *)malloc((size_t)q_count * sizeof(float));
+    float *candidate = (float *)malloc((size_t)q_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(
+        topk_count * sizeof(int32_t));
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    int rc = 1;
+    if (!sinks || !topk_host || !reference || !candidate ||
+        !q || !raw || !comp || !topk || !heads) goto cleanup;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t k = 0; k < top_k; k++) {
+            topk_host[(uint64_t)t * top_k + k] =
+                (int32_t)((t * 131u + k * 17u) % n_comp);
+        }
+    }
+    if (!ds4_gpu_tensor_fill_f32(q, 0.03125f, q_count) ||
+        !ds4_gpu_tensor_fill_f32(raw, 0.015625f, raw_count) ||
+        !ds4_gpu_tensor_fill_f32(comp, -0.0078125f, comp_count) ||
+        !ds4_gpu_tensor_write(topk, 0, topk_host,
+                              topk_count * sizeof(int32_t)) ||
+        !ds4_gpu_set_model_map(sinks, n_head * sizeof(float))) goto cleanup;
+#define RUN_INDEXED_HEADS8(DST) \
+    (ds4_gpu_attention_indexed_mixed_batch_heads_tensor( \
+        heads, sinks, n_head * sizeof(float), 0u, q, raw, comp, 0u, topk, \
+        n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, \
+        ratio, n_head, head_dim) && ds4_gpu_synchronize() && \
+     ds4_gpu_tensor_read(heads, 0, (DST), q_count * sizeof(float)))
+    (void)setenv("DS4_CUDA_INDEXED_HEADS8_SM75", "0", 1);
+    if (!RUN_INDEXED_HEADS8(reference)) goto cleanup;
+    (void)setenv("DS4_CUDA_INDEXED_HEADS8_SM75", "1", 1);
+    if (!RUN_INDEXED_HEADS8(candidate) ||
+        !compare_exact_f32("SM75 indexed attention heads8",
+                           reference, candidate, q_count)) goto cleanup;
+    if (!ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+            heads, sinks, n_head * sizeof(float), 0u, q, raw, comp, 0u,
+            topk, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, 0u, n_head / 2u, n_head, head_dim) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+            heads, sinks, n_head * sizeof(float), 0u, q, raw, comp, 0u,
+            topk, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head / 2u, n_head / 2u, n_head, head_dim) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads, 0, candidate,
+                             q_count * sizeof(float)) ||
+        !compare_exact_f32("SM75 indexed attention heads8 shards",
+                           reference, candidate, q_count)) goto cleanup;
+    {
+        uint64_t nonzero = 0u;
+        for (uint64_t i = 0; i < q_count; i++)
+            nonzero += candidate[i] != 0.0f;
+        if (nonzero == 0u) {
+            fprintf(stderr,
+                    "SM75 indexed attention heads8 produced only zeros\n");
+            goto cleanup;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 indexed attention 16-head/512-thread "
+            "versus 8-head/256-thread whole and sharded exact (%llu values)\n",
+            (unsigned long long)q_count);
+    rc = 0;
+#undef RUN_INDEXED_HEADS8
+
+cleanup:
+    (void)unsetenv("DS4_CUDA_INDEXED_HEADS8_SM75");
+    if (sinks && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    free(candidate);
+    free(reference);
+    free(topk_host);
+    free(sinks);
+    return rc;
+}
+
 int main(void) {
     /* The regression owns the path and both halves of each new A/B.  Do not
      * let a debug shell silently change tile width, row span, MMA eligibility,
@@ -1669,6 +1770,7 @@ int main(void) {
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
+    if (check_sm75_indexed_attention_heads8_exact() != 0) rc = 1;
     ds4_gpu_cleanup();
     free(idle_model_map);
     idle_model_map = NULL;

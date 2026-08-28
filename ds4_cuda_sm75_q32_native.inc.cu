@@ -553,6 +553,104 @@ __global__ static void moe_down_sm75_q4_32_tile_kernel(
     }
 }
 
+/* Preserve the production tile16 work assignment while staging only eight
+ * activations at a time.  The ordinary tile16 kernel keeps all sixteen Q8_K
+ * rows resident (37.6 KiB at K=2048), which limits SM75 to one 256-thread CTA
+ * per SM.  Two exact 8-pair phases cut that allocation in half; each pair
+ * retains the same K-block accumulation order and therefore the same bits.
+ * This remains an opt-in candidate until production A/B data proves that the
+ * extra barrier is cheaper than the occupancy lost by full staging. */
+template <uint32_t ROW_SPAN>
+__global__ static void moe_down_sm75_q4_32_tile16_stage8_kernel(
+        float *down_out, const char *down_base,
+        const cuda_sm75_native_q8_K *midq,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint32_t midq_blocks, uint32_t out_dim) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t start = tile_starts[tile];
+    __shared__ cuda_sm75_native_q8_K sxq[8][8];
+    __shared__ uint32_t s_pair[8], s_np;
+    const uint32_t words = sizeof(cuda_sm75_native_q8_K) / 4u;
+    const uint32_t words_per_pair = midq_blocks * words;
+    const uint32_t pair_lane = lane >> 2u;
+    const uint32_t n0 = (lane & 3u) * 2u;
+    const uint32_t row_stride = (blockDim.x >> 5u) * 8u;
+
+#pragma unroll
+    for (uint32_t phase = 0u; phase < 2u; phase++) {
+        if (threadIdx.x == 0u) {
+            uint32_t np = 0u;
+            for (; np < 8u; np++) {
+                const uint32_t local = start + phase * 8u + np;
+                if (local >= counts[expert]) break;
+                s_pair[np] = sorted_pairs[offsets[expert] + local];
+            }
+            s_np = np;
+        }
+        __syncthreads();
+        const uint32_t np = s_np;
+        for (uint32_t i = threadIdx.x; i < 8u * words_per_pair;
+             i += blockDim.x) {
+            const uint32_t p = i / words_per_pair;
+            const uint32_t w = i - p * words_per_pair;
+            ((uint32_t *)sxq[p])[w] = p < np
+                ? ((const uint32_t *)(midq +
+                    (uint64_t)s_pair[p] * midq_blocks))[w] : 0u;
+        }
+        __syncthreads();
+        for (uint32_t base = 0; base < ROW_SPAN; base += row_stride) {
+            const uint32_t row0 = blockIdx.x * ROW_SPAN +
+                                  base + warp * 8u;
+            if (base + warp * 8u >= ROW_SPAN || row0 >= out_dim) continue;
+            DS4_SM75_Q32_SLOT4_DECL(0); DS4_SM75_Q32_SLOT4_DECL(1);
+            DS4_SM75_Q32_SLOT4_DECL(2); DS4_SM75_Q32_SLOT4_DECL(3);
+            DS4_SM75_Q32_SLOT4_DECL(4); DS4_SM75_Q32_SLOT4_DECL(5);
+            DS4_SM75_Q32_SLOT4_DECL(6); DS4_SM75_Q32_SLOT4_DECL(7);
+            const uint64_t nt = (uint64_t)expert * (out_dim / 8u) +
+                                row0 / 8u;
+#pragma unroll
+            for (uint32_t b = 0; b < 8u; b++) {
+                if (b >= midq_blocks) continue;
+                const cuda_sm75_q4_32_tile *w =
+                    (const cuda_sm75_q4_32_tile *)down_base +
+                    nt * midq_blocks + b;
+                float v0, v1;
+                sm75_q32_ops<false>::mma_block(
+                    w, &sxq[pair_lane][b], lane, n0, &v0, &v1);
+                switch (b) {
+                    DS4_SM75_Q32_SLOT4_ADD(0,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(1,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(2,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(3,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(4,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(5,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(6,v0,v1,0.0f,0.0f);
+                    DS4_SM75_Q32_SLOT4_ADD(7,v0,v1,0.0f,0.0f);
+                }
+            }
+            float o0, o1, unused0, unused1;
+            DS4_SM75_Q32_REDUCE(s0,o0);
+            DS4_SM75_Q32_REDUCE(s1,o1);
+            DS4_SM75_Q32_REDUCE(s2,unused0);
+            DS4_SM75_Q32_REDUCE(s3,unused1);
+            if (pair_lane < np) {
+                const uint32_t r0 = row0 + n0, r1 = r0 + 1u;
+                if (r0 < out_dim)
+                    down_out[(uint64_t)s_pair[pair_lane] * out_dim + r0] = o0;
+                if (r1 < out_dim)
+                    down_out[(uint64_t)s_pair[pair_lane] * out_dim + r1] = o1;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 #undef DS4_SM75_Q32_REDUCE
 #undef DS4_SM75_Q32_SLOT4_ADD
 #undef DS4_SM75_Q32_SLOT4_DECL

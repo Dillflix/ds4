@@ -1803,9 +1803,14 @@ int main(int argc, char **argv) {
             break;
     }
     printf("scalar_target=%s\nscalar_enabled=%u\n"
-           "iq2_tail8_all=%u\ntimed_repeats=%u\n",
+           "iq2_tail8_all=%u\ntimed_repeats=%u\n"
+           "indexed_heads8_sm75=%u\nq4_32_down_stage8_sm75=%u\n",
            scalar_target_name(scalar_target), scalar_enabled,
-           iq2_tail8_all, timed_repeats);
+           iq2_tail8_all, timed_repeats,
+           (unsigned)(getenv("DS4_CUDA_INDEXED_HEADS8_SM75") != NULL &&
+               strcmp(getenv("DS4_CUDA_INDEXED_HEADS8_SM75"), "0") != 0),
+           (unsigned)(getenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75") != NULL &&
+               strcmp(getenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75"), "0") != 0));
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA backend initialization failed\n");
