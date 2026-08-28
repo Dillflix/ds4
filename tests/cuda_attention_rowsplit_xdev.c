@@ -2,8 +2,9 @@
  * not a production dispatch.  It compares the shipping 512-row launch with
  * concurrent 256/256 launches using either peer-read or mirrored partner
  * inputs.  The mixed scenario models the production ratio-128 compressed
- * path and also exercises its Q handoff/result-gather lifecycle.  Query rows
- * are independent, so adjusted pos0/n_raw preserves the shipping kernel's
+ * path with the production native-F16 compressed cache and also exercises its
+ * Q handoff/result-gather and incremental KV-mirror lifecycle.  Query rows are
+ * independent, so adjusted pos0/n_raw preserves the shipping kernel's
  * arithmetic order and permits bit-exact validation. */
 
 #include "ds4_gpu.h"
@@ -46,8 +47,46 @@ static uint32_t get_repeats(void) {
     return end && !*end && n >= 1ul && n <= 50ul ? (uint32_t)n : 0u;
 }
 
+static uint32_t get_cache_repeats(uint32_t fallback) {
+    const char *env = getenv("DS4_ROWSPLIT_CACHE_REPEATS");
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    unsigned long n = strtoul(env, &end, 10);
+    return end && !*end && n >= 1ul && n <= 4096ul ? (uint32_t)n : 0u;
+}
+
 static int sync_tier(int tier) {
     return ds4_gpu_set_current_device(tier) == 0 && ds4_gpu_synchronize();
+}
+
+/* Model one production KV update on the home default stream, then mirror it
+ * without racing the preceding partner consumer or the home producer. */
+static int produce_and_mirror_cache_rows(
+        ds4_gpu_tensor       *partner_rows,
+        ds4_gpu_tensor       *home_rows,
+        const ds4_gpu_tensor *producer_rows) {
+    const int home_tier = ds4_gpu_tensor_device(home_rows);
+    return home_tier >= 0 &&
+           ds4_gpu_set_current_device(home_tier) == 0 &&
+           ds4_gpu_tensor_copy_async(
+               home_rows, producer_rows, home_rows->bytes) &&
+           ds4_gpu_tensor_wait_xdev_default(partner_rows, home_tier) &&
+           ds4_gpu_tensor_copy_xdev_default(
+               partner_rows, home_rows, home_rows->bytes);
+}
+
+static int produce_and_mirror_f16_cache_rows(
+        ds4_gpu_tensor       *partner_rows,
+        ds4_gpu_tensor       *home_rows,
+        const ds4_gpu_tensor *producer_rows,
+        uint64_t              count) {
+    const int home_tier = ds4_gpu_tensor_device(home_rows);
+    return home_tier >= 0 &&
+           ds4_gpu_tensor_copy_f32_to_f16(
+               home_rows, 0, producer_rows, 0, count) &&
+           ds4_gpu_tensor_wait_xdev_default(partner_rows, home_tier) &&
+           ds4_gpu_tensor_copy_xdev_default(
+               partner_rows, home_rows, home_rows->bytes);
 }
 
 static int launch_attention(
@@ -61,12 +100,12 @@ static int launch_attention(
         uint32_t n_head, uint32_t head_dim) {
     if (indexed) {
         return ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-            heads, model, model_bytes, 0u, q, raw, comp, 0u, topk,
+            heads, model, model_bytes, 0u, q, raw, comp, 1u, topk,
             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
             window, ratio, n_head, head_dim);
     }
     return ds4_gpu_attention_decode_mixed_batch_heads_tensor(
-        heads, model, model_bytes, 0u, q, raw, comp, 0u, NULL, 0u,
+        heads, model, model_bytes, 0u, q, raw, comp, 1u, NULL, 0u,
         n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window,
         ratio, n_head, head_dim);
 }
@@ -117,6 +156,15 @@ static int run_case(int indexed) {
     const uint64_t topk_half_count = (uint64_t)half_tokens * top_k;
     const uint64_t model_bytes = (uint64_t)n_head * sizeof(float);
     const uint32_t repeats = get_repeats();
+    const uint32_t cache_repeats = get_cache_repeats(repeats);
+    const uint32_t raw_update_first = pos0 % raw_cap;
+    const uint32_t raw_update_rows = n_tokens;
+    const uint32_t comp_update_rows = n_tokens / ratio;
+    const uint32_t comp_update_first = n_comp - comp_update_rows;
+    const uint64_t raw_update_count =
+        (uint64_t)raw_update_rows * head_dim;
+    const uint64_t comp_update_count =
+        (uint64_t)comp_update_rows * head_dim;
     int ok = 0, initialized = 0;
 
     float *model = NULL, *q_host = NULL, *raw_host = NULL;
@@ -128,12 +176,20 @@ static int run_case(int indexed) {
     ds4_gpu_tensor q1 = {0}, raw1 = {0}, comp1 = {0}, topk1 = {0};
     ds4_gpu_tensor q_home = {0}, q_peer = {0};
     ds4_gpu_tensor topk_home = {0}, topk_peer = {0};
+    ds4_gpu_tensor raw_update_home = {0}, raw_update_partner = {0};
+    ds4_gpu_tensor comp_update_home = {0}, comp_update_partner = {0};
+    ds4_gpu_tensor raw_update_stage = {0}, comp_update_stage = {0};
+    ds4_gpu_tensor comp_source = {0};
 
-    if (!repeats) {
+    if (!repeats || !cache_repeats) {
         fprintf(stderr,
-                "error: DS4_ROWSPLIT_REPEATS must be an integer from 1 to 50\n");
+                "error: DS4_ROWSPLIT_REPEATS must be 1..50 and "
+                "DS4_ROWSPLIT_CACHE_REPEATS must be 1..4096\n");
         return 0;
     }
+    CHECK(raw_update_first + raw_update_rows <= raw_cap &&
+          comp_update_rows <= n_comp,
+          "production cache update range");
     model = (float *)malloc((size_t)model_bytes);
     q_host = (float *)malloc((size_t)q_count * sizeof(float));
     raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
@@ -177,7 +233,8 @@ static int run_case(int indexed) {
 
     CHECK(ds4_gpu_tensor_alloc_on(&q0, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw0, 0, raw_count * sizeof(float)) == 0 &&
-          ds4_gpu_tensor_alloc_on(&comp0, 0, comp_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&comp0, 0,
+                                  comp_count * sizeof(uint16_t)) == 0 &&
           ds4_gpu_tensor_alloc_on(&ref, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&home, 0, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&partner, 1,
@@ -187,7 +244,13 @@ static int run_case(int indexed) {
           ds4_gpu_tensor_alloc_on(&q1, 1, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw1, 1, raw_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&comp1, 1,
-                                  comp_count * sizeof(float)) == 0,
+                                  comp_count * sizeof(uint16_t)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&comp_source, 0,
+                                  comp_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&raw_update_stage, 0,
+                                  raw_update_count * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&comp_update_stage, 0,
+                                  comp_update_count * sizeof(float)) == 0,
           "device allocations");
     if (indexed) {
         CHECK(ds4_gpu_tensor_alloc_on(&topk0, 0,
@@ -201,14 +264,20 @@ static int run_case(int indexed) {
                                q_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw0, 0, raw_host,
                                raw_count * sizeof(float)) &&
-          ds4_gpu_tensor_write(&comp0, 0, comp_host,
+          ds4_gpu_tensor_write(&comp_source, 0, comp_host,
                                comp_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&q1, 0, q_host + half_count,
                                half_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw1, 0, raw_host,
                                raw_count * sizeof(float)) &&
-          ds4_gpu_tensor_write(&comp1, 0, comp_host,
-                               comp_count * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              &raw_update_stage, 0,
+              raw_host + (uint64_t)raw_update_first * head_dim,
+              raw_update_count * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              &comp_update_stage, 0,
+              comp_host + (uint64_t)comp_update_first * head_dim,
+              comp_update_count * sizeof(float)) &&
           (!indexed ||
            (ds4_gpu_tensor_write(&topk0, 0, topk_host,
                                  topk_count * sizeof(int32_t)) &&
@@ -216,6 +285,12 @@ static int run_case(int indexed) {
                                  topk_host + topk_half_count,
                                  topk_half_count * sizeof(int32_t)))),
           "device input writes");
+    CHECK(ds4_gpu_tensor_copy_f32_to_f16(
+              &comp0, 0, &comp_source, 0, comp_count) &&
+          ds4_gpu_tensor_wait_xdev_default(&comp1, 0) &&
+          ds4_gpu_tensor_copy_xdev_default(
+              &comp1, &comp0, comp_count * sizeof(uint16_t)),
+          "initial native-F16 compressed cache mirror");
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_set_model_map(model, model_bytes), "model-map setup");
@@ -236,6 +311,18 @@ static int run_case(int indexed) {
                     topk_half_count * sizeof(int32_t),
                     topk_half_count * sizeof(int32_t));
     }
+    borrow_view(&raw_update_home, &raw0,
+                (uint64_t)raw_update_first * head_dim * sizeof(float),
+                raw_update_count * sizeof(float));
+    borrow_view(&raw_update_partner, &raw1,
+                (uint64_t)raw_update_first * head_dim * sizeof(float),
+                raw_update_count * sizeof(float));
+    borrow_view(&comp_update_home, &comp0,
+                (uint64_t)comp_update_first * head_dim * sizeof(uint16_t),
+                comp_update_count * sizeof(uint16_t));
+    borrow_view(&comp_update_partner, &comp1,
+                (uint64_t)comp_update_first * head_dim * sizeof(uint16_t),
+                comp_update_count * sizeof(uint16_t));
 
 #define LAUNCH_HOME() \
     launch_attention(indexed, &home, model, model_bytes, &q_home, &raw0, \
@@ -366,6 +453,45 @@ static int run_case(int indexed) {
     const double transfer_ms =
         (now_seconds() - start) * 1000.0 / (double)repeats;
 
+    /* The original mechanism harness preloaded both KV copies.  Exercise the
+     * missing production lifecycle at sustained depth: a default-stream home
+     * producer updates each new raw/compressed segment, the segment is
+     * mirrored, both attention halves consume it, and the result is gathered
+     * before the destination segment is reused on the next iteration. */
+    for (uint32_t r = 0; r < cache_repeats; r++) {
+        CHECK(produce_and_mirror_cache_rows(
+                  &raw_update_partner, &raw_update_home,
+                  &raw_update_stage),
+              "cache lifecycle raw update");
+        CHECK(produce_and_mirror_f16_cache_rows(
+                  &comp_update_partner, &comp_update_home,
+                  &comp_update_stage, comp_update_count),
+              "cache lifecycle compressed update");
+        CHECK(ds4_gpu_tensor_wait_xdev_default(&q1, 0) &&
+              ds4_gpu_tensor_copy_xdev_default(
+                  &q1, &q_peer, half_count * sizeof(float)),
+              "cache lifecycle query handoff");
+        CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
+              "cache lifecycle home launch");
+        CHECK(ds4_gpu_set_current_device(1) == 0 &&
+              LAUNCH_PARTNER(&q1, &raw1, &comp1, &topk1),
+              "cache lifecycle partner launch");
+        CHECK(ds4_gpu_tensor_wait_xdev_default(&gathered, 1) &&
+              ds4_gpu_tensor_copy_xdev_default(
+                  &gathered, &partner, half_count * sizeof(float)),
+              "cache lifecycle result gather");
+    }
+    CHECK(sync_tier(0) && sync_tier(1),
+          "cache lifecycle synchronization");
+    CHECK(ds4_gpu_tensor_read(&home, 0, home_host,
+                              half_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(&gathered, 0, partner_host,
+                              half_count * sizeof(float)),
+          "cache lifecycle result read");
+    CHECK(compare_halves(ref_host, home_host, partner_host, half_count,
+                         "cache lifecycle"),
+          "cache lifecycle exactness");
+
     printf("scenario=attention-row-split-%s-32k\n",
            indexed ? "indexed" : "mixed-ratio128");
     printf("validation=bit-exact-nonzero\nrepeats=%u\n", repeats);
@@ -380,13 +506,24 @@ static int run_case(int indexed) {
            (unsigned long long)(half_count * sizeof(float)),
            (unsigned long long)(half_count * sizeof(float)));
     printf("persistent_partner_kv_bytes=%llu\n",
-           (unsigned long long)((raw_count + comp_count) * sizeof(float)));
+           (unsigned long long)(raw_count * sizeof(float) +
+                                comp_count * sizeof(uint16_t)));
+    printf("cache_update_lifecycle=bit-exact\n");
+    printf("cache_update_repeats=%u\n", cache_repeats);
+    printf("cache_update_raw_bytes=%llu\n",
+           (unsigned long long)(raw_update_count * sizeof(float)));
+    printf("cache_update_compressed_bytes=%llu\n",
+           (unsigned long long)(comp_update_count * sizeof(uint16_t)));
+    printf("compressed_cache_format=f16\n");
     ok = 1;
 
 #undef LAUNCH_PARTNER
 #undef LAUNCH_HOME
 
 cleanup:
+    ds4_gpu_tensor_free_in_place(&comp_source);
+    ds4_gpu_tensor_free_in_place(&comp_update_stage);
+    ds4_gpu_tensor_free_in_place(&raw_update_stage);
     ds4_gpu_tensor_free_in_place(&gathered);
     ds4_gpu_tensor_free_in_place(&topk1);
     ds4_gpu_tensor_free_in_place(&comp1);

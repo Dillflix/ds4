@@ -20759,7 +20759,21 @@ static bool metal_graph_cuda_tp_attn_cache_copy_row(
     if (bytes == 0) return true;
     ds4_gpu_tensor *dst = ds4_gpu_tensor_view(dst_base, offset, bytes);
     ds4_gpu_tensor *src = ds4_gpu_tensor_view(src_base, offset, bytes);
-    bool ok = dst && src && ds4_gpu_tensor_copy_xdev(dst, src, bytes) != 0;
+    /* Raw/compressed KV is produced on the home default stream and consumed
+     * by attention on the partner default stream.  The generic xdev helper
+     * uses per-device side streams, so using it here allows both ends to race:
+     * the copy can start before the home producer finishes, and a following
+     * partner attention launch need not wait for the copied rows.
+     *
+     * First record partner-default readiness and make the home default stream
+     * wait before overwriting the mirror.  Then execute the peer copy on the
+     * home default stream; copy_xdev_default records completion and makes the
+     * partner default stream wait before consuming it.  This also orders the
+     * next update against the partner's preceding attention read. */
+    const int src_tier = src ? ds4_gpu_tensor_device(src) : -1;
+    bool ok = dst && src && src_tier >= 0 &&
+              ds4_gpu_tensor_wait_xdev_default(dst, src_tier) != 0 &&
+              ds4_gpu_tensor_copy_xdev_default(dst, src, bytes) != 0;
     ds4_gpu_tensor_free(src);
     ds4_gpu_tensor_free(dst);
     return ok;
@@ -20824,9 +20838,9 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
         if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) return false;
         const uint64_t raw_bytes =
             (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
-        if (!ds4_gpu_tensor_copy_xdev(g->layer_raw_cache_tp[il],
-                                      g->layer_raw_cache[il],
-                                      raw_bytes)) {
+        if (!metal_graph_cuda_tp_attn_cache_copy_row(
+                g->layer_raw_cache_tp[il],
+                g->layer_raw_cache[il], 0, raw_bytes)) {
             return false;
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -20834,9 +20848,9 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
         if (ratio != 0 && n_comp != 0) {
             const uint64_t comp_bytes =
                 (uint64_t)n_comp * metal_graph_attn_comp_cache_row_bytes();
-            if (!ds4_gpu_tensor_copy_xdev(g->layer_attn_comp_cache_tp[il],
-                                          g->layer_attn_comp_cache[il],
-                                          comp_bytes)) {
+            if (!metal_graph_cuda_tp_attn_cache_copy_row(
+                    g->layer_attn_comp_cache_tp[il],
+                    g->layer_attn_comp_cache[il], 0, comp_bytes)) {
                 return false;
             }
         }
