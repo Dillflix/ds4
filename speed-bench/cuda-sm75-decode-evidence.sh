@@ -7,7 +7,7 @@ Measure and trace the fixed SM75 production decode path.
 
 The pass has three independent products:
   1. PP4096 throughput A/B: indexed threshold 1024 versus forced-dense 4096.
-  2. Bit-exact per-token logits for a short version of that A/B.
+  2. Full-vocabulary per-token logit comparison for a short version of that A/B.
   3. Bounded steady-decode Nsight Systems traces at PP2048, PP4096, and PP32768,
      plus a PP4096 forced-dense trace. Prefill and initial decode tokens remain
      outside the profiler range.
@@ -318,25 +318,33 @@ if (( RUN_EXACT )); then
         logits="$base-logits"
         mkdir -p "$logits"
         ctx_alloc=$((AB_PP + EXACT_TG + 1))
-        printf 'Exact decode logits variant=%s tokens=%d...\n' "$variant" "$EXACT_TG"
-        set +e
-        "${production_env[@]}" \
-        "DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=$threshold" \
-        DS4_BENCH_UNTIMED_WARMUP_TOKENS=512 \
-        ./ds4-bench --cuda --cuda-tensor-parallel \
-            --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-            --model "$MODEL" --prompt-file "$PROMPT" \
-            --ctx-start "$AB_PP" --ctx-max "$AB_PP" --ctx-alloc "$ctx_alloc" \
-            --step-incr "$AB_PP" --prefill-chunk "$PREFILL_CHUNK" \
-            --gen-tokens "$EXACT_TG" --dump-decode-logits-dir "$logits" \
-            --csv "$base.csv" >"$base.log" 2>&1
-        rc=$?
-        set -e
-        (( rc == 0 )) || { tail -n 160 "$base.log" >&2 || true; die "$variant exact run failed"; }
-        validate_production_log "$base.log" "$threshold" ||
-            die "$variant exact run did not preserve production configuration"
-        [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == "$EXACT_TG" ]] ||
-            die "$variant exact run did not emit $EXACT_TG logit files"
+        if (( RESUME )) &&
+           validate_benchmark_csv "$base.csv" "$AB_PP" "$EXACT_TG" &&
+           validate_production_log "$base.log" "$threshold" &&
+           [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == "$EXACT_TG" ]]; then
+            printf 'Reusing decode logits variant=%s tokens=%d...\n' \
+                "$variant" "$EXACT_TG"
+        else
+            printf 'Decode logits variant=%s tokens=%d...\n' "$variant" "$EXACT_TG"
+            set +e
+            "${production_env[@]}" \
+            "DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=$threshold" \
+            DS4_BENCH_UNTIMED_WARMUP_TOKENS=512 \
+            ./ds4-bench --cuda --cuda-tensor-parallel \
+                --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+                --model "$MODEL" --prompt-file "$PROMPT" \
+                --ctx-start "$AB_PP" --ctx-max "$AB_PP" --ctx-alloc "$ctx_alloc" \
+                --step-incr "$AB_PP" --prefill-chunk "$PREFILL_CHUNK" \
+                --gen-tokens "$EXACT_TG" --dump-decode-logits-dir "$logits" \
+                --csv "$base.csv" >"$base.log" 2>&1
+            rc=$?
+            set -e
+            (( rc == 0 )) || { tail -n 160 "$base.log" >&2 || true; die "$variant logit run failed"; }
+            validate_production_log "$base.log" "$threshold" ||
+                die "$variant logit run did not preserve production configuration"
+            [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == "$EXACT_TG" ]] ||
+                die "$variant logit run did not emit $EXACT_TG logit files"
+        fi
     done
     find "$OUTPUT_DIR/exact/indexed1024-logits" -maxdepth 1 -type f -printf '%f\n' | sort \
         >"$OUTPUT_DIR/exact/indexed-files.txt"
@@ -344,13 +352,22 @@ if (( RUN_EXACT )); then
         >"$OUTPUT_DIR/exact/dense-files.txt"
     cmp -s "$OUTPUT_DIR/exact/indexed-files.txt" "$OUTPUT_DIR/exact/dense-files.txt" ||
         die "exact variants produced different logit inventories"
+    bit_exact=true
+    first_divergence=
     while IFS= read -r file; do
-        cmp -s "$OUTPUT_DIR/exact/indexed1024-logits/$file" \
-               "$OUTPUT_DIR/exact/dense4096-logits/$file" ||
-            die "decode logits are not bit-exact: $file"
+        if ! cmp -s "$OUTPUT_DIR/exact/indexed1024-logits/$file" \
+                  "$OUTPUT_DIR/exact/dense4096-logits/$file"; then
+            bit_exact=false
+            [[ -n $first_divergence ]] || first_divergence=$file
+        fi
     done <"$OUTPUT_DIR/exact/indexed-files.txt"
-    printf 'bit_exact=true\nfrontier=%s\ndecode_tokens=%s\n' \
-        "$AB_PP" "$EXACT_TG" >"$OUTPUT_DIR/exact/verification.txt"
+    printf 'bit_exact=%s\nfrontier=%s\ndecode_tokens=%s\nfirst_divergence=%s\nsemantic_equivalence=not-claimed\n' \
+        "$bit_exact" "$AB_PP" "$EXACT_TG" "${first_divergence:-none}" \
+        >"$OUTPUT_DIR/exact/verification.txt"
+    if [[ $bit_exact == false ]]; then
+        printf 'Decode threshold paths diverge at %s; retaining both as semantic evidence.\n' \
+            "$first_divergence"
+    fi
 fi
 
 printf 'label\tpp_tokens\tthreshold\tcaptured_tokens\tdevices\tsqlite\n' \

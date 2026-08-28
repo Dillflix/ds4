@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import array
 import csv
 import sqlite3
 import subprocess
@@ -116,7 +117,27 @@ class DecodeEvidenceSummaryTests(unittest.TestCase):
                 writer = csv.DictWriter(handle, fieldnames=records[0].keys())
                 writer.writeheader()
                 writer.writerows(records)
-            (root / "exact" / "verification.txt").write_text("bit_exact=true\n")
+            indexed_logits = root / "exact" / "indexed1024-logits"
+            dense_logits = root / "exact" / "dense4096-logits"
+            indexed_logits.mkdir()
+            dense_logits.mkdir()
+            for step, (indexed_values, dense_values) in enumerate(
+                (
+                    ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]),
+                    ([1.0, 2.0, 3.0], [1.0, 2.25, 3.1]),
+                ),
+                1,
+            ):
+                name = f"frontier_004096.decode_{step:06d}.logits.f32"
+                (indexed_logits / name).write_bytes(
+                    array.array("f", indexed_values).tobytes()
+                )
+                (dense_logits / name).write_bytes(
+                    array.array("f", dense_values).tobytes()
+                )
+            (root / "exact" / "verification.txt").write_text(
+                "bit_exact=false\nfirst_divergence=frontier_004096.decode_000002.logits.f32\n"
+            )
             trace = root / "trace.sqlite"
             make_trace(trace)
             (root / "trace-map.tsv").write_text(
@@ -132,8 +153,16 @@ class DecodeEvidenceSummaryTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = (root / "summary" / "summary.md").read_text()
-            self.assertIn("bit-exact", summary)
+            self.assertIn("Threshold-path logit comparison", summary)
+            self.assertIn("2/2", summary)
             self.assertIn("PP4096 indexer threshold A/B", summary)
+            with (root / "summary" / "logit-comparison.csv").open(
+                newline=""
+            ) as handle:
+                logit_rows = list(csv.DictReader(handle))
+            self.assertEqual(logit_rows[0]["bit_exact"], "True")
+            self.assertEqual(logit_rows[1]["bit_exact"], "False")
+            self.assertEqual(logit_rows[1]["top1_equal"], "True")
             with (root / "summary" / "stage-device-summary.csv").open(newline="") as handle:
                 categories = {row["category"] for row in csv.DictReader(handle)}
             self.assertEqual(

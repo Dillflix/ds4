@@ -2337,9 +2337,13 @@ fixed.
 The throughput experiment isolates the implementation transition observed
 between PP2048 and PP4096: PP4096 is run with the production 1024-compressed-row
 indexing threshold and with a forced 4096-row dense threshold. Runs are paired
-and order-reversed. A separate correctness pass writes every full-vocabulary
-FP32 logit vector for eight generated tokens and requires byte identity; its
-filesystem work is never used as a throughput sample.
+and order-reversed. These paths are not assumed to be semantically equivalent:
+after the threshold, indexed attention changes the selected compressed-row
+set. A separate semantic pass writes every full-vocabulary FP32 logit vector
+for eight generated tokens and reports first divergence, top-1 agreement,
+top-10 overlap, maximum absolute delta, and NRMSE. Its filesystem work is never
+used as a throughput sample. Any proposal to change the production threshold
+still requires a scored quality suite.
 
 Nsight Systems captures begin after prefill and sixteen unprofiled decode
 tokens. Only the next sixteen tokens are recorded. Opt-in NVTX ranges identify
@@ -2377,6 +2381,6 @@ Completed threshold samples are reused only after their CSV shape and every
 production-path marker validate; missing or invalid samples are rerun.
 
 Return `sm75-decode-evidence-<timestamp>.tar.gz`. The primary products are the
-paired threshold result in `summary/summary.md`, exactness record under
+paired threshold result in `summary/summary.md`, semantic logit record under
 `exact/`, the four bounded `.nsys-rep` files, and the operation, stage/device,
 layer/device, kernel/device, and trace summaries under `summary/`.

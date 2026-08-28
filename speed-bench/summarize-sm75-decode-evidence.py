@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import array
 import bisect
 import csv
+import heapq
+import math
 import sqlite3
 import statistics
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,6 +181,94 @@ def summarize_ab(root: Path) -> tuple[list[dict[str, object]], dict[str, float]]
         "paired_speedup_sd": statistics.stdev(paired) if len(paired) > 1 else 0.0,
     }
     return samples, result
+
+
+def load_f32(path: Path) -> tuple[bytes, array.array]:
+    payload = path.read_bytes()
+    if not payload or len(payload) % 4:
+        raise EvidenceError(f"invalid raw FP32 logit file: {path}")
+    values = array.array("f")
+    values.frombytes(payload)
+    if sys.byteorder != "little":
+        values.byteswap()
+    if any(not math.isfinite(value) for value in values):
+        raise EvidenceError(f"non-finite value in raw FP32 logit file: {path}")
+    return payload, values
+
+
+def summarize_exact(
+    root: Path,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    verification = root / "exact" / "verification.txt"
+    if not verification.exists():
+        return [], {}
+    indexed_dir = root / "exact" / "indexed1024-logits"
+    dense_dir = root / "exact" / "dense4096-logits"
+    indexed = sorted(indexed_dir.glob("*.f32"))
+    dense = sorted(dense_dir.glob("*.f32"))
+    if not indexed or [path.name for path in indexed] != [path.name for path in dense]:
+        raise EvidenceError("decode logit inventories are missing or unequal")
+
+    rows: list[dict[str, object]] = []
+    for step, (indexed_path, dense_path) in enumerate(zip(indexed, dense), 1):
+        indexed_bytes, indexed_values = load_f32(indexed_path)
+        dense_bytes, dense_values = load_f32(dense_path)
+        if len(indexed_values) != len(dense_values):
+            raise EvidenceError(f"logit length mismatch: {indexed_path.name}")
+        count = len(indexed_values)
+        sum_abs = 0.0
+        sum_sq = 0.0
+        reference_sq = 0.0
+        max_abs = 0.0
+        differing = 0
+        indexed_words = memoryview(indexed_bytes).cast("I")
+        dense_words = memoryview(dense_bytes).cast("I")
+        for i, (left, right) in enumerate(zip(indexed_values, dense_values)):
+            delta = float(left) - float(right)
+            absolute = abs(delta)
+            sum_abs += absolute
+            sum_sq += delta * delta
+            reference_sq += float(left) * float(left)
+            max_abs = max(max_abs, absolute)
+            differing += indexed_words[i] != dense_words[i]
+        indexed_argmax = max(range(count), key=indexed_values.__getitem__)
+        dense_argmax = max(range(count), key=dense_values.__getitem__)
+        indexed_top10 = set(
+            heapq.nlargest(10, range(count), key=indexed_values.__getitem__)
+        )
+        dense_top10 = set(
+            heapq.nlargest(10, range(count), key=dense_values.__getitem__)
+        )
+        rmse = math.sqrt(sum_sq / count)
+        reference_rms = math.sqrt(reference_sq / count)
+        rows.append(
+            {
+                "step": step,
+                "file": indexed_path.name,
+                "vocab": count,
+                "bit_exact": indexed_bytes == dense_bytes,
+                "differing_values": differing,
+                "max_abs": max_abs,
+                "mean_abs": sum_abs / count,
+                "rmse": rmse,
+                "nrmse": rmse / reference_rms if reference_rms else 0.0,
+                "indexed_argmax": indexed_argmax,
+                "dense_argmax": dense_argmax,
+                "top1_equal": indexed_argmax == dense_argmax,
+                "top10_overlap": len(indexed_top10 & dense_top10),
+            }
+        )
+    divergent = [row for row in rows if not row["bit_exact"]]
+    result: dict[str, object] = {
+        "bit_exact": not divergent,
+        "first_divergence_step": int(divergent[0]["step"]) if divergent else 0,
+        "top1_equal": sum(bool(row["top1_equal"]) for row in rows),
+        "steps": len(rows),
+        "max_nrmse": max(float(row["nrmse"]) for row in rows),
+        "max_abs": max(float(row["max_abs"]) for row in rows),
+        "min_top10_overlap": min(int(row["top10_overlap"]) for row in rows),
+    }
+    return rows, result
 
 
 def load_trace(
@@ -483,6 +575,19 @@ def main() -> int:
             ab_samples,
         )
 
+    exact_rows, exact_result = summarize_exact(root)
+    if exact_rows:
+        write_csv(
+            summary_dir / "logit-comparison.csv",
+            [
+                "step", "file", "vocab", "bit_exact", "differing_values",
+                "max_abs", "mean_abs", "rmse", "nrmse",
+                "indexed_argmax", "dense_argmax", "top1_equal",
+                "top10_overlap",
+            ],
+            exact_rows,
+        )
+
     all_ops, stage_rows, layer_rows, kernel_rows, trace_rows = summarize_traces(root)
     if all_ops:
         write_csv(
@@ -527,10 +632,6 @@ def main() -> int:
             trace_rows,
         )
 
-    exact_path = root / "exact" / "verification.txt"
-    exact = exact_path.is_file() and "bit_exact=true" in exact_path.read_text(
-        encoding="utf-8", errors="replace"
-    )
     lines = ["# SM75 production decode evidence", ""]
     if ab_result:
         change = (ab_result["dense_over_indexed"] - 1.0) * 100.0
@@ -549,12 +650,27 @@ def main() -> int:
                 "",
             ]
         )
-    if exact_path.exists():
+    if exact_result:
         lines.extend(
             [
-                "## Exactness",
+                "## Threshold-path logit comparison",
                 "",
-                f"Per-token full-vocabulary FP32 logits: **{'bit-exact' if exact else 'FAILED'}**.",
+                (
+                    "These paths are not assumed to be semantically "
+                    "equivalent: indexed attention changes the selected "
+                    "compressed-row set after the threshold."
+                ),
+                "",
+                "| Bit-exact | First divergent step | Top-1 agreement | Maximum NRMSE | Maximum absolute delta | Minimum top-10 overlap |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+                (
+                    f"| {'yes' if exact_result['bit_exact'] else 'no'} | "
+                    f"{exact_result['first_divergence_step'] or 'none'} | "
+                    f"{exact_result['top1_equal']}/{exact_result['steps']} | "
+                    f"{float(exact_result['max_nrmse']):.6f} | "
+                    f"{float(exact_result['max_abs']):.6f} | "
+                    f"{exact_result['min_top10_overlap']}/10 |"
+                ),
                 "",
             ]
         )
@@ -581,7 +697,7 @@ def main() -> int:
                 f"{int(row['memcpy_bytes']) / 1048576.0:.3f} |"
             )
         lines.append("")
-    if not ab_result and not exact_path.exists() and not all_ops:
+    if not ab_result and not exact_result and not all_ops:
         raise EvidenceError("no completed evidence phase was found")
     summary = "\n".join(lines) + "\n"
     (summary_dir / "summary.md").write_text(summary, encoding="utf-8")
