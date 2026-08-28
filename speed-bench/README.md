@@ -2223,6 +2223,25 @@ are `profile-summary.md`, `stage-device-summary.csv`,
 `kernel-family-total.csv`, `operation-family-summary.csv`, the genuine
 `nsys/combined.nsys-rep`, and the five validated reports under `ncu/`.
 
+Critical-path attribution uses an indexed NVTX interval lookup; a genuine 32K
+trace that previously required more than an hour of single-core Python scanning
+processes in seconds. If collection was interrupted after `combined.sqlite`
+was written, reuse it without loading or tracing the model again:
+
+```bash
+PROFILE_DIR="$PWD/sm75-q32-production-profile-<timestamp>" \
+RESUME_POSTPROCESS=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q32-production-profile.sh
+```
+
+Keep the same `MODEL`, `PROMPT`, `GPU_DEVICES`, and fixed production variables
+from the original invocation. Resume validates the saved production artifacts,
+reuses the SQLite export and Nsight Systems reports, regenerates attribution,
+then continues with the bounded Nsight Compute captures.
+
 # SM75 routed-quant real-weight quality sweep
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and

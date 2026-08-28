@@ -25,6 +25,7 @@ Optional environment:
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   PROFILE_DIR=...              output directory
+  RESUME_POSTPROCESS=0         reuse PROFILE_DIR trace/export after interruption
 EOF
 }
 
@@ -48,6 +49,7 @@ RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+RESUME_POSTPROCESS=${RESUME_POSTPROCESS:-0}
 Q3A4_LAYERS=6,8,10,12,14,16,18,20,30,32,34,36,38,40,42
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${PROFILE_DIR:-$repo_dir/sm75-q32-production-profile-$stamp}
@@ -59,7 +61,8 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "PROFILE_TOKENS:$PROFILE_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
             "PIPELINE_MB:$PIPELINE_MB" "PROFILE_GPU:$PROFILE_GPU" \
             "RUN_NCU:$RUN_NCU" "NCU_USE_SUDO:$NCU_USE_SUDO" \
-            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
+            "RESUME_POSTPROCESS:$RESUME_POSTPROCESS"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -69,7 +72,7 @@ done
    PIPELINE_MB == 512 )) ||
     die "require ctx_alloc=32769, prefill_chunk=2048, and pipeline_mb=512"
 printf -v frontier_tag '%06d' "$PROFILE_TOKENS"
-for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE RESUME_POSTPROCESS; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -125,9 +128,14 @@ for pair in 0:2 1:3; do
         die "physical pair $home<->$partner has a non-NVLink reverse cell: ${fwd:-missing}/$rev"
 done
 
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{nsys/frontier-logits,ncu,validation,telemetry,provenance}
+if [[ $RESUME_POSTPROCESS == 1 ]]; then
+    [[ -n ${PROFILE_DIR:-} && -d $OUTPUT_DIR ]] ||
+        die "RESUME_POSTPROCESS=1 requires an existing PROFILE_DIR"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"/{nsys/frontier-logits,ncu,validation,telemetry,provenance}
+fi
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -181,7 +189,10 @@ production_env=(
 phase=build
 targets=(ds4-bench tests/cuda_long_context_smoke
          tests/test_engine_mgpu_placement tests/cuda_sm75_profile_harness)
-if [[ $SKIP_BUILD == 0 ]]; then
+if [[ $RESUME_POSTPROCESS == 1 ]]; then
+    [[ -x ./ds4-bench && -x ./tests/cuda_sm75_profile_harness ]] ||
+        die "resume requires the existing production binaries"
+elif [[ $SKIP_BUILD == 0 ]]; then
     make -B -j"$(nproc)" "${targets[@]}" CUDA_ARCH=sm_75 \
         2>&1 | tee "$OUTPUT_DIR/validation/build.log"
 else
@@ -192,16 +203,18 @@ fi
     die "required binaries are missing"
 
 phase=exactness
-"${clean[@]}" ./tests/test_engine_mgpu_placement \
-    >"$OUTPUT_DIR/validation/planner.log" 2>&1 || {
-        tail -n 120 "$OUTPUT_DIR/validation/planner.log" >&2 || true
-        die "planner tests failed"
-    }
-"${clean[@]}" ./tests/cuda_long_context_smoke \
-    >"$OUTPUT_DIR/validation/cuda-exactness.log" 2>&1 || {
-        tail -n 180 "$OUTPUT_DIR/validation/cuda-exactness.log" >&2 || true
-        die "CUDA exactness tests failed"
-    }
+if [[ $RESUME_POSTPROCESS == 0 ]]; then
+    "${clean[@]}" ./tests/test_engine_mgpu_placement \
+        >"$OUTPUT_DIR/validation/planner.log" 2>&1 || {
+            tail -n 120 "$OUTPUT_DIR/validation/planner.log" >&2 || true
+            die "planner tests failed"
+        }
+    "${clean[@]}" ./tests/cuda_long_context_smoke \
+        >"$OUTPUT_DIR/validation/cuda-exactness.log" 2>&1 || {
+            tail -n 180 "$OUTPUT_DIR/validation/cuda-exactness.log" >&2 || true
+            die "CUDA exactness tests failed"
+        }
+fi
 for marker in \
     'SM75 Q4-32 gate/up + Q4-32 down production 16/8/4 prefill/direct-decode exact' \
     'SM75 Q3A4 gate/up + Q4-32 down production 16/8/4 prefill/direct-decode exact' \
@@ -223,40 +236,42 @@ if [[ $RUN_NCU == 1 ]]; then
         sudo -v
         ncu_cmd=(sudo -E "$ncu_bin")
     fi
-    printf 'Nsight Compute permission preflight...\n'
-    preflight="$OUTPUT_DIR/validation/ncu-preflight"
-    rc=0
-    "${clean[@]}" CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
-        "${ncu_cmd[@]}" --config-file off --target-processes application-only \
-        --devices 0 --kernel-name-base function \
-        --kernel-name 'regex:^matmul_q8_0_mma_sm75_exact_kernel.*' \
-        --launch-count 1 --replay-mode kernel --cache-control none \
-        --clock-control none --force-overwrite --export "$preflight" \
-        --section SpeedOfLight --section LaunchStats \
-        ./tests/cuda_sm75_profile_harness q8-shared \
-        >"$preflight.log" 2>&1 || rc=$?
-    (( rc == 0 )) || {
-        tail -n 100 "$preflight.log" >&2 || true
-        die "Nsight Compute permission preflight failed"
-    }
-    if grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
-            "$preflight.log"; then
-        tail -n 100 "$preflight.log" >&2 || true
-        die "Nsight Compute preflight captured no usable kernel"
+    if [[ $RESUME_POSTPROCESS == 0 ]]; then
+        printf 'Nsight Compute permission preflight...\n'
+        preflight="$OUTPUT_DIR/validation/ncu-preflight"
+        rc=0
+        "${clean[@]}" CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
+            "${ncu_cmd[@]}" --config-file off --target-processes application-only \
+            --devices 0 --kernel-name-base function \
+            --kernel-name 'regex:^matmul_q8_0_mma_sm75_exact_kernel.*' \
+            --launch-count 1 --replay-mode kernel --cache-control none \
+            --clock-control none --force-overwrite --export "$preflight" \
+            --section SpeedOfLight --section LaunchStats \
+            ./tests/cuda_sm75_profile_harness q8-shared \
+            >"$preflight.log" 2>&1 || rc=$?
+        (( rc == 0 )) || {
+            tail -n 100 "$preflight.log" >&2 || true
+            die "Nsight Compute permission preflight failed"
+        }
+        if grep -Eq '==ERROR==|No kernels were profiled|Failed to (profile|create report)' \
+                "$preflight.log"; then
+            tail -n 100 "$preflight.log" >&2 || true
+            die "Nsight Compute preflight captured no usable kernel"
+        fi
+        [[ -s $preflight.ncu-rep ]] || die "Nsight Compute preflight omitted report"
+        if [[ $NCU_USE_SUDO == 1 ]]; then
+            sudo chown -- "$(id -u):$(id -g)" "$preflight.ncu-rep"
+        fi
+        "$ncu_bin" --config-file off --import "$preflight.ncu-rep" \
+            --csv --page raw >"$preflight.csv" 2>"$preflight-import.log"
+        python3 speed-bench/validate-ncu-capture.py \
+            "$preflight.csv" 'matmul_q8_0_mma_sm75_exact_kernel' 0 \
+            --process cuda_sm75_profile_harness --block-size 256
     fi
-    [[ -s $preflight.ncu-rep ]] || die "Nsight Compute preflight omitted report"
-    if [[ $NCU_USE_SUDO == 1 ]]; then
-        sudo chown -- "$(id -u):$(id -g)" "$preflight.ncu-rep"
-    fi
-    "$ncu_bin" --config-file off --import "$preflight.ncu-rep" \
-        --csv --page raw >"$preflight.csv" 2>"$preflight-import.log"
-    python3 speed-bench/validate-ncu-capture.py \
-        "$preflight.csv" 'matmul_q8_0_mma_sm75_exact_kernel' 0 \
-        --process cuda_sm75_profile_harness --block-size 256
 fi
 
 phase=manifest
-{
+if [[ $RESUME_POSTPROCESS == 0 ]]; then {
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$(git branch --show-current)"
@@ -280,10 +295,11 @@ phase=manifest
     printf '\n[nsight systems]\n'; nsys --version
     if [[ $RUN_NCU == 1 ]]; then printf '\n[nsight compute]\n'; ncu --version; fi
 } >"$OUTPUT_DIR/manifest.txt"
-git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
-git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
-env | awk -F= '$1 ~ /^DS4_/ {print}' | sort -u \
-    >"$OUTPUT_DIR/provenance/inherited-ds4-env.txt"
+    git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
+    git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+    env | awk -F= '$1 ~ /^DS4_/ {print}' | sort -u \
+        >"$OUTPUT_DIR/provenance/inherited-ds4-env.txt"
+fi
 
 phase=nsight-systems
 base="$OUTPUT_DIR/nsys/combined"
@@ -295,14 +311,15 @@ q8_audit="$OUTPUT_DIR/nsys/q8-cache-audit.csv"
 tile_audit="$OUTPUT_DIR/nsys/routed-tile-audit.csv"
 cache_before="$OUTPUT_DIR/nsys/cache-before.csv"
 cache_after="$OUTPUT_DIR/nsys/cache-after.csv"
-printf 'Capturing one genuine 32K Q4-32/Q3A4 production trace...\n'
-nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,\
+if [[ $RESUME_POSTPROCESS == 0 ]]; then
+    printf 'Capturing one genuine 32K Q4-32/Q3A4 production trace...\n'
+    nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw,\
 temperature.gpu,clocks.current.sm,clocks.current.memory \
-    --format=csv,noheader,nounits -lms 200 \
-    >"$OUTPUT_DIR/telemetry/combined.csv" &
-sampler_pid=$!
-run_rc=0
-"${production_env[@]}" \
+        --format=csv,noheader,nounits -lms 200 \
+        >"$OUTPUT_DIR/telemetry/combined.csv" &
+    sampler_pid=$!
+    run_rc=0
+    "${production_env[@]}" \
     DS4_BENCH_ROUTED_QUANT_AUDIT=1 \
     DS4_CUDA_CRITICAL_PATH_NVTX=1 \
     "DS4_CUDA_PREFILL_TILE_AUDIT_CSV=$tile_audit" \
@@ -327,12 +344,15 @@ run_rc=0
             --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
             --csv "$base-benchmark.csv" \
             --dump-frontier-logits-dir "$OUTPUT_DIR/nsys/frontier-logits" \
-            >"$base.log" 2>&1 || run_rc=$?
-cleanup_sampler
-(( run_rc == 0 )) || {
-    tail -n 220 "$base.log" >&2 || true
-    die "32K Nsight Systems capture failed (exit $run_rc)"
-}
+                >"$base.log" 2>&1 || run_rc=$?
+    cleanup_sampler
+    (( run_rc == 0 )) || {
+        tail -n 220 "$base.log" >&2 || true
+        die "32K Nsight Systems capture failed (exit $run_rc)"
+    }
+else
+    printf 'Reusing completed 32K trace and SQLite export in %s\n' "$OUTPUT_DIR"
+fi
 [[ -s $base.nsys-rep && -s $base-benchmark.csv ]] ||
     die "Nsight Systems omitted its report or benchmark"
 [[ -s $OUTPUT_DIR/nsys/frontier-logits/frontier_${frontier_tag}.logits.f32 &&
@@ -407,17 +427,23 @@ python3 speed-bench/validate-sm75-stage-aware-plan.py \
     "$OUTPUT_DIR/dense-stage-aware-summary.csv"
 
 phase=nsight-systems-export
-nsys export --type sqlite --force-overwrite=true \
-    --output "$base.sqlite" "$base.nsys-rep" \
-    >"$base-export.log" 2>&1 || die "Nsight SQLite export failed"
-printf 'label\tdevices\tsqlite\nproduction-32k\t%s\t%s\n' \
-    "$GPU_DEVICES" "$base.sqlite" >"$OUTPUT_DIR/trace-map.tsv"
-printf 'trial\tslot\tscenario\tdevice\tlog\n' >"$OUTPUT_DIR/harness-runs.tsv"
-for report in cuda_gpu_kern_sum cuda_gpu_mem_time_sum cuda_api_sum \
-              cuda_gpu_trace nvtx_sum nvtx_gpu_proj_sum; do
-    nsys stats --report "$report" --format csv "$base.nsys-rep" \
-        >"$base-$report.csv" 2>"$base-$report.log" || true
-done
+if [[ $RESUME_POSTPROCESS == 0 ]]; then
+    nsys export --type sqlite --force-overwrite=true \
+        --output "$base.sqlite" "$base.nsys-rep" \
+        >"$base-export.log" 2>&1 || die "Nsight SQLite export failed"
+    printf 'label\tdevices\tsqlite\nproduction-32k\t%s\t%s\n' \
+        "$GPU_DEVICES" "$base.sqlite" >"$OUTPUT_DIR/trace-map.tsv"
+    printf 'trial\tslot\tscenario\tdevice\tlog\n' >"$OUTPUT_DIR/harness-runs.tsv"
+    for report in cuda_gpu_kern_sum cuda_gpu_mem_time_sum cuda_api_sum \
+                  cuda_gpu_trace nvtx_sum nvtx_gpu_proj_sum; do
+        nsys stats --report "$report" --format csv "$base.nsys-rep" \
+            >"$base-$report.csv" 2>"$base-$report.log" || true
+    done
+else
+    [[ -s $base.sqlite && -s $OUTPUT_DIR/trace-map.tsv &&
+       -s $OUTPUT_DIR/harness-runs.tsv ]] ||
+        die "resume directory lacks the completed SQLite export metadata"
+fi
 python3 speed-bench/summarize-cuda-critical-path.py "$OUTPUT_DIR" \
     | tee "$OUTPUT_DIR/critical-path-summary.txt"
 python3 speed-bench/summarize-sm75-q32-production-profile.py "$OUTPUT_DIR" \

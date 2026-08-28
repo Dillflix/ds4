@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import math
 import re
@@ -22,6 +23,26 @@ class NvtxRange:
     text: str
 
 
+@dataclass(frozen=True)
+class NvtxRangeIndex:
+    items: list[NvtxRange]
+    starts: list[int]
+    prefix_max_ends: list[int]
+
+
+RANGE_PREFIXES = (
+    "ds4/prefill/stage/",
+    "ds4/prefill/layer/",
+    "ds4/prefill/handoff/",
+    "ds4/q8/partner/",
+    "ds4/prefill/attention-rows/",
+    "ds4/prefill/indexer-rows/",
+    "ds4/prefill/wave/",
+    "ds4/prefill/embedding/",
+    "ds4/prefill/output/",
+)
+
+
 def table_exists(db: sqlite3.Connection, name: str) -> bool:
     return db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
@@ -37,15 +58,38 @@ def parse_fields(text: str) -> dict[str, str]:
     return fields
 
 
+def build_range_index(ranges: list[NvtxRange], prefix: str) -> NvtxRangeIndex:
+    items = sorted(
+        (item for item in ranges if item.text.startswith(prefix)),
+        key=lambda item: (item.start, -item.end),
+    )
+    starts: list[int] = []
+    prefix_max_ends: list[int] = []
+    max_end = -1
+    for item in items:
+        starts.append(item.start)
+        max_end = max(max_end, item.end)
+        prefix_max_ends.append(max_end)
+    return NvtxRangeIndex(items, starts, prefix_max_ends)
+
+
 def enclosing_range(
-    ranges: list[NvtxRange], timestamp: int, prefix: str
+    index: NvtxRangeIndex | None, timestamp: int
 ) -> NvtxRange | None:
-    matches = [
-        item
-        for item in ranges
-        if item.text.startswith(prefix) and item.start <= timestamp <= item.end
-    ]
-    return min(matches, key=lambda item: item.end - item.start) if matches else None
+    if index is None or not index.items:
+        return None
+    position = bisect.bisect_right(index.starts, timestamp) - 1
+    best: NvtxRange | None = None
+    best_duration: int | None = None
+    while position >= 0 and index.prefix_max_ends[position] >= timestamp:
+        item = index.items[position]
+        if item.end >= timestamp:
+            duration = item.end - item.start
+            if best_duration is None or duration <= best_duration:
+                best = item
+                best_duration = duration
+        position -= 1
+    return best
 
 
 def load_trace(label: str, sqlite_path: Path, devices: list[int]):
@@ -76,6 +120,13 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
             f"{sqlite_path} contains no DS4 timeline ranges; verify "
             "DS4_CUDA_CRITICAL_PATH_NVTX=1 and nvtx tracing"
         )
+    range_indexes_by_tid = {
+        tid: {
+            prefix: build_range_index(items, prefix)
+            for prefix in RANGE_PREFIXES
+        }
+        for tid, items in ranges_by_tid.items()
+    }
 
     runtime = {
         int(correlation): (int(tid), int(start))
@@ -103,20 +154,22 @@ def load_trace(label: str, sqlite_path: Path, devices: list[int]):
         if correlation is None or int(correlation) not in runtime:
             return
         tid, api_start = runtime[int(correlation)]
-        host_ranges = ranges_by_tid.get(tid, [])
-        stage = enclosing_range(host_ranges, api_start, "ds4/prefill/stage/")
-        layer = enclosing_range(host_ranges, api_start, "ds4/prefill/layer/")
-        handoff = enclosing_range(host_ranges, api_start, "ds4/prefill/handoff/")
-        partner = enclosing_range(host_ranges, api_start, "ds4/q8/partner/")
+        indexes = range_indexes_by_tid.get(tid, {})
+        stage = enclosing_range(indexes.get("ds4/prefill/stage/"), api_start)
+        layer = enclosing_range(indexes.get("ds4/prefill/layer/"), api_start)
+        handoff = enclosing_range(indexes.get("ds4/prefill/handoff/"), api_start)
+        partner = enclosing_range(indexes.get("ds4/q8/partner/"), api_start)
         attention_rows = enclosing_range(
-            host_ranges, api_start, "ds4/prefill/attention-rows/"
+            indexes.get("ds4/prefill/attention-rows/"), api_start
         )
         indexer_rows = enclosing_range(
-            host_ranges, api_start, "ds4/prefill/indexer-rows/"
+            indexes.get("ds4/prefill/indexer-rows/"), api_start
         )
-        wave = enclosing_range(host_ranges, api_start, "ds4/prefill/wave/")
-        embedding = enclosing_range(host_ranges, api_start, "ds4/prefill/embedding/")
-        output = enclosing_range(host_ranges, api_start, "ds4/prefill/output/")
+        wave = enclosing_range(indexes.get("ds4/prefill/wave/"), api_start)
+        embedding = enclosing_range(
+            indexes.get("ds4/prefill/embedding/"), api_start
+        )
+        output = enclosing_range(indexes.get("ds4/prefill/output/"), api_start)
         if not any(
             (stage, handoff, partner, attention_rows, indexer_rows, wave,
              embedding, output)
