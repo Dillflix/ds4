@@ -599,6 +599,7 @@ static std::atomic<uint64_t> g_q8_f16_partner_offloads = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_activation_bytes = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_result_bytes = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_f16_result_offloads = 0;
+static std::atomic<uint64_t> g_q8_f16_partner_execution_suppressed = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_local_calls = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_partner_calls = 0;
 
@@ -1235,6 +1236,7 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_f16_partner_activation_bytes.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_result_bytes.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_f16_result_offloads.store(0, std::memory_order_relaxed);
+    g_q8_f16_partner_execution_suppressed.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
 }
@@ -3504,6 +3506,14 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)g_q8_f16_partner_f16_result_offloads.load(
                     std::memory_order_relaxed));
     }
+    const uint64_t suppressed_partner_calls =
+        g_q8_f16_partner_execution_suppressed.load(std::memory_order_relaxed);
+    if (suppressed_partner_calls != 0u) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 partner execution-only diagnostic: "
+                "suppressed-calls=%llu resident-bindings-retained=yes\n",
+                (unsigned long long)suppressed_partner_calls);
+    }
     const uint64_t t32_fused_local =
         g_t32_f16_fused_local_calls.load(std::memory_order_relaxed);
     const uint64_t t32_fused_partner =
@@ -5483,6 +5493,7 @@ extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
     g_q8_f16_partner_activation_bytes.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_result_bytes.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_f16_result_offloads.store(0, std::memory_order_relaxed);
+    g_q8_f16_partner_execution_suppressed.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
 }
@@ -15371,6 +15382,15 @@ static int cuda_q8_f16_partner_matmul_impl(
     cuda_q8_f16_binding *binding = cuda_q8_f16_find_partner_binding(
         model_map, weight_offset, weight_bytes, in_dim, out_dim, home_device);
     if (!binding) return 0;
+    /* Diagnostic isolation only: retain the production balanced plan,
+     * partner-resident weights, and admitted scratch, but execute the logical
+     * projection through its ordinary home-side fallback.  Unlike
+     * DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD this must not affect admission. */
+    if (getenv("DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION") != NULL) {
+        g_q8_f16_partner_execution_suppressed.fetch_add(
+            1u, std::memory_order_relaxed);
+        return 0;
+    }
     const int partner_tier = home_tier + g_n_gpus / 2;
     const int partner_device = g_gpu[partner_tier].device_id;
     if (binding->resident_device != partner_device ||

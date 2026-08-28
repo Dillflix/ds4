@@ -752,6 +752,11 @@ model startup fails instead of silently changing the production policy.
 per-device cap; `DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD=1` disables only partner
 admission/execution for controlled A/B testing; pair it with an explicit
 non-partner T256 placement such as `DS4_CUDA_Q8_T256_PLACEMENT=all-local`.
+`DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION=1` is a narrower fault-isolation control:
+it retains the selected production plan, partner-resident F16 weights, and
+reserved transfer scratch, but suppresses partner execution at runtime and
+uses the ordinary home-side projection fallback. Cleanup reports the number of
+suppressed binding calls. It is not a placement or performance policy.
 `DS4_CUDA_Q8_F16_FREEZE_HOME_PLAN=1` is a diagnostic mode that removes partner
 eligibility from the primary admission tie-break. It freezes the home ranking,
 not an exact imported inventory: ordinary phase-two partner admission can still
