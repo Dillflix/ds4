@@ -2449,8 +2449,11 @@ dense-F16 admission, tagged SM75 Q32 tensors, and direct pair routes. The
 candidate's decode dispatch marker proves that the native-F16 partner index
 cache mirror was available and consumed; the control does not require a
 prefill-indexer compute dispatch at its below-threshold 512-token warm-up.
-Runs are paired and order-reversed. Full-vocabulary FP32 logits for eight decode
-steps must be byte-identical before the report is accepted.
+PP2048 remains below the 1024-compressed-row decode-indexer threshold, so both
+variants must omit the split there; this is a no-op regression control. At
+PP4096 and above, the candidate split marker is mandatory. Runs are paired and
+order-reversed. Full-vocabulary FP32 logits for eight decode steps must be
+byte-identical before the report is accepted.
 
 ```bash
 cd ~/ds4-iq2-q4

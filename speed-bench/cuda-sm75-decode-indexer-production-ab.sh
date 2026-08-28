@@ -166,7 +166,7 @@ if [[ $RESUME == 0 ]]; then
 fi
 
 validate_log() {
-    local variant=$1 log=$2
+    local variant=$1 pp=$2 log=$3
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   'dense-placement=stage-aware-fixed-22-21' \
                   'materialized 344/344 candidates' \
@@ -177,7 +177,7 @@ validate_log() {
         grep -Fq "$route" "$log" || return 1
     done
     ! grep -Fq 'CUDA decode attention head split active' "$log" || return 1
-    if [[ $variant == indexer50 ]]; then
+    if [[ $variant == indexer50 && $pp -ge 4096 ]]; then
         grep -Fq 'CUDA decode indexer score row split enabled' "$log" || return 1
     else
         ! grep -Fq 'CUDA decode indexer score row split enabled' "$log" || return 1
@@ -209,7 +209,8 @@ run_one() {
         --ctx-start "$pp" --ctx-max "$pp" --ctx-alloc "$ctx_alloc" \
         --step-incr "$pp" --prefill-chunk "$PREFILL_CHUNK" \
         --gen-tokens "$TG_TOKENS" --csv "$csv" >"$log" 2>&1 || return 1
-    validate_csv "$csv" "$pp" "$TG_TOKENS" && validate_log "$variant" "$log"
+    validate_csv "$csv" "$pp" "$TG_TOKENS" &&
+        validate_log "$variant" "$pp" "$log"
 }
 
 phase=throughput
@@ -230,7 +231,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             base="$OUTPUT_DIR/runs/r${repeat}-pp${pp}-${variant}"
             if [[ $RESUME == 1 && -s $base.csv && -s $base.log ]] &&
                validate_csv "$base.csv" "$pp" "$TG_TOKENS" &&
-               validate_log "$variant" "$base.log"; then
+               validate_log "$variant" "$pp" "$base.log"; then
                 printf 'Reusing decode indexer A/B repeat=%d/%d context=%s variant=%s...\n' \
                     "$repeat" "$REPEATS" "$pp" "$variant"
             else
@@ -257,7 +258,7 @@ for variant in control indexer50; do
     base="$OUTPUT_DIR/exact/$variant"
     logits="$base-logits"
     if [[ $RESUME == 1 && -s $base.csv && -s $base.log && -d $logits ]] &&
-       validate_log "$variant" "$base.log" &&
+       validate_log "$variant" "$EXACT_CONTEXT" "$base.log" &&
        [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == "$EXACT_TOKENS" ]]; then
         printf 'Reusing exact decode logits: %s...\n' "$variant"
         continue
@@ -281,7 +282,8 @@ for variant in control indexer50; do
             tail -n 200 "$base.log" >&2 || true
             die "$variant exact-logit run failed"
         }
-    validate_log "$variant" "$base.log" || die "$variant exact log omitted a required path"
+    validate_log "$variant" "$EXACT_CONTEXT" "$base.log" ||
+        die "$variant exact log omitted a required path"
     [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == "$EXACT_TOKENS" ]] ||
         die "$variant did not emit $EXACT_TOKENS decode-logit files"
 done
