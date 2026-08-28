@@ -2384,3 +2384,52 @@ Return `sm75-decode-evidence-<timestamp>.tar.gz`. The primary products are the
 paired threshold result in `summary/summary.md`, semantic logit record under
 `exact/`, the four bounded `.nsys-rep` files, and the operation, stage/device,
 layer/device, kernel/device, and trace summaries under `summary/`.
+
+# SM75 one-token decode pair experiments
+
+`cuda-sm75-decode-pair-next.sh` tests the two high-value pair-parallel decode
+mechanisms without changing the production default. The indexer candidate
+partitions the production native-F16 compressed-row cache 50/50, gathers the
+partner score half, and runs the unchanged deterministic top-k on the home
+GPU. The attention candidate exercises DS4's existing, disabled one-token
+32/32 head path with mirrored raw/compressed KV. Both must be bit-exact and
+non-zero against the shipping one-GPU operation before timing begins.
+
+The transfer-inclusive indexer timing includes the per-token index query and
+64 head weights plus the score gather. The attention timing includes the
+partner query heads, 512 selected indices, one raw KV update, one compressed
+KV update, and the partner output gather. Persistent cache mirroring is
+reported separately. `RUN_NCU=1` captures the index score half, unchanged
+top-k, shipping indexed-attention kernel, and 32-head candidate with occupancy,
+scheduler, warp-stall, compute-pipe, and memory-workload sections.
+
+Set `RUN_PRODUCTION=1` to follow the mechanism checks with an order-reversed
+fixed-production decode A/B of the existing `DS4_CUDA_TP_ATTN_HEADS` path.
+Every production sample requires 22/21 placement, complete 344/344 dense-F16
+admission, and the tagged SM75 Q32 model. Full-vocabulary logits from both
+variants must be byte-identical.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+PROFILE_GPU=0 \
+PROFILE_PARTNER_GPU=1 \
+REPEATS=100 \
+RUN_PRODUCTION=1 \
+PRODUCTION_PP=32768 \
+PRODUCTION_TG=256 \
+PRODUCTION_REPEATS=3 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-pair-next.sh
+```
+
+Return `sm75-decode-pair-next-<timestamp>.tar.gz`. A fast first check can use
+`RUN_PRODUCTION=0 RUN_NCU=0 REPEATS=25`; it still enforces exact operation
+outputs, but does not claim an end-to-end result.

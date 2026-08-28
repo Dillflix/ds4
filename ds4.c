@@ -23510,6 +23510,19 @@ static bool metal_graph_encode_decode_layer_phase(
                         g_gpu_peer_ok[cuda_tp_partner_tier][cuda_tp_home_tier] : 0);
             ok = false;
         }
+        if (cuda_tp_attn_heads_active &&
+            getenv("DS4_CUDA_TP_ATTN_HEADS_AUDIT") != NULL) {
+            static bool logged_decode_head_split[2] = {false, false};
+            const uint32_t audit_slot = indexed_attention ? 1u : 0u;
+            if (!logged_decode_head_split[audit_slot]) {
+                fprintf(stderr,
+                        "ds4: CUDA decode attention head split active: "
+                        "32/32 layer=%u pos=%u home=%d partner=%d indexed=%u\n",
+                        il, pos, cuda_tp_home_tier, cuda_tp_partner_tier,
+                        audit_slot);
+                logged_decode_head_split[audit_slot] = true;
+            }
+        }
         if (ok && cuda_tp_attn_heads_active) {
             const uint64_t tp_head_bytes = (uint64_t)cuda_tp_heads * DS4_N_HEAD_DIM * sizeof(float);
             ds4_gpu_tensor q_peer_src;
