@@ -195,8 +195,19 @@ phase=manifest
     printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
     printf 'attention_row_split=disabled\npartner_projection_execution=suppressed\n'
-    nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,bar1_memory.total,compute_cap \
+    nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,compute_cap \
         --format=csv
+    printf '\nbar1_inventory:\n'
+    for gpu in "${gpu_ids[@]}"; do
+        bar1_total=$(nvidia-smi -i "$gpu" -q 2>/dev/null | awk '
+            /^[[:space:]]*BAR1 Memory Usage/ { in_bar1 = 1; next }
+            in_bar1 && /^[[:space:]]*Total[[:space:]]*:/ {
+                print $3 " " $4
+                exit
+            }
+        ' || true)
+        printf 'gpu=%s bar1_total=%s\n' "$gpu" "${bar1_total:-unavailable}"
+    done
     printf '\ntopology:\n'
     nvidia-smi topo -m
 } >"$OUTPUT_DIR/manifest.txt"
