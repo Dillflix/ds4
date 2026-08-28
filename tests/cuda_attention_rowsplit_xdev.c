@@ -2,10 +2,10 @@
  * not a production dispatch.  It compares the shipping 512-row launch with
  * concurrent 256/256 launches using either peer-read or mirrored partner
  * inputs.  The mixed scenario models the production ratio-128 compressed
- * path with the production native-F16 compressed cache and also exercises its
- * Q handoff/result-gather and incremental KV-mirror lifecycle.  Query rows are
- * independent, so adjusted pos0/n_raw preserves the shipping kernel's
- * arithmetic order and permits bit-exact validation. */
+ * path and also exercises its Q handoff/result-gather and incremental
+ * KV-mirror lifecycle.  Query rows are independent, so adjusted pos0/n_raw
+ * preserves the shipping kernel's arithmetic order and permits bit-exact
+ * validation. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -75,20 +75,6 @@ static int produce_and_mirror_cache_rows(
                partner_rows, home_rows, home_rows->bytes);
 }
 
-static int produce_and_mirror_f16_cache_rows(
-        ds4_gpu_tensor       *partner_rows,
-        ds4_gpu_tensor       *home_rows,
-        const ds4_gpu_tensor *producer_rows,
-        uint64_t              count) {
-    const int home_tier = ds4_gpu_tensor_device(home_rows);
-    return home_tier >= 0 &&
-           ds4_gpu_tensor_copy_f32_to_f16(
-               home_rows, 0, producer_rows, 0, count) &&
-           ds4_gpu_tensor_wait_xdev_default(partner_rows, home_tier) &&
-           ds4_gpu_tensor_copy_xdev_default(
-               partner_rows, home_rows, home_rows->bytes);
-}
-
 static int launch_attention(
         int indexed, ds4_gpu_tensor *heads,
         const void *model, uint64_t model_bytes,
@@ -100,12 +86,12 @@ static int launch_attention(
         uint32_t n_head, uint32_t head_dim) {
     if (indexed) {
         return ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-            heads, model, model_bytes, 0u, q, raw, comp, 1u, topk,
+            heads, model, model_bytes, 0u, q, raw, comp, 0u, topk,
             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
             window, ratio, n_head, head_dim);
     }
     return ds4_gpu_attention_decode_mixed_batch_heads_tensor(
-        heads, model, model_bytes, 0u, q, raw, comp, 1u, NULL, 0u,
+        heads, model, model_bytes, 0u, q, raw, comp, 0u, NULL, 0u,
         n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window,
         ratio, n_head, head_dim);
 }
@@ -179,7 +165,6 @@ static int run_case(int indexed) {
     ds4_gpu_tensor raw_update_home = {0}, raw_update_partner = {0};
     ds4_gpu_tensor comp_update_home = {0}, comp_update_partner = {0};
     ds4_gpu_tensor raw_update_stage = {0}, comp_update_stage = {0};
-    ds4_gpu_tensor comp_source = {0};
 
     if (!repeats || !cache_repeats) {
         fprintf(stderr,
@@ -234,7 +219,7 @@ static int run_case(int indexed) {
     CHECK(ds4_gpu_tensor_alloc_on(&q0, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw0, 0, raw_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&comp0, 0,
-                                  comp_count * sizeof(uint16_t)) == 0 &&
+                                  comp_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&ref, 0, q_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&home, 0, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&partner, 1,
@@ -244,8 +229,6 @@ static int run_case(int indexed) {
           ds4_gpu_tensor_alloc_on(&q1, 1, half_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw1, 1, raw_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&comp1, 1,
-                                  comp_count * sizeof(uint16_t)) == 0 &&
-          ds4_gpu_tensor_alloc_on(&comp_source, 0,
                                   comp_count * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw_update_stage, 0,
                                   raw_update_count * sizeof(float)) == 0 &&
@@ -264,12 +247,14 @@ static int run_case(int indexed) {
                                q_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw0, 0, raw_host,
                                raw_count * sizeof(float)) &&
-          ds4_gpu_tensor_write(&comp_source, 0, comp_host,
+          ds4_gpu_tensor_write(&comp0, 0, comp_host,
                                comp_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&q1, 0, q_host + half_count,
                                half_count * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw1, 0, raw_host,
                                raw_count * sizeof(float)) &&
+          ds4_gpu_tensor_write(&comp1, 0, comp_host,
+                               comp_count * sizeof(float)) &&
           ds4_gpu_tensor_write(
               &raw_update_stage, 0,
               raw_host + (uint64_t)raw_update_first * head_dim,
@@ -285,13 +270,6 @@ static int run_case(int indexed) {
                                  topk_host + topk_half_count,
                                  topk_half_count * sizeof(int32_t)))),
           "device input writes");
-    CHECK(ds4_gpu_tensor_copy_f32_to_f16(
-              &comp0, 0, &comp_source, 0, comp_count) &&
-          ds4_gpu_tensor_wait_xdev_default(&comp1, 0) &&
-          ds4_gpu_tensor_copy_xdev_default(
-              &comp1, &comp0, comp_count * sizeof(uint16_t)),
-          "initial native-F16 compressed cache mirror");
-
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_set_model_map(model, model_bytes), "model-map setup");
     ds4_tensor_range sink0 = {0u, model_bytes, 0};
@@ -318,11 +296,11 @@ static int run_case(int indexed) {
                 (uint64_t)raw_update_first * head_dim * sizeof(float),
                 raw_update_count * sizeof(float));
     borrow_view(&comp_update_home, &comp0,
-                (uint64_t)comp_update_first * head_dim * sizeof(uint16_t),
-                comp_update_count * sizeof(uint16_t));
+                (uint64_t)comp_update_first * head_dim * sizeof(float),
+                comp_update_count * sizeof(float));
     borrow_view(&comp_update_partner, &comp1,
-                (uint64_t)comp_update_first * head_dim * sizeof(uint16_t),
-                comp_update_count * sizeof(uint16_t));
+                (uint64_t)comp_update_first * head_dim * sizeof(float),
+                comp_update_count * sizeof(float));
 
 #define LAUNCH_HOME() \
     launch_attention(indexed, &home, model, model_bytes, &q_home, &raw0, \
@@ -463,9 +441,9 @@ static int run_case(int indexed) {
                   &raw_update_partner, &raw_update_home,
                   &raw_update_stage),
               "cache lifecycle raw update");
-        CHECK(produce_and_mirror_f16_cache_rows(
+        CHECK(produce_and_mirror_cache_rows(
                   &comp_update_partner, &comp_update_home,
-                  &comp_update_stage, comp_update_count),
+                  &comp_update_stage),
               "cache lifecycle compressed update");
         CHECK(ds4_gpu_tensor_wait_xdev_default(&q1, 0) &&
               ds4_gpu_tensor_copy_xdev_default(
@@ -506,22 +484,20 @@ static int run_case(int indexed) {
            (unsigned long long)(half_count * sizeof(float)),
            (unsigned long long)(half_count * sizeof(float)));
     printf("persistent_partner_kv_bytes=%llu\n",
-           (unsigned long long)(raw_count * sizeof(float) +
-                                comp_count * sizeof(uint16_t)));
+           (unsigned long long)((raw_count + comp_count) * sizeof(float)));
     printf("cache_update_lifecycle=bit-exact\n");
     printf("cache_update_repeats=%u\n", cache_repeats);
     printf("cache_update_raw_bytes=%llu\n",
            (unsigned long long)(raw_update_count * sizeof(float)));
     printf("cache_update_compressed_bytes=%llu\n",
-           (unsigned long long)(comp_update_count * sizeof(uint16_t)));
-    printf("compressed_cache_format=f16\n");
+           (unsigned long long)(comp_update_count * sizeof(float)));
+    printf("compressed_cache_format=f32\n");
     ok = 1;
 
 #undef LAUNCH_PARTNER
 #undef LAUNCH_HOME
 
 cleanup:
-    ds4_gpu_tensor_free_in_place(&comp_source);
     ds4_gpu_tensor_free_in_place(&comp_update_stage);
     ds4_gpu_tensor_free_in_place(&raw_update_stage);
     ds4_gpu_tensor_free_in_place(&gathered);

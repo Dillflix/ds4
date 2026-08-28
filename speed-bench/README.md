@@ -1941,13 +1941,14 @@ is justified only if one of the exact candidates wins in both indexed and
 mixed attention; the harness result does not include output-projection work or
 the incremental cost of maintaining a partner KV mirror.
 
-The harness also validates the production native-F16 compressed-cache
-lifecycle. `DS4_ROWSPLIT_CACHE_REPEATS` controls a separate sustained loop of
-home-default-stream raw/F16-compressed KV production, ordered peer mirroring,
+The harness also validates the production compressed-cache lifecycle.
+`DS4_ROWSPLIT_CACHE_REPEATS` controls a separate sustained loop of
+home-default-stream raw/F32-compressed KV production, ordered peer mirroring,
 partner attention consumption, and result gathering (default: `REPEATS`,
 maximum 4096). Use roughly 750 repetitions per physical pair to match the
 number of per-layer 512-token cache updates through a 16K full-model prefill;
-the final split output must remain bit-exact.
+the final split output must remain bit-exact. This attention cache is distinct
+from the SM75-native F16 indexer cache.
 
 `cuda-sm75-attention-rowsplit-production-ab.sh` is the fail-closed production
 promotion gate. It interleaves the unchanged home path with the mirrored-KV
