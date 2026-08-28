@@ -495,7 +495,7 @@ if [[ $RUN_NCU == 1 ]]; then
         'moe_gate_up_mid_sm75_q32_tile8_kernel' 512
     profile_one attention-indexed-32k attn-indexed-32k \
         '^attention_indexed_mixed_heads8_online_kernel.*' \
-        'attention_indexed_mixed_heads8_online_kernel' 512
+        'attention_indexed_mixed_heads8_online_kernel' 256
     profile_one attention-mixed-32k attn-mixed-32k \
         '^attention_decode_mixed_heads8_online_kernel.*' \
         'attention_decode_mixed_heads8_online_kernel' 256

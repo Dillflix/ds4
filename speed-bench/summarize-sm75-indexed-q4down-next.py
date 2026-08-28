@@ -21,7 +21,7 @@ def main() -> int:
                     key = (run["variant"], ctx)
                     values[key].append(tps)
                     paired[(int(run["repeat"]), run["variant"], ctx)] = tps
-    variants = ["control", "indexed8", "down-stage8", "both"]
+    variants = ["control", "indexed8", "down-compact", "both"]
     contexts = sorted({ctx for _, ctx in values})
     with output_path.open("w", newline="") as handle:
         writer = csv.writer(handle)

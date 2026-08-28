@@ -88,8 +88,8 @@ phase=regression
 }
 grep -Fq 'indexed attention 16-head/512-thread versus 8-head/256-thread whole and sharded exact' \
     "$OUTPUT_DIR/cuda-regression.log" || die "indexed-attention exact proof missing"
-[[ $(grep -Fc 'tile16-stage8 exact' "$OUTPUT_DIR/cuda-regression.log") == 2 ]] ||
-    die "Q4-32 stage8 exact proofs missing"
+[[ $(grep -Fc 'tile16-compact exact' "$OUTPUT_DIR/cuda-regression.log") == 2 ]] ||
+    die "Q4-32 compact tile16 exact proofs missing"
 
 phase=bounded-harness
 for variant in control indexed8; do
@@ -100,9 +100,9 @@ for variant in control indexed8; do
         >"$OUTPUT_DIR/harness/attention-$variant.log" 2>&1 ||
         die "bounded indexed-attention $variant failed"
 done
-for variant in control down-stage8; do
-    stage8=0; [[ $variant == down-stage8 ]] && stage8=1
-    "${clean[@]}" DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=$stage8 \
+for variant in control down-compact; do
+    compact16=0; [[ $variant == down-compact ]] && compact16=1
+    "${clean[@]}" DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75=$compact16 \
         DS4_PROFILE_REPEATS=$HARNESS_REPEATS \
         ./tests/cuda_sm75_profile_harness sm75-q4-32 \
         >"$OUTPUT_DIR/harness/q4down-$variant.log" 2>&1 ||
@@ -110,6 +110,29 @@ for variant in control down-stage8; do
 done
 cuobjdump --dump-resource-usage ./tests/cuda_sm75_profile_harness \
     >"$OUTPUT_DIR/harness/resource-usage.txt" 2>&1 || true
+grep -Fq 'moe_down_sm75_q4_32_tile16_compact_kernel' \
+    "$OUTPUT_DIR/harness/resource-usage.txt" ||
+    die "compact Q4-32 down kernel is missing from resource report"
+python3 - "$OUTPUT_DIR/harness/resource-usage.txt" <<'PY' ||
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+records = re.findall(
+    r"Function ([^\n]*moe_down_sm75_q4_32_tile16_compact_kernel[^\n]*):\n"
+    r"\s*REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)",
+    text,
+)
+if len(records) != 3:
+    raise SystemExit(f"expected 3 compact-kernel resource records, found {len(records)}")
+for name, reg, stack, shared, local in records:
+    if int(shared) != 32768 or int(reg) > 128 or int(stack) or int(local):
+        raise SystemExit(
+            f"invalid compact-kernel resources: REG={reg} STACK={stack} "
+            f"SHARED={shared} LOCAL={local} function={name}"
+        )
+PY
+    die "compact Q4-32 down resource gate failed"
 
 phase=manifest
 {
@@ -131,19 +154,19 @@ if [[ $RUN_PRODUCTION == 1 ]]; then
     phase=production-ab
     printf 'repeat,slot,variant,csv,log,logits\n' \
         >"$OUTPUT_DIR/production/runs.csv"
-    variants=(control indexed8 down-stage8 both)
+    variants=(control indexed8 down-compact both)
     for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if (( repeat % 2 == 0 )); then
-            order=(both down-stage8 indexed8 control)
+            order=(both down-compact indexed8 control)
         else
-            order=(control indexed8 down-stage8 both)
+            order=(control indexed8 down-compact both)
         fi
         declare -A logits_by_variant=()
         slot=0
         for variant in "${order[@]}"; do
-            slot=$((slot + 1)); heads8=0; stage8=0
+            slot=$((slot + 1)); heads8=0; compact16=0
             [[ $variant == indexed8 || $variant == both ]] && heads8=1
-            [[ $variant == down-stage8 || $variant == both ]] && stage8=1
+            [[ $variant == down-compact || $variant == both ]] && compact16=1
             base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
             logits="$base-logits"
             reusable=0
@@ -175,7 +198,7 @@ if [[ $RUN_PRODUCTION == 1 ]]; then
                     DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \
                     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
                     "DS4_CUDA_INDEXED_HEADS8_SM75=$heads8" \
-                    "DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=$stage8" \
+                    "DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75=$compact16" \
                     ./ds4-bench --cuda --cuda-tensor-parallel \
                         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                         --model "$MODEL" --prompt-file "$PROMPT" \
@@ -195,20 +218,20 @@ if [[ $RUN_PRODUCTION == 1 ]]; then
             grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
                 die "$variant omitted indexed row splitting"
             if [[ $heads8 == 1 ]]; then
-                grep -Fq 'indexed attention candidate selected: 8 heads / 256 threads' \
+                grep -Fq 'indexed attention selected: 8 heads / 256 threads' \
                     "$base.log" ||
                     die "$variant omitted the indexed8 dispatch"
             fi
-            if [[ $stage8 == 1 ]]; then
-                grep -Fq 'Q4-32 down candidate selected: tile16 stage8' "$base.log" ||
-                    die "$variant omitted the Q4-32 stage8 dispatch"
+            if [[ $compact16 == 1 ]]; then
+                grep -Fq 'Q4-32 down candidate selected: compact tile16' "$base.log" ||
+                    die "$variant omitted the Q4-32 compact tile16 dispatch"
             fi
             logits_by_variant[$variant]=$logits
             printf '%s,%s,%s,%s,%s,%s\n' "$repeat" "$slot" "$variant" \
                 "$base.csv" "$base.log" "$logits" \
                 >>"$OUTPUT_DIR/production/runs.csv"
         done
-        for variant in indexed8 down-stage8 both; do
+        for variant in indexed8 down-compact both; do
             diff -rq "${logits_by_variant[control]}" \
                      "${logits_by_variant[$variant]}" \
                 >"$OUTPUT_DIR/production/r${repeat}-$variant-logits.diff" ||

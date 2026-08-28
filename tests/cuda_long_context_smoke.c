@@ -1022,7 +1022,7 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
     }
     ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
                                   DS4_TENSOR_LAYOUT_SM75_Q3A4);
-    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", "0", 1);
+    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75", "0", 1);
     if (!ds4_gpu_set_model_map(model, model_bytes)) goto cleanup;
     bool mid_is_f16 = false;
 #define RUN_Q32(NTOK, MID_DST, OUT_DST) \
@@ -1056,20 +1056,20 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
                            mid_ref, mid_got, mid_count) ||
         !compare_exact_f32("SM75 Q32 production prefill output",
                            out_ref, out_got, out_count)) goto cleanup;
-    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", "1", 1);
+    (void)setenv("DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75", "1", 1);
     if (!RUN_Q32(n_tokens, mid_got, out_got) ||
-        !compare_exact_f32("SM75 Q32 stage8 prefill mid",
+        !compare_exact_f32("SM75 Q32 compact16 prefill mid",
                            mid_ref, mid_got, mid_count) ||
-        !compare_exact_f32("SM75 Q32 stage8 prefill output",
+        !compare_exact_f32("SM75 Q32 compact16 prefill output",
                            out_ref, out_got, out_count)) goto cleanup;
     fprintf(stderr,
             "cuda-regression: SM75 %s gate/up + Q4-32 down production "
-            "16/8/4 prefill/direct-decode and tile16-stage8 exact\n", label);
+            "16/8/4 prefill/direct-decode and tile16-compact exact\n", label);
     rc = 0;
 #undef RUN_Q32
 
 cleanup:
-    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75");
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);

@@ -46,7 +46,10 @@ def family_of(row: dict[str, str]) -> str:
         return "other_memcpy"
     if "moe_gate_up_mid_sm75_q32_tile8_kernel" in name:
         return "q3a4_gate_up" if layer in Q3A4_DEFAULT else "q4_32_gate_up"
-    if "moe_down_sm75_q4_32_tile_kernel" in name:
+    if (
+        "moe_down_sm75_q4_32_tile_kernel" in name
+        or "moe_down_sm75_q4_32_tile16_compact_kernel" in name
+    ):
         return "q4_32_down"
     if "attention_indexed" in lower:
         return "attention_indexed"

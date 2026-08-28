@@ -19245,12 +19245,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             const int sm75_heads8 = cuda_sm75_mma_ok() &&
-                cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 0);
+                cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
             if (sm75_heads8) {
                 static std::atomic<bool> logged = false;
                 if (!logged.exchange(true, std::memory_order_relaxed))
                     fprintf(stderr,
-                            "ds4: SM75 indexed attention candidate selected: "
+                            "ds4: SM75 indexed attention selected: "
                             "8 heads / 256 threads\n");
             }
             dim3 grid(n_tokens,
@@ -19353,12 +19353,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
         topk_ptr = sorted;
     }
     const int sm75_heads8 = cuda_sm75_mma_ok() &&
-        cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 0);
+        cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
     if (sm75_heads8) {
         static std::atomic<bool> logged = false;
         if (!logged.exchange(true, std::memory_order_relaxed))
             fprintf(stderr,
-                    "ds4: SM75 indexed attention shard candidate selected: "
+                    "ds4: SM75 indexed attention shard selected: "
                     "8 heads / 256 threads\n");
     }
     dim3 grid(n_tokens,
@@ -26515,8 +26515,8 @@ static int routed_moe_launch(
     const int native_down_q4 = tagged_native_q4 && down_q4k;
     const int any_native_q4 = native_gate_q4 || native_down_q4;
     const int any_q32 = gate_q32 || down_q4_32;
-    const uint32_t use_q32_down_stage8 = down_q4_32 &&
-        cuda_env_flag_enabled("DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75", 0);
+    const uint32_t use_q32_down_compact16 = down_q4_32 &&
+        cuda_env_flag_enabled("DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75", 0);
     const int any_native_layout = any_native_q4 || any_q32;
     const uint32_t use_native_q4_cost_tiles = any_native_layout &&
         !cuda_env_flag_enabled("DS4_CUDA_MOE_NATIVE_Q4_LEGACY_TILES", 0);
@@ -26592,12 +26592,12 @@ static int routed_moe_launch(
                 gate_q3a4 ? "q3a4" : (gate_q4_32 ? "q4-32" : "other"),
                  down_q4_32 ? "q4-32" : "other");
     }
-    if (use_q32_down_stage8) {
+    if (use_q32_down_compact16) {
         static std::atomic<bool> logged = false;
         if (!logged.exchange(true, std::memory_order_relaxed))
             fprintf(stderr,
                     "ds4: SM75 Q4-32 down candidate selected: "
-                    "tile16 stage8\n");
+                    "compact tile16\n");
     }
     if (any_native_q4 && !g_cuda_native_q4_logged.exchange(
             true, std::memory_order_relaxed)) {
@@ -28098,8 +28098,8 @@ static int routed_moe_launch(
                     do { \
                         dim3 ng((out_dim + (RS) - 1u) / (RS), \
                                 tile16_capacity, 1u); \
-                        if (use_q32_down_stage8) { \
-                            moe_down_sm75_q4_32_tile16_stage8_kernel<RS> \
+                        if (use_q32_down_compact16) { \
+                            moe_down_sm75_q4_32_tile16_compact_kernel<RS> \
                                 <<<ng, 256>>>( \
                                     (float *)down->ptr, down_w, \
                                     (const cuda_sm75_native_q8_K *)midq, \

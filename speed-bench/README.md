@@ -2269,23 +2269,29 @@ production format.
 
 # SM75 indexed-attention and Q4-32-down candidates
 
-`cuda-sm75-indexed-q4down-next.sh` measures two opt-in candidates against the
-fixed production configuration:
+`cuda-sm75-indexed-q4down-next.sh` measures the promoted indexed-attention
+dispatch and one new opt-in Q4-32-down candidate against the fixed production
+configuration:
 
-- `DS4_CUDA_INDEXED_HEADS8_SM75=1` changes indexed attention from sixteen
-  heads in a 512-thread CTA to eight heads in a 256-thread CTA. Per-head row
-  order and online-softmax arithmetic are unchanged. The smaller CTA trades
-  duplicated L2-resident KV staging for more resident warps.
-- `DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=1` retains tile16 scheduling but stages
-  its activations as two exact eight-pair phases, reducing shared memory from
-  approximately 37.6 KiB to 18.8 KiB.
+- SM75 indexed attention now uses eight heads in a 256-thread CTA by default.
+  `DS4_CUDA_INDEXED_HEADS8_SM75=0` selects the former sixteen-head,
+  512-thread control. Per-head row order and online-softmax arithmetic are
+  unchanged. The fixed-production A/B measured +1.07% at 8K and +1.33% at
+  32K, with byte-identical frontier logits.
+- `DS4_CUDA_MOE_Q4_32_DOWN_COMPACT16_SM75=1` keeps all sixteen expert pairs in
+  one phase but omits Q8 block sums that Q4-32 never consumes. Its staged
+  activation payload is exactly 32 KiB, allowing two 256-thread CTAs per SM75
+  shared-memory partition while preserving pair-half Q4 weight reuse.
 
-Neither candidate is a production default. The runner first requires exact
-nonzero indexed-attention output and exact Q4-32 16/8/4 production output,
-then records bounded harness timings. Its optional full-model pass compares
-control, each candidate independently, and both together while holding fixed
-22/21 placement, complete 344/344 dense-F16 admission, and 50/50 indexer and
-attention row splitting. Frontier logits must be byte-identical.
+The rejected two-phase stage8 Q4-32-down experiment is not dispatched: despite
+a 1.054x isolated-kernel result, it regressed every full-production pairing by
+about 2.0-2.1%. The compact candidate avoids its second K traversal and phase
+barrier. The runner requires exact nonzero indexed-attention output, exact
+Q4-32 16/8/4 production output, and a spill-free 32 KiB compact-kernel resource
+gate before timing. Its optional full-model pass compares control, indexed8,
+compact down, and both while holding fixed 22/21 placement, complete 344/344
+dense-F16 admission, and 50/50 indexer and attention row splitting. Frontier
+logits must be byte-identical.
 
 ```bash
 cd ~/ds4-iq2-q4

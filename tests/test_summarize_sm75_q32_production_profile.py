@@ -44,6 +44,12 @@ class ClassifierTests(unittest.TestCase):
             MODULE.family_of(row("moe_down_sm75_q4_32_tile_kernel<16>")),
             "q4_32_down",
         )
+        self.assertEqual(
+            MODULE.family_of(
+                row("moe_down_sm75_q4_32_tile16_compact_kernel<512>")
+            ),
+            "q4_32_down",
+        )
 
     def test_integrated_critical_path_families_are_separate(self) -> None:
         cases = {
