@@ -28740,8 +28740,11 @@ static int routed_moe_decode_q32_owned_graph_launch(
     cuda_moe_q32_decode_graph_cache *c =
         &g_moe_q32_decode_graph[logical_tier][entry];
 
-    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    // CUDA graph kernel argument tables are arrays of mutable void pointers.
+    // Keep these scalar argument-storage objects non-const; the graph API
+    // copies their values and the kernels still receive them by value.
+    uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     uint32_t x_rows = 1u;
     uint32_t mid_rows = 6u;
     uint64_t xpack_blocks = xq_blocks;
