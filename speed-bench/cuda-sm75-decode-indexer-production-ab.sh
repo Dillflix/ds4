@@ -170,8 +170,7 @@ validate_log() {
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   'dense-placement=stage-aware-fixed-22-21' \
                   'materialized 344/344 candidates' \
-                  'SM75 routed Q32 layout enabled' \
-                  'CUDA prefill indexer score/top-k row split enabled'; do
+                  'SM75 routed Q32 layout enabled'; do
         grep -Fq "$marker" "$log" || return 1
     done
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do

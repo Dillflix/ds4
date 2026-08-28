@@ -2445,10 +2445,12 @@ splitting; it allocates no additional persistent cache. The rejected decode
 attention head split is explicitly disabled in both variants.
 
 Every sample requires the fixed 22/21 placement, stage-aware complete 344/344
-dense-F16 admission, tagged SM75 Q32 tensors, direct pair routes, and the
-production prefill indexer row split. Runs are paired and order-reversed.
-Full-vocabulary FP32 logits for eight decode steps must be byte-identical before
-the report is accepted.
+dense-F16 admission, tagged SM75 Q32 tensors, and direct pair routes. The
+candidate's decode dispatch marker proves that the native-F16 partner index
+cache mirror was available and consumed; the control does not require a
+prefill-indexer compute dispatch at its below-threshold 512-token warm-up.
+Runs are paired and order-reversed. Full-vocabulary FP32 logits for eight decode
+steps must be byte-identical before the report is accepted.
 
 ```bash
 cd ~/ds4-iq2-q4
