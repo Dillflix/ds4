@@ -293,8 +293,7 @@ static int run_case(int indexed) {
     CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
           "transfer home launch");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
-          LAUNCH_PARTNER(&q1, &raw1,
-                         indexed ? &comp1 : NULL, &topk1),
+          LAUNCH_PARTNER(&q1, &raw1, &comp1, &topk1),
           "transfer partner launch");
     CHECK(ds4_gpu_tensor_wait_xdev_default(&gathered, 1) &&
           ds4_gpu_tensor_copy_xdev_default(
@@ -355,8 +354,7 @@ static int run_case(int indexed) {
         CHECK(ds4_gpu_set_current_device(0) == 0 && LAUNCH_HOME(),
               "transfer timed home launch");
         CHECK(ds4_gpu_set_current_device(1) == 0 &&
-              LAUNCH_PARTNER(&q1, &raw1,
-                             indexed ? &comp1 : NULL, &topk1),
+              LAUNCH_PARTNER(&q1, &raw1, &comp1, &topk1),
               "transfer timed partner launch");
         CHECK(ds4_gpu_tensor_wait_xdev_default(&gathered, 1) &&
               ds4_gpu_tensor_copy_xdev_default(
