@@ -214,7 +214,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             "$repeat" "$REPEATS" "$slot" "$variant"
         "${clean[@]}" \
             "${variant_env[@]}" \
-            DS4_CUDA_NO_INDEXER_STREAMING64=1 \
+            DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE=1 \
             "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT" \
             DS4_CUDA_PREFILL_PIPELINE=1 \
             DS4_CUDA_PREFILL_PIPELINE_MB=512 \
@@ -240,7 +240,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         dispatches=$(audit_count "$base.log" "$expected_dispatch")
         (( dispatches > 0 )) || die "$variant did not dispatch $expected_dispatch"
         direct_dispatches=$(audit_count "$base.log" direct-one)
-        for unexpected in streaming64-native wmma128 wmma64 wmma32 wmma16 generic; do
+        for unexpected in streaming64-native wmma128-f16-native wmma128 wmma64 wmma32 wmma16 generic; do
             [[ $unexpected == "$expected_dispatch" ]] && continue
             unexpected_count=$(audit_count "$base.log" "$unexpected")
             (( unexpected_count == 0 )) ||

@@ -320,7 +320,7 @@ static int cuda_sm75_mma_ok(void) {
 
 extern "C" int ds4_gpu_sm75_indexer_native_supported(void) {
     return !g_quality_mode &&
-           getenv("DS4_CUDA_NO_INDEXER_STREAMING64") == NULL &&
+           getenv("DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE") == NULL &&
            cuda_sm75_mma_ok();
 }
 
@@ -14293,6 +14293,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
 typedef enum {
     INDEXER_SCORE_DISPATCH_DIRECT_ONE = 0,
     INDEXER_SCORE_DISPATCH_STREAMING64_NATIVE,
+    INDEXER_SCORE_DISPATCH_WMMA128_F16_NATIVE,
     INDEXER_SCORE_DISPATCH_WMMA128,
     INDEXER_SCORE_DISPATCH_WMMA64,
     INDEXER_SCORE_DISPATCH_WMMA32,
@@ -14307,8 +14308,8 @@ static std::atomic<bool> g_indexer_score_audit_registered = false;
 
 static void indexer_score_audit_report(void) {
     static const char *names[INDEXER_SCORE_DISPATCH_COUNT] = {
-        "direct-one", "streaming64-native", "wmma128", "wmma64", "wmma32",
-        "wmma16", "generic",
+        "direct-one", "streaming64-native", "wmma128-f16-native", "wmma128",
+        "wmma64", "wmma32", "wmma16", "generic",
     };
     for (uint32_t i = 0; i < INDEXER_SCORE_DISPATCH_COUNT; i++) {
         fprintf(stderr,
@@ -14523,6 +14524,7 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_f16_tensor(
         ds4_gpu_set_current_device(tier) != 0) {
         return 0;
     }
+    indexer_score_audit_record(INDEXER_SCORE_DISPATCH_WMMA128_F16_NATIVE);
     dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1u);
     indexer_scores_wmma128_f16_kernel<<<grid, 256>>>(
             (float *)scores->ptr,

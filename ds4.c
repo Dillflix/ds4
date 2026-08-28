@@ -17542,8 +17542,13 @@ static bool metal_graph_alloc_raw_cap(
     if (g->index_comp_cache_f16) {
         g->index_comp_stage_cap = prefill_cap / 4u + 2u;
         if (g->index_comp_stage_cap < 2u) g->index_comp_stage_cap = 2u;
-        fprintf(stderr,
-                "ds4: SM75 native F16 indexer cache and streaming WMMA64 enabled\n");
+        if (getenv("DS4_CUDA_NO_INDEXER_STREAMING64") != NULL) {
+            fprintf(stderr,
+                    "ds4: SM75 native F16 indexer cache with F16-input WMMA128 enabled\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: SM75 native F16 indexer cache and streaming WMMA64 enabled\n");
+        }
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -20710,10 +20715,13 @@ static bool metal_graph_indexer_scores_batch(
         const uint64_t q_count = (uint64_t)n_tokens *
                                  DS4_N_INDEXER_HEAD *
                                  DS4_N_INDEXER_HEAD_DIM;
-        return ds4_gpu_tensor_copy_f32_to_f16(
-                    metal_graph_batch_indexer_q_f16(g), 0,
-                    metal_graph_batch_indexer_q(g), 0, q_count) != 0 &&
-               ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
+        if (ds4_gpu_tensor_copy_f32_to_f16(
+                metal_graph_batch_indexer_q_f16(g), 0,
+                metal_graph_batch_indexer_q(g), 0, q_count) == 0) {
+            return false;
+        }
+        if (getenv("DS4_CUDA_NO_INDEXER_STREAMING64") != NULL) {
+            return ds4_gpu_indexer_scores_decode_batch_f16_tensor(
                     metal_graph_indexer_scores(g),
                     metal_graph_batch_indexer_q_f16(g),
                     metal_graph_batch_indexer_weights(g),
@@ -20721,6 +20729,15 @@ static bool metal_graph_indexer_scores_batch(
                     n_comp, n_tokens, pos0,
                     DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
                     ratio, scale) != 0;
+        }
+        return ds4_gpu_indexer_scores_decode_batch_f16_streaming64_tensor(
+                metal_graph_indexer_scores(g),
+                metal_graph_batch_indexer_q_f16(g),
+                metal_graph_batch_indexer_weights(g),
+                g->layer_index_comp_cache[il],
+                n_comp, n_tokens, pos0,
+                DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                ratio, scale) != 0;
     }
 #endif
     return ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -48852,7 +48869,7 @@ static bool engine_sm75_native_indexer_cache_planner_enabled(
     return false;
 #else
     if (!e || e->quality || e->gpu_cfg.n_gpus <= 0 ||
-        getenv("DS4_CUDA_NO_INDEXER_STREAMING64") != NULL) {
+        getenv("DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE") != NULL) {
         return false;
     }
     for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {

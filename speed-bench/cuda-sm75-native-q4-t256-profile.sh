@@ -265,7 +265,7 @@ production_env=(
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
 )
 if [[ $INDEXER_NATIVE_CACHE == 0 ]]; then
-    production_env+=(DS4_CUDA_NO_INDEXER_STREAMING64=1)
+    production_env+=(DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE=1)
 fi
 if [[ $INDEXER_NATIVE_CACHE == 0 && $INDEXER_SCORE_TILE == 64 ]]; then
     production_env+=(DS4_CUDA_NO_INDEXER_WMMA128=1)
@@ -467,7 +467,7 @@ if [[ $INDEXER_NATIVE_CACHE == 1 ]]; then
 else
     expected_indexer_dispatch=wmma$INDEXER_SCORE_TILE
 fi
-for dispatch in direct-one streaming64-native wmma128 wmma64 wmma32 wmma16 generic; do
+for dispatch in direct-one streaming64-native wmma128-f16-native wmma128 wmma64 wmma32 wmma16 generic; do
     audit_line=$(grep -F "ds4: CUDA indexer score audit dispatch=$dispatch " \
         "$base.log" || true)
     [[ $(printf '%s\n' "$audit_line" | grep -c .) == 1 ]] ||

@@ -214,7 +214,7 @@ common_env=(
 
 variant_env() {
     if [[ $1 == legacy-f32 ]]; then
-        printf '%s\0' DS4_CUDA_NO_INDEXER_STREAMING64=1
+        printf '%s\0' DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE=1
     fi
 }
 
@@ -230,7 +230,8 @@ audit_launches() {
 
 validate_variant_log() {
     local variant=$1 log=$2 score_official=${3:-0} require_dispatch=${4:-1}
-    local expected unexpected count
+    local expected count dispatch
+    local -a unexpected
     if [[ $score_official == 1 ]]; then
         grep -Fq 'score_official: runtime_path=production' "$log" ||
             die "$variant did not execute the production runtime path"
@@ -241,21 +242,19 @@ validate_variant_log() {
         "$log" || die "$variant did not use the accepted native-Q4 path"
     if [[ $variant == native-f16 ]]; then
         expected=streaming64-native
-        unexpected=wmma128
+        unexpected=(wmma128 wmma128-f16-native)
         grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' "$log" ||
             die "native arm did not enable the native indexer cache"
     else
         expected=wmma128
-        unexpected=streaming64-native
+        unexpected=(streaming64-native wmma128-f16-native)
         ! grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' "$log" ||
             die "legacy arm unexpectedly enabled the native indexer cache"
     fi
     if [[ $require_dispatch == 1 ]]; then
         count=$(audit_launches "$log" "$expected")
         (( count > 0 )) || die "$variant did not dispatch $expected"
-        count=$(audit_launches "$log" "$unexpected")
-        (( count == 0 )) || die "$variant unexpectedly dispatched $unexpected"
-        for dispatch in wmma64 wmma32 wmma16 generic; do
+        for dispatch in "${unexpected[@]}" wmma64 wmma32 wmma16 generic; do
             count=$(audit_launches "$log" "$dispatch")
             (( count == 0 )) || die "$variant unexpectedly dispatched $dispatch"
         done

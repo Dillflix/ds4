@@ -1857,10 +1857,42 @@ FP4-QAT arithmetic remain F32; each completed K row is rounded once when it is
 committed. This matches the F16 operands that shipping WMMA prefill previously
 created inside every score tile, eliminates the repeated K conversion, and
 reduces the 21-layer 256K indexer cache from about 672 MiB to 336 MiB. Session
-payloads remain F32 so checkpoint files are backend-independent. Set
-`DS4_CUDA_NO_INDEXER_STREAMING64=1` only to obtain the exact legacy-F32
-production control; it is not an automatic runtime fallback on a qualifying
-SM75 graph.
+payloads remain F32 so checkpoint files are backend-independent. The diagnostic
+controls are independent: `DS4_CUDA_NO_INDEXER_NATIVE_F16_CACHE=1` selects the
+legacy F32 cache and WMMA128 scorer, while `DS4_CUDA_NO_INDEXER_STREAMING64=1`
+keeps the native F16 cache but selects the F16-input WMMA128 scorer. Neither is
+an automatic runtime fallback on a qualifying SM75 graph.
+
+`cuda-sm75-indexer-native-controls.sh` isolates cache representation from score
+kernel structure in one interleaved three-arm test:
+
+1. legacy F32 cache + WMMA128;
+2. native F16 cache + F16-input WMMA128;
+3. native F16 cache + streaming WMMA64.
+
+It preserves complete balanced dense-FP16 admission while suppressing partner
+projection execution and attention row splitting, requires an unambiguous
+dispatch audit for each arm, and byte-compares every frontier-logit artifact.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+CTX_START=2048 \
+CTX_MAX=16384 \
+CTX_ALLOC=262273 \
+REPEATS=1 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-indexer-native-controls.sh
+```
+
+Return `sm75-indexer-native-controls-<timestamp>.tar.gz`.
 
 `cuda-sm75-indexer-native-cache-production-ab.sh` is the promotion gate. It
 tests aligned and 63-row-tail streaming tiles, compares the native one-token
