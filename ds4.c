@@ -15481,6 +15481,36 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
            n_raw > n_tokens / 2u;
 }
 
+/* Pure policy helpers remain outside the GPU graph implementation so the CPU
+ * placement binary compiles and tests the exact production row math. */
+static uint32_t metal_graph_cuda_tp_prefill_rows_for_share(
+        uint32_t n_tokens,
+        uint32_t home_permille) {
+    if (n_tokens < 256u) return n_tokens / 2u;
+    if (home_permille < 250u || home_permille > 750u) home_permille = 500u;
+    uint64_t wanted = ((uint64_t)n_tokens * home_permille + 500u) / 1000u;
+    uint32_t rows = (uint32_t)((wanted + 32u) & ~UINT64_C(63));
+    uint32_t min_rows = 128u;
+    if (min_rows * 2u > n_tokens) min_rows = n_tokens / 4u;
+    if (rows < min_rows) rows = min_rows;
+    if (rows > n_tokens - min_rows) rows = n_tokens - min_rows;
+    return rows;
+}
+
+static uint32_t metal_graph_cuda_tp_prefill_calibrated_permille(
+        float home_ms,
+        float partner_ms) {
+    if (!(home_ms > 0.0f) || !(partner_ms > 0.0f) ||
+        !isfinite(home_ms) || !isfinite(partner_ms)) return 500u;
+    /* Equal calibration rows imply rate_h/rate_p == partner_ms/home_ms. */
+    const double share = (double)partner_ms /
+                         ((double)home_ms + (double)partner_ms);
+    uint32_t permille = (uint32_t)llround(share * 1000.0);
+    if (permille < 250u) permille = 250u;
+    if (permille > 750u) permille = 750u;
+    return permille;
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -20686,6 +20716,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_active(
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t n_raw);
+static bool metal_graph_cuda_timeline_pushf(const char *fmt, ...);
+static void metal_graph_cuda_timeline_pop(bool active);
 
 static bool metal_graph_store_index_comp_stage(
         ds4_gpu_graph *g,
@@ -20875,7 +20907,6 @@ static bool metal_graph_indexer_scores_batch(
         uint32_t       n_comp,
         uint32_t       n_tokens,
         uint32_t       pos0,
-        uint32_t       n_raw,
         uint32_t       ratio,
         float          scale) {
     return metal_graph_indexer_scores_batch_on(
@@ -21025,38 +21056,6 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
     return true;
 }
 
-/* Convert a calibrated home share to a tile-friendly row boundary.  The
- * clamp guarantees that both devices receive useful work; 64-row alignment
- * matches the native F16 indexer tile and is also friendly to the attention
- * kernels. An uncalibrated pair uses 50/50. */
-static uint32_t metal_graph_cuda_tp_prefill_rows_for_share(
-        uint32_t n_tokens,
-        uint32_t home_permille) {
-    if (n_tokens < 256u) return n_tokens / 2u;
-    if (home_permille < 250u || home_permille > 750u) home_permille = 500u;
-    uint64_t wanted = ((uint64_t)n_tokens * home_permille + 500u) / 1000u;
-    uint32_t rows = (uint32_t)((wanted + 32u) & ~UINT64_C(63));
-    uint32_t min_rows = 128u;
-    if (min_rows * 2u > n_tokens) min_rows = n_tokens / 4u;
-    if (rows < min_rows) rows = min_rows;
-    if (rows > n_tokens - min_rows) rows = n_tokens - min_rows;
-    return rows;
-}
-
-static uint32_t metal_graph_cuda_tp_prefill_calibrated_permille(
-        float home_ms,
-        float partner_ms) {
-    if (!(home_ms > 0.0f) || !(partner_ms > 0.0f) ||
-        !isfinite(home_ms) || !isfinite(partner_ms)) return 500u;
-    /* Equal calibration rows imply rate_h/rate_p == partner_ms/home_ms. */
-    const double share = (double)partner_ms /
-                         ((double)home_ms + (double)partner_ms);
-    uint32_t permille = (uint32_t)llround(share * 1000.0);
-    if (permille < 250u) permille = 250u;
-    if (permille > 750u) permille = 750u;
-    return permille;
-}
-
 static bool metal_graph_cuda_tp_prefill_indexer_rows_active(
         const ds4_gpu_graph *g,
         uint32_t             il,
@@ -21091,6 +21090,7 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
         uint32_t       n_comp,
         uint32_t       n_tokens,
         uint32_t       pos0,
+        uint32_t       n_raw,
         uint32_t       ratio,
         float          scale) {
 #if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
@@ -28071,9 +28071,6 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_DECODE_MIXED = 2,
     DS4_CUDA_PREFILL_ATTN_INDEXED = 3,
 } ds4_cuda_prefill_attn_kind;
-
-static bool metal_graph_cuda_timeline_pushf(const char *fmt, ...);
-static void metal_graph_cuda_timeline_pop(bool active);
 
 static bool metal_graph_cuda_tp_prefill_heads_active(
         const ds4_gpu_graph *g,
