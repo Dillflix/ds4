@@ -2309,4 +2309,18 @@ bash ./speed-bench/cuda-sm75-indexed-q4down-next.sh
 ```
 
 Set `RUN_PRODUCTION=0` for the quick exact-output and bounded-harness gate.
+After an interrupted or rejected production run, set `RESUME=1` and point
+`OUTPUT_DIR` at its existing unarchived result directory. Completed slots are
+revalidated and reused; missing slots alone are executed. For example:
+
+```bash
+RESUME=1 \
+OUTPUT_DIR="$PWD/sm75-indexed-q4down-next-20260828T173339Z" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+CTX_START=8192 CTX_MAX=32768 CTX_ALLOC=32769 STEP_MUL=4 \
+REPEATS=2 HARNESS_REPEATS=7 SKIP_BUILD=1 RUN_PRODUCTION=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-indexed-q4down-next.sh
+```
+
 Return `sm75-indexed-q4down-next-<timestamp>.tar.gz`.

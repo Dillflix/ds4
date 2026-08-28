@@ -23,6 +23,7 @@ HARNESS_REPEATS=${HARNESS_REPEATS:-7}
 SKIP_BUILD=${SKIP_BUILD:-0}
 RUN_PRODUCTION=${RUN_PRODUCTION:-1}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+RESUME=${RESUME:-0}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/sm75-indexed-q4down-next-$(date -u +%Y%m%dT%H%M%SZ)}
 
 [[ -f $MODEL ]] || die "model not found: $MODEL"
@@ -33,7 +34,7 @@ for pair in \
     "PREFILL_CHUNK:$PREFILL_CHUNK" "PIPELINE_MB:$PIPELINE_MB" \
     "REPEATS:$REPEATS" "HARNESS_REPEATS:$HARNESS_REPEATS" \
     "SKIP_BUILD:$SKIP_BUILD" "RUN_PRODUCTION:$RUN_PRODUCTION" \
-    "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+    "CREATE_ARCHIVE:$CREATE_ARCHIVE" "RESUME:$RESUME"; do
     name=${pair%%:*}; value=${pair#*:}
     is_uint "$value" || die "$name must be an unsigned integer"
 done
@@ -41,7 +42,8 @@ done
 (( CTX_START > 0 && CTX_MAX >= CTX_START && CTX_ALLOC > CTX_MAX )) ||
     die "invalid context bounds"
 (( REPEATS > 0 && HARNESS_REPEATS > 0 )) || die "repeat counts must be positive"
-(( SKIP_BUILD <= 1 && RUN_PRODUCTION <= 1 && CREATE_ARCHIVE <= 1 )) ||
+(( SKIP_BUILD <= 1 && RUN_PRODUCTION <= 1 && CREATE_ARCHIVE <= 1 &&
+   RESUME <= 1 )) ||
     die "boolean controls must be 0 or 1"
 
 mkdir -p "$OUTPUT_DIR"/{harness,production,provenance}
@@ -143,31 +145,49 @@ if [[ $RUN_PRODUCTION == 1 ]]; then
             [[ $variant == indexed8 || $variant == both ]] && heads8=1
             [[ $variant == down-stage8 || $variant == both ]] && stage8=1
             base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
-            logits="$base-logits"; mkdir -p "$logits"
-            printf 'Production candidate A/B repeat=%d/%d slot=%d variant=%s...\n' \
-                "$repeat" "$REPEATS" "$slot" "$variant"
-            "${clean[@]}" \
-                DS4_CUDA_EP_STAGE_SPLIT=22 \
-                DS4_CUDA_PREFILL_PIPELINE=1 \
-                "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB" \
-                DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
-                DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
-                DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
-                DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \
-                DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
-                "DS4_CUDA_INDEXED_HEADS8_SM75=$heads8" \
-                "DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=$stage8" \
-                ./ds4-bench --cuda --cuda-tensor-parallel \
-                    --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-                    --model "$MODEL" --prompt-file "$PROMPT" \
-                    --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
-                    --ctx-alloc "$CTX_ALLOC" --step-mul "$STEP_MUL" \
-                    --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
-                    --csv "$base.csv" --dump-frontier-logits-dir "$logits" \
-                    >"$base.log" 2>&1 || {
-                        tail -n 200 "$base.log" >&2
-                        die "$variant production run failed"
-                    }
+            logits="$base-logits"
+            reusable=0
+            if [[ $RESUME == 1 && -s $base.csv && -s $base.log &&
+                  -d $logits &&
+                  -s $logits/frontier_$(printf '%06d' "$CTX_START").logits.f32 &&
+                  -s $logits/frontier_$(printf '%06d' "$CTX_MAX").logits.f32 ]]; then
+                reusable=1
+            fi
+            if [[ $reusable == 1 ]]; then
+                printf 'Reusing production A/B repeat=%d/%d slot=%d variant=%s...\n' \
+                    "$repeat" "$REPEATS" "$slot" "$variant"
+            else
+                [[ $base == "$OUTPUT_DIR"/production/r*-s*-* &&
+                   $logits == "$OUTPUT_DIR"/production/r*-s*-*-logits ]] ||
+                    die "refusing to replace output outside the production run directory"
+                rm -rf -- "$logits"
+                rm -f -- "$base.csv" "$base.log"
+                mkdir -p "$logits"
+                printf 'Production candidate A/B repeat=%d/%d slot=%d variant=%s...\n' \
+                    "$repeat" "$REPEATS" "$slot" "$variant"
+                "${clean[@]}" \
+                    DS4_CUDA_EP_STAGE_SPLIT=22 \
+                    DS4_CUDA_PREFILL_PIPELINE=1 \
+                    "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB" \
+                    DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
+                    DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
+                    DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
+                    DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \
+                    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
+                    "DS4_CUDA_INDEXED_HEADS8_SM75=$heads8" \
+                    "DS4_CUDA_MOE_Q4_32_DOWN_STAGE8_SM75=$stage8" \
+                    ./ds4-bench --cuda --cuda-tensor-parallel \
+                        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+                        --model "$MODEL" --prompt-file "$PROMPT" \
+                        --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" \
+                        --ctx-alloc "$CTX_ALLOC" --step-mul "$STEP_MUL" \
+                        --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
+                        --csv "$base.csv" --dump-frontier-logits-dir "$logits" \
+                        >"$base.log" 2>&1 || {
+                            tail -n 200 "$base.log" >&2
+                            die "$variant production run failed"
+                        }
+            fi
             grep -Fq 'materialized 344/344 candidates' "$base.log" ||
                 die "$variant did not retain complete dense-F16 admission"
             grep -Fq 'dense-placement=stage-aware-fixed-22-21' "$base.log" ||
@@ -175,7 +195,8 @@ if [[ $RUN_PRODUCTION == 1 ]]; then
             grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
                 die "$variant omitted indexed row splitting"
             if [[ $heads8 == 1 ]]; then
-                grep -Fq 'indexed attention shard candidate selected' "$base.log" ||
+                grep -Fq 'indexed attention candidate selected: 8 heads / 256 threads' \
+                    "$base.log" ||
                     die "$variant omitted the indexed8 dispatch"
             fi
             if [[ $stage8 == 1 ]]; then
