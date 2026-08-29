@@ -1956,29 +1956,30 @@ Return `sm75-indexer-native-controls-<timestamp>.tar.gz`.
 
 After the cache/scorer controls are separated, use
 `cuda-sm75-xdev-feature-isolation.sh` to reintroduce the two high-volume
-cross-device mechanisms independently. It fixes the native F16 cache and
-streaming64 scorer, then runs `neither`, `partner-only`, `rows-only`, and
-`both` in a fixed safety order. Every arm records per-GPU telemetry and a
-durable active-arm journal before launch; successful arms must expose their
-requested runtime paths. Row splitting must remain byte-exact within each
-partner-arithmetic state (`neither` versus `rows-only`, and `partner-only`
-versus `both`). The partner toggle is recorded but is not exactness-gated,
-because native-Q8 fallback and FP16-expanded cuBLAS are intentionally different
-arithmetic paths.
+cross-device mechanisms independently. It keeps the full 344/344 dense cache,
+stage-aware 22/21 placement, automatic T32/T256/shared-down partner classes,
+native F16 index cache, and streaming64 scorer fixed, then runs `neither`,
+`partner-only`, `rows-only`, and `both` in a fixed safety order. Every arm
+records per-GPU telemetry and a durable active-arm journal before launch;
+successful arms must expose their requested runtime paths. Row splitting must
+remain byte-exact within each partner-arithmetic state (`neither` versus
+`rows-only`, and `partner-only` versus `both`). The partner toggle is recorded
+but is not exactness-gated, because native-Q8 fallback and FP16-expanded cuBLAS
+are intentionally different arithmetic paths.
 
 ```bash
 cd ~/ds4-iq2-q4
 git pull --ff-only
 
-export MODEL="$PWD/gguf/DeepSeek-V4-Flash-0731-Q4-IQ2-FullF16-256K-SM75.gguf"
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 CTX_START=2048 \
-CTX_MAX=16384 \
-CTX_ALLOC=262273 \
+CTX_MAX=32768 \
+CTX_ALLOC=32769 \
 REPEATS=1 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-xdev-feature-isolation.sh

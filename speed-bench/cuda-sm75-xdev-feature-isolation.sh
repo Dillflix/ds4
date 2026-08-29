@@ -6,10 +6,10 @@ usage() {
 Run a four-arm SM75 cross-device production isolation while holding the native
 F16 indexer cache and streaming64 scorer constant:
 
-  neither        partner T256 execution off, attention row split off
-  partner-only   partner T256 execution on,  attention row split off
-  rows-only      partner T256 execution off, attention row split on
-  both           partner T256 execution on,  attention row split on
+  neither        production partner execution off, attention row split off
+  partner-only   production partner execution on,  attention row split off
+  rows-only      production partner execution off, attention row split on
+  both           production partner execution on,  attention row split on
 
 The arms run in that fixed safety order. Before every arm, the runner persists
 the active-arm identity and starts one-second per-GPU telemetry. If the host
@@ -25,8 +25,8 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   CTX_START=2048
-  CTX_MAX=16384
-  CTX_ALLOC=262273
+  CTX_MAX=32768
+  CTX_ALLOC=32769
   REPEATS=1
   TELEMETRY_INTERVAL_MS=1000
   SKIP_BUILD=0
@@ -49,14 +49,14 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 MODEL=${MODEL:-}
 [[ $MODEL == /* && -f $MODEL ]] ||
-    die "MODEL must name the existing absolute tagged mixed-Q4/IQ2 model"
+    die "MODEL must name the existing absolute tagged SM75 model"
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_START=${CTX_START:-2048}
-CTX_MAX=${CTX_MAX:-16384}
-CTX_ALLOC=${CTX_ALLOC:-262273}
+CTX_MAX=${CTX_MAX:-32768}
+CTX_ALLOC=${CTX_ALLOC:-32769}
 REPEATS=${REPEATS:-1}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-1000}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -197,6 +197,8 @@ if [[ -n $REUSE_XDEV_DIR ]]; then
                     "ctx_alloc=$CTX_ALLOC" "repeats=$REPEATS" \
                     "indexer_cache=native-f16" \
                     "indexer_scorer=streaming64" \
+                    "dense_placement=stage-aware-fixed-22-21" \
+                    "partner_classes=automatic:t32,t256,shared_down" \
                     "arm_order=neither,partner-only,rows-only,both"; do
         grep -Fxq "$expected" "$REUSE_XDEV_DIR/manifest.txt" ||
             die "reuse manifest does not match this run: $expected"
@@ -213,6 +215,8 @@ fi
     printf 'ctx_start=%s\nctx_max=%s\nctx_alloc=%s\nrepeats=%s\n' \
         "$CTX_START" "$CTX_MAX" "$CTX_ALLOC" "$REPEATS"
     printf 'indexer_cache=native-f16\nindexer_scorer=streaming64\n'
+    printf 'dense_placement=stage-aware-fixed-22-21\n'
+    printf 'partner_classes=automatic:t32,t256,shared_down\n'
     printf 'arm_order=neither,partner-only,rows-only,both\n'
     printf 'reuse_xdev_dir=%s\n' "${REUSE_XDEV_DIR:-none}"
     printf 'telemetry_interval_ms=%s\n' "$TELEMETRY_INTERVAL_MS"
@@ -276,8 +280,10 @@ validate_variant_log() {
         "$log" || die "$variant did not use the fixed production split"
     grep -Fq 'SM75 native F16 indexer cache and streaming WMMA64 enabled' \
         "$log" || die "$variant did not keep native F16 streaming64 enabled"
-    grep -Fq 't256-placement=balanced' "$log" ||
-        die "$variant missed balanced T256 placement"
+    grep -Fq 'partner-classes=automatic:t32,t256,shared_down' "$log" ||
+        die "$variant missed the production partner classes"
+    grep -Fq 't256-placement=stage-aware dense-placement=stage-aware-fixed-22-21' \
+        "$log" || die "$variant missed stage-aware dense placement"
     grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
         die "$variant did not preserve complete dense-FP16 admission"
     ! grep -Fq 'required but unavailable' "$log" ||
@@ -331,8 +337,6 @@ common_env=(
     DS4_CUDA_PREFILL_PIPELINE=1
     DS4_CUDA_PREFILL_PIPELINE_MB=512
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
-    DS4_CUDA_Q8_T256_PLACEMENT=balanced
-    DS4_CUDA_Q8_F16_PARTNER_CLASSES=t256
     DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048
     DS4_CUDA_TP_PREFILL_ATTN_HEADS=0
     DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
