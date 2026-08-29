@@ -11,6 +11,9 @@ extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_mapping(void);
+extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
+extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_ksplit(void);
+extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -1126,6 +1129,58 @@ static int check_sm75_q3a4_dp4a_pack(void) {
     return 0;
 }
 
+static int require_nonzero_f32(const char *label, const float *values,
+                               uint64_t count) {
+    for (uint64_t i = 0; i < count; i++)
+        if (values[i] != 0.0f) return 1;
+    fprintf(stderr, "%s unexpectedly contains only zero values\n", label);
+    return 0;
+}
+
+static int check_sm75_q3a4_ksplit_env(void) {
+    int rc = 1;
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING", "tile32-dp4a", 1) != 0 ||
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "2", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 2u) goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "3", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0 ||
+        setenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING", "1", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 0u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+    rc = 0;
+
+cleanup:
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
+    (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (rc == 0 &&
+        (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u)) rc = 1;
+    fputs(rc == 0
+              ? "cuda-regression: SM75 Q3A4 K1/K2/K4 environment selector exact\n"
+              : "cuda-regression: SM75 Q3A4 K-split environment selector failed\n",
+          stderr);
+    return rc;
+}
+
 /* Exercise the exact six-node production CUDA Graph through the real
  * owned-expert API.  The full-expert dispatcher is the independent reference;
  * home slots plus fixed-three partner output are combined exactly as ds4.c
@@ -1226,7 +1281,15 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                 home_slots, false, shared_prequant) ||
             !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(mid, 0, mid_refh, mid_bytes) ||
-            !ds4_gpu_tensor_read(home_slots, 0, home_refh, slot_bytes))
+            !ds4_gpu_tensor_read(home_slots, 0, home_refh, slot_bytes) ||
+            (gate_type == 43u &&
+             !require_nonzero_f32("SM75 Q3A4 K-split reference intermediate",
+                                  mid_refh,
+                                  (uint64_t)n_expert * mid_dim)) ||
+            (gate_type == 43u &&
+             !require_nonzero_f32("SM75 Q3A4 K-split reference owned output",
+                                  home_refh,
+                                  (uint64_t)n_expert * out_dim)))
             goto cleanup;
         ds4_gpu_test_set_moe_q32_decode_split(1);
         if (!ds4_gpu_routed_moe_one_owned_tensor(
@@ -1267,6 +1330,7 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
         }
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
         if (gate_type == 43u) {
+            ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
             for (uint32_t mapping = 1u; mapping <= 3u; mapping++) {
                 ds4_gpu_test_set_moe_q3a4_decode_mapping(mapping);
                 if (!ds4_gpu_routed_moe_one_owned_tensor(
@@ -1289,6 +1353,32 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                         home_refh, home_splith,
                         (size_t)n_expert * out_dim)) goto cleanup;
             }
+            /* K2/K4 retain mapping 3 and only redistribute its independent
+             * K256 leaves among cooperating warps in the same CTA. */
+            ds4_gpu_test_set_moe_q3a4_decode_mapping(3u);
+            for (uint32_t ksplit = 2u; ksplit <= 4u; ksplit *= 2u) {
+                ds4_gpu_test_set_moe_q3a4_decode_ksplit(ksplit);
+                if (!ds4_gpu_routed_moe_one_owned_tensor(
+                        tmp_out, gate, up, mid, down, model, model_bytes,
+                        gate_off, up_off, down_off, gate_type, 42u,
+                        gate_expert, gate_row, down_expert, down_row,
+                        in_dim, mid_dim, out_dim, selected, weights,
+                        n_total, n_expert, 0u, 4u, 10.0f, x,
+                        home_slots, false, shared_prequant) ||
+                    !ds4_gpu_synchronize() ||
+                    !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+                    !ds4_gpu_tensor_read(home_slots, 0, home_splith,
+                                         slot_bytes) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 K-split gate/up intermediate",
+                        mid_refh, mid_splith,
+                        (size_t)n_expert * mid_dim) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 K-split owned output",
+                        home_refh, home_splith,
+                        (size_t)n_expert * out_dim)) goto cleanup;
+            }
+            ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
             ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
         }
         if (!ds4_gpu_routed_moe_one_owned_tensor(
@@ -1343,6 +1433,8 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
             gate_type == 43u
                 ? "cuda-regression: SM75 Q3A4 hwarp16/tile32/dp4a gate/up "
                   "and owned decode exact/reuse\n"
+                  "cuda-regression: SM75 Q3A4 tile32-dp4a K1/K2/K4 "
+                  "in-CTA gate/up and owned decode exact/reuse\n"
                 : "");
     rc = 0;
 
@@ -1350,6 +1442,7 @@ cleanup:
     ds4_gpu_test_set_moe_q32_decode_split(0);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
     ds4_gpu_test_set_moe_q32_decode_graph(1);
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
@@ -2043,6 +2136,8 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
+    if (check_sm75_q3a4_ksplit_env() != 0) return 1;
     if (check_sm75_q3a4_dp4a_pack() != 0) return 1;
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
@@ -2054,6 +2149,13 @@ int main(void) {
         fprintf(stderr,
                 "cuda-regression: SM75 Q3A4 production mapping is not "
                 "tile32-dp4a\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
+    if (ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q3A4 production K split is not K1\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;

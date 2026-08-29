@@ -29,6 +29,40 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q3a4-native.sh
 ```
 
+### SM75 Q3A4 exact in-CTA K-split
+
+`cuda-sm75-decode-q3a4-ksplit.sh` keeps the production tile32 signed-DP4A
+kernel as K1 and tests Q3A4-only K2 and K4 CTA mappings. Two or four warps
+cooperate on each native eight-row tile, write disjoint K256 leaves to the
+same 4 KiB shared table, then the split-zero warp executes the unchanged
+16-leaf `__fadd_rn` tree. This is an in-CTA experiment: it adds no global
+partial buffer, reducer launch, atomic, or multi-GPU boundary.
+
+The runner requires nonzero byte-exact gate/up intermediates and owned output,
+memcheck of the 512-thread K4 case, fresh PTXAS/SASS identities, DP4A with no
+atomics, zero stack/spill/local traffic, and at most 64 allocated registers for
+K2/K4. Inclusive timing compares each candidate directly with production K1
+and includes activation quantize/pack, gate/up, mid quantize/pack, and Q4-32
+down. Focused Nsight captures report duration, memory traffic, occupancy, and
+scheduler stalls. K1 remains the default until a separate end-to-end A/B
+accepts a measured winner.
+
+The bounded harness materializes a zero-valued synthetic expert payload. Its
+timings compare inclusive launch/resource structure, but do not establish
+real-weight cache or DRAM behavior; production promotion therefore requires
+the separate real-model end-to-end A/B.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection

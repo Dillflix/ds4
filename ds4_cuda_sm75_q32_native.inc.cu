@@ -510,6 +510,149 @@ moe_gate_up_mid_decode_sm75_q3a4_tile32_owned_kernel(
     }
 }
 
+/* Q3A4-only exact in-CTA K-split candidates.  K_SPLIT warps cooperate on
+ * each native eight-row tile while retaining the K1 kernel's complete
+ * 16-leaf table.  That is intentional: after the CTA barrier the split-zero
+ * warps execute the identical explicit floating-point tree, so moving an
+ * independent K256 record to another warp cannot change accumulation order.
+ *
+ * K2 uses 8 warps (four row groups x two K partitions); K4 uses 16.  Both
+ * launch-bound specializations target all 32 resident SM75 warps without
+ * changing the 32-row CTA span or the 4 KiB shared-memory footprint. */
+template <uint32_t K_SPLIT>
+__global__ __launch_bounds__(128u * K_SPLIT, 8u / K_SPLIT) static void
+moe_gate_up_mid_decode_sm75_q3a4_tile32_ksplit_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    static_assert(K_SPLIT == 2u || K_SPLIT == 4u,
+                  "Q3A4 decode K split must be 2 or 4");
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t split = warp >> 2u;
+    const uint32_t row_group = warp & 3u;
+    const uint32_t row8 = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t block_row0 = blockIdx.x * 32u;
+    const uint32_t row0 = block_row0 + row_group * 8u;
+    const uint32_t slot = blockIdx.y;
+    __shared__ float gate_part[4][16][8];
+    __shared__ float up_part[4][16][8];
+
+    /* These exits are CTA-uniform.  Row-group tails may not return before the
+     * block barrier below; they simply skip their record work and final store. */
+    if (slot >= 6u || block_row0 >= expert_mid_dim || xq_blocks != 16u)
+        return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (split == 0u && lane < 8u && row0 + lane < expert_mid_dim)
+            mid_out[(uint64_t)slot * expert_mid_dim + row0 + lane] = 0.0f;
+        return;
+    }
+
+    const bool row_group_valid = row0 < expert_mid_dim;
+    if (row_group_valid) {
+        for (uint32_t b = split; b < 16u; b += K_SPLIT) {
+            const cuda_sm75_q3a4_tile *gate_w =
+                sm75_q32_ops<true>::record(gate_base, expert, row0,
+                                           expert_mid_dim, xq_blocks, b);
+            const cuda_sm75_q3a4_tile *up_w =
+                sm75_q32_ops<true>::record(up_base, expert, row0,
+                                           expert_mid_dim, xq_blocks, b);
+            const cuda_sm75_native_q8_K *a = xq + b;
+            int gate_total = 0, up_total = 0;
+            int gate_correction = 0, up_correction = 0;
+#pragma unroll 1
+            for (uint32_t group = 0; group < 8u; group++) {
+                const uint32_t gate_qw = sm75_q32_dilate_q3(
+                    gate_w->low2[group][lane], gate_w->high[group][lane]);
+                const uint32_t up_qw = sm75_q32_dilate_q3(
+                    up_w->low2[group][lane], up_w->high[group][lane]);
+                const uint32_t lo = a->low[group][lane4];
+                const uint32_t hi = a->high_signed[group][lane4];
+                const uint32_t nibble_mask = 0x0f0f0f0fu;
+                const uint32_t a_even =
+                    (lo & nibble_mask) | ((hi & nibble_mask) << 4u);
+                const uint32_t a_odd =
+                    ((lo >> 4u) & nibble_mask) | (hi & 0xf0f0f0f0u);
+                const uint32_t gate_even = gate_qw & nibble_mask;
+                const uint32_t gate_odd =
+                    (gate_qw >> 4u) & nibble_mask;
+                const uint32_t up_even = up_qw & nibble_mask;
+                const uint32_t up_odd = (up_qw >> 4u) & nibble_mask;
+                int gate_sum = __dp4a((int)a_even, (int)gate_even, 0);
+                gate_sum = __dp4a((int)a_odd, (int)gate_odd, gate_sum);
+                int up_sum = __dp4a((int)a_even, (int)up_even, 0);
+                up_sum = __dp4a((int)a_odd, (int)up_odd, up_sum);
+                const int gate1 =
+                    __shfl_sync(0xffffffffu, gate_sum, 1, 4);
+                const int gate2 =
+                    __shfl_sync(0xffffffffu, gate_sum, 2, 4);
+                const int gate3 =
+                    __shfl_sync(0xffffffffu, gate_sum, 3, 4);
+                const int up1 = __shfl_sync(0xffffffffu, up_sum, 1, 4);
+                const int up2 = __shfl_sync(0xffffffffu, up_sum, 2, 4);
+                const int up3 = __shfl_sync(0xffffffffu, up_sum, 3, 4);
+                if (lane4 == 0u) {
+                    const int gate_group =
+                        ((gate_sum + gate1) + gate2) + gate3;
+                    const int up_group = ((up_sum + up1) + up2) + up3;
+                    const int bsum = (int)a->bsums[2u * group] +
+                                     (int)a->bsums[2u * group + 1u];
+                    gate_total += (int)sm75_q32_u4(
+                        gate_w->scales[row8], group) * gate_group;
+                    up_total += (int)sm75_q32_u4(
+                        up_w->scales[row8], group) * up_group;
+                    gate_correction += (int)sm75_q32_u4(
+                        gate_w->mins[row8], group) * bsum;
+                    up_correction += (int)sm75_q32_u4(
+                        up_w->mins[row8], group) * bsum;
+                }
+            }
+            if (lane4 == 0u) {
+                gate_part[row_group][b][row8] = a->d * (
+                    dev_f16_to_f32(gate_w->d[row8]) * (float)gate_total -
+                    dev_f16_to_f32(gate_w->dmin[row8]) *
+                        (float)gate_correction);
+                up_part[row_group][b][row8] = a->d * (
+                    dev_f16_to_f32(up_w->d[row8]) * (float)up_total -
+                    dev_f16_to_f32(up_w->dmin[row8]) *
+                        (float)up_correction);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (split != 0u || !row_group_valid) return;
+    /* Keep this tree byte-for-byte aligned with the production K1 kernel. */
+    float gate = __fadd_rn(
+        __fadd_rn(gate_part[row_group][lane4][row8],
+                  gate_part[row_group][lane4 + 8u][row8]),
+        __fadd_rn(gate_part[row_group][lane4 + 4u][row8],
+                  gate_part[row_group][lane4 + 12u][row8]));
+    float up = __fadd_rn(
+        __fadd_rn(up_part[row_group][lane4][row8],
+                  up_part[row_group][lane4 + 8u][row8]),
+        __fadd_rn(up_part[row_group][lane4 + 4u][row8],
+                  up_part[row_group][lane4 + 12u][row8]));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 2, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 2, 4));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 1, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 1, 4));
+    if (lane4 == 0u && row0 + row8 < expert_mid_dim) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row0 + row8] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
 /* Single-launch low-register gate/up candidates.  Unlike the rejected split
  * experiment these preserve one owned-slot traversal, keep the gate and up
  * outputs in registers, and avoid global intermediates and a combine launch.
