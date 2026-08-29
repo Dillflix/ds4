@@ -1961,11 +1961,16 @@ stage-aware 22/21 placement, automatic T32/T256/shared-down partner classes,
 native F16 index cache, and streaming64 scorer fixed, then runs `neither`,
 `partner-only`, `rows-only`, and `both` in a fixed safety order. Every arm
 records per-GPU telemetry and a durable active-arm journal before launch;
-successful arms must expose their requested runtime paths. Row splitting must
-remain byte-exact within each partner-arithmetic state (`neither` versus
-`rows-only`, and `partner-only` versus `both`). The partner toggle is recorded
-but is not exactness-gated, because native-Q8 fallback and FP16-expanded cuBLAS
-are intentionally different arithmetic paths.
+successful arms must expose their requested runtime paths. Each new arm also
+exports its dense-FP16 placement plan. Row splitting allocates partner-side
+state before the stage-aware dense planner runs, so separately launched arms
+can select different local/partner bindings even when all 344 weights remain
+cached. The runner therefore reports NRMSE, maximum delta, top-1 agreement,
+top-10 overlap, planned-partner counts, and exact placement-plan equality in
+`production/logit-comparisons.csv`; it does not mislabel a cache-confounded
+cross-process comparison as a row-split exactness test. The partner toggle is
+also informational because native-Q8 fallback and FP16-expanded cuBLAS are
+intentionally different arithmetic paths.
 
 ```bash
 cd ~/ds4-iq2-q4

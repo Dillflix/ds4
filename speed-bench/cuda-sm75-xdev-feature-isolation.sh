@@ -37,7 +37,9 @@ Optional environment:
 REUSE_XDEV_DIR is fail-closed: an arm is reused only when its CSV, log,
 frontier logits, and telemetry are all present and pass the same production
 path validation as a newly executed arm. Missing arms run normally into a new
-output directory; the prior directory and archive are never modified.
+output directory; the prior directory and archive are never modified. Older
+partial runs without plan CSVs may be reused, but their cache-placement
+comparison is reported as unavailable rather than inferred from logits.
 EOF
 }
 
@@ -99,7 +101,7 @@ done
     die "CTX_MAX must be reachable from CTX_START by doubling"
 expected_frontier_files=$((2 * ${#expected_contexts[@]}))
 
-for tool in awk basename cat cmp cp date dirname env find git grep kill make \
+for tool in awk basename cat cp date dirname env find git grep kill make \
             mkdir mv nproc nvidia-smi python3 rm sleep sort stat sync tail tar \
             tee tr; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -274,6 +276,15 @@ audit_launches() {
     printf '%s\n' "$line"
 }
 
+planned_partner_count() {
+    local log=$1 line
+    line=$(grep -F 'CUDA q8 fp16 stage-aware 22/21 planner selected ' "$log" |
+        tail -n 1 || true)
+    [[ $line =~ selected[[:space:]]([0-9]+)/([0-9]+)[[:space:]]movable ]] ||
+        die "cannot parse stage-aware partner count in $log"
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 validate_variant_log() {
     local variant=$1 log=$2 partner=$3 rows=$4 count dispatch line calls
     grep -Fq "CUDA EP forced pipeline split $STAGE_SPLIT/$((43-STAGE_SPLIT))" \
@@ -345,7 +356,7 @@ common_env=(
 
 variants=(neither partner-only rows-only both)
 phase=production-isolation
-printf 'repeat,slot,variant,partner,rows,csv,log,logits,telemetry\n' \
+printf 'repeat,slot,variant,partner,rows,planned_partner,csv,log,logits,telemetry,plan\n' \
     >"$OUTPUT_DIR/production/runs.csv"
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
     no_partner_logits=
@@ -362,11 +373,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         fi
         base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
         logits="$base-logits"
+        plan="$base-plan.csv"
         telemetry="$OUTPUT_DIR/telemetry/r${repeat}-s${slot}-$variant.csv"
         reused=0
         if [[ -n $REUSE_XDEV_DIR ]]; then
             source_base="$REUSE_XDEV_DIR/production/r${repeat}-s${slot}-$variant"
             source_logits="$source_base-logits"
+            source_plan="$source_base-plan.csv"
             source_telemetry="$REUSE_XDEV_DIR/telemetry/r${repeat}-s${slot}-$variant.csv"
             reuse_present=0
             for source in "$source_base.csv" "$source_base.log" \
@@ -385,6 +398,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 cp -a -- "$source_base.log" "$base.log"
                 cp -a -- "$source_logits" "$logits"
                 cp -a -- "$source_telemetry" "$telemetry"
+                if [[ -s $source_plan ]]; then
+                    cp -a -- "$source_plan" "$plan"
+                fi
                 reused=1
             fi
         fi
@@ -396,6 +412,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 "$partner" "$rows" starting
             start_telemetry "$telemetry"
             if "${clean[@]}" "${mode_env[@]}" "${common_env[@]}" \
+                    "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$plan" \
                     ./ds4-bench --cuda --cuda-tensor-parallel \
                         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
                         --model "$MODEL" --prompt-file "$PROMPT" \
@@ -422,6 +439,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "$variant did not produce usable GPU telemetry"
         [[ -s $base.csv ]] || die "$variant omitted benchmark CSV"
         validate_variant_log "$variant" "$base.log" "$partner" "$rows"
+        planned_partner=$(planned_partner_count "$base.log")
+        if (( reused == 0 )); then
+            [[ -s $plan ]] || die "$variant omitted Q8 placement plan CSV"
+        fi
 
         mapfile -t candidate_files < <(find "$logits" -maxdepth 1 \
             -type f -printf '%f\n' | sort)
@@ -437,37 +458,20 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 partner_files=("${candidate_files[@]}")
                 [[ "${no_partner_files[*]}" == "${partner_files[*]}" ]] ||
                     die "repeat $repeat partner arithmetic changed the logits inventory"
-                partner_arithmetic=identical
-                for file in "${no_partner_files[@]}"; do
-                    if ! cmp -s "$no_partner_logits/$file" "$partner_logits/$file"; then
-                        partner_arithmetic=different
-                        break
-                    fi
-                done
-                printf 'repeat=%s\nneither_vs_partner_only=%s\ncomparison_gate=informational\n' \
-                    "$repeat" "$partner_arithmetic" \
-                    >"$OUTPUT_DIR/production/r${repeat}-partner-arithmetic.txt"
                 ;;
             rows-only)
                 [[ "${no_partner_files[*]}" == "${candidate_files[*]}" ]] ||
                     die "repeat $repeat rows-only frontier-logit inventory differs"
-                for file in "${no_partner_files[@]}"; do
-                    cmp -s "$no_partner_logits/$file" "$logits/$file" ||
-                        die "repeat $repeat rows-only frontier logits differ: $file"
-                done
                 ;;
             both)
                 [[ "${partner_files[*]}" == "${candidate_files[*]}" ]] ||
                     die "repeat $repeat both frontier-logit inventory differs"
-                for file in "${partner_files[@]}"; do
-                    cmp -s "$partner_logits/$file" "$logits/$file" ||
-                        die "repeat $repeat both frontier logits differ: $file"
-                done
                 ;;
         esac
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
             "$repeat" "$slot" "$variant" "$partner" "$rows" \
-            "$base.csv" "$base.log" "$logits" "$telemetry" \
+            "$planned_partner" "$base.csv" "$base.log" "$logits" \
+            "$telemetry" "${plan:-}" \
             >>"$OUTPUT_DIR/production/runs.csv"
         if (( reused == 1 )); then
             record_arm_state "$repeat" "$slot" "$variant" \
@@ -479,52 +483,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
     done
 done
 
-python3 - "$OUTPUT_DIR" "$CTX_START" "$CTX_MAX" <<'PY'
-import csv, pathlib, statistics, sys
-root = pathlib.Path(sys.argv[1])
-start, maximum = map(int, sys.argv[2:])
-expected, ctx = [], start
-while ctx <= maximum:
-    expected.append(ctx)
-    ctx *= 2
-runs = list(csv.DictReader((root / "production/runs.csv").open()))
-variants = ["neither", "partner-only", "rows-only", "both"]
-values, paired = {}, {}
-for run in runs:
-    rows = list(csv.DictReader(pathlib.Path(run["csv"]).open()))
-    contexts = [int(row["ctx_tokens"]) for row in rows]
-    if contexts != expected:
-        raise SystemExit(f"frontier mismatch for {run['variant']}: {contexts}")
-    for row in rows:
-        key = (run["variant"], int(row["ctx_tokens"]))
-        value = float(row["prefill_tps"])
-        values.setdefault(key, []).append(value)
-        paired[(int(run["repeat"]), *key)] = value
-n = max(int(run["repeat"]) for run in runs)
-with (root / "production/summary.csv").open("w", newline="") as handle:
-    out = csv.writer(handle)
-    out.writerow(["ctx_tokens", "neither_tps", "partner_only_tps",
-                  "rows_only_tps", "both_tps", "partner_vs_neither",
-                  "rows_vs_neither", "both_vs_neither",
-                  "interaction_ratio", "row_split_logits"])
-    for ctx in expected:
-        medians = {v: statistics.median(values[(v, ctx)]) for v in variants}
-        ratios = {}
-        for arm in variants[1:]:
-            ratios[arm] = statistics.median(
-                paired[(r, arm, ctx)] / paired[(r, "neither", ctx)]
-                for r in range(1, n + 1))
-        interaction = statistics.median(
-            paired[(r, "both", ctx)] * paired[(r, "neither", ctx)] /
-            (paired[(r, "partner-only", ctx)] * paired[(r, "rows-only", ctx)])
-            for r in range(1, n + 1))
-        out.writerow([ctx, *(f"{medians[v]:.3f}" for v in variants),
-                      f"{ratios['partner-only']:.6f}",
-                      f"{ratios['rows-only']:.6f}",
-                      f"{ratios['both']:.6f}", f"{interaction:.6f}",
-                      "bit-exact-within-partner-state"])
-PY
+python3 speed-bench/summarize-sm75-xdev-feature-isolation.py \
+    "$OUTPUT_DIR" "$CTX_START" "$CTX_MAX"
 cat "$OUTPUT_DIR/production/summary.csv"
+cat "$OUTPUT_DIR/production/logit-comparisons.csv"
 
 phase=complete
 printf 'SM75 cross-device feature isolation complete: %s\n' "$OUTPUT_DIR"
