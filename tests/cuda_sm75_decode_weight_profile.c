@@ -11,9 +11,15 @@
 #define PROFILE_TYPE_SM75_Q4_32 42u
 #define PROFILE_TYPE_SM75_Q3A4 43u
 
+extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
+
 typedef enum {
     SCENARIO_Q4_32_GATE_UP,
     SCENARIO_Q3A4_GATE_UP,
+    SCENARIO_Q4_32_GATE_UP_SPLIT,
+    SCENARIO_Q3A4_GATE_UP_SPLIT,
+    SCENARIO_Q4_32_GATE_UP_AB,
+    SCENARIO_Q3A4_GATE_UP_AB,
     SCENARIO_Q8_SINGLE_T32,
     SCENARIO_Q8_PAIR_2048,
     SCENARIO_Q8_PAIR_1024,
@@ -34,6 +40,14 @@ typedef struct {
 static const scenario_spec scenarios[] = {
     { "q4-32-gate-up", "routed-q4-32", SCENARIO_Q4_32_GATE_UP },
     { "q3a4-gate-up", "routed-q3a4", SCENARIO_Q3A4_GATE_UP },
+    { "q4-32-gate-up-split", "routed-q4-32-split",
+      SCENARIO_Q4_32_GATE_UP_SPLIT },
+    { "q3a4-gate-up-split", "routed-q3a4-split",
+      SCENARIO_Q3A4_GATE_UP_SPLIT },
+    { "q4-32-gate-up-ab", "routed-q4-32-ab",
+      SCENARIO_Q4_32_GATE_UP_AB },
+    { "q3a4-gate-up-ab", "routed-q3a4-ab",
+      SCENARIO_Q3A4_GATE_UP_AB },
     { "q8-single-t32", "dense-q8-single", SCENARIO_Q8_SINGLE_T32 },
     { "q8-pair-2048", "dense-q8-pair", SCENARIO_Q8_PAIR_2048 },
     { "q8-pair-1024", "dense-q8-pair", SCENARIO_Q8_PAIR_1024 },
@@ -76,6 +90,22 @@ static int checked_add(uint64_t a, uint64_t b, uint64_t *out) {
     if (b > UINT64_MAX - a) return 0;
     *out = a + b;
     return 1;
+}
+
+static uint32_t positive_env_u32(const char *name, uint32_t fallback) {
+    const char *text = getenv(name);
+    if (!text || !text[0]) return fallback;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (end == text || *end || value == 0u || value > UINT32_MAX)
+        return fallback;
+    return (uint32_t)value;
+}
+
+static int compare_float(const void *lhs, const void *rhs) {
+    const float a = *(const float *)lhs;
+    const float b = *(const float *)rhs;
+    return (a > b) - (a < b);
 }
 
 static int verify_zero_tensor(const ds4_gpu_tensor *tensor, uint64_t count,
@@ -156,7 +186,7 @@ static ds4_gpu_tensor *input_tensor(uint64_t count) {
     return tensor;
 }
 
-static int run_routed_gate_up(int q3a4) {
+static int run_routed_gate_up(int q3a4, int split, int benchmark) {
     /* Three active home experts plus three partner-owned slots reproduce the
      * per-device production ownership shape.  Only the three addressable home
      * payloads need to be materialized; resident_expert_count is merely the
@@ -210,24 +240,74 @@ static int run_routed_gate_up(int q3a4) {
     }
     ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
                                  DS4_TENSOR_LAYOUT_SM75_Q3A4);
-    if (!ds4_gpu_routed_moe_one_owned_tensor(
-            out, gate, up, mid, down, model_storage, model_bytes,
-            gate_offset, up_offset, down_offset,
-            q3a4 ? PROFILE_TYPE_SM75_Q3A4 : PROFILE_TYPE_SM75_Q4_32,
-            PROFILE_TYPE_SM75_Q4_32,
-            gate_expert_bytes, gate_row_bytes,
-            down_expert_bytes, down_row_bytes,
-            in_dim, mid_dim, out_dim, selected, weights,
-            n_total_experts, n_expert, 0u, resident_experts, 10.0f, x,
-            NULL, false, NULL) ||
-        !ds4_gpu_synchronize()) {
+    ds4_gpu_test_set_moe_q32_decode_split(split);
+#define RUN_ROUTED_GATE_UP() ds4_gpu_routed_moe_one_owned_tensor( \
+            out, gate, up, mid, down, model_storage, model_bytes, \
+            gate_offset, up_offset, down_offset, \
+            q3a4 ? PROFILE_TYPE_SM75_Q3A4 : PROFILE_TYPE_SM75_Q4_32, \
+            PROFILE_TYPE_SM75_Q4_32, \
+            gate_expert_bytes, gate_row_bytes, \
+            down_expert_bytes, down_row_bytes, \
+            in_dim, mid_dim, out_dim, selected, weights, \
+            n_total_experts, n_expert, 0u, resident_experts, 10.0f, x, \
+            NULL, false, NULL)
+    if (!RUN_ROUTED_GATE_UP() || !ds4_gpu_synchronize()) {
         fprintf(stderr, "error: routed decode production launch failed\n");
         goto cleanup;
+    }
+    printf("q32_split=%s\n", split ? "enabled" : "disabled");
+    if (benchmark) {
+        const uint32_t rounds = positive_env_u32("TIMING_ROUNDS", 7u);
+        const uint32_t repeats = positive_env_u32("TIMING_REPEATS", 20u);
+        float *control_ms = (float *)malloc(rounds * sizeof(float));
+        float *split_ms = (float *)malloc(rounds * sizeof(float));
+        ds4_gpu_timer *timer = ds4_gpu_timer_create();
+        if (!control_ms || !split_ms || !timer) {
+            fprintf(stderr, "error: routed decode timing allocation failed\n");
+            free(split_ms); free(control_ms); ds4_gpu_timer_free(timer);
+            goto cleanup;
+        }
+        for (uint32_t round = 0; round < rounds; round++) {
+            for (uint32_t order = 0; order < 2u; order++) {
+                const int candidate = ((round & 1u) ^ order) != 0u;
+                ds4_gpu_test_set_moe_q32_decode_split(candidate);
+                if (!ds4_gpu_timer_record_start(timer)) goto timing_error;
+                for (uint32_t repeat = 0; repeat < repeats; repeat++)
+                    if (!RUN_ROUTED_GATE_UP()) goto timing_error;
+                if (!ds4_gpu_timer_record_end(timer)) goto timing_error;
+                float elapsed = 0.0f;
+                if (!ds4_gpu_timer_elapsed_ms(timer, &elapsed))
+                    goto timing_error;
+                (candidate ? split_ms : control_ms)[round] =
+                    elapsed / (float)repeats;
+            }
+        }
+        qsort(control_ms, rounds, sizeof(float), compare_float);
+        qsort(split_ms, rounds, sizeof(float), compare_float);
+        const float control_median = control_ms[rounds / 2u];
+        const float split_median = split_ms[rounds / 2u];
+        printf("timing_scope=production-owned-call-inclusive\n"
+               "timing_rounds=%u\ntiming_repeats=%u\n"
+               "control_median_ms=%.9g\nsplit_median_ms=%.9g\n"
+               "split_speedup=%.9g\n",
+               rounds, repeats, control_median, split_median,
+               control_median / split_median);
+        ds4_gpu_timer_free(timer);
+        free(split_ms); free(control_ms);
+        ds4_gpu_test_set_moe_q32_decode_split(split);
+        goto timing_done;
+timing_error:
+        fprintf(stderr, "error: routed decode inclusive timing failed\n");
+        ds4_gpu_timer_free(timer);
+        free(split_ms); free(control_ms);
+        goto cleanup;
+timing_done:;
     }
     ok = verify_zero_tensor(mid, (uint64_t)n_expert * mid_dim,
                             q3a4 ? "q3a4-gate-up" : "q4-32-gate-up");
 
 cleanup:
+    ds4_gpu_test_set_moe_q32_decode_split(0);
     ds4_gpu_set_routed_q4_layout(0u);
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -237,6 +317,7 @@ cleanup:
     ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(x);
+#undef RUN_ROUTED_GATE_UP
     return ok;
 }
 
@@ -436,8 +517,16 @@ int main(int argc, char **argv) {
 
     int ok = 0;
     switch (spec->kind) {
-        case SCENARIO_Q4_32_GATE_UP: ok = run_routed_gate_up(0); break;
-        case SCENARIO_Q3A4_GATE_UP: ok = run_routed_gate_up(1); break;
+        case SCENARIO_Q4_32_GATE_UP: ok = run_routed_gate_up(0, 0, 0); break;
+        case SCENARIO_Q3A4_GATE_UP: ok = run_routed_gate_up(1, 0, 0); break;
+        case SCENARIO_Q4_32_GATE_UP_SPLIT:
+            ok = run_routed_gate_up(0, 1, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_SPLIT:
+            ok = run_routed_gate_up(1, 1, 0); break;
+        case SCENARIO_Q4_32_GATE_UP_AB:
+            ok = run_routed_gate_up(0, 0, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_AB:
+            ok = run_routed_gate_up(1, 0, 1); break;
         case SCENARIO_Q8_SINGLE_T32: ok = run_q8_single(1024u, 32768u); break;
         case SCENARIO_Q8_PAIR_2048: ok = run_q8_pair(2048u); break;
         case SCENARIO_Q8_PAIR_1024: ok = run_q8_pair(1024u); break;

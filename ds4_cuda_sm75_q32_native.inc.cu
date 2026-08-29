@@ -64,6 +64,36 @@ template <> struct sm75_q32_ops<false> {
         }
         return a->d * dev_f16_to_f32(w->d[row8]) * (float)total;
     }
+    /* Decode-only scalar form.  Deliberately inhibit the complete unroll used
+     * by the fused kernel: keeping one projection live at a time and one
+     * packed word live per loop is the resource experiment.  Integer sums and
+     * the single final float conversion retain dot()'s exact operation order. */
+    __device__ __forceinline__ static float dot_decode_lowreg(
+            const tile_type *w, uint32_t row8,
+            const cuda_sm75_native_q8_K *a) {
+        int total = 0;
+#pragma unroll 1
+        for (uint32_t group = 0; group < 8u; group++) {
+            int sum = 0;
+#pragma unroll 1
+            for (uint32_t lane4 = 0; lane4 < 4u; lane4++) {
+                const uint32_t qw = w->b[group][row8 * 4u + lane4];
+                const uint32_t lo = a->low[group][lane4];
+                const uint32_t hi = a->high_signed[group][lane4];
+#pragma unroll 1
+                for (uint32_t i = 0; i < 8u; i++) {
+                    const int wc = (int)((qw >> (4u * i)) & 15u);
+                    const int ws = (wc ^ 8) - 8;
+                    const int al = (int)((lo >> (4u * i)) & 15u);
+                    const int hc = (int)((hi >> (4u * i)) & 15u);
+                    const int ah = (hc ^ 8) - 8;
+                    sum += ws * (al + 16 * ah);
+                }
+            }
+            total += sm75_q32_scale6(w->scales[row8], group) * sum;
+        }
+        return a->d * dev_f16_to_f32(w->d[row8]) * (float)total;
+    }
     __device__ __forceinline__ static void mma_block(
             const tile_type *w, const cuda_sm75_native_q8_K *a,
             uint32_t lane, uint32_t n0, float *v0, float *v1) {
@@ -108,6 +138,37 @@ template <> struct sm75_q32_ops<true> {
                 const uint32_t lo = a->low[group][lane4];
                 const uint32_t hi = a->high_signed[group][lane4];
 #pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    const int wc = (int)((qw >> (4u * i)) & 15u);
+                    const int al = (int)((lo >> (4u * i)) & 15u);
+                    const int hc = (int)((hi >> (4u * i)) & 15u);
+                    const int ah = (hc ^ 8) - 8;
+                    sum += wc * (al + 16 * ah);
+                }
+            }
+            const int bsum = (int)a->bsums[2u * group] +
+                             (int)a->bsums[2u * group + 1u];
+            total += (int)sm75_q32_u4(w->scales[row8], group) * sum;
+            correction += (int)sm75_q32_u4(w->mins[row8], group) * bsum;
+        }
+        return a->d * (dev_f16_to_f32(w->d[row8]) * (float)total -
+                       dev_f16_to_f32(w->dmin[row8]) * (float)correction);
+    }
+    __device__ __forceinline__ static float dot_decode_lowreg(
+            const tile_type *w, uint32_t row8,
+            const cuda_sm75_native_q8_K *a) {
+        int total = 0, correction = 0;
+#pragma unroll 1
+        for (uint32_t group = 0; group < 8u; group++) {
+            int sum = 0;
+#pragma unroll 1
+            for (uint32_t lane4 = 0; lane4 < 4u; lane4++) {
+                const uint32_t lane = row8 * 4u + lane4;
+                const uint32_t qw = sm75_q32_dilate_q3(
+                    w->low2[group][lane], w->high[group][lane]);
+                const uint32_t lo = a->low[group][lane4];
+                const uint32_t hi = a->high_signed[group][lane4];
+#pragma unroll 1
                 for (uint32_t i = 0; i < 8u; i++) {
                     const int wc = (int)((qw >> (4u * i)) & 15u);
                     const int al = (int)((lo >> (4u * i)) & 15u);
@@ -236,6 +297,66 @@ __global__ static void moe_gate_up_mid_decode_sm75_q32_owned_kernel(
         mid_out[(uint64_t)slot * expert_mid_dim + row] =
             (gate / (1.0f + expf(-gate))) * up * weights[slot];
     }
+}
+
+/* Gate and up have distinct template identities so profiling can account for
+ * both launches independently even though their projection arithmetic is
+ * intentionally identical. */
+template <bool Q3A, bool IS_UP>
+__global__ __launch_bounds__(256, 2) static void
+moe_gate_up_mid_decode_sm75_q32_projection_owned_kernel(
+        float *projection_out, const char *projection_base,
+        const cuda_sm75_native_q8_K *xq, const int32_t *selected,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count) {
+    (void)IS_UP;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= expert_mid_dim || slot >= 6u) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane == 0u)
+            projection_out[(uint64_t)slot * expert_mid_dim + row] = 0.0f;
+        return;
+    }
+    float projection = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+        projection += sm75_q32_ops<Q3A>::dot_decode_lowreg(
+            sm75_q32_ops<Q3A>::record(
+                projection_base, expert, row, expert_mid_dim, xq_blocks, b),
+            row & 7u, xq + b);
+    }
+    projection = warp_sum_f32(projection);
+    if (lane == 0u)
+        projection_out[(uint64_t)slot * expert_mid_dim + row] = projection;
+}
+
+__global__ __launch_bounds__(256, 2) static void
+moe_gate_up_mid_decode_sm75_q32_combine_owned_kernel(
+        float *mid_out, const float *gate_in, const float *up_in,
+        const int32_t *selected, const float *weights,
+        uint32_t expert_mid_dim, uint32_t expert_base,
+        uint32_t expert_count, float clamp) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t count = 6u * expert_mid_dim;
+    if (index >= count) return;
+    const uint32_t slot = index / expert_mid_dim;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        mid_out[index] = 0.0f;
+        return;
+    }
+    float gate = gate_in[index];
+    float up = up_in[index];
+    if (clamp > 1.0e-6f) {
+        if (gate > clamp) gate = clamp;
+        if (up > clamp) up = clamp;
+        if (up < -clamp) up = -clamp;
+    }
+    mid_out[index] = (gate / (1.0f + expf(-gate))) * up * weights[slot];
 }
 
 template <uint32_t NSLOT>

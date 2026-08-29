@@ -178,6 +178,7 @@ static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_cuda_moe_q32_decode_graph;
+static int g_cuda_moe_q32_decode_split;
 static uint32_t g_cuda_routed_q4_layout;
 static std::atomic<bool> g_cuda_native_q4_logged = false;
 static std::atomic<bool> g_cuda_q32_logged = false;
@@ -368,6 +369,10 @@ extern "C" void ds4_gpu_test_set_moe_q32_decode_graph(int enabled) {
     g_cuda_moe_q32_decode_graph = enabled != 0;
 }
 
+extern "C" void ds4_gpu_test_set_moe_q32_decode_split(int enabled) {
+    g_cuda_moe_q32_decode_split = enabled != 0;
+}
+
 static int cuda_q4_mma_ok(void) {
     /* Cached once: all tiers on this host are the same GPU model. */
     static int cached = -1;
@@ -510,6 +515,9 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_moe_q32_decode_graph =
         getenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH") != NULL &&
         getenv("DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH") == NULL;
+    g_cuda_moe_q32_decode_split =
+        getenv("DS4_CUDA_MOE_Q32_DECODE_SPLIT") != NULL &&
+        getenv("DS4_CUDA_NO_MOE_Q32_DECODE_SPLIT") == NULL;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -28953,6 +28961,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     const bool gate_q4_32 = gate_type == 42u;
     const bool gate_q3a4 = gate_type == 43u;
     const bool gate_q32 = gate_q4_32 || gate_q3a4;
+    const bool split_gate_q32 = gate_q32 && g_cuda_moe_q32_decode_split;
     const bool down_q4k = down_type == 12u;
     const bool down_q2k = down_type == 10u;
     const bool down_q4_32 = down_type == 42u;
@@ -29048,6 +29057,8 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     if (down->bytes < xq_bytes || down->bytes < down_output_bytes ||
         (down_output && down_output->bytes < down_output_bytes) ||
         gate->bytes < midq_bytes ||
+        (split_gate_q32 &&
+         (gate->bytes < aux_bytes || up->bytes < aux_bytes)) ||
         (shared_prequant &&
          (shared_prequant->bytes < shared_prequant_bytes ||
           ds4_tensor_device_idx(shared_prequant) != logical_tier)) ||
@@ -29058,7 +29069,8 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
     cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
 
-    if (g_cuda_moe_q32_decode_graph && gate_q32 && down_q4_32) {
+    if (g_cuda_moe_q32_decode_graph && gate_q32 && down_q4_32 &&
+        !split_gate_q32) {
         g_moe_q32_graph_calls.fetch_add(1, std::memory_order_relaxed);
         int8_t *shared_xq = shared_prequant
             ? (int8_t *)shared_prequant->ptr : NULL;
@@ -29099,7 +29111,47 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
 
     if (gate_q32) {
         dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
-        if (gate_q3a4) {
+        if (split_gate_q32) {
+            if (gate_q3a4) {
+                moe_gate_up_mid_decode_sm75_q32_projection_owned_kernel<true, false>
+                    <<<gate_grid, 256>>>(
+                        (float *)gate->ptr, gate_w,
+                        (const cuda_sm75_native_q8_K *)xq,
+                        (const int32_t *)selected->ptr, xq_blocks,
+                        expert_mid_dim, resident_expert_base,
+                        resident_expert_count);
+                moe_gate_up_mid_decode_sm75_q32_projection_owned_kernel<true, true>
+                    <<<gate_grid, 256>>>(
+                        (float *)up->ptr, up_w,
+                        (const cuda_sm75_native_q8_K *)xq,
+                        (const int32_t *)selected->ptr, xq_blocks,
+                        expert_mid_dim, resident_expert_base,
+                        resident_expert_count);
+            } else {
+                moe_gate_up_mid_decode_sm75_q32_projection_owned_kernel<false, false>
+                    <<<gate_grid, 256>>>(
+                        (float *)gate->ptr, gate_w,
+                        (const cuda_sm75_native_q8_K *)xq,
+                        (const int32_t *)selected->ptr, xq_blocks,
+                        expert_mid_dim, resident_expert_base,
+                        resident_expert_count);
+                moe_gate_up_mid_decode_sm75_q32_projection_owned_kernel<false, true>
+                    <<<gate_grid, 256>>>(
+                        (float *)up->ptr, up_w,
+                        (const cuda_sm75_native_q8_K *)xq,
+                        (const int32_t *)selected->ptr, xq_blocks,
+                        expert_mid_dim, resident_expert_base,
+                        resident_expert_count);
+            }
+            const uint32_t combine_count = 6u * expert_mid_dim;
+            moe_gate_up_mid_decode_sm75_q32_combine_owned_kernel
+                <<<(combine_count + 255u) / 256u, 256>>>(
+                    (float *)mid->ptr, (const float *)gate->ptr,
+                    (const float *)up->ptr,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr, expert_mid_dim,
+                    resident_expert_base, resident_expert_count, clamp);
+        } else if (gate_q3a4) {
             moe_gate_up_mid_decode_sm75_q32_owned_kernel<true><<<gate_grid, 256>>>(
                 (float *)mid->ptr, gate_w, up_w,
                 (const cuda_sm75_native_q8_K *)xq,

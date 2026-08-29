@@ -1,5 +1,25 @@
 ## Benchmarking
 
+### SM75 low-register Q4-32/Q3A4 decode gate/up split
+
+`cuda-sm75-decode-q32-lowreg.sh` is a bounded, production-shaped experiment
+for splitting the one-token Q4-32 and Q3A4 gate/up kernel into two independent
+projections and an exact SiLU/multiply/weight combine. It tests the two formats
+independently, rejects any byte mismatch, PTXAS stack/spill bytes, SASS
+`LDL`/`STL`, or allocation above 128 registers/thread, and reports timing for
+the complete owned-expert API call. That timing includes both additional
+launches and the intermediate global-memory traffic.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=7 \
+TIMING_REPEATS=20 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q32-lowreg.sh
+```
+
 ### Tagged SM75-native full-Q4 production A/B
 
 `cuda-sm75-native-q4-production.sh` is the acceptance runner for the packed
