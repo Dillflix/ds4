@@ -2544,3 +2544,22 @@ DRAM peak utilization, L2 hit/throughput, global-load efficiency,
 sectors/request, long-scoreboard and MIO stalls, and achieved occupancy.  A
 subset can be captured with `PROFILE_SET=routed`, `q8`, or `f16`, or with an
 explicit comma-separated `SCENARIOS` list.
+
+### Bounded SM75 P2P direction audit
+
+`cuda-sm75-p2p-direction-audit.sh` escalates a production-shaped partner-FP16
+projection through explicit traffic levels without loading a full model.  The
+first device in each pair is the logical home and the second is the execution
+partner, so the large result travels from the second device back to the first.
+Each level runs in a fresh process and leaves a durable `.started` marker if the
+host disappears.  The default T32 shape transfers 2 MiB of activation and 64
+MiB of result per call at 512 tokens.
+
+```bash
+PAIRS="1,0 0,1" \
+SCENARIO=t32 \
+TOKENS=512 \
+REPEAT_LEVELS=1,64,256,512,1536 \
+SKIP_BUILD=0 \
+bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
+```

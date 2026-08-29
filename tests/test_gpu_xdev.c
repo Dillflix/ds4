@@ -1876,7 +1876,8 @@ static int run_q8_partner_projection_case(
         uint64_t out_dim,
         uint64_t n_tok,
         int profile_capture,
-        int t32_fused) {
+        int t32_fused,
+        uint64_t repetitions) {
     const uint64_t fp16_bytes = in_dim * out_dim * sizeof(uint16_t);
     char cache_mib[32];
     snprintf(cache_mib, sizeof(cache_mib), "%llu",
@@ -1912,6 +1913,9 @@ static int run_q8_partner_projection_case(
     }
 
     CHECK(n_tok > 1u, "q8 partner token count");
+    CHECK(repetitions > 0u, "q8 partner repetition count");
+    CHECK(!t32_fused || repetitions == 1u,
+          "T32 fused exactness requires one repetition");
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t weight_bytes = out_dim * blocks * 34u;
     const uint64_t model_size = 2u * weight_bytes;
@@ -1983,9 +1987,46 @@ static int run_q8_partner_projection_case(
         CHECK(cudaProfilerStart() == cudaSuccess,
               "q8 partner profiler start");
     }
-    const int partner_ok = ds4_gpu_matmul_q8_0_tensor(
-        &partner, model, model_size, weight_bytes,
-        in_dim, out_dim, &input, n_tok);
+    int partner_ok = 1;
+    const uint64_t activation_bytes = input_count * sizeof(float);
+    const uint64_t result_bytes = output_count * sizeof(float);
+    uint64_t completed = 0u;
+    uint64_t progress_interval = repetitions < 64u ? repetitions : 64u;
+    const char *progress_env = getenv("DS4_XDEV_PROFILE_PROGRESS");
+    if (progress_env && *progress_env) {
+        char *end = NULL;
+        unsigned long long parsed = strtoull(progress_env, &end, 10);
+        CHECK(end && *end == '\0' && parsed > 0u,
+              "DS4_XDEV_PROFILE_PROGRESS must be a positive integer");
+        progress_interval = (uint64_t)parsed;
+    }
+    for (uint64_t rep = 0u; rep < repetitions; rep++) {
+        partner_ok = ds4_gpu_matmul_q8_0_tensor(
+            &partner, model, model_size, weight_bytes,
+            in_dim, out_dim, &input, n_tok);
+        if (!partner_ok) {
+            fprintf(stderr,
+                    "FAIL: q8 partner remote projection at call %llu/%llu\n",
+                    (unsigned long long)(rep + 1u),
+                    (unsigned long long)repetitions);
+            fflush(stderr);
+            break;
+        }
+        completed = rep + 1u;
+        if (completed == repetitions ||
+            completed % progress_interval == 0u) {
+            fprintf(stderr,
+                    "  q8 partner progress calls=%llu/%llu "
+                    "activation=%.2f GiB result=%.2f GiB\n",
+                    (unsigned long long)completed,
+                    (unsigned long long)repetitions,
+                    (double)completed * (double)activation_bytes /
+                        (1024.0 * 1024.0 * 1024.0),
+                    (double)completed * (double)result_bytes /
+                        (1024.0 * 1024.0 * 1024.0));
+            fflush(stderr);
+        }
+    }
     if (profile_capture) {
         CHECK(cudaDeviceSynchronize() == cudaSuccess,
               "q8 partner profile synchronize");
@@ -2001,8 +2042,8 @@ static int run_q8_partner_projection_case(
     /* Check dispatch before comparing arithmetic.  Otherwise an ineligible
      * synthetic cache-filler can leave this projection on native Q8 and turn
      * a missing partner offload into a misleading cuBLAS exactness failure. */
-    CHECK(ds4_gpu_q8_f16_partner_offload_count() == 1u,
-          "exactly one projection executed on the partner");
+    CHECK(ds4_gpu_q8_f16_partner_offload_count() == repetitions,
+          "requested projections executed on the partner");
     CHECK(memcmp(host_local, host_partner,
                  (size_t)output_count * sizeof(float)) == 0,
           "partner cuBLAS output is bit-exact with local cuBLAS");
@@ -2198,13 +2239,13 @@ static int run_q8_partner_projection(void) {
 
     if (run_q8_partner_projection_case(
             "T32", "tensor:blk.1.attn_q_b.weight",
-            1024u, 32768u, 17u, 0, 1)) return 1;
+            1024u, 32768u, 17u, 0, 1, 1u)) return 1;
     if (run_q8_partner_projection_case(
             "T256", "tensor:blk.1.attn_output_b.weight",
-            8192u, 4096u, 17u, 0, 1)) return 1;
+            8192u, 4096u, 17u, 0, 1, 1u)) return 1;
     if (run_q8_partner_projection_case(
             "shared-down", "tensor:blk.1.ffn_down_shexp.weight",
-            2048u, 4096u, 17u, 0, 1)) return 1;
+            2048u, 4096u, 17u, 0, 1, 1u)) return 1;
     fprintf(stderr, "  q8 partner projection exactness OK (3 classes)\n");
     return 0;
 }
@@ -2365,16 +2406,45 @@ int main(int argc, char **argv) {
             return 2;
         }
         const int t32 = strcmp(argv[1], "q8-partner-t32-profile") == 0;
+        uint64_t profile_tokens = 512u;
+        uint64_t profile_repetitions = 1u;
+        const char *tokens_env = getenv("DS4_XDEV_PROFILE_TOKENS");
+        const char *repetitions_env = getenv("DS4_XDEV_PROFILE_REPEATS");
+        if (tokens_env && *tokens_env) {
+            char *end = NULL;
+            unsigned long long parsed = strtoull(tokens_env, &end, 10);
+            if (!end || *end != '\0' || parsed < 2u || parsed > 2048u) {
+                fprintf(stderr,
+                        "error: DS4_XDEV_PROFILE_TOKENS must be 2..2048\n");
+                return 2;
+            }
+            profile_tokens = (uint64_t)parsed;
+        }
+        if (repetitions_env && *repetitions_env) {
+            char *end = NULL;
+            unsigned long long parsed = strtoull(repetitions_env, &end, 10);
+            if (!end || *end != '\0' || parsed < 1u || parsed > 65536u) {
+                fprintf(stderr,
+                        "error: DS4_XDEV_PROFILE_REPEATS must be 1..65536\n");
+                return 2;
+            }
+            profile_repetitions = (uint64_t)parsed;
+        }
         fprintf(stdout,
                 "scenario=%s\n"
                 "profile_kind=partner_f16_cublas\n"
-                "profile_tokens=512\n", argv[1]);
+                "profile_tokens=%llu\n"
+                "profile_repetitions=%llu\n",
+                argv[1],
+                (unsigned long long)profile_tokens,
+                (unsigned long long)profile_repetitions);
+        fflush(stdout);
         const int rc = run_q8_partner_projection_case(
             t32 ? "T32-profile" : "T256-profile",
             t32 ? "tensor:blk.1.attn_q_b.weight" :
                   "tensor:blk.1.attn_output_b.weight",
-            t32 ? 1024u : 8192u, t32 ? 32768u : 4096u, 512u, 1,
-            0);
+            t32 ? 1024u : 8192u, t32 ? 32768u : 4096u,
+            profile_tokens, 1, 0, profile_repetitions);
         if (rc == 0) fprintf(stdout, "harness_status=ok\n");
         return rc;
     }
