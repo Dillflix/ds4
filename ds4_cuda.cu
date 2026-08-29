@@ -185,6 +185,8 @@ static uint32_t g_cuda_moe_q32_decode_fused_lowreg;
  * tile across all 32 lanes with scalar arithmetic, and 3 retains that mapping
  * while using exact signed DP4A. */
 static uint32_t g_cuda_moe_q3a4_decode_mapping;
+static int g_cuda_moe_q3a4_decode_mapping_audit;
+static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
 static uint32_t g_cuda_routed_q4_layout;
 static std::atomic<bool> g_cuda_native_q4_logged = false;
 static std::atomic<bool> g_cuda_q32_logged = false;
@@ -545,6 +547,12 @@ static void cuda_decode_dispatch_env_refresh(void) {
             g_cuda_moe_q32_decode_fused_lowreg = (uint32_t)value;
     }
     g_cuda_moe_q3a4_decode_mapping = 0u;
+    g_cuda_moe_q3a4_decode_mapping_audit =
+        getenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING_AUDIT") != NULL;
+    for (uint32_t i = 0; i < 4u; i++) {
+        g_moe_q3a4_decode_mapping_calls[i].store(
+            0u, std::memory_order_relaxed);
+    }
     const char *q3a4_mapping = getenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     if (q3a4_mapping &&
         getenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING") == NULL) {
@@ -3780,6 +3788,20 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)g_moe_q32_graph_creates.load(
                     std::memory_order_relaxed),
                 (unsigned long long)g_moe_q32_graph_fallbacks.load(
+                    std::memory_order_relaxed));
+    }
+
+    if (g_cuda_moe_q3a4_decode_mapping_audit) {
+        fprintf(stderr,
+                "ds4: SM75 Q3A4 decode mapping audit control=%llu "
+                "hwarp16=%llu tile32=%llu tile32-dp4a=%llu\n",
+                (unsigned long long)g_moe_q3a4_decode_mapping_calls[0].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q3a4_decode_mapping_calls[1].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q3a4_decode_mapping_calls[2].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q3a4_decode_mapping_calls[3].load(
                     std::memory_order_relaxed));
     }
 
@@ -29155,6 +29177,10 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     }
 
     if (gate_q32) {
+        if (gate_q3a4 && g_cuda_moe_q3a4_decode_mapping_audit) {
+            g_moe_q3a4_decode_mapping_calls[q3a4_decode_mapping].fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         dim3 gate_grid((expert_mid_dim + 7u) / 8u, 6u, 1u);
         if (split_gate_q32) {
             if (gate_q3a4) {

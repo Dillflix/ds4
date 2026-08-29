@@ -2405,6 +2405,52 @@ cases are reused; incomplete or invalid cases are rerun. Return the generated
 `sm75-decode-baseline-<timestamp>.tar.gz`. The primary results are
 `summary/summary.csv`, `summary/summary.md`, and `summary/samples.csv`.
 
+# SM75 Q3A4 tile32-DP4A production decode A/B
+
+`cuda-sm75-decode-q3a4-production-ab.sh` is the promotion gate for the
+Q3A4-only native decode mapping selected by the single-GPU kernel audit.  It
+compares the shipping Q3A4 gate/up kernel with the exact tile32 signed-DP4A
+kernel while leaving Q4-32, expert ownership, shared-expert placement, the
+22/21 stage split, dense-F16 placement, and every cross-GPU boundary unchanged.
+
+Each process evaluates PP512, PP4096, and PP32768 with TG256.  The geometric
+frontier sequence avoids two redundant 139-GiB model loads per arm.  Variant
+order reverses on alternating repeats, and the report uses the median of
+within-repeat speedup ratios.  A separate pass emits sixteen full-vocabulary
+FP32 logit vectors at every frontier and requires byte identity.
+
+The runner also enables a host-side dispatch audit.  A control sample is valid
+only when every Q3A4 owned call uses mapping zero; a candidate sample is valid
+only when every Q3A4 owned call uses `tile32-dp4a`.  Q32 CUDA Graphs, the split
+projection experiment, and the generic fused-low-register experiment are
+explicitly disabled in both arms, so they cannot confound the result.  Every
+sample still requires complete 344/344 dense-F16 admission and the fixed direct
+NVLink routes.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REPEATS=3 \
+TG_TOKENS=256 \
+EXACT_TOKENS=16 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-q3a4-production-ab.sh
+```
+
+To resume, retain all original settings and set `RESUME=1` plus
+`Q3A4_PRODUCTION_AB_DIR` to the existing output directory.  Return the
+generated `sm75-decode-q3a4-production-ab-<timestamp>.tar.gz`; the production
+decision table is `summary/summary.md` and the exactness gate is
+`exact/verification.txt`.
+
 # SM75 production decode evidence
 
 `cuda-sm75-decode-evidence.sh` is the first attribution pass after the broad
