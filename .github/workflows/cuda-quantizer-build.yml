@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence, agent/sm75-decode-crash-isolation]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -66,6 +66,8 @@ on:
       - "speed-bench/summarize-sm75-decode-baseline.py"
       - "speed-bench/summarize-sm75-decode-evidence.py"
       - "speed-bench/cuda-sm75-decode-crash-isolation.sh"
+      - "speed-bench/cuda-sm75-decode-graph-ab.sh"
+      - "speed-bench/cuda-sm75-pair-stability-matrix.sh"
       - "speed-bench/summarize-sm75-decode-crash-isolation.py"
       - "speed-bench/cuda-sm75-xdev-feature-isolation.sh"
       - "speed-bench/summarize-sm75-xdev-feature-isolation.py"
@@ -94,6 +96,7 @@ on:
       - "tests/test_engine_mgpu_placement.c"
       - "tests/test_gpu_xdev.c"
       - "tests/cuda_attention_rowsplit_xdev.c"
+      - "tests/cuda_sm75_pair_stability.cu"
       - "tests/test_summarize_q8_partner_offload_ab.py"
       - "tests/test_summarize_q8_partner_production.py"
       - "tests/test_summarize_sm75_native_q4_t256_ab.py"
@@ -137,7 +140,7 @@ jobs:
       - name: Build CUDA quality scorer
         run: make -C gguf-tools quality-score CUDA_ARCH=sm_75
       - name: Build SM75 engine and CUDA regressions
-        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev CUDA_ARCH=sm_75
+        run: make ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_profile_harness tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/test_engine_mgpu_placement tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/cuda_sm75_pair_stability CUDA_ARCH=sm_75
       - name: Run CPU placement regressions
         run: ./tests/test_engine_mgpu_placement
       - name: Check Q8 partner A/B tooling
@@ -169,6 +172,10 @@ jobs:
           bash -n speed-bench/cuda-sm75-decode-evidence.sh
           test -x speed-bench/cuda-sm75-decode-crash-isolation.sh
           bash -n speed-bench/cuda-sm75-decode-crash-isolation.sh
+          test -x speed-bench/cuda-sm75-decode-graph-ab.sh
+          bash -n speed-bench/cuda-sm75-decode-graph-ab.sh
+          test -x speed-bench/cuda-sm75-pair-stability-matrix.sh
+          bash -n speed-bench/cuda-sm75-pair-stability-matrix.sh
           test -x speed-bench/cuda-sm75-xdev-feature-isolation.sh
           bash -n speed-bench/cuda-sm75-xdev-feature-isolation.sh
           test -x speed-bench/cuda-sm75-iq2-next-ab.sh

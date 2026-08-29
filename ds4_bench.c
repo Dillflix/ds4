@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
 
@@ -68,6 +71,64 @@ static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+typedef struct {
+    const char *path;
+    const char *phase;
+    bool warned;
+} bench_progress_journal;
+
+static bool bench_progress_journal_flush(FILE *fp) {
+    if (fflush(fp) != 0) return false;
+#if !defined(_WIN32)
+    if (fsync(fileno(fp)) != 0) return false;
+#endif
+    return true;
+}
+
+static bool bench_progress_journal_init(bench_progress_journal *journal) {
+    if (!journal || !journal->path || journal->path[0] == '\0') return true;
+    FILE *fp = fopen(journal->path, "wb");
+    if (!fp) return false;
+    const bool ok =
+        fprintf(fp, "realtime_sec,realtime_nsec,phase,event,current,total\n") > 0 &&
+        bench_progress_journal_flush(fp);
+    const int close_rc = fclose(fp);
+    return ok && close_rc == 0;
+}
+
+static void bench_progress_journal_note(void *ud,
+                                        const char *event,
+                                        int current,
+                                        int total) {
+    bench_progress_journal *journal = ud;
+    if (!journal || !journal->path || journal->path[0] == '\0') return;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    }
+    FILE *fp = fopen(journal->path, "ab");
+    bool ok = fp != NULL;
+    if (ok) {
+        ok = fprintf(fp, "%lld,%ld,%s,%s,%d,%d\n",
+                     (long long)ts.tv_sec,
+                     ts.tv_nsec,
+                     journal->phase ? journal->phase : "unknown",
+                     event ? event : "unknown",
+                     current,
+                     total) > 0 &&
+             bench_progress_journal_flush(fp);
+        if (fclose(fp) != 0) ok = false;
+    }
+    if (!ok && !journal->warned) {
+        journal->warned = true;
+        fprintf(stderr,
+                "ds4-bench: failed to update progress journal %s: %s\n",
+                journal->path,
+                strerror(errno));
+    }
 }
 
 static uint64_t bench_snapshot_max_bytes(void) {
@@ -679,6 +740,17 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    bench_progress_journal progress_journal = {
+        .path = getenv("DS4_BENCH_PROGRESS_JOURNAL"),
+        .phase = "initialization",
+    };
+    if (!bench_progress_journal_init(&progress_journal)) {
+        fprintf(stderr,
+                "ds4-bench: failed to initialize progress journal %s: %s\n",
+                progress_journal.path,
+                strerror(errno));
+        return 2;
+    }
 
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not
@@ -688,6 +760,7 @@ int main(int argc, char **argv) {
 
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
+    int untimed_warmup_tokens = 0;
     const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
     if (have_gpu_config) {
         char gpu_err[256];
@@ -701,7 +774,6 @@ int main(int argc, char **argv) {
     }
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    int untimed_warmup_tokens = 0;
     int nsys_decode_skip = -1;
     int nsys_decode_tokens = 0;
     const char *q8_cache_pretiming_state_csv =
@@ -875,6 +947,13 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    progress_journal.phase = untimed_warmup_tokens > 0 ?
+        "untimed-warmup" : "measured-prefill";
+    if (progress_journal.path && progress_journal.path[0]) {
+        ds4_session_set_progress(session,
+                                 bench_progress_journal_note,
+                                 &progress_journal);
+    }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
@@ -937,6 +1016,12 @@ int main(int argc, char **argv) {
             ds4_tokens_free(&prompt);
             ds4_engine_close(engine);
             return 1;
+        }
+        progress_journal.phase = "measured-prefill";
+        if (progress_journal.path && progress_journal.path[0]) {
+            ds4_session_set_progress(session,
+                                     bench_progress_journal_note,
+                                     &progress_journal);
         }
         if (q8_cache_pretiming_state_csv &&
             q8_cache_pretiming_state_csv[0] &&

@@ -2494,8 +2494,18 @@ Graphs are explicitly disabled.
 Every case persists `active-case.txt` and `run-journal.tsv` before launch,
 captures per-GPU telemetry, exports the exact dense placement and binding
 inventories, and requires healthy four-GPU snapshots before and after the
-process. It never invokes `sudo`. If the host resets before the archive can be
-created, return the matching unarchived directory.
+process. A separately fsynced progress journal records each completed warmup
+and measured-prefill chunk without adding CUDA synchronization. The telemetry
+watcher stops `nvidia-smi -lms` when it reports a lost device, preventing that
+poller from lingering after the CUDA process exits. It never invokes `sudo`.
+If the host resets before the archive can be created, return the matching
+unarchived directory.
+
+This runner performs the complete 32K prefill before it reaches decode. A
+failure with no benchmark CSV row and no decode marker is therefore prefill or
+device-stability evidence, not decode-graph evidence. After an Xid 79, use the
+model-independent pair-stability matrix below rather than repeatedly loading
+the 153 GiB model.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2516,8 +2526,9 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-decode-crash-isolation.sh
 ```
 
-Only after this graph-disabled boundary is stable should the broader
-`cuda-sm75-decode-graph-ab.sh` matrix be resumed.
+Decode CUDA Graph validation is deliberately bounded to PP512/2048/4096.
+Long-context device stability is a separate question handled by the symmetric
+pair matrix below.
 
 `cuda-sm75-decode-graph-ab.sh` tests graph coverage for the routed kernels
 that the production Q4-32/Q3A4 model actually executes. The candidate replaces
@@ -2537,8 +2548,9 @@ binding, that call uses the unchanged launch path.
 The CUDA smoke test compares the graph-owned home/partner result against the
 independent full-expert production dispatcher for both gate formats and two
 successive inputs. The production test then runs paired, order-reversed decode
-A/B samples at PP512/2048/4096/32768 and requires byte-identical full-vocabulary
-logits before reporting a speedup.
+A/B samples at PP512/2048/4096 and requires byte-identical full-vocabulary
+logits before reporting a speedup. The script rejects larger contexts so a 32K
+prefill crash cannot be attributed to CUDA Graphs that decode never reached.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2550,7 +2562,7 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
-CONTEXTS=512,2048,4096,32768 \
+CONTEXTS=512,2048,4096 \
 TG_TOKENS=256 \
 REPEATS=3 \
 EXACT_CONTEXT=4096 \
@@ -2586,6 +2598,38 @@ DRAM peak utilization, L2 hit/throughput, global-load efficiency,
 sectors/request, long-scoreboard and MIO stalls, and achieved occupancy.  A
 subset can be captured with `PROFILE_SET=routed`, `q8`, or `f16`, or with an
 explicit comma-separated `SCENARIOS` list.
+
+### Symmetric SM75 pair-stability matrix
+
+`cuda-sm75-pair-stability-matrix.sh` compares both physical NVLink pairs with
+the same model-independent workload. It runs the known-reference pair first,
+then the NUMA0 pair, for four escalating cases: high VRAM residency, concurrent
+Tensor-Core GEMM, bidirectional P2P, and combined compute plus P2P. The harness
+uses exactly two visible GPUs, records physical PCI bus IDs, and fsyncs progress
+about once per second. It performs no `nvidia-smi` polling while a load is
+active and stops at the first failure.
+
+This is a hardware/driver-path diagnostic, not a production placement policy:
+both pairs receive identical work and no conclusion assumes heterogeneous GPU
+performance.
+
+```bash
+cd ~/ds4-iq2-q4
+
+PAIRS="2,3 0,1" \
+SCENARIOS="residency compute p2p combined" \
+DURATION_SECONDS=60 \
+RESIDENT_MIB=43008 \
+COPY_MIB=128 \
+GEMM_N=4096 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-pair-stability-matrix.sh
+```
+
+The directory remains usable after a reboot. A `.started` or `.failed` marker
+plus the last durable progress row identifies the exact scenario and pair that
+were active when an endpoint disappeared.
 
 ### Bounded SM75 P2P direction audit
 

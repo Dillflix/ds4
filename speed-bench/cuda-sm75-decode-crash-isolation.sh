@@ -88,7 +88,7 @@ done
 
 for tool in awk basename cat cmp cp date dirname env find git grep kill make \
             mkdir mv nproc nvidia-smi python3 rm sleep sort stat sync tail tar \
-            tee tr wc; do
+            tee timeout tr wc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
 git diff --quiet && git diff --cached --quiet ||
@@ -101,7 +101,26 @@ printf 'Diagnostic directory: %s\n' "$OUTPUT_DIR"
 
 phase=initialization
 telemetry_pid=
+telemetry_watch_pid=
+active_case_pid=
+stop_active_case() {
+    if [[ -n ${active_case_pid:-} ]]; then
+        local pid=$active_case_pid
+        active_case_pid=
+        kill -TERM "$pid" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+            kill -0 "$pid" >/dev/null 2>&1 || return 0
+            sleep 0.1
+        done
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+}
 stop_telemetry() {
+    if [[ -n ${telemetry_watch_pid:-} ]]; then
+        local watch_pid=$telemetry_watch_pid
+        telemetry_watch_pid=
+        kill "$watch_pid" >/dev/null 2>&1 || true
+    fi
     if [[ -n ${telemetry_pid:-} ]]; then
         local pid=$telemetry_pid
         telemetry_pid=
@@ -116,6 +135,7 @@ stop_telemetry() {
 finish() {
     status=$?
     trap - EXIT INT TERM HUP
+    stop_active_case
     stop_telemetry
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
@@ -156,11 +176,11 @@ gpu_health_snapshot() {
     local path=$1
     {
         printf 'date_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        nvidia-smi -L
-        nvidia-smi --query-gpu=index,pci.bus_id,uuid,pstate,temperature.gpu,power.draw,power.limit,memory.used,memory.free,utilization.gpu,compute_cap \
+        timeout --kill-after=5s 20s nvidia-smi -L
+        timeout --kill-after=5s 20s nvidia-smi --query-gpu=index,pci.bus_id,uuid,pstate,temperature.gpu,power.draw,power.limit,memory.used,memory.free,utilization.gpu,compute_cap \
             --format=csv
         printf '\ntopology:\n'
-        nvidia-smi topo -m
+        timeout --kill-after=5s 20s nvidia-smi topo -m
     } >"$path" 2>&1 || return 1
     [[ $(grep -c '^GPU [0-9]:' "$path") == 4 ]] || return 1
     ! grep -Eiq 'ERR!|GPU is lost|Unknown Error|Unable to determine' "$path"
@@ -181,9 +201,35 @@ record_case() {
 
 start_telemetry() {
     local output=$1
-    nvidia-smi --query-gpu=timestamp,index,pci.bus_id,pstate,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.free \
+    stdbuf -oL -eL nvidia-smi --query-gpu=timestamp,index,pci.bus_id,pstate,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.free \
         --format=csv -lms "$TELEMETRY_INTERVAL_MS" >"$output" 2>&1 &
     telemetry_pid=$!
+}
+
+start_telemetry_watch() {
+    local output=$1 marker=$2 case_pid=$3
+    (
+        while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
+            if tail -n 16 "$output" 2>/dev/null |
+                    grep -Eiq 'GPU is lost|GPU requires reset|Unknown Error|ERR!|Unable to determine'; then
+                printf 'telemetry-watch: lost-device response detected; stopping nvidia-smi loop\n' \
+                    >>"$output"
+                printf 'timestamp_utc=%s\nstatus=lost-device-detected\ncase_pid=%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$case_pid" >"$marker"
+                sync "$marker" 2>/dev/null || sync
+                kill "$telemetry_pid" >/dev/null 2>&1 || true
+                kill -TERM "$case_pid" >/dev/null 2>&1 || true
+                for _ in {1..20}; do
+                    kill -0 "$case_pid" >/dev/null 2>&1 || exit 0
+                    sleep 0.1
+                done
+                kill -KILL "$case_pid" >/dev/null 2>&1 || true
+                exit 0
+            fi
+            sleep 0.1
+        done
+    ) &
+    telemetry_watch_pid=$!
 }
 
 phase=build
@@ -224,7 +270,7 @@ git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
 printf 'timestamp_utc\trepeat\tslot\ttg_tokens\tstatus\n' \
     >"$OUTPUT_DIR/run-journal.tsv"
-printf 'repeat\tslot\tpp_tokens\ttg_tokens\tprefill_tps\tgen_tps\tfirst_ms\tsteady_tps\tsteady_ms_per_token\tcsv\tlog\ttelemetry\tplan\tbindings\n' \
+printf 'repeat\tslot\tpp_tokens\ttg_tokens\tprefill_tps\tgen_tps\tfirst_ms\tsteady_tps\tsteady_ms_per_token\tcsv\tlog\ttelemetry\tprogress\tplan\tbindings\n' \
     >"$OUTPUT_DIR/production/runs.tsv"
 
 validate_log() {
@@ -270,6 +316,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         tag="r${repeat}-s${slot}-pp${PP_TOKENS}-tg${tg}-control"
         base="$OUTPUT_DIR/production/$tag"
         telemetry="$OUTPUT_DIR/telemetry/$tag.csv"
+        lost_marker="$OUTPUT_DIR/telemetry/$tag-lost-device.txt"
+        progress="$base-progress.csv"
         plan="$base-plan.csv"
         bindings="$base-bindings.csv"
         pre_health="$OUTPUT_DIR/health/$tag-pre.log"
@@ -285,7 +333,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         }
         record_case "$repeat" "$slot" "$tg" starting
         start_telemetry "$telemetry"
-        if "${clean[@]}" \
+        "${clean[@]}" \
                 "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT" \
                 DS4_CUDA_PREFILL_PIPELINE=1 \
                 DS4_CUDA_PREFILL_PIPELINE_MB=512 \
@@ -296,6 +344,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 DS4_CUDA_TP_DECODE_INDEXER_ROWS=0 \
                 DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1 \
                 DS4_BENCH_UNTIMED_WARMUP_TOKENS=512 \
+                "DS4_BENCH_PROGRESS_JOURNAL=$progress" \
                 "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$plan" \
                 "DS4_CUDA_Q8_BINDING_STATE_CSV=$bindings" \
                 ./ds4-bench --cuda --cuda-tensor-parallel \
@@ -304,11 +353,15 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     --ctx-start "$PP_TOKENS" --ctx-max "$PP_TOKENS" \
                     --ctx-alloc "$ctx_alloc" --step-incr "$PP_TOKENS" \
                     --prefill-chunk 2048 --gen-tokens "$tg" \
-                    --csv "$base.csv" >"$base.log" 2>&1; then
+                    --csv "$base.csv" >"$base.log" 2>&1 &
+        active_case_pid=$!
+        start_telemetry_watch "$telemetry" "$lost_marker" "$active_case_pid"
+        if wait "$active_case_pid"; then
             run_status=0
         else
             run_status=$?
         fi
+        active_case_pid=
         stop_telemetry
         if (( run_status != 0 )); then
             record_case "$repeat" "$slot" "$tg" "failed-exit-$run_status"
@@ -330,6 +383,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "TG$tg omitted its 344-entry binding inventory"
         [[ -s $telemetry && $(grep -c . "$telemetry") -ge 2 ]] ||
             die "TG$tg omitted usable telemetry"
+        [[ -s $progress ]] || die "TG$tg omitted its progress journal"
         record_case "$repeat" "$slot" "$tg" settling
         sleep "$POST_CASE_SETTLE_SECONDS"
         gpu_health_snapshot "$post_health" || {
@@ -340,10 +394,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         IFS=, read -r ctx prefill_tokens prefill_tps gen_tokens gen_tps \
             first_ms steady_tokens steady_tps kv_bytes < <(tail -n 1 "$base.csv")
         steady_ms=$(awk -v tps="$steady_tps" 'BEGIN {printf "%.6f", 1000/tps}')
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repeat" "$slot" "$PP_TOKENS" "$tg" "$prefill_tps" \
             "$gen_tps" "$first_ms" "$steady_tps" "$steady_ms" \
-            "$base.csv" "$base.log" "$telemetry" "$plan" "$bindings" \
+            "$base.csv" "$base.log" "$telemetry" "$progress" "$plan" "$bindings" \
             >>"$OUTPUT_DIR/production/runs.tsv"
         record_case "$repeat" "$slot" "$tg" completed
     done
