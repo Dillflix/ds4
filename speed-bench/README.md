@@ -2454,7 +2454,12 @@ are summarized before exact validation starts. A fresh exact arm evaluates all
 three frontiers in one process; after an interrupted run, completed exact
 frontiers are preserved and only missing frontiers are repaired. Every source
 log must still prove the same dense-Q8 plan, exact mapping-call inventory, and
-final expected filename inventory. Return the generated
+final expected filename inventory. If an interrupted progressive arm is paired
+with a directly repaired PP32768 candidate, resume preserves both inventories
+and captures only a direct PP32768 control into a separate checkpoint. The
+Q3A4 exactness gate then compares direct control with direct candidate; the
+progressive-control/direct-control result is recorded separately as a prefill-
+history comparison. Return the generated
 `sm75-decode-q3a4-production-ab-<timestamp>.tar.gz`; the production decision
 table is `summary/summary.md` and the exactness gate is
 `exact/verification.txt`.

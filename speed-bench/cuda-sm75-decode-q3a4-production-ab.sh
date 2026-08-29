@@ -484,7 +484,8 @@ validate_source_manifest() {
 }
 
 write_selected_csv() {
-    local input=$1 frontiers=$2 output=$3 partial="$output.partial.$$"
+    local input=$1 frontiers=$2 output=$3 partial
+    partial="$output.partial.$$"
     awk -F, -v selected="$frontiers" '
         BEGIN {
             OFS=",";
@@ -777,6 +778,58 @@ validate_source_manifest "$control_sources" &&
     die "exact-source manifest does not assign every frontier exactly once"
 control_ref=$(awk -F'\t' 'NR==2 {print $3}' "$control_sources")
 [[ -n $control_ref ]] || die "control exact-source manifest is empty"
+
+# An interrupted progressive exact arm can leave one frontier repaired by a
+# direct single-frontier process.  Comparing that direct candidate with the
+# progressive control would compare different prefill histories, not Q3A4
+# arithmetic.  Preserve both canonical inventories and add only the missing
+# direct control needed for a matched PP32768 comparison.
+control_32768_kind=$(source_kind_for_frontier "$control_sources" 32768)
+candidate_32768_kind=$(source_kind_for_frontier "$candidate_sources" 32768)
+matched_direct_control=0
+matched_control_calls=0
+history_mismatch_count=0
+history_bit_exact=not-applicable
+matched_comparison_mode=canonical-control-vs-canonical-candidate
+matched_control_base="$OUTPUT_DIR/exact/control-frontier-32768-matched"
+matched_control_logits="$matched_control_base-logits"
+if [[ $control_32768_kind != "$candidate_32768_kind" ]]; then
+    [[ $control_32768_kind == base && $candidate_32768_kind == repair ]] ||
+        die "unsupported PP32768 exact-history orientation: control=$control_32768_kind candidate=$candidate_32768_kind"
+    mkdir -p "$matched_control_logits"
+    if [[ $RESUME == 1 && -s $matched_control_base.csv &&
+          -s $matched_control_base.log ]] &&
+       validate_exact_partial_csv "$matched_control_base.csv" &&
+       csv_has_frontier "$matched_control_base.csv" 32768 &&
+       validate_common_log "$matched_control_base.log" &&
+       validate_mapping_audit control "$matched_control_base.log" &&
+       mapping_count_is_exact control "$matched_control_base.log" 1 &&
+       frontier_complete "$matched_control_logits" 32768 &&
+       [[ $(find "$matched_control_logits" -maxdepth 1 -type f \
+                 -name '*.f32' | wc -l) == "$EXACT_TOKENS" ]]; then
+        printf 'Reusing matched direct Q3A4 control logits: PP=32768...\n'
+    else
+        printf 'Capturing matched direct Q3A4 control logits: PP=32768...\n'
+        run_exact_frontier control 32768 "$matched_control_base" \
+            "$matched_control_logits" ||
+            die "matched direct control PP=32768 exact-logit run failed"
+        validate_exact_partial_csv "$matched_control_base.csv" &&
+            csv_has_frontier "$matched_control_base.csv" 32768 &&
+            validate_common_log "$matched_control_base.log" &&
+            validate_mapping_audit control "$matched_control_base.log" &&
+            mapping_count_is_exact control "$matched_control_base.log" 1 &&
+            frontier_complete "$matched_control_logits" 32768 &&
+            [[ $(find "$matched_control_logits" -maxdepth 1 -type f \
+                      -name '*.f32' | wc -l) == "$EXACT_TOKENS" ]] ||
+            die "matched direct control PP=32768 evidence is invalid"
+    fi
+    validate_q8_plan_equal "$control_ref" "$matched_control_base.log" ||
+        die "matched direct control changed the dense-Q8 placement plan"
+    matched_control_calls=$(mapping_active_count control \
+        "$matched_control_base.log")
+    matched_direct_control=1
+    matched_comparison_mode=direct-control-vs-direct-candidate
+fi
 for sources in "$control_sources" "$candidate_sources"; do
     while IFS=$'\t' read -r frontiers kind log csv; do
         [[ $frontiers != frontiers ]] || continue
@@ -810,17 +863,46 @@ cmp -s "$expected_files" "$OUTPUT_DIR/exact/control-files.txt" ||
     die "control emitted an unexpected logit inventory"
 cmp -s "$expected_files" "$OUTPUT_DIR/exact/candidate-files.txt" ||
     die "tile32-dp4a emitted an unexpected logit inventory"
-while IFS= read -r file; do
-    if ! cmp -s "$OUTPUT_DIR/exact/control-logits/$file" \
-              "$OUTPUT_DIR/exact/tile32-dp4a-logits/$file"; then
-        padded_context=${file#frontier_}
-        padded_context=${padded_context%%.*}
-        context=$((10#$padded_context))
-        control_kind=$(source_kind_for_frontier "$control_sources" "$context")
-        candidate_kind=$(source_kind_for_frontier "$candidate_sources" "$context")
-        if [[ $control_kind != "$candidate_kind" ]]; then
-            die "exact paths used different prefill histories at PP=$context ($control_kind vs $candidate_kind); this is not classified as a Q3A4 arithmetic mismatch"
+if [[ $matched_direct_control == 1 ]]; then
+    find "$matched_control_logits" -maxdepth 1 -type f -name '*.f32' \
+        -printf '%f\n' | sort >"$OUTPUT_DIR/exact/matched-control-files.txt"
+    grep '^frontier_032768\.' "$expected_files" \
+        >"$OUTPUT_DIR/exact/expected-files-32768.txt"
+    cmp -s "$OUTPUT_DIR/exact/expected-files-32768.txt" \
+        "$OUTPUT_DIR/exact/matched-control-files.txt" ||
+        die "matched direct control emitted an unexpected logit inventory"
+    for ((token=1; token<=EXACT_TOKENS; token++)); do
+        printf -v file 'frontier_032768.decode_%06d.logits.f32' "$token"
+        if ! cmp -s "$OUTPUT_DIR/exact/control-logits/$file" \
+                  "$matched_control_logits/$file"; then
+            history_mismatch_count=$((history_mismatch_count + 1))
         fi
+    done
+    if (( history_mismatch_count == 0 )); then
+        history_bit_exact=true
+    else
+        history_bit_exact=false
+    fi
+    printf 'comparison=progressive-control-vs-direct-control\n' \
+        >"$OUTPUT_DIR/exact/prefill-history-comparison.txt"
+    printf 'frontier=32768\nbit_exact=%s\nmismatched_files=%s\ntotal_files=%s\n' \
+        "$history_bit_exact" "$history_mismatch_count" "$EXACT_TOKENS" \
+        >>"$OUTPUT_DIR/exact/prefill-history-comparison.txt"
+fi
+while IFS= read -r file; do
+    padded_context=${file#frontier_}
+    padded_context=${padded_context%%.*}
+    context=$((10#$padded_context))
+    control_kind=$(source_kind_for_frontier "$control_sources" "$context")
+    candidate_kind=$(source_kind_for_frontier "$candidate_sources" "$context")
+    control_file="$OUTPUT_DIR/exact/control-logits/$file"
+    if [[ $context == 32768 && $matched_direct_control == 1 ]]; then
+        control_file="$matched_control_logits/$file"
+    elif [[ $control_kind != "$candidate_kind" ]]; then
+        die "exact paths used different prefill histories at PP=$context ($control_kind vs $candidate_kind); no matched comparison was captured"
+    fi
+    if ! cmp -s "$control_file" \
+              "$OUTPUT_DIR/exact/tile32-dp4a-logits/$file"; then
         die "tile32-dp4a diverged at $file"
     fi
 done <"$OUTPUT_DIR/exact/control-files.txt"
@@ -834,11 +916,23 @@ printf 'control_interrupted_extra_calls=%s\n' "$control_extra_calls" \
     >>"$OUTPUT_DIR/exact/verification.txt"
 printf 'tile32_dp4a_interrupted_extra_calls=%s\n' "$candidate_extra_calls" \
     >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'pp32768_control_source=%s\npp32768_candidate_source=%s\n' \
+    "$control_32768_kind" "$candidate_32768_kind" \
+    >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'pp32768_matched_comparison=%s\nmatched_direct_control_owned_calls=%s\n' \
+    "$matched_comparison_mode" \
+    "$matched_control_calls" >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'progressive_vs_direct_control_bit_exact=%s\n' "$history_bit_exact" \
+    >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'progressive_vs_direct_control_mismatched_files=%s\n' \
+    "$history_mismatch_count" >>"$OUTPUT_DIR/exact/verification.txt"
 cat >>"$OUTPUT_DIR/summary/summary.md" <<EOF
 
 ## Exact-output verification
 
-All $EXACT_TOKENS decode logits at PP512, PP4096, and PP32768 were byte-identical.
+All $EXACT_TOKENS decode logits at PP512, PP4096, and PP32768 were byte-identical
+under matched prefill histories. PP32768 comparison mode:
+`$matched_comparison_mode`.
 EOF
 
 phase=complete
