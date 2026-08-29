@@ -42,6 +42,7 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
+bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         uint32_t n_tokens, uint32_t n_raw);
 uint32_t ds4_test_cuda_tp_prefill_fixed_half_rows(uint32_t n_tokens);
@@ -917,6 +918,21 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
 }
 
+static void test_cuda_tp_decode_indexer_rows_default(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_decode_indexer_rows_default\n");
+    char *old = save_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+
+    unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+    CHECK(ds4_test_cuda_tp_decode_indexer_rows_enabled(),
+          "CUDA TP decode indexer row split is enabled by default");
+
+    setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS", "1", 1);
+    CHECK(!ds4_test_cuda_tp_decode_indexer_rows_enabled(),
+          "negative diagnostic switch disables decode indexer row splitting");
+
+    restore_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS", old);
+}
+
 static void test_sm75_native_indexer_cache_accounting(void) {
     fprintf(stderr, "RUN: test_sm75_native_indexer_cache_accounting\n");
     ds4_test_seed_compress_ratios();
@@ -1137,6 +1153,7 @@ int main(void) {
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_attn_rows_default();
+    test_cuda_tp_decode_indexer_rows_default();
     test_cuda_tp_prefill_attn_rows_shape();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_ep_forced_stage_split();

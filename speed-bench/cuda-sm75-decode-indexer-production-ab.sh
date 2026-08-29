@@ -131,7 +131,6 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
     DS4_CUDA_TP_PREFILL_ATTN_ROWS=1
-    DS4_CUDA_TP_ATTN_HEADS=0
     "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$WARMUP_TOKENS"
 )
 
@@ -177,7 +176,6 @@ validate_log() {
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
         grep -Fq "$route" "$log" || return 1
     done
-    ! grep -Fq 'CUDA decode attention head split active' "$log" || return 1
     if [[ $variant == indexer50 ]]; then
         grep -Fq 'CUDA decode indexer score row split enabled' "$log" || return 1
     else
@@ -199,11 +197,12 @@ validate_csv() {
 
 run_one() {
     local variant=$1 pp=$2 csv=$3 log=$4
-    local enabled=0
-    [[ $variant == control ]] || enabled=1
+    local -a variant_env=()
+    [[ $variant != control ]] ||
+        variant_env+=(DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS=1)
     local ctx_alloc=$((pp + TG_TOKENS + 1))
     "${production_env[@]}" \
-    "DS4_CUDA_TP_DECODE_INDEXER_ROWS=$enabled" \
+    "${variant_env[@]}" \
     ./ds4-bench --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --prompt-file "$PROMPT" \
@@ -254,7 +253,9 @@ mv -- "$runs_partial" "$OUTPUT_DIR/runs/runs.tsv"
 
 phase=exact-logits
 for variant in control indexer50; do
-    enabled=0; [[ $variant == control ]] || enabled=1
+    variant_env=()
+    [[ $variant != control ]] ||
+        variant_env+=(DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS=1)
     base="$OUTPUT_DIR/exact/$variant"
     logits="$base-logits"
     if [[ $RESUME == 1 && -s $base.csv && -s $base.log && -d $logits ]] &&
@@ -270,7 +271,7 @@ for variant in control indexer50; do
     ctx_alloc=$((EXACT_CONTEXT + EXACT_TOKENS + 1))
     printf 'Exact decode logits: %s...\n' "$variant"
     "${production_env[@]}" \
-    "DS4_CUDA_TP_DECODE_INDEXER_ROWS=$enabled" \
+    "${variant_env[@]}" \
     ./ds4-bench --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$MODEL" --prompt-file "$PROMPT" \

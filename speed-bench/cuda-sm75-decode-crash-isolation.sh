@@ -357,8 +357,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
                 DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
                 DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \
-                DS4_CUDA_TP_ATTN_HEADS=0 \
-                DS4_CUDA_TP_DECODE_INDEXER_ROWS=0 \
+                DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS=1 \
                 DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1 \
                 DS4_CUDA_PREFILL_FAULT_BREADCRUMBS=1 \
                 DS4_BENCH_UNTIMED_WARMUP_TOKENS=512 \
