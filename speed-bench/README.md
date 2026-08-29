@@ -2483,6 +2483,42 @@ the exact-output gate is `exact/verification.txt`.
 
 # SM75 production Q32 decode CUDA Graph A/B
 
+Before resuming a broad graph A/B after any lost-GPU event, use
+`cuda-sm75-decode-crash-isolation.sh` to reproduce the graph-disabled 32K
+control without six preceding benchmark processes. It runs TG16, TG64, and
+TG256 in increasing order, with each case in a separate process. The production
+row split, stage-aware 22/21 dense placement, partner execution, native-F16
+indexer, and complete 344/344 dense cache remain enabled; owned routed-MoE CUDA
+Graphs are explicitly disabled.
+
+Every case persists `active-case.txt` and `run-journal.tsv` before launch,
+captures per-GPU telemetry, exports the exact dense placement and binding
+inventories, and requires healthy four-GPU snapshots before and after the
+process. It never invokes `sudo`. If the host resets before the archive can be
+created, return the matching unarchived directory.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+PP_TOKENS=32768 \
+TG_LEVELS=16,64,256 \
+REPEATS=1 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-decode-crash-isolation.sh
+```
+
+Only after this graph-disabled boundary is stable should the broader
+`cuda-sm75-decode-graph-ab.sh` matrix be resumed.
+
 `cuda-sm75-decode-graph-ab.sh` tests graph coverage for the routed kernels
 that the production Q4-32/Q3A4 model actually executes. The candidate replaces
 each owned expert half's six host submissions—Q8_K quantize, native activation
