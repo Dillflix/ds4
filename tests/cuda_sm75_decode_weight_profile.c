@@ -15,6 +15,7 @@ extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
+extern void ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(uint32_t depth);
 
 typedef enum {
     SCENARIO_Q4_32_GATE_UP,
@@ -34,11 +35,15 @@ typedef enum {
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A,
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K2,
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2,
     SCENARIO_Q3A4_GATE_UP_HWARP16_AB,
     SCENARIO_Q3A4_GATE_UP_TILE32_AB,
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_AB,
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K2_AB,
     SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_AB,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1_AB,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2_AB,
     SCENARIO_Q4_32_GATE_UP_FUSED_U1,
     SCENARIO_Q4_32_GATE_UP_FUSED_U2,
     SCENARIO_Q4_32_GATE_UP_FUSED_U4,
@@ -95,6 +100,14 @@ static const scenario_spec scenarios[] = {
       SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K2 },
     { "q3a4-gate-up-tile32-dp4a-k4", "routed-q3a4-tile32-dp4a-k4",
       SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4 },
+    { "q3a4-tile32-dp4a-k4", "routed-q3a4-tile32-dp4a-k4",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4 },
+    { "q3a4-tile32-dp4a-k4-prefetch1",
+      "routed-q3a4-tile32-dp4a-k4-prefetch1",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1 },
+    { "q3a4-tile32-dp4a-k4-prefetch2",
+      "routed-q3a4-tile32-dp4a-k4-prefetch2",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2 },
     { "q3a4-gate-up-hwarp16-ab", "routed-q3a4-hwarp16-ab",
       SCENARIO_Q3A4_GATE_UP_HWARP16_AB },
     { "q3a4-gate-up-tile32-ab", "routed-q3a4-tile32-ab",
@@ -107,6 +120,15 @@ static const scenario_spec scenarios[] = {
     { "q3a4-gate-up-tile32-dp4a-k4-ab",
       "routed-q3a4-tile32-dp4a-k4-ab",
       SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_AB },
+    { "q3a4-tile32-dp4a-k4-ab",
+      "routed-q3a4-tile32-dp4a-k4-ab",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_AB },
+    { "q3a4-tile32-dp4a-k4-prefetch1-ab",
+      "routed-q3a4-tile32-dp4a-k4-prefetch1-ab",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1_AB },
+    { "q3a4-tile32-dp4a-k4-prefetch2-ab",
+      "routed-q3a4-tile32-dp4a-k4-prefetch2-ab",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2_AB },
     { "q4-32-gate-up-fused-u1", "routed-q4-32-fused-u1",
       SCENARIO_Q4_32_GATE_UP_FUSED_U1 },
     { "q4-32-gate-up-fused-u2", "routed-q4-32-fused-u2",
@@ -257,10 +279,12 @@ static ds4_gpu_tensor *input_tensor(uint64_t count) {
     return tensor;
 }
 
-static int run_routed_gate_up(int q3a4, int split,
-                              uint32_t fused_unroll,
-                              uint32_t q3a4_mapping,
-                              uint32_t q3a4_ksplit, int benchmark) {
+static int run_routed_gate_up_candidate(int q3a4, int split,
+                                        uint32_t fused_unroll,
+                                        uint32_t q3a4_mapping,
+                                        uint32_t q3a4_ksplit,
+                                        uint32_t q3a4_prefetch_depth,
+                                        int benchmark) {
     /* Three active home experts plus three partner-owned slots reproduce the
      * per-device production ownership shape.  Only the three addressable home
      * payloads need to be materialized; resident_expert_count is merely the
@@ -318,6 +342,7 @@ static int run_routed_gate_up(int q3a4, int split,
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
     ds4_gpu_test_set_moe_q3a4_decode_ksplit(q3a4_ksplit);
+    ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(q3a4_prefetch_depth);
 #define RUN_ROUTED_GATE_UP() ds4_gpu_routed_moe_one_owned_tensor( \
             out, gate, up, mid, down, model_storage, model_bytes, \
             gate_offset, up_offset, down_offset, \
@@ -333,15 +358,19 @@ static int run_routed_gate_up(int q3a4, int split,
         goto cleanup;
     }
     printf("q32_split=%s\nq32_fused_lowreg_unroll=%u\n"
-           "q3a4_decode_mapping=%u\nq3a4_decode_ksplit=%u\n",
+           "q3a4_decode_mapping=%u\nq3a4_decode_ksplit=%u\n"
+           "q3a4_decode_prefetch_depth=%u\n",
            split ? "enabled" : "disabled", fused_unroll,
-           q3a4_mapping, q3a4_ksplit);
+           q3a4_mapping, q3a4_ksplit, q3a4_prefetch_depth);
     if (benchmark) {
         const uint32_t control_mapping = q3a4_ksplit > 1u ? 3u : 0u;
+        const uint32_t control_ksplit =
+            q3a4_prefetch_depth != 0u ? 4u : 1u;
         ds4_gpu_test_set_moe_q32_decode_split(0);
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
         ds4_gpu_test_set_moe_q3a4_decode_mapping(control_mapping);
-        ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
+        ds4_gpu_test_set_moe_q3a4_decode_ksplit(control_ksplit);
+        ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
         if (!RUN_ROUTED_GATE_UP() || !ds4_gpu_synchronize()) {
             fprintf(stderr, "error: routed decode control warmup failed\n");
             goto cleanup;
@@ -351,6 +380,8 @@ static int run_routed_gate_up(int q3a4, int split,
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
         ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
         ds4_gpu_test_set_moe_q3a4_decode_ksplit(q3a4_ksplit);
+        ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(
+            q3a4_prefetch_depth);
         if (!RUN_ROUTED_GATE_UP() || !ds4_gpu_synchronize()) {
             fprintf(stderr, "error: routed decode candidate warmup failed\n");
             goto cleanup;
@@ -376,7 +407,9 @@ static int run_routed_gate_up(int q3a4, int split,
                 ds4_gpu_test_set_moe_q3a4_decode_mapping(
                     candidate ? q3a4_mapping : control_mapping);
                 ds4_gpu_test_set_moe_q3a4_decode_ksplit(
-                    candidate ? q3a4_ksplit : 1u);
+                    candidate ? q3a4_ksplit : control_ksplit);
+                ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(
+                    candidate ? q3a4_prefetch_depth : 0u);
                 if (!ds4_gpu_timer_record_start(timer)) goto timing_error;
                 for (uint32_t repeat = 0; repeat < repeats; repeat++)
                     if (!RUN_ROUTED_GATE_UP()) goto timing_error;
@@ -392,13 +425,23 @@ static int run_routed_gate_up(int q3a4, int split,
         qsort(candidate_ms, rounds, sizeof(float), compare_float);
         const float control_median = control_ms[rounds / 2u];
         const float candidate_median = candidate_ms[rounds / 2u];
-        const char *candidate_kind =
-            q3a4_ksplit == 2u ? "q3a4-tile32-dp4a-k2" :
-            (q3a4_ksplit == 4u ? "q3a4-tile32-dp4a-k4" :
-             (q3a4_mapping == 1u ? "q3a4-hwarp16" :
-              (q3a4_mapping == 2u ? "q3a4-tile32" :
-               (q3a4_mapping == 3u ? "q3a4-tile32-dp4a" :
-                (fused_unroll ? "fused-lowreg" : "split")))));
+        const char *candidate_kind = "split";
+        if (q3a4_prefetch_depth == 1u)
+            candidate_kind = "q3a4-tile32-dp4a-k4-prefetch1";
+        else if (q3a4_prefetch_depth == 2u)
+            candidate_kind = "q3a4-tile32-dp4a-k4-prefetch2";
+        else if (q3a4_ksplit == 2u)
+            candidate_kind = "q3a4-tile32-dp4a-k2";
+        else if (q3a4_ksplit == 4u)
+            candidate_kind = "q3a4-tile32-dp4a-k4";
+        else if (q3a4_mapping == 1u)
+            candidate_kind = "q3a4-hwarp16";
+        else if (q3a4_mapping == 2u)
+            candidate_kind = "q3a4-tile32";
+        else if (q3a4_mapping == 3u)
+            candidate_kind = "q3a4-tile32-dp4a";
+        else if (fused_unroll)
+            candidate_kind = "fused-lowreg";
         printf("timing_scope=production-owned-call-inclusive\n"
                "timing_rounds=%u\ntiming_repeats=%u\n"
                "candidate_kind=%s\ncontrol_median_ms=%.9g\n"
@@ -415,6 +458,8 @@ static int run_routed_gate_up(int q3a4, int split,
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
         ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
         ds4_gpu_test_set_moe_q3a4_decode_ksplit(q3a4_ksplit);
+        ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(
+            q3a4_prefetch_depth);
         goto timing_done;
 timing_error:
         fprintf(stderr, "error: routed decode inclusive timing failed\n");
@@ -431,6 +476,7 @@ cleanup:
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
+    ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
     ds4_gpu_set_routed_q4_layout(0u);
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -442,6 +488,15 @@ cleanup:
     ds4_gpu_tensor_free(x);
 #undef RUN_ROUTED_GATE_UP
     return ok;
+}
+
+static int run_routed_gate_up(int q3a4, int split,
+                              uint32_t fused_unroll,
+                              uint32_t q3a4_mapping,
+                              uint32_t q3a4_ksplit, int benchmark) {
+    return run_routed_gate_up_candidate(
+        q3a4, split, fused_unroll, q3a4_mapping, q3a4_ksplit, 0u,
+        benchmark);
 }
 
 static uint64_t q8_matrix_bytes(uint64_t in_dim, uint64_t out_dim) {
@@ -679,6 +734,12 @@ int main(int argc, char **argv) {
             ok = run_routed_gate_up(1, 0, 0u, 3u, 2u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4:
             ok = run_routed_gate_up(1, 0, 0u, 3u, 4u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1:
+            ok = run_routed_gate_up_candidate(
+                1, 0, 0u, 3u, 4u, 1u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2:
+            ok = run_routed_gate_up_candidate(
+                1, 0, 0u, 3u, 4u, 2u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_HWARP16_AB:
             ok = run_routed_gate_up(1, 0, 0u, 1u, 1u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_TILE32_AB:
@@ -689,6 +750,12 @@ int main(int argc, char **argv) {
             ok = run_routed_gate_up(1, 0, 0u, 3u, 2u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_AB:
             ok = run_routed_gate_up(1, 0, 0u, 3u, 4u, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH1_AB:
+            ok = run_routed_gate_up_candidate(
+                1, 0, 0u, 3u, 4u, 1u, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_K4_PREFETCH2_AB:
+            ok = run_routed_gate_up_candidate(
+                1, 0, 0u, 3u, 4u, 2u, 1); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U1:
             ok = run_routed_gate_up(0, 0, 1u, 0u, 1u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U2:

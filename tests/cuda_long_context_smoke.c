@@ -13,6 +13,8 @@ extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_mapping(void);
 extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_ksplit(void);
+extern void ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(uint32_t depth);
+extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
@@ -1384,6 +1386,33 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                         home_refh, home_splith,
                         (size_t)n_expert * out_dim)) goto cleanup;
             }
+            /* The K4 prefetch candidates alter only load scheduling.  Run
+             * both against the same nonzero production-owned-call reference
+             * and require exact intermediate and final outputs. */
+            ds4_gpu_test_set_moe_q3a4_decode_ksplit(4u);
+            for (uint32_t depth = 1u; depth <= 2u; depth++) {
+                ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(depth);
+                if (!ds4_gpu_routed_moe_one_owned_tensor(
+                        tmp_out, gate, up, mid, down, model, model_bytes,
+                        gate_off, up_off, down_off, gate_type, 42u,
+                        gate_expert, gate_row, down_expert, down_row,
+                        in_dim, mid_dim, out_dim, selected, weights,
+                        n_total, n_expert, 0u, 4u, 10.0f, x,
+                        home_slots, false, shared_prequant) ||
+                    !ds4_gpu_synchronize() ||
+                    !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+                    !ds4_gpu_tensor_read(home_slots, 0, home_splith,
+                                         slot_bytes) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 K4 prefetch gate/up intermediate",
+                        mid_refh, mid_splith,
+                        (size_t)n_expert * mid_dim) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 K4 prefetch owned output",
+                        home_refh, home_splith,
+                        (size_t)n_expert * out_dim)) goto cleanup;
+            }
+            ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
             ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
             ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
         }
@@ -1441,6 +1470,8 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                   "and owned decode exact/reuse\n"
                   "cuda-regression: SM75 Q3A4 tile32-dp4a K1/K2/K4 "
                   "in-CTA gate/up and owned decode exact/reuse\n"
+                  "cuda-regression: SM75 Q3A4 tile32-dp4a K4 "
+                  "prefetch-depth 1/2 nonzero exact\n"
                 : "");
     rc = 0;
 
@@ -1449,6 +1480,7 @@ cleanup:
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
+    ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
     ds4_gpu_test_set_moe_q32_decode_graph(1);
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
@@ -2162,6 +2194,14 @@ int main(void) {
     if (ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) {
         fprintf(stderr,
                 "cuda-regression: SM75 Q3A4 production K split is not K4\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
+    if (ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q3A4 production K4 unexpectedly "
+                "enables prefetch candidate\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;

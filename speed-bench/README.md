@@ -122,6 +122,32 @@ CREATE_ARCHIVE=1 \
 ./speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
 ```
 
+### SM75 Q3A4 K4 software-prefetch depth
+
+`cuda-sm75-decode-q3a4-prefetch.sh` holds the production tile32-DP4A K4
+mapping fixed and compares its ordinary weight stream with bounded prefetch
+depths 1 and 2. It requires the nonzero exact regression, sanitizes depth 2,
+and rejects any specialization above 64 allocated registers or with PTXAS
+spills, stack, or SASS `LDL`/`STL`. Inclusive timing covers the complete
+production owned call; focused Nsight captures report duration, DRAM bytes and
+rate, long-scoreboard stalls, and eligible warps.
+
+The profile harness still uses a zero-valued synthetic payload, so a bounded
+winner is not production evidence. The runner archives success or failure and
+can resume only the Nsight phase after revalidating the original exactness,
+sanitizer, resource, timing, source, and binary evidence.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection

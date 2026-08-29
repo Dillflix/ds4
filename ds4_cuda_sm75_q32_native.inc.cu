@@ -653,6 +653,249 @@ moe_gate_up_mid_decode_sm75_q3a4_tile32_ksplit_owned_kernel(
     }
 }
 
+/* K4-only software-pipelined weight-stream candidates.  The operand bundle
+ * contains only the two dilated weight words and the matching activation
+ * words for one Q3A4 group.  Depth 1 keeps the current and next group live;
+ * depth 2 keeps the current and next two groups live.  The consume calls stay
+ * explicitly ordered from group 0 through group 7, so all integer totals and
+ * corrections are accumulated in exactly the production K4 order. */
+struct sm75_q3a4_k4_group_operands {
+    uint32_t gate_qw;
+    uint32_t up_qw;
+    uint32_t lo;
+    uint32_t hi;
+};
+
+template <uint32_t GROUP>
+__device__ __forceinline__ static sm75_q3a4_k4_group_operands
+sm75_q3a4_k4_load_group(
+        const cuda_sm75_q3a4_tile *gate_w,
+        const cuda_sm75_q3a4_tile *up_w,
+        const cuda_sm75_native_q8_K *a,
+        uint32_t lane, uint32_t lane4) {
+    static_assert(GROUP < 8u, "Q3A4 group must be in [0, 8)");
+    sm75_q3a4_k4_group_operands operands;
+    operands.gate_qw = sm75_q32_dilate_q3(
+        gate_w->low2[GROUP][lane], gate_w->high[GROUP][lane]);
+    operands.up_qw = sm75_q32_dilate_q3(
+        up_w->low2[GROUP][lane], up_w->high[GROUP][lane]);
+    operands.lo = a->low[GROUP][lane4];
+    operands.hi = a->high_signed[GROUP][lane4];
+    return operands;
+}
+
+template <uint32_t GROUP>
+__device__ __forceinline__ static void sm75_q3a4_k4_consume_group(
+        sm75_q3a4_k4_group_operands operands,
+        const cuda_sm75_q3a4_tile *gate_w,
+        const cuda_sm75_q3a4_tile *up_w,
+        const cuda_sm75_native_q8_K *a,
+        uint32_t row8, uint32_t lane4,
+        int *gate_total, int *up_total,
+        int *gate_correction, int *up_correction) {
+    static_assert(GROUP < 8u, "Q3A4 group must be in [0, 8)");
+    const uint32_t nibble_mask = 0x0f0f0f0fu;
+    const uint32_t a_even =
+        (operands.lo & nibble_mask) |
+        ((operands.hi & nibble_mask) << 4u);
+    const uint32_t a_odd =
+        ((operands.lo >> 4u) & nibble_mask) |
+        (operands.hi & 0xf0f0f0f0u);
+    const uint32_t gate_even = operands.gate_qw & nibble_mask;
+    const uint32_t gate_odd = (operands.gate_qw >> 4u) & nibble_mask;
+    const uint32_t up_even = operands.up_qw & nibble_mask;
+    const uint32_t up_odd = (operands.up_qw >> 4u) & nibble_mask;
+    int gate_sum = __dp4a((int)a_even, (int)gate_even, 0);
+    gate_sum = __dp4a((int)a_odd, (int)gate_odd, gate_sum);
+    int up_sum = __dp4a((int)a_even, (int)up_even, 0);
+    up_sum = __dp4a((int)a_odd, (int)up_odd, up_sum);
+    const int gate1 = __shfl_sync(0xffffffffu, gate_sum, 1, 4);
+    const int gate2 = __shfl_sync(0xffffffffu, gate_sum, 2, 4);
+    const int gate3 = __shfl_sync(0xffffffffu, gate_sum, 3, 4);
+    const int up1 = __shfl_sync(0xffffffffu, up_sum, 1, 4);
+    const int up2 = __shfl_sync(0xffffffffu, up_sum, 2, 4);
+    const int up3 = __shfl_sync(0xffffffffu, up_sum, 3, 4);
+    if (lane4 == 0u) {
+        const int gate_group = ((gate_sum + gate1) + gate2) + gate3;
+        const int up_group = ((up_sum + up1) + up2) + up3;
+        const int bsum = (int)a->bsums[2u * GROUP] +
+                         (int)a->bsums[2u * GROUP + 1u];
+        *gate_total +=
+            (int)sm75_q32_u4(gate_w->scales[row8], GROUP) * gate_group;
+        *up_total +=
+            (int)sm75_q32_u4(up_w->scales[row8], GROUP) * up_group;
+        *gate_correction +=
+            (int)sm75_q32_u4(gate_w->mins[row8], GROUP) * bsum;
+        *up_correction +=
+            (int)sm75_q32_u4(up_w->mins[row8], GROUP) * bsum;
+    }
+}
+
+template <uint32_t PREFETCH_DEPTH>
+__global__ __launch_bounds__(512, 2) static void
+moe_gate_up_mid_decode_sm75_q3a4_tile32_k4_prefetch_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    static_assert(PREFETCH_DEPTH == 1u || PREFETCH_DEPTH == 2u,
+                  "Q3A4 K4 prefetch depth must be 1 or 2");
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t split = warp >> 2u;
+    const uint32_t row_group = warp & 3u;
+    const uint32_t row8 = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t block_row0 = blockIdx.x * 32u;
+    const uint32_t row0 = block_row0 + row_group * 8u;
+    const uint32_t slot = blockIdx.y;
+    __shared__ float gate_part[4][16][8];
+    __shared__ float up_part[4][16][8];
+
+    if (slot >= 6u || block_row0 >= expert_mid_dim || xq_blocks != 16u)
+        return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (split == 0u && lane < 8u && row0 + lane < expert_mid_dim)
+            mid_out[(uint64_t)slot * expert_mid_dim + row0 + lane] = 0.0f;
+        return;
+    }
+
+    const bool row_group_valid = row0 < expert_mid_dim;
+    if (row_group_valid) {
+        for (uint32_t b = split; b < 16u; b += 4u) {
+            const cuda_sm75_q3a4_tile *gate_w =
+                sm75_q32_ops<true>::record(gate_base, expert, row0,
+                                           expert_mid_dim, xq_blocks, b);
+            const cuda_sm75_q3a4_tile *up_w =
+                sm75_q32_ops<true>::record(up_base, expert, row0,
+                                           expert_mid_dim, xq_blocks, b);
+            const cuda_sm75_native_q8_K *a = xq + b;
+            int gate_total = 0, up_total = 0;
+            int gate_correction = 0, up_correction = 0;
+            sm75_q3a4_k4_group_operands op0 =
+                sm75_q3a4_k4_load_group<0u>(gate_w, up_w, a, lane, lane4);
+            sm75_q3a4_k4_group_operands op1 =
+                sm75_q3a4_k4_load_group<1u>(gate_w, up_w, a, lane, lane4);
+            if (PREFETCH_DEPTH == 1u) {
+                sm75_q3a4_k4_consume_group<0u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op0 = sm75_q3a4_k4_load_group<2u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<1u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op1 = sm75_q3a4_k4_load_group<3u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<2u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op0 = sm75_q3a4_k4_load_group<4u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<3u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op1 = sm75_q3a4_k4_load_group<5u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<4u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op0 = sm75_q3a4_k4_load_group<6u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<5u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op1 = sm75_q3a4_k4_load_group<7u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<6u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                sm75_q3a4_k4_consume_group<7u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+            } else {
+                sm75_q3a4_k4_group_operands op2 =
+                    sm75_q3a4_k4_load_group<2u>(
+                        gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<0u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op0 = sm75_q3a4_k4_load_group<3u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<1u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op1 = sm75_q3a4_k4_load_group<4u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<2u>(
+                    op2, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op2 = sm75_q3a4_k4_load_group<5u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<3u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op0 = sm75_q3a4_k4_load_group<6u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<4u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                op1 = sm75_q3a4_k4_load_group<7u>(
+                    gate_w, up_w, a, lane, lane4);
+                sm75_q3a4_k4_consume_group<5u>(
+                    op2, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                sm75_q3a4_k4_consume_group<6u>(
+                    op0, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+                sm75_q3a4_k4_consume_group<7u>(
+                    op1, gate_w, up_w, a, row8, lane4, &gate_total,
+                    &up_total, &gate_correction, &up_correction);
+            }
+            if (lane4 == 0u) {
+                gate_part[row_group][b][row8] = a->d * (
+                    dev_f16_to_f32(gate_w->d[row8]) * (float)gate_total -
+                    dev_f16_to_f32(gate_w->dmin[row8]) *
+                        (float)gate_correction);
+                up_part[row_group][b][row8] = a->d * (
+                    dev_f16_to_f32(up_w->d[row8]) * (float)up_total -
+                    dev_f16_to_f32(up_w->dmin[row8]) *
+                        (float)up_correction);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (split != 0u || !row_group_valid) return;
+    /* This is the production K4/K1 16-leaf reduction, intentionally exact. */
+    float gate = __fadd_rn(
+        __fadd_rn(gate_part[row_group][lane4][row8],
+                  gate_part[row_group][lane4 + 8u][row8]),
+        __fadd_rn(gate_part[row_group][lane4 + 4u][row8],
+                  gate_part[row_group][lane4 + 12u][row8]));
+    float up = __fadd_rn(
+        __fadd_rn(up_part[row_group][lane4][row8],
+                  up_part[row_group][lane4 + 8u][row8]),
+        __fadd_rn(up_part[row_group][lane4 + 4u][row8],
+                  up_part[row_group][lane4 + 12u][row8]));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 2, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 2, 4));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 1, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 1, 4));
+    if (lane4 == 0u && row0 + row8 < expert_mid_dim) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row0 + row8] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
 /* Single-launch low-register gate/up candidates.  Unlike the rejected split
  * experiment these preserve one owned-slot traversal, keep the gate and up
  * outputs in registers, and avoid global intermediates and a combine launch.

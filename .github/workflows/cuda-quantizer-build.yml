@@ -176,6 +176,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-decode-graph-ab.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
+          test -x speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
+          bash -n speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
           ! grep -Eq '<<[[:space:]]*EOF' speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
