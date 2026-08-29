@@ -14,9 +14,10 @@ signed-DP4A implementation so layout and arithmetic effects remain separable.
 The runner requires the real 16-K256-record byte-exact regression, fresh
 PTXAS/SASS evidence, zero spills and local traffic, complete owned-call timing,
 and focused Nsight Compute memory/scheduler captures for all five kernels.
-This pass selects the local Q3A4 microkernel; it does not by itself authorize
-production dispatch. The winner must next be measured in the real two-GPU FFN
-envelope with routed counts, shared-expert assignment, down, and return/reduce.
+This pass selected tile32 signed-DP4A. The subsequent real four-GPU production
+A/B established byte-exact output and a 5.2--6.5% decode gain, so that mapping
+is now the SM75 tagged-Q3A4 default; this harness remains the bounded kernel
+audit rather than the production acceptance test.
 
 ```bash
 PROFILE_GPU=0 \
@@ -2407,11 +2408,13 @@ cases are reused; incomplete or invalid cases are rerun. Return the generated
 
 # SM75 Q3A4 tile32-DP4A production decode A/B
 
-`cuda-sm75-decode-q3a4-production-ab.sh` is the promotion gate for the
-Q3A4-only native decode mapping selected by the single-GPU kernel audit.  It
-compares the shipping Q3A4 gate/up kernel with the exact tile32 signed-DP4A
-kernel while leaving Q4-32, expert ownership, shared-expert placement, the
-22/21 stage split, dense-F16 placement, and every cross-GPU boundary unchanged.
+`cuda-sm75-decode-q3a4-production-ab.sh` validates the production-default
+Q3A4-only native decode mapping selected by the kernel and end-to-end audits.
+SM75 tagged Q3A4 tensors now use the exact tile32 signed-DP4A kernel by default;
+`DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1` is the explicit rollback to the prior
+control.  The runner compares that control with an unmodified default process
+while leaving Q4-32, expert ownership, shared-expert placement, the 22/21 stage
+split, dense-F16 placement, and every cross-GPU boundary unchanged.
 
 Each process evaluates PP512, PP4096, and PP32768 with TG256.  The geometric
 frontier sequence avoids two redundant 139-GiB model loads per arm.  Variant
@@ -2446,9 +2449,14 @@ bash ./speed-bench/cuda-sm75-decode-q3a4-production-ab.sh
 ```
 
 To resume, retain all original settings and set `RESUME=1` plus
-`Q3A4_PRODUCTION_AB_DIR` to the existing output directory.  Return the
-generated `sm75-decode-q3a4-production-ab-<timestamp>.tar.gz`; the production
-decision table is `summary/summary.md` and the exactness gate is
+`Q3A4_PRODUCTION_AB_DIR` to the existing output directory. Throughput results
+are summarized before exact validation starts. A fresh exact arm evaluates all
+three frontiers in one process; after an interrupted run, completed exact
+frontiers are preserved and only missing frontiers are repaired. Every source
+log must still prove the same dense-Q8 plan, exact mapping-call inventory, and
+final expected filename inventory. Return the generated
+`sm75-decode-q3a4-production-ab-<timestamp>.tar.gz`; the production decision
+table is `summary/summary.md` and the exactness gate is
 `exact/verification.txt`.
 
 # SM75 production decode evidence

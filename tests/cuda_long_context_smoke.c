@@ -10,6 +10,7 @@ extern void ds4_gpu_test_set_moe_q32_decode_graph(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
+extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_mapping(void);
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -2049,6 +2050,16 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q3A4 production mapping is not "
+                "tile32-dp4a\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 Q3A4 tile32-dp4a production default\n");
     if (!retire_temporary_model_map()) {
         ds4_gpu_cleanup();
         free(idle_model_map);

@@ -25,8 +25,9 @@ Optional environment:
   CREATE_ARCHIVE=1
   Q3A4_PRODUCTION_AB_DIR=...
 
-The fixed PP frontiers are 512, 4096, and 32768.  Each process evaluates all
-three, avoiding redundant model loads while retaining paired variant order.
+The fixed PP frontiers are 512, 4096, and 32768.  A fresh exact run evaluates
+all three in one process.  RESUME preserves completed exact frontiers and runs
+only a missing frontier, so a late hardware failure does not discard evidence.
 EOF
 }
 
@@ -106,14 +107,25 @@ emit_configuration() {
     printf 'tg_tokens=%s\nexact_tokens=%s\nwarmup_tokens=%s\n' \
         "$TG_TOKENS" "$EXACT_TOKENS" "$WARMUP_TOKENS"
     printf 'prefill_chunk=%s\npipeline_mb=%s\n' "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 'q3a4_decode_default=tile32-dp4a\n'
 }
 
+legacy_resume=0
 if [[ $RESUME == 1 ]]; then
     [[ -n ${Q3A4_PRODUCTION_AB_DIR:-} && -d $OUTPUT_DIR ]] ||
         die "RESUME=1 requires an existing Q3A4_PRODUCTION_AB_DIR"
     [[ -f $OUTPUT_DIR/configuration.txt ]] || die "resume configuration is missing"
-    cmp -s <(emit_configuration) "$OUTPUT_DIR/configuration.txt" ||
-        die "resume configuration differs from the original run"
+    if ! cmp -s <(emit_configuration) "$OUTPUT_DIR/configuration.txt"; then
+        if cmp -s <(emit_configuration | \
+                    grep -Fv 'q3a4_decode_default=tile32-dp4a') \
+                  "$OUTPUT_DIR/configuration.txt"; then
+            legacy_resume=1
+            printf 'Resuming pre-default Q3A4 evidence with exact legacy '
+            printf 'configuration compatibility.\n'
+        else
+            die "resume configuration differs from the original run"
+        fi
+    fi
 else
     [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
         die "output path already exists: $OUTPUT_DIR"
@@ -165,7 +177,8 @@ phase=build
 if [[ $SKIP_BUILD == 0 ]]; then
     make -B -j"$(nproc)" ds4-bench tests/cuda_long_context_smoke \
         CUDA_ARCH=sm_75 2>&1 | tee "$OUTPUT_DIR/build.log"
-    ./tests/cuda_long_context_smoke >"$OUTPUT_DIR/smoke.log" 2>&1 || {
+    "${clean[@]}" ./tests/cuda_long_context_smoke \
+        >"$OUTPUT_DIR/smoke.log" 2>&1 || {
         tail -n 180 "$OUTPUT_DIR/smoke.log" >&2 || true
         die "byte-exact CUDA regression failed"
     }
@@ -173,6 +186,8 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 native exact marker missing"
     grep -Fq 'SM75 Q3A4 DP4A byte packing exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 DP4A packing marker missing"
+    grep -Fq 'SM75 Q3A4 tile32-dp4a production default' \
+        "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
         die "SKIP_BUILD=1 found stale targets"
@@ -272,7 +287,16 @@ mapping_active_count() {
 }
 
 validate_mapping_audit() {
-    mapping_active_count "$1" "$2" >/dev/null
+    local variant=$1 log=$2 marker
+    if [[ $variant == control ]]; then
+        marker='SM75 Q3A4 decode gate/up mapping=control'
+    else
+        marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a (production default)'
+    fi
+    if ! grep -Fq "$marker" "$log"; then
+        [[ $legacy_resume == 1 ]] || return 1
+    fi
+    mapping_active_count "$variant" "$log" >/dev/null
 }
 
 validate_q8_plan_equal() {
@@ -280,6 +304,8 @@ validate_q8_plan_equal() {
     for marker in 'CUDA q8 fp16 benefit plan candidates=' \
                   'CUDA q8 fp16 stage-aware 22/21 planner selected ' \
                   'CUDA q8 fp16 benefit plan materialized '; do
+        [[ $(grep -Fc "$marker" "$control_log") == 1 &&
+           $(grep -Fc "$marker" "$candidate_log") == 1 ]] || return 1
         control_line=$(grep -F "$marker" "$control_log") || return 1
         candidate_line=$(grep -F "$marker" "$candidate_log") || return 1
         [[ $control_line == "$candidate_line" ]] || {
@@ -303,12 +329,180 @@ validate_csv() {
     ' "$csv"
 }
 
+validate_exact_partial_csv() {
+    local csv=$1
+    awk -F, -v tg="$EXACT_TOKENS" '
+        NR==1 {
+            header=($1=="ctx_tokens" && $4=="gen_tokens" &&
+                    $8=="gen_steady_tps")
+            next
+        }
+        {
+            rows++
+            ctx=$1+0
+            if ((ctx!=512 && ctx!=4096 && ctx!=32768) || seen[ctx]++ ||
+                $4!=tg || ($8+0)<=0) bad=1
+        }
+        END {exit !(header && rows>=1 && rows<=3 && !bad)}
+    ' "$csv"
+}
+
+csv_has_frontier() {
+    local csv=$1 context=$2
+    awk -F, -v ctx="$context" 'NR>1 && $1==ctx {found++}
+        END {exit !(found==1)}' "$csv"
+}
+
+frontier_complete() {
+    local logits=$1 context=$2 token file
+    for ((token=1; token<=EXACT_TOKENS; token++)); do
+        printf -v file 'frontier_%06d.decode_%06d.logits.f32' \
+            "$context" "$token"
+        [[ -s $logits/$file ]] || return 1
+    done
+}
+
+run_exact_full() {
+    local variant=$1 base=$2 logits=$3
+    local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
+    [[ $variant == control ]] || mapping_env=()
+    local ctx_alloc=$((CTX_MAX + EXACT_TOKENS + 1))
+    printf 'Exact Q3A4 decode logits: %s (all frontiers)...\n' "$variant"
+    "${production_env[@]}" "${mapping_env[@]}" \
+    ./ds4-bench --cuda --cuda-tensor-parallel \
+        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+        --model "$MODEL" --prompt-file "$PROMPT" \
+        --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" --ctx-alloc "$ctx_alloc" \
+        --step-mul "$STEP_MUL" --prefill-chunk "$PREFILL_CHUNK" \
+        --gen-tokens "$EXACT_TOKENS" --dump-decode-logits-dir "$logits" \
+        --csv "$base.csv" >"$base.log" 2>&1
+}
+
+run_exact_frontier() {
+    local variant=$1 context=$2 base=$3 logits=$4 prefix
+    local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
+    [[ $variant == control ]] || mapping_env=()
+    local ctx_alloc=$((CTX_MAX + EXACT_TOKENS + 1))
+    printf -v prefix 'frontier_%06d' "$context"
+    find "$logits" -maxdepth 1 -type f \
+        -name "$prefix.decode_*.logits.f32" -delete
+    printf 'Repairing exact Q3A4 decode logits: %s PP=%s...\n' \
+        "$variant" "$context"
+    "${production_env[@]}" "${mapping_env[@]}" \
+    ./ds4-bench --cuda --cuda-tensor-parallel \
+        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
+        --model "$MODEL" --prompt-file "$PROMPT" \
+        --ctx-start "$context" --ctx-max "$context" --ctx-alloc "$ctx_alloc" \
+        --step-mul "$STEP_MUL" --prefill-chunk "$PREFILL_CHUNK" \
+        --gen-tokens "$EXACT_TOKENS" --dump-decode-logits-dir "$logits" \
+        --csv "$base.csv" >"$base.log" 2>&1
+}
+
+exact_source_calls() {
+    local variant=$1 sources=$2 frontiers kind log csv calls total=0
+    local expected context
+    while IFS=$'\t' read -r frontiers kind log csv; do
+        [[ $frontiers != frontiers ]] || continue
+        validate_common_log "$log" && validate_mapping_audit "$variant" "$log" &&
+            validate_exact_partial_csv "$csv" || return 1
+        IFS=, read -r -a source_contexts <<<"$frontiers"
+        [[ ${#source_contexts[@]} -ge 1 ]] || return 1
+        for context in "${source_contexts[@]}"; do
+            csv_has_frontier "$csv" "$context" || return 1
+        done
+        [[ $(awk -F, 'NR>1 {n++} END {print n+0}' "$csv") == \
+           ${#source_contexts[@]} ]] || return 1
+        calls=$(mapping_active_count "$variant" "$log") || return 1
+        expected=$((${#source_contexts[@]} * EXACT_TOKENS * 15 * 2))
+        if [[ $kind == repair ]]; then
+            (( calls == expected )) || return 1
+        else
+            # A failed all-frontier process may have entered the next decode
+            # frontier after completing every file attributed to it. Preserve
+            # those complete frontiers and record the partial extra calls.
+            (( calls >= expected )) || return 1
+        fi
+        total=$((total + calls))
+    done <"$sources"
+    printf '%s\n' "$total"
+}
+
+mapping_count_is_exact() {
+    local variant=$1 log=$2 frontier_count=$3 calls
+    calls=$(mapping_active_count "$variant" "$log") || return 1
+    (( calls == frontier_count * EXACT_TOKENS * 15 * 2 ))
+}
+
+mapping_count_covers() {
+    local variant=$1 log=$2 frontier_count=$3 calls
+    calls=$(mapping_active_count "$variant" "$log") || return 1
+    (( calls >= frontier_count * EXACT_TOKENS * 15 * 2 ))
+}
+
+source_kind_for_frontier() {
+    local sources=$1 context=$2
+    awk -F'\t' -v target="$context" '
+        NR==1 {next}
+        {
+            n=split($1, values, ",")
+            for (i=1; i<=n; i++) {
+                if (values[i]==target) {
+                    found++
+                    kind=$2
+                }
+            }
+        }
+        END {
+            if (found!=1) exit 1
+            print kind
+        }
+    ' "$sources"
+}
+
+validate_source_manifest() {
+    awk -F'\t' '
+        NR==1 {
+            header=($1=="frontiers" && $2=="kind" &&
+                    $3=="log" && $4=="csv")
+            next
+        }
+        {
+            rows++
+            if (($2!="base" && $2!="repair") || !$3 || !$4) bad=1
+            n=split($1, values, ",")
+            for (i=1; i<=n; i++) {
+                ctx=values[i]+0
+                if (ctx!=512 && ctx!=4096 && ctx!=32768) bad=1
+                seen[ctx]++
+            }
+        }
+        END {
+            exit !(header && rows>=1 && !bad &&
+                   seen[512]==1 && seen[4096]==1 && seen[32768]==1)
+        }
+    ' "$1"
+}
+
+write_selected_csv() {
+    local input=$1 frontiers=$2 output=$3 partial="$output.partial.$$"
+    awk -F, -v selected="$frontiers" '
+        BEGIN {
+            OFS=",";
+            n=split(selected, values, ",")
+            for (i=1; i<=n; i++) wanted[values[i]]=1
+        }
+        NR==1 {print; next}
+        wanted[$1] {print}
+    ' "$input" >"$partial"
+    mv -- "$partial" "$output"
+}
+
 run_one() {
     local variant=$1 tokens=$2 csv=$3 log=$4
     local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
-    [[ $variant == control ]] || mapping_env=(
-        DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
-    )
+    # The candidate deliberately carries no mapping override: this A/B now
+    # proves the production default rather than an opt-in experiment.
+    [[ $variant == control ]] || mapping_env=()
     local ctx_alloc=$((CTX_MAX + tokens + 1))
     "${production_env[@]}" "${mapping_env[@]}" \
     ./ds4-bench --cuda --cuda-tensor-parallel \
@@ -319,6 +513,70 @@ run_one() {
         --gen-tokens "$tokens" --csv "$csv" >"$log" 2>&1 || return 1
     validate_csv "$csv" "$tokens" && validate_common_log "$log" &&
         validate_mapping_audit "$variant" "$log"
+}
+
+write_throughput_summary() {
+    python3 - "$OUTPUT_DIR/runs/runs.tsv" "$OUTPUT_DIR/summary/summary.csv" \
+               "$OUTPUT_DIR/summary/summary.md" <<'PY'
+import csv
+import pathlib
+import statistics
+import sys
+
+rows = list(csv.DictReader(pathlib.Path(sys.argv[1]).open(), delimiter="\t"))
+by_pair = {}
+for row in rows:
+    key = (int(row["repeat"]), int(row["context"]))
+    by_pair.setdefault(key, {})[row["variant"]] = float(row["steady_tps"])
+
+groups = {}
+for (repeat, context), values in by_pair.items():
+    if set(values) != {"control", "tile32-dp4a"}:
+        raise SystemExit(f"unpaired sample at repeat={repeat} context={context}")
+    groups.setdefault(context, []).append(
+        (values["control"], values["tile32-dp4a"]))
+
+records = []
+for context in sorted(groups):
+    pairs = groups[context]
+    control = [p[0] for p in pairs]
+    candidate = [p[1] for p in pairs]
+    ratios = [b / a for a, b in pairs]
+    records.append((
+        context,
+        statistics.median(control),
+        statistics.median(candidate),
+        statistics.median(ratios),
+        statistics.stdev(ratios) if len(ratios) > 1 else 0.0,
+        len(ratios),
+    ))
+
+with pathlib.Path(sys.argv[2]).open("w", newline="") as handle:
+    out = csv.writer(handle)
+    out.writerow(["context", "control_tps", "tile32_dp4a_tps",
+                  "paired_median_speedup", "change_pct",
+                  "paired_speedup_sd", "samples"])
+    for context, control, candidate, speedup, sd, samples in records:
+        out.writerow([context, f"{control:.6f}", f"{candidate:.6f}",
+                      f"{speedup:.9f}", f"{(speedup - 1) * 100:.6f}",
+                      f"{sd:.9f}", samples])
+
+lines = [
+    "# SM75 production Q3A4 tile32-DP4A decode A/B",
+    "",
+    "Only Q3A4 gate/up mapping changes. Q4-32 and every cross-GPU boundary "
+    "are identical. Exact-output validation is a separate checkpointed phase.",
+    "",
+    "| Context | Control tok/s | Tile32-DP4A tok/s | Paired speedup | Change | SD |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: |",
+]
+for context, control, candidate, speedup, sd, _ in records:
+    lines.append(
+        f"| {context} | {control:.3f} | {candidate:.3f} | {speedup:.6f}x | "
+        f"{(speedup - 1) * 100:+.3f}% | {sd:.6f} |"
+    )
+pathlib.Path(sys.argv[3]).write_text("\n".join(lines) + "\n")
+PY
 }
 
 phase=throughput
@@ -368,134 +626,219 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 done
 mv -- "$runs_partial" "$OUTPUT_DIR/runs/runs.tsv"
 mv -- "$dispatch_partial" "$OUTPUT_DIR/runs/dispatch.tsv"
+phase=throughput-summary
+write_throughput_summary
+cat "$OUTPUT_DIR/summary/summary.md"
 
 phase=exact-logits
 for variant in control tile32-dp4a; do
     base="$OUTPUT_DIR/exact/$variant"; logits="$base-logits"
+    sources="$OUTPUT_DIR/exact/$variant-sources.tsv"
+    sources_partial="$sources.partial.$$"
+    printf 'frontiers\tkind\tlog\tcsv\n' >"$sources_partial"
     valid=0
     if [[ $RESUME == 1 && -s $base.csv && -s $base.log && -d $logits ]] &&
        validate_csv "$base.csv" "$EXACT_TOKENS" &&
        validate_common_log "$base.log" &&
        validate_mapping_audit "$variant" "$base.log" &&
-       [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == \
-          $((3 * EXACT_TOKENS)) ]]; then
-        valid=1; printf 'Reusing exact Q3A4 decode logits: %s...\n' "$variant"
+       frontier_complete "$logits" 512 &&
+       frontier_complete "$logits" 4096 &&
+       frontier_complete "$logits" 32768; then
+        valid=1
+        printf '512,4096,32768\tbase\t%s\t%s\n' \
+            "$base.log" "$base.csv" >>"$sources_partial"
+        printf 'Reusing exact Q3A4 decode logits: %s (all frontiers)...\n' \
+            "$variant"
     fi
     if [[ $valid == 0 ]]; then
-        [[ ! -d $logits ]] || find "$logits" -maxdepth 1 -type f -name '*.f32' -delete
         mkdir -p "$logits"
-        mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
-        [[ $variant == control ]] || mapping_env=(
-            DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
-        )
-        ctx_alloc=$((CTX_MAX + EXACT_TOKENS + 1))
-        printf 'Exact Q3A4 decode logits: %s...\n' "$variant"
-        "${production_env[@]}" "${mapping_env[@]}" \
-        ./ds4-bench --cuda --cuda-tensor-parallel \
-            --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
-            --model "$MODEL" --prompt-file "$PROMPT" \
-            --ctx-start "$CTX_START" --ctx-max "$CTX_MAX" --ctx-alloc "$ctx_alloc" \
-            --step-mul "$STEP_MUL" --prefill-chunk "$PREFILL_CHUNK" \
-            --gen-tokens "$EXACT_TOKENS" --dump-decode-logits-dir "$logits" \
-            --csv "$base.csv" >"$base.log" 2>&1 ||
+        if [[ $RESUME == 0 ]]; then
+            find "$logits" -maxdepth 1 -type f -name '*.f32' -delete
+            run_exact_full "$variant" "$base" "$logits" ||
                 die "$variant exact-logit run failed"
-        validate_csv "$base.csv" "$EXACT_TOKENS" ||
-            die "$variant exact-logit CSV is invalid"
-        validate_common_log "$base.log" && validate_mapping_audit "$variant" "$base.log" ||
-            die "$variant exact run omitted its production or mapping path"
-        [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == \
-           $((3 * EXACT_TOKENS)) ]] ||
-            die "$variant did not emit all decode-logit files"
+            validate_csv "$base.csv" "$EXACT_TOKENS" &&
+                validate_common_log "$base.log" &&
+                validate_mapping_audit "$variant" "$base.log" ||
+                die "$variant exact run omitted its production or mapping path"
+            printf '512,4096,32768\tbase\t%s\t%s\n' \
+                "$base.log" "$base.csv" >>"$sources_partial"
+        else
+            base_reusable=0
+            base_frontiers=
+            base_frontier_count=0
+            if [[ -s $base.csv && -s $base.log ]] &&
+               validate_exact_partial_csv "$base.csv" &&
+               validate_common_log "$base.log" &&
+               validate_mapping_audit "$variant" "$base.log"; then
+                base_reusable=1
+                for context in 512 4096 32768; do
+                    if csv_has_frontier "$base.csv" "$context" &&
+                       frontier_complete "$logits" "$context"; then
+                        base_frontiers+="${base_frontiers:+,}$context"
+                        base_frontier_count=$((base_frontier_count + 1))
+                    fi
+                done
+                if [[ $base_frontier_count == 0 ]] ||
+                   ! mapping_count_covers "$variant" "$base.log" \
+                       "$base_frontier_count"; then
+                    base_reusable=0
+                    base_frontiers=
+                    base_frontier_count=0
+                fi
+            fi
+            reusable_frontiers=0
+            for context in 512 4096 32768; do
+                repair="$OUTPUT_DIR/exact/$variant-frontier-$context"
+                if [[ $base_reusable == 1 ]] &&
+                   csv_has_frontier "$base.csv" "$context" &&
+                   frontier_complete "$logits" "$context"; then
+                    reusable_frontiers=$((reusable_frontiers + 1))
+                elif [[ -s $repair.csv && -s $repair.log ]] &&
+                     validate_exact_partial_csv "$repair.csv" &&
+                     csv_has_frontier "$repair.csv" "$context" &&
+                     validate_common_log "$repair.log" &&
+                     validate_mapping_audit "$variant" "$repair.log" &&
+                     mapping_count_is_exact "$variant" "$repair.log" 1 &&
+                     frontier_complete "$logits" "$context"; then
+                    reusable_frontiers=$((reusable_frontiers + 1))
+                fi
+            done
+            if [[ $reusable_frontiers == 0 ]]; then
+                find "$logits" -maxdepth 1 -type f -name '*.f32' -delete
+                run_exact_full "$variant" "$base" "$logits" ||
+                    die "$variant exact-logit run failed"
+                validate_csv "$base.csv" "$EXACT_TOKENS" &&
+                    validate_common_log "$base.log" &&
+                    validate_mapping_audit "$variant" "$base.log" ||
+                    die "$variant exact run omitted its production or mapping path"
+                printf '512,4096,32768\tbase\t%s\t%s\n' \
+                    "$base.log" "$base.csv" >>"$sources_partial"
+            else
+                reused_base=0
+                for context in 512 4096 32768; do
+                    repair="$OUTPUT_DIR/exact/$variant-frontier-$context"
+                    if [[ $base_reusable == 1 ]] &&
+                       csv_has_frontier "$base.csv" "$context" &&
+                       frontier_complete "$logits" "$context"; then
+                        reused_base=1
+                        printf 'Reusing exact Q3A4 decode logits: %s PP=%s...\n' \
+                            "$variant" "$context"
+                        continue
+                    fi
+                    if [[ -s $repair.csv && -s $repair.log ]] &&
+                       validate_exact_partial_csv "$repair.csv" &&
+                       csv_has_frontier "$repair.csv" "$context" &&
+                       validate_common_log "$repair.log" &&
+                       validate_mapping_audit "$variant" "$repair.log" &&
+                       mapping_count_is_exact "$variant" "$repair.log" 1 &&
+                       frontier_complete "$logits" "$context"; then
+                        printf 'Reusing repaired exact Q3A4 decode logits: %s PP=%s...\n' \
+                            "$variant" "$context"
+                    else
+                        run_exact_frontier "$variant" "$context" "$repair" "$logits" ||
+                            die "$variant PP=$context exact-logit repair failed"
+                        validate_exact_partial_csv "$repair.csv" &&
+                            csv_has_frontier "$repair.csv" "$context" &&
+                            validate_common_log "$repair.log" &&
+                            validate_mapping_audit "$variant" "$repair.log" &&
+                            mapping_count_is_exact "$variant" "$repair.log" 1 &&
+                            frontier_complete "$logits" "$context" ||
+                            die "$variant PP=$context exact-logit repair is invalid"
+                    fi
+                    printf '%s\trepair\t%s\t%s\n' \
+                        "$context" "$repair.log" "$repair.csv" \
+                        >>"$sources_partial"
+                done
+                if [[ $reused_base == 1 ]]; then
+                    selected_csv="$OUTPUT_DIR/exact/$variant-base-selected.csv"
+                    write_selected_csv "$base.csv" "$base_frontiers" \
+                        "$selected_csv"
+                    printf '%s\tbase\t%s\t%s\n' \
+                        "$base_frontiers" "$base.log" "$selected_csv" \
+                        >>"$sources_partial"
+                fi
+            fi
+        fi
     fi
+    for context in 512 4096 32768; do
+        frontier_complete "$logits" "$context" ||
+            die "$variant did not emit all PP=$context decode-logit files"
+    done
+    [[ $(find "$logits" -maxdepth 1 -type f -name '*.f32' | wc -l) == \
+       $((3 * EXACT_TOKENS)) ]] ||
+        die "$variant emitted an unexpected decode-logit inventory"
+    mv -- "$sources_partial" "$sources"
 done
 
-validate_q8_plan_equal "$OUTPUT_DIR/exact/control.log" \
-    "$OUTPUT_DIR/exact/tile32-dp4a.log" ||
-    die "exact arms changed the dense-Q8 placement plan"
-control_calls=$(mapping_active_count control "$OUTPUT_DIR/exact/control.log")
-candidate_calls=$(mapping_active_count tile32-dp4a \
-    "$OUTPUT_DIR/exact/tile32-dp4a.log")
-[[ $control_calls == "$candidate_calls" ]] ||
-    die "exact arms changed Q3A4 owned-call inventory ($control_calls vs $candidate_calls)"
+control_sources="$OUTPUT_DIR/exact/control-sources.tsv"
+candidate_sources="$OUTPUT_DIR/exact/tile32-dp4a-sources.tsv"
+validate_source_manifest "$control_sources" &&
+    validate_source_manifest "$candidate_sources" ||
+    die "exact-source manifest does not assign every frontier exactly once"
+control_ref=$(awk -F'\t' 'NR==2 {print $3}' "$control_sources")
+[[ -n $control_ref ]] || die "control exact-source manifest is empty"
+for sources in "$control_sources" "$candidate_sources"; do
+    while IFS=$'\t' read -r frontiers kind log csv; do
+        [[ $frontiers != frontiers ]] || continue
+        validate_q8_plan_equal "$control_ref" "$log" ||
+            die "exact source changed the dense-Q8 placement plan: $log"
+    done <"$sources"
+done
+control_calls=$(exact_source_calls control "$control_sources") ||
+    die "control exact sources failed mapping validation"
+candidate_calls=$(exact_source_calls tile32-dp4a "$candidate_sources") ||
+    die "tile32-dp4a exact sources failed mapping validation"
+minimum_calls=$((3 * EXACT_TOKENS * 15 * 2))
+(( control_calls >= minimum_calls && candidate_calls >= minimum_calls )) ||
+    die "exact sources omitted Q3A4 calls (minimum $minimum_calls; control $control_calls; candidate $candidate_calls)"
+control_extra_calls=$((control_calls - minimum_calls))
+candidate_extra_calls=$((candidate_calls - minimum_calls))
 
+expected_files="$OUTPUT_DIR/exact/expected-files.txt"
+: >"$expected_files"
+for context in 512 4096 32768; do
+    for ((token=1; token<=EXACT_TOKENS; token++)); do
+        printf 'frontier_%06d.decode_%06d.logits.f32\n' \
+            "$context" "$token" >>"$expected_files"
+    done
+done
 find "$OUTPUT_DIR/exact/control-logits" -maxdepth 1 -type f -name '*.f32' \
     -printf '%f\n' | sort >"$OUTPUT_DIR/exact/control-files.txt"
 find "$OUTPUT_DIR/exact/tile32-dp4a-logits" -maxdepth 1 -type f -name '*.f32' \
     -printf '%f\n' | sort >"$OUTPUT_DIR/exact/candidate-files.txt"
-cmp -s "$OUTPUT_DIR/exact/control-files.txt" \
-       "$OUTPUT_DIR/exact/candidate-files.txt" ||
-    die "control and candidate emitted different logit inventories"
+cmp -s "$expected_files" "$OUTPUT_DIR/exact/control-files.txt" ||
+    die "control emitted an unexpected logit inventory"
+cmp -s "$expected_files" "$OUTPUT_DIR/exact/candidate-files.txt" ||
+    die "tile32-dp4a emitted an unexpected logit inventory"
 while IFS= read -r file; do
-    cmp -s "$OUTPUT_DIR/exact/control-logits/$file" \
-           "$OUTPUT_DIR/exact/tile32-dp4a-logits/$file" ||
+    if ! cmp -s "$OUTPUT_DIR/exact/control-logits/$file" \
+              "$OUTPUT_DIR/exact/tile32-dp4a-logits/$file"; then
+        padded_context=${file#frontier_}
+        padded_context=${padded_context%%.*}
+        context=$((10#$padded_context))
+        control_kind=$(source_kind_for_frontier "$control_sources" "$context")
+        candidate_kind=$(source_kind_for_frontier "$candidate_sources" "$context")
+        if [[ $control_kind != "$candidate_kind" ]]; then
+            die "exact paths used different prefill histories at PP=$context ($control_kind vs $candidate_kind); this is not classified as a Q3A4 arithmetic mismatch"
+        fi
         die "tile32-dp4a diverged at $file"
+    fi
 done <"$OUTPUT_DIR/exact/control-files.txt"
 printf 'bit_exact=true\nfrontiers=512,4096,32768\ndecode_tokens_per_frontier=%s\n' \
     "$EXACT_TOKENS" >"$OUTPUT_DIR/exact/verification.txt"
-printf 'control_owned_calls=%s\ntile32_dp4a_owned_calls=%s\nq8_plan_equal=true\n' \
-    "$control_calls" "$candidate_calls" >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'minimum_required_owned_calls=%s\ncontrol_observed_owned_calls=%s\n' \
+    "$minimum_calls" "$control_calls" >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'tile32_dp4a_observed_owned_calls=%s\nq8_plan_equal=true\n' \
+    "$candidate_calls" >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'control_interrupted_extra_calls=%s\n' "$control_extra_calls" \
+    >>"$OUTPUT_DIR/exact/verification.txt"
+printf 'tile32_dp4a_interrupted_extra_calls=%s\n' "$candidate_extra_calls" \
+    >>"$OUTPUT_DIR/exact/verification.txt"
+cat >>"$OUTPUT_DIR/summary/summary.md" <<EOF
 
-phase=summary
-python3 - "$OUTPUT_DIR/runs/runs.tsv" "$OUTPUT_DIR/summary/summary.csv" \
-           "$OUTPUT_DIR/summary/summary.md" <<'PY'
-import csv
-import pathlib
-import statistics
-import sys
+## Exact-output verification
 
-rows = list(csv.DictReader(pathlib.Path(sys.argv[1]).open(), delimiter="\t"))
-by_pair = {}
-for row in rows:
-    key = (int(row["repeat"]), int(row["context"]))
-    by_pair.setdefault(key, {})[row["variant"]] = float(row["steady_tps"])
+All $EXACT_TOKENS decode logits at PP512, PP4096, and PP32768 were byte-identical.
+EOF
 
-groups = {}
-for (repeat, context), values in by_pair.items():
-    if set(values) != {"control", "tile32-dp4a"}:
-        raise SystemExit(f"unpaired sample at repeat={repeat} context={context}")
-    groups.setdefault(context, []).append(
-        (values["control"], values["tile32-dp4a"]))
-
-records = []
-for context in sorted(groups):
-    pairs = groups[context]
-    control = [p[0] for p in pairs]
-    candidate = [p[1] for p in pairs]
-    ratios = [b / a for a, b in pairs]
-    records.append((
-        context,
-        statistics.median(control),
-        statistics.median(candidate),
-        statistics.median(ratios),
-        statistics.stdev(ratios) if len(ratios) > 1 else 0.0,
-        len(ratios),
-    ))
-
-with pathlib.Path(sys.argv[2]).open("w", newline="") as handle:
-    out = csv.writer(handle)
-    out.writerow(["context", "control_tps", "tile32_dp4a_tps",
-                  "paired_median_speedup", "change_pct",
-                  "paired_speedup_sd", "samples"])
-    for context, control, candidate, speedup, sd, samples in records:
-        out.writerow([context, f"{control:.6f}", f"{candidate:.6f}",
-                      f"{speedup:.9f}", f"{(speedup - 1) * 100:.6f}",
-                      f"{sd:.9f}", samples])
-
-lines = [
-    "# SM75 production Q3A4 tile32-DP4A decode A/B",
-    "",
-    "Only Q3A4 gate/up mapping changes. Q4-32 and every cross-GPU boundary "
-    "are identical. All decode logits were byte-identical.",
-    "",
-    "| Context | Control tok/s | Tile32-DP4A tok/s | Paired speedup | Change | SD |",
-    "| ---: | ---: | ---: | ---: | ---: | ---: |",
-]
-for context, control, candidate, speedup, sd, _ in records:
-    lines.append(
-        f"| {context} | {control:.3f} | {candidate:.3f} | {speedup:.6f}x | "
-        f"{(speedup - 1) * 100:+.3f}% | {sd:.6f} |"
-    )
-pathlib.Path(sys.argv[3]).write_text("\n".join(lines) + "\n")
-PY
-cat "$OUTPUT_DIR/summary/summary.md"
 phase=complete
