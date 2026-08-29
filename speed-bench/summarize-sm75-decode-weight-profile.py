@@ -56,7 +56,7 @@ def number(row: dict[str, str], key: str, required: bool = False) -> float:
     return value
 
 
-def load_one(path: Path) -> dict[str, str]:
+def load_one(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     try:
         with path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
@@ -64,23 +64,110 @@ def load_one(path: Path) -> dict[str, str]:
             missing = [metric for metric in CORE_METRICS if metric not in fields]
             if missing:
                 fail(f"{path} lacks required metrics: {', '.join(missing)}")
-            rows = [row for row in reader if (row.get("ID") or "").strip()]
+            all_rows = list(reader)
     except OSError as exc:
         fail(f"cannot read {path}: {exc}")
+    rows = [row for row in all_rows if (row.get("ID") or "").strip()]
     if len(rows) != 1:
         fail(f"{path} contains {len(rows)} kernel rows; expected exactly one")
-    return rows[0]
+    unit_rows = [
+        row
+        for row in all_rows
+        if not (row.get("ID") or "").strip()
+        and any((row.get(metric) or "").strip() for metric in CORE_METRICS)
+    ]
+    if len(unit_rows) != 1:
+        fail(f"{path} contains {len(unit_rows)} Nsight unit rows; expected exactly one")
+    return unit_rows[0], rows[0]
+
+
+def converted_metric(
+    row: dict[str, str],
+    units: dict[str, str],
+    key: str,
+    factors: dict[str, float],
+    target_unit: str,
+    required: bool = False,
+) -> float:
+    value = number(row, key, required)
+    if not math.isfinite(value):
+        return value
+    unit = (units.get(key) or "").strip()
+    if unit not in factors:
+        fail(f"unsupported Nsight unit for {key}: {unit!r}; expected {target_unit}")
+    return value * factors[unit]
+
+
+def duration_us(row: dict[str, str], units: dict[str, str]) -> float:
+    return converted_metric(
+        row,
+        units,
+        "gpu__time_duration.sum",
+        {"ns": 1.0e-3, "us": 1.0, "ms": 1.0e3, "s": 1.0e6},
+        "microseconds",
+        True,
+    )
+
+
+def bandwidth_gb_s(row: dict[str, str], units: dict[str, str], key: str) -> float:
+    return converted_metric(
+        row,
+        units,
+        key,
+        {
+            "byte/s": 1.0e-9,
+            "Kbyte/s": 1.0e-6,
+            "Mbyte/s": 1.0e-3,
+            "Gbyte/s": 1.0,
+        },
+        "decimal GB/s",
+        True,
+    )
+
+
+def bytes_mib(
+    row: dict[str, str], units: dict[str, str], key: str, required: bool = False
+) -> float:
+    return converted_metric(
+        row,
+        units,
+        key,
+        {
+            "byte": 1.0 / 1048576.0,
+            "Kbyte": 1000.0 / 1048576.0,
+            "Mbyte": 1000000.0 / 1048576.0,
+            "Gbyte": 1000000000.0 / 1048576.0,
+        },
+        "MiB",
+        required,
+    )
 
 
 def fmt(value: float, digits: int = 3) -> str:
     return "NA" if not math.isfinite(value) else f"{value:.{digits}f}"
 
 
-def evidence_class(dram_pct: float, load_eff: float) -> str:
+def evidence_class(
+    dram_pct: float,
+    load_eff: float,
+    sectors_request: float,
+    occupancy: float,
+    registers: float,
+    waves_per_sm: float,
+    mio: float,
+) -> str:
+    if registers >= 192.0 and occupancy < 35.0:
+        return "register/occupancy limited; poor load efficiency is secondary"
     if dram_pct >= 75.0:
         return "DRAM-saturated: reduce/distribute bytes"
+    if waves_per_sm < 1.0 and occupancy < 50.0:
+        return "small-grid latency limited; scattered loads amplify it"
+    if mio >= 0.5 and dram_pct < 25.0:
+        return "MIO/instruction limited"
+    if sectors_request >= 16.0 or (load_eff < 25.0 and dram_pct >= 20.0):
+        return "scattered-load/latency limited: layout candidate"
     if load_eff < 75.0:
-        return "load-efficiency limited: fix layout/coalescing"
+        return "load-efficiency limited: inspect layout and instruction cost"
     if dram_pct >= 50.0:
         return "high DRAM pressure: bytes and latency both matter"
     return "not DRAM-saturated: inspect latency/occupancy/instructions"
@@ -103,9 +190,11 @@ def main() -> int:
         path = args.ncu_dir / f"{name}.csv"
         if not path.is_file():
             fail(f"missing Nsight CSV for selected scenario {name}: {path}")
-        row = load_one(path)
-        duration_ms = number(row, "gpu__time_duration.sum", True)
-        dram_bps = number(row, "dram__bytes.sum.per_second", True)
+        units, row = load_one(path)
+        kernel_duration_us = duration_us(row, units)
+        dram_gb_s = bandwidth_gb_s(
+            row, units, "dram__bytes.sum.per_second"
+        )
         dram_pct = number(
             row, "dram__bytes.avg.pct_of_peak_sustained_elapsed", True
         )
@@ -133,17 +222,19 @@ def main() -> int:
         occupancy = number(
             row, "sm__warps_active.avg.pct_of_peak_sustained_active", True
         )
+        registers = number(row, "launch__registers_per_thread")
+        waves_per_sm = number(row, "launch__waves_per_multiprocessor")
         records.append(
             {
                 "scenario": name,
                 "family": family,
                 "kernel": (row.get("Kernel Name") or "").strip(),
-                "duration_ms": duration_ms,
+                "duration_us": kernel_duration_us,
                 "expected_weight_stream_mib": weight_mib,
-                "dram_gb_s": dram_bps / 1.0e9,
+                "dram_gb_s": dram_gb_s,
                 "dram_peak_pct": dram_pct,
-                "dram_read_mib": number(row, "dram__bytes_read.sum") / 1048576.0,
-                "dram_write_mib": number(row, "dram__bytes_write.sum") / 1048576.0,
+                "dram_read_mib": bytes_mib(row, units, "dram__bytes_read.sum"),
+                "dram_write_mib": bytes_mib(row, units, "dram__bytes_write.sum"),
                 "l2_hit_pct": l2_hit,
                 "l2_peak_pct": number(
                     row, "lts__throughput.avg.pct_of_peak_sustained_elapsed"
@@ -156,9 +247,21 @@ def main() -> int:
                 "eligible_warps_per_cycle": number(
                     row, "smsp__warps_eligible.avg.per_cycle_active"
                 ),
-                "registers_per_thread": number(row, "launch__registers_per_thread"),
+                "registers_per_thread": registers,
                 "shared_mem_per_block": number(row, "launch__shared_mem_per_block"),
-                "evidence_class": evidence_class(dram_pct, load_eff),
+                "register_occupancy_limit_blocks": number(
+                    row, "launch__occupancy_limit_registers"
+                ),
+                "waves_per_sm": waves_per_sm,
+                "evidence_class": evidence_class(
+                    dram_pct,
+                    load_eff,
+                    sectors_request,
+                    occupancy,
+                    registers,
+                    waves_per_sm,
+                    mio,
+                ),
             }
         )
 
@@ -179,7 +282,7 @@ def main() -> int:
             "representing first-use layer weights rather than replay-warm L2.\n\n"
         )
         handle.write(
-            "| Scenario | Duration ms | DRAM GB/s | DRAM peak | L2 hit | "
+            "| Scenario | Duration us | DRAM GB/s | DRAM peak | L2 hit | "
             "Load efficiency | Sectors/request | Long scoreboard | MIO | "
             "Occupancy | Evidence |\n"
         )
@@ -189,7 +292,7 @@ def main() -> int:
         )
         for record in records:
             handle.write(
-                f"| {record['scenario']} | {fmt(record['duration_ms'], 6)} | "
+                f"| {record['scenario']} | {fmt(record['duration_us'], 3)} | "
                 f"{fmt(record['dram_gb_s'])} | "
                 f"{fmt(record['dram_peak_pct'])}% | "
                 f"{fmt(record['l2_hit_pct'])}% | "
@@ -202,9 +305,9 @@ def main() -> int:
             )
         handle.write(
             "\n`Sectors/request` is a coalescing proxy, not a load-efficiency "
-            "percentage. The evidence classification uses only measured DRAM "
-            "peak utilization and global-load efficiency; use the raw stall, "
-            "occupancy, and L2 columns before choosing an implementation.\n"
+            "percentage. Evidence classification combines measured DRAM/load "
+            "behavior with register count, achieved occupancy, grid waves, and "
+            "MIO stalls; use the raw columns before choosing an implementation.\n"
         )
 
     print(md_path.read_text(encoding="utf-8"), end="")
