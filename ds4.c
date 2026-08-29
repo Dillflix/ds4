@@ -35027,6 +35027,31 @@ static bool metal_graph_encode_prefill_stage_batch(
     return true;
 }
 
+static bool metal_graph_prefill_fault_breadcrumbs_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_CUDA_PREFILL_FAULT_BREADCRUMBS");
+        enabled = value && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return enabled != 0;
+}
+
+static void metal_graph_prefill_fault_breadcrumb(const char *event,
+                                                 const char *fmt,
+                                                 ...) {
+    if (!metal_graph_prefill_fault_breadcrumbs_enabled()) return;
+    fprintf(stderr, "ds4: prefill fault breadcrumb event=%s", event);
+    if (fmt && fmt[0] != '\0') {
+        va_list ap;
+        fputc(' ', stderr);
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 static bool metal_graph_prefill_pipeline_stage_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -35065,6 +35090,12 @@ static bool metal_graph_prefill_pipeline_stage_major(
 
     metal_graph_report_cuda_prefill_audit(
             g, stages, n_stages, n_tokens, mb_cap, n_mb);
+    metal_graph_prefill_fault_breadcrumb(
+            "pipeline-begin",
+            "chunk_start=%u chunk_tokens=%u microbatch_tokens=%u "
+            "microbatches=%u stages=%u schedule=%s",
+            start, n_tokens, mb_cap, n_mb, n_stages,
+            getenv("DS4_CUDA_PREFILL_PIPELINE_SEQUENTIAL") ? "sequential" : "wave");
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
@@ -35126,6 +35157,13 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                                                 mb_i,
                                                                 pos0,
                                                                 mb_len);
+                    metal_graph_prefill_fault_breadcrumb(
+                            ok ? "stage-queued" : "stage-queue-failed",
+                            "chunk_start=%u wave=sequential stage=%u mb=%u "
+                            "tier=%d pos=%u tokens=%u layers=%u-%u",
+                            start, stage_i, mb_i, stages[stage_i].tier,
+                            pos0, mb_len, stages[stage_i].first_layer,
+                            stages[stage_i].end_layer);
                 }
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
@@ -35138,20 +35176,40 @@ static bool metal_graph_prefill_pipeline_stage_major(
                             stage_i, stage_i + 1u, mb_i,
                             stages[stage_i].tier, stages[stage_i + 1u].tier,
                             (unsigned long long)handoff_bytes);
+                    metal_graph_prefill_fault_breadcrumb(
+                            "handoff-begin",
+                            "chunk_start=%u wave=sequential stage=%u mb=%u "
+                            "pos=%u tokens=%u src_tier=%d dst_tier=%d bytes=%llu",
+                            start, stage_i, mb_i, pos0, mb_len,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
                     }
-                    ok = src && dst &&
-                         ds4_gpu_tensor_copy_xdev_ordered(dst,
-                                                          src,
-                                                          handoff_bytes) != 0;
+                    if (ok) {
+                        ok = src && dst &&
+                             ds4_gpu_tensor_copy_xdev_ordered(dst,
+                                                              src,
+                                                              handoff_bytes) != 0;
+                    }
+                    metal_graph_prefill_fault_breadcrumb(
+                            ok ? "handoff-complete" : "handoff-failed",
+                            "chunk_start=%u wave=sequential stage=%u mb=%u "
+                            "pos=%u tokens=%u src_tier=%d dst_tier=%d bytes=%llu",
+                            start, stage_i, mb_i, pos0, mb_len,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     metal_graph_cuda_timeline_pop(handoff_range);
                 }
             }
             metal_graph_cuda_timeline_pop(mb_range);
             if (ok) ok = ds4_gpu_end_commands() != 0;
             else (void)ds4_gpu_synchronize();
+            metal_graph_prefill_fault_breadcrumb(
+                    ok ? "microbatch-complete" : "microbatch-failed",
+                    "chunk_start=%u wave=sequential mb=%u pos=%u tokens=%u",
+                    start, mb_i, pos0, mb_len);
             if (ok && display_progress) {
                 uint32_t done = mb_off + mb_len;
                 if (done > n_tokens) done = n_tokens;
@@ -35219,6 +35277,13 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                                                 mb_i,
                                                                 pos0,
                                                                 mb_len);
+                    metal_graph_prefill_fault_breadcrumb(
+                            ok ? "stage-queued" : "stage-queue-failed",
+                            "chunk_start=%u wave=%u stage=%u mb=%u tier=%d "
+                            "pos=%u tokens=%u layers=%u-%u",
+                            start, wave, stage_i, mb_i, stages[stage_i].tier,
+                            pos0, mb_len, stages[stage_i].first_layer,
+                            stages[stage_i].end_layer);
                 }
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
@@ -35231,14 +35296,30 @@ static bool metal_graph_prefill_pipeline_stage_major(
                             stage_i, stage_i + 1u, mb_i,
                             stages[stage_i].tier, stages[stage_i + 1u].tier,
                             (unsigned long long)handoff_bytes);
+                    metal_graph_prefill_fault_breadcrumb(
+                            "handoff-begin",
+                            "chunk_start=%u wave=%u stage=%u mb=%u pos=%u "
+                            "tokens=%u src_tier=%d dst_tier=%d bytes=%llu",
+                            start, wave, stage_i, mb_i, pos0, mb_len,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
                     }
-                    ok = src && dst &&
-                         ds4_gpu_tensor_copy_xdev_ordered(dst,
-                                                          src,
-                                                          handoff_bytes) != 0;
+                    if (ok) {
+                        ok = src && dst &&
+                             ds4_gpu_tensor_copy_xdev_ordered(dst,
+                                                              src,
+                                                              handoff_bytes) != 0;
+                    }
+                    metal_graph_prefill_fault_breadcrumb(
+                            ok ? "handoff-complete" : "handoff-failed",
+                            "chunk_start=%u wave=%u stage=%u mb=%u pos=%u "
+                            "tokens=%u src_tier=%d dst_tier=%d bytes=%llu",
+                            start, wave, stage_i, mb_i, pos0, mb_len,
+                            stages[stage_i].tier, stages[stage_i + 1u].tier,
+                            (unsigned long long)handoff_bytes);
                     metal_graph_cuda_timeline_pop(handoff_range);
                 }
                 if (ok && display_progress && stage_i + 1u == n_stages) {
@@ -35260,6 +35341,10 @@ static bool metal_graph_prefill_pipeline_stage_major(
         }
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
+        metal_graph_prefill_fault_breadcrumb(
+                ok ? "pipeline-body-complete" : "pipeline-body-failed",
+                "chunk_start=%u chunk_tokens=%u microbatches=%u stages=%u",
+                start, n_tokens, n_mb, n_stages);
     }
     if (show_progress) fputc('\n', stderr);
     g->batch_token_offset = 0;
@@ -35307,6 +35392,10 @@ static bool metal_graph_prefill_pipeline_stage_major(
                                  logits,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    metal_graph_prefill_fault_breadcrumb(
+            ok ? "pipeline-complete" : "pipeline-finalization-failed",
+            "chunk_start=%u chunk_tokens=%u logits=%s",
+            start, n_tokens, logits ? "yes" : "no");
     if (ok && display_progress)
         display_progress(display_progress_ud, "prefill_display",
                          (int)(start + n_tokens), prompt->len);
@@ -36114,6 +36203,10 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        metal_graph_prefill_fault_breadcrumb(
+                "chunk-begin",
+                "range_start=%u range_tokens=%u chunk_start=%u chunk_tokens=%u",
+                start, n_tokens, pos0, chunk);
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
@@ -36126,11 +36219,19 @@ static bool metal_graph_prefill_chunked_range(
                                                   display_progress,
                                                   display_progress_ud);
         if (!ok) {
+            metal_graph_prefill_fault_breadcrumb(
+                    "chunk-failed",
+                    "range_start=%u range_tokens=%u chunk_start=%u chunk_tokens=%u",
+                    start, n_tokens, pos0, chunk);
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
             }
             return false;
         }
+        metal_graph_prefill_fault_breadcrumb(
+                "chunk-complete",
+                "range_start=%u range_tokens=%u chunk_start=%u chunk_tokens=%u",
+                start, n_tokens, pos0, chunk);
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }

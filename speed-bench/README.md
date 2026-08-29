@@ -2483,29 +2483,36 @@ the exact-output gate is `exact/verification.txt`.
 
 # SM75 production Q32 decode CUDA Graph A/B
 
-Before resuming a broad graph A/B after any lost-GPU event, use
-`cuda-sm75-decode-crash-isolation.sh` to reproduce the graph-disabled 32K
-control without six preceding benchmark processes. It runs TG16, TG64, and
-TG256 in increasing order, with each case in a separate process. The production
-row split, stage-aware 22/21 dense placement, partner execution, native-F16
-indexer, and complete 344/344 dense cache remain enabled; owned routed-MoE CUDA
-Graphs are explicitly disabled.
+`cuda-sm75-decode-crash-isolation.sh` reproduces the graph-disabled 32K failure
+with physical GPU0 in a home role. The established placement evidence is not
+retested here: physical GPU0 succeeds as a partner in `1,3,0,2` and
+`1,2,0,3`, while it fails as a home in both the original `0,3,1,2` placement
+and the stage-swapped `2,0,3,1` placement. The default therefore runs only the
+known TG16 reproducer. The production row split, stage-aware 22/21 dense
+placement, partner execution, native-F16 indexer, and complete 344/344 dense
+cache remain enabled; owned routed-MoE CUDA Graphs are explicitly disabled.
 
 Every case persists `active-case.txt` and `run-journal.tsv` before launch,
 captures per-GPU telemetry, exports the exact dense placement and binding
 inventories, and requires healthy four-GPU snapshots before and after the
 process. A separately fsynced progress journal records each completed warmup
-and measured-prefill chunk without adding CUDA synchronization. The telemetry
-watcher stops `nvidia-smi -lms` when it reports a lost device, preventing that
-poller from lingering after the CUDA process exits. It never invokes `sudo`.
+and measured-prefill chunk. `DS4_CUDA_PREFILL_FAULT_BREADCRUMBS=1` also records
+each queued stage and each begin/completion/failure of the existing cross-stage
+host-bounce handoff. Those handoffs already synchronize the destination stream,
+so a `handoff-complete` breadcrumb is completed-GPU evidence without adding a
+new CUDA synchronization point. The final 160 breadcrumb records are extracted
+to `fault-breadcrumbs.log`. The telemetry watcher stops `nvidia-smi -lms` when
+it reports a lost device, preventing that poller from lingering after the CUDA
+process exits. The runner never invokes `sudo`.
 If the host resets before the archive can be created, return the matching
 unarchived directory.
 
 This runner performs the complete 32K prefill before it reaches decode. A
 failure with no benchmark CSV row and no decode marker is therefore prefill or
-device-stability evidence, not decode-graph evidence. After an Xid 79, use the
-model-independent pair-stability matrix below rather than repeatedly loading
-the 153 GiB model.
+device-stability evidence, not decode-graph evidence. Its purpose is to identify
+the precise chunk, wave, microbatch, and handoff at which the home-role failure
+becomes visible. It is not another board, slot, pair-direction, or generic-load
+qualification pass.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2517,7 +2524,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 PP_TOKENS=32768 \
-TG_LEVELS=16,64,256 \
+TG_LEVELS=16 \
 REPEATS=1 \
 TELEMETRY_INTERVAL_MS=500 \
 POST_CASE_SETTLE_SECONDS=5 \
@@ -2527,8 +2534,6 @@ bash ./speed-bench/cuda-sm75-decode-crash-isolation.sh
 ```
 
 Decode CUDA Graph validation is deliberately bounded to PP512/2048/4096.
-Long-context device stability is a separate question handled by the symmetric
-pair matrix below.
 
 `cuda-sm75-decode-graph-ab.sh` tests graph coverage for the routed kernels
 that the production Q4-32/Q3A4 model actually executes. The candidate replaces

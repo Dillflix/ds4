@@ -3,10 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run the production 32K decode control in graduated TG16/TG64/TG256 cases.
-CUDA Graph execution is explicitly disabled. Each case is a separate process
-with a durable active-case journal, per-GPU telemetry, exact dense-placement
-exports, and pre/post GPU-health snapshots.
+Run the known production 32K failure reproducer with physical GPU0 in a home
+role. CUDA Graph execution is explicitly disabled. The default is the first
+TG16 case only because the observed failure occurs during prefill, before
+decode. Flushed, non-synchronizing pipeline breadcrumbs identify the last
+completed cross-stage handoff.
 
 Required environment:
   MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
@@ -17,7 +18,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   PP_TOKENS=32768
-  TG_LEVELS=16,64,256
+  TG_LEVELS=16
   REPEATS=1
   TELEMETRY_INTERVAL_MS=500
   POST_CASE_SETTLE_SECONDS=5
@@ -25,9 +26,10 @@ Optional environment:
   CREATE_ARCHIVE=1
   DECODE_CRASH_ISOLATION_DIR=/absolute/output/directory
 
-The safety order is fixed by TG_LEVELS and must be strictly increasing. If a
-host reset prevents archive creation, retain the unarchived output directory;
-active-case.txt, run-journal.tsv, telemetry/, and health/ identify the boundary.
+If a host reset prevents archive creation, retain the unarchived output
+directory. fault-breadcrumbs.log records the last pipeline boundary reached;
+active-case.txt, run-journal.tsv, telemetry/, and health/ retain supporting
+evidence.
 EOF
 }
 
@@ -43,7 +45,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 PP_TOKENS=${PP_TOKENS:-32768}
-TG_LEVELS=${TG_LEVELS:-16,64,256}
+TG_LEVELS=${TG_LEVELS:-16}
 REPEATS=${REPEATS:-1}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-500}
 POST_CASE_SETTLE_SECONDS=${POST_CASE_SETTLE_SECONDS:-5}
@@ -140,6 +142,20 @@ finish() {
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
         "$status" "$phase" >"$OUTPUT_DIR/run-status.txt"
+    breadcrumb_all="$OUTPUT_DIR/fault-breadcrumbs.all.log"
+    breadcrumb_tail="$OUTPUT_DIR/fault-breadcrumbs.log"
+    : >"$breadcrumb_all"
+    shopt -s nullglob
+    for log in "$OUTPUT_DIR"/production/*.log; do
+        grep -H -F 'ds4: prefill fault breadcrumb event=' "$log" \
+            >>"$breadcrumb_all" || true
+    done
+    shopt -u nullglob
+    if [[ -s $breadcrumb_all ]]; then
+        tail -n 160 "$breadcrumb_all" >"$breadcrumb_tail"
+    else
+        rm -f -- "$breadcrumb_all" "$breadcrumb_tail"
+    fi
     sync "$OUTPUT_DIR/run-status.txt" 2>/dev/null || sync
     if [[ $CREATE_ARCHIVE == 1 ]]; then
         archive="$OUTPUT_DIR.tar.gz"
@@ -261,6 +277,7 @@ gpu_health_snapshot "$OUTPUT_DIR/health/initial.log" ||
     printf 'pp_tokens=%s\ntg_levels=%s\nrepeats=%s\n' \
         "$PP_TOKENS" "$TG_LEVELS" "$REPEATS"
     printf 'decode_graph=explicitly-disabled\nattention_rows=production-enabled\n'
+    printf 'prefill_fault_breadcrumbs=enabled-no-added-cuda-sync\n'
     printf 'dense_placement=stage-aware-fixed-22-21\n'
     printf 'partner_classes=automatic:t32,t256,shared_down\n'
     printf 'telemetry_interval_ms=%s\npost_case_settle_seconds=%s\n' \
@@ -343,6 +360,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 DS4_CUDA_TP_ATTN_HEADS=0 \
                 DS4_CUDA_TP_DECODE_INDEXER_ROWS=0 \
                 DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1 \
+                DS4_CUDA_PREFILL_FAULT_BREADCRUMBS=1 \
                 DS4_BENCH_UNTIMED_WARMUP_TOKENS=512 \
                 "DS4_BENCH_PROGRESS_JOURNAL=$progress" \
                 "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$plan" \
