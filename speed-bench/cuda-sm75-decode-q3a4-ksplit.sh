@@ -15,6 +15,7 @@ Optional environment:
   RUN_NCU=1
   NCU_USE_SUDO=0
   SKIP_BUILD=0
+  RESUME=0
   CREATE_ARCHIVE=1
   Q3A4_KSPLIT_DIR=/absolute/output/directory
 EOF
@@ -35,6 +36,7 @@ RUN_SANITIZER=${RUN_SANITIZER:-1}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 OUTPUT_DIR=${Q3A4_KSPLIT_DIR:-$repo_dir/sm75-decode-q3a4-ksplit-$(date -u +%Y%m%dT%H%M%SZ)}
 
@@ -43,11 +45,11 @@ OUTPUT_DIR=${Q3A4_KSPLIT_DIR:-$repo_dir/sm75-decode-q3a4-ksplit-$(date -u +%Y%m%
     die "TIMING_ROUNDS must be a positive odd integer"
 [[ $TIMING_REPEATS =~ ^[1-9][0-9]*$ ]] || die "TIMING_REPEATS must be positive"
 for value in "$RUN_SANITIZER" "$RUN_NCU" "$NCU_USE_SUDO" \
-             "$SKIP_BUILD" "$CREATE_ARCHIVE"; do
+             "$SKIP_BUILD" "$RESUME" "$CREATE_ARCHIVE"; do
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
 
-tools=(c++filt cuobjdump env git grep make nproc nvidia-smi python3 tar)
+tools=(c++filt cmp cuobjdump env git grep make mktemp nproc nvidia-smi python3 sha256sum tar)
 (( RUN_NCU == 0 )) || tools+=(ncu)
 for tool in "${tools[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -61,8 +63,17 @@ compute_cap=$(nvidia-smi -i "$PROFILE_GPU" --query-gpu=compute_cap \
     --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]')
 [[ $compute_cap == 7.5 ]] ||
     die "physical GPU $PROFILE_GPU has compute capability ${compute_cap:-unknown}; SM75 is required"
-[[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/smoke" "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+if [[ $RESUME == 1 ]]; then
+    [[ -n ${Q3A4_KSPLIT_DIR:-} ]] ||
+        die "RESUME=1 requires Q3A4_KSPLIT_DIR"
+    [[ $SKIP_BUILD == 1 ]] || die "RESUME=1 requires SKIP_BUILD=1"
+    [[ $RUN_NCU == 1 ]] || die "RESUME=1 requires RUN_NCU=1"
+    [[ -d $OUTPUT_DIR ]] || die "resume directory does not exist: $OUTPUT_DIR"
+    [[ -d $OUTPUT_DIR/ncu ]] || die "resume directory is missing its ncu subdirectory"
+else
+    [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR/smoke" "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+fi
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 current_phase=initialization
@@ -94,7 +105,8 @@ finalize() {
 }
 trap finalize EXIT
 
-{
+write_manifest() {
+    [[ $RESUME == 0 ]] || printf '\n[resume]\n'
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
     printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
     printf 'scope=q3a4-only-exact-in-cta-k1-k2-k4\n'
@@ -102,15 +114,167 @@ trap finalize EXIT
     printf 'profile_gpu=%s\ncuda_arch=%s\n' "$PROFILE_GPU" "$CUDA_ARCH"
     printf 'timing_rounds=%s\ntiming_repeats=%s\n' "$TIMING_ROUNDS" "$TIMING_REPEATS"
     printf 'run_sanitizer=%s\nrun_ncu=%s\n' "$RUN_SANITIZER" "$RUN_NCU"
+    printf 'resume=%s\n' "$RESUME"
     printf '\n[gpu]\n'
     nvidia-smi -i "$PROFILE_GPU" \
         --query-gpu=index,name,pci.bus_id,memory.total,memory.free,driver_version \
         --format=csv
     printf '\n[git status]\n'; git status --short
-} >"$OUTPUT_DIR/manifest.txt"
+}
+if [[ $RESUME == 1 ]]; then
+    write_manifest >>"$OUTPUT_DIR/manifest.txt"
+else
+    write_manifest >"$OUTPUT_DIR/manifest.txt"
+fi
 
 smoke=tests/cuda_long_context_smoke
 harness=tests/cuda_sm75_decode_weight_profile
+declare -A scenario=(
+    [k1]=q3a4-gate-up-tile32-dp4a
+    [k2]=q3a4-gate-up-tile32-dp4a-k2
+    [k4]=q3a4-gate-up-tile32-dp4a-k4
+)
+
+if [[ $RESUME == 1 ]]; then
+    current_phase=resume-validation
+    [[ -x $smoke && -x $harness ]] ||
+        die "resume requires the previously built CUDA binaries"
+    [[ -s $OUTPUT_DIR/build.log && -s $OUTPUT_DIR/build.demangled.log &&
+       -s $OUTPUT_DIR/sass.demangled.txt &&
+       -s $OUTPUT_DIR/resource-summary.csv &&
+       -s $OUTPUT_DIR/timing-summary.csv ]] ||
+        die "resume directory is missing build/resource/timing evidence"
+    exact_log="$OUTPUT_DIR/smoke/cuda-long-context.log"
+    grep -q 'SM75 Q3A4 tile32-dp4a K1/K2/K4 in-CTA gate/up and owned decode exact/reuse' \
+        "$exact_log" || die "resume exact-regression evidence is invalid"
+    grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' "$exact_log" ||
+        die "resume environment-selector evidence is invalid"
+    grep -q 'SM75 Q3A4 tile32-dp4a production default' "$exact_log" ||
+        die "resume K1 production-default evidence is invalid"
+    grep -q '^cuda long-context regression: OK$' "$exact_log" ||
+        die "resume exact-regression completion marker is missing"
+    grep -q 'ERROR SUMMARY: 0 errors' "$OUTPUT_DIR/memcheck.log" ||
+        die "resume K4 memcheck evidence is not clean"
+    evidence_commit=$(python3 - "$OUTPUT_DIR/manifest.txt" \
+              "$OUTPUT_DIR/resource-summary.csv" \
+              "$OUTPUT_DIR/timing-summary.csv" \
+              "$PROFILE_GPU" "$CUDA_ARCH" <<'PY'
+import csv, math, sys
+manifest_path, resource_path, timing_path, profile_gpu, cuda_arch = sys.argv[1:]
+initial = {}
+with open(manifest_path, encoding="utf-8", errors="replace") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if line == "[resume]":
+            break
+        if "=" in line:
+            key, value = line.split("=", 1)
+            initial.setdefault(key, value)
+required_provenance = {
+    "scope": "q3a4-only-exact-in-cta-k1-k2-k4",
+    "q4_32": "unchanged",
+    "production_default": "k1",
+    "profile_gpu": profile_gpu,
+    "cuda_arch": cuda_arch,
+    "run_sanitizer": "1",
+}
+for key, expected in required_provenance.items():
+    if initial.get(key) != expected:
+        raise SystemExit(
+            f"resume provenance mismatch for {key}: "
+            f"{initial.get(key)!r} != {expected!r}")
+evidence_commit = initial.get("git_commit", "")
+if not evidence_commit:
+    raise SystemExit("resume manifest has no original git commit")
+with open(resource_path, newline="", encoding="utf-8") as handle:
+    resources = {row["variant"]: row for row in csv.DictReader(handle)}
+if set(resources) != {"k1", "k2", "k4"}:
+    raise SystemExit("resume resource inventory is incomplete")
+for variant, block in (("k1", 128), ("k2", 256), ("k4", 512)):
+    row = resources[variant]
+    if row.get("resource_gate") != "pass" or int(row["block_size"]) != block:
+        raise SystemExit(f"resume resource gate failed for {variant}")
+    if any(int(row[field]) for field in (
+            "stack_frame_bytes", "spill_store_bytes", "spill_load_bytes",
+            "sass_ldl", "sass_stl", "sass_atom_red")):
+        raise SystemExit(f"resume spill/local/atomic evidence failed for {variant}")
+    if int(row["shared_memory_bytes"]) != 4096:
+        raise SystemExit(f"resume shared-memory evidence failed for {variant}")
+with open(timing_path, newline="", encoding="utf-8") as handle:
+    timings = {row["variant"]: row for row in csv.DictReader(handle)}
+if set(timings) != {"k2", "k4"}:
+    raise SystemExit("resume timing inventory is incomplete")
+for variant, row in timings.items():
+    values = [float(row[key]) for key in (
+        "k1_median_ms", "candidate_median_ms", "candidate_speedup")]
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise SystemExit(f"resume timing evidence is invalid for {variant}")
+print(evidence_commit)
+PY
+    )
+    git cat-file -e "$evidence_commit^{commit}" 2>/dev/null ||
+        die "resume evidence commit is not present in this repository"
+    git merge-base --is-ancestor "$evidence_commit" HEAD ||
+        die "resume evidence commit is not an ancestor of the current checkout"
+    evidence_sources=(
+        Makefile
+        ds4_cuda.cu
+        ds4_cuda_sm75_q32_native.inc.cu
+        tests/cuda_long_context_smoke.c
+        tests/cuda_sm75_decode_weight_profile.c
+    )
+    git diff --quiet "$evidence_commit" -- "${evidence_sources[@]}" ||
+        die "Q3A4 implementation or evidence sources changed since the reused run"
+    if [[ -s $OUTPUT_DIR/harness-sha256.txt ]]; then
+        sha256sum --check --status "$OUTPUT_DIR/harness-sha256.txt" ||
+            die "current profile harness differs from the reused evidence binary"
+    else
+        current_sass=$(mktemp)
+        if ! cuobjdump --dump-sass "$harness" | c++filt >"$current_sass"; then
+            rm -f -- "$current_sass"
+            die "could not identify the current profile harness SASS"
+        fi
+        if ! cmp -s -- "$OUTPUT_DIR/sass.demangled.txt" "$current_sass"; then
+            rm -f -- "$current_sass"
+            die "current profile harness SASS differs from the reused evidence"
+        fi
+        rm -f -- "$current_sass"
+        sha256sum "$harness" >"$OUTPUT_DIR/harness-sha256.txt"
+    fi
+    for variant in k1 k2 k4; do
+        log="$OUTPUT_DIR/smoke/$variant.log"
+        grep -q '^output_validation=exact-zero$' "$log" ||
+            die "resume $variant output evidence is invalid"
+        grep -q '^q3a4_decode_mapping=3$' "$log" ||
+            die "resume $variant mapping evidence is invalid"
+        grep -q '^harness_status=ok$' "$log" ||
+            die "resume $variant smoke evidence is invalid"
+        expected=${variant#k}
+        grep -q "^q3a4_decode_ksplit=$expected$" "$log" ||
+            die "resume $variant dispatch evidence is invalid"
+        case "$variant" in
+            k1) audit_pattern='tile32-dp4a=1 k1=1 k2=0 k4=0' ;;
+            k2) audit_pattern='tile32-dp4a=1 k1=0 k2=1 k4=0' ;;
+            k4) audit_pattern='tile32-dp4a=1 k1=0 k2=0 k4=1' ;;
+        esac
+        grep -Fq -- "$audit_pattern" "$log" ||
+            die "resume $variant aggregate dispatch audit is impure"
+    done
+    for variant in k2 k4; do
+        log="$OUTPUT_DIR/timing/$variant.log"
+        grep -q '^timing_scope=production-owned-call-inclusive$' "$log" ||
+            die "resume $variant timing scope is invalid"
+        grep -q "^candidate_kind=q3a4-tile32-dp4a-$variant$" "$log" ||
+            die "resume $variant timing candidate is invalid"
+        case "$variant" in
+            k2) timing_audit_pattern='tile32-dp4a=[1-9][0-9]* k1=[1-9][0-9]* k2=[1-9][0-9]* k4=0' ;;
+            k4) timing_audit_pattern='tile32-dp4a=[1-9][0-9]* k1=[1-9][0-9]* k2=0 k4=[1-9][0-9]*' ;;
+        esac
+        grep -Eq -- "$timing_audit_pattern" "$log" ||
+            die "resume $variant timing dispatch audit is impure"
+    done
+    printf 'Reusing validated exactness, sanitizer, resource, and timing evidence.\n'
+else
 current_phase=build
 if [[ $SKIP_BUILD == 0 ]]; then
     evidence_nvccflags=${EVIDENCE_NVCCFLAGS:-"-O3 -g -lineinfo --use_fast_math -arch=$CUDA_ARCH -Xcompiler -march=native -Xcompiler -pthread -Xptxas -v"}
@@ -127,6 +291,7 @@ else
     die "SKIP_BUILD=1 cannot provide fresh PTXAS evidence; use SKIP_BUILD=0"
 fi
 [[ -x $smoke && -x $harness ]] || die "required CUDA binaries are missing"
+sha256sum "$harness" >"$OUTPUT_DIR/harness-sha256.txt"
 
 current_phase=byte-exact-regression
 printf 'Running nonzero byte-exact Q3A4 K1/K2/K4 regression...\n'
@@ -150,11 +315,6 @@ grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q3A4 K-split environment-selector regression marker missing"
 
-declare -A scenario=(
-    [k1]=q3a4-gate-up-tile32-dp4a
-    [k2]=q3a4-gate-up-tile32-dp4a-k2
-    [k4]=q3a4-gate-up-tile32-dp4a-k4
-)
 for variant in k1 k2 k4; do
     printf 'Synthetic owned-call smoke: %s...\n' "$variant"
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
@@ -344,6 +504,7 @@ for variant in k2 k4; do
         >>"$OUTPUT_DIR/timing-summary.csv"
 done
 cat "$OUTPUT_DIR/timing-summary.csv"
+fi
 
 if [[ $RUN_NCU == 1 ]]; then
     current_phase=nsight-compute
@@ -417,7 +578,10 @@ if [[ $RUN_NCU == 1 ]]; then
 
     for variant in k1 k2 k4; do
         case "$variant" in
-            k1) regex='moe_gate_up_mid_decode_sm75_q3a4_tile32_owned_kernel<true>'; block=128 ;;
+            # Nsight's function-base filter strips template arguments, while
+            # the imported CSV can retain a return type and full signature.
+            # Keep these unanchored so one expression is valid at both gates.
+            k1) regex='moe_gate_up_mid_decode_sm75_q3a4_tile32_owned_kernel.*'; block=128 ;;
             k2) regex='moe_gate_up_mid_decode_sm75_q3a4_tile32_ksplit_owned_kernel.*'; block=256 ;;
             k4) regex='moe_gate_up_mid_decode_sm75_q3a4_tile32_ksplit_owned_kernel.*'; block=512 ;;
         esac

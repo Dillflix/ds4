@@ -63,6 +63,24 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
 ```
 
+If a run reached Nsight Compute after all earlier gates passed, resume the
+same evidence directory without rebuilding or repeating exactness, sanitizer,
+or timing. Resume mode requires the original clean sanitizer result, the same
+physical GPU and SM architecture, unchanged Q3A4 implementation sources, and
+the same profile-harness machine code; it revalidates the reused artifacts
+before capture.
+
+```bash
+RESUME=1 \
+Q3A4_KSPLIT_DIR="$PWD/sm75-decode-q3a4-ksplit-YYYYMMDDTHHMMSSZ" \
+RUN_SANITIZER=0 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=1 \
+CREATE_ARCHIVE=1 \
+./speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection
