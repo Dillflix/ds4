@@ -11,7 +11,7 @@ PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
-CONTEXTS=${CONTEXTS:-512,2048,4096}
+CONTEXTS=${CONTEXTS:-512,2048,4096,32768}
 TG_TOKENS=${TG_TOKENS:-256}
 REPEATS=${REPEATS:-3}
 EXACT_CONTEXT=${EXACT_CONTEXT:-4096}
@@ -54,15 +54,13 @@ IFS=, read -r -a contexts <<<"$CONTEXTS"
 (( ${#contexts[@]} >= 1 )) || die "CONTEXTS selected no frontiers"
 declare -A seen_context=()
 for pp in "${contexts[@]}"; do
-    [[ $pp =~ ^[0-9]+$ && $pp -ge 512 && $pp -le 4096 &&
+    [[ $pp =~ ^[0-9]+$ && $pp -ge 512 && $pp -le 32768 &&
        -z ${seen_context[$pp]+x} ]] ||
         die "CONTEXTS contains an invalid or duplicate frontier: $pp"
     seen_context[$pp]=1
 done
 [[ -n ${seen_context[$EXACT_CONTEXT]+x} ]] ||
     die "EXACT_CONTEXT must also appear in CONTEXTS"
-printf 'Decode CUDA Graph validation is bounded to PP<=4096; use the pair-stability matrix for lost-GPU diagnosis.\n'
-
 for tool in awk basename cat cmp date dirname env find git grep make mkdir mv \
             nproc nvidia-smi python3 sort stat tail tar tee tr wc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"

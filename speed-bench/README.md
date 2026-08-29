@@ -2533,8 +2533,6 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-decode-crash-isolation.sh
 ```
 
-Decode CUDA Graph validation is deliberately bounded to PP512/2048/4096.
-
 `cuda-sm75-decode-graph-ab.sh` tests graph coverage for the routed kernels
 that the production Q4-32/Q3A4 model actually executes. The candidate replaces
 each owned expert half's six host submissions—Q8_K quantize, native activation
@@ -2553,9 +2551,10 @@ binding, that call uses the unchanged launch path.
 The CUDA smoke test compares the graph-owned home/partner result against the
 independent full-expert production dispatcher for both gate formats and two
 successive inputs. The production test then runs paired, order-reversed decode
-A/B samples at PP512/2048/4096 and requires byte-identical full-vocabulary
-logits before reporting a speedup. The script rejects larger contexts so a 32K
-prefill crash cannot be attributed to CUDA Graphs that decode never reached.
+A/B samples through PP32768 and requires byte-identical full-vocabulary logits
+before reporting a speedup. The 32K path is enabled after the current
+graph-disabled production configuration completed three PP32768/TG256 samples
+with healthy pre/post GPU state.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -2567,10 +2566,10 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
-CONTEXTS=512,2048,4096 \
+CONTEXTS=32768 \
 TG_TOKENS=256 \
 REPEATS=3 \
-EXACT_CONTEXT=4096 \
+EXACT_CONTEXT=32768 \
 EXACT_TOKENS=16 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
