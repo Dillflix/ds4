@@ -3,8 +3,9 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Audit exact in-CTA K2/K4 parallelism for the production SM75 Q3A4 decode
-tile32-DP4A kernel. K1 remains the production control and Q4-32 is unchanged.
+Audit exact in-CTA K1/K2/K4 parallelism for the production SM75 Q3A4 decode
+tile32-DP4A kernel. K4 is the production default, K1 is the comparison
+control, and Q4-32 is unchanged.
 
 Optional environment:
   PROFILE_GPU=0
@@ -110,7 +111,7 @@ write_manifest() {
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
     printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
     printf 'scope=q3a4-only-exact-in-cta-k1-k2-k4\n'
-    printf 'q4_32=unchanged\nproduction_default=k1\n'
+    printf 'q4_32=unchanged\nproduction_default=k4\n'
     printf 'profile_gpu=%s\ncuda_arch=%s\n' "$PROFILE_GPU" "$CUDA_ARCH"
     printf 'timing_rounds=%s\ntiming_repeats=%s\n' "$TIMING_ROUNDS" "$TIMING_REPEATS"
     printf 'run_sanitizer=%s\nrun_ncu=%s\n' "$RUN_SANITIZER" "$RUN_NCU"
@@ -149,8 +150,8 @@ if [[ $RESUME == 1 ]]; then
         "$exact_log" || die "resume exact-regression evidence is invalid"
     grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' "$exact_log" ||
         die "resume environment-selector evidence is invalid"
-    grep -q 'SM75 Q3A4 tile32-dp4a production default' "$exact_log" ||
-        die "resume K1 production-default evidence is invalid"
+    grep -q 'SM75 Q3A4 tile32-dp4a-k4 production default' "$exact_log" ||
+        die "resume K4 production-default evidence is invalid"
     grep -q '^cuda long-context regression: OK$' "$exact_log" ||
         die "resume exact-regression completion marker is missing"
     grep -q 'ERROR SUMMARY: 0 errors' "$OUTPUT_DIR/memcheck.log" ||
@@ -173,7 +174,7 @@ with open(manifest_path, encoding="utf-8", errors="replace") as handle:
 required_provenance = {
     "scope": "q3a4-only-exact-in-cta-k1-k2-k4",
     "q4_32": "unchanged",
-    "production_default": "k1",
+    "production_default": "k4",
     "profile_gpu": profile_gpu,
     "cuda_arch": cuda_arch,
     "run_sanitizer": "1",
@@ -308,9 +309,9 @@ env -u DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG \
 grep -q 'SM75 Q3A4 tile32-dp4a K1/K2/K4 in-CTA gate/up and owned decode exact/reuse' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q3A4 K-split exact marker missing"
-grep -q 'SM75 Q3A4 tile32-dp4a production default' \
+grep -q 'SM75 Q3A4 tile32-dp4a-k4 production default' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
-    die "K1 production-default assertion missing"
+    die "K4 production-default assertion missing"
 grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q3A4 K-split environment-selector regression marker missing"
@@ -332,11 +333,12 @@ for variant in k1 k2 k4; do
     grep -q "^q3a4_decode_ksplit=$expected$" "$OUTPUT_DIR/smoke/$variant.log" ||
         die "$variant K-split marker missing"
     case "$variant" in
-        k1) dispatch_marker='mapping=tile32-dp4a (production default)' ;;
+        k1) dispatch_marker='mapping=tile32-dp4a' ;;
         k2) dispatch_marker='mapping=tile32-dp4a-k2' ;;
-        k4) dispatch_marker='mapping=tile32-dp4a-k4' ;;
+        k4) dispatch_marker='mapping=tile32-dp4a-k4 (production default)' ;;
     esac
-    grep -Fq -- "$dispatch_marker" "$OUTPUT_DIR/smoke/$variant.log" ||
+    grep -Fxq -- "ds4: SM75 Q3A4 decode gate/up $dispatch_marker" \
+        "$OUTPUT_DIR/smoke/$variant.log" ||
         die "$variant requested state did not reach the CUDA dispatch"
     case "$variant" in
         k1) audit_pattern='tile32-dp4a=1 k1=1 k2=0 k4=0' ;;

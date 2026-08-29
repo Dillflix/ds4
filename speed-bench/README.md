@@ -31,8 +31,8 @@ SKIP_BUILD=0 \
 
 ### SM75 Q3A4 exact in-CTA K-split
 
-`cuda-sm75-decode-q3a4-ksplit.sh` keeps the production tile32 signed-DP4A
-kernel as K1 and tests Q3A4-only K2 and K4 CTA mappings. Two or four warps
+`cuda-sm75-decode-q3a4-ksplit.sh` uses tile32 signed-DP4A K1 as the control
+and tests Q3A4-only K2 and K4 CTA mappings. Two or four warps
 cooperate on each native eight-row tile, write disjoint K256 leaves to the
 same 4 KiB shared table, then the split-zero warp executes the unchanged
 16-leaf `__fadd_rn` tree. This is an in-CTA experiment: it adds no global
@@ -41,16 +41,17 @@ partial buffer, reducer launch, atomic, or multi-GPU boundary.
 The runner requires nonzero byte-exact gate/up intermediates and owned output,
 memcheck of the 512-thread K4 case, fresh PTXAS/SASS identities, DP4A with no
 atomics, zero stack/spill/local traffic, and at most 64 allocated registers for
-K2/K4. Inclusive timing compares each candidate directly with production K1
-and includes activation quantize/pack, gate/up, mid quantize/pack, and Q4-32
-down. Focused Nsight captures report duration, memory traffic, occupancy, and
-scheduler stalls. K1 remains the default until a separate end-to-end A/B
-accepts a measured winner.
+K2/K4. Inclusive timing compares each candidate directly with K1 and includes
+activation quantize/pack, gate/up, mid quantize/pack, and Q4-32 down. Focused
+Nsight captures report duration, memory traffic, occupancy, and scheduler
+stalls. K4 is now the production default; set
+`DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=1`, `=2`, or `=4` to select the split
+explicitly.
 
 The bounded harness materializes a zero-valued synthetic expert payload. Its
 timings compare inclusive launch/resource structure, but do not establish
-real-weight cache or DRAM behavior; production promotion therefore requires
-the separate real-model end-to-end A/B.
+real-weight cache or DRAM behavior. The subsequent real-model end-to-end A/B
+provided the production evidence used to promote K4.
 
 ```bash
 PROFILE_GPU=0 \
@@ -78,6 +79,14 @@ exact layer list. `Q3A4_LAYOUT=all43` is the target-model mode and requires
 Q3A4 gate/up plus Q4-32 down on every routed layer. The selected layout, layer
 count, and complete list are recorded, and owned-call expectations scale with
 15 or 43 rather than accepting an inferred inventory.
+
+On the mixed15 model, K4 improved steady decode by 1.109% at PP512, 1.364% at
+PP4096, and 1.308% at PP32768 across three alternating paired repeats. The 16
+decode logits at every frontier were byte-identical and the exported 344-entry
+dense-F16 plans and bindings were identical between arms. This accepted K4 as
+the SM75 Q3A4 production default. The all43 model will use the same K4 default
+without another dispatch-code change; its end-to-end performance and exactness
+remain to be measured separately with `Q3A4_LAYOUT=all43`.
 
 ```bash
 export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"

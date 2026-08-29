@@ -192,10 +192,11 @@ enum cuda_moe_q3a4_decode_mapping {
     CUDA_MOE_Q3A4_DECODE_TILE32_DP4A = 3u,
 };
 static uint32_t g_cuda_moe_q3a4_decode_mapping;
-/* Experimental intra-CTA K parallelism for the production tile32-DP4A
- * mapping.  One remains the production default; only 2 and 4 select the
- * bounded Q3A4 experiment. */
-static uint32_t g_cuda_moe_q3a4_decode_ksplit = 1u;
+/* Intra-CTA K parallelism for the production tile32-DP4A mapping.  K4 is the
+ * SM75 production default; K1 and K2 remain available as explicit controls. */
+static const uint32_t CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT = 4u;
+static uint32_t g_cuda_moe_q3a4_decode_ksplit =
+    CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
 static int g_cuda_moe_q3a4_decode_mapping_audit;
 static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_ksplit_calls[3] = {};
@@ -414,7 +415,8 @@ extern "C" uint32_t ds4_gpu_test_get_moe_q3a4_decode_mapping(void) {
 extern "C" void ds4_gpu_test_set_moe_q3a4_decode_ksplit(
         uint32_t split) {
     g_cuda_moe_q3a4_decode_ksplit =
-        split == 2u || split == 4u ? split : 1u;
+        split == 1u || split == 2u || split == 4u
+            ? split : CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
 }
 
 extern "C" uint32_t ds4_gpu_test_get_moe_q3a4_decode_ksplit(void) {
@@ -580,7 +582,8 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_moe_q3a4_decode_mapping = q3a4_mapping_disabled
         ? CUDA_MOE_Q3A4_DECODE_CONTROL
         : CUDA_MOE_Q3A4_DECODE_TILE32_DP4A;
-    g_cuda_moe_q3a4_decode_ksplit = 1u;
+    g_cuda_moe_q3a4_decode_ksplit = q3a4_mapping_disabled
+        ? 1u : CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
     g_cuda_moe_q3a4_decode_mapping_audit =
         getenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING_AUDIT") != NULL;
     g_cuda_moe_q3a4_decode_mapping_logged.store(
@@ -621,9 +624,10 @@ static void cuda_decode_dispatch_env_refresh(void) {
             g_cuda_moe_q3a4_decode_ksplit = 4u;
         } else {
             fprintf(stderr,
-                    "ds4: invalid Q3A4 decode K split '%s'; using K1\n",
+                    "ds4: invalid Q3A4 decode K split '%s'; using K4\n",
                     q3a4_ksplit);
-            g_cuda_moe_q3a4_decode_ksplit = 1u;
+            g_cuda_moe_q3a4_decode_ksplit =
+                CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
         }
     }
 }
@@ -29241,7 +29245,8 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                     "ds4: SM75 Q3A4 decode gate/up mapping=%s%s\n",
                     mapping_name,
                     q3a4_decode_mapping == CUDA_MOE_Q3A4_DECODE_TILE32_DP4A &&
-                    q3a4_decode_ksplit == 1u
+                    q3a4_decode_ksplit ==
+                        CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT
                         ? " (production default)" : "");
         }
     }

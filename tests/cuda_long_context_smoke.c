@@ -1140,7 +1140,13 @@ static int require_nonzero_f32(const char *label, const float *values,
 static int check_sm75_q3a4_ksplit_env(void) {
     int rc = 1;
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING", "tile32-dp4a", 1) != 0 ||
-        setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "2", 1) != 0)
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "1", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "2", 1) != 0)
         goto cleanup;
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
@@ -1156,7 +1162,7 @@ static int check_sm75_q3a4_ksplit_env(void) {
         goto cleanup;
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) goto cleanup;
 
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0 ||
         setenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING", "1", 1) != 0)
@@ -1173,7 +1179,7 @@ cleanup:
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (rc == 0 &&
         (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u)) rc = 1;
+         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u)) rc = 1;
     fputs(rc == 0
               ? "cuda-regression: SM75 Q3A4 K1/K2/K4 environment selector exact\n"
               : "cuda-regression: SM75 Q3A4 K-split environment selector failed\n",
@@ -2153,15 +2159,15 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
-    if (ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) {
+    if (ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) {
         fprintf(stderr,
-                "cuda-regression: SM75 Q3A4 production K split is not K1\n");
+                "cuda-regression: SM75 Q3A4 production K split is not K4\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;
     }
     fprintf(stderr,
-            "cuda-regression: SM75 Q3A4 tile32-dp4a production default\n");
+            "cuda-regression: SM75 Q3A4 tile32-dp4a-k4 production default\n");
     if (!retire_temporary_model_map()) {
         ds4_gpu_cleanup();
         free(idle_model_map);

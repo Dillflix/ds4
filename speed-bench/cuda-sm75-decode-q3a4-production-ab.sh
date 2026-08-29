@@ -107,7 +107,7 @@ emit_configuration() {
     printf 'tg_tokens=%s\nexact_tokens=%s\nwarmup_tokens=%s\n' \
         "$TG_TOKENS" "$EXACT_TOKENS" "$WARMUP_TOKENS"
     printf 'prefill_chunk=%s\npipeline_mb=%s\n' "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 'q3a4_decode_default=tile32-dp4a\n'
+    printf 'q3a4_decode_candidate=tile32-dp4a-k1\n'
 }
 
 legacy_resume=0
@@ -116,9 +116,15 @@ if [[ $RESUME == 1 ]]; then
         die "RESUME=1 requires an existing Q3A4_PRODUCTION_AB_DIR"
     [[ -f $OUTPUT_DIR/configuration.txt ]] || die "resume configuration is missing"
     if ! cmp -s <(emit_configuration) "$OUTPUT_DIR/configuration.txt"; then
-        if cmp -s <(emit_configuration | \
-                    grep -Fv 'q3a4_decode_default=tile32-dp4a') \
-                  "$OUTPUT_DIR/configuration.txt"; then
+        if cmp -s <(emit_configuration | awk '
+                    $0=="q3a4_decode_candidate=tile32-dp4a-k1" {
+                        print "q3a4_decode_default=tile32-dp4a"; next
+                    }
+                    {print}
+                ') "$OUTPUT_DIR/configuration.txt" ||
+           cmp -s <(emit_configuration | \
+                    grep -Fv 'q3a4_decode_candidate=tile32-dp4a-k1') \
+                 "$OUTPUT_DIR/configuration.txt"; then
             legacy_resume=1
             printf 'Resuming pre-default Q3A4 evidence with exact legacy '
             printf 'configuration compatibility.\n'
@@ -186,7 +192,7 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 native exact marker missing"
     grep -Fq 'SM75 Q3A4 DP4A byte packing exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 DP4A packing marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
@@ -291,9 +297,9 @@ validate_mapping_audit() {
     if [[ $variant == control ]]; then
         marker='SM75 Q3A4 decode gate/up mapping=control'
     else
-        marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a (production default)'
+        marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a'
     fi
-    if ! grep -Fq "$marker" "$log"; then
+    if ! grep -Fxq "ds4: $marker" "$log"; then
         [[ $legacy_resume == 1 ]] || return 1
     fi
     mapping_active_count "$variant" "$log" >/dev/null
@@ -365,7 +371,10 @@ frontier_complete() {
 run_exact_full() {
     local variant=$1 base=$2 logits=$3
     local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
-    [[ $variant == control ]] || mapping_env=()
+    [[ $variant == control ]] || mapping_env=(
+        DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
+        DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=1
+    )
     local ctx_alloc=$((CTX_MAX + EXACT_TOKENS + 1))
     printf 'Exact Q3A4 decode logits: %s (all frontiers)...\n' "$variant"
     "${production_env[@]}" "${mapping_env[@]}" \
@@ -381,7 +390,10 @@ run_exact_full() {
 run_exact_frontier() {
     local variant=$1 context=$2 base=$3 logits=$4 prefix
     local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
-    [[ $variant == control ]] || mapping_env=()
+    [[ $variant == control ]] || mapping_env=(
+        DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
+        DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=1
+    )
     local ctx_alloc=$((CTX_MAX + EXACT_TOKENS + 1))
     printf -v prefix 'frontier_%06d' "$context"
     find "$logits" -maxdepth 1 -type f \
@@ -500,9 +512,12 @@ write_selected_csv() {
 run_one() {
     local variant=$1 tokens=$2 csv=$3 log=$4
     local -a mapping_env=(DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING=1)
-    # The candidate deliberately carries no mapping override: this A/B now
-    # proves the production default rather than an opt-in experiment.
-    [[ $variant == control ]] || mapping_env=()
+    # Preserve this historical mapping A/B after K4 became the production
+    # default by selecting the original K1 candidate explicitly.
+    [[ $variant == control ]] || mapping_env=(
+        DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
+        DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=1
+    )
     local ctx_alloc=$((CTX_MAX + tokens + 1))
     "${production_env[@]}" "${mapping_env[@]}" \
     ./ds4-bench --cuda --cuda-tensor-parallel \

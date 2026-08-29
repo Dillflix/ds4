@@ -31,7 +31,7 @@ The fixed PP frontiers are 512, 4096, and 32768. A fresh exact run evaluates
 all three in one process. RESUME preserves completed exact frontiers only when
 their process has healthy pre/post GPU snapshots; evidence from a GPU-loss
 process is deliberately rejected.
-K1 remains the production default; this script does not promote K4.
+K4 is the production default; K1 remains an explicit control.
 EOF
 }
 
@@ -198,7 +198,7 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 K-split selector marker missing"
     grep -Fq 'SM75 Q3A4 tile32-dp4a K1/K2/K4 in-CTA gate/up and owned decode exact/reuse' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 K-split exact marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
@@ -313,13 +313,16 @@ mapping_active_count() {
 }
 
 validate_mapping_audit() {
-    local variant=$1 log=$2 marker
+    local variant=$1 log=$2 marker default_marker
     if [[ $variant == k1 ]]; then
-        marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a (production default)'
+        marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a'
+        default_marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a (production default)'
     else
         marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4'
+        default_marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)'
     fi
-    grep -Fq "$marker" "$log" || return 1
+    grep -Fxq "ds4: $marker" "$log" ||
+        grep -Fxq "ds4: $default_marker" "$log" || return 1
     mapping_active_count "$variant" "$log" >/dev/null
 }
 
@@ -1001,13 +1004,12 @@ printf 'k1_interrupted_extra_calls=%s\n' "$k1_extra_calls" \
     >>"$OUTPUT_DIR/exact/verification.txt"
 printf 'k4_interrupted_extra_calls=%s\n' "$candidate_extra_calls" \
     >>"$OUTPUT_DIR/exact/verification.txt"
-cat >>"$OUTPUT_DIR/summary/summary.md" <<EOF
-
-## Exact-output verification
-
-All $EXACT_TOKENS decode logits at PP512, PP4096, and PP32768 were byte-identical.
-
-Q3A4 layout: `$Q3A4_LAYOUT` ($Q3A4_LAYER_COUNT routed layers: $Q3A4_LAYER_LIST).
-EOF
+{
+    printf '\n## Exact-output verification\n\n'
+    printf 'All %s decode logits at PP512, PP4096, and PP32768 were byte-identical.\n\n' \
+        "$EXACT_TOKENS"
+    printf 'Q3A4 layout: `%s` (%s routed layers: %s).\n' \
+        "$Q3A4_LAYOUT" "$Q3A4_LAYER_COUNT" "$Q3A4_LAYER_LIST"
+} >>"$OUTPUT_DIR/summary/summary.md"
 
 phase=complete
