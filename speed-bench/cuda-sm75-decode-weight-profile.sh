@@ -244,8 +244,10 @@ focused_metrics=$(IFS=,; printf '%s' "${selected_metric_names[*]}")
 
 kernel_regex() {
     case "$1" in
-        q4-32-gate-up) printf '%s' 'moe_gate_up_mid_decode_sm75_q32_owned_kernel<false>.*' ;;
-        q3a4-gate-up) printf '%s' 'moe_gate_up_mid_decode_sm75_q32_owned_kernel<true>.*' ;;
+        # With --kernel-name-base function, Nsight strips the template value
+        # from this symbol. Each scenario launches exactly one specialization,
+        # so the harness scenario—not a missing suffix—provides separation.
+        q4-32-gate-up|q3a4-gate-up) printf '%s' 'moe_gate_up_mid_decode_sm75_q32_owned_kernel.*' ;;
         q8-single-t32) printf '%s' 'matmul_q8_0_preq_warp8_kernel.*' ;;
         q8-pair-2048|q8-pair-1024) printf '%s' 'matmul_q8_0_pair_preq_warp8_kernel.*' ;;
         q8-kslice-t256) printf '%s' 'matmul_q8_0_kslice_preq_warp8_kernel.*' ;;
