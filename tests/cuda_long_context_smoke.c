@@ -9,6 +9,7 @@
 extern void ds4_gpu_test_set_moe_q32_decode_graph(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
+extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -1083,6 +1084,47 @@ static int check_sm75_q32_production_exact(void) {
     return rc;
 }
 
+/* Exhaustively prove the byte packing used by the tile32 DP4A path.  The
+ * activation byte is low_nibble | high_signed_nibble<<4; Q3A4 weights are
+ * non-negative 0..7 bytes. */
+static int check_sm75_q3a4_dp4a_pack(void) {
+    const uint32_t nibble_mask = 0x0f0f0f0fu;
+    for (uint32_t byte = 0; byte < 256u; byte++) {
+        const uint32_t lo = (byte & 15u) * 0x11111111u;
+        const uint32_t hi = ((byte >> 4u) & 15u) * 0x11111111u;
+        const uint32_t a_even =
+            (lo & nibble_mask) | ((hi & nibble_mask) << 4u);
+        const uint32_t a_odd =
+            ((lo >> 4u) & nibble_mask) | (hi & 0xf0f0f0f0u);
+        int activation = (int)byte;
+        if (activation >= 128) activation -= 256;
+        for (uint32_t q = 0; q < 8u; q++) {
+            const uint32_t qw = q * 0x11111111u;
+            const uint32_t w_even = qw & nibble_mask;
+            const uint32_t w_odd = (qw >> 4u) & nibble_mask;
+            int got = 0;
+            for (uint32_t i = 0; i < 4u; i++) {
+                int ae = (int)((a_even >> (8u * i)) & 255u);
+                int ao = (int)((a_odd >> (8u * i)) & 255u);
+                if (ae >= 128) ae -= 256;
+                if (ao >= 128) ao -= 256;
+                got += ae * (int)((w_even >> (8u * i)) & 255u);
+                got += ao * (int)((w_odd >> (8u * i)) & 255u);
+            }
+            if (got != 8 * activation * (int)q) {
+                fprintf(stderr,
+                        "SM75 Q3A4 DP4A pack mismatch byte=%u q=%u: "
+                        "got=%d expected=%d\n",
+                        byte, q, got, 8 * activation * (int)q);
+                return 1;
+            }
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 Q3A4 DP4A byte packing exact\n");
+    return 0;
+}
+
 /* Exercise the exact six-node production CUDA Graph through the real
  * owned-expert API.  The full-expert dispatcher is the independent reference;
  * home slots plus fixed-three partner output are combined exactly as ds4.c
@@ -1091,8 +1133,10 @@ static int check_sm75_q32_production_exact(void) {
 static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                                            const char *label) {
     const uint32_t n_total = 8u, n_expert = 6u;
-    const uint32_t in_dim = 256u, mid_dim = 256u, out_dim = 256u;
-    const uint32_t in_blocks = 1u, mid_blocks = 1u;
+    /* Use the real decode K shape so Q3A4 native mappings are validated with
+     * all 16 K256 records, not merely a one-record short test. */
+    const uint32_t in_dim = 4096u, mid_dim = 256u, out_dim = 256u;
+    const uint32_t in_blocks = 16u, mid_blocks = 1u;
     const uint64_t gate_block = gate_type == 43u ? 108u : 136u;
     const uint64_t gate_row = gate_block * in_blocks;
     const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
@@ -1170,6 +1214,8 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
          * partner-owned slots. */
         ds4_gpu_test_set_moe_q32_decode_graph(0);
         ds4_gpu_test_set_moe_q32_decode_split(0);
+        ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+        ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
         if (!ds4_gpu_routed_moe_one_owned_tensor(
                 tmp_out, gate, up, mid, down, model, model_bytes,
                 gate_off, up_off, down_off, gate_type, 42u,
@@ -1219,6 +1265,31 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                                    (size_t)n_expert * out_dim)) goto cleanup;
         }
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+        if (gate_type == 43u) {
+            for (uint32_t mapping = 1u; mapping <= 3u; mapping++) {
+                ds4_gpu_test_set_moe_q3a4_decode_mapping(mapping);
+                if (!ds4_gpu_routed_moe_one_owned_tensor(
+                        tmp_out, gate, up, mid, down, model, model_bytes,
+                        gate_off, up_off, down_off, gate_type, 42u,
+                        gate_expert, gate_row, down_expert, down_row,
+                        in_dim, mid_dim, out_dim, selected, weights,
+                        n_total, n_expert, 0u, 4u, 10.0f, x,
+                        home_slots, false, shared_prequant) ||
+                    !ds4_gpu_synchronize() ||
+                    !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+                    !ds4_gpu_tensor_read(home_slots, 0, home_splith,
+                                         slot_bytes) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 native mapping gate/up intermediate",
+                        mid_refh, mid_splith,
+                        (size_t)n_expert * mid_dim) ||
+                    !compare_exact_f32(
+                        "SM75 Q3A4 native mapping owned output",
+                        home_refh, home_splith,
+                        (size_t)n_expert * out_dim)) goto cleanup;
+            }
+            ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+        }
         if (!ds4_gpu_routed_moe_one_owned_tensor(
                 tmp_out, gate, up, mid, down, model, model_bytes,
                 gate_off, up_off, down_off, gate_type, 42u,
@@ -1266,13 +1337,18 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
             "cuda-regression: SM75 %s split gate/up and owned decode "
             "CUDA Graph exact/reuse\n"
             "cuda-regression: SM75 %s fused-lowreg u1/u2/u4 gate/up "
-            "and owned decode exact/reuse\n",
-            label, label);
+            "and owned decode exact/reuse\n%s",
+            label, label,
+            gate_type == 43u
+                ? "cuda-regression: SM75 Q3A4 hwarp16/tile32/dp4a gate/up "
+                  "and owned decode exact/reuse\n"
+                : "");
     rc = 0;
 
 cleanup:
     ds4_gpu_test_set_moe_q32_decode_split(0);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q32_decode_graph(1);
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
@@ -1962,6 +2038,11 @@ int main(void) {
     (void)setenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH", "1", 1);
     (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_SPLIT");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_SPLIT");
+    (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG");
+    (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
+    if (check_sm75_q3a4_dp4a_pack() != 0) return 1;
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);
     if (!idle_model_map) return 1;
     if (!ds4_gpu_init()) {

@@ -1,5 +1,33 @@
 ## Benchmarking
 
+### SM75-native Q3A4 decode mapping
+
+`cuda-sm75-decode-q3a4-native.sh` treats Q3A4 as its own decode problem. It
+keeps Q4-32 unchanged and compares the shipping Q3A4 gate/up kernel against
+the measured fused-u2 control, a two-row half-warp mapping, and a mapping in
+which each warp follows one complete native eight-row Q3A4 tile. The latter
+targets the measured idle half-warps and highly fragmented weight loads while
+preserving fused gate/up traversal and the existing expert-parallel boundary.
+The tile mapping is measured with both scalar nibble arithmetic and an exact
+signed-DP4A implementation so layout and arithmetic effects remain separable.
+
+The runner requires the real 16-K256-record byte-exact regression, fresh
+PTXAS/SASS evidence, zero spills and local traffic, complete owned-call timing,
+and focused Nsight Compute memory/scheduler captures for all five kernels.
+This pass selects the local Q3A4 microkernel; it does not by itself authorize
+production dispatch. The winner must next be measured in the real two-GPU FFN
+envelope with routed counts, shared-expert assignment, down, and return/reduce.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q3a4-native.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection

@@ -317,6 +317,199 @@ __global__ static void moe_gate_up_mid_decode_sm75_q32_owned_kernel(
     }
 }
 
+/* Q3A4-only decode control: the production shape has exactly 16 K256
+ * records.  Two independent rows therefore occupy the two 16-lane halves of
+ * each warp instead of leaving lanes 16..31 idle.  The dot expression and
+ * the 8/4/2/1 float-reduction tree are unchanged. */
+__global__ static void moe_gate_up_mid_decode_sm75_q3a4_hwarp16_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    const uint32_t lane16 = threadIdx.x & 15u;
+    const uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= expert_mid_dim || slot >= 6u) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane16 == 0u)
+            mid_out[(uint64_t)slot * expert_mid_dim + row] = 0.0f;
+        return;
+    }
+    float gate = 0.0f, up = 0.0f;
+    for (uint32_t b = lane16; b < xq_blocks; b += 16u) {
+        gate += sm75_q32_ops<true>::dot_decode_partial<2u>(
+            sm75_q32_ops<true>::record(gate_base, expert, row,
+                                       expert_mid_dim, xq_blocks, b),
+            row & 7u, xq + b);
+        up += sm75_q32_ops<true>::dot_decode_partial<2u>(
+            sm75_q32_ops<true>::record(up_base, expert, row,
+                                       expert_mid_dim, xq_blocks, b),
+            row & 7u, xq + b);
+    }
+    gate = half_warp_sum_f32(gate, lane16);
+    up = half_warp_sum_f32(up, lane16);
+    if (lane16 == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
+/* Native-layout Q3A4 decode mapping.  A warp follows one 8-row Q3A4 tile
+ * instead of following one row through 16 tile records:
+ *
+ *   lane = row-in-tile * 4 + activation-lane
+ *
+ * This makes low2/high weight loads contiguous across all 32 lanes and
+ * broadcasts each activation word to the eight output rows that reuse it.
+ * Four integer lane fragments are gathered in lane order, then the 16 K256
+ * float contributions are staged and reduced with the production warp tree.
+ * Gate and up stay fused and share the activation traversal. */
+template <bool USE_DP4A>
+__global__ __launch_bounds__(128, 4) static void
+moe_gate_up_mid_decode_sm75_q3a4_tile32_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row8 = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t row0 = blockIdx.x * 32u + warp * 8u;
+    const uint32_t slot = blockIdx.y;
+    /* block-major scratch makes the eight row-leader stores contiguous.  The
+     * final four-lane reduction also addresses all 32 banks exactly once. */
+    __shared__ float gate_part[4][16][8];
+    __shared__ float up_part[4][16][8];
+
+    if (slot >= 6u || row0 >= expert_mid_dim) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane < 8u && row0 + lane < expert_mid_dim)
+            mid_out[(uint64_t)slot * expert_mid_dim + row0 + lane] = 0.0f;
+        return;
+    }
+
+    /* Dispatch specializes this mapping for the production 16-record K. */
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        const cuda_sm75_q3a4_tile *gate_w =
+            sm75_q32_ops<true>::record(gate_base, expert, row0,
+                                       expert_mid_dim, xq_blocks, b);
+        const cuda_sm75_q3a4_tile *up_w =
+            sm75_q32_ops<true>::record(up_base, expert, row0,
+                                       expert_mid_dim, xq_blocks, b);
+        const cuda_sm75_native_q8_K *a = xq + b;
+        int gate_total = 0, up_total = 0;
+        int gate_correction = 0, up_correction = 0;
+#pragma unroll 1
+        for (uint32_t group = 0; group < 8u; group++) {
+            const uint32_t gate_qw = sm75_q32_dilate_q3(
+                gate_w->low2[group][lane], gate_w->high[group][lane]);
+            const uint32_t up_qw = sm75_q32_dilate_q3(
+                up_w->low2[group][lane], up_w->high[group][lane]);
+            const uint32_t lo = a->low[group][lane4];
+            const uint32_t hi = a->high_signed[group][lane4];
+            int gate_sum = 0, up_sum = 0;
+            if (USE_DP4A) {
+                /* low | high<<4 is the exact signed Q8 byte.  Q3A4 codes are
+                 * 0..7, so signed/signed DP4A preserves the dot product. */
+                const uint32_t nibble_mask = 0x0f0f0f0fu;
+                const uint32_t a_even =
+                    (lo & nibble_mask) | ((hi & nibble_mask) << 4u);
+                const uint32_t a_odd =
+                    ((lo >> 4u) & nibble_mask) | (hi & 0xf0f0f0f0u);
+                const uint32_t gate_even = gate_qw & nibble_mask;
+                const uint32_t gate_odd =
+                    (gate_qw >> 4u) & nibble_mask;
+                const uint32_t up_even = up_qw & nibble_mask;
+                const uint32_t up_odd = (up_qw >> 4u) & nibble_mask;
+                gate_sum = __dp4a((int)a_even, (int)gate_even, 0);
+                gate_sum = __dp4a((int)a_odd, (int)gate_odd, gate_sum);
+                up_sum = __dp4a((int)a_even, (int)up_even, 0);
+                up_sum = __dp4a((int)a_odd, (int)up_odd, up_sum);
+            } else {
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    const int al = (int)((lo >> (4u * i)) & 15u);
+                    const int hc = (int)((hi >> (4u * i)) & 15u);
+                    const int av = al + 16 * ((hc ^ 8) - 8);
+                    gate_sum +=
+                        (int)((gate_qw >> (4u * i)) & 15u) * av;
+                    up_sum += (int)((up_qw >> (4u * i)) & 15u) * av;
+                }
+            }
+            const int gate1 = __shfl_sync(0xffffffffu, gate_sum, 1, 4);
+            const int gate2 = __shfl_sync(0xffffffffu, gate_sum, 2, 4);
+            const int gate3 = __shfl_sync(0xffffffffu, gate_sum, 3, 4);
+            const int up1 = __shfl_sync(0xffffffffu, up_sum, 1, 4);
+            const int up2 = __shfl_sync(0xffffffffu, up_sum, 2, 4);
+            const int up3 = __shfl_sync(0xffffffffu, up_sum, 3, 4);
+            if (lane4 == 0u) {
+                const int gate_group =
+                    ((gate_sum + gate1) + gate2) + gate3;
+                const int up_group = ((up_sum + up1) + up2) + up3;
+                const int bsum = (int)a->bsums[2u * group] +
+                                 (int)a->bsums[2u * group + 1u];
+                gate_total += (int)sm75_q32_u4(
+                    gate_w->scales[row8], group) * gate_group;
+                up_total += (int)sm75_q32_u4(
+                    up_w->scales[row8], group) * up_group;
+                gate_correction += (int)sm75_q32_u4(
+                    gate_w->mins[row8], group) * bsum;
+                up_correction += (int)sm75_q32_u4(
+                    up_w->mins[row8], group) * bsum;
+            }
+        }
+        if (lane4 == 0u) {
+            gate_part[warp][b][row8] = a->d * (
+                dev_f16_to_f32(gate_w->d[row8]) * (float)gate_total -
+                dev_f16_to_f32(gate_w->dmin[row8]) *
+                    (float)gate_correction);
+            up_part[warp][b][row8] = a->d * (
+                dev_f16_to_f32(up_w->d[row8]) * (float)up_total -
+                dev_f16_to_f32(up_w->dmin[row8]) *
+                    (float)up_correction);
+        }
+    }
+    __syncwarp();
+
+    /* Reproduce the production 16-value reduction tree exactly:
+     * offset 8, then offset 4, then subgroup offsets 2 and 1. */
+    float gate = __fadd_rn(
+        __fadd_rn(gate_part[warp][lane4][row8],
+                  gate_part[warp][lane4 + 8u][row8]),
+        __fadd_rn(gate_part[warp][lane4 + 4u][row8],
+                  gate_part[warp][lane4 + 12u][row8]));
+    float up = __fadd_rn(
+        __fadd_rn(up_part[warp][lane4][row8],
+                  up_part[warp][lane4 + 8u][row8]),
+        __fadd_rn(up_part[warp][lane4 + 4u][row8],
+                  up_part[warp][lane4 + 12u][row8]));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 2, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 2, 4));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 1, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 1, 4));
+    if (lane4 == 0u && row0 + row8 < expert_mid_dim) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row0 + row8] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
 /* Single-launch low-register gate/up candidates.  Unlike the rejected split
  * experiment these preserve one owned-slot traversal, keep the gate and up
  * outputs in registers, and avoid global intermediates and a combine launch.

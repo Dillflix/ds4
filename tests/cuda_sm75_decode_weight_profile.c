@@ -13,6 +13,7 @@
 
 extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
+extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 
 typedef enum {
     SCENARIO_Q4_32_GATE_UP,
@@ -27,6 +28,12 @@ typedef enum {
     SCENARIO_Q3A4_GATE_UP_FUSED_U1_AB,
     SCENARIO_Q3A4_GATE_UP_FUSED_U2_AB,
     SCENARIO_Q3A4_GATE_UP_FUSED_U4_AB,
+    SCENARIO_Q3A4_GATE_UP_HWARP16,
+    SCENARIO_Q3A4_GATE_UP_TILE32,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A,
+    SCENARIO_Q3A4_GATE_UP_HWARP16_AB,
+    SCENARIO_Q3A4_GATE_UP_TILE32_AB,
+    SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_AB,
     SCENARIO_Q4_32_GATE_UP_FUSED_U1,
     SCENARIO_Q4_32_GATE_UP_FUSED_U2,
     SCENARIO_Q4_32_GATE_UP_FUSED_U4,
@@ -73,6 +80,18 @@ static const scenario_spec scenarios[] = {
       SCENARIO_Q3A4_GATE_UP_FUSED_U2_AB },
     { "q3a4-gate-up-fused-u4-ab", "routed-q3a4-fused-u4-ab",
       SCENARIO_Q3A4_GATE_UP_FUSED_U4_AB },
+    { "q3a4-gate-up-hwarp16", "routed-q3a4-hwarp16",
+      SCENARIO_Q3A4_GATE_UP_HWARP16 },
+    { "q3a4-gate-up-tile32", "routed-q3a4-tile32",
+      SCENARIO_Q3A4_GATE_UP_TILE32 },
+    { "q3a4-gate-up-tile32-dp4a", "routed-q3a4-tile32-dp4a",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A },
+    { "q3a4-gate-up-hwarp16-ab", "routed-q3a4-hwarp16-ab",
+      SCENARIO_Q3A4_GATE_UP_HWARP16_AB },
+    { "q3a4-gate-up-tile32-ab", "routed-q3a4-tile32-ab",
+      SCENARIO_Q3A4_GATE_UP_TILE32_AB },
+    { "q3a4-gate-up-tile32-dp4a-ab", "routed-q3a4-tile32-dp4a-ab",
+      SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_AB },
     { "q4-32-gate-up-fused-u1", "routed-q4-32-fused-u1",
       SCENARIO_Q4_32_GATE_UP_FUSED_U1 },
     { "q4-32-gate-up-fused-u2", "routed-q4-32-fused-u2",
@@ -224,7 +243,8 @@ static ds4_gpu_tensor *input_tensor(uint64_t count) {
 }
 
 static int run_routed_gate_up(int q3a4, int split,
-                              uint32_t fused_unroll, int benchmark) {
+                              uint32_t fused_unroll,
+                              uint32_t q3a4_mapping, int benchmark) {
     /* Three active home experts plus three partner-owned slots reproduce the
      * per-device production ownership shape.  Only the three addressable home
      * payloads need to be materialized; resident_expert_count is merely the
@@ -280,6 +300,7 @@ static int run_routed_gate_up(int q3a4, int split,
                                  DS4_TENSOR_LAYOUT_SM75_Q3A4);
     ds4_gpu_test_set_moe_q32_decode_split(split);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
 #define RUN_ROUTED_GATE_UP() ds4_gpu_routed_moe_one_owned_tensor( \
             out, gate, up, mid, down, model_storage, model_bytes, \
             gate_offset, up_offset, down_offset, \
@@ -294,17 +315,22 @@ static int run_routed_gate_up(int q3a4, int split,
         fprintf(stderr, "error: routed decode production launch failed\n");
         goto cleanup;
     }
-    printf("q32_split=%s\nq32_fused_lowreg_unroll=%u\n",
-           split ? "enabled" : "disabled", fused_unroll);
+    printf("q32_split=%s\nq32_fused_lowreg_unroll=%u\n"
+           "q3a4_decode_mapping=%u\n",
+           split ? "enabled" : "disabled", fused_unroll,
+           q3a4_mapping);
     if (benchmark) {
         ds4_gpu_test_set_moe_q32_decode_split(0);
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+        ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
         if (!RUN_ROUTED_GATE_UP() || !ds4_gpu_synchronize()) {
             fprintf(stderr, "error: routed decode control warmup failed\n");
             goto cleanup;
         }
-        ds4_gpu_test_set_moe_q32_decode_split(fused_unroll == 0u);
+        ds4_gpu_test_set_moe_q32_decode_split(
+            fused_unroll == 0u && q3a4_mapping == 0u);
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
+        ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
         if (!RUN_ROUTED_GATE_UP() || !ds4_gpu_synchronize()) {
             fprintf(stderr, "error: routed decode candidate warmup failed\n");
             goto cleanup;
@@ -323,9 +349,12 @@ static int run_routed_gate_up(int q3a4, int split,
             for (uint32_t order = 0; order < 2u; order++) {
                 const int candidate = ((round & 1u) ^ order) != 0u;
                 ds4_gpu_test_set_moe_q32_decode_split(
-                    fused_unroll == 0u ? candidate : 0);
+                    fused_unroll == 0u && q3a4_mapping == 0u
+                        ? candidate : 0);
                 ds4_gpu_test_set_moe_q32_decode_fused_lowreg(
                     candidate ? fused_unroll : 0u);
+                ds4_gpu_test_set_moe_q3a4_decode_mapping(
+                    candidate ? q3a4_mapping : 0u);
                 if (!ds4_gpu_timer_record_start(timer)) goto timing_error;
                 for (uint32_t repeat = 0; repeat < repeats; repeat++)
                     if (!RUN_ROUTED_GATE_UP()) goto timing_error;
@@ -346,16 +375,20 @@ static int run_routed_gate_up(int q3a4, int split,
                "candidate_kind=%s\ncontrol_median_ms=%.9g\n"
                "candidate_median_ms=%.9g\ncandidate_speedup=%.9g\n",
                rounds, repeats,
-               fused_unroll ? "fused-lowreg" : "split",
+               q3a4_mapping == 1u ? "q3a4-hwarp16" :
+               (q3a4_mapping == 2u ? "q3a4-tile32" :
+                (q3a4_mapping == 3u ? "q3a4-tile32-dp4a" :
+                 (fused_unroll ? "fused-lowreg" : "split"))),
                control_median, candidate_median,
                control_median / candidate_median);
-        if (fused_unroll == 0u)
+        if (fused_unroll == 0u && q3a4_mapping == 0u)
             printf("split_median_ms=%.9g\nsplit_speedup=%.9g\n",
                    candidate_median, control_median / candidate_median);
         ds4_gpu_timer_free(timer);
         free(candidate_ms); free(control_ms);
         ds4_gpu_test_set_moe_q32_decode_split(split);
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(fused_unroll);
+        ds4_gpu_test_set_moe_q3a4_decode_mapping(q3a4_mapping);
         goto timing_done;
 timing_error:
         fprintf(stderr, "error: routed decode inclusive timing failed\n");
@@ -370,6 +403,7 @@ timing_done:;
 cleanup:
     ds4_gpu_test_set_moe_q32_decode_split(0);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_set_routed_q4_layout(0u);
     ds4_gpu_tensor_free(down);
     ds4_gpu_tensor_free(mid);
@@ -561,6 +595,8 @@ int main(int argc, char **argv) {
     (void)setenv("DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH", "1", 1);
     (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
 
     printf("scenario=%s\nfamily=%s\nn_tokens=1\n"
            "q8_arithmetic=production-dp4a\nq8_f16_cache=disabled\n"
@@ -581,40 +617,54 @@ int main(int argc, char **argv) {
 
     int ok = 0;
     switch (spec->kind) {
-        case SCENARIO_Q4_32_GATE_UP: ok = run_routed_gate_up(0, 0, 0u, 0); break;
-        case SCENARIO_Q3A4_GATE_UP: ok = run_routed_gate_up(1, 0, 0u, 0); break;
+        case SCENARIO_Q4_32_GATE_UP:
+            ok = run_routed_gate_up(0, 0, 0u, 0u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP:
+            ok = run_routed_gate_up(1, 0, 0u, 0u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_SPLIT:
-            ok = run_routed_gate_up(0, 1, 0u, 0); break;
+            ok = run_routed_gate_up(0, 1, 0u, 0u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_SPLIT:
-            ok = run_routed_gate_up(1, 1, 0u, 0); break;
+            ok = run_routed_gate_up(1, 1, 0u, 0u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_AB:
-            ok = run_routed_gate_up(0, 0, 0u, 1); break;
+            ok = run_routed_gate_up(0, 0, 0u, 0u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_AB:
-            ok = run_routed_gate_up(1, 0, 0u, 1); break;
+            ok = run_routed_gate_up(1, 0, 0u, 0u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U1:
-            ok = run_routed_gate_up(1, 0, 1u, 0); break;
+            ok = run_routed_gate_up(1, 0, 1u, 0u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U2:
-            ok = run_routed_gate_up(1, 0, 2u, 0); break;
+            ok = run_routed_gate_up(1, 0, 2u, 0u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U4:
-            ok = run_routed_gate_up(1, 0, 4u, 0); break;
+            ok = run_routed_gate_up(1, 0, 4u, 0u, 0); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U1_AB:
-            ok = run_routed_gate_up(1, 0, 1u, 1); break;
+            ok = run_routed_gate_up(1, 0, 1u, 0u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U2_AB:
-            ok = run_routed_gate_up(1, 0, 2u, 1); break;
+            ok = run_routed_gate_up(1, 0, 2u, 0u, 1); break;
         case SCENARIO_Q3A4_GATE_UP_FUSED_U4_AB:
-            ok = run_routed_gate_up(1, 0, 4u, 1); break;
+            ok = run_routed_gate_up(1, 0, 4u, 0u, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_HWARP16:
+            ok = run_routed_gate_up(1, 0, 0u, 1u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32:
+            ok = run_routed_gate_up(1, 0, 0u, 2u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A:
+            ok = run_routed_gate_up(1, 0, 0u, 3u, 0); break;
+        case SCENARIO_Q3A4_GATE_UP_HWARP16_AB:
+            ok = run_routed_gate_up(1, 0, 0u, 1u, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_AB:
+            ok = run_routed_gate_up(1, 0, 0u, 2u, 1); break;
+        case SCENARIO_Q3A4_GATE_UP_TILE32_DP4A_AB:
+            ok = run_routed_gate_up(1, 0, 0u, 3u, 1); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U1:
-            ok = run_routed_gate_up(0, 0, 1u, 0); break;
+            ok = run_routed_gate_up(0, 0, 1u, 0u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U2:
-            ok = run_routed_gate_up(0, 0, 2u, 0); break;
+            ok = run_routed_gate_up(0, 0, 2u, 0u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U4:
-            ok = run_routed_gate_up(0, 0, 4u, 0); break;
+            ok = run_routed_gate_up(0, 0, 4u, 0u, 0); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U1_AB:
-            ok = run_routed_gate_up(0, 0, 1u, 1); break;
+            ok = run_routed_gate_up(0, 0, 1u, 0u, 1); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U2_AB:
-            ok = run_routed_gate_up(0, 0, 2u, 1); break;
+            ok = run_routed_gate_up(0, 0, 2u, 0u, 1); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U4_AB:
-            ok = run_routed_gate_up(0, 0, 4u, 1); break;
+            ok = run_routed_gate_up(0, 0, 4u, 0u, 1); break;
         case SCENARIO_Q8_SINGLE_T32: ok = run_q8_single(1024u, 32768u); break;
         case SCENARIO_Q8_PAIR_2048: ok = run_q8_pair(2048u); break;
         case SCENARIO_Q8_PAIR_1024: ok = run_q8_pair(1024u); break;
