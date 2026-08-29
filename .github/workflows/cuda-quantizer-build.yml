@@ -176,6 +176,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-decode-graph-ab.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
+          test -x speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
+          bash -n speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
           test -x speed-bench/cuda-sm75-pair-stability-matrix.sh
           bash -n speed-bench/cuda-sm75-pair-stability-matrix.sh
           test -x speed-bench/cuda-sm75-xdev-feature-isolation.sh

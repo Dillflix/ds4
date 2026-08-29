@@ -63,6 +63,38 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
 ```
 
+After the bounded K-split audit selects K4, use the real-model production A/B
+to compare only tile32-DP4A K1 against tile32-DP4A K4. Both arms explicitly
+retain mapping 3; Q4-32, the 22/21 placement, complete 344/344 dense-F16 cache,
+indexer, attention, and cross-GPU topology must remain identical. The runner
+exports and compares all 344 placement entries and canonical binding identities
+between arms, rather than accepting matching aggregate counts. It also
+uses PP512/4096/32768, TG256, alternating paired repeats, and 16 byte-exact
+decode-logit comparisons per frontier. It is resumable and archives failures.
+Resume accepts evidence only with healthy pre/post GPU snapshots; outputs from
+a process that lost a GPU are intentionally rerun.
+`Q3A4_LAYOUT=mixed15` validates the current 15-layer model and requires its
+exact layer list. `Q3A4_LAYOUT=all43` is the target-model mode and requires
+Q3A4 gate/up plus Q4-32 down on every routed layer. The selected layout, layer
+count, and complete list are recorded, and owned-call expectations scale with
+15 or 43 rather than accepting an inferred inventory.
+
+```bash
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+Q3A4_LAYOUT=mixed15 \
+REPEATS=3 \
+TG_TOKENS=256 \
+EXACT_TOKENS=16 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+./speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
+```
+
 If a run reached Nsight Compute after all earlier gates passed, resume the
 same evidence directory without rebuilding or repeating exactness, sanitizer,
 or timing. Resume mode requires the original clean sanitizer result, the same
