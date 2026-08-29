@@ -1,5 +1,29 @@
 ## Benchmarking
 
+### SM75 fused low-register Q3A4/Q4-32 decode sweep
+
+`cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection
+split with a single-launch design. It preserves gate/up fusion and exact
+accumulation while sweeping partial-unroll factors 1, 2, and 4. Q3A4 is timed
+first; its measured ranking determines the Q4-32 execution order, but all
+three Q4-32 variants are still tested independently.
+
+The runner requires fresh PTXAS/SASS evidence, byte-exact non-zero regression,
+and inclusive production-owned-call timing. Spills, SASS local traffic, or
+more than 128 allocated registers reject an individual candidate without
+hiding the other measurements. Nsight Compute profiles the control and the
+best structurally eligible candidate for each format.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=7 \
+TIMING_REPEATS=20 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q32-fused-lowreg.sh
+```
+
 ### SM75 low-register Q4-32/Q3A4 decode gate/up split
 
 `cuda-sm75-decode-q32-lowreg.sh` is a bounded, production-shaped experiment

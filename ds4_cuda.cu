@@ -179,6 +179,7 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_cuda_moe_q32_decode_graph;
 static int g_cuda_moe_q32_decode_split;
+static uint32_t g_cuda_moe_q32_decode_fused_lowreg;
 static uint32_t g_cuda_routed_q4_layout;
 static std::atomic<bool> g_cuda_native_q4_logged = false;
 static std::atomic<bool> g_cuda_q32_logged = false;
@@ -373,6 +374,12 @@ extern "C" void ds4_gpu_test_set_moe_q32_decode_split(int enabled) {
     g_cuda_moe_q32_decode_split = enabled != 0;
 }
 
+extern "C" void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(
+        uint32_t unroll) {
+    g_cuda_moe_q32_decode_fused_lowreg =
+        unroll == 1u || unroll == 2u || unroll == 4u ? unroll : 0u;
+}
+
 static int cuda_q4_mma_ok(void) {
     /* Cached once: all tiers on this host are the same GPU model. */
     static int cached = -1;
@@ -518,6 +525,15 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_moe_q32_decode_split =
         getenv("DS4_CUDA_MOE_Q32_DECODE_SPLIT") != NULL &&
         getenv("DS4_CUDA_NO_MOE_Q32_DECODE_SPLIT") == NULL;
+    g_cuda_moe_q32_decode_fused_lowreg = 0u;
+    const char *q32_lowreg = getenv("DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG");
+    if (q32_lowreg && getenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG") == NULL) {
+        char *end = NULL;
+        const unsigned long value = strtoul(q32_lowreg, &end, 10);
+        if (end && *end == '\0' &&
+            (value == 1ul || value == 2ul || value == 4ul))
+            g_cuda_moe_q32_decode_fused_lowreg = (uint32_t)value;
+    }
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -28962,6 +28978,8 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     const bool gate_q3a4 = gate_type == 43u;
     const bool gate_q32 = gate_q4_32 || gate_q3a4;
     const bool split_gate_q32 = gate_q32 && g_cuda_moe_q32_decode_split;
+    const uint32_t fused_lowreg_gate_q32 = gate_q32 && !split_gate_q32
+        ? g_cuda_moe_q32_decode_fused_lowreg : 0u;
     const bool down_q4k = down_type == 12u;
     const bool down_q2k = down_type == 10u;
     const bool down_q4_32 = down_type == 42u;
@@ -29070,7 +29088,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
 
     if (g_cuda_moe_q32_decode_graph && gate_q32 && down_q4_32 &&
-        !split_gate_q32) {
+        !split_gate_q32 && fused_lowreg_gate_q32 == 0u) {
         g_moe_q32_graph_calls.fetch_add(1, std::memory_order_relaxed);
         int8_t *shared_xq = shared_prequant
             ? (int8_t *)shared_prequant->ptr : NULL;
@@ -29151,6 +29169,34 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                     (const int32_t *)selected->ptr,
                     (const float *)weights->ptr, expert_mid_dim,
                     resident_expert_base, resident_expert_count, clamp);
+        } else if (fused_lowreg_gate_q32 != 0u) {
+#define DS4_LAUNCH_Q32_FUSED_LOWREG(Q3A, U) \
+            moe_gate_up_mid_decode_sm75_q32_fused_lowreg_owned_kernel<Q3A, U> \
+                <<<gate_grid, 256>>>( \
+                    (float *)mid->ptr, gate_w, up_w, \
+                    (const cuda_sm75_native_q8_K *)xq, \
+                    (const int32_t *)selected->ptr, \
+                    (const float *)weights->ptr, xq_blocks, \
+                    expert_mid_dim, resident_expert_base, \
+                    resident_expert_count, clamp)
+            if (gate_q3a4) {
+                if (fused_lowreg_gate_q32 == 1u) {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(true, 1u);
+                } else if (fused_lowreg_gate_q32 == 2u) {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(true, 2u);
+                } else {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(true, 4u);
+                }
+            } else {
+                if (fused_lowreg_gate_q32 == 1u) {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(false, 1u);
+                } else if (fused_lowreg_gate_q32 == 2u) {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(false, 2u);
+                } else {
+                    DS4_LAUNCH_Q32_FUSED_LOWREG(false, 4u);
+                }
+            }
+#undef DS4_LAUNCH_Q32_FUSED_LOWREG
         } else if (gate_q3a4) {
             moe_gate_up_mid_decode_sm75_q32_owned_kernel<true><<<gate_grid, 256>>>(
                 (float *)mid->ptr, gate_w, up_w,

@@ -8,6 +8,7 @@
 
 extern void ds4_gpu_test_set_moe_q32_decode_graph(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
+extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -1198,6 +1199,26 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                                home_refh, home_splith,
                                (size_t)n_expert * out_dim)) goto cleanup;
         ds4_gpu_test_set_moe_q32_decode_split(0);
+        for (uint32_t unroll = 1u; unroll <= 4u; unroll *= 2u) {
+            ds4_gpu_test_set_moe_q32_decode_fused_lowreg(unroll);
+            if (!ds4_gpu_routed_moe_one_owned_tensor(
+                    tmp_out, gate, up, mid, down, model, model_bytes,
+                    gate_off, up_off, down_off, gate_type, 42u,
+                    gate_expert, gate_row, down_expert, down_row,
+                    in_dim, mid_dim, out_dim, selected, weights,
+                    n_total, n_expert, 0u, 4u, 10.0f, x,
+                    home_slots, false, shared_prequant) ||
+                !ds4_gpu_synchronize() ||
+                !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+                !ds4_gpu_tensor_read(home_slots, 0, home_splith, slot_bytes) ||
+                !compare_exact_f32("SM75 Q32 fused-lowreg gate/up intermediate",
+                                   mid_refh, mid_splith,
+                                   (size_t)n_expert * mid_dim) ||
+                !compare_exact_f32("SM75 Q32 fused-lowreg owned output",
+                                   home_refh, home_splith,
+                                   (size_t)n_expert * out_dim)) goto cleanup;
+        }
+        ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
         if (!ds4_gpu_routed_moe_one_owned_tensor(
                 tmp_out, gate, up, mid, down, model, model_bytes,
                 gate_off, up_off, down_off, gate_type, 42u,
@@ -1243,12 +1264,15 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
     }
     fprintf(stderr,
             "cuda-regression: SM75 %s split gate/up and owned decode "
-            "CUDA Graph exact/reuse\n",
-            label);
+            "CUDA Graph exact/reuse\n"
+            "cuda-regression: SM75 %s fused-lowreg u1/u2/u4 gate/up "
+            "and owned decode exact/reuse\n",
+            label, label);
     rc = 0;
 
 cleanup:
     ds4_gpu_test_set_moe_q32_decode_split(0);
+    ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
     ds4_gpu_test_set_moe_q32_decode_graph(1);
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
