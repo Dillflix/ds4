@@ -306,8 +306,8 @@ sass_path, build_path, output_path = sys.argv[1:]
 targets = {
     "slots-control": (r"moe_down_sm75_q4_32_owned_slots_kernel", False, 256),
     "packed-control": (r"moe_down_sm75_q4_32_owned_packed_kernel", False, 256),
-    "slots-tile32": (r"moe_down_sm75_q4_32_tile32_owned_slots_kernel", True, 128),
-    "packed-tile32": (r"moe_down_sm75_q4_32_tile32_owned_packed_kernel", True, 128),
+    "slots-tile32": (r"moe_down_sm75_q4_32_tile32_owned_slots_kernel<0u>", True, 128),
+    "packed-tile32": (r"moe_down_sm75_q4_32_tile32_owned_packed_kernel<0u>", True, 128),
 }
 
 def sections(path, marker, sass):
@@ -524,9 +524,9 @@ if [[ $RUN_NCU == 1 ]]; then
             packed-control)
                 regex='moe_down_sm75_q4_32_owned_packed_kernel.*'; block=256 ;;
             slots-tile32)
-                regex='moe_down_sm75_q4_32_tile32_owned_slots_kernel.*'; block=128 ;;
+                regex='moe_down_sm75_q4_32_tile32_owned_slots_kernel<0u>.*'; block=128 ;;
             packed-tile32)
-                regex='moe_down_sm75_q4_32_tile32_owned_packed_kernel.*'; block=128 ;;
+                regex='moe_down_sm75_q4_32_tile32_owned_packed_kernel<0u>.*'; block=128 ;;
         esac
         base="$OUTPUT_DIR/ncu/$variant"
         printf 'Nsight Compute: %s...\n' "$variant"

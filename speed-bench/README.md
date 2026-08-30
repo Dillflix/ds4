@@ -246,6 +246,44 @@ CREATE_ARCHIVE=1 \
 ./speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh
 ```
 
+### SM75 Q4-32 software-prefetch depth
+
+`cuda-sm75-decode-q4-prefetch.sh` applies the same bounded software-pipeline
+question to the current Q4-32 production kernels, but it keeps three ownership
+and execution shapes separate:
+
+- gate/up tile32 packed-INT4 MMA;
+- down tile32 packed-INT4 MMA writing `owned_slots`;
+- down tile32 packed-INT4 MMA writing `owned_packed`.
+
+Each family compares prefetch depths 1 and 2 with that family's depth-0
+production kernel. It does not compare against the superseded quarter-warp or
+non-MMA controls, so any reported speedup is attributable only to instruction
+scheduling/prefetch. The audit requires nonzero byte-exact regression for both
+depths, independent dispatch counters, depth-2 memcheck for every family,
+fresh PTXAS/SASS identities, native U4xS4 plus S4xS4 `m8n8k32` instructions,
+zero stack/spill/local/atomic traffic, no DP4A fallback, at most 128 allocated
+registers, and a two-CTA/SM register gate. Inclusive timing covers the complete
+production-owned call. Focused Nsight Compute captures report duration, DRAM
+traffic, long-scoreboard pressure, and eligible warps for all nine kernels.
+
+This is intentionally only the bounded acceptance screen. A winning Q4 depth
+must still pass a real four-GPU production A/B with exact decode logits before
+it can become a default. Gate/up, down-slots, and down-packed may select
+different depths—or reject prefetch independently.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+./speed-bench/cuda-sm75-decode-q4-prefetch.sh
+```
+
 ### SM75 Q4-32 down tile32 packed-INT4 audit
 
 `cuda-sm75-decode-q4down-tile32.sh` compares the former one-token

@@ -192,8 +192,13 @@ enum cuda_moe_q4_32_decode_mapping {
 static const uint32_t CUDA_MOE_Q4_32_DECODE_MAPPING_DEFAULT =
     CUDA_MOE_Q4_32_DECODE_TILE32_MMA;
 static uint32_t g_cuda_moe_q4_32_decode_mapping;
+/* Group-level packed-MMA software pipeline.  Depth zero remains production;
+ * depths one and two are opt-in architecture candidates until a real
+ * four-GPU A/B proves an end-to-end win. */
+static uint32_t g_cuda_moe_q4_32_decode_prefetch_depth;
 static int g_cuda_moe_q4_32_decode_mapping_audit;
 static std::atomic<uint64_t> g_moe_q4_32_decode_mapping_calls[4] = {};
+static std::atomic<uint64_t> g_moe_q4_32_decode_prefetch_calls[3] = {};
 static std::atomic<bool> g_cuda_moe_q4_32_decode_mapping_logged = false;
 /* Q3A4-only SM75 mappings.  These deliberately do not affect the Q4-32 path:
  * 1 uses two 16-lane rows per warp, 2 follows the native Q3A4 tile across all
@@ -230,11 +235,13 @@ enum cuda_moe_q4_32_down_decode_mapping {
 static const uint32_t CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_DEFAULT =
     CUDA_MOE_Q4_32_DOWN_DECODE_TILE32;
 static uint32_t g_cuda_moe_q4_32_down_decode_mapping;
+static uint32_t g_cuda_moe_q4_32_down_decode_prefetch_depth;
 static std::atomic<bool> g_cuda_moe_q4_32_down_decode_mapping_logged = false;
 static int g_cuda_moe_q4_32_down_decode_mapping_audit;
 /* Mapping x ownership shape: control-slots, control-packed,
  * tile32-slots, tile32-packed. */
 static std::atomic<uint64_t> g_moe_q4_32_down_decode_mapping_calls[4] = {};
+static std::atomic<uint64_t> g_moe_q4_32_down_decode_prefetch_calls[3] = {};
 static uint32_t g_cuda_routed_q4_layout;
 static std::atomic<bool> g_cuda_native_q4_logged = false;
 static std::atomic<bool> g_cuda_q32_logged = false;
@@ -446,6 +453,15 @@ extern "C" uint32_t ds4_gpu_test_get_moe_q4_32_decode_mapping(void) {
     return g_cuda_moe_q4_32_decode_mapping;
 }
 
+extern "C" void ds4_gpu_test_set_moe_q4_32_decode_prefetch_depth(
+        uint32_t depth) {
+    g_cuda_moe_q4_32_decode_prefetch_depth = depth <= 2u ? depth : 0u;
+}
+
+extern "C" uint32_t ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth(void) {
+    return g_cuda_moe_q4_32_decode_prefetch_depth;
+}
+
 extern "C" void ds4_gpu_test_set_moe_q3a4_decode_mapping(
         uint32_t mapping) {
     g_cuda_moe_q3a4_decode_mapping =
@@ -486,6 +502,16 @@ extern "C" void ds4_gpu_test_set_moe_q4_32_down_decode_mapping(
 
 extern "C" uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_mapping(void) {
     return g_cuda_moe_q4_32_down_decode_mapping;
+}
+
+extern "C" void ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(
+        uint32_t depth) {
+    g_cuda_moe_q4_32_down_decode_prefetch_depth = depth <= 2u ? depth : 0u;
+}
+
+extern "C" uint32_t
+ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth(void) {
+    return g_cuda_moe_q4_32_down_decode_prefetch_depth;
 }
 
 static int cuda_q4_mma_ok(void) {
@@ -644,12 +670,17 @@ static void cuda_decode_dispatch_env_refresh(void) {
     }
     g_cuda_moe_q4_32_decode_mapping =
         CUDA_MOE_Q4_32_DECODE_MAPPING_DEFAULT;
+    g_cuda_moe_q4_32_decode_prefetch_depth = 0u;
     g_cuda_moe_q4_32_decode_mapping_audit =
         getenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT") != NULL;
     g_cuda_moe_q4_32_decode_mapping_logged.store(
         false, std::memory_order_relaxed);
     for (uint32_t i = 0; i < 4u; i++) {
         g_moe_q4_32_decode_mapping_calls[i].store(
+            0u, std::memory_order_relaxed);
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        g_moe_q4_32_decode_prefetch_calls[i].store(
             0u, std::memory_order_relaxed);
     }
     const char *q4_32_mapping =
@@ -671,7 +702,23 @@ static void cuda_decode_dispatch_env_refresh(void) {
             fprintf(stderr,
                     "ds4: unknown Q4-32 decode mapping '%s'; "
                     "using tile32-mma\n",
-                    q4_32_mapping);
+            q4_32_mapping);
+        }
+    }
+    const char *q4_32_prefetch_depth =
+        getenv("DS4_CUDA_MOE_Q4_32_DECODE_PREFETCH_DEPTH");
+    if (q4_32_prefetch_depth &&
+        g_cuda_moe_q4_32_decode_mapping == CUDA_MOE_Q4_32_DECODE_TILE32_MMA) {
+        if (strcmp(q4_32_prefetch_depth, "0") == 0) {
+            g_cuda_moe_q4_32_decode_prefetch_depth = 0u;
+        } else if (strcmp(q4_32_prefetch_depth, "1") == 0) {
+            g_cuda_moe_q4_32_decode_prefetch_depth = 1u;
+        } else if (strcmp(q4_32_prefetch_depth, "2") == 0) {
+            g_cuda_moe_q4_32_decode_prefetch_depth = 2u;
+        } else {
+            fprintf(stderr,
+                    "ds4: unknown Q4-32 decode prefetch depth '%s'; using 0\n",
+                    q4_32_prefetch_depth);
         }
     }
     const bool q3a4_mapping_disabled =
@@ -698,6 +745,7 @@ static void cuda_decode_dispatch_env_refresh(void) {
     }
     g_cuda_moe_q4_32_down_decode_mapping =
         CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_DEFAULT;
+    g_cuda_moe_q4_32_down_decode_prefetch_depth = 0u;
     const char *q4_32_down_mapping =
         getenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
     if (q4_32_down_mapping) {
@@ -714,12 +762,33 @@ static void cuda_decode_dispatch_env_refresh(void) {
                     q4_32_down_mapping);
         }
     }
+    const char *q4_32_down_prefetch_depth =
+        getenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_PREFETCH_DEPTH");
+    if (q4_32_down_prefetch_depth &&
+        g_cuda_moe_q4_32_down_decode_mapping ==
+            CUDA_MOE_Q4_32_DOWN_DECODE_TILE32) {
+        if (strcmp(q4_32_down_prefetch_depth, "0") == 0) {
+            g_cuda_moe_q4_32_down_decode_prefetch_depth = 0u;
+        } else if (strcmp(q4_32_down_prefetch_depth, "1") == 0) {
+            g_cuda_moe_q4_32_down_decode_prefetch_depth = 1u;
+        } else if (strcmp(q4_32_down_prefetch_depth, "2") == 0) {
+            g_cuda_moe_q4_32_down_decode_prefetch_depth = 2u;
+        } else {
+            fprintf(stderr,
+                    "ds4: unknown Q4-32 down decode prefetch depth '%s'; using 0\n",
+                    q4_32_down_prefetch_depth);
+        }
+    }
     g_cuda_moe_q4_32_down_decode_mapping_logged.store(
         false, std::memory_order_relaxed);
     g_cuda_moe_q4_32_down_decode_mapping_audit =
         getenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT") != NULL;
     for (uint32_t i = 0; i < 4u; i++) {
         g_moe_q4_32_down_decode_mapping_calls[i].store(
+            0u, std::memory_order_relaxed);
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        g_moe_q4_32_down_decode_prefetch_calls[i].store(
             0u, std::memory_order_relaxed);
     }
     const char *q3a4_mapping = getenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
@@ -4039,7 +4108,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_cuda_moe_q4_32_decode_mapping_audit) {
         fprintf(stderr,
                 "ds4: SM75 Q4-32 decode mapping audit control=%llu "
-                "hwarp16=%llu tile32-dp4a=%llu tile32-mma=%llu\n",
+                "hwarp16=%llu tile32-dp4a=%llu tile32-mma=%llu "
+                "pf0=%llu pf1=%llu pf2=%llu\n",
                 (unsigned long long)g_moe_q4_32_decode_mapping_calls[0].load(
                     std::memory_order_relaxed),
                 (unsigned long long)g_moe_q4_32_decode_mapping_calls[1].load(
@@ -4047,6 +4117,12 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)g_moe_q4_32_decode_mapping_calls[2].load(
                     std::memory_order_relaxed),
                 (unsigned long long)g_moe_q4_32_decode_mapping_calls[3].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q4_32_decode_prefetch_calls[0].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q4_32_decode_prefetch_calls[1].load(
+                    std::memory_order_relaxed),
+                (unsigned long long)g_moe_q4_32_decode_prefetch_calls[2].load(
                     std::memory_order_relaxed));
     }
 
@@ -4066,13 +4142,23 @@ extern "C" void ds4_gpu_cleanup(void) {
         fprintf(stderr,
                 "ds4: SM75 Q4-32 down decode mapping audit control=%llu "
                 "tile32=%llu control-slots=%llu control-packed=%llu "
-                "tile32-slots=%llu tile32-packed=%llu\n",
+                "tile32-slots=%llu tile32-packed=%llu "
+                "pf0=%llu pf1=%llu pf2=%llu\n",
                 (unsigned long long)(control_slots + control_packed),
                 (unsigned long long)(tile32_slots + tile32_packed),
                 (unsigned long long)control_slots,
                 (unsigned long long)control_packed,
                 (unsigned long long)tile32_slots,
-                (unsigned long long)tile32_packed);
+                (unsigned long long)tile32_packed,
+                (unsigned long long)
+                    g_moe_q4_32_down_decode_prefetch_calls[0].load(
+                        std::memory_order_relaxed),
+                (unsigned long long)
+                    g_moe_q4_32_down_decode_prefetch_calls[1].load(
+                        std::memory_order_relaxed),
+                (unsigned long long)
+                    g_moe_q4_32_down_decode_prefetch_calls[2].load(
+                        std::memory_order_relaxed));
     }
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -29299,6 +29385,9 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         !split_gate_q32 && fused_lowreg_gate_q32 == 0u
             ? g_cuda_moe_q4_32_decode_mapping
             : CUDA_MOE_Q4_32_DECODE_CONTROL;
+    const uint32_t q4_32_decode_prefetch_depth =
+        q4_32_decode_mapping == CUDA_MOE_Q4_32_DECODE_TILE32_MMA
+            ? g_cuda_moe_q4_32_decode_prefetch_depth : 0u;
     const uint32_t q3a4_decode_mapping =
         gate_q3a4 && expert_in_dim / CUDA_QK_K == 16u &&
         !split_gate_q32 && fused_lowreg_gate_q32 == 0u
@@ -29314,6 +29403,11 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     const bool down_q4k = down_type == 12u;
     const bool down_q2k = down_type == 10u;
     const bool down_q4_32 = down_type == 42u;
+    const uint32_t q4_32_down_decode_prefetch_depth =
+        down_q4_32 && expert_mid_dim / CUDA_QK_K == 8u &&
+        g_cuda_moe_q4_32_down_decode_mapping ==
+            CUDA_MOE_Q4_32_DOWN_DECODE_TILE32
+            ? g_cuda_moe_q4_32_down_decode_prefetch_depth : 0u;
     const bool tagged_native_q4 =
         (g_cuda_routed_q4_layout & DS4_TENSOR_LAYOUT_SM75_NATIVE_Q4) != 0u;
     const uint32_t q32_layout_mask =
@@ -29422,6 +29516,12 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         if (g_cuda_moe_q4_32_decode_mapping_audit) {
             g_moe_q4_32_decode_mapping_calls[q4_32_decode_mapping].fetch_add(
                 1u, std::memory_order_relaxed);
+            if (q4_32_decode_mapping ==
+                    CUDA_MOE_Q4_32_DECODE_TILE32_MMA) {
+                g_moe_q4_32_decode_prefetch_calls[
+                    q4_32_decode_prefetch_depth].fetch_add(
+                        1u, std::memory_order_relaxed);
+            }
         }
         if (!split_gate_q32 && fused_lowreg_gate_q32 == 0u &&
             !g_cuda_moe_q4_32_decode_mapping_logged.exchange(
@@ -29434,12 +29534,18 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                         ? "tile32-dp4a"
                         : (q4_32_decode_mapping ==
                                 CUDA_MOE_Q4_32_DECODE_TILE32_MMA
-                            ? "tile32-mma" : "control"));
+                            ? (q4_32_decode_prefetch_depth == 1u
+                                ? "tile32-mma-prefetch1"
+                                : (q4_32_decode_prefetch_depth == 2u
+                                    ? "tile32-mma-prefetch2"
+                                    : "tile32-mma"))
+                            : "control"));
             fprintf(stderr,
                     "ds4: SM75 Q4-32 decode gate/up mapping=%s%s\n",
                     mapping_name,
                     q4_32_decode_mapping ==
-                            CUDA_MOE_Q4_32_DECODE_MAPPING_DEFAULT
+                            CUDA_MOE_Q4_32_DECODE_MAPPING_DEFAULT &&
+                    q4_32_decode_prefetch_depth == 0u
                         ? " (production default)"
                         : (q4_32_decode_mapping ==
                                 CUDA_MOE_Q4_32_DECODE_CONTROL
@@ -29625,7 +29731,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
             dim3 tile_grid((expert_mid_dim + 31u) / 32u, 6u, 1u);
             if (q4_32_decode_mapping ==
                     CUDA_MOE_Q4_32_DECODE_TILE32_DP4A) {
-                moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<false>
+                moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<false, 0u>
                     <<<tile_grid, 128>>>(
                         (float *)mid->ptr, gate_w, up_w,
                         (const cuda_sm75_native_q8_K *)xq,
@@ -29634,14 +29740,23 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                         expert_mid_dim, resident_expert_base,
                         resident_expert_count, clamp);
             } else {
-                moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<true>
-                    <<<tile_grid, 128>>>(
-                        (float *)mid->ptr, gate_w, up_w,
-                        (const cuda_sm75_native_q8_K *)xq,
-                        (const int32_t *)selected->ptr,
-                        (const float *)weights->ptr, xq_blocks,
-                        expert_mid_dim, resident_expert_base,
-                        resident_expert_count, clamp);
+#define DS4_LAUNCH_Q4_32_TILE32_MMA_PREFETCH(D) \
+                moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<true, D> \
+                    <<<tile_grid, 128>>>( \
+                        (float *)mid->ptr, gate_w, up_w, \
+                        (const cuda_sm75_native_q8_K *)xq, \
+                        (const int32_t *)selected->ptr, \
+                        (const float *)weights->ptr, xq_blocks, \
+                        expert_mid_dim, resident_expert_base, \
+                        resident_expert_count, clamp)
+                if (q4_32_decode_prefetch_depth == 1u) {
+                    DS4_LAUNCH_Q4_32_TILE32_MMA_PREFETCH(1u);
+                } else if (q4_32_decode_prefetch_depth == 2u) {
+                    DS4_LAUNCH_Q4_32_TILE32_MMA_PREFETCH(2u);
+                } else {
+                    DS4_LAUNCH_Q4_32_TILE32_MMA_PREFETCH(0u);
+                }
+#undef DS4_LAUNCH_Q4_32_TILE32_MMA_PREFETCH
             }
         } else if (q3a4_decode_mapping == CUDA_MOE_Q3A4_DECODE_HWARP16) {
             dim3 hwarp_grid((expert_mid_dim + 15u) / 16u, 6u, 1u);
@@ -29812,31 +29927,64 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
             (down_q4_32_tile32 ? 2u : 0u) + (pack_fixed3 ? 1u : 0u);
         g_moe_q4_32_down_decode_mapping_calls[audit_index].fetch_add(
                 1u, std::memory_order_relaxed);
+        if (down_q4_32_tile32) {
+            g_moe_q4_32_down_decode_prefetch_calls[
+                q4_32_down_decode_prefetch_depth].fetch_add(
+                    1u, std::memory_order_relaxed);
+        }
     }
     if (down_q4_32 &&
         !g_cuda_moe_q4_32_down_decode_mapping_logged.exchange(
             true, std::memory_order_relaxed)) {
         fprintf(stderr,
                 "ds4: SM75 Q4-32 down decode mapping=%s%s\n",
-                down_q4_32_tile32 ? "tile32-int4" : "control",
+                down_q4_32_tile32
+                    ? (q4_32_down_decode_prefetch_depth == 1u
+                        ? "tile32-int4-prefetch1"
+                        : (q4_32_down_decode_prefetch_depth == 2u
+                            ? "tile32-int4-prefetch2" : "tile32-int4"))
+                    : "control",
                 g_cuda_moe_q4_32_down_decode_mapping ==
-                        CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_DEFAULT
-                    ? " (production default)" : " (explicit fallback)");
+                        CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_DEFAULT &&
+                q4_32_down_decode_prefetch_depth == 0u
+                    ? " (production default)"
+                    : (down_q4_32_tile32
+                        ? " (audit candidate)" : " (explicit fallback)"));
     }
     if (down_q4_32_tile32 && pack_fixed3) {
-        moe_down_sm75_q4_32_tile32_owned_packed_kernel<<<down_grid, 128>>>(
-                down_dst, down_w,
-                (const cuda_sm75_native_q8_K *)midq,
-                (const int32_t *)selected->ptr,
-                midq_blocks, out_dim, resident_expert_base,
-                resident_expert_count);
+#define DS4_LAUNCH_Q4_32_DOWN_PACKED_PREFETCH(D) \
+        moe_down_sm75_q4_32_tile32_owned_packed_kernel<D> \
+            <<<down_grid, 128>>>( \
+                down_dst, down_w, \
+                (const cuda_sm75_native_q8_K *)midq, \
+                (const int32_t *)selected->ptr, \
+                midq_blocks, out_dim, resident_expert_base, \
+                resident_expert_count)
+        if (q4_32_down_decode_prefetch_depth == 1u) {
+            DS4_LAUNCH_Q4_32_DOWN_PACKED_PREFETCH(1u);
+        } else if (q4_32_down_decode_prefetch_depth == 2u) {
+            DS4_LAUNCH_Q4_32_DOWN_PACKED_PREFETCH(2u);
+        } else {
+            DS4_LAUNCH_Q4_32_DOWN_PACKED_PREFETCH(0u);
+        }
+#undef DS4_LAUNCH_Q4_32_DOWN_PACKED_PREFETCH
     } else if (down_q4_32_tile32) {
-        moe_down_sm75_q4_32_tile32_owned_slots_kernel<<<down_grid, 128>>>(
-                down_dst, down_w,
-                (const cuda_sm75_native_q8_K *)midq,
-                (const int32_t *)selected->ptr,
-                midq_blocks, out_dim, resident_expert_base,
-                resident_expert_count);
+#define DS4_LAUNCH_Q4_32_DOWN_SLOTS_PREFETCH(D) \
+        moe_down_sm75_q4_32_tile32_owned_slots_kernel<D> \
+            <<<down_grid, 128>>>( \
+                down_dst, down_w, \
+                (const cuda_sm75_native_q8_K *)midq, \
+                (const int32_t *)selected->ptr, \
+                midq_blocks, out_dim, resident_expert_base, \
+                resident_expert_count)
+        if (q4_32_down_decode_prefetch_depth == 1u) {
+            DS4_LAUNCH_Q4_32_DOWN_SLOTS_PREFETCH(1u);
+        } else if (q4_32_down_decode_prefetch_depth == 2u) {
+            DS4_LAUNCH_Q4_32_DOWN_SLOTS_PREFETCH(2u);
+        } else {
+            DS4_LAUNCH_Q4_32_DOWN_SLOTS_PREFETCH(0u);
+        }
+#undef DS4_LAUNCH_Q4_32_DOWN_SLOTS_PREFETCH
     } else if (down_q4_32 && pack_fixed3) {
         moe_down_sm75_q4_32_owned_packed_kernel<<<down_grid, 256>>>(
                 down_dst, down_w,

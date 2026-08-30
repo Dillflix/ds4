@@ -123,6 +123,87 @@ template <> struct sm75_q32_ops<false> {
         *v0 = a->d * dev_f16_to_f32(w->d[n0]) * (float)i0;
         *v1 = a->d * dev_f16_to_f32(w->d[n0 + 1u]) * (float)i1;
     }
+
+    struct mma_group_operands {
+        uint32_t b;
+        uint32_t lo;
+        uint32_t hi;
+    };
+
+    template <uint32_t GROUP>
+    __device__ __forceinline__ static mma_group_operands mma_load_group(
+            const tile_type *w, const cuda_sm75_native_q8_K *a,
+            uint32_t lane) {
+        static_assert(GROUP < 8u, "Q4-32 MMA group must be in [0, 8)");
+        mma_group_operands op;
+        op.b = w->b[GROUP][lane];
+        op.lo = a->low[GROUP][lane & 3u];
+        op.hi = a->high_signed[GROUP][lane & 3u];
+        return op;
+    }
+
+    template <uint32_t GROUP>
+    __device__ __forceinline__ static void mma_consume_group(
+            mma_group_operands op, const tile_type *w, uint32_t n0,
+            int *i0, int *i1) {
+        static_assert(GROUP < 8u, "Q4-32 MMA group must be in [0, 8)");
+        int l0 = 0, l1 = 0, h0 = 0, h1 = 0;
+        mma_m8n8k32_u4_s4(l0, l1, op.lo, op.b);
+        mma_m8n8k32_s4_s4(h0, h1, op.hi, op.b);
+        *i0 += sm75_q32_scale6(w->scales[n0], GROUP) *
+               (l0 + 16 * h0);
+        *i1 += sm75_q32_scale6(w->scales[n0 + 1u], GROUP) *
+               (l1 + 16 * h1);
+    }
+
+    /* Group-level software pipelines for the packed-INT4 MMA path.  Loads
+     * for one or two future groups are issued before the current MMA work,
+     * while consume order remains explicitly 0..7.  Integer accumulation
+     * and the final float conversion therefore remain byte-identical to
+     * mma_block(). */
+    template <uint32_t PREFETCH_DEPTH>
+    __device__ __forceinline__ static void mma_block_prefetch(
+            const tile_type *w, const cuda_sm75_native_q8_K *a,
+            uint32_t lane, uint32_t n0, float *v0, float *v1) {
+        static_assert(PREFETCH_DEPTH == 1u || PREFETCH_DEPTH == 2u,
+                      "Q4-32 MMA prefetch depth must be 1 or 2");
+        int i0 = 0, i1 = 0;
+        mma_group_operands op0 = mma_load_group<0u>(w, a, lane);
+        mma_group_operands op1 = mma_load_group<1u>(w, a, lane);
+        if (PREFETCH_DEPTH == 1u) {
+            mma_consume_group<0u>(op0, w, n0, &i0, &i1);
+            op0 = mma_load_group<2u>(w, a, lane);
+            mma_consume_group<1u>(op1, w, n0, &i0, &i1);
+            op1 = mma_load_group<3u>(w, a, lane);
+            mma_consume_group<2u>(op0, w, n0, &i0, &i1);
+            op0 = mma_load_group<4u>(w, a, lane);
+            mma_consume_group<3u>(op1, w, n0, &i0, &i1);
+            op1 = mma_load_group<5u>(w, a, lane);
+            mma_consume_group<4u>(op0, w, n0, &i0, &i1);
+            op0 = mma_load_group<6u>(w, a, lane);
+            mma_consume_group<5u>(op1, w, n0, &i0, &i1);
+            op1 = mma_load_group<7u>(w, a, lane);
+            mma_consume_group<6u>(op0, w, n0, &i0, &i1);
+            mma_consume_group<7u>(op1, w, n0, &i0, &i1);
+        } else {
+            mma_group_operands op2 = mma_load_group<2u>(w, a, lane);
+            mma_consume_group<0u>(op0, w, n0, &i0, &i1);
+            op0 = mma_load_group<3u>(w, a, lane);
+            mma_consume_group<1u>(op1, w, n0, &i0, &i1);
+            op1 = mma_load_group<4u>(w, a, lane);
+            mma_consume_group<2u>(op2, w, n0, &i0, &i1);
+            op2 = mma_load_group<5u>(w, a, lane);
+            mma_consume_group<3u>(op0, w, n0, &i0, &i1);
+            op0 = mma_load_group<6u>(w, a, lane);
+            mma_consume_group<4u>(op1, w, n0, &i0, &i1);
+            op1 = mma_load_group<7u>(w, a, lane);
+            mma_consume_group<5u>(op2, w, n0, &i0, &i1);
+            mma_consume_group<6u>(op0, w, n0, &i0, &i1);
+            mma_consume_group<7u>(op1, w, n0, &i0, &i1);
+        }
+        *v0 = a->d * dev_f16_to_f32(w->d[n0]) * (float)i0;
+        *v1 = a->d * dev_f16_to_f32(w->d[n0 + 1u]) * (float)i1;
+    }
 };
 
 template <> struct sm75_q32_ops<true> {
@@ -429,7 +510,7 @@ sm75_q4_32_sign_extend_nibble_bytes(uint32_t v) {
  * unique row. It is the production default. Both mappings stage all 16 K256
  * leaves and reproduce the control warp-sum tree exactly before
  * SiLU/multiply/weight combine. */
-template <bool PACKED_MMA>
+template <bool PACKED_MMA, uint32_t PREFETCH_DEPTH = 0u>
 __global__ __launch_bounds__(128, 4) static void
 moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel(
         float *mid_out, const char *gate_base, const char *up_base,
@@ -437,6 +518,10 @@ moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel(
         const int32_t *selected, const float *weights,
         uint32_t xq_blocks, uint32_t expert_mid_dim,
         uint32_t expert_base, uint32_t expert_count, float clamp) {
+    static_assert(PREFETCH_DEPTH <= 2u,
+                  "Q4-32 gate/up prefetch depth must be 0, 1, or 2");
+    static_assert(PACKED_MMA || PREFETCH_DEPTH == 0u,
+                  "Q4-32 prefetch applies only to packed MMA");
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t row8 = lane >> 2u;
@@ -472,10 +557,22 @@ moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel(
              * result, two output columns per lane. */
             float gate0, gate1, up0, up1;
             const uint32_t n0 = lane4 * 2u;
-            sm75_q32_ops<false>::mma_block(
-                gate_w, a, lane, n0, &gate0, &gate1);
-            sm75_q32_ops<false>::mma_block(
-                up_w, a, lane, n0, &up0, &up1);
+            if (PREFETCH_DEPTH == 1u) {
+                sm75_q32_ops<false>::mma_block_prefetch<1u>(
+                    gate_w, a, lane, n0, &gate0, &gate1);
+                sm75_q32_ops<false>::mma_block_prefetch<1u>(
+                    up_w, a, lane, n0, &up0, &up1);
+            } else if (PREFETCH_DEPTH == 2u) {
+                sm75_q32_ops<false>::mma_block_prefetch<2u>(
+                    gate_w, a, lane, n0, &gate0, &gate1);
+                sm75_q32_ops<false>::mma_block_prefetch<2u>(
+                    up_w, a, lane, n0, &up0, &up1);
+            } else {
+                sm75_q32_ops<false>::mma_block(
+                    gate_w, a, lane, n0, &gate0, &gate1);
+                sm75_q32_ops<false>::mma_block(
+                    up_w, a, lane, n0, &up0, &up1);
+            }
             if (lane < 4u) {
                 gate_part[warp][b][n0] = __fadd_rn(0.0f, gate0);
                 gate_part[warp][b][n0 + 1u] = __fadd_rn(0.0f, gate1);
@@ -1353,12 +1450,15 @@ __device__ __forceinline__ static float sm75_q4_32_down_reduce8_exact(
     return __fadd_rn(__fadd_rn(a0, a2), __fadd_rn(a1, a3));
 }
 
+template <uint32_t PREFETCH_DEPTH = 0u>
 __global__ __launch_bounds__(128, 8) static void
 moe_down_sm75_q4_32_tile32_owned_slots_kernel(
         float *out, const char *down_base,
         const cuda_sm75_native_q8_K *midq, const int32_t *selected,
         uint32_t midq_blocks, uint32_t out_dim,
         uint32_t expert_base, uint32_t expert_count) {
+    static_assert(PREFETCH_DEPTH <= 2u,
+                  "Q4-32 down prefetch depth must be 0, 1, or 2");
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane4 = lane & 3u;
@@ -1391,7 +1491,15 @@ moe_down_sm75_q4_32_tile32_owned_slots_kernel(
         const cuda_sm75_native_q8_K *a =
             midq + (uint64_t)slot * midq_blocks + b;
         float v0 = 0.0f, v1 = 0.0f;
-        sm75_q32_ops<false>::mma_block(w, a, lane, n0, &v0, &v1);
+        if (PREFETCH_DEPTH == 1u) {
+            sm75_q32_ops<false>::mma_block_prefetch<1u>(
+                w, a, lane, n0, &v0, &v1);
+        } else if (PREFETCH_DEPTH == 2u) {
+            sm75_q32_ops<false>::mma_block_prefetch<2u>(
+                w, a, lane, n0, &v0, &v1);
+        } else {
+            sm75_q32_ops<false>::mma_block(w, a, lane, n0, &v0, &v1);
+        }
         /* Every four-lane MMA token group sees the same decode activation.
          * The first group owns the unique output fragments.  Normalize each
          * staged leaf with the control's initial +0 addition.  This is
@@ -1413,12 +1521,15 @@ moe_down_sm75_q4_32_tile32_owned_slots_kernel(
     }
 }
 
+template <uint32_t PREFETCH_DEPTH = 0u>
 __global__ __launch_bounds__(128, 8) static void
 moe_down_sm75_q4_32_tile32_owned_packed_kernel(
         float *out, const char *down_base,
         const cuda_sm75_native_q8_K *midq, const int32_t *selected,
         uint32_t midq_blocks, uint32_t out_dim,
         uint32_t expert_base, uint32_t expert_count) {
+    static_assert(PREFETCH_DEPTH <= 2u,
+                  "Q4-32 down prefetch depth must be 0, 1, or 2");
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane4 = lane & 3u;
@@ -1464,7 +1575,16 @@ moe_down_sm75_q4_32_tile32_owned_packed_kernel(
             const cuda_sm75_native_q8_K *a =
                 midq + (uint64_t)slot * midq_blocks + b;
             float v0 = 0.0f, v1 = 0.0f;
-            sm75_q32_ops<false>::mma_block(w, a, lane, n0, &v0, &v1);
+            if (PREFETCH_DEPTH == 1u) {
+                sm75_q32_ops<false>::mma_block_prefetch<1u>(
+                    w, a, lane, n0, &v0, &v1);
+            } else if (PREFETCH_DEPTH == 2u) {
+                sm75_q32_ops<false>::mma_block_prefetch<2u>(
+                    w, a, lane, n0, &v0, &v1);
+            } else {
+                sm75_q32_ops<false>::mma_block(
+                    w, a, lane, n0, &v0, &v1);
+            }
             if (lane < 4u) {
                 leaf[warp][b][n0] = __fadd_rn(0.0f, v0);
                 leaf[warp][b][n0 + 1u] = __fadd_rn(0.0f, v1);

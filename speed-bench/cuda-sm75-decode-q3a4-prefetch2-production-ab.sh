@@ -103,6 +103,8 @@ case "$Q3A4_LAYOUT" in
         ;;
     *) die "Q3A4_LAYOUT must be mixed15 or all43" ;;
 esac
+Q4_GATE_LAYER_COUNT=$((43 - Q3A4_LAYER_COUNT))
+Q4_DOWN_LAYER_COUNT=43
 
 for tool in awk basename cat cmp date dirname env find git grep make mkdir mv \
             nproc nvidia-smi python3 sha256sum sort stat tail tar tee tr wc; do
@@ -133,6 +135,8 @@ emit_configuration() {
     printf 'production_ctx_max=%s\nproduction_ctx_alloc=%s\nvocab_size=%s\nlogits_bytes=%s\n' \
         "$PRODUCTION_CTX_MAX" "$PRODUCTION_CTX_ALLOC" "$VOCAB_SIZE" "$LOGITS_BYTES"
     printf 'q3a4_decode_mapping=tile32-dp4a\nq3a4_decode_ksplit=4\n'
+    printf 'q4_gate_up_decode_mapping=tile32-mma\n'
+    printf 'q4_down_decode_mapping=tile32\n'
     printf 'q3a4_layout=%s\nq3a4_layer_count=%s\nq3a4_layers=%s\n' \
         "$Q3A4_LAYOUT" "$Q3A4_LAYER_COUNT" "$Q3A4_LAYER_LIST"
 }
@@ -190,6 +194,10 @@ production_env=(
     DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1
     DS4_CUDA_NO_MOE_Q32_DECODE_SPLIT=1
     DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG=1
+    DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=tile32-mma
+    DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING=tile32
+    DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT=1
+    DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT=1
     DS4_CUDA_MOE_Q3A4_DECODE_MAPPING_AUDIT=1
     DS4_BENCH_ROUTED_QUANT_AUDIT=1
 )
@@ -207,6 +215,8 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 prefetch exact marker missing"
     grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
         "$OUTPUT_DIR/smoke.log" || die "ordinary K4 production-default marker missing"
+    grep -Fq 'SM75 Q4-32 tile32-mma gate/up + tile32 down production defaults' \
+        "$OUTPUT_DIR/smoke.log" || die "Q4 production-default marker missing"
     grep -Fq 'SM75 Q3A4 K4 prefetch depth 0/2 environment selector exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 prefetch environment selector marker missing"
     grep -Fxq 'cuda long-context regression: OK' "$OUTPUT_DIR/smoke.log" ||
@@ -327,6 +337,10 @@ validate_common_log() {
     ! grep -Fq 'required but unavailable' "$log" || return 1
     ! grep -Fq 'SM75 Q32 owned decode CUDA Graph enabled' "$log" || return 1
     ! grep -Fq 'SM75 Q32 decode graph audit' "$log" || return 1
+    grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
+        "$log" || return 1
+    grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=tile32-int4 (production default)' \
+        "$log" || return 1
     awk -v expected_count="$Q3A4_LAYER_COUNT" \
         -v expected_layers="$Q3A4_LAYER_LIST" '
         /routed-quant-audit/ {
@@ -352,6 +366,60 @@ validate_common_log() {
             for (i=0; i<43; i++) if (layer_seen[i]!=1) bad=1
             exit !(seen==43 && q3==expected_count &&
                    layers==expected_layers && !bad)
+        }
+    ' "$log"
+}
+
+q4_gate_active_count() {
+    local log=$1
+    awk '
+        /SM75 Q4-32 decode mapping audit/ {
+            seen++
+            c=h=d=m=p0=p1=p2=-1
+            for (i=1; i<=NF; i++) {
+                split($i, a, "=")
+                if (a[1]=="control") c=a[2]+0
+                if (a[1]=="hwarp16") h=a[2]+0
+                if (a[1]=="tile32-dp4a") d=a[2]+0
+                if (a[1]=="tile32-mma") m=a[2]+0
+                if (a[1]=="pf0") p0=a[2]+0
+                if (a[1]=="pf1") p1=a[2]+0
+                if (a[1]=="pf2") p2=a[2]+0
+            }
+            good=(c==0 && h==0 && d==0 && m>=0 &&
+                  p0==m && p1==0 && p2==0)
+        }
+        END {
+            if (seen!=1 || !good) exit 1
+            print m
+        }
+    ' "$log"
+}
+
+q4_down_active_count() {
+    local log=$1
+    awk '
+        /SM75 Q4-32 down decode mapping audit/ {
+            seen++
+            c=t=cs=cp=ts=tp=p0=p1=p2=-1
+            for (i=1; i<=NF; i++) {
+                split($i, a, "=")
+                if (a[1]=="control") c=a[2]+0
+                if (a[1]=="tile32") t=a[2]+0
+                if (a[1]=="control-slots") cs=a[2]+0
+                if (a[1]=="control-packed") cp=a[2]+0
+                if (a[1]=="tile32-slots") ts=a[2]+0
+                if (a[1]=="tile32-packed") tp=a[2]+0
+                if (a[1]=="pf0") p0=a[2]+0
+                if (a[1]=="pf1") p1=a[2]+0
+                if (a[1]=="pf2") p2=a[2]+0
+            }
+            good=(c==0 && t>0 && cs==0 && cp==0 && ts>0 && tp>0 &&
+                  t==ts+tp && p0==t && p1==0 && p2==0)
+        }
+        END {
+            if (seen!=1 || !good) exit 1
+            print t
         }
     ' "$log"
 }
@@ -544,6 +612,10 @@ validate_exact_run() {
         validate_common_log "$base.log" &&
         validate_mapping_audit "$variant" "$base.log" &&
         [[ $(mapping_active_count "$variant" "$base.log") == "$expected_calls" ]] &&
+        [[ $(q4_gate_active_count "$base.log") == \
+           $((EXACT_TOKENS * Q4_GATE_LAYER_COUNT * 2)) ]] &&
+        [[ $(q4_down_active_count "$base.log") == \
+           $((EXACT_TOKENS * Q4_DOWN_LAYER_COUNT * 2)) ]] &&
         frontier_complete "$logits" "$context"
 }
 
@@ -589,9 +661,16 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
     control_calls=$(mapping_active_count control "$control_log")
     candidate_calls=$(mapping_active_count prefetch2 "$candidate_log")
     expected_calls=$((3 * TG_TOKENS * Q3A4_LAYER_COUNT * 2))
+    expected_q4_gate=$((3 * TG_TOKENS * Q4_GATE_LAYER_COUNT * 2))
+    expected_q4_down=$((3 * TG_TOKENS * Q4_DOWN_LAYER_COUNT * 2))
     [[ $control_calls == "$expected_calls" &&
        $candidate_calls == "$expected_calls" ]] ||
         die "repeat $repeat has unexpected Q3A4 inventory (expected $expected_calls; control $control_calls; prefetch2 $candidate_calls)"
+    for log in "$control_log" "$candidate_log"; do
+        [[ $(q4_gate_active_count "$log") == "$expected_q4_gate" &&
+           $(q4_down_active_count "$log") == "$expected_q4_down" ]] ||
+            die "repeat $repeat changed the fixed production Q4 dispatch inventory"
+    done
     printf '%s\t%s\t%s\ttrue\n' "$repeat" "$control_calls" \
         "$candidate_calls" >>"$dispatch_partial"
 done

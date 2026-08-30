@@ -346,8 +346,8 @@ sass_path, build_path, output_path = sys.argv[1:]
 targets = {
     "control": (r"moe_gate_up_mid_decode_sm75_q32_owned_kernel<false>", False, 256, 0),
     "hwarp16": (r"moe_gate_up_mid_decode_sm75_q4_32_hwarp16_owned_kernel", True, 256, 0),
-    "tile32-dp4a": (r"moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<false>", True, 128, 4096),
-    "tile32-mma": (r"moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<true>", True, 128, 4096),
+    "tile32-dp4a": (r"moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<false, 0u>", True, 128, 4096),
+    "tile32-mma": (r"moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel<true, 0u>", True, 128, 4096),
 }
 
 def sections(path, marker, sass):

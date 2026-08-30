@@ -183,6 +183,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
           test -x speed-bench/cuda-sm75-decode-q4down-tile32.sh
           bash -n speed-bench/cuda-sm75-decode-q4down-tile32.sh
+          test -x speed-bench/cuda-sm75-decode-q4-prefetch.sh
+          bash -n speed-bench/cuda-sm75-decode-q4-prefetch.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh

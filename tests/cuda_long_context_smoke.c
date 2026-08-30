@@ -11,6 +11,8 @@ extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 extern void ds4_gpu_test_set_moe_q4_32_decode_mapping(uint32_t mapping);
 extern uint32_t ds4_gpu_test_get_moe_q4_32_decode_mapping(void);
+extern void ds4_gpu_test_set_moe_q4_32_decode_prefetch_depth(uint32_t depth);
+extern uint32_t ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth(void);
 extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_mapping(void);
 extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
@@ -19,6 +21,9 @@ extern void ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(uint32_t depth);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth(void);
 extern void ds4_gpu_test_set_moe_q4_32_down_decode_mapping(uint32_t mapping);
 extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_mapping(void);
+extern void ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(
+    uint32_t depth);
+extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
@@ -1415,6 +1420,25 @@ static int check_sm75_q4_32_mapping_env(void) {
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING");
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u) rc = 1;
+    for (uint32_t depth = 0u; rc == 0 && depth <= 2u; depth++) {
+        char value[2] = {(char)('0' + depth), '\0'};
+        if (setenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING",
+                   "tile32-mma", 1) != 0 ||
+            setenv("DS4_CUDA_MOE_Q4_32_DECODE_PREFETCH_DEPTH",
+                   value, 1) != 0) return 1;
+        ds4_gpu_test_refresh_decode_dispatch_env();
+        if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u ||
+            ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != depth)
+            rc = 1;
+    }
+    if (rc == 0 &&
+        (setenv("DS4_CUDA_MOE_Q4_32_DECODE_PREFETCH_DEPTH", "invalid", 1) != 0 ||
+         setenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING", "control", 1) != 0))
+        return 1;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != 0u) rc = 1;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_PREFETCH_DEPTH");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING");
     static const struct {
         const char *name;
         uint32_t expected;
@@ -1437,6 +1461,32 @@ static int check_sm75_q4_32_mapping_env(void) {
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u) rc = 1;
+    for (uint32_t depth = 0u; rc == 0 && depth <= 2u; depth++) {
+        char value[2] = {(char)('0' + depth), '\0'};
+        if (setenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING",
+                   "tile32", 1) != 0 ||
+            setenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_PREFETCH_DEPTH",
+                   value, 1) != 0) return 1;
+        ds4_gpu_test_refresh_decode_dispatch_env();
+        if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u ||
+            ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != depth)
+            rc = 1;
+    }
+    if (rc == 0 &&
+        (setenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_PREFETCH_DEPTH",
+                "invalid", 1) != 0 ||
+         setenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING", "control", 1) != 0))
+        return 1;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u) rc = 1;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_PREFETCH_DEPTH");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != 0u ||
+        ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u ||
+        ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u)
+        rc = 1;
     fputs(rc == 0
               ? "cuda-regression: SM75 Q4-32 production mapping selectors exact\n"
               : "cuda-regression: SM75 Q4-32 production mapping selectors failed\n",
@@ -1644,6 +1694,40 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                         home_refh, home_splith,
                         (size_t)n_expert * out_dim)) goto cleanup;
             }
+            /* Prefetch changes only the packed-MMA group load schedule. */
+            ds4_gpu_test_set_moe_q4_32_decode_mapping(3u);
+            for (uint32_t depth = 1u; depth <= 2u; depth++) {
+                ds4_gpu_test_set_moe_q4_32_decode_prefetch_depth(depth);
+                fill_sm75_q32_poison_f32(
+                    mid_splith, (uint64_t)n_expert * mid_dim);
+                fill_sm75_q32_poison_f32(
+                    home_splith, (uint64_t)n_expert * out_dim);
+                if (!ds4_gpu_tensor_write(mid, 0, mid_splith, mid_bytes) ||
+                    !ds4_gpu_tensor_write(home_slots, 0, home_splith,
+                                          slot_bytes) ||
+                    !ds4_gpu_routed_moe_one_owned_tensor(
+                        tmp_out, gate, up, mid, down, model, model_bytes,
+                        gate_off, up_off, down_off, gate_type, 42u,
+                        gate_expert, gate_row, down_expert, down_row,
+                        in_dim, mid_dim, out_dim, selected, weights,
+                        n_total, n_expert, 0u, 4u, 10.0f, x,
+                        home_slots, false, shared_prequant) ||
+                    !ds4_gpu_synchronize() ||
+                    !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+                    !ds4_gpu_tensor_read(home_slots, 0, home_splith,
+                                         slot_bytes) ||
+                    !require_sm75_q32_overwritten_f32(
+                        "SM75 Q4-32 prefetch intermediate", mid_splith,
+                        (uint64_t)n_expert * mid_dim) ||
+                    !compare_exact_f32(
+                        "SM75 Q4-32 packed-MMA prefetch gate/up intermediate",
+                        mid_refh, mid_splith, (size_t)n_expert * mid_dim) ||
+                    !compare_exact_f32(
+                        "SM75 Q4-32 packed-MMA prefetch owned output",
+                        home_refh, home_splith,
+                        (size_t)n_expert * out_dim)) goto cleanup;
+            }
+            ds4_gpu_test_set_moe_q4_32_decode_prefetch_depth(0u);
             ds4_gpu_test_set_moe_q4_32_decode_mapping(0u);
         } else if (gate_type == 43u) {
             ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
@@ -1782,6 +1866,8 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                   "prefetch-depth 1/2 nonzero exact\n"
                 : "cuda-regression: SM75 Q4-32 hwarp16/tile32-dp4a/"
                   "tile32-mma gate/up and owned decode nonzero exact/reuse\n"
+                  "cuda-regression: SM75 Q4-32 tile32-mma prefetch-depth "
+                  "1/2 nonzero exact\n"
                   "cuda-regression: SM75 Q4-32 signed-zero gate probe exact\n");
     rc = 0;
 
@@ -1789,6 +1875,7 @@ cleanup:
     ds4_gpu_test_set_moe_q32_decode_split(0);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
     ds4_gpu_test_set_moe_q4_32_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q4_32_decode_prefetch_depth(0u);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
     ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
@@ -1946,6 +2033,24 @@ static int check_sm75_q4_32_down_tile32_exact(void) {
         !require_q4_down_positive_zero_rows(
             "SM75 Q4-32 down tile32 owned_slots signed-zero",
             slot_got, 6u, out_dim)) goto cleanup;
+    for (uint32_t depth = 1u; depth <= 2u; depth++) {
+        ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(depth);
+        if (!ds4_gpu_tensor_write(slot_got_out, 0u, poison,
+                                  slot_count * sizeof(float)) ||
+            !RUN_Q4_DOWN(slot_got_out, 0u, 4u, false) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(slot_got_out, 0u, slot_got,
+                                 slot_count * sizeof(float)) ||
+            !require_q4_down_overwritten(
+                "SM75 Q4-32 down prefetch owned_slots",
+                slot_got, slot_count) ||
+            !compare_exact_f32("SM75 Q4-32 down prefetch owned_slots",
+                               slot_ref, slot_got, (size_t)slot_count) ||
+            !require_q4_down_positive_zero_rows(
+                "SM75 Q4-32 down prefetch owned_slots signed-zero",
+                slot_got, 6u, out_dim)) goto cleanup;
+    }
+    ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(0u);
 
     /* Four cases pair masks 000/001, 010/011, 100/101 and 110/111.
      * Mask 111 forces both the prefix-pair reuse/barrier cycle and its second
@@ -2007,6 +2112,27 @@ static int check_sm75_q4_32_down_tile32_exact(void) {
                                (size_t)packed_count) ||
             !require_q4_down_positive_zero_rows(
                 label, packed_got, 4u, out_dim)) goto cleanup;
+        for (uint32_t depth = 1u; depth <= 2u; depth++) {
+            ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(depth);
+            if (!ds4_gpu_tensor_write(packed_got_out, 0u, poison,
+                                      packed_count * sizeof(float)) ||
+                !RUN_Q4_DOWN(packed_got_out, 4u, 4u, true) ||
+                !ds4_gpu_synchronize() ||
+                !ds4_gpu_tensor_read(packed_got_out, 0u, packed_got,
+                                     packed_count * sizeof(float)))
+                goto cleanup;
+            snprintf(label, sizeof(label),
+                     "SM75 Q4-32 down prefetch%u owned_packed masks %s/%s",
+                     depth, mask_names[packed_masks[c][0]],
+                     mask_names[packed_masks[c][1]]);
+            if (!require_q4_down_overwritten(
+                    label, packed_got, packed_count) ||
+                !compare_exact_f32(label, packed_ref, packed_got,
+                                   (size_t)packed_count) ||
+                !require_q4_down_positive_zero_rows(
+                    label, packed_got, 4u, out_dim)) goto cleanup;
+        }
+        ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(0u);
     }
 
     fprintf(stderr,
@@ -2016,11 +2142,14 @@ static int check_sm75_q4_32_down_tile32_exact(void) {
             "owned_packed masks 000..111 poison-overwrite exact\n"
             "cuda-regression: SM75 Q4-32 down tile32 packed-INT4 "
             "mask111 prefix-pair second-cycle exact\n"
+            "cuda-regression: SM75 Q4-32 down tile32 packed-INT4 "
+            "prefetch-depth 1/2 slots/packed exact\n"
             "cuda-regression: SM75 Q4-32 down tile32 signed-zero boundary "
             "exact\n");
     rc = 0;
 
 cleanup:
+    ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(0u);
     ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
@@ -2737,6 +2866,14 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
+    if (ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != 0u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q4-32 production gate/up "
+                "unexpectedly enables prefetch candidate\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u) {
         fprintf(stderr,
                 "cuda-regression: SM75 Q3A4 production mapping is not "
@@ -2764,6 +2901,14 @@ int main(void) {
         fprintf(stderr,
                 "cuda-regression: SM75 Q4-32 production down mapping is not "
                 "tile32\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
+    if (ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q4-32 production down "
+                "unexpectedly enables prefetch candidate\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;
