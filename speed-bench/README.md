@@ -3061,6 +3061,56 @@ The directory remains usable after a reboot. A `.started` or `.failed` marker
 plus the last durable progress row identifies the exact scenario and pair that
 were active when an endpoint disappeared.
 
+### Small-BAR1 production-pair isolation
+
+`cuda-sm75-small-bar1-pair-isolation.sh` keeps the production device order,
+22/21 stage split, Q3A4 K4, Q4 tile32, and the healthy logical pair unchanged.
+The first four arms also keep the complete 344/344 dense cache; the explicit
+admission-off confirmation changes only pair-0 peer admission. It varies only
+logical pair 0 (physical
+GPU 0<->1 under `GPU_DEVICES=0,3,1,2`) through five arms:
+
+- `partner-off` retains pair-0 partner-resident weights and scratch but routes
+  their projections through the ordinary home fallback;
+- `indexer-off` retains pair-0 partner execution but performs pair-0 decode
+  indexer scoring on the home GPU;
+- `both-off` suppresses both runtime transfer classes only on pair 0; and
+- `admission-off` omits pair-0 partner weights and scratch while leaving the
+  decode-indexer split enabled; and
+- `production` is the unmodified control.
+
+The safe diagnostic arms run before the known control. Every case preserves a
+flushed engine/prefill/decode journal, begin/complete byte checkpoints for Q8
+partner transfers, per-dispatch byte records for decode-indexer row splitting,
+ordinary GPU telemetry, and best-effort raw NVLink counters 0 and 1. Unsupported
+NVLink counters are labeled explicitly. If a GPU loss interrupts the shell,
+reuse the same directory with `RESUME=1`; the interrupted arm is retained as
+evidence and the next arm runs.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+TELEMETRY_INTERVAL_MS=500 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+This comparison can prove that admission alone is insufficient when
+`partner-off` passes: that arm keeps the admitted peer cache intact. If
+`both-off` still fails before decode, the decode row transfers are excluded,
+but an admission-off confirmation is still required to distinguish admitted
+peer memory from other unchanged prefill/P2P work.
+
 ### Bounded SM75 P2P direction audit
 
 `cuda-sm75-p2p-direction-audit.sh` escalates a production-shaped partner-FP16

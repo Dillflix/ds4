@@ -43,6 +43,7 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void);
+bool ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         uint32_t n_tokens, uint32_t n_raw);
 uint32_t ds4_test_cuda_tp_prefill_fixed_half_rows(uint32_t n_tokens);
@@ -921,16 +922,41 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
 static void test_cuda_tp_decode_indexer_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_decode_indexer_rows_default\n");
     char *old = save_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+    char *old_pairs = save_env_value(
+        "DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
 
     unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+    unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
     CHECK(ds4_test_cuda_tp_decode_indexer_rows_enabled(),
           "CUDA TP decode indexer row split is enabled by default");
+    CHECK(ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(1),
+          "both decode indexer pairs are enabled by default");
+
+    setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(1),
+          "pair-scoped switch disables only decode indexer pair 0");
+
+    setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", "1", 1);
+    CHECK(ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(1),
+          "pair-scoped switch disables only decode indexer pair 1");
+
+    setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", "0,1", 1);
+    CHECK(!ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(1),
+          "pair-scoped switch accepts both logical pairs");
 
     setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS", "1", 1);
     CHECK(!ds4_test_cuda_tp_decode_indexer_rows_enabled(),
           "negative diagnostic switch disables decode indexer row splitting");
+    CHECK(!ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(1),
+          "global rollback overrides the pair selector");
 
     restore_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS", old);
+    restore_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", old_pairs);
 }
 
 static void test_sm75_native_indexer_cache_accounting(void) {

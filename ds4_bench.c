@@ -131,6 +131,17 @@ static void bench_progress_journal_note(void *ud,
     }
 }
 
+static void bench_progress_journal_mark(
+        bench_progress_journal *journal,
+        const char             *phase,
+        const char             *event,
+        int                     current,
+        int                     total) {
+    if (!journal) return;
+    journal->phase = phase;
+    bench_progress_journal_note(journal, event, current, total);
+}
+
 static uint64_t bench_snapshot_max_bytes(void) {
     const char *env = getenv("DS4_BENCH_SNAPSHOT_MAX_BYTES");
     if (!env || env[0] == '\0') return DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES;
@@ -898,6 +909,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
+    bench_progress_journal_mark(
+        &progress_journal, "engine-create", "start", 0, 1);
     if (have_gpu_config && !skip_cuda) {
         const bool was_auto =
             (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -913,6 +926,8 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    bench_progress_journal_mark(
+        &progress_journal, "engine-create", "complete", 1, 1);
     if (getenv("DS4_BENCH_ROUTED_QUANT_AUDIT") != NULL) {
         ds4_engine_log_routed_quant_audit(engine);
     }
@@ -941,12 +956,16 @@ int main(int argc, char **argv) {
     }
 
     ds4_session *session = NULL;
+    bench_progress_journal_mark(
+        &progress_journal, "session-create", "start", 0, 1);
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
         return 1;
     }
+    bench_progress_journal_mark(
+        &progress_journal, "session-create", "complete", 1, 1);
     progress_journal.phase = untimed_warmup_tokens > 0 ?
         "untimed-warmup" : "measured-prefill";
     if (progress_journal.path && progress_journal.path[0]) {
@@ -974,6 +993,9 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-bench: starting untimed CUDA warm-up frontier %d\n",
                 untimed_warmup_tokens);
+        bench_progress_journal_mark(
+            &progress_journal, "untimed-warmup", "frontier-start",
+            0, untimed_warmup_tokens);
         if (ds4_session_sync(session, &warmup_prefix,
                              warmup_err, sizeof(warmup_err)) != 0) {
             fprintf(stderr,
@@ -987,6 +1009,9 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-bench: completed untimed CUDA warm-up frontier %d\n",
                 untimed_warmup_tokens);
+        bench_progress_journal_mark(
+            &progress_journal, "untimed-warmup", "frontier-complete",
+            untimed_warmup_tokens, untimed_warmup_tokens);
 
         if (q8_cache_audit_csv && q8_cache_audit_csv[0]) {
             if (!ds4_gpu_q8_audit_write_csv(q8_cache_audit_csv)) {
@@ -1010,6 +1035,8 @@ int main(int argc, char **argv) {
          * cache populated by the untimed pass. */
         ds4_session_free(session);
         session = NULL;
+        bench_progress_journal_mark(
+            &progress_journal, "session-recreate", "start", 0, 1);
         if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
             fprintf(stderr,
                     "ds4-bench: failed to recreate session after warm-up\n");
@@ -1017,6 +1044,8 @@ int main(int argc, char **argv) {
             ds4_engine_close(engine);
             return 1;
         }
+        bench_progress_journal_mark(
+            &progress_journal, "session-recreate", "complete", 1, 1);
         progress_journal.phase = "measured-prefill";
         if (progress_journal.path && progress_journal.path[0]) {
             ds4_session_set_progress(session,
@@ -1146,6 +1175,9 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+        bench_progress_journal_mark(
+            &progress_journal, "measured-prefill", "frontier-start",
+            previous, frontier);
         const double prefill_t0 = bench_now_sec();
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
@@ -1156,6 +1188,9 @@ int main(int argc, char **argv) {
             break;
         }
         const double prefill_t1 = bench_now_sec();
+        bench_progress_journal_mark(
+            &progress_journal, "measured-prefill", "frontier-complete",
+            frontier, frontier);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (capture_this_prefill) {
             if (!ds4_gpu_profiler_stop()) {
@@ -1240,6 +1275,11 @@ int main(int argc, char **argv) {
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
+        if (cfg.gen_tokens > 0) {
+            bench_progress_journal_mark(
+                &progress_journal, "decode", "frontier-start",
+                0, cfg.gen_tokens);
+        }
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -1270,6 +1310,11 @@ int main(int argc, char **argv) {
                 nsys_decode_capture_active = true;
             }
 #endif
+            if (i == 0 || ((i + 1) % 16) == 0) {
+                bench_progress_journal_mark(
+                    &progress_journal, "decode", "token-start",
+                    i + 1, cfg.gen_tokens);
+            }
             const double token_t0 = bench_now_sec();
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
@@ -1306,6 +1351,12 @@ int main(int argc, char **argv) {
             else gen_steady_sec += token_t1 - token_t0;
             if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
             gen_done++;
+            if (i == 0 || ((i + 1) % 16) == 0 ||
+                i + 1 == cfg.gen_tokens) {
+                bench_progress_journal_mark(
+                    &progress_journal, "decode", "token-complete",
+                    i + 1, cfg.gen_tokens);
+            }
             if (write_decode_logits_raw(&cfg,
                                         engine,
                                         session,
@@ -1316,6 +1367,11 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        if (rc == 0 && cfg.gen_tokens > 0) {
+            bench_progress_journal_mark(
+                &progress_journal, "decode", "frontier-complete",
+                gen_done, cfg.gen_tokens);
+        }
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {

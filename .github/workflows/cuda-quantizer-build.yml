@@ -120,6 +120,7 @@ on:
       - "tests/test_summarize_sm75_decode_evidence.py"
       - "tests/test_summarize_sm75_decode_crash_isolation.py"
       - "tests/test_summarize_sm75_xdev_feature_isolation.py"
+      - "tests/test_summarize_sm75_small_bar1_pair_isolation.py"
       - "gguf-tools/**"
       - "produce-benchmark-iq2-iq2-q4.sh"
       - "produce-verify-q4-iq2-full-f16-256k.sh"
@@ -199,6 +200,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-pair-stability-matrix.sh
           test -x speed-bench/cuda-sm75-xdev-feature-isolation.sh
           bash -n speed-bench/cuda-sm75-xdev-feature-isolation.sh
+          test -x speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+          bash -n speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
           test -x speed-bench/cuda-sm75-iq2-next-ab.sh
           bash -n speed-bench/cuda-sm75-iq2-next-ab.sh
           test -x speed-bench/cuda-sm75-critical-path-audit.sh
@@ -226,6 +229,7 @@ jobs:
           python3 -m py_compile speed-bench/summarize-sm75-decode-evidence.py
           python3 -m py_compile speed-bench/summarize-sm75-decode-crash-isolation.py
           python3 -m py_compile speed-bench/summarize-sm75-xdev-feature-isolation.py
+          python3 -m py_compile speed-bench/summarize-sm75-small-bar1-pair-isolation.py
           python3 -m py_compile speed-bench/validate-sm75-q32-production-log.py
           python3 -m py_compile tests/test_summarize_q8_partner_offload_ab.py
           python3 -m py_compile tests/test_summarize_q8_partner_production.py
@@ -241,6 +245,7 @@ jobs:
           python3 -m py_compile tests/test_summarize_sm75_decode_evidence.py
           python3 -m py_compile tests/test_summarize_sm75_decode_crash_isolation.py
           python3 -m py_compile tests/test_summarize_sm75_xdev_feature_isolation.py
+          python3 -m py_compile tests/test_summarize_sm75_small_bar1_pair_isolation.py
           python3 tests/test_summarize_q8_partner_offload_ab.py
           python3 tests/test_summarize_q8_partner_production.py
           python3 tests/test_summarize_q8_partner_quality_isolation.py
@@ -255,6 +260,7 @@ jobs:
           python3 tests/test_summarize_sm75_decode_evidence.py
           python3 tests/test_summarize_sm75_decode_crash_isolation.py
           python3 tests/test_summarize_sm75_xdev_feature_isolation.py
+          python3 tests/test_summarize_sm75_small_bar1_pair_isolation.py
       - name: Verify production tagged-Q4 SM75 instructions
         run: |
           cuobjdump --list-elf tests/cuda_long_context_smoke | grep -Eqi 'sm_?75'

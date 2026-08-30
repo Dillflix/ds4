@@ -2486,6 +2486,30 @@ static int cuda_q8_f16_partner_scratch_sizes(
     return 1;
 }
 
+/* Pair-scoped diagnostics name lower-half logical home tiers.  In the
+ * production 0,3,1,2 layout, pair 0 is physical 0<->1 and pair 1 is
+ * physical 3<->2.  Keep this parser allocation-free because it is consulted
+ * from both admission and the hot dispatch boundary. */
+static bool cuda_env_pair_list_contains(const char *name, int pair) {
+    const char *p = name ? getenv(name) : NULL;
+    if (!p || !p[0] || pair < 0) return false;
+    while (*p) {
+        uint64_t value = 0u;
+        if (*p < '0' || *p > '9') return false;
+        do {
+            const uint64_t digit = (uint64_t)(*p - '0');
+            if (value > ((uint64_t)INT_MAX - digit) / 10u) return false;
+            value = value * 10u + digit;
+            p++;
+        } while (*p >= '0' && *p <= '9');
+        if ((int)value == pair) return true;
+        if (*p == '\0') break;
+        if (*p != ',' || p[1] == '\0') return false;
+        p++;
+    }
+    return false;
+}
+
 /* Materialize one consumer's weight on its validated partner.  Return 1 on
  * admission, 0 for an ordinary capacity/policy miss, and -1 when CUDA state
  * is no longer safe for a native fallback.  Forced T256 placement calls this
@@ -2500,6 +2524,22 @@ static int cuda_q8_f16_plan_materialize_partner_candidate(
     const int home_tier = cuda_logical_tier_for_physical(c.physical_device);
     const int partner_tier =
         cuda_logical_tier_for_physical(c.fallback_physical_device);
+    if (cuda_env_pair_list_contains(
+            "DS4_CUDA_NO_Q8_F16_PARTNER_ADMISSION_PAIRS", home_tier)) {
+        static std::atomic<uint32_t> logged_pair_mask = 0u;
+        const uint32_t bit = home_tier >= 0 && home_tier < 32
+            ? (UINT32_C(1) << (uint32_t)home_tier) : 0u;
+        const uint32_t old = bit != 0u
+            ? logged_pair_mask.fetch_or(bit, std::memory_order_relaxed) : bit;
+        if (bit == 0u || (old & bit) == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 partner admission suppressed for "
+                    "logical pair %d; no partner weights or scratch admitted\n",
+                    home_tier);
+            fflush(stderr);
+        }
+        return 0;
+    }
     if (home_tier < 0 || partner_tier < 0 ||
         !g_gpu_peer_ok[home_tier][partner_tier] ||
         !g_gpu_peer_ok[partner_tier][home_tier]) return 0;
@@ -16120,7 +16160,25 @@ static int cuda_q8_f16_partner_matmul_impl(
      * partner-resident weights, and admitted scratch, but execute the logical
      * projection through its ordinary home-side fallback.  Unlike
      * DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD this must not affect admission. */
-    if (getenv("DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION") != NULL) {
+    const bool suppress_all_partner_execution =
+        getenv("DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION") != NULL;
+    const bool suppress_pair_partner_execution =
+        cuda_env_pair_list_contains(
+            "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS", home_tier);
+    if (suppress_all_partner_execution || suppress_pair_partner_execution) {
+        static std::atomic<uint32_t> logged_pair_mask = 0u;
+        const uint32_t bit = home_tier < 32
+            ? (UINT32_C(1) << (uint32_t)home_tier) : 0u;
+        const uint32_t old = bit != 0u
+            ? logged_pair_mask.fetch_or(bit, std::memory_order_relaxed) : bit;
+        if (bit == 0u || (old & bit) == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 fp16 partner execution suppressed for "
+                    "logical pair %d; admitted partner weights and scratch "
+                    "retained\n",
+                    home_tier);
+            fflush(stderr);
+        }
         g_q8_f16_partner_execution_suppressed.fetch_add(
             1u, std::memory_order_relaxed);
         return 0;
@@ -16312,6 +16370,34 @@ static int cuda_q8_f16_partner_matmul_impl(
                           activation_f32_bytes, 0, partner_tier};
         activation_transfer_bytes = activation_f32_bytes;
     }
+    static std::atomic<uint64_t> audit_begun_calls[DS4_MAX_GPUS] = {};
+    static std::atomic<uint64_t> audit_begun_bytes[DS4_MAX_GPUS] = {};
+    static std::atomic<uint64_t> audit_completed_calls[DS4_MAX_GPUS] = {};
+    static std::atomic<uint64_t> audit_completed_bytes[DS4_MAX_GPUS] = {};
+    const bool transfer_audit =
+        getenv("DS4_CUDA_Q8_F16_PARTNER_TRANSFER_AUDIT") != NULL;
+    uint64_t audit_begin_sequence = 0u;
+    if (transfer_audit && home_tier >= 0 && home_tier < DS4_MAX_GPUS) {
+        const uint64_t call_bytes = activation_transfer_bytes + result_bytes;
+        audit_begin_sequence = audit_begun_calls[home_tier].fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+        const uint64_t cumulative = audit_begun_bytes[home_tier].fetch_add(
+            call_bytes, std::memory_order_relaxed) + call_bytes;
+        if (audit_begin_sequence == 1u ||
+            (audit_begin_sequence & UINT64_C(63)) == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 partner transfer audit event=begin "
+                    "home_tier=%d partner_tier=%d calls=%llu bytes=%llu "
+                    "activation_bytes=%llu result_bytes=%llu tokens=%llu\n",
+                    home_tier, partner_tier,
+                    (unsigned long long)audit_begin_sequence,
+                    (unsigned long long)cumulative,
+                    (unsigned long long)activation_transfer_bytes,
+                    (unsigned long long)result_bytes,
+                    (unsigned long long)n_tok);
+            fflush(stderr);
+        }
+    }
     if (!ds4_gpu_tensor_copy_xdev_default_impl(
             &activation_dst, &activation_src,
             activation_transfer_bytes)) {
@@ -16442,6 +16528,23 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (cuda_q8_f16_restore_home(home_tier,
                                  "successful result peer copy") < 0) {
         return -1;
+    }
+
+    if (transfer_audit && home_tier >= 0 && home_tier < DS4_MAX_GPUS) {
+        const uint64_t call_bytes = activation_transfer_bytes + result_bytes;
+        const uint64_t completed = audit_completed_calls[home_tier].fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+        const uint64_t cumulative = audit_completed_bytes[home_tier].fetch_add(
+            call_bytes, std::memory_order_relaxed) + call_bytes;
+        if (completed == 1u || (completed & UINT64_C(63)) == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 partner transfer audit event=complete "
+                    "home_tier=%d partner_tier=%d calls=%llu bytes=%llu\n",
+                    home_tier, partner_tier,
+                    (unsigned long long)completed,
+                    (unsigned long long)cumulative);
+            fflush(stderr);
+        }
     }
 
     const uint64_t sequence =

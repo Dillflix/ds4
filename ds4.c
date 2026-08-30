@@ -15480,6 +15480,35 @@ static bool cuda_tp_decode_indexer_rows_env_enabled(void) {
     return getenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS") == NULL;
 }
 
+/* Pair lists name lower-half logical home tiers.  Invalid lists do not
+ * silently disable a production path; diagnostic harnesses validate their
+ * values before launch. */
+static bool env_pair_list_contains(const char *name, int pair) {
+    const char *p = name ? getenv(name) : NULL;
+    if (!p || !p[0] || pair < 0) return false;
+    while (*p) {
+        uint64_t value = 0u;
+        if (*p < '0' || *p > '9') return false;
+        do {
+            const uint64_t digit = (uint64_t)(*p - '0');
+            if (value > ((uint64_t)INT_MAX - digit) / 10u) return false;
+            value = value * 10u + digit;
+            p++;
+        } while (*p >= '0' && *p <= '9');
+        if ((int)value == pair) return true;
+        if (*p == '\0') break;
+        if (*p != ',' || p[1] == '\0') return false;
+        p++;
+    }
+    return false;
+}
+
+static bool cuda_tp_decode_indexer_rows_pair_enabled(int home_tier) {
+    return cuda_tp_decode_indexer_rows_env_enabled() &&
+           !env_pair_list_contains(
+               "DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", home_tier);
+}
+
 /* Kept outside the GPU-only graph implementation so the CPU placement test
  * can lock down the production dispatch boundary without linking CUDA. */
 static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
@@ -17627,6 +17656,15 @@ static bool metal_graph_alloc_raw_cap(
     g->cuda_tp_decode_indexer_rows =
         g->cuda_tp_prefill_indexer_rows &&
         cuda_tp_decode_indexer_rows_env_enabled();
+    const char *decode_indexer_disabled_pairs =
+        getenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
+    if (g->cuda_tp_decode_indexer_rows && decode_indexer_disabled_pairs &&
+        decode_indexer_disabled_pairs[0]) {
+        fprintf(stderr,
+                "ds4: CUDA decode indexer row split pair-scoped disable: "
+                "logical-pairs=%s; disabled pairs use home fallback\n",
+                decode_indexer_disabled_pairs);
+    }
     if (g->index_comp_cache_f16) {
         g->index_comp_stage_cap = prefill_cap / 4u + 2u;
         if (g->index_comp_stage_cap < 2u) g->index_comp_stage_cap = 2u;
@@ -20829,6 +20867,7 @@ static bool metal_graph_cuda_tp_decode_indexer_rows_active(
     return false;
 #else
     if (!g || !g->cuda_tp_decode_indexer_rows ||
+        !cuda_tp_decode_indexer_rows_pair_enabled(g->active_tier) ||
         !g->cuda_tp_prefill_indexer_rows ||
         !g->index_comp_cache_f16 || il >= DS4_N_LAYER || n_comp < 2u) {
         return false;
@@ -20874,6 +20913,8 @@ static bool metal_graph_cuda_tp_decode_indexer_score_one(
         (uint64_t)home_rows * sizeof(float);
     const uint64_t partner_score_bytes =
         (uint64_t)partner_rows * sizeof(float);
+    const uint64_t transfer_bytes = q_bytes + weight_bytes +
+                                    partner_score_bytes;
 
     ds4_gpu_tensor home_scores;
     ds4_gpu_tensor gather_scores;
@@ -20903,6 +20944,15 @@ static bool metal_graph_cuda_tp_decode_indexer_score_one(
      * kernels then run concurrently on their default streams; the final
      * gather restores the original contiguous score order before the unchanged
      * deterministic top-k runs on the home GPU. */
+    if (ok && getenv("DS4_CUDA_TP_DECODE_INDEXER_ROWS_AUDIT") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA decode indexer row audit event=begin "
+                "layer=%u home_tier=%d partner_tier=%d n_comp=%u "
+                "transfer_bytes=%llu\n",
+                il, home, partner, n_comp,
+                (unsigned long long)transfer_bytes);
+        fflush(stderr);
+    }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(
                  g->indexer_q_by_tier[partner], home) != 0 &&
@@ -20954,10 +21004,13 @@ static bool metal_graph_cuda_tp_decode_indexer_score_one(
     }
     if (ok && getenv("DS4_CUDA_TP_DECODE_INDEXER_ROWS_AUDIT") != NULL) {
         fprintf(stderr,
-                "ds4: CUDA decode indexer row audit dispatch=split "
+                "ds4: CUDA decode indexer row audit event=complete "
+                "dispatch=split "
                 "layer=%u home_tier=%d partner_tier=%d n_comp=%u "
-                "home_rows=%u partner_rows=%u\n",
-                il, home, partner, n_comp, home_rows, partner_rows);
+                "home_rows=%u partner_rows=%u transfer_bytes=%llu\n",
+                il, home, partner, n_comp, home_rows, partner_rows,
+                (unsigned long long)transfer_bytes);
+        fflush(stderr);
     }
     return ok;
 #endif
@@ -20972,7 +21025,10 @@ static bool metal_graph_indexer_score_one(
         float               scale,
         bool                allow_pair_split) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (allow_pair_split && g->cuda_tp_decode_indexer_rows) {
+    const bool pair_split_enabled = allow_pair_split &&
+        g->cuda_tp_decode_indexer_rows &&
+        cuda_tp_decode_indexer_rows_pair_enabled(g->active_tier);
+    if (pair_split_enabled) {
         if (!metal_graph_cuda_tp_decode_indexer_rows_active(g, il, n_comp)) {
             fprintf(stderr,
                     "ds4: required CUDA decode indexer score row split "
@@ -58048,6 +58104,10 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
 
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void) {
     return cuda_tp_decode_indexer_rows_env_enabled();
+}
+
+bool ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(int home_tier) {
+    return cuda_tp_decode_indexer_rows_pair_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
