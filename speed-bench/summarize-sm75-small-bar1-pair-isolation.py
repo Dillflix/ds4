@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "partner-bounce", "bounce-indexer-off", "partner-serialized",
+    "attention-off", "partner-bounce", "bounce-indexer-off", "partner-serialized",
     "indexer-off", "production"
 )
 
@@ -66,11 +66,34 @@ def outcome(statuses: list[str]) -> str:
 
 
 def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
+    if any("power-limit-drift" in row.get("watch_status", "") for row in rows):
+        return (
+            "At least one arm changed power limit after its 250 W preflight. That arm "
+            "is invalid for causal comparison; identify the external power-limit writer "
+            "and rerun it."
+        )
+    attention = outcomes.get("attention-off", "not-run")
     production = outcomes.get("production", "not-run")
     bounce = outcomes.get("partner-bounce", "not-run")
     bounce_indexer = outcomes.get("bounce-indexer-off", "not-run")
     serialized = outcomes.get("partner-serialized", "not-run")
     indexer = outcomes.get("indexer-off", "not-run")
+    if attention == "passed":
+        return (
+            "Pair 0 survived with only its prefill attention row split "
+            "disabled while full dense admission, direct partner projections, and "
+            "both prefill/decode indexer splits remained. Against the reproduced "
+            "attention-rows-on failures, "
+            "this makes pair-0 prefill row splitting or its interaction a necessary "
+            "condition in this pass."
+        )
+    if attention == "failed":
+        return (
+            "Pair 0 still failed with its prefill attention row split disabled. "
+            "That split is therefore not necessary for the failure; the remaining "
+            "common path is full partner projection work/traffic, aggregate load, "
+            "power delivery, or the shared PCIe/root-complex path."
+        )
     if production in {"not-run", "incomplete"}:
         return (
             "The production control has no durable outcome yet. Resume the same "
@@ -152,6 +175,8 @@ def main() -> None:
         nvlink_path = root / "nvlink" / f"{stem}.log"
         nvlink_text = (nvlink_path.read_text(errors="replace")
                        if nvlink_path.exists() else "")
+        watch_path = root / "telemetry" / f"{stem}-watch-event.txt"
+        watch_values = read_kv(watch_path) if watch_path.exists() else {}
         q8_begin_calls, q8_begin_bytes = checkpoint_max(
             log_text, "q8 partner transfer audit", "begin", 0
         )
@@ -193,6 +218,7 @@ def main() -> None:
                 "no" if "counter_status=unsupported-or-unavailable" in nvlink_text
                 else ("yes" if "snapshot_utc=" in nvlink_text else "unknown")
             ),
+            "watch_status": watch_values.get("status", ""),
             "result": str(result_path),
             "log": str(log_path),
             "nvlink_log": str(nvlink_path),
@@ -219,13 +245,13 @@ def main() -> None:
         "Pair 0 is logical tier 0<->2, physical GPU 0<->1 in the required "
         "`GPU_DEVICES=0,3,1,2` layout. Every arm retains the 344/344 admission "
         "plan, partner-resident weights, and partner projection arithmetic. The "
-        "diagnostics vary only pair-0 Q8 transport/synchronization and pair-0 "
-        "decode-indexer row splitting.",
+        "diagnostics vary only pair-0 Q8 transport/synchronization, pair-0 "
+        "prefill attention rows, and pair-0 prefill/decode-indexer rows.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
-        "Pair-0 indexer begun bytes | NVLink snapshots |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: |",
+        "Pair-0 indexer begun bytes | Watch event | NVLink snapshots |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
@@ -235,6 +261,7 @@ def main() -> None:
             f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
+            f"{row.get('watch_status', '')} | "
             f"{row.get('nvlink_counter_snapshots', '0')} |"
         )
     lines.extend([

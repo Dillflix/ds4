@@ -42,6 +42,7 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void);
 bool ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
@@ -867,6 +868,8 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    char *old_pairs = save_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
     const int old_n_gpus = g_n_gpus;
     ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
     int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
@@ -892,8 +895,28 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     }
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "both prefill attention row-split pairs are enabled by default");
+
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "pair-scoped switch disables only prefill attention pair 0");
+
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "pair-scoped switch disables only prefill attention pair 1");
+
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "0,1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "pair-scoped switch accepts both prefill attention pairs");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
 
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
@@ -917,6 +940,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memcpy(g_gpu_peer_ok, old_peer_ok, sizeof(old_peer_ok));
     memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
+    restore_env_value("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", old_pairs);
 }
 
 static void test_cuda_tp_decode_indexer_rows_default(void) {

@@ -3067,8 +3067,15 @@ were active when an endpoint disappeared.
 22/21 stage split, Q3A4 K4, Q4 tile32, and the healthy logical pair unchanged.
 Every arm keeps the complete 344/344 dense cache, partner-resident FP16 weights,
 partner cuBLAS projections, activation/result shapes, and arithmetic. It varies
-only logical pair 0 (physical GPU 0<->1 under `GPU_DEVICES=0,3,1,2`) through
-five workload-preserving arms:
+only logical pair 0 (physical GPU 0<->1 under `GPU_DEVICES=0,3,1,2`). The
+current decisive arm is:
+
+- `attention-off`, which retains normal direct partner projections plus both
+  prefill and decode indexer splitting but runs pair-0 prefill attention on the
+  home GPU; pair 1 retains its production 50/50 attention row split.
+
+The earlier workload-preserving transport and scheduling arms remain accepted
+for reproducing existing evidence:
 
 - `partner-bounce` stages only pair-0 Q8 partner activations and results through
   pinned host memory instead of direct peer copies;
@@ -3080,7 +3087,18 @@ five workload-preserving arms:
   decode-indexer scoring on the home GPU; and
 - `production` is the unmodified control.
 
-All four GPUs must report an exact 250 W power limit before every arm. The
+The host-bounce arm failed during its 512-token warmup after one complete
+65 MiB pair-0 round trip. The serialized-direct arm completed that warmup, then
+failed in the first measured 32K chunk immediately after pair-0 prefill
+attention row splitting began. Decode-indexer-only controls therefore do not
+isolate the observed prefill failure; `attention-off` controls the relevant
+path.
+
+All four GPUs must report an exact 250 W power limit before every arm and for
+the entire run. The telemetry watcher aborts the active case if a limit changes
+or a device becomes unavailable. This matters because the serialized archive
+recorded an external sequential rewrite from 250 W to 225 W during engine
+startup; accepting that run as a 250 W arm would be invalid. The
 transport/scheduling diagnostics run before the known control. They retain the
 same arithmetic work but host staging and serialization necessarily change the
 timing and instantaneous power envelope; a passing arm narrows the trigger but
@@ -3095,6 +3113,10 @@ stopped during post-run validation, resume validates and recovers that arm from
 its existing CSV, binding inventory, progress journal, and log instead of
 rerunning it.
 
+`RESUME=1` requires the exact original variant list and order. Use a new output
+directory when selecting a different arm; do not point a new variant list at an
+older directory.
+
 ```bash
 cd ~/ds4-iq2-q4
 
@@ -3105,7 +3127,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production \
+VARIANTS=attention-off,production \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
@@ -3120,8 +3142,9 @@ The earlier execution-off arm remains useful only as evidence that static
 344/344 admission and low-volume row traffic can survive at reduced load. It is
 not used for causal attribution because it removed thousands of partner
 projections and cut 32K prefill throughput by roughly threefold. The new
-factorial retains partner computation and separates Q8 transport, indexer rows,
-and overlap while telemetry records the remaining timing/power differences.
+factorial retains partner computation and separates Q8 transport, prefill
+attention rows, prefill/decode-indexer rows, and overlap while telemetry
+records the remaining timing/power differences.
 
 ### Bounded SM75 P2P direction audit
 

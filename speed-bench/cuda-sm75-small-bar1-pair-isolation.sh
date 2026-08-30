@@ -16,7 +16,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
-  VARIANTS=partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production
+  VARIANTS=attention-off,production
   PP_TOKENS=32768
   TG_TOKENS=256
   REPEATS=1
@@ -48,7 +48,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 SMALL_BAR1_PAIR=${SMALL_BAR1_PAIR:-0}
-VARIANTS=${VARIANTS:-partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production}
+VARIANTS=${VARIANTS:-attention-off,production}
 PP_TOKENS=${PP_TOKENS:-32768}
 TG_TOKENS=${TG_TOKENS:-256}
 REPEATS=${REPEATS:-1}
@@ -95,7 +95,7 @@ IFS=, read -r -a variants <<<"$VARIANTS"
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     case "$variant" in
-        partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
@@ -263,11 +263,31 @@ start_telemetry_watch() {
     local output=$1 marker=$2 case_pid=$3
     (
         while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
-            if tail -n 16 "$output" 2>/dev/null |
+            local watch_status=
+            if tail -n 24 "$output" 2>/dev/null |
                     grep -Eiq 'GPU is lost|GPU requires reset|Unknown Error|ERR!|Unable to determine'; then
-                printf 'telemetry-watch: lost-device response detected\n' >>"$output"
-                printf 'timestamp_utc=%s\nstatus=lost-device-detected\ncase_pid=%s\n' \
-                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$case_pid" >"$marker"
+                watch_status=lost-device-detected
+            elif tail -n 24 "$output" 2>/dev/null |
+                    awk -F, -v required="$REQUIRED_POWER_LIMIT_W" '
+                        {
+                            index_field=$2
+                            limit=$7
+                            gsub(/^[[:space:]]+|[[:space:]]+$/, "", index_field)
+                            gsub(/^[[:space:]]+|[[:space:]]+$/, "", limit)
+                            sub(/[[:space:]]+W$/, "", limit)
+                            if (index_field ~ /^[0-9]+$/ &&
+                                limit ~ /^[0-9]+([.][0-9]+)?$/ &&
+                                limit + 0.0 != required + 0.0) found=1
+                        }
+                        END {exit !found}
+                    '; then
+                watch_status=power-limit-drift
+            fi
+            if [[ -n $watch_status ]]; then
+                printf 'telemetry-watch: %s detected\n' "$watch_status" >>"$output"
+                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
+                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" >"$marker"
                 sync "$marker" 2>/dev/null || sync
                 kill "$telemetry_pid" >/dev/null 2>&1 || true
                 kill -TERM "$case_pid" >/dev/null 2>&1 || true
@@ -409,6 +429,26 @@ validate_success_path() {
     grep -Fq 'q8 partner transfer audit event=begin home_tier=1' "$log" ||
         return 1
     case "$variant" in
+        attention-off)
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
+                return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
+                return 1
+            grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
+                "$log" || return 1
+            ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
+                return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
         production)
             ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
                 return 1
@@ -480,7 +520,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         memory="$base-memory.csv"
         telemetry="$OUTPUT_DIR/telemetry/$tag.csv"
         nvlink="$OUTPUT_DIR/nvlink/$tag.log"
-        lost_marker="$OUTPUT_DIR/telemetry/$tag-lost-device.txt"
+        watch_marker="$OUTPUT_DIR/telemetry/$tag-watch-event.txt"
         pre_health="$OUTPUT_DIR/health/$tag-pre.log"
         post_health="$OUTPUT_DIR/health/$tag-post.log"
 
@@ -531,6 +571,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 
         variant_env=()
         case "$variant" in
+            attention-off)
+                variant_env+=("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
             partner-bounce)
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
@@ -556,6 +599,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
                 DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
                 DS4_CUDA_TP_PREFILL_ATTN_ROWS=1 \
+                DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
                 DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1 \
                 DS4_CUDA_PREFILL_FAULT_BREADCRUMBS=1 \
                 DS4_CUDA_Q8_F16_PARTNER_TRANSFER_AUDIT=1 \
@@ -574,9 +618,18 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     --prefill-chunk 2048 --gen-tokens "$TG_TOKENS" \
                     --csv "$csv" >"$log" 2>&1 &
         active_case_pid=$!
-        start_telemetry_watch "$telemetry" "$lost_marker" "$active_case_pid"
+        start_telemetry_watch "$telemetry" "$watch_marker" "$active_case_pid"
         if wait "$active_case_pid"; then run_status=0; else run_status=$?; fi
         active_case_pid=
+        if (( run_status == 0 )) && ! validate_power_limits; then
+            run_status=126
+            if [[ ! -s $watch_marker ]]; then
+                printf 'timestamp_utc=%s\nstatus=post-run-power-limit-drift\nrequired_power_limit_w=%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    "$REQUIRED_POWER_LIMIT_W" >"$watch_marker"
+                sync "$watch_marker" 2>/dev/null || sync
+            fi
+        fi
         stop_telemetry
         gpu_health_snapshot "$post_health" || true
 

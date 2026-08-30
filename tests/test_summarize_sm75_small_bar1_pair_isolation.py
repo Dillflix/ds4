@@ -13,6 +13,50 @@ SUMMARIZER = REPO / "speed-bench/summarize-sm75-small-bar1-pair-isolation.py"
 
 
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
+    def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            (root / "nvlink").mkdir()
+            production.mkdir()
+            statuses = {"attention-off": "passed", "production": "failed"}
+            for slot, (variant, status) in enumerate(statuses.items(), 1):
+                stem = f"r1-s{slot}-{variant}"
+                (production / f"{stem}.result").write_text(
+                    f"variant={variant}\nstatus={status}\nexit_status="
+                    f"{0 if status == 'passed' else 1}\n"
+                    "last_phase=measured-prefill\nlast_event=chunk-start\n"
+                )
+                (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("prefill attention row split disabled", report)
+            self.assertIn("necessary condition", report)
+
+    def test_rejects_power_limit_drift_as_causal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            telemetry = root / "telemetry"
+            (root / "nvlink").mkdir()
+            production.mkdir()
+            telemetry.mkdir()
+            stem = "r1-s1-attention-off"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-off\nstatus=failed\nexit_status=126\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            (telemetry / f"{stem}-watch-event.txt").write_text(
+                "status=power-limit-drift\nrequired_power_limit_w=250\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("invalid for causal comparison", report)
+            self.assertIn("external power-limit writer", report)
+
     def test_identifies_direct_or_overlap_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
