@@ -20,8 +20,15 @@ Optional environment:
   RUN_NCU=1
   NCU_USE_SUDO=0
   SKIP_BUILD=0
+  RESUME=0
+  BUILD_LOCK_TIMEOUT=0
   CREATE_ARCHIVE=1
   Q4DOWN_TILE32_DIR=/absolute/output/directory
+
+To resume an interrupted run, set RESUME=1 and point Q4DOWN_TILE32_DIR at
+its existing output directory.  A completed build is reused only when its
+commit/source/options fingerprint and both binary hashes still match.  The
+checkpoint can also be passed explicitly to the gate/up audit.
 EOF
 }
 
@@ -40,6 +47,8 @@ RUN_SANITIZER=${RUN_SANITIZER:-1}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
+BUILD_LOCK_TIMEOUT=${BUILD_LOCK_TIMEOUT:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 OUTPUT_DIR=${Q4DOWN_TILE32_DIR:-$repo_dir/sm75-decode-q4down-tile32-$(date -u +%Y%m%dT%H%M%SZ)}
 
@@ -47,7 +56,9 @@ OUTPUT_DIR=${Q4DOWN_TILE32_DIR:-$repo_dir/sm75-decode-q4down-tile32-$(date -u +%
 [[ $TIMING_ROUNDS =~ ^[1-9][0-9]*$ ]] || die "TIMING_ROUNDS must be positive"
 (( TIMING_ROUNDS % 2 == 1 )) || die "TIMING_ROUNDS must be odd"
 [[ $TIMING_REPEATS =~ ^[1-9][0-9]*$ ]] || die "TIMING_REPEATS must be positive"
-for value in "$RUN_SANITIZER" "$RUN_NCU" "$NCU_USE_SUDO" "$SKIP_BUILD" "$CREATE_ARCHIVE"; do
+[[ $BUILD_LOCK_TIMEOUT =~ ^[0-9]+$ ]] ||
+    die "BUILD_LOCK_TIMEOUT must be a non-negative integer"
+for value in "$RUN_SANITIZER" "$RUN_NCU" "$NCU_USE_SUDO" "$SKIP_BUILD" "$RESUME" "$CREATE_ARCHIVE"; do
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
 
@@ -56,7 +67,7 @@ done
 unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING
 unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT
 
-tools=(c++filt cuobjdump env git grep make nproc nvidia-smi python3 tar)
+tools=(c++filt cuobjdump env flock git grep make nproc nvidia-smi python3 sha256sum tar)
 (( RUN_SANITIZER == 0 )) || tools+=(compute-sanitizer)
 (( RUN_NCU == 0 )) || tools+=(ncu)
 for tool in "${tools[@]}"; do
@@ -66,28 +77,75 @@ compute_cap=$(nvidia-smi -i "$PROFILE_GPU" --query-gpu=compute_cap \
     --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]')
 [[ $compute_cap == 7.5 ]] ||
     die "physical GPU $PROFILE_GPU has compute capability ${compute_cap:-unknown}; SM75 is required"
-[[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+
+checkout_key=$(printf '%s' "$repo_dir" | sha256sum | cut -c1-16)
+audit_lock=${TMPDIR:-/tmp}/ds4-sm75-q4-decode-audit-$checkout_key.lock
+exec 9>"$audit_lock"
+flock -w "$BUILD_LOCK_TIMEOUT" 9 ||
+    die "another SM75 Q4 decode audit owns this checkout"
+
+if [[ $RESUME == 1 ]]; then
+    [[ -n ${Q4DOWN_TILE32_DIR:-} ]] ||
+        die "RESUME=1 requires Q4DOWN_TILE32_DIR"
+    [[ -d $OUTPUT_DIR ]] ||
+        die "resume output directory does not exist: $OUTPUT_DIR"
+else
+    [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+fi
 mkdir -p "$OUTPUT_DIR/smoke" "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 current_phase=initialization
+termination_signal=
+termination_status=
+write_run_status() {
+    local state=$1 status=$2 phase=$3
+    printf 'state=%s\nexit_status=%s\nlast_phase=%s\ndate_utc=%s\n' \
+        "$state" "$status" "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        >"$OUTPUT_DIR/run-status.txt"
+    if [[ -n $termination_signal ]]; then
+        printf 'signal=%s\n' "$termination_signal" >>"$OUTPUT_DIR/run-status.txt"
+    fi
+}
+record_signal() {
+    termination_signal=$1
+    termination_status=$2
+    trap - INT TERM HUP
+    exit "$termination_status"
+}
 finalize() {
-    local status=$?
-    trap - EXIT
+    local status=${1:-1} state archive
+    trap - EXIT INT TERM HUP
+    if [[ -n $termination_status ]]; then
+        status=$termination_status
+        state=interrupted
+    elif (( status == 0 )) && [[ $current_phase == complete ]]; then
+        state=complete
+    else
+        state=failed
+        (( status != 0 )) || status=1
+    fi
     if [[ -d $OUTPUT_DIR ]]; then
-        printf 'state=finished\nexit_status=%s\nlast_phase=%s\ndate_utc=%s\n' \
-            "$status" "$current_phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            >"$OUTPUT_DIR/run-status.txt"
+        write_run_status "$state" "$status" "$current_phase"
         if [[ $CREATE_ARCHIVE == 1 ]]; then
-            local archive="$OUTPUT_DIR.tar.gz"
-            tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
-                "$(basename "$OUTPUT_DIR")" || status=1
-            printf 'Archive to return: %s\n' "$archive"
+            archive="$OUTPUT_DIR.tar.gz"
+            if tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
+                    "$(basename "$OUTPUT_DIR")"; then
+                printf 'Archive to return: %s\n' "$archive"
+            else
+                status=1
+                state=failed
+                write_run_status "$state" "$status" archive
+            fi
         fi
     fi
     exit "$status"
 }
-trap finalize EXIT
+trap 'record_signal INT 130' INT
+trap 'record_signal TERM 143' TERM
+trap 'record_signal HUP 129' HUP
+trap 'finalize "$?"' EXIT
+write_run_status running '' "$current_phase"
 
 {
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
@@ -96,8 +154,8 @@ trap finalize EXIT
     printf 'scope=audit-only-q4-32-down-decode-tile32-packed-int4\n'
     printf 'production_default=control\nmidq_blocks=8\n'
     printf 'candidate_block_size=128\ncandidate_static_shared_bytes=1024\n'
-    printf 'timing_rounds=%s\ntiming_repeats=%s\nrun_ncu=%s\n' \
-        "$TIMING_ROUNDS" "$TIMING_REPEATS" "$RUN_NCU"
+    printf 'timing_rounds=%s\ntiming_repeats=%s\nrun_ncu=%s\nresume=%s\n' \
+        "$TIMING_ROUNDS" "$TIMING_REPEATS" "$RUN_NCU" "$RESUME"
     printf '\n[gpu]\n'
     nvidia-smi -i "$PROFILE_GPU" \
         --query-gpu=index,name,pci.bus_id,memory.total,memory.free,driver_version \
@@ -107,9 +165,29 @@ trap finalize EXIT
 
 smoke=tests/cuda_long_context_smoke
 harness=tests/cuda_sm75_decode_weight_profile
+git_commit=$(git rev-parse HEAD)
+evidence_nvccflags=${EVIDENCE_NVCCFLAGS:-"-O3 -g -lineinfo --use_fast_math -arch=$CUDA_ARCH -Xcompiler -march=native -Xcompiler -pthread -Xptxas -v"}
+build_fingerprint=$({
+    printf '%s\n%s\n%s\n' "$git_commit" "$CUDA_ARCH" "$evidence_nvccflags"
+    git diff --no-ext-diff --binary HEAD --
+} | sha256sum | cut -d' ' -f1)
+build_checkpoint="$OUTPUT_DIR/build-complete.txt"
+build_checkpoint_valid() {
+    [[ -s $build_checkpoint && -s $OUTPUT_DIR/build.log &&
+       -x $smoke && -x $harness ]] || return 1
+    grep -Fxq "git_commit=$git_commit" "$build_checkpoint" || return 1
+    grep -Fxq "build_fingerprint=$build_fingerprint" "$build_checkpoint" || return 1
+    local smoke_sha harness_sha
+    smoke_sha=$(sha256sum "$smoke" | cut -d' ' -f1)
+    harness_sha=$(sha256sum "$harness" | cut -d' ' -f1)
+    grep -Fxq "smoke_sha256=$smoke_sha" "$build_checkpoint" || return 1
+    grep -Fxq "harness_sha256=$harness_sha" "$build_checkpoint" || return 1
+}
 current_phase=build
-if [[ $SKIP_BUILD == 0 ]]; then
-    evidence_nvccflags=${EVIDENCE_NVCCFLAGS:-"-O3 -g -lineinfo --use_fast_math -arch=$CUDA_ARCH -Xcompiler -march=native -Xcompiler -pthread -Xptxas -v"}
+if [[ $RESUME == 1 ]] && build_checkpoint_valid; then
+    printf 'Reusing fingerprinted completed evidence build.\n'
+elif [[ $SKIP_BUILD == 0 ]]; then
+    rm -f -- "$build_checkpoint"
     set +e
     make -B -j"$(nproc)" "$smoke" "$harness" CUDA_ARCH="$CUDA_ARCH" \
         NVCCFLAGS="$evidence_nvccflags" >"$OUTPUT_DIR/build.log" 2>&1
@@ -119,10 +197,29 @@ if [[ $SKIP_BUILD == 0 ]]; then
         tail -n 180 "$OUTPUT_DIR/build.log" >&2 || true
         die "SM75 Q4-32 down tile32 evidence build failed"
     fi
+    [[ -x $smoke && -x $harness ]] || die "required CUDA binaries are missing"
+    {
+        printf 'git_commit=%s\nbuild_fingerprint=%s\n' \
+            "$git_commit" "$build_fingerprint"
+        printf 'smoke_sha256=%s\nharness_sha256=%s\n' \
+            "$(sha256sum "$smoke" | cut -d' ' -f1)" \
+            "$(sha256sum "$harness" | cut -d' ' -f1)"
+    } >"$build_checkpoint.tmp"
+    mv -f -- "$build_checkpoint.tmp" "$build_checkpoint"
 else
-    die "SKIP_BUILD=1 cannot provide fresh PTXAS evidence; use SKIP_BUILD=0"
+    die "SKIP_BUILD=1 requires RESUME=1 with a valid completed build checkpoint"
 fi
 [[ -x $smoke && -x $harness ]] || die "required CUDA binaries are missing"
+
+# Resume from byte-exact validation with no stale downstream evidence.  The
+# build log/checkpoint and manifest are retained; all phase outputs are rebuilt.
+if [[ $RESUME == 1 ]]; then
+    rm -rf -- "$OUTPUT_DIR/smoke" "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+    rm -f -- "$OUTPUT_DIR/build.demangled.log" "$OUTPUT_DIR/elf-list.txt" \
+        "$OUTPUT_DIR/sass.demangled.txt" "$OUTPUT_DIR/resource-summary.csv" \
+        "$OUTPUT_DIR/timing-summary.csv"
+    mkdir -p "$OUTPUT_DIR/smoke" "$OUTPUT_DIR/timing" "$OUTPUT_DIR/ncu"
+fi
 
 current_phase=byte-exact-regression
 printf 'Running nonzero byte-exact Q4-32 down slots/packed regression...\n'
@@ -462,5 +559,6 @@ if [[ $RUN_NCU == 1 ]]; then
     done
 fi
 
+build_checkpoint_valid || die "evidence binaries changed during audit"
 current_phase=complete
 printf 'SM75 Q4-32 down tile32 audit complete: %s\n' "$OUTPUT_DIR"

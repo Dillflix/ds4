@@ -28,6 +28,29 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q4-gate-native.sh
 ```
 
+The Q4 decode evidence runners serialize access to the checkout because both
+rebuild and execute the same objects and binaries. Interrupted runs write
+`state=interrupted` with the signal-derived exit status; other incomplete
+runs write `state=failed` even if Bash presents a transient zero status to the
+EXIT trap. To resume, reuse the exact output directory explicitly:
+
+```bash
+RESUME=1 \
+Q4_GATE_NATIVE_DIR="$PWD/sm75-decode-q4-gate-native-<timestamp>" \
+./speed-bench/cuda-sm75-decode-q4-gate-native.sh
+```
+
+A successful Q4 audit build writes `build-complete.txt`, binding the Git
+commit, complete tracked-worktree diff, CUDA flags, and both binary hashes.
+The gate audit can reuse a down audit's build only by naming it explicitly;
+it never selects a latest directory:
+
+```bash
+REUSE_BUILD_DIR="$PWD/sm75-decode-q4down-tile32-<timestamp>" \
+SKIP_BUILD=1 \
+./speed-bench/cuda-sm75-decode-q4-gate-native.sh
+```
+
 ### SM75-native Q3A4 decode mapping
 
 `cuda-sm75-decode-q3a4-native.sh` treats Q3A4 as its own decode problem. It
@@ -249,6 +272,10 @@ NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q4down-tile32.sh
 ```
+
+Set `RESUME=1` with the existing `Q4DOWN_TILE32_DIR` to reuse a verified
+completed build after interruption. A missing or mismatched checkpoint forces
+a fresh build; `SKIP_BUILD=1` is rejected in that case.
 
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
