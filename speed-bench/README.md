@@ -3068,11 +3068,30 @@ were active when an endpoint disappeared.
 Every arm keeps the complete 344/344 dense cache, partner-resident FP16 weights,
 partner cuBLAS projections, activation/result shapes, and arithmetic. It varies
 only logical pair 0 (physical GPU 0<->1 under `GPU_DEVICES=0,3,1,2`). The
-current decisive arm is:
+completed localization control is:
 
-- `attention-off`, which retains normal direct partner projections plus both
-  prefill and decode indexer splitting but runs pair-0 prefill attention on the
-  home GPU; pair 1 retains its production 50/50 attention row split.
+- `attention-off`, which retains normal direct partner projections, all mirrored
+  attention-cache updates, and pair-0 decode-indexer splitting but runs pair-0
+  prefill attention on the home GPU. Pair-0 prefill indexer score/top-k also
+  stays home because its split selected-row ownership exists only to feed split
+  attention; pair 1 retains both production 50/50 prefill splits. This arm
+  completed PP32768/TG256 at 250 W with healthy post-run GPUs, localizing the
+  reproduced failure to the pair-0 prefill attention-row path or its
+  interaction. It is a diagnostic control, not a proposed production fallback.
+
+The next row-split-on diagnostic is:
+
+- `attention-phase-audit`, which leaves the full production path enabled and
+  adds device-completion checks only to one selected pair/layer/frontier
+  dispatch (default pair 0, mixed layer 17, position 512). Durable events name
+  `query-copy`, `partner-attention`, `home-attention`, and `result-gather`.
+  Every production row-split operation and byte remains, and only that one
+  known failure-coordinate dispatch is fenced. The fence deliberately removes
+  its normal partner/home overlap and can drain other device work, so a passing
+  arm implicates the overlap, instantaneous-load, or timing envelope rather
+  than proving a specific asynchronous-ordering defect. It is still materially
+  different from a low-load approximation: the surrounding 32K workload and
+  direct-peer traffic remain enabled.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
@@ -3131,6 +3150,26 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
 VARIANTS=attention-off,production \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+To audit the exact row-split failure coordinate without disabling row splitting:
+
+```bash
+ATTN_PHASE_AUDIT_LAYER=17 \
+ATTN_PHASE_AUDIT_POS=512 \
+VARIANTS=attention-phase-audit \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

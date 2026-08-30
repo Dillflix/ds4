@@ -17,6 +17,8 @@ Optional environment:
   STAGE_SPLIT=22
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
   VARIANTS=attention-off,production
+  ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
+  ATTN_PHASE_AUDIT_POS=512
   PP_TOKENS=32768
   TG_TOKENS=256
   REPEATS=1
@@ -49,6 +51,8 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 SMALL_BAR1_PAIR=${SMALL_BAR1_PAIR:-0}
 VARIANTS=${VARIANTS:-attention-off,production}
+ATTN_PHASE_AUDIT_LAYER=${ATTN_PHASE_AUDIT_LAYER:-17}
+ATTN_PHASE_AUDIT_POS=${ATTN_PHASE_AUDIT_POS:-512}
 PP_TOKENS=${PP_TOKENS:-32768}
 TG_TOKENS=${TG_TOKENS:-256}
 REPEATS=${REPEATS:-1}
@@ -70,6 +74,8 @@ cmp -s "$PROMPT" "$repo_dir/speed-bench/promessi_sposi.txt" ||
     die "require GPU_DEVICES=0,3,1,2, GPU_VRAM=auto, STAGE_SPLIT=22"
 for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
             "TG_TOKENS:$TG_TOKENS" "REPEATS:$REPEATS" \
+            "ATTN_PHASE_AUDIT_LAYER:$ATTN_PHASE_AUDIT_LAYER" \
+            "ATTN_PHASE_AUDIT_POS:$ATTN_PHASE_AUDIT_POS" \
             "REQUIRED_POWER_LIMIT_W:$REQUIRED_POWER_LIMIT_W" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "POST_CASE_SETTLE_SECONDS:$POST_CASE_SETTLE_SECONDS" \
@@ -79,6 +85,9 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( SMALL_BAR1_PAIR == 0 && PP_TOKENS == 32768 && TG_TOKENS == 256 &&
+   ATTN_PHASE_AUDIT_LAYER < STAGE_SPLIT &&
+   ATTN_PHASE_AUDIT_POS < PP_TOKENS &&
+   ATTN_PHASE_AUDIT_POS % 512 == 0 &&
    REPEATS >= 1 && REQUIRED_POWER_LIMIT_W == 250 &&
    TELEMETRY_INTERVAL_MS >= 100 &&
    POST_CASE_SETTLE_SECONDS <= 60 )) ||
@@ -95,7 +104,7 @@ IFS=, read -r -a variants <<<"$VARIANTS"
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-phase-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
@@ -130,6 +139,12 @@ if [[ $RESUME == 1 && -s $OUTPUT_DIR/manifest.txt ]]; then
         die "resume model differs from the original isolation"
     grep -Fxq "variants=$VARIANTS" "$OUTPUT_DIR/manifest.txt" ||
         die "resume variant order differs from the original isolation"
+    grep -Fxq "attention_phase_audit_layer=$ATTN_PHASE_AUDIT_LAYER" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume attention phase-audit layer differs from the original isolation"
+    grep -Fxq "attention_phase_audit_pos=$ATTN_PHASE_AUDIT_POS" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume attention phase-audit position differs from the original isolation"
 fi
 
 phase=initialization
@@ -387,6 +402,8 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'logical_pair_0=physical_0_physical_1\n'
         printf 'logical_pair_1=physical_3_physical_2\n'
         printf 'small_bar1_pair=%s\nvariants=%s\n' "$SMALL_BAR1_PAIR" "$VARIANTS"
+        printf 'attention_phase_audit_layer=%s\nattention_phase_audit_pos=%s\n' \
+            "$ATTN_PHASE_AUDIT_LAYER" "$ATTN_PHASE_AUDIT_POS"
         printf 'pp_tokens=%s\ntg_tokens=%s\nrepeats=%s\n' \
             "$PP_TOKENS" "$TG_TOKENS" "$REPEATS"
         printf 'required_power_limit_w=%s\n' "$REQUIRED_POWER_LIMIT_W"
@@ -452,10 +469,30 @@ validate_success_path() {
                 return 1
             grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
                 return 1
-            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+            ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
                 return 1
             grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
                 return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        attention-phase-audit)
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            for audit_phase in query-copy partner-attention home-attention result-gather; do
+                log_line_has "$log" \
+                    "prefill attention row phase audit event=complete phase=$audit_phase " \
+                    "layer=$ATTN_PHASE_AUDIT_LAYER pos=$ATTN_PHASE_AUDIT_POS tokens=512 home=0 partner=2" ||
+                    return 1
+            done
+            ! grep -Eq 'prefill attention row phase audit event=(submit-failed|device-switch-failed|sync-failed)' \
+                "$log" || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -587,6 +624,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             attention-off)
                 variant_env+=("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
+            attention-phase-audit)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_LAYER=$ATTN_PHASE_AUDIT_LAYER")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_POS=$ATTN_PHASE_AUDIT_POS")
+                ;;
             partner-bounce)
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
@@ -643,7 +685,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             fi
         fi
         stop_telemetry
-        gpu_health_snapshot "$post_health" || true
+        post_health_status=0
+        gpu_health_snapshot "$post_health" || post_health_status=124
+        if (( run_status == 0 && post_health_status != 0 )); then
+            run_status=$post_health_status
+        fi
 
         fields=$(last_progress_fields "$progress")
         IFS=$'\t' read -r lp le lc lt <<<"$fields"
@@ -662,8 +708,16 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if [[ $(wc -l <"$bindings") != 345 ]]; then
             die "variant=$variant omitted its 344-entry binding inventory"
         fi
-        validate_success_path "$variant" "$log" "$bindings" ||
+        if ! validate_success_path "$variant" "$log" "$bindings"; then
+            write_result "$result" "$variant" validation-failed 127 \
+                "$progress" "$log"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                validation-failed 127 "$lp" "$le" \
+                >>"$OUTPUT_DIR/run-journal.tsv"
+            sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
             die "variant=$variant failed production-path validation"
+        fi
         write_result "$result" "$variant" passed 0 "$progress" "$log"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \

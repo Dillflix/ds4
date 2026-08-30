@@ -15503,6 +15503,18 @@ static bool env_pair_list_contains(const char *name, int pair) {
     return false;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+static bool env_u32_exactly_matches(const char *name, uint32_t actual) {
+    const char *env = name ? getenv(name) : NULL;
+    if (!env || !env[0]) return false;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    return errno == 0 && end != env && *end == '\0' &&
+           value <= UINT32_MAX && (uint32_t)value == actual;
+}
+#endif
+
 static bool cuda_tp_decode_indexer_rows_pair_enabled(int home_tier) {
     return cuda_tp_decode_indexer_rows_env_enabled() &&
            !env_pair_list_contains(
@@ -28309,6 +28321,57 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_active(
 #endif
 }
 
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
+        int home, uint32_t il, uint32_t pos0) {
+    return env_pair_list_contains(
+               "DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_PAIRS", home) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_LAYER", il) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_POS", pos0);
+}
+
+static void metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+        const char *event, const char *phase,
+        ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens, int home, int partner) {
+    fprintf(stderr,
+            "ds4: CUDA prefill attention row phase audit event=%s "
+            "phase=%s kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d\n",
+            event, phase,
+            kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+            il, pos0, n_tokens, home, partner);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
+        bool submitted, const char *phase, int sync_tier,
+        ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens, int home, int partner) {
+    if (!submitted) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "submit-failed", phase, kind, il, pos0, n_tokens, home, partner);
+        return false;
+    }
+    if (ds4_gpu_set_current_device(sync_tier) != 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "device-switch-failed", phase, kind, il, pos0, n_tokens,
+            home, partner);
+        return false;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "sync-failed", phase, kind, il, pos0, n_tokens, home, partner);
+        return false;
+    }
+    metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+        "complete", phase, kind, il, pos0, n_tokens, home, partner);
+    return true;
+}
+#endif
+
 /* Split independent query rows 50/50 across one NVLink pair. The fixed policy
  * is deterministic across graph lifetimes and homogeneous physical devices.
  * The partner consumes only partner-local raw/compressed KV; remote reads are
@@ -28336,6 +28399,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
 
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
+    const bool phase_audit =
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
+            home, il, pos0);
     uint32_t home_rows = metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
     /* home_n_raw below removes the partner's trailing query rows from the
      * linearized raw span. Keep at least one aligned raw row on home even if a
@@ -28400,10 +28466,19 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
      * The generic xdev helper uses the engine side stream; the destination-
      * ready handshake also prevents scratch reuse while an earlier operation
      * on the destination device is still in flight. */
+    if (phase_audit) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "begin", "query-copy", kind, il, pos0, n_tokens, home, partner);
+    }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
              ds4_gpu_tensor_copy_xdev_default(
                  peer_q_dst, peer_q_src, q_partner_bytes) != 0;
+    }
+    if (phase_audit) {
+        ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
+            ok, "query-copy", partner, kind, il, pos0, n_tokens,
+            home, partner);
     }
 
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
@@ -28423,7 +28498,22 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         }
     }
 
-    if (ok) ok = ds4_gpu_set_current_device(partner) == 0;
+    const bool audit_partner_attention = phase_audit && ok;
+    if (audit_partner_attention) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "begin", "partner-attention", kind, il, pos0, n_tokens,
+            home, partner);
+    }
+    bool partner_device_ready = true;
+    if (ok) {
+        partner_device_ready = ds4_gpu_set_current_device(partner) == 0;
+        ok = partner_device_ready;
+        if (phase_audit && !partner_device_ready) {
+            metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+                "device-switch-failed", "partner-attention", kind, il, pos0,
+                n_tokens, home, partner);
+        }
+    }
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
@@ -28441,7 +28531,26 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             pos0 + home_rows, n_raw, raw_cap, raw_start, n_comp, window,
             ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ds4_gpu_set_current_device(home) != 0) ok = false;
+    if (audit_partner_attention && partner_device_ready) {
+        ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
+            ok, "partner-attention", partner, kind, il, pos0, n_tokens,
+            home, partner);
+    }
+    const bool home_device_ready = ds4_gpu_set_current_device(home) == 0;
+    if (!home_device_ready) {
+        ok = false;
+        if (phase_audit) {
+            metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+                "device-switch-failed", "home-attention", kind, il, pos0,
+                n_tokens, home, partner);
+        }
+    }
+    const bool audit_home_attention = phase_audit && ok;
+    if (audit_home_attention) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "begin", "home-attention", kind, il, pos0, n_tokens,
+            home, partner);
+    }
     if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             home_heads, model->map, model->size, layer->attn_sinks->abs_offset,
@@ -28457,10 +28566,26 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
+    if (audit_home_attention) {
+        ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
+            ok, "home-attention", home, kind, il, pos0, n_tokens,
+            home, partner);
+    }
+    const bool audit_result_gather = phase_audit && ok;
+    if (audit_result_gather) {
+        metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
+            "begin", "result-gather", kind, il, pos0, n_tokens,
+            home, partner);
+    }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
              ds4_gpu_tensor_copy_xdev_default(
                  gather_dst, peer_heads, q_partner_bytes) != 0;
+    }
+    if (audit_result_gather) {
+        ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
+            ok, "result-gather", home, kind, il, pos0, n_tokens,
+            home, partner);
     }
 
     static uint32_t logged_home_mask = 0u;

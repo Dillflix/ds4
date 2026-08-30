@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "attention-off", "partner-bounce", "bounce-indexer-off", "partner-serialized",
-    "indexer-off", "production"
+    "attention-off", "attention-phase-audit", "partner-bounce",
+    "bounce-indexer-off", "partner-serialized", "indexer-off", "production"
 )
 
 
@@ -55,6 +55,22 @@ def indexer_totals(text: str, event: str, pair: int) -> tuple[int, int]:
     return count, traffic
 
 
+def last_attention_phase_audit(text: str) -> str:
+    last = ""
+    pattern = re.compile(
+        r"prefill attention row phase audit event=(\S+) phase=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        r"home=(\d+) partner=(\d+)"
+    )
+    for match in pattern.finditer(text):
+        event, phase, kind, layer, pos, tokens, home, partner = match.groups()
+        last = (
+            f"{event}:{phase}:{kind}:layer{layer}:pos{pos}:tokens{tokens}:"
+            f"home{home}:partner{partner}"
+        )
+    return last
+
+
 def outcome(statuses: list[str]) -> str:
     if not statuses:
         return "not-run"
@@ -62,7 +78,29 @@ def outcome(statuses: list[str]) -> str:
         return "passed"
     if any(status in {"failed", "interrupted-prior-run"} for status in statuses):
         return "failed"
+    if any(status == "validation-failed" for status in statuses):
+        return "invalid"
     return "incomplete"
+
+
+def last_progress(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    return rows[-1] if rows else {}
+
+
+def healthy_post_snapshot(path: Path) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(errors="replace")
+    return (len(re.findall(r"^GPU \d+:", text, re.MULTILINE)) == 4 and
+            not re.search(
+                r"ERR!|GPU is lost|Unknown Error|Unable to determine",
+                text,
+                re.IGNORECASE,
+            ))
 
 
 def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
@@ -73,19 +111,65 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "and rerun it."
         )
     attention = outcomes.get("attention-off", "not-run")
+    phase_audit = outcomes.get("attention-phase-audit", "not-run")
     production = outcomes.get("production", "not-run")
     bounce = outcomes.get("partner-bounce", "not-run")
     bounce_indexer = outcomes.get("bounce-indexer-off", "not-run")
     serialized = outcomes.get("partner-serialized", "not-run")
     indexer = outcomes.get("indexer-off", "not-run")
-    if attention == "passed":
+    attention_rows = [row for row in rows if row.get("variant") == "attention-off"]
+    attention_completed_without_result = (
+        bool(attention_rows) and
+        any(row.get("status") == "completed-no-result" for row in attention_rows) and
+        all(row.get("status") in {"passed", "completed-no-result"}
+            for row in attention_rows)
+    )
+    if phase_audit == "passed":
         return (
+            "All production row-split operations and traffic survived after adding "
+            "four completion checkpoints to only the selected pair/layer/frontier "
+            "dispatch. This does not make row splitting dispensable. The checkpoints "
+            "deliberately perturb overlap and instantaneous load, making that broader "
+            "timing/power/traffic envelope part of the trigger and preserving the "
+            "checkpoint log for the next narrowing step."
+        )
+    if phase_audit == "failed":
+        return (
+            "The targeted row-split phase-audit arm failed. The last durable "
+            "query-copy, partner-attention, home-attention, or result-gather event "
+            "in its production log, if present, is the observation boundary for "
+            "the device loss."
+        )
+    if phase_audit == "invalid":
+        return (
+            "The targeted row-split phase-audit process returned but failed its "
+            "production-path validation. Its result is invalid for causal inference; "
+            "inspect the missing marker before running another arm."
+        )
+    if phase_audit == "incomplete":
+        return (
+            "The targeted row-split phase-audit arm has no validated final outcome. "
+            "Its last durable query-copy, partner-attention, home-attention, or "
+            "result-gather record, if present, remains the observation boundary; "
+            "determine GPU health before classifying the arm as passed or failed."
+        )
+    if attention == "passed" or attention_completed_without_result:
+        result_note = (
+            "The benchmark reached its final decode frontier and emitted results, "
+            "although the older wrapper omitted its final result record. "
+            if attention_completed_without_result else ""
+        )
+        return (
+            result_note +
             "Pair 0 survived with only its prefill attention row split "
-            "disabled while full dense admission, direct partner projections, and "
-            "both prefill/decode indexer splits remained. Against the reproduced "
-            "attention-rows-on failures, "
-            "this makes pair-0 prefill row splitting or its interaction a necessary "
-            "condition in this pass."
+            "disabled while full dense admission, direct partner projections, "
+            "mirrored attention-cache updates, pair-0 decode-indexer splitting, and "
+            "both pair-1 prefill splits remained. Pair-0 prefill indexer splitting "
+            "also stayed home because its split ownership only feeds split attention. "
+            "The reproduced failure was already observed at mixed layer 17/position "
+            "512, before indexed attention begins. Together, this makes the pair-0 "
+            "mixed prefill split-attention ownership/execution path or its interaction "
+            "a necessary condition in this pass."
         )
     if attention == "failed":
         return (
@@ -93,6 +177,12 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "That split is therefore not necessary for the failure; the remaining "
             "common path is full partner projection work/traffic, aggregate load, "
             "power delivery, or the shared PCIe/root-complex path."
+        )
+    if attention == "invalid":
+        return (
+            "The attention-off process returned but failed its production-path "
+            "validation. It is invalid for causal inference; inspect the missing "
+            "marker rather than treating the wrapper failure as a GPU failure."
         )
     if production in {"not-run", "incomplete"}:
         return (
@@ -136,7 +226,11 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "production path failed. The indexer path or its interaction is necessary "
             "under direct transport, pending the host-bounce factorial arm."
         )
-    if all(outcomes.get(variant) == "failed" for variant in VARIANT_ORDER):
+    full_legacy_matrix = (
+        "attention-off", "partner-bounce", "bounce-indexer-off",
+        "partner-serialized", "indexer-off", "production",
+    )
+    if all(outcomes.get(variant) == "failed" for variant in full_legacy_matrix):
         return (
             "Every workload-preserving arm failed. The evidence does not isolate direct "
             "P2P, indexer rows, or overlap; partner computation, aggregate pair load, "
@@ -158,11 +252,18 @@ def main() -> None:
 
     rows: list[dict[str, str]] = []
     statuses: defaultdict[str, list[str]] = defaultdict(list)
-    for result_path in sorted(production.glob("*.result")):
-        values = read_kv(result_path)
+    stems = {
+        path.name.removesuffix(suffix)
+        for suffix in (".result", ".started")
+        for path in production.glob(f"*{suffix}")
+    }
+    for stem in sorted(stems):
+        result_path = production / f"{stem}.result"
+        started_path = production / f"{stem}.started"
+        has_result = result_path.exists()
+        values = read_kv(result_path if has_result else started_path)
         variant = values.get("variant", "unknown")
-        status = values.get("status", "unknown")
-        stem = result_path.name.removesuffix(".result")
+        progress_values = last_progress(production / f"{stem}-progress.csv")
         log_path = production / f"{stem}.log"
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
         bench_path = production / f"{stem}.csv"
@@ -172,6 +273,24 @@ def main() -> None:
                 bench_rows = list(csv.DictReader(handle))
             if bench_rows:
                 bench_row = bench_rows[-1]
+        post_health_ok = healthy_post_snapshot(
+            root / "health" / f"{stem}-post.log"
+        )
+        if has_result:
+            status = values.get("status", "unknown")
+            if status == "passed" and not post_health_ok:
+                status = "passed-unverified-health"
+        elif (bench_row and progress_values.get("phase") == "decode" and
+              progress_values.get("event") == "frontier-complete" and
+              progress_values.get("current") == progress_values.get("total") and
+              post_health_ok):
+            status = "completed-no-result"
+        elif (bench_row and progress_values.get("phase") == "decode" and
+              progress_values.get("event") == "frontier-complete" and
+              progress_values.get("current") == progress_values.get("total")):
+            status = "completed-no-result-unverified-health"
+        else:
+            status = "interrupted-no-result"
         watch_path = root / "telemetry" / f"{stem}-watch-event.txt"
         watch_values = read_kv(watch_path) if watch_path.exists() else {}
         q8_begin_calls, q8_begin_bytes = checkpoint_max(
@@ -194,10 +313,10 @@ def main() -> None:
             "variant": variant,
             "status": status,
             "exit_status": values.get("exit_status", ""),
-            "last_phase": values.get("last_phase", ""),
-            "last_event": values.get("last_event", ""),
-            "last_current": values.get("last_current", ""),
-            "last_total": values.get("last_total", ""),
+            "last_phase": values.get("last_phase", progress_values.get("phase", "")),
+            "last_event": values.get("last_event", progress_values.get("event", "")),
+            "last_current": values.get("last_current", progress_values.get("current", "")),
+            "last_total": values.get("last_total", progress_values.get("total", "")),
             "prefill_tps": bench_row.get("prefill_tps", ""),
             "decode_tps": bench_row.get("gen_tps", ""),
             "pair0_q8_begin_checkpoint_calls": str(q8_begin_calls),
@@ -210,6 +329,8 @@ def main() -> None:
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
+            "attention_phase_audit_last": last_attention_phase_audit(log_text),
+            "post_health": "healthy" if post_health_ok else "unverified",
             "watch_status": watch_values.get("status", ""),
             "result": str(result_path),
             "log": str(log_path),
@@ -241,8 +362,9 @@ def main() -> None:
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
-        "Pair-0 indexer begun bytes | Watch event |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- |",
+        "Pair-0 indexer begun bytes | Attention phase checkpoint | Post health | "
+        "Watch event |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -252,6 +374,8 @@ def main() -> None:
             f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
+            f"{row.get('attention_phase_audit_last', '')} | "
+            f"{row.get('post_health', '')} | "
             f"{row.get('watch_status', '')} |"
         )
     lines.extend([
