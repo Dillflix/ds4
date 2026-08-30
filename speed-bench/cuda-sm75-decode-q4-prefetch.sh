@@ -212,8 +212,11 @@ for family in "${families[@]}"; do
         grep -Fxq 'output_validation=exact-zero' "$log" ||
             die "$family depth $depth output validation missing"
         grep -Fxq 'harness_status=ok' "$log" || die "$family depth $depth harness marker missing"
-        validate_audit "$family" "$depth" single "$log" ||
+        validate_audit "$family" "$depth" single "$log" || {
+            grep -F 'mapping audit' "$log" >&2 ||
+                printf 'audit line missing from %s\n' "$log" >&2
             die "$family depth $depth dispatch audit failed"
+        }
     done
 done
 
@@ -354,8 +357,11 @@ for family in "${families[@]}"; do
             }
         grep -Fxq 'timing_scope=production-owned-call-inclusive' "$log" ||
             die "$family depth $depth timing scope missing"
-        validate_audit "$family" "$depth" paired "$log" ||
+        validate_audit "$family" "$depth" paired "$log" || {
+            grep -F 'mapping audit' "$log" >&2 ||
+                printf 'audit line missing from %s\n' "$log" >&2
             die "$family depth $depth paired dispatch audit failed"
+        }
         control=$(grep '^control_median_ms=' "$log" | cut -d= -f2)
         candidate=$(grep '^candidate_median_ms=' "$log" | cut -d= -f2)
         speedup=$(grep '^candidate_speedup=' "$log" | cut -d= -f2)

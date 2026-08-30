@@ -992,7 +992,8 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING");
-    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT");
+    /* Preserve mapping-audit switches supplied by evidence runners.  They
+     * only add teardown counters and cannot alter kernel selection. */
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
