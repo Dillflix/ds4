@@ -153,7 +153,9 @@ write_run_status running '' "$current_phase"
     printf 'profile_gpu=%s\ncuda_arch=%s\n' "$PROFILE_GPU" "$CUDA_ARCH"
     printf 'scope=audit-only-q4-32-down-decode-tile32-packed-int4\n'
     printf 'production_default=control\nmidq_blocks=8\n'
-    printf 'candidate_block_size=128\ncandidate_static_shared_bytes=1024\n'
+    printf 'candidate_block_size=128\n'
+    printf 'slots_candidate_static_shared_bytes=1024\n'
+    printf 'packed_candidate_static_shared_bytes=1152\n'
     printf 'timing_rounds=%s\ntiming_repeats=%s\nrun_ncu=%s\nresume=%s\n' \
         "$TIMING_ROUNDS" "$TIMING_REPEATS" "$RUN_NCU" "$RESUME"
     printf '\n[gpu]\n'
@@ -370,9 +372,10 @@ for label, (expression, candidate, block_size) in targets.items():
         if allocated > 64:
             raise SystemExit(
                 f"{label}: {allocated} allocated registers exceed the 64-register gate")
-        if values.get("shared_memory", 0) != 1024:
+        expected_shared = 1152 if label == "packed-tile32" else 1024
+        if values.get("shared_memory", 0) != expected_shared:
             raise SystemExit(
-                f"{label}: expected exactly 1024 static shared bytes, got "
+                f"{label}: expected exactly {expected_shared} static shared bytes, got "
                 f"{values.get('shared_memory', 0)}")
         if imma32 == 0 or u4s4 == 0 or s4s4 == 0:
             raise SystemExit(

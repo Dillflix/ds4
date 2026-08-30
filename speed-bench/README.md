@@ -254,7 +254,10 @@ poisoned independent control/candidate outputs, all packed ownership masks
 boundary. It also requires memcheck, fresh PTXAS/SASS identities, both native
 INT4 MMA opcode forms, zero
 atomics, zero stack/spill/local traffic, at most 64 allocated registers, and
-exactly 128 threads plus 1024 bytes of static shared memory for each candidate.
+exactly 128 threads plus 1024 bytes of static shared memory for owned-slots
+and 1152 bytes for owned-packed.  The packed path's extra 128 bytes explicitly
+stage the first prefix-pair total instead of allowing it to spill across the
+second fully unrolled MMA pass; this does not change the SM75 occupancy limit.
 Timing includes the full production-owned call. Nsight Compute captures both
 controls and candidates. Timing requires an odd round count and checks exact
 control/candidate dispatch counters. The zero-weight timing harness measures

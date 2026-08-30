@@ -1425,6 +1425,12 @@ moe_down_sm75_q4_32_tile32_owned_packed_kernel(
     const uint32_t row0 = blockIdx.x * 32u + warp * 8u;
     const uint32_t packed_slot = blockIdx.y;
     __shared__ float leaf[4][8][8];
+    /* Keep the first expert's exact prefix total out of the register file
+     * while the fully unrolled second eight-record MMA pass is live.  Volatile
+     * makes this an intentional shared-memory handoff rather than allowing
+     * ptxas to promote the values back into the two local spill slots this
+     * buffer replaces. */
+    __shared__ volatile float prefix_total[4][8];
 
     if (midq_blocks != 8u || row0 >= out_dim || packed_slot >= 4u) return;
     bool prefix_pair = false;
@@ -1441,7 +1447,6 @@ moe_down_sm75_q4_32_tile32_owned_packed_kernel(
         return;
     }
 
-    float total0 = 0.0f, total1 = 0.0f;
     const uint32_t count = prefix_pair ? 2u : 1u;
 #pragma unroll
     for (uint32_t i = 0; i < 2u; i++) {
@@ -1470,18 +1475,26 @@ moe_down_sm75_q4_32_tile32_owned_packed_kernel(
                 sm75_q4_32_down_reduce8_exact(leaf[warp], n0);
             const float acc1 = sm75_q4_32_down_reduce8_exact(
                 leaf[warp], n0 + 1u);
-            total0 = prefix_pair ? __fadd_rn(total0, acc0) : acc0;
-            total1 = prefix_pair ? __fadd_rn(total1, acc1) : acc1;
+            if (prefix_pair && i == 0u) {
+                /* Match the control's initial total=+0 addition exactly. */
+                prefix_total[warp][n0] = __fadd_rn(0.0f, acc0);
+                prefix_total[warp][n0 + 1u] = __fadd_rn(0.0f, acc1);
+            } else {
+                const float total0 = prefix_pair
+                    ? __fadd_rn(prefix_total[warp][n0], acc0) : acc0;
+                const float total1 = prefix_pair
+                    ? __fadd_rn(prefix_total[warp][n0 + 1u], acc1) : acc1;
+                if (row0 + n0 < out_dim)
+                    out[(uint64_t)packed_slot * out_dim + row0 + n0] =
+                        total0;
+                if (row0 + n0 + 1u < out_dim)
+                    out[(uint64_t)packed_slot * out_dim + row0 + n0 + 1u] =
+                        total1;
+            }
         }
         /* Prevent the next expert's MMA leaders from overwriting shared
          * leaves while the current leaders still consume the exact tree. */
         __syncwarp();
-    }
-    if (lane < 4u) {
-        if (row0 + n0 < out_dim)
-            out[(uint64_t)packed_slot * out_dim + row0 + n0] = total0;
-        if (row0 + n0 + 1u < out_dim)
-            out[(uint64_t)packed_slot * out_dim + row0 + n0 + 1u] = total1;
     }
 }
 
