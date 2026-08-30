@@ -362,6 +362,220 @@ __global__ static void moe_gate_up_mid_decode_sm75_q3a4_hwarp16_owned_kernel(
     }
 }
 
+/* Q4-32 decode half-warp candidate.  Like the Q3A4 experiment above, the
+ * shipping decode shape has exactly 16 K256 records, so two rows can share a
+ * warp without changing either the per-record dot expression or the original
+ * 8/4/2/1 floating-point reduction tree.  This remains an explicitly selected
+ * audit candidate; the production Q4-32 default is unchanged. */
+__global__ static void moe_gate_up_mid_decode_sm75_q4_32_hwarp16_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    const uint32_t lane16 = threadIdx.x & 15u;
+    const uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= expert_mid_dim || slot >= 6u) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane16 == 0u)
+            mid_out[(uint64_t)slot * expert_mid_dim + row] = 0.0f;
+        return;
+    }
+    float gate = 0.0f, up = 0.0f;
+    for (uint32_t b = lane16; b < xq_blocks; b += 16u) {
+        gate += sm75_q32_ops<false>::dot_decode_partial<2u>(
+            sm75_q32_ops<false>::record(gate_base, expert, row,
+                                        expert_mid_dim, xq_blocks, b),
+            row & 7u, xq + b);
+        up += sm75_q32_ops<false>::dot_decode_partial<2u>(
+            sm75_q32_ops<false>::record(up_base, expert, row,
+                                        expert_mid_dim, xq_blocks, b),
+            row & 7u, xq + b);
+    }
+    /* The control warp performs an offset-16 add against a +0 lane before
+     * its 8/4/2/1 tree.  Preserve that signed-zero normalization even though
+     * this half-warp mapping has no offset-16 stage. */
+    gate = __fadd_rn(0.0f, gate);
+    up = __fadd_rn(0.0f, up);
+    gate = half_warp_sum_f32(gate, lane16);
+    up = half_warp_sum_f32(up, lane16);
+    if (lane16 == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
+__device__ __forceinline__ static uint32_t
+sm75_q4_32_sign_extend_nibble_bytes(uint32_t v) {
+    v &= 0x0f0f0f0fu;
+    const uint32_t sign = v & 0x08080808u;
+    return v | (sign << 1u) | (sign << 2u) |
+               (sign << 3u) | (sign << 4u);
+}
+
+/* Native Q4-32 one-token tile candidates.  A warp follows one 8-row weight
+ * tile.  The DP4A specialization expands four signed Q4 nibbles to four
+ * signed bytes per instruction.  The packed-MMA specialization feeds the
+ * native Q4 words directly to Turing m8n8k32 INT4 MMA and replicates the one
+ * decode activation across MMA's eight M rows; lanes 0..3 retain the single
+ * unique row.  Both stage all 16 K256 leaves and reproduce the shipping
+ * warp-sum tree exactly before SiLU/multiply/weight combine. */
+template <bool PACKED_MMA>
+__global__ __launch_bounds__(128, 4) static void
+moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel(
+        float *mid_out, const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const int32_t *selected, const float *weights,
+        uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t expert_base, uint32_t expert_count, float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row8 = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t row0 = blockIdx.x * 32u + warp * 8u;
+    const uint32_t slot = blockIdx.y;
+    __shared__ float gate_part[4][16][8];
+    __shared__ float up_part[4][16][8];
+
+    if (xq_blocks != 16u) return;
+    if (slot >= 6u || row0 >= expert_mid_dim) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane < 8u && row0 + lane < expert_mid_dim)
+            mid_out[(uint64_t)slot * expert_mid_dim + row0 + lane] = 0.0f;
+        return;
+    }
+
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        const cuda_sm75_q4_32_tile *gate_w =
+            sm75_q32_ops<false>::record(gate_base, expert, row0,
+                                        expert_mid_dim, xq_blocks, b);
+        const cuda_sm75_q4_32_tile *up_w =
+            sm75_q32_ops<false>::record(up_base, expert, row0,
+                                        expert_mid_dim, xq_blocks, b);
+        const cuda_sm75_native_q8_K *a = xq + b;
+
+        if (PACKED_MMA) {
+            /* Every lane supplies its native A/B fragment.  Making A depend
+             * only on lane&3 duplicates the same decode row in all eight M
+             * positions.  The first M row (lanes 0..3) owns the unique
+             * result, two output columns per lane. */
+            float gate0, gate1, up0, up1;
+            const uint32_t n0 = lane4 * 2u;
+            sm75_q32_ops<false>::mma_block(
+                gate_w, a, lane, n0, &gate0, &gate1);
+            sm75_q32_ops<false>::mma_block(
+                up_w, a, lane, n0, &up0, &up1);
+            if (lane < 4u) {
+                gate_part[warp][b][n0] = __fadd_rn(0.0f, gate0);
+                gate_part[warp][b][n0 + 1u] = __fadd_rn(0.0f, gate1);
+                up_part[warp][b][n0] = __fadd_rn(0.0f, up0);
+                up_part[warp][b][n0 + 1u] = __fadd_rn(0.0f, up1);
+            }
+        } else {
+            int gate_total = 0, up_total = 0;
+#pragma unroll 1
+            for (uint32_t group = 0; group < 8u; group++) {
+                const uint32_t gate_qw = gate_w->b[group][lane];
+                const uint32_t up_qw = up_w->b[group][lane];
+                const uint32_t lo = a->low[group][lane4];
+                const uint32_t hi = a->high_signed[group][lane4];
+                const uint32_t nibble_mask = 0x0f0f0f0fu;
+                const uint32_t a_even =
+                    (lo & nibble_mask) | ((hi & nibble_mask) << 4u);
+                const uint32_t a_odd =
+                    ((lo >> 4u) & nibble_mask) | (hi & 0xf0f0f0f0u);
+                const uint32_t gate_even =
+                    sm75_q4_32_sign_extend_nibble_bytes(gate_qw);
+                const uint32_t gate_odd =
+                    sm75_q4_32_sign_extend_nibble_bytes(gate_qw >> 4u);
+                const uint32_t up_even =
+                    sm75_q4_32_sign_extend_nibble_bytes(up_qw);
+                const uint32_t up_odd =
+                    sm75_q4_32_sign_extend_nibble_bytes(up_qw >> 4u);
+                int gate_sum = __dp4a((int)a_even, (int)gate_even, 0);
+                gate_sum = __dp4a(
+                    (int)a_odd, (int)gate_odd, gate_sum);
+                int up_sum = __dp4a((int)a_even, (int)up_even, 0);
+                up_sum = __dp4a((int)a_odd, (int)up_odd, up_sum);
+                const int gate1 =
+                    __shfl_sync(0xffffffffu, gate_sum, 1, 4);
+                const int gate2 =
+                    __shfl_sync(0xffffffffu, gate_sum, 2, 4);
+                const int gate3 =
+                    __shfl_sync(0xffffffffu, gate_sum, 3, 4);
+                const int up1 = __shfl_sync(0xffffffffu, up_sum, 1, 4);
+                const int up2 = __shfl_sync(0xffffffffu, up_sum, 2, 4);
+                const int up3 = __shfl_sync(0xffffffffu, up_sum, 3, 4);
+                if (lane4 == 0u) {
+                    const int gate_group =
+                        ((gate_sum + gate1) + gate2) + gate3;
+                    const int up_group = ((up_sum + up1) + up2) + up3;
+                    gate_total += sm75_q32_scale6(
+                        gate_w->scales[row8], group) * gate_group;
+                    up_total += sm75_q32_scale6(
+                        up_w->scales[row8], group) * up_group;
+                }
+            }
+            if (lane4 == 0u) {
+                const float gate_leaf = a->d *
+                    dev_f16_to_f32(gate_w->d[row8]) * (float)gate_total;
+                const float up_leaf = a->d *
+                    dev_f16_to_f32(up_w->d[row8]) * (float)up_total;
+                gate_part[warp][b][row8] =
+                    __fadd_rn(0.0f, gate_leaf);
+                up_part[warp][b][row8] = __fadd_rn(0.0f, up_leaf);
+            }
+        }
+    }
+    __syncwarp();
+
+    /* The control's first offset-16 stage adds an inactive-lane +0 to every
+     * live leaf.  Normalize the staged values explicitly, then perform its
+     * offset 8, offset 4, and four-lane offset 2/1 tree. */
+    const float gate0 =
+        __fadd_rn(gate_part[warp][lane4][row8], 0.0f);
+    const float gate8 =
+        __fadd_rn(gate_part[warp][lane4 + 8u][row8], 0.0f);
+    const float gate4 =
+        __fadd_rn(gate_part[warp][lane4 + 4u][row8], 0.0f);
+    const float gate12 =
+        __fadd_rn(gate_part[warp][lane4 + 12u][row8], 0.0f);
+    const float up0 = __fadd_rn(up_part[warp][lane4][row8], 0.0f);
+    const float up8 =
+        __fadd_rn(up_part[warp][lane4 + 8u][row8], 0.0f);
+    const float up4 =
+        __fadd_rn(up_part[warp][lane4 + 4u][row8], 0.0f);
+    const float up12 =
+        __fadd_rn(up_part[warp][lane4 + 12u][row8], 0.0f);
+    float gate = __fadd_rn(
+        __fadd_rn(gate0, gate8), __fadd_rn(gate4, gate12));
+    float up = __fadd_rn(
+        __fadd_rn(up0, up8), __fadd_rn(up4, up12));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 2, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 2, 4));
+    gate = __fadd_rn(gate, __shfl_down_sync(0xffffffffu, gate, 1, 4));
+    up = __fadd_rn(up, __shfl_down_sync(0xffffffffu, up, 1, 4));
+    if (lane4 == 0u && row0 + row8 < expert_mid_dim) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        mid_out[(uint64_t)slot * expert_mid_dim + row0 + row8] =
+            (gate / (1.0f + expf(-gate))) * up * weights[slot];
+    }
+}
+
 /* Native-layout Q3A4 decode mapping.  A warp follows one 8-row Q3A4 tile
  * instead of following one row through 16 tile records:
  *

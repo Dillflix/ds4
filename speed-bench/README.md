@@ -1,5 +1,33 @@
 ## Benchmarking
 
+### SM75-native Q4-32 decode gate/up audit
+
+`cuda-sm75-decode-q4-gate-native.sh` compares the unchanged Q4-32 one-row/
+warp decode control with three audit-only mappings: two rows per warp,
+eight-row native-tile signed DP4A, and eight-row native-tile packed
+`m8n8k32` INT4 MMA.  The production default remains control until a candidate
+passes this bounded audit and a separate real-model production A/B.
+
+The exactness checkpoint uses the production 4096-element K dimension (16
+K256 records), two deterministic nonzero inputs, nonuniform expert weights,
+and interleaved owned/unowned slots.  It requires byte equality at both the
+gate/up mid boundary and final Q4-32 down output, with nonzero reference and
+candidate outputs.  Fresh PTXAS/SASS gates reject spills, local memory,
+ATOM/RED, more than 128 allocated registers, or failure of the two-CTA/SM
+register budget.  The DP4A candidate must contain `IDP.4A`; the packed-MMA
+candidate must contain both `IMMA.8832.U4.S4` and `IMMA.8832.S4.S4`.  Timing
+includes activation quantize/pack, fused gate/up, mid quantize/pack, and down.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q4-gate-native.sh
+```
+
 ### SM75-native Q3A4 decode mapping
 
 `cuda-sm75-decode-q3a4-native.sh` treats Q3A4 as its own decode problem. It
