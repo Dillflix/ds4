@@ -214,6 +214,42 @@ CREATE_ARCHIVE=1 \
 ./speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh
 ```
 
+### SM75 Q4-32 down tile32 packed-INT4 audit
+
+`cuda-sm75-decode-q4down-tile32.sh` compares the existing one-token
+quarter-warp `owned_slots` and `owned_packed` Q4-32 down kernels with
+audit-only 128-thread tile32 candidates. A warp follows one native eight-row
+tile and consumes the tagged packed Q4 weights directly through Turing
+`m8n8k32` U4xS4 and S4xS4 MMA. All eight K256 float leaves are staged before
+the unchanged 4/2/1 reduction. The packed exactness fixture owns slots 0+1 in
+both three-slot groups, so it proves the real prefix-pair exact-add case rather
+than only single packed operands.
+
+The runner requires nonzero byte-exact outputs for both ownership modes,
+poisoned independent control/candidate outputs, all packed ownership masks
+`000` through `111`, the mask-`111` second prefix-pair cycle, and a signed-zero
+boundary. It also requires memcheck, fresh PTXAS/SASS identities, both native
+INT4 MMA opcode forms, zero
+atomics, zero stack/spill/local traffic, at most 64 allocated registers, and
+exactly 128 threads plus 1024 bytes of static shared memory for each candidate.
+Timing includes the full production-owned call. Nsight Compute captures both
+controls and candidates. Timing requires an odd round count and checks exact
+control/candidate dispatch counters. The zero-weight timing harness measures
+launch and resource shape; the independent long-context regression is the
+arithmetic proof. Tile32 is default-off and remains an audit candidate until
+real-model end-to-end decode evidence supports promotion.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+./speed-bench/cuda-sm75-decode-q4down-tile32.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection

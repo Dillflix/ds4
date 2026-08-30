@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence, agent/sm75-decode-crash-isolation, agent/sm75-decode-q4-gate-native]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence, agent/sm75-decode-crash-isolation, agent/sm75-decode-q4-gate-native, agent/sm75-decode-q4down-tile32-audit, agent/sm75-decode-q4-native-audit]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -69,6 +69,7 @@ on:
       - "speed-bench/summarize-sm75-decode-evidence.py"
       - "speed-bench/cuda-sm75-decode-crash-isolation.sh"
       - "speed-bench/cuda-sm75-decode-graph-ab.sh"
+      - "speed-bench/cuda-sm75-decode-q4down-tile32.sh"
       - "speed-bench/cuda-sm75-pair-stability-matrix.sh"
       - "speed-bench/summarize-sm75-decode-crash-isolation.py"
       - "speed-bench/cuda-sm75-xdev-feature-isolation.sh"
@@ -179,6 +180,8 @@ jobs:
           bash -n speed-bench/cuda-sm75-decode-graph-ab.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-ksplit.sh
+          test -x speed-bench/cuda-sm75-decode-q4down-tile32.sh
+          bash -n speed-bench/cuda-sm75-decode-q4down-tile32.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
           test -x speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh

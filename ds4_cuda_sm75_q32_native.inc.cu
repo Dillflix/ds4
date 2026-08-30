@@ -1331,6 +1331,160 @@ __global__ static void moe_down_sm75_q4_32_owned_packed_kernel(
     if (lane == 0u) out[(uint64_t)packed_slot * out_dim + row] = total;
 }
 
+/* Decode-only packed-INT4 mapping for the production eight-record Q4-32
+ * down projection.  A warp follows one native eight-row tile.  Each MMA
+ * consumes one K256 record and produces the eight output rows; the four
+ * lane leaders stage its two-row fragments.  Keeping all eight float leaves
+ * in shared memory lets the leaders reproduce quarter_warp_sum_f32's exact
+ * 4/2/1 tree without carrying sixteen live float accumulators through the
+ * packed-INT4 MMA loop.
+ *
+ * Four warps cover the same 32 output rows as the 256-thread scalar control.
+ * The 128-thread launch bound intentionally caps allocation at 64 registers,
+ * so eight CTAs can supply all 32 resident SM75 warps if the compiler keeps
+ * the candidate spill-free. */
+__device__ __forceinline__ static float sm75_q4_32_down_reduce8_exact(
+        const float leaf[8][8], uint32_t row8) {
+    const float a0 = __fadd_rn(leaf[0][row8], leaf[4][row8]);
+    const float a1 = __fadd_rn(leaf[1][row8], leaf[5][row8]);
+    const float a2 = __fadd_rn(leaf[2][row8], leaf[6][row8]);
+    const float a3 = __fadd_rn(leaf[3][row8], leaf[7][row8]);
+    return __fadd_rn(__fadd_rn(a0, a2), __fadd_rn(a1, a3));
+}
+
+__global__ __launch_bounds__(128, 8) static void
+moe_down_sm75_q4_32_tile32_owned_slots_kernel(
+        float *out, const char *down_base,
+        const cuda_sm75_native_q8_K *midq, const int32_t *selected,
+        uint32_t midq_blocks, uint32_t out_dim,
+        uint32_t expert_base, uint32_t expert_count) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t n0 = lane4 * 2u;
+    const uint32_t row0 = blockIdx.x * 32u + warp * 8u;
+    const uint32_t slot = blockIdx.y;
+    __shared__ float leaf[4][8][8];
+
+    /* Dispatch admits this candidate only for the production K=8 shape.
+     * Keep the condition explicit so an accidental direct launch cannot read
+     * uninitialized leaves. */
+    if (midq_blocks != 8u || row0 >= out_dim || slot >= 6u) return;
+    uint32_t expert = 0;
+    if (!moe_owned_local_expert(selected[slot], expert_base,
+                                expert_count, &expert)) {
+        if (lane < 4u) {
+            if (row0 + n0 < out_dim)
+                out[(uint64_t)slot * out_dim + row0 + n0] = 0.0f;
+            if (row0 + n0 + 1u < out_dim)
+                out[(uint64_t)slot * out_dim + row0 + n0 + 1u] = 0.0f;
+        }
+        return;
+    }
+
+#pragma unroll
+    for (uint32_t b = 0; b < 8u; b++) {
+        const cuda_sm75_q4_32_tile *w =
+            sm75_q32_ops<false>::record(
+                down_base, expert, row0, out_dim, midq_blocks, b);
+        const cuda_sm75_native_q8_K *a =
+            midq + (uint64_t)slot * midq_blocks + b;
+        float v0 = 0.0f, v1 = 0.0f;
+        sm75_q32_ops<false>::mma_block(w, a, lane, n0, &v0, &v1);
+        /* Every four-lane MMA token group sees the same decode activation.
+         * The first group owns the unique output fragments.  Normalize each
+         * staged leaf with the control's initial +0 addition.  This is
+         * observable for a raw -0 MMA product and is part of byte exactness. */
+        if (lane < 4u) {
+            leaf[warp][b][n0] = __fadd_rn(0.0f, v0);
+            leaf[warp][b][n0 + 1u] = __fadd_rn(0.0f, v1);
+        }
+    }
+    __syncwarp();
+    if (lane < 4u) {
+        const float v0 = sm75_q4_32_down_reduce8_exact(leaf[warp], n0);
+        const float v1 = sm75_q4_32_down_reduce8_exact(
+            leaf[warp], n0 + 1u);
+        if (row0 + n0 < out_dim)
+            out[(uint64_t)slot * out_dim + row0 + n0] = v0;
+        if (row0 + n0 + 1u < out_dim)
+            out[(uint64_t)slot * out_dim + row0 + n0 + 1u] = v1;
+    }
+}
+
+__global__ __launch_bounds__(128, 8) static void
+moe_down_sm75_q4_32_tile32_owned_packed_kernel(
+        float *out, const char *down_base,
+        const cuda_sm75_native_q8_K *midq, const int32_t *selected,
+        uint32_t midq_blocks, uint32_t out_dim,
+        uint32_t expert_base, uint32_t expert_count) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t n0 = lane4 * 2u;
+    const uint32_t row0 = blockIdx.x * 32u + warp * 8u;
+    const uint32_t packed_slot = blockIdx.y;
+    __shared__ float leaf[4][8][8];
+
+    if (midq_blocks != 8u || row0 >= out_dim || packed_slot >= 4u) return;
+    bool prefix_pair = false;
+    const int first = moe_owned_packed_component(
+        selected, packed_slot / 2u, packed_slot & 1u,
+        expert_base, expert_count, &prefix_pair);
+    if (first < 0) {
+        if (lane < 4u) {
+            if (row0 + n0 < out_dim)
+                out[(uint64_t)packed_slot * out_dim + row0 + n0] = 0.0f;
+            if (row0 + n0 + 1u < out_dim)
+                out[(uint64_t)packed_slot * out_dim + row0 + n0 + 1u] = 0.0f;
+        }
+        return;
+    }
+
+    float total0 = 0.0f, total1 = 0.0f;
+    const uint32_t count = prefix_pair ? 2u : 1u;
+#pragma unroll
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (i >= count) break;
+        const uint32_t slot = (uint32_t)first + i;
+        uint32_t expert = 0;
+        if (!moe_owned_local_expert(selected[slot], expert_base,
+                                    expert_count, &expert)) continue;
+#pragma unroll
+        for (uint32_t b = 0; b < 8u; b++) {
+            const cuda_sm75_q4_32_tile *w =
+                sm75_q32_ops<false>::record(
+                    down_base, expert, row0, out_dim, midq_blocks, b);
+            const cuda_sm75_native_q8_K *a =
+                midq + (uint64_t)slot * midq_blocks + b;
+            float v0 = 0.0f, v1 = 0.0f;
+            sm75_q32_ops<false>::mma_block(w, a, lane, n0, &v0, &v1);
+            if (lane < 4u) {
+                leaf[warp][b][n0] = __fadd_rn(0.0f, v0);
+                leaf[warp][b][n0 + 1u] = __fadd_rn(0.0f, v1);
+            }
+        }
+        __syncwarp();
+        if (lane < 4u) {
+            const float acc0 =
+                sm75_q4_32_down_reduce8_exact(leaf[warp], n0);
+            const float acc1 = sm75_q4_32_down_reduce8_exact(
+                leaf[warp], n0 + 1u);
+            total0 = prefix_pair ? __fadd_rn(total0, acc0) : acc0;
+            total1 = prefix_pair ? __fadd_rn(total1, acc1) : acc1;
+        }
+        /* Prevent the next expert's MMA leaders from overwriting shared
+         * leaves while the current leaders still consume the exact tree. */
+        __syncwarp();
+    }
+    if (lane < 4u) {
+        if (row0 + n0 < out_dim)
+            out[(uint64_t)packed_slot * out_dim + row0 + n0] = total0;
+        if (row0 + n0 + 1u < out_dim)
+            out[(uint64_t)packed_slot * out_dim + row0 + n0 + 1u] = total1;
+    }
+}
+
 #define DS4_SM75_Q32_SLOT4_DECL(S) \
     float s0_##S=0.0f,s1_##S=0.0f,s2_##S=0.0f,s3_##S=0.0f
 #define DS4_SM75_Q32_SLOT4_ADD(S,A,B,C,D) \

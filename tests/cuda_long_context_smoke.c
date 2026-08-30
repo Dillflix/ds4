@@ -17,6 +17,8 @@ extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_ksplit(void);
 extern void ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(uint32_t depth);
 extern uint32_t ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth(void);
+extern void ds4_gpu_test_set_moe_q4_32_down_decode_mapping(uint32_t mapping);
+extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_mapping(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
@@ -1243,6 +1245,28 @@ static int require_sm75_q32_overwritten_f32(
     return 1;
 }
 
+static void fill_q4_down_poison(float *values, uint64_t count) {
+    const uint32_t bits = 0x7fc12345u;
+    for (uint64_t i = 0; i < count; i++)
+        memcpy(values + i, &bits, sizeof(bits));
+}
+
+static int require_q4_down_overwritten(const char *label,
+                                       const float *values,
+                                       uint64_t count) {
+    const uint32_t poison = 0x7fc12345u;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t bits;
+        memcpy(&bits, values + i, sizeof(bits));
+        if (bits == poison) {
+            fprintf(stderr, "%s left poison at %llu\n", label,
+                    (unsigned long long)i);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int require_sm75_q32_f32_bits(
         const char *label, float value, uint32_t expected) {
     uint32_t bits = 0u;
@@ -1251,6 +1275,29 @@ static int require_sm75_q32_f32_bits(
     fprintf(stderr, "%s bits=0x%08x expected=0x%08x\n",
             label, bits, expected);
     return 0;
+}
+
+static int require_q4_down_positive_zero_rows(const char *label,
+                                              const float *values,
+                                              uint32_t vectors,
+                                              uint32_t stride) {
+    for (uint32_t i = 0; i < vectors; i++) {
+        uint32_t bits;
+        memcpy(&bits, values + (uint64_t)i * stride, sizeof(bits));
+        if (bits != 0u) {
+            fprintf(stderr, "%s vector %u row 0 is 0x%08x, expected +0\n",
+                    label, i, bits);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int q4_down_packed_component_present(uint32_t mask,
+                                            uint32_t component) {
+    if (component == 0u) return mask != 0u;
+    if ((mask & 3u) == 3u) return (mask & 4u) != 0u;
+    return mask != 0u && (mask & (mask - 1u)) != 0u;
 }
 
 static int check_sm75_q3a4_ksplit_env(void) {
@@ -1742,6 +1789,234 @@ cleanup:
 static int check_sm75_q32_owned_graph(void) {
     int rc = check_sm75_q32_owned_graph_case(42u, "Q4-32");
     if (check_sm75_q32_owned_graph_case(43u, "Q3A4") != 0) rc = 1;
+    return rc;
+}
+
+/* Compare the audit-only packed-INT4 Q4-32 down mapping against both real
+ * production controls.  The eight nonzero K256 records are the production
+ * down shape.  Control/candidate outputs live in separate poisoned buffers,
+ * and the packed cases cover every three-slot ownership mask. */
+static int check_sm75_q4_32_down_tile32_exact(void) {
+    const uint32_t n_total = 8u, n_expert = 6u;
+    const uint32_t in_dim = 256u, mid_dim = 2048u, out_dim = 256u;
+    const uint32_t in_blocks = 1u, mid_blocks = 8u;
+    const uint64_t gate_row = 136u * in_blocks;
+    const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
+    const uint64_t down_row = 136u * mid_blocks;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    const uint64_t gate_off = 0u;
+    const uint64_t up_off = gate_expert * n_total;
+    const uint64_t down_off = up_off + gate_expert * n_total;
+    const uint64_t model_bytes = down_off + down_expert * n_total;
+    const uint64_t slot_count = 6ull * out_dim;
+    const uint64_t packed_count = 4ull * out_dim;
+    const uint64_t mid_count = 6ull * mid_dim;
+    const int32_t slot_selected[6] = {0, 1, 4, 2, 3, 5};
+    const uint32_t packed_masks[4][2] = {
+        {0u, 1u}, {2u, 3u}, {4u, 5u}, {6u, 7u},
+    };
+    const char *const mask_names[8] = {
+        "000", "001", "010", "011", "100", "101", "110", "111",
+    };
+    const float wh[6] = {0.125f, 0.25f, 0.375f,
+                         0.5f, 0.625f, 0.75f};
+    unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
+    float *xh = (float *)malloc((size_t)in_dim * sizeof(float));
+    float *poison = (float *)malloc((size_t)slot_count * sizeof(float));
+    float *slot_ref = (float *)malloc((size_t)slot_count * sizeof(float));
+    float *slot_got = (float *)malloc((size_t)slot_count * sizeof(float));
+    float *packed_ref =
+        (float *)malloc((size_t)packed_count * sizeof(float));
+    float *packed_got =
+        (float *)malloc((size_t)packed_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(sizeof(slot_selected));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(sizeof(wh));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(slot_count * sizeof(float));
+    ds4_gpu_tensor *slot_ref_out =
+        ds4_gpu_tensor_alloc(slot_count * sizeof(float));
+    ds4_gpu_tensor *slot_got_out =
+        ds4_gpu_tensor_alloc(slot_count * sizeof(float));
+    ds4_gpu_tensor *packed_ref_out =
+        ds4_gpu_tensor_alloc(packed_count * sizeof(float));
+    ds4_gpu_tensor *packed_got_out =
+        ds4_gpu_tensor_alloc(packed_count * sizeof(float));
+    int rc = 1;
+    if (!model || !xh || !poison || !slot_ref || !slot_got ||
+        !packed_ref || !packed_got || !x || !selected || !weights ||
+        !out || !gate || !up || !mid || !down ||
+        !slot_ref_out || !slot_got_out ||
+        !packed_ref_out || !packed_got_out) goto cleanup;
+
+    fill_sm75_q4_32_tensor(model + gate_off, 0u, n_total,
+                           mid_dim, in_blocks);
+    fill_sm75_q4_32_tensor(model + up_off, 1u, n_total,
+                           mid_dim, in_blocks);
+    fill_sm75_q4_32_tensor(model + down_off, 2u, n_total,
+                           out_dim, mid_blocks);
+    /* A raw MMA leaf for row zero is signed zero.  The scalar control's
+     * initial +0 add normalizes it; candidate staging must do the same. */
+    test_sm75_q4_32_tile *down_tiles =
+        (test_sm75_q4_32_tile *)(model + down_off);
+    for (uint32_t e = 0; e < n_total; e++) {
+        for (uint32_t b = 0; b < mid_blocks; b++) {
+            test_sm75_q4_32_tile *tile = down_tiles +
+                ((uint64_t)e * (out_dim / 8u)) * mid_blocks + b;
+            tile->d[0] = 0x8000u; /* FP16 -0. */
+        }
+    }
+    for (uint32_t i = 0; i < in_dim; i++)
+        xh[i] = (float)((int)((i * 29u + (i >> 2u) * 17u) % 211u) - 105) /
+            109.0f;
+    fill_q4_down_poison(poison, slot_count);
+    if (!ds4_gpu_set_model_map(model, model_bytes) ||
+        !ds4_gpu_tensor_write(x, 0u, xh, in_dim * sizeof(float)) ||
+        !ds4_gpu_tensor_write(weights, 0u, wh, sizeof(wh))) goto cleanup;
+
+    ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                                  DS4_TENSOR_LAYOUT_SM75_Q3A4);
+    ds4_gpu_test_set_moe_q32_decode_graph(0);
+    ds4_gpu_test_set_moe_q32_decode_split(0);
+    ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+
+#define RUN_Q4_DOWN(OUT, BASE, COUNT, PACKED) \
+    ds4_gpu_routed_moe_one_owned_tensor( \
+        out, gate, up, mid, down, model, model_bytes, \
+        gate_off, up_off, down_off, 42u, 42u, \
+        gate_expert, gate_row, down_expert, down_row, \
+        in_dim, mid_dim, out_dim, selected, weights, \
+        n_total, n_expert, BASE, COUNT, 10.0f, x, OUT, PACKED, NULL)
+
+    /* Non-packed owned_slots control and candidate use distinct poisoned
+     * outputs, so an omitted candidate launch cannot inherit the reference. */
+    if (!ds4_gpu_tensor_write(selected, 0u, slot_selected,
+                              sizeof(slot_selected)) ||
+        !ds4_gpu_tensor_write(slot_ref_out, 0u, poison,
+                              slot_count * sizeof(float))) goto cleanup;
+    ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
+    if (!RUN_Q4_DOWN(slot_ref_out, 0u, 4u, false) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(slot_ref_out, 0u, slot_ref,
+                             slot_count * sizeof(float)) ||
+        !require_q4_down_overwritten(
+            "SM75 Q4-32 down owned_slots control", slot_ref, slot_count) ||
+        !require_nonzero_f32("SM75 Q4-32 down owned_slots control",
+                             slot_ref, slot_count) ||
+        !require_q4_down_positive_zero_rows(
+            "SM75 Q4-32 down owned_slots signed-zero control",
+            slot_ref, 6u, out_dim) ||
+        !ds4_gpu_tensor_write(slot_got_out, 0u, poison,
+                              slot_count * sizeof(float))) goto cleanup;
+    ds4_gpu_test_set_moe_q4_32_down_decode_mapping(1u);
+    if (!RUN_Q4_DOWN(slot_got_out, 0u, 4u, false) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(slot_got_out, 0u, slot_got,
+                             slot_count * sizeof(float)) ||
+        !require_q4_down_overwritten(
+            "SM75 Q4-32 down tile32 owned_slots", slot_got, slot_count) ||
+        !compare_exact_f32("SM75 Q4-32 down tile32 owned_slots",
+                           slot_ref, slot_got, (size_t)slot_count) ||
+        !require_q4_down_positive_zero_rows(
+            "SM75 Q4-32 down tile32 owned_slots signed-zero",
+            slot_got, 6u, out_dim)) goto cleanup;
+
+    /* Four cases pair masks 000/001, 010/011, 100/101 and 110/111.
+     * Mask 111 forces both the prefix-pair reuse/barrier cycle and its second
+     * packed component. */
+    for (uint32_t c = 0; c < 4u; c++) {
+        int32_t packed_selected[6];
+        char label[160];
+        for (uint32_t group = 0; group < 2u; group++) {
+            const uint32_t mask = packed_masks[c][group];
+            for (uint32_t i = 0; i < 3u; i++) {
+                const uint32_t slot = group * 3u + i;
+                packed_selected[slot] = (mask & (1u << i)) != 0u
+                    ? (int32_t)(4u + (slot & 3u))
+                    : (int32_t)(slot & 3u);
+            }
+        }
+        if (!ds4_gpu_tensor_write(selected, 0u, packed_selected,
+                                   sizeof(packed_selected)) ||
+            !ds4_gpu_tensor_write(packed_ref_out, 0u, poison,
+                                  packed_count * sizeof(float))) goto cleanup;
+        ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
+        if (!RUN_Q4_DOWN(packed_ref_out, 4u, 4u, true) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(packed_ref_out, 0u, packed_ref,
+                                 packed_count * sizeof(float))) goto cleanup;
+        snprintf(label, sizeof(label),
+                 "SM75 Q4-32 down owned_packed masks %s/%s control",
+                 mask_names[packed_masks[c][0]],
+                 mask_names[packed_masks[c][1]]);
+        if (!require_q4_down_overwritten(label, packed_ref, packed_count) ||
+            !require_q4_down_positive_zero_rows(
+                label, packed_ref, 4u, out_dim) ||
+            !ds4_gpu_tensor_write(packed_got_out, 0u, poison,
+                                  packed_count * sizeof(float))) goto cleanup;
+        for (uint32_t group = 0; group < 2u; group++) {
+            for (uint32_t component = 0; component < 2u; component++) {
+                if (!q4_down_packed_component_present(
+                        packed_masks[c][group], component)) continue;
+                snprintf(label, sizeof(label),
+                         "SM75 Q4-32 down packed mask %s component %u",
+                         mask_names[packed_masks[c][group]], component);
+                if (!require_nonzero_f32(
+                        label,
+                        packed_ref + (group * 2u + component) * out_dim,
+                        out_dim)) goto cleanup;
+            }
+        }
+        ds4_gpu_test_set_moe_q4_32_down_decode_mapping(1u);
+        if (!RUN_Q4_DOWN(packed_got_out, 4u, 4u, true) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(packed_got_out, 0u, packed_got,
+                                 packed_count * sizeof(float))) goto cleanup;
+        snprintf(label, sizeof(label),
+                 "SM75 Q4-32 down tile32 owned_packed masks %s/%s",
+                 mask_names[packed_masks[c][0]],
+                 mask_names[packed_masks[c][1]]);
+        if (!require_q4_down_overwritten(label, packed_got, packed_count) ||
+            !compare_exact_f32(label, packed_ref, packed_got,
+                               (size_t)packed_count) ||
+            !require_q4_down_positive_zero_rows(
+                label, packed_got, 4u, out_dim)) goto cleanup;
+    }
+
+    fprintf(stderr,
+            "cuda-regression: SM75 Q4-32 down tile32 packed-INT4 "
+            "owned_slots nonzero poison-overwrite exact\n"
+            "cuda-regression: SM75 Q4-32 down tile32 packed-INT4 "
+            "owned_packed masks 000..111 poison-overwrite exact\n"
+            "cuda-regression: SM75 Q4-32 down tile32 packed-INT4 "
+            "mask111 prefix-pair second-cycle exact\n"
+            "cuda-regression: SM75 Q4-32 down tile32 signed-zero boundary "
+            "exact\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+    ds4_gpu_test_set_moe_q32_decode_split(0);
+    ds4_gpu_test_set_moe_q32_decode_graph(1);
+    ds4_gpu_set_routed_q4_layout(0u);
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(packed_got_out);
+    ds4_gpu_tensor_free(packed_ref_out);
+    ds4_gpu_tensor_free(slot_got_out);
+    ds4_gpu_tensor_free(slot_ref_out);
+    ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
+    free(packed_got); free(packed_ref); free(slot_got); free(slot_ref);
+    free(poison); free(xh); free(model);
+#undef RUN_Q4_DOWN
     return rc;
 }
 
@@ -2421,6 +2696,8 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
     if (check_sm75_q4_32_mapping_env() != 0) return 1;
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT");
     if (check_sm75_q3a4_ksplit_env() != 0) return 1;
     if (check_sm75_q4_32_dp4a_pack() != 0) return 1;
     if (check_sm75_q3a4_dp4a_pack() != 0) return 1;
@@ -2460,6 +2737,14 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
+    if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 0u) {
+        fprintf(stderr,
+                "cuda-regression: SM75 Q4-32 down audit mapping is not "
+                "default-off\n");
+        ds4_gpu_cleanup();
+        free(idle_model_map);
+        return 1;
+    }
     fprintf(stderr,
             "cuda-regression: SM75 Q3A4 tile32-dp4a-k4 production default\n");
     if (!retire_temporary_model_map()) {
@@ -2472,6 +2757,7 @@ int main(void) {
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
     if (check_sm75_q32_production_exact() != 0) rc = 1;
     if (check_sm75_q32_owned_graph() != 0) rc = 1;
+    if (check_sm75_q4_32_down_tile32_exact() != 0) rc = 1;
     if (check_sm75_native_q4_layout_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;

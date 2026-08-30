@@ -17,6 +17,7 @@ extern void ds4_gpu_test_set_moe_q4_32_decode_mapping(uint32_t mapping);
 extern void ds4_gpu_test_set_moe_q3a4_decode_mapping(uint32_t mapping);
 extern void ds4_gpu_test_set_moe_q3a4_decode_ksplit(uint32_t split);
 extern void ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(uint32_t depth);
+extern void ds4_gpu_test_set_moe_q4_32_down_decode_mapping(uint32_t mapping);
 
 typedef enum {
     SCENARIO_Q4_32_GATE_UP,
@@ -57,6 +58,12 @@ typedef enum {
     SCENARIO_Q4_32_GATE_UP_FUSED_U1_AB,
     SCENARIO_Q4_32_GATE_UP_FUSED_U2_AB,
     SCENARIO_Q4_32_GATE_UP_FUSED_U4_AB,
+    SCENARIO_Q4_32_DOWN_SLOTS,
+    SCENARIO_Q4_32_DOWN_SLOTS_TILE32,
+    SCENARIO_Q4_32_DOWN_SLOTS_TILE32_AB,
+    SCENARIO_Q4_32_DOWN_PACKED,
+    SCENARIO_Q4_32_DOWN_PACKED_TILE32,
+    SCENARIO_Q4_32_DOWN_PACKED_TILE32_AB,
     SCENARIO_Q8_SINGLE_T32,
     SCENARIO_Q8_PAIR_2048,
     SCENARIO_Q8_PAIR_1024,
@@ -160,6 +167,18 @@ static const scenario_spec scenarios[] = {
       SCENARIO_Q4_32_GATE_UP_FUSED_U2_AB },
     { "q4-32-gate-up-fused-u4-ab", "routed-q4-32-fused-u4-ab",
       SCENARIO_Q4_32_GATE_UP_FUSED_U4_AB },
+    { "q4-32-down-slots", "routed-q4-32-down-slots",
+      SCENARIO_Q4_32_DOWN_SLOTS },
+    { "q4-32-down-slots-tile32", "routed-q4-32-down-slots-tile32",
+      SCENARIO_Q4_32_DOWN_SLOTS_TILE32 },
+    { "q4-32-down-slots-tile32-ab", "routed-q4-32-down-slots-tile32-ab",
+      SCENARIO_Q4_32_DOWN_SLOTS_TILE32_AB },
+    { "q4-32-down-packed", "routed-q4-32-down-packed",
+      SCENARIO_Q4_32_DOWN_PACKED },
+    { "q4-32-down-packed-tile32", "routed-q4-32-down-packed-tile32",
+      SCENARIO_Q4_32_DOWN_PACKED_TILE32 },
+    { "q4-32-down-packed-tile32-ab", "routed-q4-32-down-packed-tile32-ab",
+      SCENARIO_Q4_32_DOWN_PACKED_TILE32_AB },
     { "q8-single-t32", "dense-q8-single", SCENARIO_Q8_SINGLE_T32 },
     { "q8-pair-2048", "dense-q8-pair", SCENARIO_Q8_PAIR_2048 },
     { "q8-pair-1024", "dense-q8-pair", SCENARIO_Q8_PAIR_1024 },
@@ -541,6 +560,172 @@ static int run_routed_gate_up_q4_mapping(uint32_t mapping, int benchmark) {
         0, 0, 0u, mapping, 0u, 1u, 0u, benchmark);
 }
 
+static int run_q4_32_down_candidate(int packed, uint32_t mapping,
+                                    int benchmark) {
+    const uint32_t n_total_experts = 8u;
+    const uint32_t n_expert = 6u;
+    const uint32_t in_dim = 256u;
+    const uint32_t mid_dim = 2048u;
+    const uint32_t out_dim = 4096u;
+    const uint32_t resident_base = packed ? 4u : 0u;
+    const uint32_t resident_count = 4u;
+    const uint64_t gate_row_bytes = (in_dim / 256u) * 136u;
+    const uint64_t gate_expert_bytes =
+        (uint64_t)mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = (mid_dim / 256u) * 136u;
+    const uint64_t down_expert_bytes =
+        (uint64_t)out_dim * down_row_bytes;
+    const uint64_t gate_offset = 0u;
+    const uint64_t up_offset = gate_expert_bytes * n_total_experts;
+    const uint64_t down_offset =
+        up_offset + gate_expert_bytes * n_total_experts;
+    const uint64_t output_count = (packed ? 4ull : 6ull) * out_dim;
+    const uint64_t slot_scratch_count = 6ull * out_dim;
+    const uint64_t mid_count = 6ull * mid_dim;
+    const int32_t slots_selected[6] = {0, 1, 4, 2, 3, 5};
+    /* Both three-slot groups begin with an owned prefix pair. */
+    const int32_t packed_selected[6] = {4, 5, 0, 6, 7, 1};
+    const int32_t *selected_host = packed ? packed_selected : slots_selected;
+    const float weights_host[6] = {
+        0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f,
+    };
+    uint64_t model_bytes;
+    if (!checked_add(down_offset,
+                     down_expert_bytes * n_total_experts, &model_bytes) ||
+        !install_zero_model(model_bytes)) return 0;
+
+    ds4_gpu_tensor *x = input_tensor(in_dim);
+    ds4_gpu_tensor *selected = zero_tensor(n_expert, sizeof(int32_t));
+    ds4_gpu_tensor *weights = zero_tensor(n_expert, sizeof(float));
+    ds4_gpu_tensor *out = zero_tensor(out_dim, sizeof(float));
+    ds4_gpu_tensor *gate = zero_tensor(mid_count, sizeof(float));
+    ds4_gpu_tensor *up = zero_tensor(mid_count, sizeof(float));
+    ds4_gpu_tensor *mid = zero_tensor(mid_count, sizeof(float));
+    ds4_gpu_tensor *down = zero_tensor(slot_scratch_count, sizeof(float));
+    ds4_gpu_tensor *down_output = zero_tensor(output_count, sizeof(float));
+    int ok = 0;
+    if (!x || !selected || !weights || !out || !gate || !up || !mid ||
+        !down || !down_output ||
+        !ds4_gpu_tensor_write(selected, 0u, selected_host,
+                              sizeof(slots_selected)) ||
+        !ds4_gpu_tensor_write(weights, 0u, weights_host,
+                              sizeof(weights_host))) {
+        fprintf(stderr, "error: Q4-32 down tensor setup failed\n");
+        goto cleanup;
+    }
+    ds4_gpu_set_routed_q4_layout(DS4_TENSOR_LAYOUT_SM75_Q4_32 |
+                                 DS4_TENSOR_LAYOUT_SM75_Q3A4);
+    ds4_gpu_test_set_moe_q32_decode_split(0);
+    ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
+    ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
+    ds4_gpu_test_set_moe_q4_32_down_decode_mapping(mapping);
+
+#define RUN_Q4_32_DOWN() ds4_gpu_routed_moe_one_owned_tensor( \
+            out, gate, up, mid, down, model_storage, model_bytes, \
+            gate_offset, up_offset, down_offset, \
+            PROFILE_TYPE_SM75_Q4_32, PROFILE_TYPE_SM75_Q4_32, \
+            gate_expert_bytes, gate_row_bytes, \
+            down_expert_bytes, down_row_bytes, \
+            in_dim, mid_dim, out_dim, selected, weights, \
+            n_total_experts, n_expert, resident_base, resident_count, \
+            10.0f, x, down_output, packed != 0, NULL)
+
+    if (!RUN_Q4_32_DOWN() || !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: Q4-32 down production launch failed\n");
+        goto cleanup;
+    }
+    printf("down_output_kind=%s\nq4_32_down_decode_mapping=%u\n"
+           "midq_blocks=8\n",
+           packed ? "owned_packed-prefix-pair" : "owned_slots", mapping);
+    if (benchmark) {
+        ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
+        if (!RUN_Q4_32_DOWN() || !ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: Q4-32 down control warmup failed\n");
+            goto cleanup;
+        }
+        ds4_gpu_test_set_moe_q4_32_down_decode_mapping(1u);
+        if (!RUN_Q4_32_DOWN() || !ds4_gpu_synchronize()) {
+            fprintf(stderr, "error: Q4-32 down candidate warmup failed\n");
+            goto cleanup;
+        }
+        const uint32_t rounds = positive_env_u32("TIMING_ROUNDS", 9u);
+        const uint32_t repeats = positive_env_u32("TIMING_REPEATS", 25u);
+        if ((rounds & 1u) == 0u) {
+            fprintf(stderr, "error: TIMING_ROUNDS must be odd\n");
+            goto cleanup;
+        }
+        float *control_ms = (float *)malloc(rounds * sizeof(float));
+        float *candidate_ms = (float *)malloc(rounds * sizeof(float));
+        ds4_gpu_timer *timer = ds4_gpu_timer_create();
+        if (!control_ms || !candidate_ms || !timer) {
+            fprintf(stderr, "error: Q4-32 down timing allocation failed\n");
+            free(candidate_ms); free(control_ms); ds4_gpu_timer_free(timer);
+            goto cleanup;
+        }
+        for (uint32_t round = 0; round < rounds; round++) {
+            for (uint32_t order = 0; order < 2u; order++) {
+                const int candidate = ((round & 1u) ^ order) != 0u;
+                ds4_gpu_test_set_moe_q4_32_down_decode_mapping(
+                    candidate ? 1u : 0u);
+                if (!ds4_gpu_timer_record_start(timer)) goto timing_error;
+                for (uint32_t repeat = 0; repeat < repeats; repeat++)
+                    if (!RUN_Q4_32_DOWN()) goto timing_error;
+                if (!ds4_gpu_timer_record_end(timer)) goto timing_error;
+                float elapsed = 0.0f;
+                if (!ds4_gpu_timer_elapsed_ms(timer, &elapsed))
+                    goto timing_error;
+                (candidate ? candidate_ms : control_ms)[round] =
+                    elapsed / (float)repeats;
+            }
+        }
+        qsort(control_ms, rounds, sizeof(float), compare_float);
+        qsort(candidate_ms, rounds, sizeof(float), compare_float);
+        const float control_median = control_ms[rounds / 2u];
+        const float candidate_median = candidate_ms[rounds / 2u];
+        printf("timing_scope=production-owned-call-inclusive\n"
+               "timing_rounds=%u\ntiming_repeats=%u\n"
+               "candidate_kind=q4-32-down-tile32-int4-%s\n"
+               "control_median_ms=%.9g\ncandidate_median_ms=%.9g\n"
+               "candidate_speedup=%.9g\n",
+               rounds, repeats, packed ? "packed" : "slots",
+               control_median, candidate_median,
+               control_median / candidate_median);
+        ds4_gpu_timer_free(timer);
+        free(candidate_ms); free(control_ms);
+        ds4_gpu_test_set_moe_q4_32_down_decode_mapping(mapping);
+        goto timing_done;
+timing_error:
+        fprintf(stderr, "error: Q4-32 down inclusive timing failed\n");
+        ds4_gpu_timer_free(timer);
+        free(candidate_ms); free(control_ms);
+        goto cleanup;
+timing_done:;
+    }
+    ok = verify_zero_tensor(
+        down_output, output_count,
+        packed ? "q4-32-down-packed" : "q4-32-down-slots");
+
+cleanup:
+    ds4_gpu_test_set_moe_q4_32_down_decode_mapping(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
+    ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
+    ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+    ds4_gpu_set_routed_q4_layout(0u);
+    ds4_gpu_tensor_free(down_output);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+#undef RUN_Q4_32_DOWN
+    return ok;
+}
+
 static uint64_t q8_matrix_bytes(uint64_t in_dim, uint64_t out_dim) {
     return out_dim * ((in_dim + 31u) / 32u) * 34u;
 }
@@ -724,6 +909,7 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
 
     printf("scenario=%s\nfamily=%s\nn_tokens=1\n"
            "q8_arithmetic=production-dp4a\nq8_f16_cache=disabled\n"
@@ -824,6 +1010,18 @@ int main(int argc, char **argv) {
             ok = run_routed_gate_up(0, 0, 2u, 0u, 1u, 1); break;
         case SCENARIO_Q4_32_GATE_UP_FUSED_U4_AB:
             ok = run_routed_gate_up(0, 0, 4u, 0u, 1u, 1); break;
+        case SCENARIO_Q4_32_DOWN_SLOTS:
+            ok = run_q4_32_down_candidate(0, 0u, 0); break;
+        case SCENARIO_Q4_32_DOWN_SLOTS_TILE32:
+            ok = run_q4_32_down_candidate(0, 1u, 0); break;
+        case SCENARIO_Q4_32_DOWN_SLOTS_TILE32_AB:
+            ok = run_q4_32_down_candidate(0, 1u, 1); break;
+        case SCENARIO_Q4_32_DOWN_PACKED:
+            ok = run_q4_32_down_candidate(1, 0u, 0); break;
+        case SCENARIO_Q4_32_DOWN_PACKED_TILE32:
+            ok = run_q4_32_down_candidate(1, 1u, 0); break;
+        case SCENARIO_Q4_32_DOWN_PACKED_TILE32_AB:
+            ok = run_q4_32_down_candidate(1, 1u, 1); break;
         case SCENARIO_Q8_SINGLE_T32: ok = run_q8_single(1024u, 32768u); break;
         case SCENARIO_Q8_PAIR_2048: ok = run_q8_pair(2048u); break;
         case SCENARIO_Q8_PAIR_1024: ok = run_q8_pair(1024u); break;
