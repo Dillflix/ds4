@@ -17,7 +17,6 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
-            (root / "nvlink").mkdir()
             production.mkdir()
             statuses = {"attention-off": "passed", "production": "failed"}
             for slot, (variant, status) in enumerate(statuses.items(), 1):
@@ -39,7 +38,6 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             production = root / "production"
             telemetry = root / "telemetry"
-            (root / "nvlink").mkdir()
             production.mkdir()
             telemetry.mkdir()
             stem = "r1-s1-attention-off"
@@ -61,9 +59,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
-            nvlink = root / "nvlink"
             production.mkdir()
-            nvlink.mkdir()
             cases = {
                 "partner-bounce": ("passed", "decode", "frontier-complete"),
                 "bounce-indexer-off": ("failed", "decode", "token-start"),
@@ -87,10 +83,6 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                     "ds4: CUDA decode indexer row audit event=begin layer=2 "
                     "home_tier=0 partner_tier=2 n_comp=1024 transfer_bytes=256\n"
                 )
-                (nvlink / f"{stem}.log").write_text(
-                    "snapshot_utc=2026-08-30T00:00:00Z\nRx0: 1 KiB\n"
-                )
-
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             with (root / "summary.csv").open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
@@ -114,7 +106,6 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
-            (root / "nvlink").mkdir()
             production.mkdir()
             statuses = {
                 "partner-bounce": "failed",
@@ -141,7 +132,6 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
-            (root / "nvlink").mkdir()
             production.mkdir()
             stem = "r1-s1-partner-bounce"
             (production / f"{stem}.result").write_text(

@@ -172,9 +172,6 @@ def main() -> None:
                 bench_rows = list(csv.DictReader(handle))
             if bench_rows:
                 bench_row = bench_rows[-1]
-        nvlink_path = root / "nvlink" / f"{stem}.log"
-        nvlink_text = (nvlink_path.read_text(errors="replace")
-                       if nvlink_path.exists() else "")
         watch_path = root / "telemetry" / f"{stem}-watch-event.txt"
         watch_values = read_kv(watch_path) if watch_path.exists() else {}
         q8_begin_calls, q8_begin_bytes = checkpoint_max(
@@ -213,15 +210,9 @@ def main() -> None:
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
-            "nvlink_counter_snapshots": str(nvlink_text.count("snapshot_utc=")),
-            "nvlink_counter_supported": (
-                "no" if "counter_status=unsupported-or-unavailable" in nvlink_text
-                else ("yes" if "snapshot_utc=" in nvlink_text else "unknown")
-            ),
             "watch_status": watch_values.get("status", ""),
             "result": str(result_path),
             "log": str(log_path),
-            "nvlink_log": str(nvlink_path),
         }
         rows.append(row)
         statuses[variant].append(status)
@@ -250,8 +241,8 @@ def main() -> None:
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
-        "Pair-0 indexer begun bytes | Watch event | NVLink snapshots |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | ---: |",
+        "Pair-0 indexer begun bytes | Watch event |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- |",
     ]
     for row in rows:
         lines.append(
@@ -261,8 +252,7 @@ def main() -> None:
             f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
-            f"{row.get('watch_status', '')} | "
-            f"{row.get('nvlink_counter_snapshots', '0')} |"
+            f"{row.get('watch_status', '')} |"
         )
     lines.extend([
         "",
@@ -273,8 +263,8 @@ def main() -> None:
         "",
         conclusion,
         "",
-        "Raw `nvidia-smi nvlink -g 0/1` samples are retained under `nvlink/`; "
-        "unsupported counters are explicitly labeled rather than treated as zero traffic.",
+        "No NVLink counter command is run by this harness. Pair traffic is measured "
+        "only from the in-process Q8 and indexer transfer-audit records.",
     ])
     (root / "summary.md").write_text("\n".join(lines) + "\n")
 

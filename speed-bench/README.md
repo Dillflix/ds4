@@ -3105,8 +3105,11 @@ timing and instantaneous power envelope; a passing arm narrows the trigger but
 is not described as a power-matched proof. Every case preserves a
 flushed engine/prefill/decode journal, begin/complete byte checkpoints for Q8
 partner transfers, per-dispatch byte records for decode-indexer row splitting,
-ordinary GPU telemetry, and best-effort raw NVLink counters 0 and 1. Unsupported
-NVLink counters are labeled explicitly. If a GPU loss interrupts the shell,
+and ordinary passive GPU telemetry. The harness intentionally does not poll
+external NVLink counters during an arm. A separate home-built `nvbandwidth`
+workload was observed running concurrently, so pre-arm and in-arm guards now
+reject any GPU compute process other than the active `ds4-bench` PID. If a GPU
+loss interrupts the shell,
 reuse the same directory with `RESUME=1`; the interrupted arm is retained as
 evidence and the next arm runs. If the benchmark completed but the runner
 stopped during post-run validation, resume validates and recovers that arm from

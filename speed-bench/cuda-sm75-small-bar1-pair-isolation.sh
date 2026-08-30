@@ -112,10 +112,10 @@ git diff --quiet && git diff --cached --quiet ||
 
 if [[ $RESUME == 0 ]]; then
     [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
-    mkdir -p "$OUTPUT_DIR"/{health,nvlink,production,provenance,telemetry}
+    mkdir -p "$OUTPUT_DIR"/{health,production,provenance,telemetry}
 else
     [[ -d $OUTPUT_DIR ]] || die "resume directory not found: $OUTPUT_DIR"
-    for subdir in health nvlink production provenance telemetry; do
+    for subdir in health production provenance telemetry; do
         mkdir -p "$OUTPUT_DIR/$subdir"
     done
 fi
@@ -135,7 +135,6 @@ fi
 phase=initialization
 telemetry_pid=
 telemetry_watch_pid=
-nvlink_pid=
 active_case_pid=
 stop_active_case() {
     if [[ -n ${active_case_pid:-} ]]; then
@@ -154,7 +153,7 @@ stop_telemetry() {
         kill "$telemetry_watch_pid" >/dev/null 2>&1 || true
         telemetry_watch_pid=
     fi
-    for name in telemetry_pid nvlink_pid; do
+    for name in telemetry_pid; do
         local pid=${!name:-}
         [[ -n $pid ]] || continue
         printf -v "$name" '%s' ''
@@ -216,6 +215,35 @@ validate_power_limits() {
     done
 }
 
+assert_no_compute_processes() {
+    local listing
+    listing=$(timeout --kill-after=5s 20s nvidia-smi \
+        --query-compute-apps=pid,process_name \
+        --format=csv,noheader,nounits 2>&1) || {
+        printf '%s\n' "$listing" >&2
+        return 1
+    }
+    if [[ -n ${listing//[[:space:]]/} ]]; then
+        printf 'unexpected GPU compute process(es) before arm:\n%s\n' \
+            "$listing" >&2
+        return 1
+    fi
+}
+
+list_foreign_compute_processes() {
+    local allowed_pid=$1 listing
+    listing=$(timeout --kill-after=5s 20s nvidia-smi \
+        --query-compute-apps=pid,process_name \
+        --format=csv,noheader,nounits 2>/dev/null) || return 1
+    printf '%s\n' "$listing" | awk -F, -v allowed="$allowed_pid" '
+        {
+            pid=$1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", pid)
+            if (pid ~ /^[0-9]+$/ && pid != allowed) print $0
+        }
+    '
+}
+
 gpu_health_snapshot() {
     local path=$1
     {
@@ -239,31 +267,11 @@ start_telemetry() {
     telemetry_pid=$!
 }
 
-start_nvlink_telemetry() {
-    local output=$1 interval_sec
-    interval_sec=$(awk -v ms="$TELEMETRY_INTERVAL_MS" 'BEGIN {printf "%.3f", ms/1000}')
-    (
-        while :; do
-            printf 'snapshot_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
-            for gpu in "${gpu_ids[@]}"; do
-                printf 'gpu=%s counter=0\n' "$gpu"
-                timeout --kill-after=2s 5s nvidia-smi nvlink -i "$gpu" -g 0 \
-                    2>&1 || printf 'counter_status=unsupported-or-unavailable\n'
-                printf 'gpu=%s counter=1\n' "$gpu"
-                timeout --kill-after=2s 5s nvidia-smi nvlink -i "$gpu" -g 1 \
-                    2>&1 || printf 'counter_status=unsupported-or-unavailable\n'
-            done
-            sleep "$interval_sec"
-        done
-    ) >"$output" 2>&1 &
-    nvlink_pid=$!
-}
-
 start_telemetry_watch() {
     local output=$1 marker=$2 case_pid=$3
     (
         while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
-            local watch_status=
+            local watch_status= foreign_processes=
             if tail -n 24 "$output" 2>/dev/null |
                     grep -Eiq 'GPU is lost|GPU requires reset|Unknown Error|ERR!|Unable to determine'; then
                 watch_status=lost-device-detected
@@ -282,12 +290,16 @@ start_telemetry_watch() {
                         END {exit !found}
                     '; then
                 watch_status=power-limit-drift
+            elif foreign_processes=$(list_foreign_compute_processes "$case_pid") &&
+                    [[ -n ${foreign_processes//[[:space:]]/} ]]; then
+                watch_status=foreign-compute-process
             fi
             if [[ -n $watch_status ]]; then
                 printf 'telemetry-watch: %s detected\n' "$watch_status" >>"$output"
-                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\n' \
+                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nforeign_processes=%q\n' \
                     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
-                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" >"$marker"
+                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" \
+                    "$foreign_processes" >"$marker"
                 sync "$marker" 2>/dev/null || sync
                 kill "$telemetry_pid" >/dev/null 2>&1 || true
                 kill -TERM "$case_pid" >/dev/null 2>&1 || true
@@ -383,7 +395,7 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'serialization_scope=q8_partner_projection_pair_only\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
-        printf 'external_nvlink_counters=best-effort-nvidia-smi-counter0-counter1\n'
+        printf 'external_nvlink_counters=disabled-no-external-compute-workload\n'
     } >"$OUTPUT_DIR/manifest.txt"
     git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
     git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -519,7 +531,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         allocations="$base-allocations.csv"
         memory="$base-memory.csv"
         telemetry="$OUTPUT_DIR/telemetry/$tag.csv"
-        nvlink="$OUTPUT_DIR/nvlink/$tag.log"
         watch_marker="$OUTPUT_DIR/telemetry/$tag-watch-event.txt"
         pre_health="$OUTPUT_DIR/health/$tag-pre.log"
         post_health="$OUTPUT_DIR/health/$tag-post.log"
@@ -565,6 +576,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "GPU health failed before variant=$variant"
         validate_power_limits ||
             die "power limit changed before variant=$variant; require ${REQUIRED_POWER_LIMIT_W} W"
+        assert_no_compute_processes ||
+            die "foreign GPU compute process present before variant=$variant"
         printf 'timestamp_utc=%s\nvariant=%s\nrepeat=%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" >"$started"
         sync "$started" 2>/dev/null || sync
@@ -591,7 +604,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         esac
 
         start_telemetry "$telemetry"
-        start_nvlink_telemetry "$nvlink"
         "${clean[@]}" "${variant_env[@]}" \
                 "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT" \
                 DS4_CUDA_PREFILL_PIPELINE=1 \
