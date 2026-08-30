@@ -2,7 +2,7 @@ name: CUDA quantizer build
 
 on:
   push:
-    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence, agent/sm75-decode-crash-isolation, agent/sm75-decode-q4-gate-native, agent/sm75-decode-q4down-tile32-audit, agent/sm75-decode-q4-native-audit]
+    branches: [agent/iq2-iq2-q4, agent/partner-q8-offload, agent/sm75-iq2-wide-audit, agent/sm75-q3-q4-32-audit, agent/sm75-q4-32-q3a4-production, agent/sm75-decode-baseline, agent/sm75-decode-evidence, agent/sm75-decode-crash-isolation, agent/sm75-decode-q4-gate-native, agent/sm75-decode-q4down-tile32-audit, agent/sm75-decode-q4-native-audit, agent/sm75-decode-q4-production-ab]
     paths:
       - ".github/workflows/cuda-quantizer-build.yml"
       - "ds4.c"
@@ -40,6 +40,7 @@ on:
       - "speed-bench/cuda-sm75-decode-baseline.sh"
       - "speed-bench/cuda-sm75-decode-evidence.sh"
       - "speed-bench/cuda-sm75-decode-q4-gate-native.sh"
+      - "speed-bench/cuda-sm75-decode-q4-production-ab.sh"
       - "speed-bench/cuda-sm75-iq2-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-next-ab.sh"
       - "speed-bench/cuda-sm75-native-q4-gate-fused-ab.sh"
@@ -190,6 +191,8 @@ jobs:
           test -x speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
           bash -n speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
           ! grep -Eq '<<[[:space:]]*EOF' speed-bench/cuda-sm75-decode-q3a4-k4-production-ab.sh
+          test -x speed-bench/cuda-sm75-decode-q4-production-ab.sh
+          bash -n speed-bench/cuda-sm75-decode-q4-production-ab.sh
           test -x speed-bench/cuda-sm75-pair-stability-matrix.sh
           bash -n speed-bench/cuda-sm75-pair-stability-matrix.sh
           test -x speed-bench/cuda-sm75-xdev-feature-isolation.sh

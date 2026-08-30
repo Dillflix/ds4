@@ -2933,6 +2933,25 @@ sectors/request, long-scoreboard and MIO stalls, and achieved occupancy.  A
 subset can be captured with `PROFILE_SET=routed`, `q8`, or `f16`, or with an
 explicit comma-separated `SCENARIOS` list.
 
+### Production Q4-32 decode factorial A/B
+
+`cuda-sm75-decode-q4-production-ab.sh` measures the Q4-32 gate/up
+tile32 packed-INT4 MMA and Q4-32 down tile32 paths independently and together.
+It fixes the production 22/21 placement, mixed15 Q3A4 K4 path, dense-Q8 plan,
+indexer, attention, and cross-GPU boundaries. Four-repeat blocks use a balanced
+schedule. Every arm must reproduce 16 byte-exact decode logits at PP512,
+PP4096, and PP32768 and its exact gate/down ownership-shape call inventory.
+
+```bash
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REPEATS=4 TG_TOKENS=256 EXACT_TOKENS=16 SKIP_BUILD=0 \
+MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+bash ./speed-bench/cuda-sm75-decode-q4-production-ab.sh
+```
+
+Resume accepts only whole, healthy exact variants and rejects changed source,
+binaries, model inode/size/mtime, placement plans, or partial GPU-loss output.
+
 ### Symmetric SM75 pair-stability matrix
 
 `cuda-sm75-pair-stability-matrix.sh` compares both physical NVLink pairs with
