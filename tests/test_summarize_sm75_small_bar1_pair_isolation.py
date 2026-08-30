@@ -219,6 +219,117 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             )
             self.assertIn("has no validated final outcome", report)
 
+    def test_reports_passed_attention_end_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-end-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-end-fence\nstatus=passed\nexit_status=0\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=pair kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("full production path survived", report)
+            self.assertIn("not a proposal to disable row splitting", report)
+            self.assertIn(
+                "complete:pair:mixed:layer21:pos512:tokens512:home0:partner2",
+                report,
+            )
+
+    def test_recovers_started_only_attention_end_fence_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-end-fence"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-end-fence\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=begin "
+                "target=pair kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=partner kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row end fence event=sync-failed "
+                "target=home kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row end fence event=failed "
+                "target=home kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            (production / f"{stem}-progress.csv").write_text(
+                "realtime_sec,realtime_nsec,phase,event,current,total\n"
+                "1,0,measured-prefill,prefill_chunk,0,32768\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("interrupted-no-result", report)
+            self.assertIn(
+                "failed:home:mixed:layer21:pos512:tokens512:home0:partner2",
+                report,
+            )
+            self.assertIn("partner end-fence completed", report)
+            self.assertIn("following home boundary failed", report)
+
+    def test_distinguishes_failure_after_completed_attention_end_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-end-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-end-fence\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=pair kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("completed on both partner and home", report)
+            self.assertIn("host-confirmed complete", report)
+            self.assertIn("first subsequent CUDA observation lies", report)
+            self.assertIn("delayed physical fault", report)
+
+    def test_distinguishes_partner_attention_end_fence_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-end-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-end-fence\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=sync-failed "
+                "target=partner kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row end fence event=failed "
+                "target=partner kind=mixed layer=21 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("partner synchronization was the first failing", report)
+            self.assertIn("Home synchronization was deliberately not attempted", report)
+
     def test_identifies_direct_or_overlap_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

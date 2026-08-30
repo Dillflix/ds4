@@ -28332,6 +28332,16 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
                "DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_POS", pos0);
 }
 
+static bool metal_graph_cuda_tp_prefill_attention_rows_end_fence_selected(
+        int home, uint32_t il, uint32_t pos0) {
+    return env_pair_list_contains(
+               "DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_PAIRS", home) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_LAYER", il) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_POS", pos0);
+}
+
 static void metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
         const char *event, const char *phase,
         ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
@@ -28370,6 +28380,40 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
         "complete", phase, kind, il, pos0, n_tokens, home, partner);
     return true;
 }
+
+static void metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+        const char *event, const char *target,
+        ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens, int home, int partner) {
+    fprintf(stderr,
+            "ds4: CUDA prefill attention row end fence event=%s "
+            "target=%s kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d\n",
+            event, target,
+            kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+            il, pos0, n_tokens, home, partner);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static bool metal_graph_cuda_tp_prefill_attention_rows_end_fence_sync(
+        const char *target, int tier, ds4_cuda_prefill_attn_kind kind,
+        uint32_t il, uint32_t pos0, uint32_t n_tokens,
+        int home, int partner) {
+    if (ds4_gpu_set_current_device(tier) != 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+            "device-switch-failed", target, kind, il, pos0, n_tokens,
+            home, partner);
+        return false;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+            "sync-failed", target, kind, il, pos0, n_tokens, home, partner);
+        return false;
+    }
+    metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+        "complete", target, kind, il, pos0, n_tokens, home, partner);
+    return true;
+}
 #endif
 
 /* Split independent query rows 50/50 across one NVLink pair. The fixed policy
@@ -28401,6 +28445,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     const int partner = metal_graph_cuda_tp_partner_tier(home);
     const bool phase_audit =
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
+            home, il, pos0);
+    const bool end_fence =
+        metal_graph_cuda_tp_prefill_attention_rows_end_fence_selected(
             home, il, pos0);
     uint32_t home_rows = metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
     /* home_n_raw below removes the partner's trailing query rows from the
@@ -28586,6 +28633,41 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
             ok, "result-gather", home, kind, il, pos0, n_tokens,
             home, partner);
+    }
+    if (end_fence) {
+        if (!ok) {
+            metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+                "submit-failed", "pair", kind, il, pos0, n_tokens,
+                home, partner);
+        } else {
+            metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+                "begin", "pair", kind, il, pos0, n_tokens, home, partner);
+            const bool partner_fence_ok =
+                metal_graph_cuda_tp_prefill_attention_rows_end_fence_sync(
+                    "partner", partner, kind, il, pos0, n_tokens,
+                    home, partner);
+            bool home_fence_ok = false;
+            if (partner_fence_ok) {
+                home_fence_ok =
+                    metal_graph_cuda_tp_prefill_attention_rows_end_fence_sync(
+                        "home", home, kind, il, pos0, n_tokens,
+                        home, partner);
+            } else if (ds4_gpu_set_current_device(home) != 0) {
+                /* Preserve the caller's home-device invariant if possible, but
+                 * do not issue a second synchronization after the first
+                 * observed failure. A poisoned multi-device context can make
+                 * that later error or stall causally meaningless. */
+                metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+                    "device-switch-failed", "home-restore", kind, il, pos0,
+                    n_tokens, home, partner);
+            }
+            ok = partner_fence_ok && home_fence_ok;
+            const char *pair_target = !partner_fence_ok
+                ? "partner" : (home_fence_ok ? "pair" : "home");
+            metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(
+                ok ? "complete" : "failed", pair_target, kind, il, pos0,
+                n_tokens, home, partner);
+        }
     }
 
     static uint32_t logged_home_mask = 0u;

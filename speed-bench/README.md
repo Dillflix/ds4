@@ -3093,6 +3093,30 @@ The next row-split-on diagnostic is:
   different from a low-load approximation: the surrounding 32K workload and
   direct-peer traffic remain enabled.
 
+That audit reproduced the device loss, but all four layer-17/position-512
+phase checkpoints completed. Layers 18 through 21 were then submitted and the
+first CUDA error was observed by the following tier-0-to-tier-1 stage handoff.
+The submission records do not prove those later asynchronous row-split calls
+completed, and a poisoned multi-device CUDA context makes the handoff only the
+observation point rather than the demonstrated cause.
+
+The tighter row-split-on boundary is:
+
+- `attention-end-fence`, which leaves query copy, partner attention, home
+  attention, and result gather fully overlapped exactly as production through
+  the final pair-0 attention layer (default layer 21, position 512). Only after
+  the result gather has been submitted does it synchronize partner and then
+  home once, with durable `begin`, per-device `complete`/failure, and final
+  pair records. If partner synchronization fails first, the audit only attempts
+  to restore the current device to home; it does not issue a causally secondary
+  home synchronization into an already-poisoned context. A fence failure proves
+  an error was pending before downstream
+  layer-tail/stage-handoff work. A complete fence followed by a handoff failure
+  moves the first observed boundary past row-split completion. A wholly clean
+  run means that this single boundary removed a required overlap or
+  instantaneous-load condition; it is diagnostic evidence, not a production
+  mitigation.
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 
@@ -3166,6 +3190,27 @@ To audit the exact row-split failure coordinate without disabling row splitting:
 ATTN_PHASE_AUDIT_LAYER=17 \
 ATTN_PHASE_AUDIT_POS=512 \
 VARIANTS=attention-phase-audit \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+To retain production overlap through the last pair-0 result gather and add
+only the end-completion boundary before downstream work:
+
+```bash
+ATTN_END_FENCE_LAYER=21 \
+ATTN_END_FENCE_POS=512 \
+VARIANTS=attention-end-fence \
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \

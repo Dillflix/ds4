@@ -10,8 +10,9 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "attention-off", "attention-phase-audit", "partner-bounce",
-    "bounce-indexer-off", "partner-serialized", "indexer-off", "production"
+    "attention-off", "attention-phase-audit", "attention-end-fence",
+    "partner-bounce", "bounce-indexer-off", "partner-serialized",
+    "indexer-off", "production"
 )
 
 
@@ -71,6 +72,22 @@ def last_attention_phase_audit(text: str) -> str:
     return last
 
 
+def last_attention_end_fence(text: str) -> str:
+    last = ""
+    pattern = re.compile(
+        r"prefill attention row end fence event=(\S+) target=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        r"home=(\d+) partner=(\d+)"
+    )
+    for match in pattern.finditer(text):
+        event, target, kind, layer, pos, tokens, home, partner = match.groups()
+        last = (
+            f"{event}:{target}:{kind}:layer{layer}:pos{pos}:tokens{tokens}:"
+            f"home{home}:partner{partner}"
+        )
+    return last
+
+
 def outcome(statuses: list[str]) -> str:
     if not statuses:
         return "not-run"
@@ -112,6 +129,7 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         )
     attention = outcomes.get("attention-off", "not-run")
     phase_audit = outcomes.get("attention-phase-audit", "not-run")
+    end_fence = outcomes.get("attention-end-fence", "not-run")
     production = outcomes.get("production", "not-run")
     bounce = outcomes.get("partner-bounce", "not-run")
     bounce_indexer = outcomes.get("bounce-indexer-off", "not-run")
@@ -124,6 +142,71 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         all(row.get("status") in {"passed", "completed-no-result"}
             for row in attention_rows)
     )
+    end_problem_rows = [
+        row for row in rows
+        if (row.get("variant") == "attention-end-fence" and
+            row.get("status") not in {"passed", "completed-no-result"})
+    ]
+    end_problem_marker = next(
+        (row.get("attention_end_fence_last", "")
+         for row in reversed(end_problem_rows)
+         if row.get("attention_end_fence_last")),
+        "",
+    )
+    if end_fence == "passed":
+        return (
+            "The full production path survived after one completion boundary was "
+            "added only after the selected pair's final row-split result gather. "
+            "Every row-split copy and kernel before that boundary retained production "
+            "overlap. This is diagnostic evidence that overlap with later layer-tail "
+            "or stage-handoff work is part of the trigger, not a proposal to disable "
+            "row splitting."
+        )
+    if end_fence in {"failed", "incomplete"}:
+        if end_problem_marker.startswith("complete:pair:"):
+            later_state = (
+                "before this arm later failed"
+                if end_fence == "failed"
+                else "although this arm has no validated final outcome"
+            )
+            return (
+                "The end-only fence completed on both partner and home "
+                f"{later_state}. All queued pair-0 work through the selected final "
+                "row-split result gather was therefore host-confirmed complete. The "
+                "first subsequent CUDA observation lies in downstream layer-tail or "
+                "stage-handoff work. This does not prove that the preceding traffic or "
+                "load could not trigger a delayed physical fault."
+            )
+        if end_problem_marker.startswith(("failed:partner:",
+                                          "sync-failed:partner:",
+                                          "device-switch-failed:partner:")):
+            return (
+                "The partner synchronization was the first failing end-fence "
+                "boundary. An error was already pending in pair-0 work through the "
+                "selected result gather. Home synchronization was deliberately not "
+                "attempted after that first failure because a poisoned context would "
+                "make its result secondary."
+            )
+        if end_problem_marker.startswith(("failed:home:",
+                                          "sync-failed:home:",
+                                          "device-switch-failed:home:")):
+            return (
+                "The partner end-fence completed, but the following home boundary "
+                "failed. This localizes the first observed error to queued home-side "
+                "work or completion of the partner-to-home result gather, before "
+                "downstream layer-tail or stage-handoff work."
+            )
+        state = "failed" if end_fence == "failed" else "has no validated final outcome"
+        return (
+            f"The end-only row-split fence arm {state}. Its last durable partner, "
+            "home, or pair fence record remains the observation boundary; determine "
+            "GPU health and inspect that marker before causal attribution."
+        )
+    if end_fence == "invalid":
+        return (
+            "The end-only row-split fence process returned but failed its production-"
+            "path validation. Inspect the missing fence marker before causal inference."
+        )
     if phase_audit == "passed":
         return (
             "All production row-split operations and traffic survived after adding "
@@ -330,6 +413,7 @@ def main() -> None:
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
+            "attention_end_fence_last": last_attention_end_fence(log_text),
             "post_health": "healthy" if post_health_ok else "unverified",
             "watch_status": watch_values.get("status", ""),
             "result": str(result_path),
@@ -362,9 +446,9 @@ def main() -> None:
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
-        "Pair-0 indexer begun bytes | Attention phase checkpoint | Post health | "
-        "Watch event |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |",
+        "Pair-0 indexer begun bytes | Attention phase checkpoint | "
+        "Attention end fence | Post health | Watch event |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -375,6 +459,7 @@ def main() -> None:
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('attention_phase_audit_last', '')} | "
+            f"{row.get('attention_end_fence_last', '')} | "
             f"{row.get('post_health', '')} | "
             f"{row.get('watch_status', '')} |"
         )
