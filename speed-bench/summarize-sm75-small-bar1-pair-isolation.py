@@ -10,7 +10,8 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "partner-off", "indexer-off", "both-off", "admission-off", "production"
+    "partner-bounce", "bounce-indexer-off", "partner-serialized",
+    "indexer-off", "production"
 )
 
 
@@ -66,54 +67,57 @@ def outcome(statuses: list[str]) -> str:
 
 def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     production = outcomes.get("production", "not-run")
-    partner = outcomes.get("partner-off", "not-run")
+    bounce = outcomes.get("partner-bounce", "not-run")
+    bounce_indexer = outcomes.get("bounce-indexer-off", "not-run")
+    serialized = outcomes.get("partner-serialized", "not-run")
     indexer = outcomes.get("indexer-off", "not-run")
-    both = outcomes.get("both-off", "not-run")
-    admission = outcomes.get("admission-off", "not-run")
-    if production != "failed":
+    if production in {"not-run", "incomplete"}:
+        return (
+            "The production control has no durable outcome yet. Resume the same "
+            "directory; earlier failures remain evidence, but causal comparison "
+            "requires the final control."
+        )
+    if production == "passed":
         return (
             "The full-production failure was not reproduced, so this pass cannot "
             "identify a necessary trigger. Preserve the raw traffic and phase evidence."
         )
-    if partner == "passed" and indexer != "passed":
+    if indexer == "passed" and bounce_indexer == "passed":
         return (
-            "Pair-0 partner execution is necessary for the reproduced failure. "
-            "Because pair-0 partner weights and scratch remained admitted in that "
-            "passing arm, peer-cache admission alone is not sufficient."
+            "Removing pair-0 decode-indexer row splitting prevented the reproduced "
+            "failure under both direct-peer and host-bounce Q8 transport. This makes "
+            "the indexer path or its interaction a necessary condition in this pass."
         )
-    if partner == "failed" and admission == "passed" and indexer != "passed":
+    if bounce == "passed" and serialized == "passed":
         return (
-            "Pair-0 execution-off still failed with peer weights/scratch admitted, "
-            "while pair-0 admission-off passed. The differentiating trigger is peer "
-            "cache/scratch admission (or its materialization), not decode-indexer rows."
+            "The direct overlapped production path failed while host-staged transport "
+            "and serialized direct-peer execution survived. Partner weights and cuBLAS "
+            "work were retained, narrowing the trigger to direct P2P/BAR1 traffic, "
+            "overlap, or the higher instantaneous load they create."
         )
-    if indexer == "passed" and partner != "passed":
+    if bounce == "passed" and serialized != "passed":
         return (
-            "Pair-0 decode-indexer row transfers are necessary for the reproduced "
-            "failure; partner execution without those row transfers survived."
+            "Host-staged pair-0 Q8 transport survived while direct production failed. "
+            "This implicates the direct P2P/BAR1 path or its timing envelope, but the "
+            "slower host-staged schedule is not a power-matched proof by itself."
         )
-    if partner == "passed" and indexer == "passed":
+    if serialized == "passed" and bounce != "passed":
         return (
-            "Removing either pair-0 runtime transfer class prevents the reproduced "
-            "failure. The evidence identifies a shared P2P/interaction requirement, "
-            "not one uniquely guilty feature; admission alone survived."
+            "Serializing otherwise unchanged pair-0 peer projections survived while "
+            "production failed. This implicates overlap, concurrency, or an instantaneous "
+            "power/traffic transient; direct peer transport alone was not sufficient."
         )
-    if both == "passed":
+    if indexer == "passed":
         return (
-            "Neither runtime path alone was sufficient to prevent failure, but removing "
-            "both did. This implicates their aggregate/interaction load; admitted peer "
-            "weights remained present and therefore are not sufficient by themselves."
+            "Disabling only pair-0 decode-indexer row splitting survived while the "
+            "production path failed. The indexer path or its interaction is necessary "
+            "under direct transport, pending the host-bounce factorial arm."
         )
-    failed_both = [row for row in rows
-                   if row["variant"] == "both-off" and row["status"] != "passed"]
-    if failed_both and all(row["last_phase"] in {
-            "engine-create", "session-create", "untimed-warmup", "measured-prefill"
-            } for row in failed_both):
+    if all(outcomes.get(variant) == "failed" for variant in VARIANT_ORDER):
         return (
-            "The pair still failed before decode with both pair-0 runtime features "
-            "disabled. Decode-indexer row transfers are excluded. Peer-cache admission "
-            "or another unchanged prefill/P2P path remains; an admission-off confirmation "
-            "would be required to distinguish those."
+            "Every workload-preserving arm failed. The evidence does not isolate direct "
+            "P2P, indexer rows, or overlap; partner computation, aggregate pair load, "
+            "power delivery, or the shared PCIe/root-complex path remains."
         )
     return (
         "The completed arms do not yet isolate a necessary trigger. Resume the same "
@@ -156,6 +160,14 @@ def main() -> None:
         )
         row_begin_calls, row_begin_bytes = indexer_totals(log_text, "begin", 0)
         row_complete_calls, row_complete_bytes = indexer_totals(log_text, "complete", 0)
+        transport_modes = sorted(set(re.findall(
+            r"q8 partner transfer audit event=begin home_tier=0 .*?transport=(\S+)",
+            log_text,
+        )))
+        serialized_modes = sorted(set(re.findall(
+            r"q8 partner transfer audit event=begin home_tier=0 .*?serialized=(\S+)",
+            log_text,
+        )))
         row = {
             "variant": variant,
             "status": status,
@@ -174,6 +186,8 @@ def main() -> None:
             "pair0_indexer_begin_bytes": str(row_begin_bytes),
             "pair0_indexer_complete_calls": str(row_complete_calls),
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
+            "pair0_q8_transport": ",".join(transport_modes),
+            "pair0_q8_serialized": ",".join(serialized_modes),
             "nvlink_counter_snapshots": str(nvlink_text.count("snapshot_utc=")),
             "nvlink_counter_supported": (
                 "no" if "counter_status=unsupported-or-unavailable" in nvlink_text
@@ -203,18 +217,22 @@ def main() -> None:
         "# SM75 small-BAR1 pair isolation",
         "",
         "Pair 0 is logical tier 0<->2, physical GPU 0<->1 in the required "
-        "`GPU_DEVICES=0,3,1,2` layout. `partner-off` suppresses execution only "
-        "after retaining the 344/344 admission plan; `admission-off` is the "
-        "separate materialization control.",
+        "`GPU_DEVICES=0,3,1,2` layout. Every arm retains the 344/344 admission "
+        "plan, partner-resident weights, and partner projection arithmetic. The "
+        "diagnostics vary only pair-0 Q8 transport/synchronization and pair-0 "
+        "decode-indexer row splitting.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
-        "Pair-0 Q8 begun bytes* | Pair-0 indexer begun bytes | NVLink snapshots |",
-        "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: |",
+        "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
+        "Pair-0 indexer begun bytes | NVLink snapshots |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
             f"| {row['variant']} | {row['status']} | {row.get('prefill_tps', '')} | "
             f"{row.get('decode_tps', '')} | {row['last_phase']} | {row['last_event']} | "
+            f"{row.get('pair0_q8_transport', '')} | "
+            f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('nvlink_counter_snapshots', '0')} |"

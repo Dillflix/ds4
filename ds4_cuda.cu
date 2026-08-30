@@ -4734,9 +4734,10 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
     return ds4_gpu_tensor_copy_xdev_impl(dst, src, bytes, false);
 }
 
-static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
+static int ds4_gpu_tensor_copy_xdev_default_mode(ds4_gpu_tensor *dst,
                                                   const ds4_gpu_tensor *src,
-                                                  uint64_t bytes) {
+                                                  uint64_t bytes,
+                                                  bool force_host_bounce) {
     if (!dst || !src || bytes > dst->bytes || bytes > src->bytes) return 0;
     if (bytes == 0u) return 1;
     const int sd = ds4_tensor_device_idx(src);
@@ -4753,7 +4754,7 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
 
     int peer = g_gpu_peer_ok[sd][dd];
     if (g_xdev_force_cuda_peer) peer = 1;
-    if (g_xdev_force_host_bounce) peer = 0;
+    if (g_xdev_force_host_bounce || force_host_bounce) peer = 0;
     if (peer) {
         int ok = 0;
         WITH_DEVICE(g_gpu[sd].device_id) {
@@ -4800,6 +4801,12 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
         }
     }
     return ok;
+}
+
+static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
+                                                  const ds4_gpu_tensor *src,
+                                                  uint64_t bytes) {
+    return ds4_gpu_tensor_copy_xdev_default_mode(dst, src, bytes, false);
 }
 
 extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
@@ -16197,6 +16204,42 @@ static int cuda_q8_f16_partner_matmul_impl(
         arithmetic == CUDA_Q8_PARTNER_NATIVE_Q8;
     const bool use_f32 =
         arithmetic != CUDA_Q8_PARTNER_F16_GEMM && !use_native_q8;
+    const bool force_host_bounce = cuda_env_pair_list_contains(
+        "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", home_tier);
+    const bool serialize_pair = cuda_env_pair_list_contains(
+        "DS4_CUDA_Q8_F16_PARTNER_SERIALIZE_PAIRS", home_tier);
+    if (force_host_bounce || serialize_pair) {
+        static std::atomic<uint32_t> logged_bounce_mask = 0u;
+        static std::atomic<uint32_t> logged_serialize_mask = 0u;
+        const uint32_t bit = home_tier < 32
+            ? (UINT32_C(1) << (uint32_t)home_tier) : 0u;
+        if (force_host_bounce) {
+            const uint32_t old = bit != 0u
+                ? logged_bounce_mask.fetch_or(bit, std::memory_order_relaxed)
+                : bit;
+            if (bit == 0u || (old & bit) == 0u) {
+                fprintf(stderr,
+                        "ds4: CUDA q8 fp16 partner transport override for "
+                        "logical pair %d: pinned-host-bounce; partner weights, "
+                        "cuBLAS work, and result shape retained\n",
+                        home_tier);
+                fflush(stderr);
+            }
+        }
+        if (serialize_pair) {
+            const uint32_t old = bit != 0u
+                ? logged_serialize_mask.fetch_or(bit, std::memory_order_relaxed)
+                : bit;
+            if (bit == 0u || (old & bit) == 0u) {
+                fprintf(stderr,
+                        "ds4: CUDA q8 fp16 partner scheduling override for "
+                        "logical pair %d: projection-serialized; peer transport, "
+                        "partner weights, and cuBLAS work retained\n",
+                        home_tier);
+                fflush(stderr);
+            }
+        }
+    }
     /* This diagnostic exactness anchor deliberately covers only the shipping
      * SM75 T256 projection measured by the arithmetic audit. Do not silently
      * broaden it to another shape or architecture before that path has its own
@@ -16388,19 +16431,22 @@ static int cuda_q8_f16_partner_matmul_impl(
             fprintf(stderr,
                     "ds4: CUDA q8 partner transfer audit event=begin "
                     "home_tier=%d partner_tier=%d calls=%llu bytes=%llu "
-                    "activation_bytes=%llu result_bytes=%llu tokens=%llu\n",
+                    "activation_bytes=%llu result_bytes=%llu tokens=%llu "
+                    "transport=%s serialized=%s\n",
                     home_tier, partner_tier,
                     (unsigned long long)audit_begin_sequence,
                     (unsigned long long)cumulative,
                     (unsigned long long)activation_transfer_bytes,
                     (unsigned long long)result_bytes,
-                    (unsigned long long)n_tok);
+                    (unsigned long long)n_tok,
+                    force_host_bounce ? "host-bounce" : "peer",
+                    serialize_pair ? "yes" : "no");
             fflush(stderr);
         }
     }
-    if (!ds4_gpu_tensor_copy_xdev_default_impl(
+    if (!ds4_gpu_tensor_copy_xdev_default_mode(
             &activation_dst, &activation_src,
-            activation_transfer_bytes)) {
+            activation_transfer_bytes, force_host_bounce)) {
         return cuda_q8_f16_sync_home_for_fallback(
                    home_tier, "activation peer copy") < 0 ? -1 : 0;
     }
@@ -16503,7 +16549,8 @@ static int cuda_q8_f16_partner_matmul_impl(
     ds4_gpu_tensor result_src = {
         partner_result, result_bytes, 0, partner_tier
     };
-    if (!ds4_gpu_tensor_copy_xdev_default_impl(out, &result_src, result_bytes)) {
+    if (!ds4_gpu_tensor_copy_xdev_default_mode(
+            out, &result_src, result_bytes, force_host_bounce)) {
         /* Make a subsequent native-Q8 overwrite race-free even if the peer
          * copy failed after the partner GEMM had already been submitted. */
         const cudaError_t partner_sync = cudaDeviceSynchronize();
@@ -16525,8 +16572,33 @@ static int cuda_q8_f16_partner_matmul_impl(
         }
         return 0;
     }
-    if (cuda_q8_f16_restore_home(home_tier,
-                                 "successful result peer copy") < 0) {
+    if (serialize_pair) {
+        const cudaError_t partner_sync = cudaDeviceSynchronize();
+        if (partner_sync != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 partner serialization failed on partner "
+                    "tier %d: %s\n",
+                    partner_tier, cudaGetErrorString(partner_sync));
+            (void)cudaGetLastError();
+            (void)cuda_q8_f16_restore_home(
+                home_tier, "failed serialized partner sync");
+            return -1;
+        }
+        if (cuda_q8_f16_restore_home(
+                home_tier, "successful serialized result copy") < 0) {
+            return -1;
+        }
+        const cudaError_t home_sync = cudaDeviceSynchronize();
+        if (home_sync != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal q8 partner serialization failed on home "
+                    "tier %d: %s\n",
+                    home_tier, cudaGetErrorString(home_sync));
+            (void)cudaGetLastError();
+            return -1;
+        }
+    } else if (cuda_q8_f16_restore_home(
+                   home_tier, "successful result peer copy") < 0) {
         return -1;
     }
 
@@ -16572,13 +16644,16 @@ static int cuda_q8_f16_partner_matmul_impl(
         fprintf(stderr,
                 "ds4: CUDA q8 partner execution enabled: home tier %d "
                 "device %d -> partner tier %d device %d (%s, activation=%.2f MiB "
-                "result=%.2f MiB result_type=%s arithmetic=%s)\n",
+                "result=%.2f MiB result_type=%s arithmetic=%s transport=%s "
+                "serialized=%s)\n",
                 home_tier, home_device, partner_tier, partner_device,
                 label ? label : "q8_0",
                 (double)activation_transfer_bytes / 1048576.0,
                 (double)result_bytes / 1048576.0,
                 result_f16 ? "f16" : "f32",
-                cuda_q8_partner_arithmetic_name(arithmetic));
+                cuda_q8_partner_arithmetic_name(arithmetic),
+                force_host_bounce ? "host-bounce" : "peer",
+                serialize_pair ? "yes" : "no");
     }
     return 1;
 }

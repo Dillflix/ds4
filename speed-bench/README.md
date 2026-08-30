@@ -3065,27 +3065,35 @@ were active when an endpoint disappeared.
 
 `cuda-sm75-small-bar1-pair-isolation.sh` keeps the production device order,
 22/21 stage split, Q3A4 K4, Q4 tile32, and the healthy logical pair unchanged.
-The first four arms also keep the complete 344/344 dense cache; the explicit
-admission-off confirmation changes only pair-0 peer admission. It varies only
-logical pair 0 (physical
-GPU 0<->1 under `GPU_DEVICES=0,3,1,2`) through five arms:
+Every arm keeps the complete 344/344 dense cache, partner-resident FP16 weights,
+partner cuBLAS projections, activation/result shapes, and arithmetic. It varies
+only logical pair 0 (physical GPU 0<->1 under `GPU_DEVICES=0,3,1,2`) through
+five workload-preserving arms:
 
-- `partner-off` retains pair-0 partner-resident weights and scratch but routes
-  their projections through the ordinary home fallback;
-- `indexer-off` retains pair-0 partner execution but performs pair-0 decode
-  indexer scoring on the home GPU;
-- `both-off` suppresses both runtime transfer classes only on pair 0; and
-- `admission-off` omits pair-0 partner weights and scratch while leaving the
-  decode-indexer split enabled; and
+- `partner-bounce` stages only pair-0 Q8 partner activations and results through
+  pinned host memory instead of direct peer copies;
+- `bounce-indexer-off` combines that host-staged Q8 transport with pair-0
+  decode-indexer scoring on the home GPU;
+- `partner-serialized` retains direct peer copies but synchronizes pair-0 after
+  every complete partner projection to remove cross-projection overlap;
+- `indexer-off` retains ordinary direct partner execution but performs pair-0
+  decode-indexer scoring on the home GPU; and
 - `production` is the unmodified control.
 
-The safe diagnostic arms run before the known control. Every case preserves a
+All four GPUs must report an exact 250 W power limit before every arm. The
+transport/scheduling diagnostics run before the known control. They retain the
+same arithmetic work but host staging and serialization necessarily change the
+timing and instantaneous power envelope; a passing arm narrows the trigger but
+is not described as a power-matched proof. Every case preserves a
 flushed engine/prefill/decode journal, begin/complete byte checkpoints for Q8
 partner transfers, per-dispatch byte records for decode-indexer row splitting,
 ordinary GPU telemetry, and best-effort raw NVLink counters 0 and 1. Unsupported
 NVLink counters are labeled explicitly. If a GPU loss interrupts the shell,
 reuse the same directory with `RESUME=1`; the interrupted arm is retained as
-evidence and the next arm runs.
+evidence and the next arm runs. If the benchmark completed but the runner
+stopped during post-run validation, resume validates and recovers that arm from
+its existing CSV, binding inventory, progress journal, and log instead of
+rerunning it.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -3096,20 +3104,24 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
 TELEMETRY_INTERVAL_MS=500 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-This comparison can prove that admission alone is insufficient when
-`partner-off` passes: that arm keeps the admitted peer cache intact. If
-`both-off` still fails before decode, the decode row transfers are excluded,
-but an admission-off confirmation is still required to distinguish admitted
-peer memory from other unchanged prefill/P2P work.
+The earlier execution-off arm remains useful only as evidence that static
+344/344 admission and low-volume row traffic can survive at reduced load. It is
+not used for causal attribution because it removed thousands of partner
+projections and cut 32K prefill throughput by roughly threefold. The new
+factorial retains partner computation and separates Q8 transport, indexer rows,
+and overlap while telemetry records the remaining timing/power differences.
 
 ### Bounded SM75 P2P direction audit
 

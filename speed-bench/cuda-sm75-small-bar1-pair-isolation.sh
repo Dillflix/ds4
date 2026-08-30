@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Isolate the mixed/small-BAR1 NVLink pair without changing the other pair.
-Each arm runs the current 22/21 four-GPU production path at PP32768/TG256.
+Each arm preserves partner-resident weights and partner projection work in the
+current 22/21 four-GPU production path at PP32768/TG256.
 
 Required environment:
   MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
@@ -15,10 +16,11 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
-  VARIANTS=partner-off,indexer-off,both-off,admission-off,production
+  VARIANTS=partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production
   PP_TOKENS=32768
   TG_TOKENS=256
   REPEATS=1
+  REQUIRED_POWER_LIMIT_W=250
   TELEMETRY_INTERVAL_MS=500
   POST_CASE_SETTLE_SECONDS=5
   SKIP_BUILD=0
@@ -26,7 +28,8 @@ Optional environment:
   RESUME=0
   SMALL_BAR1_ISOLATION_DIR=/absolute/output/directory
 
-The safe diagnostic arms run before the known full-production reproducer.
+The transport/scheduling diagnostic arms run before the known full-production
+reproducer. They preserve arithmetic work but can change its timing envelope.
 If a GPU loss interrupts the shell, reboot, set RESUME=1 and reuse the printed
 SMALL_BAR1_ISOLATION_DIR. The incomplete arm is retained as failed evidence
 and the next arm runs; it is not silently retried.
@@ -45,10 +48,11 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 SMALL_BAR1_PAIR=${SMALL_BAR1_PAIR:-0}
-VARIANTS=${VARIANTS:-partner-off,indexer-off,both-off,admission-off,production}
+VARIANTS=${VARIANTS:-partner-bounce,bounce-indexer-off,partner-serialized,indexer-off,production}
 PP_TOKENS=${PP_TOKENS:-32768}
 TG_TOKENS=${TG_TOKENS:-256}
 REPEATS=${REPEATS:-1}
+REQUIRED_POWER_LIMIT_W=${REQUIRED_POWER_LIMIT_W:-250}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-500}
 POST_CASE_SETTLE_SECONDS=${POST_CASE_SETTLE_SECONDS:-5}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -66,6 +70,7 @@ cmp -s "$PROMPT" "$repo_dir/speed-bench/promessi_sposi.txt" ||
     die "require GPU_DEVICES=0,3,1,2, GPU_VRAM=auto, STAGE_SPLIT=22"
 for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
             "TG_TOKENS:$TG_TOKENS" "REPEATS:$REPEATS" \
+            "REQUIRED_POWER_LIMIT_W:$REQUIRED_POWER_LIMIT_W" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "POST_CASE_SETTLE_SECONDS:$POST_CASE_SETTLE_SECONDS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
@@ -74,7 +79,8 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
 (( SMALL_BAR1_PAIR == 0 && PP_TOKENS == 32768 && TG_TOKENS == 256 &&
-   REPEATS >= 1 && TELEMETRY_INTERVAL_MS >= 100 &&
+   REPEATS >= 1 && REQUIRED_POWER_LIMIT_W == 250 &&
+   TELEMETRY_INTERVAL_MS >= 100 &&
    POST_CASE_SETTLE_SECONDS <= 60 )) ||
     die "invalid fixed production isolation configuration"
 for flag in SKIP_BUILD CREATE_ARCHIVE RESUME; do
@@ -89,7 +95,7 @@ IFS=, read -r -a variants <<<"$VARIANTS"
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     case "$variant" in
-        partner-off|indexer-off|both-off|admission-off|production) ;;
+        partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
@@ -198,6 +204,17 @@ for name in "${inherited_ds4[@]}"; do clean+=(-u "$name"); done
 
 IFS=, read -r -a gpu_ids <<<"$GPU_DEVICES"
 (( ${#gpu_ids[@]} == 4 )) || die "GPU_DEVICES must contain four IDs"
+
+validate_power_limits() {
+    local gpu limit
+    for gpu in "${gpu_ids[@]}"; do
+        limit=$(timeout --kill-after=5s 20s nvidia-smi -i "$gpu" \
+            --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null |
+            awk 'NR==1 {print $1}') || return 1
+        awk -v actual="$limit" -v required="$REQUIRED_POWER_LIMIT_W" \
+            'BEGIN {exit !(actual + 0.0 == required + 0.0)}' || return 1
+    done
+}
 
 gpu_health_snapshot() {
     local path=$1
@@ -324,6 +341,8 @@ fi
 phase=manifest
 gpu_health_snapshot "$OUTPUT_DIR/health/initial.log" ||
     die "initial four-GPU health check failed"
+validate_power_limits ||
+    die "all four selected GPUs must be fixed at ${REQUIRED_POWER_LIMIT_W} W"
 if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
     {
         printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
@@ -338,7 +357,10 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'small_bar1_pair=%s\nvariants=%s\n' "$SMALL_BAR1_PAIR" "$VARIANTS"
         printf 'pp_tokens=%s\ntg_tokens=%s\nrepeats=%s\n' \
             "$PP_TOKENS" "$TG_TOKENS" "$REPEATS"
-        printf 'partner_off_retains_admission=yes\ndecode_indexer_pair_fallback=home\n'
+        printf 'required_power_limit_w=%s\n' "$REQUIRED_POWER_LIMIT_W"
+        printf 'partner_work_retained=yes\ndecode_indexer_pair_fallback=home\n'
+        printf 'host_bounce_scope=q8_partner_activation_and_result_only\n'
+        printf 'serialization_scope=q8_partner_projection_pair_only\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
         printf 'external_nvlink_counters=best-effort-nvidia-smi-counter0-counter1\n'
@@ -364,72 +386,78 @@ validate_admission_retained() {
     ' "$bindings"
 }
 
+log_line_has() {
+    local log=$1 first=$2 second=$3
+    awk -v first="$first" -v second="$second" '
+        index($0, first) && index($0, second) { found=1 }
+        END { exit !found }
+    ' "$log"
+}
+
 validate_success_path() {
     local variant=$1 log=$2 bindings=$3
-    if [[ $variant == admission-off ]]; then
-        ! validate_admission_retained "$bindings" || return 1
-        grep -Fq 'q8 fp16 partner admission suppressed for logical pair 0' "$log" ||
-            return 1
-    else
-        validate_admission_retained "$bindings" || return 1
-        grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
-            return 1
-    fi
+    validate_admission_retained "$bindings" || return 1
+    grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
+        return 1
     grep -Fq 'CUDA EP forced pipeline split 22/21' "$log" || return 1
     grep -Fq 'SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)' \
         "$log" || return 1
     ! grep -Eiq 'illegal memory|GPU is lost|Unknown Error|CUDA .* failed' "$log" ||
         return 1
+    grep -Fq 'q8 partner transfer audit event=begin home_tier=0' "$log" ||
+        return 1
+    grep -Fq 'q8 partner transfer audit event=begin home_tier=1' "$log" ||
+        return 1
     case "$variant" in
         production)
-            ! grep -Fq 'partner execution suppressed for logical pair 0' "$log" ||
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
                 return 1
-            grep -F 'decode indexer row audit event=complete' "$log" |
-                grep -Fq 'home_tier=0 partner_tier=2' || return 1
-            grep -F 'decode indexer row audit event=complete' "$log" |
-                grep -Fq 'home_tier=1 partner_tier=3' || return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
+                return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
             ;;
-        partner-off)
-            grep -Fq 'partner execution suppressed for logical pair 0' "$log" ||
+        partner-bounce)
+            grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
+                "$log" || return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
                 return 1
-            ! grep -Fq 'q8 partner transfer audit event=begin home_tier=0' "$log" ||
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            ;;
+        bounce-indexer-off)
+            grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
+                "$log" || return 1
+            grep -Fq 'decode indexer row split pair-scoped disable: logical-pairs=0' "$log" ||
                 return 1
-            grep -Fq 'q8 partner transfer audit event=begin home_tier=1' "$log" ||
+            if log_line_has "$log" 'decode indexer row audit event=begin' \
+                    'home_tier=0 partner_tier=2'; then
                 return 1
-            grep -F 'decode indexer row audit event=complete' "$log" |
-                grep -Fq 'home_tier=0 partner_tier=2' || return 1
+            fi
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        partner-serialized)
+            grep -Fq 'partner scheduling override for logical pair 0: projection-serialized' \
+                "$log" || return 1
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
+                return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
             ;;
         indexer-off)
-            grep -Fq 'decode indexer row split pair-scoped disable: logical-pairs=0' "$log" ||
-                return 1
-            if grep -F 'decode indexer row audit event=begin' "$log" |
-                    grep -Fq 'home_tier=0 partner_tier=2'; then
-                return 1
-            fi
-            grep -Fq 'q8 partner transfer audit event=begin home_tier=0' "$log" ||
-                return 1
-            grep -F 'decode indexer row audit event=complete' "$log" |
-                grep -Fq 'home_tier=1 partner_tier=3' || return 1
-            ;;
-        both-off)
-            grep -Fq 'partner execution suppressed for logical pair 0' "$log" ||
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
                 return 1
             grep -Fq 'decode indexer row split pair-scoped disable: logical-pairs=0' "$log" ||
                 return 1
-            ! grep -Fq 'q8 partner transfer audit event=begin home_tier=0' "$log" ||
-                return 1
-            if grep -F 'decode indexer row audit event=begin' "$log" |
-                    grep -Fq 'home_tier=0 partner_tier=2'; then
+            if log_line_has "$log" 'decode indexer row audit event=begin' \
+                    'home_tier=0 partner_tier=2'; then
                 return 1
             fi
-            ;;
-        admission-off)
-            ! grep -Fq 'q8 partner transfer audit event=begin home_tier=0' "$log" ||
-                return 1
-            grep -Fq 'q8 partner transfer audit event=begin home_tier=1' "$log" ||
-                return 1
-            grep -F 'decode indexer row audit event=complete' "$log" |
-                grep -Fq 'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
             ;;
     esac
 }
@@ -462,6 +490,21 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             continue
         fi
         if [[ $RESUME == 1 && -s $started ]]; then
+            if [[ -s $csv && $(wc -l <"$csv") == 2 && -s $bindings ]] &&
+                    [[ $(wc -l <"$bindings") == 345 ]] &&
+                    validate_success_path "$variant" "$log" "$bindings"; then
+                printf 'Recovering completed prior arm: variant=%s repeat=%d...\n' \
+                    "$variant" "$repeat"
+                write_result "$result" "$variant" passed 0 "$progress" "$log"
+                fields=$(last_progress_fields "$progress")
+                IFS=$'\t' read -r lp le lc lt <<<"$fields"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                    recovered-passed 0 "$lp" "$le" \
+                    >>"$OUTPUT_DIR/run-journal.tsv"
+                sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+                continue
+            fi
             printf 'Retaining interrupted prior arm as failure: variant=%s repeat=%d\n' \
                 "$variant" "$repeat"
             write_result "$result" "$variant" interrupted-prior-run 125 \
@@ -480,28 +523,26 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             "$repeat" "$REPEATS" "$variant" "$PP_TOKENS" "$TG_TOKENS"
         gpu_health_snapshot "$pre_health" ||
             die "GPU health failed before variant=$variant"
+        validate_power_limits ||
+            die "power limit changed before variant=$variant; require ${REQUIRED_POWER_LIMIT_W} W"
         printf 'timestamp_utc=%s\nvariant=%s\nrepeat=%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" >"$started"
         sync "$started" 2>/dev/null || sync
 
         variant_env=()
         case "$variant" in
-            partner-off)
-                variant_env+=("DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS=$SMALL_BAR1_PAIR")
+            partner-bounce)
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            bounce-indexer-off)
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            partner-serialized)
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_SERIALIZE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             indexer-off)
                 variant_env+=("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS=$SMALL_BAR1_PAIR")
-                ;;
-            both-off)
-                variant_env+=("DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS=$SMALL_BAR1_PAIR")
-                variant_env+=("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS=$SMALL_BAR1_PAIR")
-                ;;
-            admission-off)
-                variant_env+=("DS4_CUDA_NO_Q8_F16_PARTNER_ADMISSION_PAIRS=$SMALL_BAR1_PAIR")
-                # The stage-aware production plan normally treats a forced
-                # partner miss as fatal. This audited arm deliberately records
-                # that miss and continues with native home fallback.
-                variant_env+=(DS4_CUDA_Q8_CAPACITY_CALIBRATION=1)
                 ;;
             production) ;;
         esac
@@ -553,7 +594,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         [[ -s $csv && $(wc -l <"$csv") == 2 ]] ||
             die "variant=$variant produced an invalid benchmark CSV"
         [[ -s $bindings ]] || die "variant=$variant omitted its binding inventory"
-        if [[ $variant != admission-off && $(wc -l <"$bindings") != 345 ]]; then
+        if [[ $(wc -l <"$bindings") != 345 ]]; then
             die "variant=$variant omitted its 344-entry binding inventory"
         fi
         validate_success_path "$variant" "$log" "$bindings" ||
