@@ -10,7 +10,8 @@ The unchanged one-row/warp control is compared with:
   tile32-dp4a  one warp follows one native eight-row tile, signed DP4A;
   tile32-mma   the same tile mapping using packed m8n8k32 INT4 MMA.
 
-Every candidate is audit-only/default-off.  The run requires a deterministic
+Tile32 packed-INT4 MMA is the production default.  The run retains all four
+mappings for deterministic diagnostic comparison and requires a
 nonzero, two-input, production-K exact test through both the mid boundary and
 Q4-32 down output.  It also rejects spills/local traffic, ATOM/RED, more than
 128 allocated registers, and a failure of the two-CTA/SM register gate.
@@ -74,9 +75,9 @@ for value in "$RUN_NCU" "$RUN_SANITIZER" "$NCU_USE_SUDO" "$SKIP_BUILD" "$RESUME"
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
 
-# This audit owns the Q4 gate/up mapping.  A caller's stale down-candidate
-# environment must not change the inclusive control/candidate comparison.
-unset DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING
+# This audit owns the Q4 gate/up mapping.  Pin the production down mapping so a
+# caller's stale rollback selector cannot change the inclusive comparison.
+export DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING=tile32
 unset DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT
 
 tools=(c++filt cuobjdump env flock git grep make nproc nvidia-smi python3 sha256sum tar)
@@ -168,8 +169,8 @@ write_run_status running '' "$current_phase"
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
     printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
     printf 'profile_gpu=%s\ncuda_arch=%s\n' "$PROFILE_GPU" "$CUDA_ARCH"
-    printf 'scope=single-gpu-q4-32-audit-only-decode-mapping\n'
-    printf 'production_default=control\n'
+    printf 'scope=single-gpu-q4-32-diagnostic-decode-mapping\n'
+    printf 'production_default=tile32-mma\nfixed_down_mapping=tile32\n'
     printf 'timing_rounds=%s\ntiming_repeats=%s\nrun_sanitizer=%s\nrun_ncu=%s\nresume=%s\n' \
         "$TIMING_ROUNDS" "$TIMING_REPEATS" "$RUN_SANITIZER" "$RUN_NCU" "$RESUME"
     printf '\n[gpu]\n'
@@ -273,9 +274,9 @@ env -u DS4_CUDA_MOE_Q4_32_DECODE_MAPPING \
 grep -q 'SM75 Q4-32 hwarp16/tile32-dp4a/tile32-mma gate/up.*nonzero exact/reuse' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q4-32 native nonzero exact marker missing"
-grep -q 'SM75 Q4-32 audit mapping selector exact/default-off' \
+grep -q 'SM75 Q4-32 production mapping selectors exact' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
-    die "Q4-32 default-off selector marker missing"
+    die "Q4-32 production selector marker missing"
 grep -q 'SM75 Q4-32 signed DP4A byte packing exact' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q4-32 signed DP4A packing marker missing"

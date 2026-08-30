@@ -1,12 +1,13 @@
 ## Benchmarking
 
-### SM75-native Q4-32 decode gate/up audit
+### SM75-native Q4-32 decode gate/up mappings
 
-`cuda-sm75-decode-q4-gate-native.sh` compares the unchanged Q4-32 one-row/
-warp decode control with three audit-only mappings: two rows per warp,
+`cuda-sm75-decode-q4-gate-native.sh` compares the former Q4-32 one-row/
+warp decode control with three measured mappings: two rows per warp,
 eight-row native-tile signed DP4A, and eight-row native-tile packed
-`m8n8k32` INT4 MMA.  The production default remains control until a candidate
-passes this bounded audit and a separate real-model production A/B.
+`m8n8k32` INT4 MMA. Tile32 packed-INT4 MMA is now the production default.
+Set `DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=control` for the explicit rollback;
+`hwarp16` and `tile32-dp4a` remain diagnostic selectors.
 
 The exactness checkpoint uses the production 4096-element K dimension (16
 K256 records), two deterministic nonzero inputs, nonuniform expert weights,
@@ -188,6 +189,14 @@ winner is not production evidence. The runner archives success or failure and
 can resume only the Nsight phase after revalidating the original exactness,
 sanitizer, resource, timing, source, and binary evidence.
 
+Prefetch depth 2 improved the complete bounded Q3A4 K4 owned call by 7.8%
+(1.078x), passed exactness and sanitizer, used 64 registers with no stack,
+spill, or SASS local traffic, and reduced the profiled kernel from 93.664 to
+77.696 microseconds. It is nevertheless still default-off because no real
+four-GPU production A/B has yet established its end-to-end gain and exact
+decode output. This is the only current Q3A4 gate/up candidate flag awaiting
+that production acceptance pass; tile32-DP4A and K4 are already defaults.
+
 ```bash
 PROFILE_GPU=0 \
 TIMING_ROUNDS=9 \
@@ -239,9 +248,9 @@ CREATE_ARCHIVE=1 \
 
 ### SM75 Q4-32 down tile32 packed-INT4 audit
 
-`cuda-sm75-decode-q4down-tile32.sh` compares the existing one-token
-quarter-warp `owned_slots` and `owned_packed` Q4-32 down kernels with
-audit-only 128-thread tile32 candidates. A warp follows one native eight-row
+`cuda-sm75-decode-q4down-tile32.sh` compares the former one-token
+quarter-warp `owned_slots` and `owned_packed` Q4-32 down controls with the
+production-default 128-thread tile32 kernels. A warp follows one native eight-row
 tile and consumes the tagged packed Q4 weights directly through Turing
 `m8n8k32` U4xS4 and S4xS4 MMA. All eight K256 float leaves are staged before
 the unchanged 4/2/1 reduction. The packed exactness fixture owns slots 0+1 in
@@ -262,8 +271,9 @@ Timing includes the full production-owned call. Nsight Compute captures both
 controls and candidates. Timing requires an odd round count and checks exact
 control/candidate dispatch counters. The zero-weight timing harness measures
 launch and resource shape; the independent long-context regression is the
-arithmetic proof. Tile32 is default-off and remains an audit candidate until
-real-model end-to-end decode evidence supports promotion.
+arithmetic proof. Tile32 is now the SM75 tagged-layout production default;
+set `DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING=control` for the explicit
+quarter-warp rollback.
 
 ```bash
 PROFILE_GPU=0 \
@@ -2941,6 +2951,35 @@ It fixes the production 22/21 placement, mixed15 Q3A4 K4 path, dense-Q8 plan,
 indexer, attention, and cross-GPU boundaries. Four-repeat blocks use a balanced
 schedule. Every arm must reproduce 16 byte-exact decode logits at PP512,
 PP4096, and PP32768 and its exact gate/down ownership-shape call inventory.
+
+The first complete paired block, run with all four GPUs capped at 200 W,
+measured gate/up MMA at +8.2% to +9.8%, down tile32 at +1.3% to +1.5%, and
+both together at +9.7% to +11.7% across PP512/4096/32768. Their saved
+milliseconds per token were almost exactly additive. Together with the prior
+byte-exact nonzero regressions, sanitizer passes, zero-spill resource gates,
+and bounded kernel wins, this promoted both paths. The production A/B still
+forces both selectors in every arm so the `control`, `gate-mma`,
+`down-tile32`, and `both` definitions remain stable after the defaults change.
+
+The next Q4 work is deliberately format- and ownership-specific:
+
+1. For gate/up, test exact in-CTA K2 and K4 cooperation on the production
+   tile32 packed-INT4 MMA kernel. Preserve the 16 K256 leaves and current
+   reduction order, reject spills/local traffic, and include the whole owned
+   call in timing. The present kernel already allocates 96 registers and
+   reaches about 75% of peak DRAM bandwidth, so software prefetch should be
+   attempted only after the K-split/live-state result is known.
+2. For down, test K2 and K4 independently for `owned_slots` and
+   `owned_packed`; do not infer one ownership mode from the other. Both tile32
+   kernels allocate 64 registers, while the profiles remain dominated by
+   long-scoreboard stalls. Apply depth-1/2 prefetch only to a winning K-split.
+3. Re-run the accepted defaults on an all-Q4 gate/up model under a stable
+   power/clock condition. The current production result contains 28 Q4
+   gate/up layers, so it establishes the dispatch but not the eventual
+   all-Q4 aggregate gain.
+
+The rejected separate gate/up projection launches, generic Q32 low-register
+variants, and earlier Q4-down stage8/compact variants are not next steps.
 
 ```bash
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \

@@ -362,11 +362,11 @@ __global__ static void moe_gate_up_mid_decode_sm75_q3a4_hwarp16_owned_kernel(
     }
 }
 
-/* Q4-32 decode half-warp candidate.  Like the Q3A4 experiment above, the
+/* Q4-32 decode half-warp diagnostic.  Like the Q3A4 experiment above, the
  * shipping decode shape has exactly 16 K256 records, so two rows can share a
  * warp without changing either the per-record dot expression or the original
- * 8/4/2/1 floating-point reduction tree.  This remains an explicitly selected
- * audit candidate; the production Q4-32 default is unchanged. */
+ * 8/4/2/1 floating-point reduction tree.  This remains explicitly selected;
+ * tile32 packed-INT4 MMA is the production Q4-32 default. */
 __global__ static void moe_gate_up_mid_decode_sm75_q4_32_hwarp16_owned_kernel(
         float *mid_out, const char *gate_base, const char *up_base,
         const cuda_sm75_native_q8_K *xq,
@@ -421,13 +421,14 @@ sm75_q4_32_sign_extend_nibble_bytes(uint32_t v) {
                (sign << 3u) | (sign << 4u);
 }
 
-/* Native Q4-32 one-token tile candidates.  A warp follows one 8-row weight
- * tile.  The DP4A specialization expands four signed Q4 nibbles to four
+/* Native Q4-32 one-token tile mappings.  A warp follows one 8-row weight
+ * tile.  The DP4A diagnostic expands four signed Q4 nibbles to four
  * signed bytes per instruction.  The packed-MMA specialization feeds the
  * native Q4 words directly to Turing m8n8k32 INT4 MMA and replicates the one
  * decode activation across MMA's eight M rows; lanes 0..3 retain the single
- * unique row.  Both stage all 16 K256 leaves and reproduce the shipping
- * warp-sum tree exactly before SiLU/multiply/weight combine. */
+ * unique row. It is the production default. Both mappings stage all 16 K256
+ * leaves and reproduce the control warp-sum tree exactly before
+ * SiLU/multiply/weight combine. */
 template <bool PACKED_MMA>
 __global__ __launch_bounds__(128, 4) static void
 moe_gate_up_mid_decode_sm75_q4_32_tile32_owned_kernel(
@@ -1339,10 +1340,10 @@ __global__ static void moe_down_sm75_q4_32_owned_packed_kernel(
  * 4/2/1 tree without carrying sixteen live float accumulators through the
  * packed-INT4 MMA loop.
  *
- * Four warps cover the same 32 output rows as the 256-thread scalar control.
+ * Four warps cover the same 32 output rows as the 256-thread scalar fallback.
  * The 128-thread launch bound intentionally caps allocation at 64 registers,
  * so eight CTAs can supply all 32 resident SM75 warps if the compiler keeps
- * the candidate spill-free. */
+ * the production kernel spill-free. */
 __device__ __forceinline__ static float sm75_q4_32_down_reduce8_exact(
         const float leaf[8][8], uint32_t row8) {
     const float a0 = __fadd_rn(leaf[0][row8], leaf[4][row8]);

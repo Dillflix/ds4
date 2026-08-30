@@ -201,6 +201,8 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q4 down owned_packed exact marker missing"
     grep -Fq 'Q4-32 down tile32 signed-zero boundary exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q4 down signed-zero marker missing"
+    grep -Fq 'SM75 Q4-32 tile32-mma gate/up + tile32 down production defaults' \
+        "$OUTPUT_DIR/smoke.log" || die "Q4 production-default marker missing"
     grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
@@ -407,17 +409,18 @@ q3a4_active_count() {
 validate_dispatch_audit() {
     local variant=$1 log=$2
     if [[ $variant == control || $variant == down-tile32 ]]; then
-        grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=control (production default)' \
+        grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=control (explicit fallback)' \
             "$log" || return 1
     else
-        grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=tile32-mma (audit candidate)' \
+        grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
             "$log" || return 1
     fi
     if [[ $variant == down-tile32 || $variant == both ]]; then
-        grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=tile32-int4 (audit candidate)' \
+        grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=tile32-int4 (production default)' \
             "$log" || return 1
     else
-        ! grep -Fq 'SM75 Q4-32 down decode mapping=tile32-int4' "$log" || return 1
+        grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=control (explicit fallback)' \
+            "$log" || return 1
     fi
     grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)' \
         "$log" || return 1
@@ -431,9 +434,11 @@ variant_env() {
     case "$variant" in
         control)
             printf 'DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=control\n'
+            printf 'DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING=control\n'
             ;;
         gate-mma)
             printf 'DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=tile32-mma\n'
+            printf 'DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING=control\n'
             ;;
         down-tile32)
             printf 'DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=control\n'

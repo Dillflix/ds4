@@ -5,8 +5,9 @@ usage() {
     cat <<'EOF'
 Audit the SM75 Q4-32 one-token down tile32 packed-INT4 candidates.
 
-The production owned_slots and owned_packed quarter-warp kernels are retained
-as controls. The candidates use m8n8k32 packed-INT4 MMA across one native
+The former production owned_slots and owned_packed quarter-warp kernels are
+retained as explicit controls. The production-default tile32 paths use
+m8n8k32 packed-INT4 MMA across one native
 eight-row Q4-32 tile and retain all eight K256 float leaves so the existing
 4/2/1 reduction is byte-exact. The packed fixture includes a real two-slot
 prefix-pair exact add.
@@ -62,9 +63,9 @@ for value in "$RUN_SANITIZER" "$RUN_NCU" "$NCU_USE_SUDO" "$SKIP_BUILD" "$RESUME"
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
 
-# This audit owns the Q4 down mapping.  A caller's stale gate/up-candidate
-# environment must not change either ownership-mode comparison.
-unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING
+# This audit owns the Q4 down mapping.  Pin the production gate/up mapping so a
+# caller's stale rollback selector cannot change either ownership comparison.
+export DS4_CUDA_MOE_Q4_32_DECODE_MAPPING=tile32-mma
 unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT
 
 tools=(c++filt cuobjdump env flock git grep make nproc nvidia-smi python3 sha256sum tar)
@@ -151,8 +152,8 @@ write_run_status running '' "$current_phase"
     printf 'date_utc=%s\nrepo=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir"
     printf 'git_commit=%s\ngit_branch=%s\n' "$(git rev-parse HEAD)" "$(git branch --show-current)"
     printf 'profile_gpu=%s\ncuda_arch=%s\n' "$PROFILE_GPU" "$CUDA_ARCH"
-    printf 'scope=audit-only-q4-32-down-decode-tile32-packed-int4\n'
-    printf 'production_default=control\nmidq_blocks=8\n'
+    printf 'scope=q4-32-down-decode-tile32-packed-int4-diagnostic\n'
+    printf 'production_default=tile32\nfixed_gate_up_mapping=tile32-mma\nmidq_blocks=8\n'
     printf 'candidate_block_size=128\n'
     printf 'slots_candidate_static_shared_bytes=1024\n'
     printf 'packed_candidate_static_shared_bytes=1152\n'
@@ -267,7 +268,7 @@ done
 for variant in slots-tile32 packed-tile32; do
     grep -q '^q4_32_down_decode_mapping=1$' "$OUTPUT_DIR/smoke/$variant.log" ||
         die "$variant omitted tile32 dispatch"
-    grep -q 'mapping=tile32-int4 (audit candidate)' \
+    grep -q 'mapping=tile32-int4 (production default)' \
         "$OUTPUT_DIR/smoke/$variant.log" || die "$variant audit marker missing"
 done
 grep -q '^down_output_kind=owned_packed-prefix-pair$' \
@@ -434,7 +435,7 @@ for kind in slots packed; do
     expected_candidate=$((2 + TIMING_ROUNDS * TIMING_REPEATS))
     grep -Fq "SM75 Q4-32 down decode mapping audit control=$expected_control tile32=$expected_candidate" \
         "$log" || die "$kind timing dispatch counters are incomplete"
-    grep -q 'mapping=tile32-int4 (audit candidate)' "$log" ||
+    grep -q 'mapping=tile32-int4 (production default)' "$log" ||
         die "$kind timing omitted tile32 dispatch marker"
     control=$(grep '^control_median_ms=' "$log" | cut -d= -f2)
     candidate=$(grep '^candidate_median_ms=' "$log" | cut -d= -f2)

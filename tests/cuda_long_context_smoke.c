@@ -1399,7 +1399,7 @@ static int check_sm75_q4_32_mapping_env(void) {
         {"hwarp16", 1u},
         {"tile32-dp4a", 2u},
         {"tile32-mma", 3u},
-        {"invalid", 0u},
+        {"invalid", 3u},
     };
     int rc = 0;
     for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1414,10 +1414,32 @@ static int check_sm75_q4_32_mapping_env(void) {
     }
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING");
     ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 0u) rc = 1;
+    if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u) rc = 1;
+    static const struct {
+        const char *name;
+        uint32_t expected;
+    } down_cases[] = {
+        {"control", 0u},
+        {"tile32", 1u},
+        {"invalid", 1u},
+    };
+    for (uint32_t i = 0;
+         rc == 0 && i < sizeof(down_cases) / sizeof(down_cases[0]); i++) {
+        if (setenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING",
+                   down_cases[i].name, 1) != 0) return 1;
+        ds4_gpu_test_refresh_decode_dispatch_env();
+        if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() !=
+                down_cases[i].expected) {
+            rc = 1;
+            break;
+        }
+    }
+    (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u) rc = 1;
     fputs(rc == 0
-              ? "cuda-regression: SM75 Q4-32 audit mapping selector exact/default-off\n"
-              : "cuda-regression: SM75 Q4-32 audit mapping selector failed\n",
+              ? "cuda-regression: SM75 Q4-32 production mapping selectors exact\n"
+              : "cuda-regression: SM75 Q4-32 production mapping selectors failed\n",
           stderr);
     return rc;
 }
@@ -1792,9 +1814,9 @@ static int check_sm75_q32_owned_graph(void) {
     return rc;
 }
 
-/* Compare the audit-only packed-INT4 Q4-32 down mapping against both real
- * production controls.  The eight nonzero K256 records are the production
- * down shape.  Control/candidate outputs live in separate poisoned buffers,
+/* Compare the production packed-INT4 Q4-32 down mapping against both former
+ * controls. The eight nonzero K256 records are the production down shape.
+ * Control/candidate outputs live in separate poisoned buffers,
  * and the packed cases cover every three-slot ownership mask. */
 static int check_sm75_q4_32_down_tile32_exact(void) {
     const uint32_t n_total = 8u, n_expert = 6u;
@@ -2707,9 +2729,10 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
-    if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 0u) {
+    if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u) {
         fprintf(stderr,
-                "cuda-regression: SM75 Q4-32 audit mapping is not default-off\n");
+                "cuda-regression: SM75 Q4-32 production gate/up mapping is "
+                "not tile32-mma\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;
@@ -2737,14 +2760,17 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
-    if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 0u) {
+    if (ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u) {
         fprintf(stderr,
-                "cuda-regression: SM75 Q4-32 down audit mapping is not "
-                "default-off\n");
+                "cuda-regression: SM75 Q4-32 production down mapping is not "
+                "tile32\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;
     }
+    fprintf(stderr,
+            "cuda-regression: SM75 Q4-32 tile32-mma gate/up + tile32 down "
+            "production defaults\n");
     fprintf(stderr,
             "cuda-regression: SM75 Q3A4 tile32-dp4a-k4 production default\n");
     if (!retire_temporary_model_map()) {
