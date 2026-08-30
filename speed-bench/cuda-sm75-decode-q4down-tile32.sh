@@ -51,6 +51,11 @@ for value in "$RUN_SANITIZER" "$RUN_NCU" "$NCU_USE_SUDO" "$SKIP_BUILD" "$CREATE_
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
 
+# This audit owns the Q4 down mapping.  A caller's stale gate/up-candidate
+# environment must not change either ownership-mode comparison.
+unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING
+unset DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT
+
 tools=(c++filt cuobjdump env git grep make nproc nvidia-smi python3 tar)
 (( RUN_SANITIZER == 0 )) || tools+=(compute-sanitizer)
 (( RUN_NCU == 0 )) || tools+=(ncu)
@@ -457,4 +462,5 @@ if [[ $RUN_NCU == 1 ]]; then
     done
 fi
 
+current_phase=complete
 printf 'SM75 Q4-32 down tile32 audit complete: %s\n' "$OUTPUT_DIR"

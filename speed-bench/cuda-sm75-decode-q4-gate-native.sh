@@ -51,10 +51,16 @@ OUTPUT_DIR=${Q4_GATE_NATIVE_DIR:-$repo_dir/sm75-decode-q4-gate-native-$(date -u 
 
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be a physical GPU index"
 [[ $TIMING_ROUNDS =~ ^[1-9][0-9]*$ ]] || die "TIMING_ROUNDS must be positive"
+(( TIMING_ROUNDS % 2 == 1 )) || die "TIMING_ROUNDS must be odd"
 [[ $TIMING_REPEATS =~ ^[1-9][0-9]*$ ]] || die "TIMING_REPEATS must be positive"
 for value in "$RUN_NCU" "$RUN_SANITIZER" "$NCU_USE_SUDO" "$SKIP_BUILD" "$CREATE_ARCHIVE"; do
     [[ $value == 0 || $value == 1 ]] || die "binary options must be 0 or 1"
 done
+
+# This audit owns the Q4 gate/up mapping.  A caller's stale down-candidate
+# environment must not change the inclusive control/candidate comparison.
+unset DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING
+unset DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT
 
 tools=(c++filt cuobjdump env git grep make nproc nvidia-smi python3 tar)
 (( RUN_NCU == 0 )) || tools+=(ncu)
@@ -334,6 +340,11 @@ declare -A timing_scenario=(
     [tile32-dp4a]=q4-32-gate-up-tile32-dp4a-ab
     [tile32-mma]=q4-32-gate-up-tile32-mma-ab
 )
+declare -A timing_kind=(
+    [hwarp16]=q4-32-hwarp16
+    [tile32-dp4a]=q4-32-tile32-dp4a
+    [tile32-mma]=q4-32-tile32-mma
+)
 current_phase=inclusive-timing
 for variant in hwarp16 tile32-dp4a tile32-mma; do
     log="$OUTPUT_DIR/timing/$variant.log"
@@ -345,6 +356,8 @@ for variant in hwarp16 tile32-dp4a tile32-mma; do
         }
     grep -q '^timing_scope=production-owned-call-inclusive$' "$log" ||
         die "$variant timing scope missing"
+    grep -Fqx "candidate_kind=${timing_kind[$variant]}" "$log" ||
+        die "$variant timing compared the wrong candidate"
     control=$(grep '^control_median_ms=' "$log" | cut -d= -f2)
     candidate=$(grep '^candidate_median_ms=' "$log" | cut -d= -f2)
     speedup=$(grep '^candidate_speedup=' "$log" | cut -d= -f2)
