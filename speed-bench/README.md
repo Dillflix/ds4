@@ -148,6 +148,44 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
 ```
 
+If the bounded audit selects prefetch depth 2, use
+`cuda-sm75-decode-q3a4-prefetch2-production-ab.sh` for the real-model
+acceptance pass. It compares ordinary production K4 (depth 0) with depth 2
+while fixing every other dispatch, the 22/21 stage split, complete 344/344
+dense-F16 admission, and the four-GPU topology. The runner alternates paired
+TG256 measurements at PP512/4096/32768 and requires 16 byte-identical decode
+logits at each frontier. Dispatch counters must show K4 exclusively in both
+arms and prefetch depth 0 versus 2 exclusively; dense-Q8 placement plans and
+canonical binding identities must also match between arms.
+
+`Q3A4_LAYOUT=mixed15` requires the current exact 15-layer allocation.
+`Q3A4_LAYOUT=all43` requires Q3A4 gate/up and Q4-32 down on every routed
+layer, so the same runner can validate the forthcoming all-Q3A4 gate/up model
+without weakening its inventory checks. Exact checkpoints are isolated by
+arm and frontier, but all use the fixed 33025-token PP32768+TG256 production
+allocation and must export the same dense-Q8 plan. Resume rejects wrong-sized,
+non-finite, or all-zero logits,
+unhealthy GPU snapshots, wrong layer inventories, wrong dispatch counters,
+invalid cache state, changed model stat identity, changed Q3A4 CUDA sources,
+or a changed engine binary; failures are archived by default. Full hashing of
+the 139 GiB model remains intentionally disabled.
+
+```bash
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+Q3A4_LAYOUT=mixed15 \
+REPEATS=3 \
+TG_TOKENS=256 \
+EXACT_TOKENS=16 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+./speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh
+```
+
 ### SM75 fused low-register Q3A4/Q4-32 decode sweep
 
 `cuda-sm75-decode-q32-fused-lowreg.sh` follows the rejected two-projection

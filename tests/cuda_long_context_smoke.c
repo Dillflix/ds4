@@ -1142,50 +1142,90 @@ static int require_nonzero_f32(const char *label, const float *values,
 static int check_sm75_q3a4_ksplit_env(void) {
     int rc = 1;
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING", "tile32-dp4a", 1) != 0 ||
-        setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "1", 1) != 0)
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "1", 1) != 0 ||
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "2", 1) != 0)
         goto cleanup;
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        goto cleanup;
 
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "2", 1) != 0)
         goto cleanup;
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 2u) goto cleanup;
-
-    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0)
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 2u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
         goto cleanup;
-    ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) goto cleanup;
-
-    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "3", 1) != 0)
-        goto cleanup;
-    ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u) goto cleanup;
 
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0 ||
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "0", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "2", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 2u)
+        goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "1", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "3", 1) != 0 ||
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "2", 1) != 0)
+        goto cleanup;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        goto cleanup;
+
+    if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "4", 1) != 0 ||
+        setenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH", "2", 1) != 0 ||
         setenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING", "1", 1) != 0)
         goto cleanup;
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 0u ||
-        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u) goto cleanup;
+        ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 1u ||
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        goto cleanup;
     rc = 0;
 
 cleanup:
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (rc == 0 &&
         (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
-         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u)) rc = 1;
-    fputs(rc == 0
-              ? "cuda-regression: SM75 Q3A4 K1/K2/K4 environment selector exact\n"
-              : "cuda-regression: SM75 Q3A4 K-split environment selector failed\n",
-          stderr);
+         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
+         ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u))
+        rc = 1;
+    if (rc == 0) {
+        fputs("cuda-regression: SM75 Q3A4 K1/K2/K4 environment selector exact\n",
+              stderr);
+        fputs("cuda-regression: SM75 Q3A4 K4 prefetch depth 0/2 "
+              "environment selector exact\n",
+              stderr);
+    } else {
+        fputs("cuda-regression: SM75 Q3A4 K-split/prefetch environment "
+              "selector failed\n",
+              stderr);
+    }
     return rc;
 }
 
@@ -2175,6 +2215,7 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q3A4_DECODE_MAPPING");
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
+    (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
     if (check_sm75_q3a4_ksplit_env() != 0) return 1;
     if (check_sm75_q3a4_dp4a_pack() != 0) return 1;
     idle_model_map = (unsigned char *)calloc(1, (size_t)idle_model_bytes);

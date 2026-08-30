@@ -197,8 +197,9 @@ static uint32_t g_cuda_moe_q3a4_decode_mapping;
 static const uint32_t CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT = 4u;
 static uint32_t g_cuda_moe_q3a4_decode_ksplit =
     CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
-/* Test-only K4 software-pipeline selector.  Production remains the ordinary
- * K4 kernel unless a bounded harness explicitly selects depth 1 or 2. */
+/* K4 software-pipeline selector.  Production remains the ordinary depth-zero
+ * K4 kernel.  A bounded runtime experiment may select depth two; depth one is
+ * retained only for the architecture harness through the test setter below. */
 static uint32_t g_cuda_moe_q3a4_decode_prefetch_depth;
 static int g_cuda_moe_q3a4_decode_mapping_audit;
 static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
@@ -630,6 +631,7 @@ static void cuda_decode_dispatch_env_refresh(void) {
             g_cuda_moe_q3a4_decode_mapping = CUDA_MOE_Q3A4_DECODE_CONTROL;
         }
     }
+    bool q3a4_ksplit_valid = true;
     const char *q3a4_ksplit = getenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT");
     if (q3a4_ksplit && !q3a4_mapping_disabled) {
         if (strcmp(q3a4_ksplit, "1") == 0) {
@@ -639,11 +641,31 @@ static void cuda_decode_dispatch_env_refresh(void) {
         } else if (strcmp(q3a4_ksplit, "4") == 0) {
             g_cuda_moe_q3a4_decode_ksplit = 4u;
         } else {
+            q3a4_ksplit_valid = false;
             fprintf(stderr,
                     "ds4: invalid Q3A4 decode K split '%s'; using K4\n",
                     q3a4_ksplit);
             g_cuda_moe_q3a4_decode_ksplit =
                 CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
+        }
+    }
+    const char *q3a4_prefetch_depth =
+        getenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
+    if (q3a4_prefetch_depth && q3a4_ksplit_valid &&
+        !q3a4_mapping_disabled &&
+        g_cuda_moe_q3a4_decode_mapping ==
+            CUDA_MOE_Q3A4_DECODE_TILE32_DP4A &&
+        g_cuda_moe_q3a4_decode_ksplit == 4u) {
+        if (strcmp(q3a4_prefetch_depth, "0") == 0) {
+            g_cuda_moe_q3a4_decode_prefetch_depth = 0u;
+        } else if (strcmp(q3a4_prefetch_depth, "2") == 0) {
+            g_cuda_moe_q3a4_decode_prefetch_depth = 2u;
+        } else {
+            fprintf(stderr,
+                    "ds4: invalid Q3A4 decode prefetch depth '%s'; "
+                    "using depth 0\n",
+                    q3a4_prefetch_depth);
+            g_cuda_moe_q3a4_decode_prefetch_depth = 0u;
         }
     }
 }
