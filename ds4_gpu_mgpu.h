@@ -139,6 +139,27 @@ int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                       const ds4_gpu_tensor *src,
                                       uint64_t bytes);
 
+/* Diagnostic per-call host-bounce override for default-stream handoffs. It
+ * preserves the normal copy API's validation and ordering while bypassing
+ * direct peer transport without changing the process-wide transport policy. */
+#if defined(DS4_NO_GPU)
+static inline int ds4_gpu_tensor_copy_xdev_default_host_bounce(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    (void)dst; (void)src; (void)bytes;
+    return 1;
+}
+#elif defined(__APPLE__)
+static inline int ds4_gpu_tensor_copy_xdev_default_host_bounce(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    return ds4_gpu_tensor_copy_xdev_default(dst, src, bytes);
+}
+#else
+int ds4_gpu_tensor_copy_xdev_default_host_bounce(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t bytes);
+#endif
+
 /* Diagnostic direct-P2P handoff executed on the destination default stream.
  * Unlike the grouped overlap helper below, this is a complete reusable-buffer
  * handshake: source-ready -> destination copy -> source completion wait. It

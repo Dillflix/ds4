@@ -17,6 +17,7 @@ Optional environment:
   STAGE_SPLIT=22
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
   VARIANTS=attention-off,production  scheduling matrix is explicit and fixed
+  VARIANTS=attention-host-bounce     host-stage pair-0 attention-owned copies
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -127,19 +128,19 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
 done
 if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
-    die "attention copy-scheduling arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
+    die "attention copy diagnostic arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
 fi
 
 for tool in awk basename cat cmp cp date dirname env find git grep kill make \
@@ -363,11 +364,38 @@ start_telemetry_watch() {
     local output=$1 marker=$2 case_pid=$3
     (
         while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
-            local watch_status= foreign_processes=
-            if tail -n 24 "$output" 2>/dev/null |
-                    grep -Eiq 'GPU is lost|GPU requires reset|GPU Unavailable|Critical Xid|Unknown Error|ERR!|Unable to determine'; then
+            local watch_status= foreign_processes= lost_devices= recent_tail=
+            recent_tail=$(tail -n 24 "$output" 2>/dev/null || true)
+            if grep -Eiq 'GPU is lost|GPU requires reset|GPU Unavailable|Critical Xid|Unknown Error|ERR!|Unable to determine' \
+                    <<<"$recent_tail"; then
                 watch_status=lost-device-detected
-            elif tail -n 24 "$output" 2>/dev/null |
+                lost_devices=$(awk -F, '
+                    function add(idx, bus, key) {
+                        key=idx "@" bus
+                        if (!seen[key]++) {
+                            if (out != "") out=out ","
+                            out=out key
+                        }
+                    }
+                    {
+                        lower=tolower($0)
+                        if (lower !~ /gpu is lost|gpu requires reset|gpu unavailable|critical xid|unknown error|err!|unable to determine/) next
+                        idx=$2; bus=$3
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", idx)
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", bus)
+                        if (idx ~ /^[0-9]+$/) {
+                            add(idx, bus)
+                            next
+                        }
+                        if (index($0, "00000000:02:00.0")) add("0", "00000000:02:00.0")
+                        if (index($0, "00000000:03:00.0")) add("1", "00000000:03:00.0")
+                        if (index($0, "00000000:81:00.0")) add("2", "00000000:81:00.0")
+                        if (index($0, "00000000:82:00.0")) add("3", "00000000:82:00.0")
+                    }
+                    END {print out}
+                ' <<<"$recent_tail")
+                [[ -n $lost_devices ]] || lost_devices=unknown
+            elif printf '%s\n' "$recent_tail" |
                     awk -F, -v required="$REQUIRED_POWER_LIMIT_W" '
                         {
                             index_field=$2
@@ -388,9 +416,9 @@ start_telemetry_watch() {
             fi
             if [[ -n $watch_status ]]; then
                 printf 'telemetry-watch: %s detected\n' "$watch_status" >>"$output"
-                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nforeign_processes=%q\n' \
+                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\n' \
                     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
-                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" \
+                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" "$lost_devices" \
                     "$foreign_processes" >"$marker"
                 sync "$marker" 2>/dev/null || sync
                 kill "$telemetry_pid" >/dev/null 2>&1 || true
@@ -504,6 +532,7 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'serialization_scope=q8_partner_projection_pair_only\n'
         printf 'attention_copy_scheduling_scope=pair0_query_and_gather_independent\n'
         printf 'attention_copy_scheduling_transport=ordered_direct_peer_no_fallback\n'
+        printf 'attention_host_bounce_scope=pair0_attention_owned_copies_only\n'
         printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
@@ -557,6 +586,13 @@ validate_attention_copy_schedule() {
         "$log"
 }
 
+validate_attention_copy_transport() {
+    local log=$1 home=$2 partner=$3 query_transport=$4 gather_transport=$5
+    grep -Eq \
+        "prefill attention row audit dispatch=split .*home=${home} partner=${partner} .*query_copy_transport=${query_transport} gather_copy_transport=${gather_transport}" \
+        "$log"
+}
+
 validate_success_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     validate_admission_retained "$bindings" || return 1
@@ -587,6 +623,64 @@ validate_success_path() {
                 return 1
             grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
                 return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        attention-host-bounce)
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
+                return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
+                return 1
+            log_line_has "$log" 'q8 partner transfer audit event=begin home_tier=0' \
+                'transport=peer' || return 1
+            log_line_has "$log" 'q8 partner transfer audit event=begin home_tier=1' \
+                'transport=peer' || return 1
+            grep -Fq 'prefill attention row transport override for logical pair 0: pinned-host-bounce' \
+                "$log" || return 1
+            grep -Eq 'prefill attention host-bounce checkpoint event=complete .*pos=512 tokens=512 home=0 partner=2' \
+                "$log" || return 1
+            for cache_class in raw attn-comp index; do
+                grep -Fq "prefill attention cache mirror transport=host-bounce home_tier=0 partner_tier=2 class=$cache_class event=complete" \
+                    "$log" || return 1
+            done
+            ! grep -Fq 'prefill attention cache mirror transport=host-bounce home_tier=1' \
+                "$log" || return 1
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
+                return 1
+            validate_attention_copy_schedule "$log" 0 2 source source || return 1
+            validate_attention_copy_schedule "$log" 1 3 source source || return 1
+            validate_attention_copy_transport "$log" 0 2 host-bounce host-bounce ||
+                return 1
+            validate_attention_copy_transport "$log" 1 3 peer peer || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split .*home=0 partner=2 .*query_copy_transport=peer|prefill attention row audit dispatch=split .*home=0 partner=2 .*gather_copy_transport=peer' \
+                "$log" || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split .*home=1 partner=3 .*query_copy_transport=host-bounce|prefill attention row audit dispatch=split .*home=1 partner=3 .*gather_copy_transport=host-bounce' \
+                "$log" || return 1
+            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=0 partner=2 .*topk_copy_transport=partner-local' \
+                "$log" || return 1
+            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=1 partner=3 .*topk_copy_transport=partner-local' \
+                "$log" || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=[01] partner=[23] .*topk_copy_transport=(peer|host-bounce)' \
+                "$log" || return 1
+            ! grep -Fq 'ordered destination-stream peer copy unavailable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row phase audit event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row entry fence event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row end fence event=' "$log" ||
+                return 1
+            validate_full_production_load "$csv" || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -845,6 +939,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         case "$variant" in
             attention-off)
                 variant_env+=("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-host-bounce)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-query-dst)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")

@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "attention-off", "attention-query-dst", "attention-gather-dst",
+    "attention-off", "attention-host-bounce", "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
     "partner-serialized", "indexer-off", "production"
@@ -69,6 +69,51 @@ def attention_copy_schedules(text: str, pair: int) -> tuple[str, str]:
         query.add(match.group(1))
         gather.add(match.group(2))
     return ",".join(sorted(query)), ",".join(sorted(gather))
+
+
+def attention_copy_transports(text: str, pair: int) -> tuple[str, str]:
+    query: set[str] = set()
+    gather: set[str] = set()
+    pattern = re.compile(
+        r"prefill attention row audit dispatch=split .*?"
+        rf"home={pair} partner=\d+ .*?query_copy_transport=(\S+) "
+        r"gather_copy_transport=(\S+)"
+    )
+    for match in pattern.finditer(text):
+        query.add(match.group(1))
+        gather.add(match.group(2))
+    return ",".join(sorted(query)), ",".join(sorted(gather))
+
+
+def attention_aux_transports(text: str, pair: int) -> tuple[str, str]:
+    cache = set(re.findall(
+        rf"prefill attention cache mirror transport=(\S+) home_tier={pair} ",
+        text,
+    ))
+    topk: set[str] = set()
+    pattern = re.compile(
+        r"prefill attention row audit dispatch=split .*?"
+        rf"home={pair} partner=\d+ .*?topk_copy_transport=(\S+)"
+    )
+    for match in pattern.finditer(text):
+        topk.add(match.group(1))
+    return ",".join(sorted(cache)), ",".join(sorted(topk))
+
+
+def last_attention_host_bounce_checkpoint(text: str, pair: int) -> str:
+    last = ""
+    pattern = re.compile(
+        r"prefill attention host-bounce checkpoint event=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        rf"home={pair} partner=(\d+)"
+    )
+    for match in pattern.finditer(text):
+        event, kind, layer, pos, tokens, partner = match.groups()
+        last = (
+            f"{event}:{kind}:layer{layer}:pos{pos}:tokens{tokens}:"
+            f"home{pair}:partner{partner}"
+        )
+    return last
 
 
 def last_attention_phase_audit(text: str) -> str:
@@ -277,6 +322,7 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "rerun it without the foreign workload."
         )
     attention = outcomes.get("attention-off", "not-run")
+    attention_host_bounce = outcomes.get("attention-host-bounce", "not-run")
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -289,6 +335,49 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     serialized = outcomes.get("partner-serialized", "not-run")
     indexer = outcomes.get("indexer-off", "not-run")
     attention_rows = [row for row in rows if row.get("variant") == "attention-off"]
+    attention_host_bounce_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-host-bounce"
+    ]
+    attention_host_bounce_failed_rows = [
+        row for row in attention_host_bounce_rows
+        if row.get("status") in {
+            "failed-device-loss", "interrupted-prior-run-device-loss",
+            "interrupted-no-result-device-loss",
+        }
+    ]
+
+    def measured_host_bounce_checkpoint(row: dict[str, str]) -> bool:
+        checkpoint = row.get("attention_host_bounce_checkpoint", "")
+        return (
+            checkpoint.startswith(("begin:", "complete:", "failed:")) and
+            ":pos512:tokens512:home0:partner2" in checkpoint
+        )
+
+    def pair0_device_loss(row: dict[str, str]) -> bool:
+        for item in row.get("lost_devices", "").split(","):
+            match = re.match(r"^([0-9]+)(?:@|$)", item.strip())
+            if match and int(match.group(1)) in {0, 1}:
+                return True
+        return False
+
+    attention_host_bounce_failure_reached = any(
+        measured_host_bounce_checkpoint(row)
+        for row in attention_host_bounce_failed_rows
+    )
+    attention_host_bounce_pair0_failure_reached = any(
+        measured_host_bounce_checkpoint(row) and pair0_device_loss(row)
+        for row in attention_host_bounce_failed_rows
+    )
+    attention_host_bounce_pass_verified = (
+        bool(attention_host_bounce_rows) and
+        all(
+            row.get("attention_host_bounce_checkpoint", "").startswith(
+                "complete:"
+            ) and measured_host_bounce_checkpoint(row)
+            for row in attention_host_bounce_rows
+        )
+    )
     attention_completed_without_result = (
         bool(attention_rows) and
         any(row.get("status") == "completed-no-result" for row in attention_rows) and
@@ -509,6 +598,67 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "Its last durable query-copy, partner-attention, home-attention, or "
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
+        )
+    if (attention_host_bounce == "passed" and
+            attention_host_bounce_pass_verified):
+        return (
+            "Pair 0 completed the full 32K production-shaped row split after only "
+            "its attention-owned query, mirrored-cache, and result copies were staged "
+            "through pinned host memory. Any non-split top-k copy uses the same staging, "
+            "although top-k remained partner-local in this arm. Q8 partner transport, "
+            "50/50 attention rows, partner attention arithmetic, and both indexer row "
+            "splits remained enabled. This implicates the direct attention P2P/BAR1 "
+            "path or its timing envelope, but host staging changes throughput and "
+            "instantaneous load and is not by itself a power-matched proof or "
+            "production mitigation."
+        )
+    if attention_host_bounce == "failed":
+        if not attention_host_bounce_failure_reached:
+            return (
+                "A device loss was corroborated, but no durable measured pos=512 "
+                "attention host-bounce checkpoint proves that the failed arm reached "
+                "the transport cut. This is a real failure but inconclusive for "
+                "direct attention P2P/BAR1; inspect the last phase, watch event, and "
+                "post-run health before attributing the failure."
+            )
+        if not attention_host_bounce_pair0_failure_reached:
+            return (
+                "The failed arm reached the measured forced-host-bounce submission "
+                "boundary, but its durable device-loss evidence does not identify "
+                "physical GPU 0 or 1, the pair under test. Because pair 1 retained "
+                "direct peer traffic, this failure is real but inconclusive for "
+                "pair-0 direct attention P2P/BAR1."
+            )
+        return (
+            "A durable measured pos=512 checkpoint proves that the failed arm reached "
+            "the forced-host-bounce submission boundary while its attention-owned "
+            "query, mirrored-cache, and result paths had no direct-P2P route; top-k "
+            "remained partner-local. Pair-0 attention-owned direct P2P/BAR1 transfer "
+            "is therefore not necessary for the observed pair-0 device loss in this "
+            "arm. The marker does not claim that the "
+            "pos=512 bounce completed; partner attention execution, host-staged cache "
+            "work, pair-1 direct traffic, aggregate pair load, or a delayed physical "
+            "effect remains."
+        )
+    if attention_host_bounce == "passed":
+        return (
+            "The attention host-bounce arm was recorded as passed, but no durable "
+            "complete pos=512 checkpoint verifies that the measured transport cut "
+            "completed. Treat this record as inconclusive rather than as a safe pass "
+            "for direct attention P2P/BAR1."
+        )
+    if attention_host_bounce == "invalid":
+        return (
+            "The attention host-bounce arm returned but failed its production-path, "
+            "transport-marker, or >=500 prefill tok/s validation. It is invalid for "
+            "causal inference and is neither a safe pass nor a reproduced device loss."
+        )
+    if attention_host_bounce == "incomplete":
+        return (
+            "The attention host-bounce arm has no verified outcome. A missing result, "
+            "user interruption, or unverified post-run GPU snapshot is not a device-loss "
+            "failure and not a safe pass; repeat this one-arm diagnostic in a fresh "
+            "directory after checking its durable watch marker."
         )
     if attention == "passed" or attention_completed_without_result:
         result_note = (
@@ -808,6 +958,8 @@ def main() -> None:
             log_text,
         )))
         query_schedule, gather_schedule = attention_copy_schedules(log_text, 0)
+        query_transport, gather_transport = attention_copy_transports(log_text, 0)
+        cache_transport, topk_transport = attention_aux_transports(log_text, 0)
         row = {
             "variant": variant,
             "status": status,
@@ -830,6 +982,13 @@ def main() -> None:
             "pair0_q8_serialized": ",".join(serialized_modes),
             "pair0_attention_query_copy_schedule": query_schedule,
             "pair0_attention_gather_copy_schedule": gather_schedule,
+            "pair0_attention_query_copy_transport": query_transport,
+            "pair0_attention_gather_copy_transport": gather_transport,
+            "pair0_attention_cache_copy_transport": cache_transport,
+            "pair0_attention_topk_copy_transport": topk_transport,
+            "attention_host_bounce_checkpoint": (
+                last_attention_host_bounce_checkpoint(log_text, 0)
+            ),
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
             "attention_end_fence_last": last_attention_end_fence(log_text),
             "attention_entry_fence_last": last_attention_entry_fence(log_text),
@@ -842,6 +1001,7 @@ def main() -> None:
             ),
             "post_health": post_health,
             "watch_status": watch_status,
+            "lost_devices": watch_values.get("lost_devices", ""),
             "result": str(result_path),
             "log": str(log_path),
         }
@@ -868,7 +1028,7 @@ def main() -> None:
         "`GPU_DEVICES=0,3,1,2` layout. Every arm retains the 344/344 admission "
         "plan, partner-resident weights, and partner projection arithmetic. The "
         "diagnostics vary only pair-0 Q8 transport/synchronization, pair-0 "
-        "prefill attention row execution/copy scheduling, and pair-0 "
+        "prefill attention row execution/copy scheduling/transport, and pair-0 "
         "prefill/decode-indexer rows. Destination-scheduled attention copies retain "
         "the same transfer direction and byte count; they change the initiating CUDA "
         "context/default stream, event dependencies, and required peer-access "
@@ -878,10 +1038,12 @@ def main() -> None:
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
         "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
+        "Query copy transport | Gather copy transport | Cache copy transport | "
+        "Top-k copy transport | Host-bounce checkpoint | "
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
-        "Boundary marker sequence | Post health | Watch event |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "Boundary marker sequence | Post health | Watch event | Lost devices |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -893,13 +1055,19 @@ def main() -> None:
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('pair0_attention_query_copy_schedule', '')} | "
             f"{row.get('pair0_attention_gather_copy_schedule', '')} | "
+            f"{row.get('pair0_attention_query_copy_transport', '')} | "
+            f"{row.get('pair0_attention_gather_copy_transport', '')} | "
+            f"{row.get('pair0_attention_cache_copy_transport', '')} | "
+            f"{row.get('pair0_attention_topk_copy_transport', '')} | "
+            f"{row.get('attention_host_bounce_checkpoint', '')} | "
             f"{row.get('attention_phase_audit_last', '')} | "
             f"{row.get('attention_end_fence_last', '')} | "
             f"{row.get('attention_entry_fence_last', '')} | "
             f"{row.get('attention_audit_first_failure', '')} | "
             f"{row.get('attention_row_boundary_marker_state', '')} | "
             f"{row.get('post_health', '')} | "
-            f"{row.get('watch_status', '')} |"
+            f"{row.get('watch_status', '')} | "
+            f"{row.get('lost_devices', '')} |"
         )
     lines.extend([
         "",

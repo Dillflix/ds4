@@ -20,11 +20,23 @@ def write_healthy_post(root: pathlib.Path, stem: str) -> None:
     )
 
 
-def write_unhealthy_post(root: pathlib.Path, stem: str) -> None:
+def write_unhealthy_post(root: pathlib.Path, stem: str, device: int = 1) -> None:
     health = root / "health"
     health.mkdir(exist_ok=True)
     (health / f"{stem}-post.log").write_text(
-        "GPU 0: ok\nGPU 1: GPU is lost\nGPU 2: ok\nGPU 3: ok\n"
+        "".join(
+            f"GPU {index}: {'GPU is lost' if index == device else 'ok'}\n"
+            for index in range(4)
+        )
+    )
+
+
+def write_lost_watch(root: pathlib.Path, stem: str, lost_devices: str) -> None:
+    telemetry = root / "telemetry"
+    telemetry.mkdir(exist_ok=True)
+    (telemetry / f"{stem}-watch-event.txt").write_text(
+        "status=lost-device-detected\n"
+        f"lost_devices={lost_devices}\n"
     )
 
 
@@ -928,6 +940,145 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertEqual(
                 query_row["pair0_attention_gather_copy_schedule"], "source"
             )
+
+    def test_reports_attention_host_bounce_transport_and_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-host-bounce\nstatus=passed\nexit_status=0\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=raw event=complete "
+                "bytes=33554432\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=indexed layer=27 pos=16384 tokens=512 home=0 partner=2 "
+                "q_bytes=33554432 result_bytes=33554432 "
+                "query_copy_stream=source gather_copy_stream=source "
+                "query_copy_transport=host-bounce "
+                "gather_copy_transport=host-bounce "
+                "topk_copy_transport=partner-local\n"
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["pair0_attention_query_copy_schedule"], "source")
+            self.assertEqual(row["pair0_attention_gather_copy_schedule"], "source")
+            self.assertEqual(
+                row["pair0_attention_query_copy_transport"], "host-bounce"
+            )
+            self.assertEqual(
+                row["pair0_attention_gather_copy_transport"], "host-bounce"
+            )
+            self.assertEqual(
+                row["pair0_attention_cache_copy_transport"], "host-bounce"
+            )
+            self.assertEqual(
+                row["pair0_attention_topk_copy_transport"], "partner-local"
+            )
+            self.assertEqual(
+                row["attention_host_bounce_checkpoint"],
+                "complete:mixed:layer17:pos512:tokens512:home0:partner2",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("attention-owned query, mirrored-cache", report)
+            self.assertIn("top-k remained partner-local", report)
+            self.assertIn("direct attention P2P/BAR1 path", report)
+            self.assertIn("not by itself a power-matched proof", report)
+
+    def test_reports_attention_host_bounce_device_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=0 pos=0 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("no durable measured pos=512", report)
+            self.assertIn("real failure but inconclusive", report)
+            self.assertNotIn("not a necessary trigger", report)
+
+    def test_reports_attention_host_bounce_device_loss_after_checkpoint(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=begin kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["attention_host_bounce_checkpoint"],
+                "begin:mixed:layer17:pos512:tokens512:home0:partner2",
+            )
+            self.assertEqual(row["lost_devices"], "1@00000000:03:00.0")
+            report = (root / "summary.md").read_text()
+            self.assertIn("durable measured pos=512 checkpoint", report)
+            self.assertIn("forced-host-bounce submission boundary", report)
+            self.assertIn("does not claim that the pos=512 bounce completed", report)
+            self.assertIn(
+                "not necessary for the observed pair-0 device loss", report
+            )
+            self.assertIn("partner attention execution", report)
+            self.assertIn("pair-1 direct traffic", report)
+
+    def test_does_not_attribute_pair1_loss_to_pair0_host_bounce(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=begin kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_unhealthy_post(root, stem, device=2)
+            write_lost_watch(root, stem, "2@00000000:81:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("does not identify physical GPU 0 or 1", report)
+            self.assertIn("pair 1 retained direct peer traffic", report)
+            self.assertIn("real but inconclusive", report)
+            self.assertNotIn("not a necessary trigger", report)
 
     def test_reports_all_destination_stream_arms_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

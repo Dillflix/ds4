@@ -3179,6 +3179,55 @@ With `SKIP_BUILD=0`, a focused two-GPU preflight also checks both transfer
 directions for byte-exact destination data, immediate source-buffer reuse
 ordering, and fail-closed behavior when host bounce is forced.
 
+The copy-scheduling matrix subsequently reproduced device loss across the
+source/destination submission arrangements. The next categorical transport arm
+is `attention-host-bounce`. It retains pair-0 50/50 row ownership, partner
+attention arithmetic, both indexer row splits, production Q8 partner transport,
+and the full PP32768/TG256 workload, but stages every pair-0 attention-owned
+copy through pinned host memory: query rows, mirrored raw/compressed/index cache
+updates, gathered attention results, and any non-split top-k state. In this
+production arm, top-k remains partner-local because prefill indexer row
+splitting is retained; pair 1 remains direct peer. A completed arm is accepted
+only when its per-dispatch
+transport markers prove pair 0 used host bounce and pair 1 used direct peer,
+including separate completed pair-0 raw, attention-compressed, and index-cache
+mirror markers,
+plus a durable completed measured-row checkpoint at `pos=512`, both schedules
+remained source/source, all four GPUs stayed at 250 W and healthy, and prefill
+remained at least 500 tok/s. A pass would implicate direct attention P2P/BAR1
+traffic or its timing envelope without making host staging a production
+mitigation. A device-loss failure rules out pair-0 attention-owned direct P2P as
+necessary for an observed pair-0 loss only if the durable `pos=512` host-bounce
+checkpoint proves the measured transport cut was reached and the watcher
+identifies physical GPU 0 or 1, the pair under test. It does not rule out the
+untouched pair-1 direct traffic as a systemic trigger. An earlier loss or a loss
+confined to pair 1 is real but causally inconclusive for pair-0 attention
+transport.
+
+Run this as a fresh one-arm diagnostic, never by changing the variant list of
+an existing resume directory:
+
+```bash
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-host-bounce-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-host-bounce \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 
@@ -3192,9 +3241,9 @@ for reproducing existing evidence:
   decode-indexer scoring on the home GPU; and
 - `production` is the unmodified control.
 
-The host-bounce arm failed during its 512-token warmup after one complete
-65 MiB pair-0 round trip. The serialized-direct arm completed that warmup, then
-failed in the first measured 32K chunk immediately after pair-0 prefill
+The earlier Q8 `partner-bounce` arm failed during its 512-token warmup after one
+complete 65 MiB pair-0 round trip. The serialized-direct arm completed that
+warmup, then failed in the first measured 32K chunk immediately after pair-0 prefill
 attention row splitting began. Decode-indexer-only controls therefore do not
 isolate the observed prefill failure; `attention-off` controls the relevant
 path.

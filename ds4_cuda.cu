@@ -4815,6 +4815,13 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
     return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
 }
 
+extern "C" int ds4_gpu_tensor_copy_xdev_default_host_bounce(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t bytes) {
+    return ds4_gpu_tensor_copy_xdev_default_mode(dst, src, bytes, true);
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
         ds4_gpu_tensor *dst,
         const ds4_gpu_tensor *src,

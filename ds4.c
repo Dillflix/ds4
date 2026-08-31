@@ -15490,6 +15490,7 @@ static bool cuda_tp_decode_indexer_rows_env_enabled(void) {
 static bool env_pair_list_contains(const char *name, int pair) {
     const char *p = name ? getenv(name) : NULL;
     if (!p || !p[0] || pair < 0) return false;
+    bool found = false;
     while (*p) {
         uint64_t value = 0u;
         if (*p < '0' || *p > '9') return false;
@@ -15499,12 +15500,12 @@ static bool env_pair_list_contains(const char *name, int pair) {
             value = value * 10u + digit;
             p++;
         } while (*p >= '0' && *p <= '9');
-        if ((int)value == pair) return true;
+        if ((int)value == pair) found = true;
         if (*p == '\0') break;
         if (*p != ',' || p[1] == '\0') return false;
         p++;
     }
-    return false;
+    return found;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
@@ -15547,6 +15548,15 @@ static bool cuda_tp_prefill_attn_query_copy_dst_pair_enabled(int home_tier) {
 static bool cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(int home_tier) {
     return env_pair_list_contains(
         "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS", home_tier);
+}
+
+/* Diagnostic-only transport cut. Unlike DS4_FORCE_HOST_BOUNCE, this selector
+ * changes only attention-owned traffic for one tensor-parallel pair; Q8
+ * partner execution and every other production cross-device path remain
+ * direct peer transfers. */
+static bool cuda_tp_prefill_attn_host_bounce_pair_enabled(int home_tier) {
+    return env_pair_list_contains(
+        "DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS", home_tier);
 }
 #endif
 
@@ -20770,11 +20780,18 @@ static uint64_t metal_graph_index_comp_cache_row_bytes(
            (g && g->index_comp_cache_f16 ? sizeof(uint16_t) : sizeof(float));
 }
 
+typedef enum {
+    DS4_CUDA_TP_ATTN_CACHE_RAW = 0,
+    DS4_CUDA_TP_ATTN_CACHE_COMP = 1,
+    DS4_CUDA_TP_ATTN_CACHE_INDEX = 2,
+} ds4_cuda_tp_attn_cache_kind;
+
 static bool metal_graph_cuda_tp_attn_cache_copy_row(
         ds4_gpu_tensor       *dst_base,
         const ds4_gpu_tensor *src_base,
         uint64_t              offset,
-        uint64_t              bytes);
+        uint64_t              bytes,
+        ds4_cuda_tp_attn_cache_kind kind);
 static ds4_gpu_tensor *metal_graph_tensor_row_range_view(
         ds4_gpu_tensor *base,
         uint32_t        row0,
@@ -20816,7 +20833,8 @@ static bool metal_graph_store_index_comp_stage(
                 g->layer_index_comp_cache_tp[il],
                 g->layer_index_comp_cache[il],
                 (uint64_t)first_row * row_bytes,
-                (uint64_t)rows * row_bytes);
+                (uint64_t)rows * row_bytes,
+                DS4_CUDA_TP_ATTN_CACHE_INDEX);
     }
     return ok;
 }
@@ -21183,11 +21201,77 @@ static bool metal_graph_cuda_tp_attn_cache_dup_layer_ready(
     return true;
 }
 
+static bool metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(
+        int home_tier) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+    (void)home_tier;
+    return false;
+#else
+    return cuda_tp_prefill_attn_host_bounce_pair_enabled(home_tier);
+#endif
+}
+
+static void metal_graph_cuda_tp_prefill_attn_host_bounce_log_once(
+        int home_tier) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    static uint32_t logged_home_mask = 0u;
+    if (home_tier < 0 || home_tier >= 32) return;
+    const uint32_t bit = 1u << (uint32_t)home_tier;
+    if ((logged_home_mask & bit) != 0u) return;
+    logged_home_mask |= bit;
+    fprintf(stderr,
+            "ds4: CUDA prefill attention row transport override for "
+            "logical pair %d: pinned-host-bounce\n",
+            home_tier);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+#else
+    (void)home_tier;
+#endif
+}
+
+static bool metal_graph_cuda_tp_prefill_attn_cache_bounce_mark_once(
+        int home_tier, ds4_cuda_tp_attn_cache_kind kind) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    static uint32_t logged_kind_mask[32] = {0u};
+    if (home_tier < 0 || home_tier >= 32 ||
+        (unsigned)kind > DS4_CUDA_TP_ATTN_CACHE_INDEX) return false;
+    const uint32_t bit = 1u << (uint32_t)kind;
+    if ((logged_kind_mask[home_tier] & bit) != 0u) return false;
+    logged_kind_mask[home_tier] |= bit;
+    return true;
+#else
+    (void)home_tier; (void)kind;
+    return false;
+#endif
+}
+
+static void metal_graph_cuda_tp_prefill_attn_cache_bounce_log(
+        const char *event, int home_tier, int partner_tier, uint64_t bytes,
+        ds4_cuda_tp_attn_cache_kind kind) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    const char *class_name = kind == DS4_CUDA_TP_ATTN_CACHE_RAW
+        ? "raw"
+        : (kind == DS4_CUDA_TP_ATTN_CACHE_COMP ? "attn-comp" : "index");
+    fprintf(stderr,
+            "ds4: CUDA prefill attention cache mirror transport="
+            "host-bounce home_tier=%d partner_tier=%d class=%s event=%s "
+            "bytes=%llu\n",
+            home_tier, partner_tier, class_name, event,
+            (unsigned long long)bytes);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+#else
+    (void)event; (void)home_tier; (void)partner_tier; (void)bytes; (void)kind;
+#endif
+}
+
 static bool metal_graph_cuda_tp_attn_cache_copy_row(
         ds4_gpu_tensor       *dst_base,
         const ds4_gpu_tensor *src_base,
         uint64_t              offset,
-        uint64_t              bytes) {
+        uint64_t              bytes,
+        ds4_cuda_tp_attn_cache_kind kind) {
     if (bytes == 0) return true;
     ds4_gpu_tensor *dst = ds4_gpu_tensor_view(dst_base, offset, bytes);
     ds4_gpu_tensor *src = ds4_gpu_tensor_view(src_base, offset, bytes);
@@ -21203,9 +21287,30 @@ static bool metal_graph_cuda_tp_attn_cache_copy_row(
      * partner default stream wait before consuming it.  This also orders the
      * next update against the partner's preceding attention read. */
     const int src_tier = src ? ds4_gpu_tensor_device(src) : -1;
+    const int dst_tier = dst ? ds4_gpu_tensor_device(dst) : -1;
+    const bool host_bounce = src_tier >= 0 &&
+        dst_tier == metal_graph_cuda_tp_partner_tier(src_tier) &&
+        metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(src_tier);
+    const bool log_host_bounce = host_bounce &&
+        metal_graph_cuda_tp_prefill_attn_cache_bounce_mark_once(
+            src_tier, kind);
+    if (host_bounce) {
+        metal_graph_cuda_tp_prefill_attn_host_bounce_log_once(src_tier);
+    }
+    if (log_host_bounce) {
+        metal_graph_cuda_tp_prefill_attn_cache_bounce_log(
+            "begin", src_tier, dst_tier, bytes, kind);
+    }
     bool ok = dst && src && src_tier >= 0 &&
               ds4_gpu_tensor_wait_xdev_default(dst, src_tier) != 0 &&
-              ds4_gpu_tensor_copy_xdev_default(dst, src, bytes) != 0;
+              (host_bounce
+                   ? ds4_gpu_tensor_copy_xdev_default_host_bounce(
+                         dst, src, bytes) != 0
+                   : ds4_gpu_tensor_copy_xdev_default(dst, src, bytes) != 0);
+    if (log_host_bounce) {
+        metal_graph_cuda_tp_prefill_attn_cache_bounce_log(
+            ok ? "complete" : "failed", src_tier, dst_tier, bytes, kind);
+    }
     ds4_gpu_tensor_free(src);
     ds4_gpu_tensor_free(dst);
     return ok;
@@ -21226,11 +21331,13 @@ static bool metal_graph_cuda_tp_attn_cache_sync_raw_rows(
     if (!metal_graph_cuda_tp_attn_cache_copy_row(
             g->layer_raw_cache_tp[il], g->layer_raw_cache[il],
             (uint64_t)first_row * row_bytes,
-            (uint64_t)first_rows * row_bytes)) return false;
+            (uint64_t)first_rows * row_bytes,
+            DS4_CUDA_TP_ATTN_CACHE_RAW)) return false;
     const uint32_t wrapped_rows = rows - first_rows;
     return wrapped_rows == 0 || metal_graph_cuda_tp_attn_cache_copy_row(
         g->layer_raw_cache_tp[il], g->layer_raw_cache[il], 0,
-        (uint64_t)wrapped_rows * row_bytes);
+        (uint64_t)wrapped_rows * row_bytes,
+        DS4_CUDA_TP_ATTN_CACHE_RAW);
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_comp_rows(
@@ -21247,7 +21354,8 @@ static bool metal_graph_cuda_tp_attn_cache_sync_comp_rows(
         g->layer_attn_comp_cache_tp[il],
         g->layer_attn_comp_cache[il],
         (uint64_t)first_row * row_bytes,
-        (uint64_t)rows * row_bytes);
+        (uint64_t)rows * row_bytes,
+        DS4_CUDA_TP_ATTN_CACHE_COMP);
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_raw_row(
@@ -21261,7 +21369,8 @@ static bool metal_graph_cuda_tp_attn_cache_sync_raw_row(
             g->layer_raw_cache_tp[il],
             g->layer_raw_cache[il],
             (uint64_t)raw_row * row_bytes,
-            row_bytes);
+            row_bytes,
+            DS4_CUDA_TP_ATTN_CACHE_RAW);
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
@@ -21272,7 +21381,8 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
             (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
         if (!metal_graph_cuda_tp_attn_cache_copy_row(
                 g->layer_raw_cache_tp[il],
-                g->layer_raw_cache[il], 0, raw_bytes)) {
+                g->layer_raw_cache[il], 0, raw_bytes,
+                DS4_CUDA_TP_ATTN_CACHE_RAW)) {
             return false;
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -21282,7 +21392,8 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
                 (uint64_t)n_comp * metal_graph_attn_comp_cache_row_bytes();
             if (!metal_graph_cuda_tp_attn_cache_copy_row(
                     g->layer_attn_comp_cache_tp[il],
-                    g->layer_attn_comp_cache[il], 0, comp_bytes)) {
+                    g->layer_attn_comp_cache[il], 0, comp_bytes,
+                    DS4_CUDA_TP_ATTN_CACHE_COMP)) {
                 return false;
             }
         }
@@ -21294,7 +21405,8 @@ static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
                     g->layer_index_comp_cache_tp[il],
                     g->layer_index_comp_cache[il], 0,
                     (uint64_t)n_index *
-                    metal_graph_index_comp_cache_row_bytes(g)))) {
+                    metal_graph_index_comp_cache_row_bytes(g),
+                    DS4_CUDA_TP_ATTN_CACHE_INDEX))) {
                 return false;
             }
         }
@@ -28481,6 +28593,34 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_end_fence_sync(
         "complete", target, kind, il, pos0, n_tokens, home, partner);
     return true;
 }
+
+/* The fixed production diagnostic has an untimed pos=0 warm-up. Persist the
+ * first pos=512 host-bounce row instead so a later GPU-loss report proves the
+ * measured 32K transport cut was actually reached. Two fsyncs per selected
+ * pair are negligible and avoid repeating the high-frequency fence audit. */
+static bool metal_graph_cuda_tp_prefill_attn_host_bounce_checkpoint_once(
+        int home, uint32_t pos0) {
+    static uint32_t logged_home_mask = 0u;
+    if (pos0 != 512u || home < 0 || home >= 32) return false;
+    const uint32_t bit = 1u << (uint32_t)home;
+    if ((logged_home_mask & bit) != 0u) return false;
+    logged_home_mask |= bit;
+    return true;
+}
+
+static void metal_graph_cuda_tp_prefill_attn_host_bounce_checkpoint_log(
+        const char *event, ds4_cuda_prefill_attn_kind kind,
+        uint32_t il, uint32_t pos0, uint32_t n_tokens,
+        int home, int partner) {
+    fprintf(stderr,
+            "ds4: CUDA prefill attention host-bounce checkpoint event=%s "
+            "kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d\n",
+            event,
+            kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+            il, pos0, n_tokens, home, partner);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
 #endif
 
 /* Split independent query rows 50/50 across one NVLink pair. The fixed policy
@@ -28514,6 +28654,19 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         cuda_tp_prefill_attn_query_copy_dst_pair_enabled(home);
     const bool gather_copy_dst =
         cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home);
+    const bool host_bounce =
+        metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(home);
+    if (host_bounce && (query_copy_dst || gather_copy_dst)) {
+        fprintf(stderr,
+                "ds4: CUDA prefill attention row transport override for "
+                "logical pair %d cannot be combined with destination-stream "
+                "copy scheduling\n",
+                home);
+        return false;
+    }
+    if (host_bounce) {
+        metal_graph_cuda_tp_prefill_attn_host_bounce_log_once(home);
+    }
     const bool phase_audit =
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
             home, il, pos0);
@@ -28551,6 +28704,11 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         g->cuda_tp_indexer_selected_tokens == n_tokens &&
         g->cuda_tp_indexer_selected_home_rows == home_rows &&
         g->cuda_tp_indexer_selected_partner_rows == partner_rows;
+    const char *topk_transport = kind != DS4_CUDA_PREFILL_ATTN_INDEXED
+        ? "none"
+        : (use_split_topk
+               ? "partner-local"
+               : (host_bounce ? "host-bounce" : "peer"));
     if (have_split_topk && !use_split_topk) {
         fprintf(stderr,
                 "ds4: CUDA split indexer/attention row ownership mismatch "
@@ -28625,17 +28783,36 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
      * that was deliberately not submitted. Standalone phase-audit behavior is
      * unchanged when no entry fence is selected. */
     const bool active_phase_audit = phase_audit && (!entry_fence || ok);
+    bool host_bounce_checkpoint = false;
     if (active_phase_audit) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "query-copy", kind, il, pos0, n_tokens, home, partner);
     }
     if (ok) {
-        ok = query_copy_dst
-            ? ds4_gpu_tensor_copy_xdev_default_dst_ordered(
-                  peer_q_dst, peer_q_src, q_partner_bytes) != 0
-            : (ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
-               ds4_gpu_tensor_copy_xdev_default(
-                   peer_q_dst, peer_q_src, q_partner_bytes) != 0);
+        if (query_copy_dst) {
+            ok = ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+                     peer_q_dst, peer_q_src, q_partner_bytes) != 0;
+        } else {
+            ok = ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0;
+            /* Do not claim that the measured transport cut was reached if a
+             * pre-existing asynchronous failure surfaces in the readiness
+             * wait. Persist begin only after that wait succeeds and directly
+             * before the forced D2H/H2D call. */
+            host_bounce_checkpoint = host_bounce && ok &&
+                metal_graph_cuda_tp_prefill_attn_host_bounce_checkpoint_once(
+                    home, pos0);
+            if (host_bounce_checkpoint) {
+                metal_graph_cuda_tp_prefill_attn_host_bounce_checkpoint_log(
+                    "begin", kind, il, pos0, n_tokens, home, partner);
+            }
+            if (ok) {
+                ok = host_bounce
+                    ? ds4_gpu_tensor_copy_xdev_default_host_bounce(
+                          peer_q_dst, peer_q_src, q_partner_bytes) != 0
+                    : ds4_gpu_tensor_copy_xdev_default(
+                          peer_q_dst, peer_q_src, q_partner_bytes) != 0;
+            }
+        }
     }
     if (active_phase_audit) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
@@ -28655,8 +28832,13 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                                                topk_partner_bytes);
             ok = peer_topk_src &&
                  ds4_gpu_tensor_wait_xdev_default(peer_topk_dst, home) != 0 &&
-                 ds4_gpu_tensor_copy_xdev_default(
-                     peer_topk_dst, peer_topk_src, topk_partner_bytes) != 0;
+                 (host_bounce
+                      ? ds4_gpu_tensor_copy_xdev_default_host_bounce(
+                            peer_topk_dst, peer_topk_src,
+                            topk_partner_bytes) != 0
+                      : ds4_gpu_tensor_copy_xdev_default(
+                            peer_topk_dst, peer_topk_src,
+                            topk_partner_bytes) != 0);
         }
     }
 
@@ -28744,12 +28926,20 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             ? ds4_gpu_tensor_copy_xdev_default_dst_ordered(
                   gather_dst, peer_heads, q_partner_bytes) != 0
             : (ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
-               ds4_gpu_tensor_copy_xdev_default(
-                   gather_dst, peer_heads, q_partner_bytes) != 0);
+               (host_bounce
+                    ? ds4_gpu_tensor_copy_xdev_default_host_bounce(
+                          gather_dst, peer_heads, q_partner_bytes) != 0
+                    : ds4_gpu_tensor_copy_xdev_default(
+                          gather_dst, peer_heads, q_partner_bytes) != 0));
     }
     if (audit_result_gather) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
             ok, "result-gather", home, kind, il, pos0, n_tokens,
+            home, partner);
+    }
+    if (host_bounce_checkpoint) {
+        metal_graph_cuda_tp_prefill_attn_host_bounce_checkpoint_log(
+            ok ? "complete" : "failed", kind, il, pos0, n_tokens,
             home, partner);
     }
     if (end_fence) {
@@ -28796,23 +28986,30 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                 "ds4: CUDA prefill attention query-row split enabled: "
                 "tier %d rows [0,%u), tier %d rows [%u,%u); "
                 "partner-local mirrored KV, full-head gather to home; "
-                "query-copy-stream=%s gather-copy-stream=%s\n",
+                "query-copy-stream=%s gather-copy-stream=%s "
+                "query-copy-transport=%s gather-copy-transport=%s\n",
                 home, home_rows, partner, home_rows, n_tokens,
                 query_copy_dst ? "destination" : "source",
-                gather_copy_dst ? "destination" : "source");
+                gather_copy_dst ? "destination" : "source",
+                host_bounce ? "host-bounce" : "peer",
+                host_bounce ? "host-bounce" : "peer");
     }
     if (ok && getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT")) {
         fprintf(stderr,
                 "ds4: CUDA prefill attention row audit dispatch=split "
                 "kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d "
                 "q_bytes=%llu result_bytes=%llu query_copy_stream=%s "
-                "gather_copy_stream=%s\n",
+                "gather_copy_stream=%s query_copy_transport=%s "
+                "gather_copy_transport=%s topk_copy_transport=%s\n",
                 kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
                 il, pos0, n_tokens, home, partner,
                 (unsigned long long)q_partner_bytes,
                 (unsigned long long)q_partner_bytes,
                 query_copy_dst ? "destination" : "source",
-                gather_copy_dst ? "destination" : "source");
+                gather_copy_dst ? "destination" : "source",
+                host_bounce ? "host-bounce" : "peer",
+                host_bounce ? "host-bounce" : "peer",
+                topk_transport);
     }
 
     ds4_gpu_tensor_free(peer_topk_dst);
@@ -58472,6 +58669,11 @@ bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
 bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
         int home_tier) {
     return cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_host_bounce_pair_enabled(
+        int home_tier) {
+    return cuda_tp_prefill_attn_host_bounce_pair_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void) {
