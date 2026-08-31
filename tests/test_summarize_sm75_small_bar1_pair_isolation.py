@@ -69,6 +69,22 @@ def complete_row_boundary_log() -> str:
     return "\n".join(lines) + "\n"
 
 
+def q8_phase_marker(
+        sequence: int, event: str, stage: str, *, home_tier: int = 0,
+        home_device: int = 0, partner_tier: int = 2,
+        partner_device: int = 1, cuda_error: str = "none") -> str:
+    return (
+        "ds4: CUDA q8 partner phase audit "
+        f"sequence={sequence} event={event} stage={stage} "
+        "binding_label=tensor:blk.14.attn_output_b.weight "
+        "passed_label=attn_output_b weight_offset=144000 "
+        f"home_tier={home_tier} home_device={home_device} "
+        f"partner_tier={partner_tier} partner_device={partner_device} "
+        "tokens=512 in=8192 out=4096 transfer_bytes=1048576 "
+        f"result_bytes=8388608 cuda_error={cuda_error}\n"
+    )
+
+
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1163,8 +1179,8 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "transport is unnecessary",
                 report,
             )
-            self.assertIn("pair-1 traffic remained direct peer", report)
-            self.assertIn("were not removed", report)
+            self.assertIn("Pair-1 traffic remained direct peer", report)
+            self.assertIn("was not removed", report)
 
     def test_combined_host_bounce_warmup_only_is_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1198,7 +1214,9 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "unnecessary",
                 report,
             )
-            self.assertIn("pair-1 traffic also retained direct peer transport", report)
+            self.assertIn("Pair-1 traffic retained direct peer transport", report)
+            self.assertIn("no pair-0 indexer dispatch was durably logged", report)
+            self.assertNotIn("those direct indexer routes", report)
 
     def test_combined_host_bounce_underloaded_completion_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1222,7 +1240,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("inconclusive-underloaded", report)
             self.assertIn("below the required 500 prefill tok/s", report)
             self.assertIn("cannot show", report)
-            self.assertIn("pair-1 traffic remained direct", report)
+            self.assertIn("Pair-1 traffic remained direct", report)
 
     def test_combined_host_bounce_verified_full_load_pass_is_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1260,14 +1278,17 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "query_copy_transport=host-bounce "
                 "gather_copy_transport=host-bounce "
                 "topk_copy_transport=partner-local\n"
+                "ds4: CUDA decode indexer row audit event=begin layer=27 "
+                "home_tier=0 partner_tier=2 n_comp=7936 "
+                "transfer_bytes=50176\n"
             )
             write_healthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
             self.assertIn("durable measured completion evidence", report)
-            self.assertIn("prefill and decode indexer", report)
-            self.assertIn("remained direct peer", report)
+            self.assertIn("indexer transport retained its direct-peer configuration", report)
+            self.assertIn("durably logged 1 begun dispatch", report)
             self.assertIn("not by itself a", report)
 
     def test_combined_pass_markers_below_load_floor_are_inconclusive(self) -> None:
@@ -1358,6 +1379,163 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("does not identify physical GPU 0 or 1", report)
             self.assertIn("real failure evidence", report)
             self.assertIn("cannot show", report)
+
+    def test_q8_phase_audit_compute_sync_failure_is_partner_side(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(41, "begin", "activation-prepare")
+                + q8_phase_marker(41, "activation-complete", "activation-copy")
+                + q8_phase_marker(41, "compute-submitted", "compute")
+                + q8_phase_marker(
+                    41, "compute-sync-failed", "compute-sync",
+                    cuda_error="unspecified launch failure",
+                )
+                + q8_phase_marker(
+                    41, "home-restored-after-failure", "recovery"
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "0@00000000:02:00.0,1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertIn(
+                "sequence=41 event=compute-sync-failed stage=compute-sync",
+                row["q8_phase_audit_last_checkpoint"],
+            )
+            self.assertEqual(
+                row["q8_phase_audit_last_checkpoint"],
+                row["q8_phase_audit_first_failure"],
+            )
+            self.assertEqual(
+                row["q8_phase_audit_classification"],
+                "partner-compute-or-earlier-async-partner-work",
+            )
+            self.assertIn(
+                "cuda_error=unspecified launch failure",
+                row["q8_phase_audit_first_failure"],
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "partner compute or earlier asynchronous partner-side work", report
+            )
+            self.assertIn("before the result gather was attempted", report)
+            self.assertIn("not in the result D2H host-bounce copy", report)
+            self.assertIn("no pair-0 indexer dispatch was durably logged", report)
+
+    def test_q8_phase_audit_compute_complete_then_d2h_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(42, "begin", "activation-prepare")
+                + q8_phase_marker(42, "activation-complete", "activation-copy")
+                + q8_phase_marker(42, "compute-submitted", "compute")
+                + q8_phase_marker(42, "compute-complete", "compute-sync")
+                + "ds4: CUDA default-stream bounce d2h failed: "
+                  "unspecified launch failure\n"
+                + q8_phase_marker(
+                    42, "result-copy-failed", "result-gather",
+                    cuda_error="unspecified launch failure",
+                )
+                + "ds4: CUDA q8 partner host-bounce failure "
+                  "class=result-gather stage=copy source_tier=2 "
+                  "source_device=1 destination_tier=0 destination_device=0 "
+                  "bytes=8388608 tokens=512 in=8192 out=4096 "
+                  "label=attn_output_b\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "0@00000000:02:00.0,1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertIn(
+                "sequence=42 event=result-copy-failed stage=result-gather",
+                row["q8_phase_audit_last_checkpoint"],
+            )
+            self.assertEqual(
+                row["q8_phase_audit_last_checkpoint"],
+                row["q8_phase_audit_first_failure"],
+            )
+            self.assertIn(
+                "cuda_phase=d2h", row["q8_phase_audit_first_failure"]
+            )
+            self.assertEqual(
+                row["q8_phase_audit_classification"],
+                "result-d2h-pcie-host-bounce-transfer",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("completed the partner compute synchronization", report)
+            self.assertIn("partner-to-host PCIe leg", report)
+            self.assertIn("rather than to the audited partner compute", report)
+
+    def test_q8_phase_audit_without_same_sequence_compute_complete_is_inconclusive(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(8, "compute-complete", "compute-sync")
+                + q8_phase_marker(
+                    9, "result-copy-failed", "result-gather",
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["q8_phase_audit_classification"], "inconclusive")
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "without a marker sequence that separates partner compute", report
+            )
+            self.assertNotIn("partner-to-host PCIe leg", report)
+
+    def test_q8_phase_audit_variant_sorts_after_combined_host_bounce(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            for slot, variant in enumerate((
+                    "attention-q8-phase-audit", "attention-q8-host-bounce"), 1):
+                stem = f"r1-s{slot}-{variant}"
+                (production / f"{stem}.result").write_text(
+                    f"variant={variant}\nstatus=validation-failed\nexit_status=127\n"
+                )
+                (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                [row["variant"] for row in rows],
+                ["attention-q8-host-bounce", "attention-q8-phase-audit"],
+            )
 
     def test_invalid_outcome_outranks_underloaded_across_repeats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

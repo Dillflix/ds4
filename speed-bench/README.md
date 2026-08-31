@@ -3316,6 +3316,60 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
+The follow-up one-arm diagnostic `attention-q8-phase-audit` retains the exact
+same pair-0 attention/Q8 host-bounce transport cut and production workload,
+then enables `DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=0`. The added audit is
+pair-scoped: it records pair-0 Q8 partner phase checkpoints and explicitly
+synchronizes the partner device after every audited Q8 compute submission,
+before the result D2H copy. It preserves arithmetic, transferred bytes,
+placement, admitted weights, and attention execution, but intentionally
+perturbs Q8 timing and overlap to localize the failure phase. Pair 1 stays on
+its production direct-peer paths. Pair-0 prefill and decode indexer row-split
+transfers also remain direct peer; this arm does not host-bounce or disable
+them. A successfully completed arm must contain one same-sequence pair-0 marker
+chain from activation preparation through activation copy, compute submission,
+compute synchronization, and result gather, with the same non-placeholder
+binding label, passed label, and weight offset throughout. Pair-1 phase markers
+or any phase-failure marker fail validation.
+
+Run it from a clean boot and a fresh output directory with all four GPUs fixed
+at 250 W:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-phase-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-phase-audit \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

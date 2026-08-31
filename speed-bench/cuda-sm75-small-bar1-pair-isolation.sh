@@ -19,6 +19,7 @@ Optional environment:
   VARIANTS=attention-off,production  scheduling matrix is explicit and fixed
   VARIANTS=attention-host-bounce     host-stage pair-0 attention-owned copies
   VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
+  VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -129,13 +130,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -535,6 +536,7 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_copy_scheduling_transport=ordered_direct_peer_no_fallback\n'
         printf 'attention_host_bounce_scope=pair0_attention_owned_copies_only\n'
         printf 'attention_q8_host_bounce_scope=pair0_attention_owned_and_q8_partner_copies\n'
+        printf 'attention_q8_phase_audit_scope=pair0_q8_partner_phase_checkpoints_and_compute_sync\n'
         printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
@@ -690,7 +692,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce)
+        attention-q8-host-bounce|attention-q8-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -939,15 +941,66 @@ validate_success_path() {
                 'home_tier=1 partner_tier=3' || return 1
             ;;
     esac
+    if [[ $variant == attention-q8-phase-audit ]]; then
+        # Require one complete pair-0 sequence with an identical binding
+        # identity at every boundary. Any pair-1 or failure marker invalidates
+        # the successful arm. The case validation above independently proves
+        # pair 0 bounced and pair 1 retained direct transport.
+        awk '
+            /ds4: CUDA q8 partner phase audit sequence=/ {
+                sequence=event=stage=binding=passed=offset=home=partner=""
+                for (i=1; i<=NF; i++) {
+                    split($i, field, "=")
+                    if (field[1]=="sequence") sequence=field[2]
+                    else if (field[1]=="event") event=field[2]
+                    else if (field[1]=="stage") stage=field[2]
+                    else if (field[1]=="binding_label") binding=field[2]
+                    else if (field[1]=="passed_label") passed=field[2]
+                    else if (field[1]=="weight_offset") offset=field[2]
+                    else if (field[1]=="home_tier") home=field[2]
+                    else if (field[1]=="partner_tier") partner=field[2]
+                }
+                if (home==1 || event ~ /-failed$/) bad=1
+                if (home!=0) next
+                if (partner!=2 || sequence !~ /^[0-9]+$/ ||
+                    binding=="" || binding=="unavailable" ||
+                    passed=="" || passed=="unavailable" ||
+                    offset !~ /^[0-9]+$/) {
+                    bad=1
+                    next
+                }
+                key=sequence SUBSEP binding SUBSEP passed SUBSEP offset
+                if (event=="begin" && stage=="activation-prepare") begun[key]=1
+                else if (event=="activation-complete" &&
+                         stage=="activation-copy") activated[key]=1
+                else if (event=="compute-submitted" && stage=="compute")
+                    submitted[key]=1
+                else if (event=="compute-complete" && stage=="compute-sync")
+                    computed[key]=1
+                else if (event=="result-complete" && stage=="result-gather")
+                    gathered[key]=1
+            }
+            END {
+                complete=0
+                for (key in begun)
+                    if (activated[key] && submitted[key] && computed[key] &&
+                        gathered[key]) complete=1
+                exit (bad || !complete)
+            }
+        ' "$log" || return 1
+    fi
 }
 
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
-    if [[ $variant == attention-q8-host-bounce ]]; then
-        validate_success_path "$variant" "$log" "$bindings" "$csv" 0
-    else
-        validate_success_path "$variant" "$log" "$bindings" "$csv"
-    fi
+    case "$variant" in
+        attention-q8-host-bounce|attention-q8-phase-audit)
+            validate_success_path "$variant" "$log" "$bindings" "$csv" 0
+            ;;
+        *)
+            validate_success_path "$variant" "$log" "$bindings" "$csv"
+            ;;
+    esac
 }
 
 ctx_alloc=$((PP_TOKENS + TG_TOKENS + 1))
@@ -985,11 +1038,14 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                         "$variant" "$log" "$bindings" "$csv"; then
                     recovered_status=passed
                     recovered_exit=0
-                    if [[ $variant == attention-q8-host-bounce ]] &&
-                            ! validate_full_production_load "$csv"; then
-                        recovered_status=inconclusive-underloaded
-                        recovered_exit=128
-                    fi
+                    case "$variant" in
+                        attention-q8-host-bounce|attention-q8-phase-audit)
+                            if ! validate_full_production_load "$csv"; then
+                                recovered_status=inconclusive-underloaded
+                                recovered_exit=128
+                            fi
+                            ;;
+                    esac
                     printf 'Recovering completed prior arm: variant=%s repeat=%d status=%s...\n' \
                         "$variant" "$repeat" "$recovered_status"
                     write_result "$result" "$variant" "$recovered_status" \
@@ -1064,6 +1120,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             attention-q8-host-bounce)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-phase-audit)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-query-dst)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
@@ -1201,19 +1262,22 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
             die "variant=$variant failed production-path validation"
         fi
-        if [[ $variant == attention-q8-host-bounce ]] &&
-                ! validate_full_production_load "$csv"; then
-            write_result "$result" "$variant" inconclusive-underloaded 128 \
-                "$progress" "$log"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
-                inconclusive-underloaded 128 "$lp" "$le" \
-                >>"$OUTPUT_DIR/run-journal.tsv"
-            sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
-            printf 'error: variant=%s completed below 500 prefill tok/s; evidence is inconclusive\n' \
-                "$variant" >&2
-            exit 128
-        fi
+        case "$variant" in
+            attention-q8-host-bounce|attention-q8-phase-audit)
+                if ! validate_full_production_load "$csv"; then
+                    write_result "$result" "$variant" inconclusive-underloaded 128 \
+                        "$progress" "$log"
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                        inconclusive-underloaded 128 "$lp" "$le" \
+                        >>"$OUTPUT_DIR/run-journal.tsv"
+                    sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+                    printf 'error: variant=%s completed below 500 prefill tok/s; evidence is inconclusive\n' \
+                        "$variant" >&2
+                    exit 128
+                fi
+                ;;
+        esac
         write_result "$result" "$variant" passed 0 "$progress" "$log"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \

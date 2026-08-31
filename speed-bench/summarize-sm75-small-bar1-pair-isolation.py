@@ -11,6 +11,7 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
+    "attention-q8-phase-audit",
     "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
@@ -146,6 +147,119 @@ def first_host_bounce_failure_context(text: str) -> str:
                         phase = f"cuda_phase={match.group(1)} "
                 return phase + context
     return ""
+
+
+def q8_partner_phase_audit_markers(
+        text: str, pair: int) -> list[dict[str, str]]:
+    pattern = re.compile(
+        r"q8 partner phase audit sequence=(\d+) event=(\S+) stage=(\S+) "
+        r"binding_label=(\S+) passed_label=(\S+) weight_offset=(\d+) "
+        r"home_tier=(-?\d+) home_device=(-?\d+) "
+        r"partner_tier=(-?\d+) partner_device=(-?\d+) "
+        r"tokens=(\d+) in=(\d+) out=(\d+) transfer_bytes=(\d+) "
+        r"result_bytes=(\d+) cuda_error=(.*)$"
+    )
+    markers: list[dict[str, str]] = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = pattern.search(line)
+        if not match:
+            continue
+        fields = (
+            "sequence", "event", "stage", "binding_label", "passed_label",
+            "weight_offset", "home_tier", "home_device", "partner_tier",
+            "partner_device", "tokens", "in", "out", "transfer_bytes",
+            "result_bytes", "cuda_error",
+        )
+        marker = dict(zip(fields, match.groups()))
+        if marker["home_tier"] != str(pair):
+            continue
+        marker["cuda_phase"] = ""
+        if index > 0:
+            phase_match = re.search(
+                r"CUDA default-stream bounce (alloc|d2h|h2d) failed:",
+                lines[index - 1],
+            )
+            if phase_match:
+                marker["cuda_phase"] = phase_match.group(1)
+        markers.append(marker)
+    return markers
+
+
+def format_q8_partner_phase_audit_marker(marker: dict[str, str]) -> str:
+    if not marker:
+        return ""
+    cuda_phase = (
+        f" cuda_phase={marker['cuda_phase']}" if marker.get("cuda_phase") else ""
+    )
+    return (
+        f"sequence={marker['sequence']} event={marker['event']} "
+        f"stage={marker['stage']} binding_label={marker['binding_label']} "
+        f"passed_label={marker['passed_label']} "
+        f"weight_offset={marker['weight_offset']} "
+        f"home_tier={marker['home_tier']} home_device={marker['home_device']} "
+        f"partner_tier={marker['partner_tier']} "
+        f"partner_device={marker['partner_device']} tokens={marker['tokens']} "
+        f"in={marker['in']} out={marker['out']} "
+        f"transfer_bytes={marker['transfer_bytes']} "
+        f"result_bytes={marker['result_bytes']}"
+        f"{cuda_phase} cuda_error={marker['cuda_error']}"
+    )
+
+
+def q8_partner_phase_audit_summary(
+        text: str, pair: int) -> tuple[str, str, str]:
+    markers = q8_partner_phase_audit_markers(text, pair)
+    checkpoint_events = {
+        "begin", "activation-complete", "activation-copy-failed",
+        "compute-submitted", "compute-submit-failed", "compute-complete",
+        "compute-sync-failed", "result-complete", "result-copy-failed",
+    }
+    failure_events = {
+        "activation-copy-failed", "compute-submit-failed",
+        "compute-sync-failed", "result-copy-failed", "home-restore-failed",
+    }
+    checkpoints = [
+        marker for marker in markers if marker["event"] in checkpoint_events
+    ]
+    first_failure_index = next(
+        (index for index, marker in enumerate(markers)
+         if marker["event"] in failure_events),
+        None,
+    )
+    first_failure = (
+        markers[first_failure_index] if first_failure_index is not None else {}
+    )
+    classification = ""
+    if first_failure:
+        event = first_failure["event"]
+        if event == "compute-sync-failed":
+            classification = "partner-compute-or-earlier-async-partner-work"
+        elif event == "result-copy-failed":
+            sequence = first_failure["sequence"]
+            compute_completed = any(
+                marker["sequence"] == sequence and
+                marker["event"] == "compute-complete"
+                for marker in markers[:first_failure_index]
+            )
+            if compute_completed:
+                phase = first_failure.get("cuda_phase", "")
+                if phase == "d2h":
+                    classification = "result-d2h-pcie-host-bounce-transfer"
+                elif phase == "h2d":
+                    classification = "result-h2d-pcie-host-bounce-transfer"
+                elif phase == "alloc":
+                    classification = "result-host-bounce-allocation"
+                else:
+                    classification = "result-host-bounce-copy-after-compute"
+        if not classification:
+            classification = "inconclusive"
+    return (
+        format_q8_partner_phase_audit_marker(checkpoints[-1])
+        if checkpoints else "",
+        format_q8_partner_phase_audit_marker(first_failure),
+        classification,
+    )
 
 
 def last_attention_phase_audit(text: str) -> str:
@@ -360,6 +474,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_host_bounce = outcomes.get(
         "attention-q8-host-bounce", "not-run"
     )
+    attention_q8_phase_audit = outcomes.get(
+        "attention-q8-phase-audit", "not-run"
+    )
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -393,6 +510,14 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "failed-device-loss", "interrupted-prior-run-device-loss",
             "interrupted-no-result-device-loss",
         }
+    ]
+    attention_q8_phase_audit_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-phase-audit"
+    ]
+    attention_q8_phase_audit_problem_rows = [
+        row for row in attention_q8_phase_audit_rows
+        if row.get("status") not in {"passed", "completed-no-result"}
     ]
 
     def measured_host_bounce_checkpoint(row: dict[str, str]) -> bool:
@@ -437,6 +562,28 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             return float(row.get("prefill_tps", "")) >= 500.0
         except (TypeError, ValueError):
             return False
+
+    def indexer_observation(candidate_rows: list[dict[str, str]]) -> str:
+        calls = sum(
+            int(row.get("pair0_indexer_begin_calls", "0") or 0)
+            for row in candidate_rows
+        )
+        traffic = sum(
+            int(row.get("pair0_indexer_begin_bytes", "0") or 0)
+            for row in candidate_rows
+        )
+        if calls:
+            return (
+                " Pair-0 indexer transport retained its direct-peer configuration "
+                f"and durably logged {calls} begun dispatch(es) carrying "
+                f"{traffic} bytes before the arm ended."
+            )
+        return (
+            " Pair-0 indexer transport retained its direct-peer configuration, but "
+            "no pair-0 indexer dispatch was durably logged before the arm ended; it "
+            "cannot be cited as executed direct pair-0 traffic in this observed "
+            "interval."
+        )
 
     def topk_evidence(candidate_rows: list[dict[str, str]]) -> str:
         transports: set[str] = set()
@@ -725,15 +872,98 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
         )
+    if attention_q8_phase_audit in {"failed", "incomplete"}:
+        classified_row = next((
+            row for row in attention_q8_phase_audit_problem_rows
+            if row.get("q8_phase_audit_classification") not in {"", "inconclusive"}
+        ), {})
+        classification = classified_row.get(
+            "q8_phase_audit_classification", "inconclusive"
+        )
+        common_scope = (
+            " The transport cut covers pair-0 attention-owned and Q8-partner "
+            "payload routes only; it does not assert that every possible direct "
+            "pair-0 peer route was removed."
+            + indexer_observation(attention_q8_phase_audit_problem_rows)
+            + " Pair-1 traffic retained direct-peer transport."
+        )
+        if classification == "partner-compute-or-earlier-async-partner-work":
+            return (
+                "The Q8 phase audit recorded compute submission followed by an "
+                "explicit partner-device compute synchronization failure before the "
+                "result gather was attempted. The first synchronous failure is "
+                "therefore in partner compute or earlier asynchronous partner-side "
+                "work, not in the result D2H host-bounce copy."
+                + common_scope
+            )
+        if classification == "result-d2h-pcie-host-bounce-transfer":
+            return (
+                "The Q8 phase audit durably completed the partner compute "
+                "synchronization for the same sequence, then recorded the first "
+                "failure in the result-gather D2H copy. This localizes the first "
+                "synchronous failure to the partner-to-host PCIe leg of the pinned-"
+                "host-bounce result transfer rather than to the audited partner "
+                "compute. It does not by itself distinguish the GPU endpoint, PCIe "
+                "path, host-memory path, or driver as the physical root cause."
+                + common_scope
+            )
+        if classification in {
+                "result-h2d-pcie-host-bounce-transfer",
+                "result-host-bounce-allocation",
+                "result-host-bounce-copy-after-compute"}:
+            detail = {
+                "result-h2d-pcie-host-bounce-transfer":
+                    "home-device H2D leg of the pinned-host-bounce result transfer",
+                "result-host-bounce-allocation":
+                    "host-bounce allocation/setup for the result transfer",
+                "result-host-bounce-copy-after-compute":
+                    "host-bounce result-copy helper, with its D2H/H2D leg unrecorded",
+            }[classification]
+            return (
+                "The Q8 phase audit durably completed the partner compute "
+                "synchronization for the same sequence before the result copy "
+                f"failed. The first synchronous failure is in the {detail}, not in "
+                "the audited partner compute."
+                + common_scope
+            )
+        return (
+            "The Q8 phase-audit arm ended without a marker sequence that separates "
+            "partner compute synchronization from result-copy failure. Its last "
+            "durable checkpoint and first failure context are the observation "
+            "boundary; the current evidence is otherwise inconclusive."
+            + common_scope
+        )
+    if attention_q8_phase_audit == "passed":
+        return (
+            "The Q8 phase-audit arm completed without a durable Q8 phase failure. "
+            "Because its explicit partner synchronization and per-phase fsync markers "
+            "perturb production timing, this is diagnostic survival rather than a "
+            "causal pass."
+            + indexer_observation(attention_q8_phase_audit_rows)
+        )
+    if attention_q8_phase_audit == "underloaded":
+        return (
+            "The Q8 phase-audit arm completed below the required production-load "
+            "floor. Its checkpoint sequence remains diagnostic evidence, but survival "
+            "under reduced load cannot identify the trigger."
+        )
+    if attention_q8_phase_audit == "invalid":
+        return (
+            "The Q8 phase-audit arm failed production-path, marker, throughput, or "
+            "health validation and is invalid for causal comparison. Preserve its raw "
+            "phase markers, but do not treat it as a safe pass."
+        )
     if (attention_q8_host_bounce == "passed" and
             attention_q8_host_bounce_pass_verified):
         return (
             "Pair 0 completed the full production-shaped arm with durable measured "
             "completion evidence for both attention-owned and Q8 partner "
             "host-bounce routes. The 50/50 attention row split and both partner "
-            "compute paths remained enabled. The pair-0 prefill and decode indexer "
-            "row-split transfers and pair-1 traffic remained direct peer; they were "
-            "not part of this transport cut. This implicates one of the "
+            "compute paths remained enabled. This transport cut covers only pair-0 "
+            "attention-owned and Q8-partner payload routes, not every possible direct "
+            "pair-0 peer route. Pair-1 traffic remained direct peer."
+            + indexer_observation(attention_q8_host_bounce_rows) +
+            " This implicates one of the "
             "removed pair-0 direct-peer transport paths or the timing/load envelope "
             "changed by staging both through host memory, but is not by itself a "
             "power-matched causal proof or a production mitigation."
@@ -760,11 +990,12 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "checkpoints for both attention-owned traffic and Q8 partner "
                 "traffic before pair-0 device loss. Thus direct pair-0 production "
                 "attention-owned and Q8-partner payload transport is unnecessary "
-                "for this observed loss. Pair-0 prefill/decode indexer transfers "
-                "and pair-1 traffic remained direct peer and were not removed. "
-                "Partner attention and Q8 compute, those direct indexer routes, "
-                "aggregate load, pair-1 traffic, or a delayed physical effect "
-                "therefore remain."
+                "for this observed loss. This transport cut did not claim to remove "
+                "every possible direct pair-0 route. Pair-1 traffic remained direct "
+                "peer and was not removed."
+                + indexer_observation(attention_q8_host_bounce_failed_rows) +
+                " Partner attention and Q8 compute, aggregate load, pair-1 traffic, "
+                "or a delayed physical effect therefore remain."
                 + topk_evidence(attention_q8_host_bounce_failed_rows)
                 + context_sentence
             )
@@ -782,8 +1013,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "but the durable records do not prove that both transport cuts completed "
             "during measured prefill. A 64-call Q8 checkpoint or an attention "
             "checkpoint at pos=0 is warmup evidence only. Do not infer that the "
-            "cut pair-0 attention/Q8 payload routes were unnecessary; pair-0 "
-            "indexer and pair-1 traffic also retained direct peer transport."
+            "cut pair-0 attention/Q8 payload routes were unnecessary. The cut covered "
+            "only attention-owned and Q8-partner payload routes, not every possible "
+            "direct pair-0 route. Pair-1 traffic retained direct peer transport."
+            + indexer_observation(attention_q8_host_bounce_failed_rows)
             + context_sentence
         )
     if attention_q8_host_bounce == "passed":
@@ -792,7 +1025,8 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "lacks durable measured completion evidence for both host-bounce routes "
             "at the required >=500 prefill tok/s load. Treat it as inconclusive; "
             "warmup-only or underloaded evidence does not validate the transport "
-            "cut, and pair-0 indexer plus pair-1 traffic remained direct."
+            "cut. Pair-1 traffic remained direct."
+            + indexer_observation(attention_q8_host_bounce_rows)
         )
     if attention_q8_host_bounce == "invalid":
         return (
@@ -806,14 +1040,16 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "500 prefill tok/s production-load floor. It is deliberately classified "
             "as inconclusive-underloaded: survival at substantially reduced work rate "
             "cannot show that either cut pair-0 direct payload family is causal. "
-            "Pair-0 indexer and pair-1 traffic remained direct."
+            "Pair-1 traffic remained direct."
+            + indexer_observation(attention_q8_host_bounce_rows)
         )
     if attention_q8_host_bounce == "incomplete":
         return (
             "The combined pair-0 host-bounce arm has no verified outcome. Missing "
             "durable measured completion for either transport family is not proof "
             "that both pair-0 attention/Q8 payload routes were removed from the "
-            "failing phase; pair-0 indexer and pair-1 traffic remained direct."
+            "failing phase. Pair-1 traffic remained direct."
+            + indexer_observation(attention_q8_host_bounce_rows)
         )
     if (attention_host_bounce == "passed" and
             attention_host_bounce_pass_verified):
@@ -1188,6 +1424,9 @@ def main() -> None:
         query_schedule, gather_schedule = attention_copy_schedules(log_text, 0)
         query_transport, gather_transport = attention_copy_transports(log_text, 0)
         cache_transport, topk_transport = attention_aux_transports(log_text, 0)
+        q8_phase_last, q8_phase_first_failure, q8_phase_classification = (
+            q8_partner_phase_audit_summary(log_text, 0)
+        )
         row = {
             "variant": variant,
             "status": status,
@@ -1208,6 +1447,9 @@ def main() -> None:
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
+            "q8_phase_audit_last_checkpoint": q8_phase_last,
+            "q8_phase_audit_first_failure": q8_phase_first_failure,
+            "q8_phase_audit_classification": q8_phase_classification,
             "pair0_attention_query_copy_schedule": query_schedule,
             "pair0_attention_gather_copy_schedule": gather_schedule,
             "pair0_attention_query_copy_transport": query_transport,
@@ -1271,13 +1513,15 @@ def main() -> None:
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
+        "Q8 phase last checkpoint | Q8 phase first failure | "
+        "Q8 phase classification | "
         "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
         "Query copy transport | Gather copy transport | Cache copy transport | "
         "Top-k copy transport | Host-bounce checkpoint | Host-bounce failure context | "
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -1286,6 +1530,9 @@ def main() -> None:
             f"{row.get('pair0_q8_transport', '')} | "
             f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
+            f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
+            f"{row.get('q8_phase_audit_first_failure', '')} | "
+            f"{row.get('q8_phase_audit_classification', '')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('pair0_attention_query_copy_schedule', '')} | "
             f"{row.get('pair0_attention_gather_copy_schedule', '')} | "
