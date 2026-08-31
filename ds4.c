@@ -137,6 +137,10 @@ int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                      uint64_t bytes) {
     return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
 }
+int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+}
 int ds4_gpu_tensor_copy_xdev3_default_dst(
         ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
         ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
@@ -15527,6 +15531,25 @@ static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
                "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", home_tier);
 }
 
+/* Diagnostic-only copy scheduling switches. Production keeps both row-split
+ * transfers on the source device's default stream. A selected pair instead
+ * submits the named peer copy from the destination CUDA context/default
+ * stream, preserving the exact bytes, row ownership, direct-P2P transport,
+ * and surrounding arithmetic while reversing the required peer-access
+ * direction. Keep these selectors in CPU test-hook builds as well. */
+#if (!defined(__APPLE__) && !defined(DS4_NO_GPU) && \
+     !defined(DS4_ROCM_BUILD)) || defined(DS4_TEST_HOOKS)
+static bool cuda_tp_prefill_attn_query_copy_dst_pair_enabled(int home_tier) {
+    return env_pair_list_contains(
+        "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS", home_tier);
+}
+
+static bool cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(int home_tier) {
+    return env_pair_list_contains(
+        "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS", home_tier);
+}
+#endif
+
 /* Kept outside the GPU-only graph implementation so the CPU placement test
  * can lock down the production dispatch boundary without linking CUDA. */
 static bool metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
@@ -28487,6 +28510,10 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
 
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
+    const bool query_copy_dst =
+        cuda_tp_prefill_attn_query_copy_dst_pair_enabled(home);
+    const bool gather_copy_dst =
+        cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home);
     const bool phase_audit =
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
             home, il, pos0);
@@ -28603,9 +28630,12 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             "begin", "query-copy", kind, il, pos0, n_tokens, home, partner);
     }
     if (ok) {
-        ok = ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
-             ds4_gpu_tensor_copy_xdev_default(
-                 peer_q_dst, peer_q_src, q_partner_bytes) != 0;
+        ok = query_copy_dst
+            ? ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+                  peer_q_dst, peer_q_src, q_partner_bytes) != 0
+            : (ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
+               ds4_gpu_tensor_copy_xdev_default(
+                   peer_q_dst, peer_q_src, q_partner_bytes) != 0);
     }
     if (active_phase_audit) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
@@ -28710,9 +28740,12 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home, partner);
     }
     if (ok) {
-        ok = ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
-             ds4_gpu_tensor_copy_xdev_default(
-                 gather_dst, peer_heads, q_partner_bytes) != 0;
+        ok = gather_copy_dst
+            ? ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+                  gather_dst, peer_heads, q_partner_bytes) != 0
+            : (ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0 &&
+               ds4_gpu_tensor_copy_xdev_default(
+                   gather_dst, peer_heads, q_partner_bytes) != 0);
     }
     if (audit_result_gather) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
@@ -28762,18 +28795,24 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         fprintf(stderr,
                 "ds4: CUDA prefill attention query-row split enabled: "
                 "tier %d rows [0,%u), tier %d rows [%u,%u); "
-                "partner-local mirrored KV, full-head gather to home\n",
-                home, home_rows, partner, home_rows, n_tokens);
+                "partner-local mirrored KV, full-head gather to home; "
+                "query-copy-stream=%s gather-copy-stream=%s\n",
+                home, home_rows, partner, home_rows, n_tokens,
+                query_copy_dst ? "destination" : "source",
+                gather_copy_dst ? "destination" : "source");
     }
     if (ok && getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT")) {
         fprintf(stderr,
                 "ds4: CUDA prefill attention row audit dispatch=split "
                 "kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d "
-                "q_bytes=%llu result_bytes=%llu\n",
+                "q_bytes=%llu result_bytes=%llu query_copy_stream=%s "
+                "gather_copy_stream=%s\n",
                 kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
                 il, pos0, n_tokens, home, partner,
                 (unsigned long long)q_partner_bytes,
-                (unsigned long long)q_partner_bytes);
+                (unsigned long long)q_partner_bytes,
+                query_copy_dst ? "destination" : "source",
+                gather_copy_dst ? "destination" : "source");
     }
 
     ds4_gpu_tensor_free(peer_topk_dst);
@@ -58423,6 +58462,16 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
     return cuda_tp_prefill_attn_rows_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
+        int home_tier) {
+    return cuda_tp_prefill_attn_query_copy_dst_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
+        int home_tier) {
+    return cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void) {

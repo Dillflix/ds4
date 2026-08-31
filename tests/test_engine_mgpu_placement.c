@@ -43,6 +43,10 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
+        int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
+        int home_tier);
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void);
 bool ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
@@ -870,6 +874,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     char *old_pairs = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
+    char *old_query_dst = save_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
+    char *old_gather_dst = save_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     const int old_n_gpus = g_n_gpus;
     ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
     int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
@@ -896,6 +904,8 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -917,6 +927,20 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           !ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
           "pair-scoped switch accepts both prefill attention pairs");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
+
+    CHECK(!ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(0),
+          "production schedules both row-split peer copies on source streams");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS", "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(1) &&
+          !ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(0),
+          "query-copy destination scheduling is scoped to one pair");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS", "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(1),
+          "query and gather destination scheduling are independent pair switches");
 
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
@@ -941,6 +965,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
     restore_env_value("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", old_pairs);
+    restore_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS", old_query_dst);
+    restore_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS", old_gather_dst);
 }
 
 static void test_cuda_tp_decode_indexer_rows_default(void) {

@@ -20,6 +20,14 @@ def write_healthy_post(root: pathlib.Path, stem: str) -> None:
     )
 
 
+def write_unhealthy_post(root: pathlib.Path, stem: str) -> None:
+    health = root / "health"
+    health.mkdir(exist_ok=True)
+    (health / f"{stem}-post.log").write_text(
+        "GPU 0: ok\nGPU 1: GPU is lost\nGPU 2: ok\nGPU 3: ok\n"
+    )
+
+
 def complete_row_boundary_log() -> str:
     end_identity = "kind=mixed layer=17 pos=512 tokens=512 home=0 partner=2"
     entry_identity = "kind=mixed layer=18 pos=512 tokens=512 home=0 partner=2"
@@ -66,6 +74,8 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 (production / f"{stem}.log").write_text("")
                 if status == "passed":
                     write_healthy_post(root, stem)
+                else:
+                    write_unhealthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
@@ -121,6 +131,142 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("older wrapper omitted its final result record", report)
             self.assertIn("mixed prefill split-attention", report)
 
+    def test_interrupted_prior_run_without_device_loss_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=interrupted-prior-run\n"
+                "exit_status=125\nlast_phase=measured-prefill\n"
+                "last_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "interrupted-prior-run")
+            report = (root / "summary.md").read_text()
+            self.assertIn("production control has no verified outcome", report)
+            self.assertIn("fresh directory", report)
+
+    def test_generic_failed_result_without_device_loss_is_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "failed-unverified")
+            report = (root / "summary.md").read_text()
+            self.assertIn("production control has no verified outcome", report)
+
+    def test_lost_device_watch_corroborates_interrupted_prior_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            telemetry = root / "telemetry"
+            production.mkdir()
+            telemetry.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=interrupted-prior-run\n"
+                "exit_status=125\nlast_phase=measured-prefill\n"
+                "last_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            (telemetry / f"{stem}-watch-event.txt").write_text(
+                "status=lost-device-detected\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["status"], "interrupted-prior-run-device-loss"
+            )
+
+    def test_lost_device_watch_corroborates_started_only_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            telemetry = root / "telemetry"
+            production.mkdir()
+            telemetry.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.started").write_text(
+                "variant=production\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            (telemetry / f"{stem}-watch-event.txt").write_text(
+                "status=lost-device-detected\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["status"], "interrupted-no-result-device-loss"
+            )
+
+    def test_unhealthy_post_corroborates_interrupted_prior_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            health = root / "health"
+            production.mkdir()
+            health.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=interrupted-prior-run\n"
+                "exit_status=125\nlast_phase=measured-prefill\n"
+                "last_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            (health / f"{stem}-post.log").write_text(
+                "GPU 0: ok\nGPU 1: GPU is lost\nGPU 2: ok\nGPU 3: ok\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["status"], "interrupted-prior-run-device-loss"
+            )
+            self.assertEqual(row["post_health"], "unhealthy")
+
+    def test_empty_post_snapshot_does_not_imply_device_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            health = root / "health"
+            production.mkdir()
+            health.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=interrupted-prior-run\n"
+                "exit_status=125\nlast_phase=measured-prefill\n"
+                "last_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            (health / f"{stem}-post.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "interrupted-prior-run")
+            self.assertEqual(row["post_health"], "unverified")
+
     def test_validation_failure_is_not_reported_as_device_loss(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -167,6 +313,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "variant=attention-off\nstatus=failed\nexit_status=1\n"
             )
             (production / f"{failed}.log").write_text("")
+            write_unhealthy_post(root, failed)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
@@ -219,6 +366,32 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "All production row-split operations and traffic survived",
                 report,
             )
+
+    def test_watch_marker_invalidates_passed_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            telemetry = root / "telemetry"
+            production.mkdir()
+            telemetry.mkdir()
+            stem = "r1-s1-attention-query-dst"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-query-dst\nstatus=passed\nexit_status=0\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            write_healthy_post(root, stem)
+            (telemetry / f"{stem}-watch-event.txt").write_text(
+                "status=foreign-compute-process\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "passed-invalidated-watch")
+            report = (root / "summary.md").read_text()
+            self.assertIn("unexpected GPU compute process", report)
+            self.assertIn("invalid for causal comparison", report)
 
     def test_recovers_started_only_phase_audit_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +470,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "target=home kind=mixed layer=21 pos=512 tokens=512 "
                 "home=0 partner=2\n"
             )
+            write_unhealthy_post(root, stem)
             (production / f"{stem}-progress.csv").write_text(
                 "realtime_sec,realtime_nsec,phase,event,current,total\n"
                 "1,0,measured-prefill,prefill_chunk,0,32768\n"
@@ -327,6 +501,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "target=pair kind=mixed layer=21 pos=512 tokens=512 "
                 "home=0 partner=2\n"
             )
+            write_unhealthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
@@ -353,6 +528,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "target=partner kind=mixed layer=21 pos=512 tokens=512 "
                 "home=0 partner=2\n"
             )
+            write_unhealthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
@@ -497,8 +673,8 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
-            self.assertIn("No lost-device watcher record", report)
-            self.assertIn("must not be assigned a hardware boundary", report)
+            self.assertIn("no lost-device watcher record", report)
+            self.assertIn("not evidence of a GPU failure", report)
             self.assertNotIn("first observed error is downstream", report)
 
     def test_lost_device_after_complete_phases_is_downstream_observation(self) -> None:
@@ -605,6 +781,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "event=device-switch-failed phase=home-attention kind=mixed "
                 "layer=18 pos=512 tokens=512 home=0 partner=2\n"
             )
+            write_unhealthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             with (root / "summary.csv").open(newline="") as handle:
@@ -653,6 +830,8 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 )
                 if status == "passed":
                     write_healthy_post(root, stem)
+                else:
+                    write_unhealthy_post(root, stem)
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             with (root / "summary.csv").open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
@@ -694,11 +873,107 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 (production / f"{stem}.log").write_text("")
                 if status == "passed":
                     write_healthy_post(root, stem)
+                else:
+                    write_unhealthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
             report = (root / "summary.md").read_text()
             self.assertIn("under both direct-peer and host-bounce", report)
             self.assertIn("indexer path or its interaction", report)
+
+    def test_reports_query_destination_stream_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            variants = (
+                ("attention-query-dst", "passed"),
+                ("attention-gather-dst", "failed"),
+                ("attention-both-dst", "failed"),
+                ("production", "failed"),
+            )
+            for slot, (variant, status) in enumerate(variants, 1):
+                stem = f"r1-s{slot}-{variant}"
+                (production / f"{stem}.result").write_text(
+                    f"variant={variant}\nstatus={status}\nexit_status="
+                    f"{'0' if status == 'passed' else '1'}\n"
+                    "last_phase=decode\nlast_event=frontier-complete\n"
+                )
+                (production / f"{stem}.log").write_text(
+                    "ds4: CUDA prefill attention row audit dispatch=split "
+                    "kind=mixed layer=17 pos=512 tokens=512 home=0 partner=2 "
+                    "q_bytes=65536 result_bytes=65536 "
+                    "query_copy_stream=destination gather_copy_stream=source\n"
+                    if variant == "attention-query-dst" else ""
+                )
+                if status == "passed":
+                    write_healthy_post(root, stem)
+                else:
+                    write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("Query-copy destination scheduling passed", report)
+            self.assertIn("scheduling/peer-access axis", report)
+            self.assertIn("not identification of a physical copy engine", report)
+            with (root / "summary.csv").open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            query_row = next(
+                row for row in rows
+                if row["variant"] == "attention-query-dst"
+            )
+            self.assertEqual(
+                query_row["pair0_attention_query_copy_schedule"], "destination"
+            )
+            self.assertEqual(
+                query_row["pair0_attention_gather_copy_schedule"], "source"
+            )
+
+    def test_reports_all_destination_stream_arms_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            for slot, variant in enumerate((
+                    "attention-query-dst", "attention-gather-dst",
+                    "attention-both-dst"), 1):
+                stem = f"r1-s{slot}-{variant}"
+                (production / f"{stem}.result").write_text(
+                    f"variant={variant}\nstatus=failed\nexit_status=1\n"
+                    "last_phase=measured-prefill\nlast_event=chunk-start\n"
+                )
+                (production / f"{stem}.log").write_text("")
+                write_unhealthy_post(root, stem)
+            stem = "r1-s4-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("all recorded failures", report)
+            self.assertIn("was not sufficient to prevent the fault", report)
+            self.assertIn("does not identify a physical copy engine", report)
+
+    def test_reports_unverified_ownership_matrix_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-query-dst"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-query-dst\n"
+            )
+            (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("has no verified outcome", report)
+            self.assertIn("not a failed arm and is not a safe pass", report)
+            self.assertIn("fresh full matrix", report)
 
     def test_requires_final_production_control(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -710,12 +985,25 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "variant=partner-bounce\nstatus=passed\nexit_status=0\n"
                 "last_phase=decode\nlast_event=frontier-complete\n"
             )
-            (production / f"{stem}.log").write_text("")
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=mixed layer=17 pos=512 tokens=512 home=0 partner=2 "
+                "q_bytes=1 result_bytes=1 query_copy_stream=destination "
+                "gather_copy_stream=source\n"
+            )
             write_healthy_post(root, stem)
 
             subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["pair0_attention_query_copy_schedule"], "destination"
+            )
+            self.assertEqual(
+                row["pair0_attention_gather_copy_schedule"], "source"
+            )
             report = (root / "summary.md").read_text()
-            self.assertIn("production control has no durable outcome yet", report)
+            self.assertIn("production control has not run yet", report)
             self.assertIn("requires the final control", report)
 
 

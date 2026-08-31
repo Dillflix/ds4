@@ -3117,17 +3117,17 @@ The tighter row-split-on boundary is:
   instantaneous-load condition; it is diagnostic evidence, not a production
   mitigation.
 
-The separate end-fence runs support a narrower cross-run observation bracket. A layer-17 fence
-completed on partner and home before the run later lost the device, agreeing
-with the earlier four-phase layer-17 audit. A layer-18 fence instead found the
-partner context already failed. Because those fences were exercised in separate
-processes and perturb timing at different points, they suggest rather than prove
-that the pending CUDA error appears after the layer-17 attention result gather
-and by the layer-18 attention completion boundary. They do **not** prove a
-layer-18 kernel defect: the interval also contains the layer-17 tail/MoE/Q8 work
-and layer-18 pre-attention setup.
+The separate end-fence runs initially appeared to place a cross-run observation
+bracket between layers 17 and 18: one layer-17 fence completed while later
+layer-18 through layer-21 fences first observed a failed partner context. The
+combined audit then reproduced the same endpoint loss at the very first
+layer-17 partner synchronization, before any layer-18 entry or phase marker.
+The failure remains reproducible, but the layer at which a newly inserted
+synchronization observes it is not stable. These fences perturb the overlap and
+instantaneous-load envelope, so further layer-number fence stepping is not used
+to assign a causal kernel.
 
-The next combined diagnostic is:
+The completed combined diagnostic was:
 
 - `attention-row-boundary-audit`, which keeps the full production workload
   and adds three ordered observations at the fixed mixed-attention
@@ -3142,11 +3142,42 @@ The next combined diagnostic is:
   upstream layer-18 QKV/cache/indexer preparation has already run. If that entry
   fence fails, layer-18 query copy has not yet been submitted, so the remaining
   interval is layer-17 tail/MoE/Q8 through that upstream layer-18 preparation.
-  If entry completes, the
-  phase markers can distinguish the layer-18 row-split operations. A passing
-  arm shows that one or both added boundaries removed a required overlap or
-  instantaneous-load condition; it still does not establish a layer-specific
-  software bug.
+  If entry completes, the phase markers can distinguish the layer-18 row-split
+  operations. In the captured combined run, the layer-17 partner end fence was
+  already the first failing boundary and layer 18 never ran. That result only
+  proves an asynchronous error was pending on the partner by the first forced
+  synchronization; it does not identify layer 17 as the trigger.
+
+The next workload-preserving diagnostic changes the CUDA context/default stream
+that submits each peer copy and the surrounding event dependencies rather than
+adding another host completion fence:
+
+- `attention-query-dst` submits only the pair-0 query-row handoff in the
+  destination device context on its default stream instead of in the source
+  device context/default stream;
+- `attention-gather-dst` makes the same scheduling change only for the pair-0
+  partner-result gather;
+- `attention-both-dst` moves both; and
+- `production` retains source-context/default-stream submission for both copies.
+
+The destination-scheduled primitive is an ordered, fail-closed direct-P2P handoff:
+source readiness, destination copy, then a destination-complete event that the
+source waits on before scratch reuse. It never silently falls back to host
+bounce or source-stream copying. Each arm retains the same 32K/256-token
+production workload, 50/50 attention rows, partner attention, direct NVLink/P2P
+transport, transfer directions, and exact query/result byte counts. Destination
+submission requires the opposite validated peer-access/mapping direction from
+source submission. The factorial therefore changes a bundle: initiating CUDA
+context/default stream, event ordering, and peer-access/mapping direction. CUDA
+and the driver choose the physical transfer engine and low-level route; this
+audit neither controls nor identifies a physical copy engine. The harness
+requires at least 500 prefill tok/s and verified pair-0/pair-1 row-split copy
+schedules before accepting either a completed candidate or the production
+control, preventing a low-utilization or degraded control from being
+misclassified as a safe pass.
+With `SKIP_BUILD=0`, a focused two-GPU preflight also checks both transfer
+directions for byte-exact destination data, immediate source-buffer reuse
+ordering, and fail-closed behavior when host bounce is forced.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
@@ -3184,11 +3215,15 @@ external NVLink counters during an arm. A separate home-built `nvbandwidth`
 workload was observed running concurrently, so pre-arm and in-arm guards now
 reject any GPU compute process other than the active `ds4-bench` PID. If a GPU
 loss interrupts the shell,
-reuse the same directory with `RESUME=1`; the interrupted arm is retained as
-evidence and the next arm runs. If the benchmark completed but the runner
-stopped during post-run validation, resume validates and recovers that arm from
-its existing CSV, binding inventory, progress journal, and log instead of
-rerunning it.
+reuse the same directory with `RESUME=1`; the interrupted arm is retained and
+the next arm runs. It is classified as a device-loss failure only when the
+watcher or an explicit unhealthy post-run snapshot corroborates that outcome.
+If the benchmark completed but the runner stopped during post-run validation,
+resume recovers that arm only when its existing CSV, binding inventory,
+progress journal, log, and healthy post-run snapshot all validate and no watch
+marker exists; otherwise it remains unverified instead of being rerun. Resume
+advances the remaining never-started arms; a retained unverified arm must be
+repeated in a fresh matrix rather than overwritten in place.
 
 `RESUME=1` requires the exact original variant list and order. Use a new output
 directory when selecting a different arm; do not point a new variant list at an
@@ -3196,6 +3231,14 @@ older directory.
 
 ```bash
 cd ~/ds4-iq2-q4
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
 
 export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
@@ -3285,6 +3328,61 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
+
+Run the three scheduling candidates and the unmodified control as one fixed
+matrix, in this order, under one output directory/manifest. Start from a clean
+boot, then run the harness's fixed build, long-context smoke, and bidirectional
+ordered-copy preflight before the first arm. If an arm loses a GPU, reboot,
+restore and verify all four 250 W limits, then reuse the exact directory,
+variant list, and order with `RESUME=1` and `SKIP_BUILD=0`. Repeating that
+preflight after every reboot keeps the pre-arm CUDA/P2P history consistent; do
+not use `SKIP_BUILD=1` for this matrix. The harness retains the interrupted arm
+as evidence and advances to the next arm.
+Do not create a new directory for each matrix arm: the per-directory summarizer
+requires all four outcomes before it makes a factorial comparison. Production
+runs last as the same-matrix positive control.
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-copy-scheduling-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-query-dst,attention-gather-dst,attention-both-dst,production \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+After a reboot-triggering loss, do not rerun the `unset` or timestamp assignment.
+Export the exact `SMALL_BAR1_ISOLATION_DIR` printed by the first run, then rerun
+the environment block with the identical `VARIANTS` value/order, `RESUME=1`,
+and `SKIP_BUILD=0`. A missing result or an unverified post-run health snapshot
+is **no verified outcome**, not a failed arm and not a pass. Resume advances
+arms that never started, but deliberately does not overwrite an incomplete
+result record. If an arm remains incomplete after the matrix traversal, repeat
+the full matrix in a fresh directory before factorial inference. If production
+passes, the known fault was not reproduced in that matrix and candidate
+differences are not causal evidence.
+
+After the complete matrix identifies an apparent passing candidate while the
+production control fails, confirm that candidate and the production control in
+separate one-arm directories, each begun from a fresh boot. Those confirmation
+runs test repeatability without losing the fixed-matrix comparison to boot,
+temperature, and prior-arm history.
 
 The earlier execution-off arm remains useful only as evidence that static
 344/344 admission and low-volume row traffic can survive at reduced load. It is

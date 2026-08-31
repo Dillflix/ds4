@@ -16,7 +16,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
-  VARIANTS=attention-off,production
+  VARIANTS=attention-off,production  scheduling matrix is explicit and fixed
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -38,8 +38,9 @@ Optional environment:
 The transport/scheduling diagnostic arms run before the known full-production
 reproducer. They preserve arithmetic work but can change its timing envelope.
 If a GPU loss interrupts the shell, reboot, set RESUME=1 and reuse the printed
-SMALL_BAR1_ISOLATION_DIR. The incomplete arm is retained as failed evidence
-and the next arm runs; it is not silently retried.
+SMALL_BAR1_ISOLATION_DIR. The incomplete arm is retained without silently
+retrying it. It counts as a failed arm only when a durable lost-device watch
+record or an unhealthy post-run GPU snapshot corroborates device loss.
 EOF
 }
 
@@ -123,14 +124,23 @@ done
 IFS=, read -r -a variants <<<"$VARIANTS"
 (( ${#variants[@]} >= 1 )) || die "VARIANTS selected no arms"
 declare -A seen_variants=()
+attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
+    case "$variant" in
+        attention-query-dst|attention-gather-dst|attention-both-dst)
+            attention_copy_matrix_requested=1
+            ;;
+    esac
 done
+if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
+    die "attention copy-scheduling arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
+fi
 
 for tool in awk basename cat cmp cp date dirname env find git grep kill make \
             mkdir mv nproc nvidia-smi python3 rm sleep sort stat stdbuf sync \
@@ -153,13 +163,26 @@ OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 printf 'Diagnostic directory: %s\n' "$OUTPUT_DIR"
 printf 'Resume with: export SMALL_BAR1_ISOLATION_DIR=%q; RESUME=1 ...\n' \
     "$OUTPUT_DIR"
-if [[ $RESUME == 1 && -s $OUTPUT_DIR/manifest.txt ]]; then
+if [[ $RESUME == 1 ]]; then
+    [[ -s $OUTPUT_DIR/manifest.txt ]] ||
+        die "resume manifest is missing or empty"
     grep -Fxq "git_commit=$(git rev-parse HEAD)" "$OUTPUT_DIR/manifest.txt" ||
         die "resume commit differs from the original isolation"
     grep -Fxq "model=$MODEL" "$OUTPUT_DIR/manifest.txt" ||
         die "resume model differs from the original isolation"
     grep -Fxq "variants=$VARIANTS" "$OUTPUT_DIR/manifest.txt" ||
         die "resume variant order differs from the original isolation"
+    grep -Fxq "small_bar1_pair=$SMALL_BAR1_PAIR" "$OUTPUT_DIR/manifest.txt" ||
+        die "resume small-BAR1 pair differs from the original isolation"
+    grep -Fxq "pp_tokens=$PP_TOKENS" "$OUTPUT_DIR/manifest.txt" ||
+        die "resume prefill length differs from the original isolation"
+    grep -Fxq "tg_tokens=$TG_TOKENS" "$OUTPUT_DIR/manifest.txt" ||
+        die "resume decode length differs from the original isolation"
+    grep -Fxq "repeats=$REPEATS" "$OUTPUT_DIR/manifest.txt" ||
+        die "resume repeat count differs from the original isolation"
+    grep -Fxq "required_power_limit_w=$REQUIRED_POWER_LIMIT_W" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume power limit differs from the original isolation"
     grep -Fxq "attention_phase_audit_layer=$ATTN_PHASE_AUDIT_LAYER" \
         "$OUTPUT_DIR/manifest.txt" ||
         die "resume attention phase-audit layer differs from the original isolation"
@@ -201,8 +224,10 @@ stop_active_case() {
 }
 stop_telemetry() {
     if [[ -n ${telemetry_watch_pid:-} ]]; then
-        kill "$telemetry_watch_pid" >/dev/null 2>&1 || true
+        local watch_pid=$telemetry_watch_pid
         telemetry_watch_pid=
+        kill "$watch_pid" >/dev/null 2>&1 || true
+        wait "$watch_pid" >/dev/null 2>&1 || true
     fi
     for name in telemetry_pid; do
         local pid=${!name:-}
@@ -306,8 +331,24 @@ gpu_health_snapshot() {
         printf '\ntopology:\n'
         timeout --kill-after=5s 20s nvidia-smi topo -m
     } >"$path" 2>&1 || return 1
+    gpu_health_snapshot_is_healthy "$path"
+}
+
+gpu_health_snapshot_is_healthy() {
+    local path=$1
+    [[ -s $path ]] || return 1
     [[ $(grep -c '^GPU [0-9]:' "$path") == 4 ]] || return 1
-    ! grep -Eiq 'ERR!|GPU is lost|Unknown Error|Unable to determine' "$path"
+    ! grep -Eiq \
+        'ERR!|GPU is lost|Unknown Error|Unable to determine|GPU Unavailable|Critical Xid' \
+        "$path"
+}
+
+gpu_health_snapshot_is_unhealthy() {
+    local path=$1
+    [[ -s $path ]] || return 1
+    grep -Eiq \
+        'ERR!|GPU is lost|Unknown Error|Unable to determine|GPU Unavailable|Critical Xid' \
+        "$path"
 }
 
 start_telemetry() {
@@ -324,7 +365,7 @@ start_telemetry_watch() {
         while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
             local watch_status= foreign_processes=
             if tail -n 24 "$output" 2>/dev/null |
-                    grep -Eiq 'GPU is lost|GPU requires reset|Unknown Error|ERR!|Unable to determine'; then
+                    grep -Eiq 'GPU is lost|GPU requires reset|GPU Unavailable|Critical Xid|Unknown Error|ERR!|Unable to determine'; then
                 watch_status=lost-device-detected
             elif tail -n 24 "$output" 2>/dev/null |
                     awk -F, -v required="$REQUIRED_POWER_LIMIT_W" '
@@ -402,7 +443,8 @@ write_result() {
 }
 
 phase=build
-targets=(ds4-bench tests/cuda_long_context_smoke tests/test_engine_mgpu_placement)
+targets=(ds4-bench tests/cuda_long_context_smoke tests/test_engine_mgpu_placement \
+         tests/test_gpu_xdev)
 if [[ $SKIP_BUILD == 0 ]]; then
     make -B -j"$(nproc)" "${targets[@]}" CUDA_ARCH=sm_75 \
         2>&1 | tee "$OUTPUT_DIR/build.log"
@@ -411,10 +453,19 @@ if [[ $SKIP_BUILD == 0 ]]; then
             tail -n 200 "$OUTPUT_DIR/placement-tests.log" >&2
             die "CPU placement tests failed"
         }
+    assert_no_compute_processes ||
+        die "foreign GPU compute process present before CUDA smoke tests"
     "${clean[@]}" ./tests/cuda_long_context_smoke \
         >"$OUTPUT_DIR/smoke.log" 2>&1 || {
             tail -n 200 "$OUTPUT_DIR/smoke.log" >&2
             die "CUDA long-context smoke failed"
+        }
+    assert_no_compute_processes ||
+        die "foreign GPU compute process present before ordered-copy tests"
+    "${clean[@]}" ./tests/test_gpu_xdev ordered-dst-copy \
+        >"$OUTPUT_DIR/ordered-dst-copy-tests.log" 2>&1 || {
+            tail -n 200 "$OUTPUT_DIR/ordered-dst-copy-tests.log" >&2
+            die "ordered destination-stream peer-copy tests failed"
         }
 else
     make -q "${targets[@]}" CUDA_ARCH=sm_75 ||
@@ -451,6 +502,9 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'partner_work_retained=yes\ndecode_indexer_pair_fallback=home\n'
         printf 'host_bounce_scope=q8_partner_activation_and_result_only\n'
         printf 'serialization_scope=q8_partner_projection_pair_only\n'
+        printf 'attention_copy_scheduling_scope=pair0_query_and_gather_independent\n'
+        printf 'attention_copy_scheduling_transport=ordered_direct_peer_no_fallback\n'
+        printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
         printf 'external_nvlink_counters=disabled-no-external-compute-workload\n'
@@ -484,8 +538,27 @@ log_line_has() {
     ' "$log"
 }
 
+validate_full_production_load() {
+    local csv=$1
+    awk -F, '
+        NR==1 {
+            for (i=1;i<=NF;i++) if ($i=="prefill_tps") col=i
+            next
+        }
+        NR==2 {ok=(col>0 && $col>=500.0)}
+        END {exit !ok}
+    ' "$csv"
+}
+
+validate_attention_copy_schedule() {
+    local log=$1 home=$2 partner=$3 query_schedule=$4 gather_schedule=$5
+    grep -Eq \
+        "prefill attention row audit dispatch=split .*home=${home} partner=${partner} .*query_copy_stream=${query_schedule} gather_copy_stream=${gather_schedule}" \
+        "$log"
+}
+
 validate_success_path() {
-    local variant=$1 log=$2 bindings=$3
+    local variant=$1 log=$2 bindings=$3 csv=$4
     validate_admission_retained "$bindings" || return 1
     grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
         return 1
@@ -514,6 +587,43 @@ validate_success_path() {
                 return 1
             grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
                 return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        attention-query-dst|attention-gather-dst|attention-both-dst)
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
+                return 1
+            local query_schedule=source gather_schedule=source
+            case "$variant" in
+                attention-query-dst) query_schedule=destination ;;
+                attention-gather-dst) gather_schedule=destination ;;
+                attention-both-dst)
+                    query_schedule=destination
+                    gather_schedule=destination
+                    ;;
+            esac
+            validate_attention_copy_schedule "$log" 0 2 \
+                "$query_schedule" "$gather_schedule" || return 1
+            validate_attention_copy_schedule "$log" 1 3 source source || return 1
+            ! grep -Fq 'ordered destination-stream peer copy unavailable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row phase audit event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row entry fence event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row end fence event=' "$log" ||
+                return 1
+            validate_full_production_load "$csv" || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -581,6 +691,27 @@ validate_success_path() {
                 return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
                 return 1
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
+                return 1
+            validate_attention_copy_schedule "$log" 0 2 source source || return 1
+            validate_attention_copy_schedule "$log" 1 3 source source || return 1
+            ! grep -Fq 'ordered destination-stream peer copy unavailable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row phase audit event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row entry fence event=' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row end fence event=' "$log" ||
+                return 1
+            validate_full_production_load "$csv" || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -658,7 +789,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if [[ $RESUME == 1 && -s $started ]]; then
             if [[ -s $csv && $(wc -l <"$csv") == 2 && -s $bindings ]] &&
                     [[ $(wc -l <"$bindings") == 345 ]] &&
-                    validate_success_path "$variant" "$log" "$bindings"; then
+                    [[ ! -e $watch_marker ]] &&
+                    gpu_health_snapshot_is_healthy "$post_health" &&
+                    validate_success_path "$variant" "$log" "$bindings" "$csv"; then
                 printf 'Recovering completed prior arm: variant=%s repeat=%d...\n' \
                     "$variant" "$repeat"
                 write_result "$result" "$variant" passed 0 "$progress" "$log"
@@ -671,15 +804,26 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
                 continue
             fi
-            printf 'Retaining interrupted prior arm as failure: variant=%s repeat=%d\n' \
-                "$variant" "$repeat"
-            write_result "$result" "$variant" interrupted-prior-run 125 \
+            retained_status=interrupted-prior-run
+            retained_exit=125
+            if { [[ -s $watch_marker ]] &&
+                    grep -Fxq 'status=lost-device-detected' "$watch_marker"; } ||
+                    gpu_health_snapshot_is_unhealthy "$post_health"; then
+                retained_status=interrupted-prior-run-device-loss
+                retained_exit=124
+                printf 'Retaining interrupted prior arm as corroborated device-loss failure: variant=%s repeat=%d\n' \
+                    "$variant" "$repeat"
+            else
+                printf 'Retaining interrupted prior arm as incomplete evidence: variant=%s repeat=%d\n' \
+                    "$variant" "$repeat"
+            fi
+            write_result "$result" "$variant" "$retained_status" "$retained_exit" \
                 "$progress" "$log"
             fields=$(last_progress_fields "$progress")
             IFS=$'\t' read -r lp le lc lt <<<"$fields"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
-                interrupted-prior-run 125 "$lp" "$le" \
+                "$retained_status" "$retained_exit" "$lp" "$le" \
                 >>"$OUTPUT_DIR/run-journal.tsv"
             continue
         fi
@@ -701,6 +845,16 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         case "$variant" in
             attention-off)
                 variant_env+=("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-query-dst)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-gather-dst)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-both-dst)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
@@ -769,6 +923,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         start_telemetry_watch "$telemetry" "$watch_marker" "$active_case_pid"
         if wait "$active_case_pid"; then run_status=0; else run_status=$?; fi
         active_case_pid=
+        stop_telemetry
+        if (( run_status == 0 )) && [[ -e $watch_marker ]]; then
+            run_status=123
+        fi
         if (( run_status == 0 )) && ! validate_power_limits; then
             run_status=126
             if [[ ! -s $watch_marker ]]; then
@@ -778,7 +936,6 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 sync "$watch_marker" 2>/dev/null || sync
             fi
         fi
-        stop_telemetry
         post_health_status=0
         gpu_health_snapshot "$post_health" || post_health_status=124
         if (( run_status == 0 && post_health_status != 0 )); then
@@ -788,13 +945,26 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         fields=$(last_progress_fields "$progress")
         IFS=$'\t' read -r lp le lc lt <<<"$fields"
         if (( run_status != 0 )); then
-            write_result "$result" "$variant" failed "$run_status" "$progress" "$log"
+            watch_status=
+            if [[ -s $watch_marker ]]; then
+                watch_status=$(awk -F= '$1=="status" {print $2; exit}' "$watch_marker")
+            fi
+            result_status=run-failed-unverified
+            if [[ $watch_status == lost-device-detected ]] ||
+                    gpu_health_snapshot_is_unhealthy "$post_health"; then
+                result_status=failed-device-loss
+            elif [[ -n $watch_status ]]; then
+                result_status=environment-invalid
+            fi
+            write_result "$result" "$variant" "$result_status" "$run_status" \
+                "$progress" "$log"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
-                failed "$run_status" "$lp" "$le" >>"$OUTPUT_DIR/run-journal.tsv"
+                "$result_status" "$run_status" "$lp" "$le" \
+                >>"$OUTPUT_DIR/run-journal.tsv"
             sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
             tail -n 240 "$log" >&2 || true
-            die "variant=$variant failed at phase=$lp event=$le"
+            die "variant=$variant ended with status=$result_status at phase=$lp event=$le"
         fi
         [[ -s $csv && $(wc -l <"$csv") == 2 ]] ||
             die "variant=$variant produced an invalid benchmark CSV"
@@ -802,7 +972,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if [[ $(wc -l <"$bindings") != 345 ]]; then
             die "variant=$variant omitted its 344-entry binding inventory"
         fi
-        if ! validate_success_path "$variant" "$log" "$bindings"; then
+        if ! validate_success_path "$variant" "$log" "$bindings" "$csv"; then
             write_result "$result" "$variant" validation-failed 127 \
                 "$progress" "$log"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

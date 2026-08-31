@@ -139,6 +139,16 @@ int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                       const ds4_gpu_tensor *src,
                                       uint64_t bytes);
 
+/* Diagnostic direct-P2P handoff executed on the destination default stream.
+ * Unlike the grouped overlap helper below, this is a complete reusable-buffer
+ * handshake: source-ready -> destination copy -> source completion wait. It
+ * fails closed rather than silently changing transport when reverse-direction
+ * peer access is unavailable or host bounce is forced. */
+int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t              bytes);
+
 /* Grouped default-stream handoff whose copies execute on the destination
  * device. The source default stream records readiness; the destination waits,
  * performs all three copies, then naturally orders its following kernels.

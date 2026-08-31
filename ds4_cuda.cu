@@ -4815,6 +4815,67 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
     return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
 }
 
+extern "C" int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t bytes) {
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes) return 0;
+    if (bytes == 0u) return 1;
+    const int sd = ds4_tensor_device_idx(src);
+    const int dd = ds4_tensor_device_idx(dst);
+    if (sd == dd) {
+        int ok = 0;
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            ok = cuda_ok(cudaMemcpyAsync(dst->ptr, src->ptr, (size_t)bytes,
+                                         cudaMemcpyDeviceToDevice, 0),
+                         "ordered destination-stream same-device copy");
+        }
+        return ok;
+    }
+
+    int peer = g_gpu_peer_ok[dd][sd];
+    if (g_xdev_force_cuda_peer) peer = 1;
+    if (g_xdev_force_host_bounce || !peer) {
+        fprintf(stderr,
+                "ds4: ordered destination-stream peer copy unavailable: "
+                "source_tier=%d destination_tier=%d host_bounce=%d\n",
+                sd, dd, g_xdev_force_host_bounce ? 1 : 0);
+        return 0;
+    }
+
+    int ok = 0;
+    WITH_DEVICE(g_gpu[sd].device_id) {
+        ok = cuda_ok(cudaEventRecord(
+                         (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                     "ordered destination-stream source-ready record");
+    }
+    if (!ok) return 0;
+    WITH_DEVICE(g_gpu[dd].device_id) {
+        ok = cuda_ok(cudaStreamWaitEvent(
+                         0, (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                     "ordered destination-stream source-ready wait");
+        if (ok) {
+            ok = cuda_ok(cudaMemcpyPeerAsync(
+                             dst->ptr, g_gpu[dd].device_id,
+                             src->ptr, g_gpu[sd].device_id,
+                             (size_t)bytes, 0),
+                         "ordered destination-stream peer copy");
+        }
+        if (ok) {
+            ok = cuda_ok(cudaEventRecord(
+                             (cudaEvent_t)g_gpu[dd].boundary_event, 0),
+                         "ordered destination-stream completion record");
+        }
+    }
+    if (!ok) return 0;
+    WITH_DEVICE(g_gpu[sd].device_id) {
+        ok = cuda_ok(cudaStreamWaitEvent(
+                         0, (cudaEvent_t)g_gpu[dd].boundary_event, 0),
+                     "ordered destination-stream source reuse wait");
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
         ds4_gpu_tensor *dst0,
         const ds4_gpu_tensor *src0,

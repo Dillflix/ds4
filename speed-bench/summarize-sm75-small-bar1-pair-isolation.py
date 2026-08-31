@@ -10,7 +10,8 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "attention-off", "attention-phase-audit", "attention-end-fence",
+    "attention-off", "attention-query-dst", "attention-gather-dst",
+    "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
     "partner-serialized", "indexer-off", "production"
 )
@@ -54,6 +55,20 @@ def indexer_totals(text: str, event: str, pair: int) -> tuple[int, int]:
         if match:
             traffic += int(match.group(1))
     return count, traffic
+
+
+def attention_copy_schedules(text: str, pair: int) -> tuple[str, str]:
+    query: set[str] = set()
+    gather: set[str] = set()
+    pattern = re.compile(
+        r"prefill attention row audit dispatch=split .*?"
+        rf"home={pair} partner=\d+ .*?query_copy_stream=(\S+) "
+        r"gather_copy_stream=(\S+)"
+    )
+    for match in pattern.finditer(text):
+        query.add(match.group(1))
+        gather.add(match.group(2))
+    return ",".join(sorted(query)), ",".join(sorted(gather))
 
 
 def last_attention_phase_audit(text: str) -> str:
@@ -203,9 +218,17 @@ def outcome(statuses: list[str]) -> str:
         return "not-run"
     if all(status == "passed" for status in statuses):
         return "passed"
-    if any(status in {"failed", "interrupted-prior-run"} for status in statuses):
+    failed_statuses = {
+        "failed-device-loss", "interrupted-prior-run-device-loss",
+        "interrupted-no-result-device-loss",
+    }
+    if any(status in failed_statuses for status in statuses):
         return "failed"
-    if any(status == "validation-failed" for status in statuses):
+    invalid_statuses = {
+        "validation-failed", "environment-invalid",
+        "passed-invalidated-watch", "completed-no-result-invalidated-watch",
+    }
+    if any(status in invalid_statuses for status in statuses):
         return "invalid"
     return "incomplete"
 
@@ -218,16 +241,25 @@ def last_progress(path: Path) -> dict[str, str]:
     return rows[-1] if rows else {}
 
 
-def healthy_post_snapshot(path: Path) -> bool:
-    if not path.exists():
-        return False
+def post_health_state(path: Path) -> str:
+    if not path.exists() or path.stat().st_size == 0:
+        return "unverified"
     text = path.read_text(errors="replace")
-    return (len(re.findall(r"^GPU \d+:", text, re.MULTILINE)) == 4 and
-            not re.search(
-                r"ERR!|GPU is lost|Unknown Error|Unable to determine",
-                text,
-                re.IGNORECASE,
-            ))
+    error = re.search(
+        r"ERR!|GPU is lost|Unknown Error|Unable to determine|"
+        r"GPU Unavailable|Critical Xid",
+        text,
+        re.IGNORECASE,
+    )
+    if error:
+        return "unhealthy"
+    if len(re.findall(r"^GPU \d+:", text, re.MULTILINE)) == 4:
+        return "healthy"
+    return "unverified"
+
+
+def healthy_post_snapshot(path: Path) -> bool:
+    return post_health_state(path) == "healthy"
 
 
 def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
@@ -237,7 +269,17 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "is invalid for causal comparison; identify the external power-limit writer "
             "and rerun it."
         )
+    if any("foreign-compute-process" in row.get("watch_status", "")
+           for row in rows):
+        return (
+            "At least one arm overlapped an unexpected GPU compute process. That arm "
+            "is invalid for causal comparison; identify the external launcher and "
+            "rerun it without the foreign workload."
+        )
     attention = outcomes.get("attention-off", "not-run")
+    query_dst = outcomes.get("attention-query-dst", "not-run")
+    gather_dst = outcomes.get("attention-gather-dst", "not-run")
+    both_dst = outcomes.get("attention-both-dst", "not-run")
     phase_audit = outcomes.get("attention-phase-audit", "not-run")
     end_fence = outcomes.get("attention-end-fence", "not-run")
     boundary_audit = outcomes.get("attention-row-boundary-audit", "not-run")
@@ -499,11 +541,122 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "validation. It is invalid for causal inference; inspect the missing "
             "marker rather than treating the wrapper failure as a GPU failure."
         )
-    if production in {"not-run", "incomplete"}:
+    ownership = {
+        "query-only destination scheduling": query_dst,
+        "gather-only destination scheduling": gather_dst,
+        "combined destination scheduling": both_dst,
+        "source-scheduled production control": production,
+    }
+    ownership_requested = any(
+        state != "not-run" for name, state in ownership.items()
+        if name != "source-scheduled production control"
+    )
+    if ownership_requested and any(
+            state == "invalid" for state in ownership.values()):
         return (
-            "The production control has no durable outcome yet. Resume the same "
-            "directory; earlier failures remain evidence, but causal comparison "
+            "At least one attention peer-copy scheduling arm returned but failed "
+            "its production-path, direct-peer, or >=500 prefill tok/s validation. "
+            "The matrix is invalid for causal inference; this is not evidence for "
+            "or against that scheduling mode."
+        )
+    unresolved_ownership = [
+        name for name, state in ownership.items()
+        if state in {"not-run", "incomplete"}
+    ]
+    if ownership_requested and unresolved_ownership:
+        return (
+            "The attention peer-copy scheduling matrix has no verified outcome for "
+            + ", ".join(unresolved_ownership)
+            + ". A missing result, interrupted wrapper, or unverified post-run GPU "
+            "snapshot is not a failed arm and is not a safe pass. Resume the same "
+            "directory only to advance arms that never started. An arm already retained "
+            "as incomplete is immutable evidence and must be repeated in a fresh full "
+            "matrix before making a factorial comparison."
+        )
+    if ownership_requested and production == "passed":
+        return (
+            "The source-scheduled production control passed, so this matrix did not "
+            "reproduce the known fault under its current boot and workload history. "
+            "Candidate pass/fail differences from this matrix cannot establish a "
+            "necessary trigger; repeat from a clean boot and preserve the full matrix."
+        )
+    candidate_ownership = (query_dst, gather_dst, both_dst)
+    if (ownership_requested and production == "failed" and
+            all(state == "failed" for state in candidate_ownership)):
+        return (
+            "The query-only, gather-only, combined destination-scheduled arms, and "
+            "source-scheduled production control all recorded failures under the full "
+            "32K direct-P2P row-split workload. Changing the CUDA submission context, "
+            "default stream, event dependencies, and required peer-access direction "
+            "was not sufficient to prevent the fault in this matrix. This does not "
+            "identify a physical copy engine or clear the attention/cache path."
+        )
+    if ownership_requested and production == "failed" and both_dst == "passed":
+        if query_dst == "failed" and gather_dst == "failed":
+            return (
+                "Only the combined destination-scheduled arm passed while both "
+                "single-copy arms and the source-scheduled production control failed. "
+                "The arm preserves transfer directions, byte counts, row splitting, "
+                "and direct P2P, but jointly changes CUDA submission context/default "
+                "stream, event dependencies, and peer-access direction for both "
+                "copies. Confirm the apparent pass and the control from fresh boots; "
+                "this matrix does not identify a physical copy engine."
+            )
+        return (
+            "The combined destination-scheduled arm passed while the source-scheduled "
+            "production control failed. Direct P2P, transfer directions, byte counts, "
+            "row splitting, and partner computation were retained. The changed bundle "
+            "is CUDA submission context/default stream, event dependencies, and "
+            "peer-access direction; its components are not independently isolated. "
+            "Confirm the apparent pass and the failed control from fresh boots."
+        )
+    if (ownership_requested and production == "failed" and
+            query_dst == "passed" and gather_dst == "passed"):
+        return (
+            "Both single-copy destination-scheduled arms passed while the combined "
+            "destination-scheduled arm and source-scheduled production control failed. "
+            "That non-additive pattern points to scheduling/history sensitivity rather "
+            "than isolating either logical transfer. Confirm each apparent pass, the "
+            "combined failure, and the control from fresh boots before attribution."
+        )
+    if ownership_requested and production == "failed" and query_dst == "passed":
+        return (
+            "Query-copy destination scheduling passed while the source-scheduled "
+            "production control failed; result gather retained production scheduling. "
+            "This is a promising query-side scheduling/peer-access axis without "
+            "disabling row splitting or direct P2P, not identification of a physical "
+            "copy engine. Confirm both the apparent pass and failed control from fresh "
+            "boots before attribution."
+        )
+    if ownership_requested and production == "failed" and gather_dst == "passed":
+        return (
+            "Only result-gather destination scheduling passed while the source-scheduled "
+            "production control failed; query copy retained production scheduling. "
+            "This is a promising gather-side scheduling/peer-access axis without "
+            "disabling row splitting or direct P2P, not identification of a physical "
+            "copy engine. Confirm both the apparent pass and failed control from fresh "
+            "boots before attribution."
+        )
+    if ownership_requested and production == "failed":
+        return (
+            "The full attention peer-copy scheduling matrix and failed production "
+            "control are complete, but the pass/fail pattern does not isolate one copy. "
+            "It changes CUDA submission context/default stream, event dependencies, "
+            "and peer-access direction without changing transfer direction or bytes. "
+            "Repeat any apparent pass and the control from fresh boots before causal "
+            "attribution."
+        )
+    if production == "not-run":
+        return (
+            "The production control has not run yet. Resume the same directory to "
+            "advance to it; earlier failures remain evidence, but causal comparison "
             "requires the final control."
+        )
+    if production == "incomplete":
+        return (
+            "The production control has no verified outcome. The retained incomplete "
+            "record is not overwritten by resume; repeat the full matrix in a fresh "
+            "directory before causal comparison."
         )
     if production == "passed":
         return (
@@ -553,7 +706,8 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         )
     return (
         "The completed arms do not yet isolate a necessary trigger. Resume the same "
-        "directory until all requested variants have durable results."
+        "directory only to advance variants that never started; repeat any retained "
+        "incomplete arm in a fresh matrix."
     )
 
 
@@ -595,26 +749,48 @@ def main() -> None:
                 bench_rows = list(csv.DictReader(handle))
             if bench_rows:
                 bench_row = bench_rows[-1]
-        post_health_ok = healthy_post_snapshot(
-            root / "health" / f"{stem}-post.log"
-        )
+        post_health_path = root / "health" / f"{stem}-post.log"
+        post_health = post_health_state(post_health_path)
+        post_health_ok = post_health == "healthy"
+        watch_path = root / "telemetry" / f"{stem}-watch-event.txt"
+        watch_present = watch_path.exists()
+        watch_values = read_kv(watch_path) if watch_present else {}
+        watch_status = watch_values.get("status", "")
         if has_result:
             status = values.get("status", "unknown")
-            if status == "passed" and not post_health_ok:
-                status = "passed-unverified-health"
+            if status == "passed":
+                if watch_present:
+                    status = "passed-invalidated-watch"
+                elif not post_health_ok:
+                    status = "passed-unverified-health"
+            elif status == "interrupted-prior-run" and (
+                    watch_status == "lost-device-detected" or
+                    post_health == "unhealthy"):
+                status = "interrupted-prior-run-device-loss"
+            elif status == "failed":
+                status = (
+                    "failed-device-loss"
+                    if (watch_status == "lost-device-detected" or
+                        post_health == "unhealthy")
+                    else "failed-unverified"
+                )
+        elif (watch_status == "lost-device-detected" or
+              post_health == "unhealthy"):
+            status = "interrupted-no-result-device-loss"
         elif (bench_row and progress_values.get("phase") == "decode" and
               progress_values.get("event") == "frontier-complete" and
               progress_values.get("current") == progress_values.get("total") and
-              post_health_ok):
+              post_health_ok and not watch_present):
             status = "completed-no-result"
         elif (bench_row and progress_values.get("phase") == "decode" and
               progress_values.get("event") == "frontier-complete" and
               progress_values.get("current") == progress_values.get("total")):
-            status = "completed-no-result-unverified-health"
+            status = (
+                "completed-no-result-invalidated-watch" if watch_present else
+                "completed-no-result-unverified-health"
+            )
         else:
             status = "interrupted-no-result"
-        watch_path = root / "telemetry" / f"{stem}-watch-event.txt"
-        watch_values = read_kv(watch_path) if watch_path.exists() else {}
         q8_begin_calls, q8_begin_bytes = checkpoint_max(
             log_text, "q8 partner transfer audit", "begin", 0
         )
@@ -631,6 +807,7 @@ def main() -> None:
             r"q8 partner transfer audit event=begin home_tier=0 .*?serialized=(\S+)",
             log_text,
         )))
+        query_schedule, gather_schedule = attention_copy_schedules(log_text, 0)
         row = {
             "variant": variant,
             "status": status,
@@ -651,6 +828,8 @@ def main() -> None:
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
+            "pair0_attention_query_copy_schedule": query_schedule,
+            "pair0_attention_gather_copy_schedule": gather_schedule,
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
             "attention_end_fence_last": last_attention_end_fence(log_text),
             "attention_entry_fence_last": last_attention_entry_fence(log_text),
@@ -661,8 +840,8 @@ def main() -> None:
                 )
                 if variant == "attention-row-boundary-audit" else ""
             ),
-            "post_health": "healthy" if post_health_ok else "unverified",
-            "watch_status": watch_values.get("status", ""),
+            "post_health": post_health,
+            "watch_status": watch_status,
             "result": str(result_path),
             "log": str(log_path),
         }
@@ -689,14 +868,20 @@ def main() -> None:
         "`GPU_DEVICES=0,3,1,2` layout. Every arm retains the 344/344 admission "
         "plan, partner-resident weights, and partner projection arithmetic. The "
         "diagnostics vary only pair-0 Q8 transport/synchronization, pair-0 "
-        "prefill attention rows, and pair-0 prefill/decode-indexer rows.",
+        "prefill attention row execution/copy scheduling, and pair-0 "
+        "prefill/decode-indexer rows. Destination-scheduled attention copies retain "
+        "the same transfer direction and byte count; they change the initiating CUDA "
+        "context/default stream, event dependencies, and required peer-access "
+        "direction. CUDA chooses the physical transfer engine, which this audit does "
+        "not identify.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
-        "Pair-0 indexer begun bytes | Attention phase checkpoint | "
+        "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
+        "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -706,6 +891,8 @@ def main() -> None:
             f"{row.get('pair0_q8_serialized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
+            f"{row.get('pair0_attention_query_copy_schedule', '')} | "
+            f"{row.get('pair0_attention_gather_copy_schedule', '')} | "
             f"{row.get('attention_phase_audit_last', '')} | "
             f"{row.get('attention_end_fence_last', '')} | "
             f"{row.get('attention_entry_fence_last', '')} | "

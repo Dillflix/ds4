@@ -5,7 +5,9 @@
  *   - ds4_gpu_tensor_alloc_on / ds4_gpu_tensor_free_in_place.
  *   - ds4_gpu_tensor_copy_xdev same-device fast path.
  *   - ds4_gpu_tensor_copy_xdev peer-auto and DS4_FORCE_HOST_BOUNCE paths
- *     (when 2+ GPUs are visible). */
+ *     (when 2+ GPUs are visible).
+ *   - destination-stream ordered peer-copy exactness, immediate source-buffer
+ *     reuse ordering, and fail-closed forced-host-bounce behavior. */
 
 /* ds4_gpu_mgpu.h is standalone-C-compatible — it now provides the
  * complete ds4_gpu_tensor struct + typedef so callers can use the
@@ -191,6 +193,165 @@ static int run_copy3(int n_gpus_wanted, int force_bounce) {
     fprintf(stderr, "  copy_xdev3 OK (n_gpus=%d, force_bounce=%d)\n",
             n_gpus_wanted, force_bounce);
     return 0;
+}
+
+/* Validate the complete source-ready -> destination-copy -> source-reuse
+ * handshake used by the attention row-split copy-scheduling diagnostic.
+ *
+ * The important ordering check is intentionally asynchronous: immediately
+ * after the destination-owned peer copy is submitted, the source default
+ * stream overwrites the entire source tensor.  A correct implementation
+ * keeps that overwrite behind the destination completion event, so the
+ * destination retains the original bytes while the source ends with the
+ * replacement byte.  A missing source-reuse wait lets the overwrite race the
+ * remote read and is exposed by the 16 MiB repeated transfers below.
+ *
+ * With DS4_FORCE_HOST_BOUNCE set, the diagnostic API must fail closed before
+ * touching the destination; it must not silently route through host memory. */
+static int run_ordered_destination_copy(int force_bounce, int require_peer) {
+    int dev_count = 0;
+    (void)cudaGetDeviceCount(&dev_count);
+    if (dev_count < 2) {
+        fprintf(stderr,
+                "  skipping ordered destination copy (need >= 2 devices)\n");
+        return 0;
+    }
+
+    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    if (force_bounce) setenv("DS4_FORCE_HOST_BOUNCE", "1", 1);
+    else              unsetenv("DS4_FORCE_HOST_BOUNCE");
+    CHECK(ds4_gpu_init_multi(&cfg), "ordered destination init_multi");
+
+    if (!force_bounce &&
+        (!g_gpu_peer_ok[1][0] || !g_gpu_peer_ok[0][1])) {
+        ds4_gpu_cleanup();
+        unsetenv("DS4_FORCE_HOST_BOUNCE");
+        if (require_peer) {
+            fprintf(stderr,
+                    "FAIL: ordered destination copy requires validated "
+                    "bidirectional direct peer access\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "  skipping ordered destination copy ordering check "
+                "(bidirectional direct peer access unavailable)\n");
+        return 0;
+    }
+
+    const size_t bytes = 16u * 1024u * 1024u;
+    const int iters = force_bounce ? 1 : 8;
+    unsigned char *host_expected = (unsigned char *)malloc(bytes);
+    unsigned char *host_got = (unsigned char *)malloc(bytes);
+    unsigned char *host_reused = (unsigned char *)malloc(bytes);
+    CHECK(host_expected && host_got && host_reused,
+          "ordered destination host alloc");
+
+    ds4_gpu_tensor tier0; memset(&tier0, 0, sizeof(tier0));
+    ds4_gpu_tensor tier1; memset(&tier1, 0, sizeof(tier1));
+    CHECK(ds4_gpu_tensor_alloc_on(&tier0, 0, bytes) == 0,
+          "ordered destination alloc tier0");
+    CHECK(ds4_gpu_tensor_alloc_on(&tier1, 1, bytes) == 0,
+          "ordered destination alloc tier1");
+
+    int total_ok = 1;
+    for (int direction = 0; direction < 2 && total_ok; direction++) {
+        const int source_tier = direction;
+        const int destination_tier = 1 - direction;
+        ds4_gpu_tensor *src = direction == 0 ? &tier0 : &tier1;
+        ds4_gpu_tensor *dst = direction == 0 ? &tier1 : &tier0;
+        for (int it = 0; it < iters && total_ok; it++) {
+            for (size_t k = 0; k < bytes; k++) {
+                host_expected[k] = (unsigned char)
+                    ((k * 31u + (size_t)it * 73u +
+                      (size_t)direction * 97u + 19u) & 0xffu);
+            }
+            const unsigned char reuse_byte = (unsigned char)
+                (0xa5u ^ (unsigned int)(it * 17) ^
+                 (unsigned int)(direction * 0x5au));
+            memset(host_reused, reuse_byte, bytes);
+            memset(host_got, 0x6d, bytes);
+
+            CHECK(ds4_gpu_tensor_write(src, 0, host_expected, bytes),
+                  "ordered destination source write");
+            CHECK(ds4_gpu_tensor_write(dst, 0, host_got, bytes),
+                  "ordered destination seed write");
+            CHECK(cudaSetDevice(g_gpu[source_tier].device_id) == cudaSuccess,
+                  "ordered destination select source device");
+
+            const int copied =
+                ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+                    dst, src, bytes);
+            if (force_bounce) {
+                CHECK(!copied,
+                      "ordered destination forced bounce must fail closed");
+                CHECK(ds4_gpu_tensor_read(dst, 0, host_expected, bytes),
+                      "ordered destination rejected-copy read");
+                for (size_t k = 0; k < bytes; k++) {
+                    if (host_expected[k] != 0x6du) {
+                        fprintf(stderr,
+                                "FAIL: ordered destination forced-bounce "
+                                "copy %d->%d modified destination at "
+                                "offset=%zu got=0x%02x\n",
+                                source_tier, destination_tier, k,
+                                host_expected[k]);
+                        total_ok = 0;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            CHECK(copied, "ordered destination peer copy submission");
+            CHECK(cudaMemsetAsync(src->ptr, (int)reuse_byte, bytes, 0) ==
+                      cudaSuccess,
+                  "ordered destination immediate source reuse");
+            CHECK(ds4_gpu_tensor_read(dst, 0, host_got, bytes),
+                  "ordered destination result read");
+            if (memcmp(host_expected, host_got, bytes) != 0) {
+                size_t k = 0;
+                while (k < bytes && host_expected[k] == host_got[k]) k++;
+                fprintf(stderr,
+                        "FAIL: ordered destination data mismatch %d->%d "
+                        "iter=%d offset=%zu got=0x%02x want=0x%02x\n",
+                        source_tier, destination_tier, it, k,
+                        k < bytes ? host_got[k] : 0u,
+                        k < bytes ? host_expected[k] : 0u);
+                total_ok = 0;
+                break;
+            }
+            CHECK(ds4_gpu_tensor_read(src, 0, host_got, bytes),
+                  "ordered destination reused source read");
+            if (memcmp(host_reused, host_got, bytes) != 0) {
+                size_t k = 0;
+                while (k < bytes && host_reused[k] == host_got[k]) k++;
+                fprintf(stderr,
+                        "FAIL: ordered destination source reuse mismatch "
+                        "%d->%d iter=%d offset=%zu got=0x%02x want=0x%02x\n",
+                        source_tier, destination_tier, it, k,
+                        k < bytes ? host_got[k] : 0u,
+                        k < bytes ? host_reused[k] : 0u);
+                total_ok = 0;
+            }
+        }
+    }
+
+    ds4_gpu_tensor_free_in_place(&tier0);
+    ds4_gpu_tensor_free_in_place(&tier1);
+    free(host_expected);
+    free(host_got);
+    free(host_reused);
+    ds4_gpu_cleanup();
+    unsetenv("DS4_FORCE_HOST_BOUNCE");
+    if (total_ok) {
+        fprintf(stderr,
+                "  ordered destination copy OK "
+                "(force_bounce=%d, directions=2, iters=%d, bytes=%zu MiB)\n",
+                force_bounce, iters, bytes / (1024u * 1024u));
+    }
+    return total_ok ? 0 : 1;
 }
 
 static int run_top1(void) {
@@ -2397,6 +2558,18 @@ int main(int argc, char **argv) {
     (void)cudaGetDeviceCount(&dev_count);
     fprintf(stderr, "test_gpu_xdev: %d CUDA devices visible\n", dev_count);
 
+    if (argc == 2 && strcmp(argv[1], "ordered-dst-copy") == 0) {
+        if (dev_count < 2) {
+            fprintf(stderr,
+                    "error: ordered destination copy test requires two "
+                    "visible GPUs\n");
+            return 2;
+        }
+        if (run_ordered_destination_copy(0, 1)) return 1;
+        if (run_ordered_destination_copy(1, 1)) return 1;
+        fprintf(stdout, "harness_status=ok\n");
+        return 0;
+    }
     if (argc == 2 &&
         (strcmp(argv[1], "q8-partner-t256-profile") == 0 ||
          strcmp(argv[1], "q8-partner-t32-profile") == 0)) {
@@ -2450,7 +2623,8 @@ int main(int argc, char **argv) {
     }
     if (argc != 1) {
         fprintf(stderr,
-                "Usage: %s [q8-partner-t256-profile|q8-partner-t32-profile]\n",
+                "Usage: %s [ordered-dst-copy|q8-partner-t256-profile|"
+                "q8-partner-t32-profile]\n",
                 argv[0]);
         return 2;
     }
@@ -2474,6 +2648,8 @@ int main(int argc, char **argv) {
     if (run_attention_output_tp()) return 1;
     /* If 2+ GPUs, exercise peer-auto and forced-bounce paths. */
     if (dev_count >= 2) {
+        if (run_ordered_destination_copy(0, 0)) return 1;
+        if (run_ordered_destination_copy(1, 0)) return 1;
         if (run_one(2, 0)) return 1;
         if (run_copy3(2, 0)) return 1;
         if (run_attention_output_tp_peer_read()) return 1;
