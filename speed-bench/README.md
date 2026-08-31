@@ -3652,15 +3652,42 @@ records and paired breadcrumbs support exactly these outcomes:
 - the arm completes: the fence changed the failure behavior and is a timing/
   ordering perturbation, not a production fix.
 
-Compare it directly against the no-fence async-completion arm. The GPU
-compute/copy configuration is otherwise identical, and both arms retain the
-same mapped-host marker kernel and event record. The fence arm uniquely adds
-the event synchronization, marker validation, and paired per-call
-`fprintf`/`fflush` writes. All of those perturb timing, so survival of the fence
-arm cannot be attributed specifically to the CUDA event fence alone.
+That bracket has now produced the evidence needed from its first arm. The
+pre-gather-fence run recorded 32 completed pair-0 result-gather returns. On call
+33, the first reported error moved to the activation H2D for the next partner
+projection. This proves that the previous result-gather return completed; it
+does **not** prove that activation H2D caused the endpoint loss. The CUDA error
+may still have originated in earlier asynchronous device work.
 
-Run it after a clean boot and use a fresh output directory. `SKIP_BUILD=0` is
-mandatory so the CUDA changes and the fixed CUDA/P2P preflight are both present:
+There is no reason to resume that directory or rerun its no-fence control. The
+next diagnostic is one fresh `attention-q8-activation-fence` arm. It preserves
+the just-tested pair-0 attention/Q8 host-bounce transport, asynchronous marker,
+and pre-gather fence, and adds the activation boundary immediately before each
+pair-0 activation H2D. `ONE_SHOT=1` requires `RESUME=0`, exactly one variant,
+`REPEATS=1`, `CREATE_ARCHIVE=1`, and nonexistent output-directory and sibling
+archive paths. The activation-fence variant refuses to run outside this mode.
+It suppresses resume guidance. Watcher events are published by writing and
+syncing a temporary marker, atomically renaming it, syncing the containing
+directory, and then publishing a similarly durable `ready` handshake only
+after pidfd-bound PID signaling has completed. The main monitor also bounds
+watcher and telemetry failure and the entire case with
+`ONE_SHOT_TIMEOUT_SECONDS`. If the case exits, the parent publishes a durable
+child-exit notice. The watcher
+captures immutable process start times for the case and both monitoring
+helpers. Every one-shot TERM/KILL uses a pidfd bound to the validated process,
+and the watcher never signals after observing a durable child-exit notice. If
+the CUDA process remains uninterruptible after bounded TERM/KILL, post-health
+probing is skipped and the already durable evidence is archived by the EXIT
+trap. The harness never signals the shell or its process group.
+
+This arm adds device-wide synchronization, exact marker validation, and host
+logging. Each changes scheduling and timing. Whether the failure surfaces at
+the synchronization boundary, during activation-copy setup, or in the entered
+H2D API is evidence about where CUDA first reports the fault—not proof of the
+underlying hardware or software root cause.
+
+Run this single arm after a clean boot. `SKIP_BUILD=0` is mandatory so the CUDA
+changes and the fixed CUDA/P2P preflight are both present:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -3679,14 +3706,16 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 unset CUDA_VISIBLE_DEVICES
 unset SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-pre-gather-fence-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-activation-fence-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-q8-pre-gather-fence,attention-q8-async-completion \
+VARIANTS=attention-q8-activation-fence \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
@@ -3698,15 +3727,10 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-The pre-gather-fence arm runs first. If either arm causes device loss, reboot
-and resume the same directory with the same two-variant order and `RESUME=1`;
-do not create a replacement directory for that comparison. The no-fence
-async-completion control explicitly rejects every pre-gather-fence enable,
-armed or returned breadcrumb, checkpoint, or failure record, so inherited
-diagnostic state cannot silently contaminate the control. The fence arm
-requires the exact pair-0 enable record, rejects pair-1 fence records, requires
-contiguous paired armed/returned sequences, and validates its sparse
-checkpoints and final counter summary before accepting a completed run.
+Do not resume or append a control arm after device loss. Return the archive
+created from this fresh one-shot directory. The existing pre-gather archive is
+the predecessor evidence; this is a serial boundary refinement, not a new
+multi-stage A/B.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

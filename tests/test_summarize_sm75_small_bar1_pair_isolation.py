@@ -339,6 +339,178 @@ def q8_pre_gather_summary(sequence: int) -> str:
     )
 
 
+Q8_ACTIVATION_TAG = 1 << 63
+
+
+def q8_activation_identity(
+        *, home_device: int = 0, partner_device: int = 1,
+        binding_label: str = "tensor:blk.0.attn_output_b.weight") -> str:
+    return (
+        f"home_tier=0 home_device={home_device} partner_tier=2 "
+        f"partner_device={partner_device} bytes=8388608 tokens=512 "
+        f"in=8192 out=4096 binding_label={binding_label} "
+        "passed_label=attn_output_b weight_offset=141234898176"
+    )
+
+
+def q8_activation_marker(sequence: int) -> tuple[int, int]:
+    marker = sequence | Q8_ACTIVATION_TAG
+    return marker, (~marker) & ((1 << 64) - 1)
+
+
+def q8_activation_enabled() -> str:
+    return (
+        "ds4: CUDA q8 partner pre-activation fence audit enabled: "
+        "logical_pairs=0 boundary=post-source-d2h-destination-sync "
+        "marker=destination-default-stream-tagged-exact-before-activation-h2d\n"
+    )
+
+
+def q8_activation_armed(sequence: int, **identity: object) -> str:
+    marker, complement = q8_activation_marker(sequence)
+    return (
+        "ds4: CUDA q8 partner pre-activation armed "
+        f"current_sequence={sequence} marker_sequence={marker} "
+        f"marker_complement={complement} activation_d2h_status=complete "
+        "destination_sync_status=complete " +
+        q8_activation_identity(**identity) + "\n"
+    )
+
+
+def q8_activation_returned(sequence: int, **identity: object) -> str:
+    return (
+        "ds4: CUDA q8 partner pre-activation returned "
+        f"current_sequence={sequence} activation_h2d_status=success " +
+        q8_activation_identity(**identity) + "\n"
+    )
+
+
+def q8_activation_checkpoint(sequence: int, **identity: object) -> str:
+    marker, complement = q8_activation_marker(sequence)
+    return (
+        "ds4: CUDA q8 partner pre-activation fence checkpoint "
+        "event=marker-confirmed stage=pre-activation-h2d "
+        f"current_sequence={sequence} marker_sequence={marker} "
+        f"marker_complement={complement} marker_matches=yes cuda_status=complete "
+        "destination_sync_status=complete activation_d2h_attempted=yes "
+        "activation_d2h_completed=yes activation_h2d_attempted=no "
+        "activation_h2d_completed=no interpretation=activation-d2h-and-"
+        "destination-stream-confirmed-before-h2d "
+        f"attempted={sequence} confirmed={sequence} returned={sequence - 1} "
+        "failed=0 " + q8_activation_identity(**identity) + "\n"
+    )
+
+
+def q8_activation_completed_calls(count: int) -> str:
+    lines: list[str] = []
+    for sequence in range(1, count + 1):
+        lines.append(q8_activation_armed(sequence))
+        if sequence == 1 or sequence % 64 == 0:
+            lines.append(q8_activation_checkpoint(sequence))
+        lines.append(q8_activation_returned(sequence))
+    return "".join(lines)
+
+
+def q8_activation_failure(sequence: int, event: str, **identity: object) -> str:
+    specs = {
+        "bounce-free-failed": (
+            "activation-staging", "cudaErrorUnknown", "not-attempted",
+            "no", "no", "no", "no",
+            "failure-surfaced-by-bounce-free-before-activation-d2h", False,
+        ),
+        "activation-d2h-failed": (
+            "activation-d2h", "cudaErrorUnknown", "not-attempted",
+            "yes", "no", "no", "no",
+            "failure-surfaced-by-activation-d2h", False,
+        ),
+        "destination-switch-failed": (
+            "pre-activation-h2d", "cudaSetDevice-failed", "not-attempted",
+            "yes", "yes", "no", "no",
+            "failure-after-activation-d2h-before-destination-sync", False,
+        ),
+        "destination-sync-failed": (
+            "pre-activation-h2d", "cudaErrorUnknown", "failed",
+            "yes", "yes", "no", "no",
+            "failure-surfaced-by-pre-h2d-destination-device-sync", False,
+        ),
+        "marker-launch-failed": (
+            "pre-activation-marker", "cudaErrorUnknown", "complete",
+            "yes", "yes", "no", "no",
+            "failure-surfaced-by-pre-h2d-marker-launch", False,
+        ),
+        "activation-h2d-failed": (
+            "activation-h2d", "cudaErrorUnknown", "complete",
+            "yes", "yes", "yes", "no",
+            "failure-surfaced-by-activation-h2d-after-confirmed-boundary", True,
+        ),
+    }
+    (stage, cuda_status, sync_status, d2h_attempted, d2h_completed,
+     h2d_attempted, h2d_completed, interpretation, confirmed_marker) = specs[event]
+    if confirmed_marker:
+        marker, complement = q8_activation_marker(sequence)
+        marker_matches = "yes"
+        confirmed = sequence
+    else:
+        marker = complement = 0
+        marker_matches = "no"
+        confirmed = sequence - 1
+    return (
+        "ds4: CUDA q8 partner pre-activation fence failure "
+        f"event={event} stage={stage} current_sequence={sequence} "
+        f"marker_sequence={marker} marker_complement={complement} "
+        f"marker_matches={marker_matches} cuda_status={cuda_status} "
+        f"destination_sync_status={sync_status} "
+        f"activation_d2h_attempted={d2h_attempted} "
+        f"activation_d2h_completed={d2h_completed} "
+        f"activation_h2d_attempted={h2d_attempted} "
+        f"activation_h2d_completed={h2d_completed} "
+        f"interpretation={interpretation} attempted={sequence} "
+        f"confirmed={confirmed} returned={sequence - 1} failed=1 " +
+        q8_activation_identity(**identity) + "\n"
+    )
+
+
+def q8_activation_sequence_domain_exhausted() -> str:
+    sequence = Q8_ACTIVATION_TAG
+    return (
+        "ds4: CUDA q8 partner pre-activation fence failure "
+        "event=state-invalid stage=pre-activation-marker "
+        f"current_sequence={sequence} marker_sequence=0 marker_complement=0 "
+        "marker_matches=no cuda_status=sequence-domain-exhausted "
+        "destination_sync_status=not-attempted "
+        "activation_d2h_attempted=no activation_d2h_completed=no "
+        "activation_h2d_attempted=no activation_h2d_completed=no "
+        "interpretation=failure-before-activation-d2h "
+        f"attempted={sequence} confirmed={sequence - 1} "
+        f"returned={sequence - 1} failed=1 " +
+        q8_activation_identity() + "\n"
+    )
+
+
+def q8_activation_summary(
+        sequence: int, *, confirmed: int | None = None,
+        returned: int | None = None, failed: int = 0,
+        last_sequence: int | None = None, shared: int = 777,
+        shared_complement: int | None = None,
+        partners_synchronized: str = "yes") -> str:
+    # A later untagged post-compute marker may legitimately own the shared slot.
+    confirmed = sequence if confirmed is None else confirmed
+    returned = sequence if returned is None else returned
+    last_sequence = confirmed if last_sequence is None else last_sequence
+    shared_complement = (
+        (~shared) & ((1 << 64) - 1)
+        if shared_complement is None else shared_complement
+    )
+    return (
+        "ds4: CUDA q8 partner pre-activation fence summary "
+        f"home_tier=0 partner_tier=2 attempted={sequence} confirmed={confirmed} "
+        f"returned={returned} failed={failed} last_sequence={last_sequence} "
+        f"shared_slot_sequence={shared} "
+        f"shared_slot_complement={shared_complement} "
+        f"partners_synchronized={partners_synchronized}\n"
+    )
+
+
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3874,6 +4046,337 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             report = (root / "summary.md").read_text()
             self.assertIn("production control has not run yet", report)
             self.assertIn("requires the final control", report)
+
+    def _summarize_activation(
+            self, log_text: str, source_status: str = "failed"
+    ) -> tuple[dict[str, str], str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-activation-fence"
+            if source_status == "started-only":
+                (production / f"{stem}.started").write_text(
+                    "variant=attention-q8-activation-fence\nrepeat=1\n"
+                )
+            else:
+                exit_status = 0 if source_status == "passed" else 124
+                (production / f"{stem}.result").write_text(
+                    "variant=attention-q8-activation-fence\n"
+                    f"status={source_status}\nexit_status={exit_status}\n"
+                )
+            (production / f"{stem}.log").write_text(log_text)
+            if source_status == "passed":
+                write_healthy_post(root, stem)
+            else:
+                write_lost_watch(root, stem, "1@00000000:03:00.0")
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            return row, (root / "summary.md").read_text()
+
+    def test_validates_complete_q8_pre_activation_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "activation.log"
+            log.write_text(
+                q8_activation_enabled() + q8_activation_completed_calls(70) +
+                q8_activation_summary(70)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-pre-activation-fence-log", str(log),
+            ], check=True)
+        row, report = self._summarize_activation(
+            q8_activation_enabled() + q8_activation_completed_calls(2) +
+            q8_activation_summary(2),
+            "passed",
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "completed-all-activation-h2d-returned",
+        )
+        self.assertEqual(row["q8_pre_activation_fence_attempted"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_returned"], "2")
+        self.assertIn("shared marker slot is later reused", report)
+        self.assertIn("survival does not clear", report)
+
+    def test_classifies_activation_failure_boundaries_without_causal_claims(
+            self) -> None:
+        cases = {
+            "bounce-free-failed": (
+                "activation-source-or-staging-setup-failed",
+                "source staging/setup",
+            ),
+            "activation-d2h-failed": (
+                "activation-source-d2h-failed", "surface earlier source-side work",
+            ),
+            "destination-switch-failed": (
+                "activation-destination-switch-or-setup-failed",
+                "destination switch/setup",
+            ),
+            "destination-sync-failed": (
+                "activation-pre-h2d-device-sync-failed",
+                "surfacing prior destination work or a poisoned context",
+            ),
+            "marker-launch-failed": (
+                "activation-marker-channel-failure",
+                "observation-channel boundary",
+            ),
+            "activation-h2d-failed": (
+                "activation-fence-confirmed-h2d-failed",
+                "does not prove that H2D initiated",
+            ),
+        }
+        for event, (classification, wording) in cases.items():
+            with self.subTest(event=event):
+                body = q8_activation_completed_calls(1)
+                if event == "activation-h2d-failed":
+                    body += q8_activation_armed(2)
+                body += q8_activation_failure(2, event)
+                row, report = self._summarize_activation(
+                    q8_activation_enabled() + body
+                )
+                self.assertEqual(
+                    row["q8_pre_activation_fence_classification"], classification
+                )
+                self.assertIn(wording, report)
+                self.assertIn("current_sequence=2", row[
+                    "q8_pre_activation_fence_last_failure"
+                ])
+
+    def test_classifies_durable_unreturned_activation_for_device_loss_statuses(
+            self) -> None:
+        cases = (
+            ("failed", "failed-device-loss"),
+            ("interrupted-prior-run", "interrupted-prior-run-device-loss"),
+            ("started-only", "interrupted-no-result-device-loss"),
+        )
+        log = (
+            q8_activation_enabled() + q8_activation_armed(1) +
+            q8_activation_checkpoint(1)
+        )
+        for source, expected_status in cases:
+            with self.subTest(status=source):
+                row, report = self._summarize_activation(log, source)
+                self.assertEqual(row["status"], expected_status)
+                self.assertEqual(
+                    row["q8_pre_activation_fence_classification"],
+                    "activation-fence-confirmed-h2d-return-not-observed-"
+                    "trailing-checkpoint",
+                )
+                self.assertIn("same-sequence durable sparse checkpoint", report)
+                self.assertIn("does not prove H2D failed or caused", report)
+
+    def test_classifies_returned_activation_then_later_device_loss(self) -> None:
+        row, report = self._summarize_activation(
+            q8_activation_enabled() + q8_activation_completed_calls(2),
+            "started-only",
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-h2d-returned-subsequent-locus-unresolved",
+        )
+        self.assertEqual(row["q8_pre_activation_fence_armed_count"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_returned_count"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_attempted"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_confirmed"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_returned"], "2")
+        self.assertIn("synchronous activation H2D returned successfully", report)
+        self.assertIn("subsequent locus unresolved", report)
+
+    def test_uses_latest_breadcrumb_counts_after_sparse_activation_checkpoint(
+            self) -> None:
+        row, _ = self._summarize_activation(
+            q8_activation_enabled() + q8_activation_completed_calls(2) +
+            q8_activation_armed(3),
+            "started-only",
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-fence-confirmed-h2d-return-not-observed",
+        )
+        self.assertEqual(row["q8_pre_activation_fence_attempted"], "3")
+        self.assertEqual(row["q8_pre_activation_fence_confirmed"], "3")
+        self.assertEqual(row["q8_pre_activation_fence_returned"], "2")
+
+    def test_classifies_all_returned_summary_before_later_device_loss(
+            self) -> None:
+        for synchronized in ("yes", "no"):
+            with self.subTest(partners_synchronized=synchronized):
+                summary = q8_activation_summary(
+                    2, partners_synchronized=synchronized,
+                    # Without a successful cleanup sync, the inventory sample
+                    # need not be an internally current marker pair.
+                    shared_complement=(777 if synchronized == "no" else None),
+                )
+                row, report = self._summarize_activation(
+                    q8_activation_enabled() + q8_activation_completed_calls(2) +
+                    summary,
+                    "started-only",
+                )
+                self.assertEqual(
+                    row["q8_pre_activation_fence_classification"],
+                    "activation-h2d-returned-subsequent-locus-unresolved",
+                )
+                self.assertEqual(row["q8_pre_activation_fence_attempted"], "2")
+                self.assertEqual(row["q8_pre_activation_fence_confirmed"], "2")
+                self.assertEqual(row["q8_pre_activation_fence_returned"], "2")
+                self.assertIn("does not retract the earlier return evidence", report)
+                self.assertIn("or identify the reset cause", report)
+
+    def test_accepts_unsynchronized_cleanup_summary_after_unreturned_arm(
+            self) -> None:
+        body = (
+            q8_activation_enabled() + q8_activation_armed(1) +
+            q8_activation_checkpoint(1) +
+            q8_activation_summary(
+                1, returned=0, partners_synchronized="no",
+                shared_complement=777,
+            )
+        )
+        row, report = self._summarize_activation(body, "started-only")
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-fence-confirmed-h2d-return-not-observed-"
+            "trailing-checkpoint",
+        )
+        self.assertEqual(row["q8_pre_activation_fence_attempted"], "1")
+        self.assertEqual(row["q8_pre_activation_fence_returned"], "0")
+        self.assertIn("does not prove H2D failed or caused", report)
+
+    def test_accepts_explicit_activation_sequence_domain_exhaustion(self) -> None:
+        row, report = self._summarize_activation(
+            q8_activation_enabled() + q8_activation_sequence_domain_exhausted()
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-audit-state-failed",
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_attempted"], str(Q8_ACTIVATION_TAG)
+        )
+        self.assertIn("software diagnostic evidence", report)
+
+    def test_validates_failure_teardown_summary_consistency(self) -> None:
+        first_call_failure = (
+            q8_activation_enabled() +
+            q8_activation_failure(1, "bounce-free-failed") +
+            q8_activation_summary(
+                1, confirmed=0, returned=0, failed=1,
+                shared=0, shared_complement=0,
+            )
+        )
+        row, _ = self._summarize_activation(first_call_failure)
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-source-or-staging-setup-failed",
+        )
+
+        calls_and_failure = (
+            q8_activation_enabled() + q8_activation_completed_calls(1) +
+            q8_activation_failure(2, "activation-d2h-failed")
+        )
+        consistent = q8_activation_summary(
+            2, confirmed=1, returned=1, failed=1,
+            partners_synchronized="no", shared_complement=777,
+        )
+        row, _ = self._summarize_activation(calls_and_failure + consistent)
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "activation-source-d2h-failed",
+        )
+        self.assertEqual(row["q8_pre_activation_fence_attempted"], "2")
+        self.assertEqual(row["q8_pre_activation_fence_confirmed"], "1")
+        self.assertEqual(row["q8_pre_activation_fence_returned"], "1")
+        self.assertEqual(row["q8_pre_activation_fence_failed"], "1")
+
+        contradictory = q8_activation_summary(1)
+        row, report = self._summarize_activation(
+            calls_and_failure + contradictory
+        )
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "invalid-activation-fence-record",
+        )
+        self.assertIn("invalid for boundary inference", report)
+
+        reordered = (
+            q8_activation_enabled() + q8_activation_completed_calls(1) +
+            consistent + q8_activation_failure(2, "activation-d2h-failed")
+        )
+        row, _ = self._summarize_activation(reordered)
+        self.assertEqual(
+            row["q8_pre_activation_fence_classification"],
+            "invalid-activation-fence-record",
+        )
+
+    def test_rejects_malformed_activation_sequences_tags_and_bindings(self) -> None:
+        marker, _ = q8_activation_marker(1)
+        complete = (
+            q8_activation_enabled() + q8_activation_completed_calls(1) +
+            q8_activation_summary(1)
+        )
+        cases = {
+            "tag": complete.replace(
+                f"marker_sequence={marker}", "marker_sequence=1", 1
+            ),
+            "physical-pair": complete.replace(
+                "home_device=0", "home_device=3", 1
+            ),
+            "binding": complete.replace(
+                "binding_label=tensor:blk.0.attn_output_b.weight",
+                "binding_label=tensor:blk.1.attn_output_b.weight",
+                1,
+            ),
+            "enable": complete.replace("tagged-exact", "exact", 1),
+            "duplicate-enable": q8_activation_enabled() + complete,
+            "enable-after-evidence": (
+                q8_activation_completed_calls(1) + q8_activation_summary(1) +
+                q8_activation_enabled()
+            ),
+            "summary-before-evidence": (
+                q8_activation_enabled() + q8_activation_summary(1) +
+                q8_activation_completed_calls(1)
+            ),
+            "shared-complement": complete.replace(
+                "shared_slot_complement=18446744073709550838",
+                "shared_slot_complement=777",
+            ),
+            "unsynchronized-complete": complete.replace(
+                "partners_synchronized=yes", "partners_synchronized=no",
+            ),
+            "order": (
+                q8_activation_enabled() + q8_activation_armed(1) +
+                q8_activation_armed(2) + q8_activation_returned(1) +
+                q8_activation_returned(2) + q8_activation_summary(2)
+            ),
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                log = pathlib.Path(temporary) / "activation.log"
+                log.write_text(body)
+                completed = subprocess.run([
+                    sys.executable, str(SUMMARIZER),
+                    "--validate-q8-pre-activation-fence-log", str(log),
+                ], capture_output=True, text=True)
+                self.assertNotEqual(completed.returncode, 0)
+
+    def test_rejects_activation_checkpoint_metadata_mismatch(self) -> None:
+        body = (
+            q8_activation_enabled() + q8_activation_armed(1) +
+            q8_activation_checkpoint(
+                1, binding_label="tensor:blk.1.attn_output_b.weight"
+            ) + q8_activation_returned(1) + q8_activation_summary(1)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "activation.log"
+            log.write_text(body)
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-pre-activation-fence-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("activation-checkpoint-binding-mismatch", completed.stderr)
 
 
 if __name__ == "__main__":

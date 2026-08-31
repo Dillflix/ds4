@@ -9,6 +9,7 @@ current 22/21 four-GPU production path at PP32768/TG256.
 
 Required environment:
   MODEL=/absolute/path/to/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
+  CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 Optional environment:
   PROMPT=...                         default: speed-bench/promessi_sposi.txt
@@ -21,6 +22,7 @@ Optional environment:
   VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
   VARIANTS=attention-q8-async-completion  global pair-0 post-Q8 positive markers
   VARIANTS=attention-q8-pre-gather-fence  confirm pair-0 Q8 completion before result D2H
+  VARIANTS=attention-q8-activation-fence  also fence before pair-0 activation H2D
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
   VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
@@ -41,12 +43,15 @@ Optional environment:
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   RESUME=0
+  ONE_SHOT=0                       require one fresh, non-resumable arm
+  ONE_SHOT_TIMEOUT_SECONDS=900     bound the one-shot case monitor
   SMALL_BAR1_ISOLATION_DIR=/absolute/output/directory
 
 The transport/scheduling diagnostic arms run before the known full-production
 reproducer. They preserve arithmetic work but can change its timing envelope.
-For the pre-gather completion bracket, use the fixed comparison order
-VARIANTS=attention-q8-pre-gather-fence,attention-q8-async-completion.
+The completed historical pre-gather bracket used the fixed order
+VARIANTS=attention-q8-pre-gather-fence,attention-q8-async-completion; do not
+rerun that comparison for the activation-fence follow-up.
 The fence arm emits a compact fflush-only `pre-gather armed` breadcrumb per
 confirmed call immediately before result gather:
   ds4: CUDA q8 partner pre-gather armed current_sequence=N marker_sequence=N
@@ -65,10 +70,31 @@ armed, and returned records as contamination.
 Structured failures record D2H and H2D attempt/completion separately. After a
 completed D2H, H2D not attempted isolates destination switch/setup; H2D
 attempted but not completed identifies an entered-but-failed H2D API.
-If a GPU loss interrupts the shell, reboot, set RESUME=1 and reuse the printed
-SMALL_BAR1_ISOLATION_DIR. The incomplete arm is retained without silently
-retrying it. It counts as a failed arm only when a durable lost-device watch
-record or an unhealthy post-run GPU snapshot corroborates device loss.
+The supplied pre-gather-fence evidence returned 32 result gathers. Call 33
+first surfaced the error at activation H2D. The next diagnostic is a single
+fresh attention-q8-activation-fence arm; no resume or control rerun is needed.
+Set ONE_SHOT=1 with RESUME=0, exactly one variant and REPEATS=1. One-shot mode
+requires CREATE_ARCHIVE=1, a fresh nonexistent output directory and archive
+path, never prints resume guidance, and its EXIT trap still archives
+interrupted device-loss evidence. The activation-fence variant requires this
+mode. The case monitor is bounded by ONE_SHOT_TIMEOUT_SECONDS. Watch records
+become visible only through an atomic marker-plus-ready handshake after
+pidfd-bound PID signaling; watcher/telemetry death also becomes durable
+evidence. An
+uninterruptible CUDA PID receives bounded TERM/KILL cleanup instead of leaving
+the shell blocked forever in wait(1).
+The harness captures immutable process start times for the case and both
+monitoring helpers. Every one-shot TERM/KILL is delivered through a pidfd bound
+to the validated process, and the watcher never signals after a durable
+child-exit notice.
+The activation arm adds device-wide synchronization, marker validation and
+host logging. Those perturb timing, and a surfaced API boundary is not proof
+of the root cause.
+For ordinary multi-arm runs only, if GPU loss interrupts the shell, reboot,
+set RESUME=1 and reuse the printed SMALL_BAR1_ISOLATION_DIR. The incomplete arm
+is retained without silently retrying it. It counts as a failed arm only when
+a durable lost-device watch record or an unhealthy post-run GPU snapshot
+corroborates device loss.
 EOF
 }
 
@@ -122,6 +148,8 @@ POST_CASE_SETTLE_SECONDS=${POST_CASE_SETTLE_SECONDS:-5}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 RESUME=${RESUME:-0}
+ONE_SHOT=${ONE_SHOT:-0}
+ONE_SHOT_TIMEOUT_SECONDS=${ONE_SHOT_TIMEOUT_SECONDS:-900}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${SMALL_BAR1_ISOLATION_DIR:-$repo_dir/sm75-small-bar1-pair-isolation-$stamp}
 
@@ -145,7 +173,8 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "POST_CASE_SETTLE_SECONDS:$POST_CASE_SETTLE_SECONDS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
-            "RESUME:$RESUME"; do
+            "RESUME:$RESUME" "ONE_SHOT:$ONE_SHOT" \
+            "ONE_SHOT_TIMEOUT_SECONDS:$ONE_SHOT_TIMEOUT_SECONDS"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -161,14 +190,17 @@ done
    ATTN_ROW_BOUNDARY_POS == 512 &&
    REPEATS >= 1 && REQUIRED_POWER_LIMIT_W == 250 &&
    TELEMETRY_INTERVAL_MS >= 100 &&
-   POST_CASE_SETTLE_SECONDS <= 60 )) ||
+   POST_CASE_SETTLE_SECONDS <= 60 &&
+   ONE_SHOT_TIMEOUT_SECONDS >= 60 && ONE_SHOT_TIMEOUT_SECONDS <= 3600 )) ||
     die "invalid fixed production isolation configuration"
-for flag in SKIP_BUILD CREATE_ARCHIVE RESUME; do
+for flag in SKIP_BUILD CREATE_ARCHIVE RESUME ONE_SHOT; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical IDs remain stable"
+[[ ${CUDA_DEVICE_ORDER:-} == PCI_BUS_ID ]] ||
+    die "CUDA_DEVICE_ORDER=PCI_BUS_ID is required for strict CUDA/nvidia-smi identity"
 
 IFS=, read -r -a variants <<<"$VARIANTS"
 (( ${#variants[@]} >= 1 )) || die "VARIANTS selected no arms"
@@ -176,17 +208,35 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
 done
+if [[ $ONE_SHOT == 1 ]]; then
+    [[ $RESUME == 0 ]] || die "ONE_SHOT=1 requires RESUME=0"
+    [[ $CREATE_ARCHIVE == 1 ]] || die "ONE_SHOT=1 requires CREATE_ARCHIVE=1"
+    (( ${#variants[@]} == 1 )) ||
+        die "ONE_SHOT=1 requires exactly one variant"
+    (( REPEATS == 1 )) || die "ONE_SHOT=1 requires REPEATS=1"
+    python3 - <<'PY' >/dev/null 2>&1 ||
+import os
+import signal
+assert callable(getattr(os, "pidfd_open", None))
+assert callable(getattr(signal, "pidfd_send_signal", None))
+PY
+        die "ONE_SHOT=1 requires Python os.pidfd_open and signal.pidfd_send_signal"
+fi
+if [[ -n ${seen_variants[attention-q8-activation-fence]:-} &&
+      $ONE_SHOT != 1 ]]; then
+    die "attention-q8-activation-fence requires ONE_SHOT=1"
+fi
 if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
     die "attention copy diagnostic arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
 fi
@@ -200,7 +250,11 @@ git diff --quiet && git diff --cached --quiet ||
     die "tracked source changes are present; test an exact committed tree"
 
 if [[ $RESUME == 0 ]]; then
-    [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
+    if [[ $CREATE_ARCHIVE == 1 && -e $OUTPUT_DIR.tar.gz ]]; then
+        die "archive path already exists: $OUTPUT_DIR.tar.gz"
+    fi
+    mkdir -- "$OUTPUT_DIR" 2>/dev/null ||
+        die "output path already exists or cannot be created: $OUTPUT_DIR"
     mkdir -p "$OUTPUT_DIR"/{health,production,provenance,telemetry}
 else
     [[ -d $OUTPUT_DIR ]] || die "resume directory not found: $OUTPUT_DIR"
@@ -210,8 +264,12 @@ else
 fi
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 printf 'Diagnostic directory: %s\n' "$OUTPUT_DIR"
-printf 'Resume with: export SMALL_BAR1_ISOLATION_DIR=%q; RESUME=1 ...\n' \
-    "$OUTPUT_DIR"
+if [[ $ONE_SHOT == 0 ]]; then
+    printf 'Resume with: export SMALL_BAR1_ISOLATION_DIR=%q; RESUME=1 ...\n' \
+        "$OUTPUT_DIR"
+else
+    printf 'One-shot mode: no resume or control rerun; interrupted evidence will be archived.\n'
+fi
 if [[ $RESUME == 1 ]]; then
     [[ -s $OUTPUT_DIR/manifest.txt ]] ||
         die "resume manifest is missing or empty"
@@ -257,37 +315,180 @@ fi
 
 phase=initialization
 telemetry_pid=
+telemetry_identity=
 telemetry_watch_pid=
+telemetry_watch_identity=
 active_case_pid=
+active_case_identity=
+pid_is_live() {
+    local pid=$1 state=
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+    if [[ -r /proc/$pid/stat ]]; then
+        state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+        [[ $state != Z ]] || return 1
+    fi
+}
+process_start_time() {
+    local pid=$1 stat rest
+    local -a stat_fields
+    [[ -r /proc/$pid/stat ]] || return 1
+    stat=$(<"/proc/$pid/stat")
+    rest=${stat##*) }
+    read -r -a stat_fields <<<"$rest"
+    # /proc/PID/stat field 22 (starttime), after removing fields 1-2.
+    [[ ${stat_fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${stat_fields[19]}"
+}
+pid_matches_identity() {
+    local pid=$1 expected=$2 actual
+    [[ -n $expected ]] || return 1
+    pid_is_live "$pid" || return 1
+    actual=$(process_start_time "$pid" 2>/dev/null) || return 1
+    [[ $actual == "$expected" ]]
+}
+capture_process_identity() {
+    local pid=$1 identity
+    for _ in {1..50}; do
+        if identity=$(process_start_time "$pid" 2>/dev/null) &&
+                pid_matches_identity "$pid" "$identity"; then
+            printf '%s\n' "$identity"
+            return 0
+        fi
+        pid_is_live "$pid" || return 2
+        sleep 0.01
+    done
+    return 1
+}
+signal_bound_process() {
+    local pid=$1 identity=$2 signal_name=$3
+    if [[ $ONE_SHOT != 1 ]]; then
+        kill "-$signal_name" "$pid" >/dev/null 2>&1
+        return
+    fi
+    if [[ -z $identity ]]; then
+        printf 'error: refusing pidfd signal %s for PID %s; immutable identity was not captured and the process may still be live\n' \
+            "$signal_name" "$pid" >&2
+        return 1
+    fi
+    python3 - "$pid" "$identity" "$signal_name" <<'PY'
+import os
+import signal
+import sys
+
+pid = int(sys.argv[1])
+expected = sys.argv[2]
+sig = getattr(signal, "SIG" + sys.argv[3])
+try:
+    fd = os.pidfd_open(pid, 0)
+except (ProcessLookupError, PermissionError):
+    raise SystemExit(1)
+try:
+    with open(f"/proc/{pid}/stat", "r", encoding="ascii") as stream:
+        rest = stream.read().rsplit(") ", 1)[1].split()
+    if rest[0] == "Z" or rest[19] != expected:
+        raise SystemExit(1)
+    signal.pidfd_send_signal(fd, sig, None, 0)
+finally:
+    os.close(fd)
+PY
+}
 stop_active_case() {
     if [[ -n ${active_case_pid:-} ]]; then
         local pid=$active_case_pid
-        active_case_pid=
-        kill -TERM "$pid" >/dev/null 2>&1 || true
+        if [[ -z ${active_case_identity:-} ]]; then
+            printf 'error: refusing bare-PID signal for case PID %s; immutable identity was not captured and the child may still be live\n' \
+                "$pid" >&2
+            return 1
+        fi
+        if ! pid_matches_identity "$pid" "$active_case_identity"; then
+            active_case_pid=
+            active_case_identity=
+            return 0
+        fi
+        signal_bound_process "$pid" "$active_case_identity" TERM || true
         for _ in {1..20}; do
-            kill -0 "$pid" >/dev/null 2>&1 || return 0
+            if [[ -n ${active_case_identity:-} ]] &&
+                    ! pid_matches_identity "$pid" "$active_case_identity"; then
+                active_case_pid=
+                active_case_identity=
+                return 0
+            fi
+            if [[ -r /proc/$pid/stat ]] &&
+                    [[ $(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) == Z ]]; then
+                wait "$pid" >/dev/null 2>&1 || true
+                active_case_pid=
+                active_case_identity=
+                return 0
+            fi
             sleep 0.1
         done
-        kill -KILL "$pid" >/dev/null 2>&1 || true
+        if pid_matches_identity "$pid" "$active_case_identity"; then
+            signal_bound_process "$pid" "$active_case_identity" KILL || true
+        fi
+        for _ in {1..20}; do
+            if [[ -n ${active_case_identity:-} ]] &&
+                    ! pid_matches_identity "$pid" "$active_case_identity"; then
+                active_case_pid=
+                active_case_identity=
+                return 0
+            fi
+            if [[ -r /proc/$pid/stat ]] &&
+                    [[ $(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) == Z ]]; then
+                wait "$pid" >/dev/null 2>&1 || true
+                active_case_pid=
+                active_case_identity=
+                return 0
+            fi
+            sleep 0.1
+        done
+        return 1
     fi
+    return 0
 }
 stop_telemetry() {
     if [[ -n ${telemetry_watch_pid:-} ]]; then
         local watch_pid=$telemetry_watch_pid
+        local watch_identity=$telemetry_watch_identity
         telemetry_watch_pid=
-        kill "$watch_pid" >/dev/null 2>&1 || true
-        wait "$watch_pid" >/dev/null 2>&1 || true
+        telemetry_watch_identity=
+        signal_bound_process "$watch_pid" "$watch_identity" TERM || true
+        if [[ $ONE_SHOT == 1 ]]; then
+            for _ in {1..20}; do
+                pid_is_live "$watch_pid" || break
+                sleep 0.05
+            done
+            if pid_is_live "$watch_pid"; then
+                signal_bound_process "$watch_pid" "$watch_identity" KILL || true
+                for _ in {1..20}; do
+                    pid_is_live "$watch_pid" || break
+                    sleep 0.05
+                done
+            fi
+            pid_is_live "$watch_pid" ||
+                wait "$watch_pid" >/dev/null 2>&1 || true
+        else
+            wait "$watch_pid" >/dev/null 2>&1 || true
+        fi
     fi
     for name in telemetry_pid; do
         local pid=${!name:-}
+        local identity=$telemetry_identity
         [[ -n $pid ]] || continue
         printf -v "$name" '%s' ''
-        kill "$pid" >/dev/null 2>&1 || true
+        telemetry_identity=
+        signal_bound_process "$pid" "$identity" TERM || true
         for _ in {1..20}; do
-            kill -0 "$pid" >/dev/null 2>&1 || break
+            pid_is_live "$pid" || break
             sleep 0.05
         done
-        kill -KILL "$pid" >/dev/null 2>&1 || true
+        if pid_is_live "$pid"; then
+            signal_bound_process "$pid" "$identity" KILL || true
+            for _ in {1..20}; do
+                pid_is_live "$pid" || break
+                sleep 0.05
+            done
+        fi
+        pid_is_live "$pid" || wait "$pid" >/dev/null 2>&1 || true
     done
 }
 write_summary() {
@@ -297,8 +498,8 @@ write_summary() {
 finish() {
     status=$?
     trap - EXIT INT TERM HUP
-    stop_active_case
     stop_telemetry
+    stop_active_case || true
     write_summary
     printf 'state=%s\nexit_status=%s\nlast_phase=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
@@ -307,9 +508,15 @@ finish() {
     if [[ $CREATE_ARCHIVE == 1 ]]; then
         archive="$OUTPUT_DIR.tar.gz"
         partial="$archive.partial.$$"
-        if tar -C "$(dirname "$OUTPUT_DIR")" -czf "$partial" \
+        if [[ -e $archive ]]; then
+            status=1
+            printf 'error: refusing to overwrite archive %s\n' "$archive" >&2
+        elif tar -C "$(dirname "$OUTPUT_DIR")" -czf "$partial" \
                 "$(basename "$OUTPUT_DIR")" && [[ -s $partial ]] &&
-                tar -tzf "$partial" >/dev/null && mv -f -- "$partial" "$archive"; then
+                tar -tzf "$partial" >/dev/null && mv -n -- "$partial" "$archive" &&
+                [[ ! -e $partial && -s $archive ]] &&
+                (sync "$archive" 2>/dev/null || sync) &&
+                (sync -f "$(dirname "$archive")" 2>/dev/null || sync); then
             printf 'Archive to return: %s\n' "$archive"
         else
             status=1
@@ -338,6 +545,57 @@ validate_power_limits() {
         awk -v actual="$limit" -v required="$REQUIRED_POWER_LIMIT_W" \
             'BEGIN {exit !(actual + 0.0 == required + 0.0)}' || return 1
     done
+}
+
+capture_and_validate_cuda_identity() {
+    local suffix= cuda_inventory nvidia_inventory topology selected_inventory
+    if [[ $RESUME == 1 ]]; then suffix=-resume; fi
+    cuda_inventory="$OUTPUT_DIR/provenance/cuda-device-inventory${suffix}.csv"
+    nvidia_inventory="$OUTPUT_DIR/provenance/nvidia-device-inventory${suffix}.csv"
+    topology="$OUTPUT_DIR/provenance/nvidia-topology${suffix}.txt"
+    selected_inventory="$OUTPUT_DIR/provenance/selected-device-identity${suffix}.csv"
+
+    "${clean[@]}" ./tests/cuda_device_identity >"$cuda_inventory" || {
+        printf 'CUDA ordinal inventory failed\n' >&2
+        return 1
+    }
+    {
+        printf 'nvidia_index,pci_bus_id,uuid\n'
+        timeout --kill-after=5s 20s nvidia-smi \
+            --query-gpu=index,pci.bus_id,uuid \
+            --format=csv,noheader,nounits
+    } >"$nvidia_inventory" || {
+        printf 'nvidia-smi identity inventory failed\n' >&2
+        return 1
+    }
+    timeout --kill-after=5s 20s nvidia-smi topo -m >"$topology" || {
+        printf 'nvidia-smi topology inventory failed\n' >&2
+        return 1
+    }
+    python3 speed-bench/validate-cuda-device-identity.py \
+        --cuda-inventory "$cuda_inventory" \
+        --nvidia-inventory "$nvidia_inventory" \
+        --topology "$topology" \
+        --selected "$GPU_DEVICES" \
+        --output "$selected_inventory" || return 1
+
+    if [[ $RESUME == 1 ]]; then
+        cmp -s "$OUTPUT_DIR/provenance/cuda-device-inventory.csv" \
+            "$cuda_inventory" || {
+                printf 'resume CUDA ordinal identity differs from the original run\n' >&2
+                return 1
+            }
+        cmp -s "$OUTPUT_DIR/provenance/nvidia-device-inventory.csv" \
+            "$nvidia_inventory" || {
+                printf 'resume nvidia-smi identity differs from the original run\n' >&2
+                return 1
+            }
+        cmp -s "$OUTPUT_DIR/provenance/selected-device-identity.csv" \
+            "$selected_inventory" || {
+                printf 'resume selected CUDA/NVLink mapping differs from the original run\n' >&2
+                return 1
+            }
+    fi
 }
 
 assert_no_compute_processes() {
@@ -400,18 +658,113 @@ gpu_health_snapshot_is_unhealthy() {
         "$path"
 }
 
+publish_watch_marker() {
+    local marker=$1 status=$2 case_pid=$3 lost_devices=$4
+    local foreign_processes=$5 monitor_detail=${6:-none}
+    local marker_tmp ready ready_tmp marker_dir
+    marker_tmp="${marker}.tmp.$BASHPID.$RANDOM"
+    ready="${marker}.ready"
+    ready_tmp="${ready}.tmp.$BASHPID.$RANDOM"
+    marker_dir=$(dirname "$marker")
+    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\nmonitor_detail=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" "$case_pid" \
+        "$REQUIRED_POWER_LIMIT_W" "$lost_devices" "$foreign_processes" \
+        "$monitor_detail" >"$marker_tmp"
+    sync "$marker_tmp" 2>/dev/null || sync
+    if ! mv -n -- "$marker_tmp" "$marker" || [[ -e $marker_tmp ]]; then
+        rm -f -- "$marker_tmp"
+        [[ -s $marker ]] || return 1
+    fi
+    sync "$marker" 2>/dev/null || sync
+    sync -f "$marker_dir" 2>/dev/null || sync
+    printf 'marker=%s\nstate=critical-actions-complete\n' \
+        "$(basename "$marker")" >"$ready_tmp"
+    sync "$ready_tmp" 2>/dev/null || sync
+    if ! mv -n -- "$ready_tmp" "$ready" || [[ -e $ready_tmp ]]; then
+        rm -f -- "$ready_tmp"
+        [[ -s $ready ]] || return 1
+    fi
+    sync "$ready" 2>/dev/null || sync
+    sync -f "$marker_dir" 2>/dev/null || sync
+}
+
+publish_child_exit_notice() {
+    local marker=$1 case_pid=$2
+    local notice="${marker}.child-exit" ready="${marker}.child-exit.ready"
+    local notice_tmp="${notice}.tmp.$BASHPID.$RANDOM"
+    local ready_tmp="${ready}.tmp.$BASHPID.$RANDOM" marker_dir
+    marker_dir=$(dirname "$marker")
+    printf 'case_pid=%s\nstate=parent-observed-child-exit\n' \
+        "$case_pid" >"$notice_tmp"
+    sync "$notice_tmp" 2>/dev/null || sync
+    mv -n -- "$notice_tmp" "$notice" || true
+    rm -f -- "$notice_tmp"
+    [[ -s $notice ]] || return 1
+    sync "$notice" 2>/dev/null || sync
+    sync -f "$marker_dir" 2>/dev/null || sync
+    printf 'state=child-exit-notice-complete\n' >"$ready_tmp"
+    sync "$ready_tmp" 2>/dev/null || sync
+    mv -n -- "$ready_tmp" "$ready" || true
+    rm -f -- "$ready_tmp"
+    [[ -s $ready ]] || return 1
+    sync "$ready" 2>/dev/null || sync
+    sync -f "$marker_dir" 2>/dev/null || sync
+}
+
+watcher_stop_case_and_publish() {
+    local marker=$1 status=$2 case_pid=$3 lost_devices=$4
+    local foreign_processes=$5 case_identity=$6
+    local monitor_detail=${7:-watcher-detected}
+    local child_state=stopped
+    signal_bound_process "$telemetry_pid" "$telemetry_identity" TERM || true
+    if [[ -s ${marker}.child-exit && -s ${marker}.child-exit.ready ]]; then
+        child_state=parent-observed-child-exit-no-signal
+    elif pid_matches_identity "$case_pid" "$case_identity"; then
+        signal_bound_process "$case_pid" "$case_identity" TERM || true
+    else
+        child_state=identity-not-live-or-mismatched-no-signal
+    fi
+    for _ in {1..20}; do
+        pid_matches_identity "$case_pid" "$case_identity" || break
+        sleep 0.1
+    done
+    if [[ ! -s ${marker}.child-exit &&
+          ! -s ${marker}.child-exit.ready ]] &&
+            pid_matches_identity "$case_pid" "$case_identity"; then
+        signal_bound_process "$case_pid" "$case_identity" KILL || true
+        for _ in {1..20}; do
+            pid_matches_identity "$case_pid" "$case_identity" || break
+            sleep 0.1
+        done
+    fi
+    if pid_matches_identity "$case_pid" "$case_identity"; then
+        child_state=still-present-after-bounded-kill
+    fi
+    publish_watch_marker "$marker" "$status" "$case_pid" "$lost_devices" \
+        "$foreign_processes" "${monitor_detail};child_state=${child_state}"
+}
+
 start_telemetry() {
     local output=$1
     stdbuf -oL -eL nvidia-smi \
         --query-gpu=timestamp,index,pci.bus_id,pstate,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.free \
         --format=csv -lms "$TELEMETRY_INTERVAL_MS" >"$output" 2>&1 &
     telemetry_pid=$!
+    telemetry_identity=$(capture_process_identity "$telemetry_pid") ||
+        die "could not capture immutable identity for telemetry PID $telemetry_pid; helper may still be live and was not signaled"
 }
 
 start_telemetry_watch() {
-    local output=$1 marker=$2 case_pid=$3
+    local output=$1 marker=$2 case_pid=$3 case_identity=$4
+    local watcher_gate="${marker}.watcher-gate.$BASHPID.$RANDOM"
     (
-        while kill -0 "$telemetry_pid" >/dev/null 2>&1; do
+        for _ in {1..100}; do
+            [[ -e $watcher_gate ]] && break
+            sleep 0.01
+        done
+        [[ -e $watcher_gate ]] || exit 125
+        rm -f -- "$watcher_gate"
+        while pid_is_live "$telemetry_pid"; do
             local watch_status= foreign_processes= lost_devices= recent_tail=
             recent_tail=$(tail -n 24 "$output" 2>/dev/null || true)
             if grep -Eiq 'GPU is lost|GPU requires reset|GPU Unavailable|Critical Xid|Unknown Error|ERR!|Unable to determine' \
@@ -464,24 +817,58 @@ start_telemetry_watch() {
             fi
             if [[ -n $watch_status ]]; then
                 printf 'telemetry-watch: %s detected\n' "$watch_status" >>"$output"
-                printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\n' \
-                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
-                    "$case_pid" "$REQUIRED_POWER_LIMIT_W" "$lost_devices" \
-                    "$foreign_processes" >"$marker"
-                sync "$marker" 2>/dev/null || sync
-                kill "$telemetry_pid" >/dev/null 2>&1 || true
-                kill -TERM "$case_pid" >/dev/null 2>&1 || true
-                for _ in {1..20}; do
-                    kill -0 "$case_pid" >/dev/null 2>&1 || exit 0
-                    sleep 0.1
-                done
-                kill -KILL "$case_pid" >/dev/null 2>&1 || true
+                if [[ $ONE_SHOT == 1 ]]; then
+                    watcher_stop_case_and_publish "$marker" "$watch_status" \
+                        "$case_pid" "$lost_devices" "$foreign_processes" \
+                        "$case_identity"
+                else
+                    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\n' \
+                        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
+                        "$case_pid" "$REQUIRED_POWER_LIMIT_W" "$lost_devices" \
+                        "$foreign_processes" >"$marker"
+                    sync "$marker" 2>/dev/null || sync
+                    kill "$telemetry_pid" >/dev/null 2>&1 || true
+                    kill -TERM "$case_pid" >/dev/null 2>&1 || true
+                    for _ in {1..20}; do
+                        kill -0 "$case_pid" >/dev/null 2>&1 || exit 0
+                        sleep 0.1
+                    done
+                    kill -KILL "$case_pid" >/dev/null 2>&1 || true
+                fi
                 exit 0
             fi
             sleep 0.1
         done
+        if [[ $ONE_SHOT == 1 ]]; then
+            recent_tail=$(tail -n 24 "$output" 2>/dev/null || true)
+            watch_status=telemetry-monitor-failed
+            lost_devices=unknown
+            if grep -Eiq 'GPU is lost|GPU requires reset|GPU Unavailable|Critical Xid|Unknown Error|ERR!|Unable to determine' \
+                    <<<"$recent_tail"; then
+                watch_status=lost-device-detected
+            elif [[ -s ${marker}.child-exit &&
+                    -s ${marker}.child-exit.ready ]] &&
+                    grep -Fxq 'state=child-exit-notice-complete' \
+                        "${marker}.child-exit.ready"; then
+                # Parent-observed completion is not itself a monitor failure;
+                # the parent will obtain the cached status with wait after
+                # this watcher exits.  Never signal that now-dead bare PID.
+                printf 'telemetry-watch: child exit notice consumed during final scan\n' \
+                    >>"$output"
+                exit 0
+            fi
+            printf 'telemetry-watch: %s detected during final scan\n' \
+                "$watch_status" >>"$output"
+            watcher_stop_case_and_publish "$marker" "$watch_status" \
+                "$case_pid" "$lost_devices" '' "$case_identity" \
+                telemetry-exited-final-scan
+        fi
     ) &
     telemetry_watch_pid=$!
+    telemetry_watch_identity=$(capture_process_identity "$telemetry_watch_pid") ||
+        die "could not capture immutable identity for watcher PID $telemetry_watch_pid; helper may still be live and was not signaled"
+    : >"$watcher_gate"
+    sync "$watcher_gate" 2>/dev/null || sync
 }
 
 last_progress_fields() {
@@ -520,7 +907,7 @@ write_result() {
 
 phase=build
 targets=(ds4-bench tests/cuda_long_context_smoke tests/test_engine_mgpu_placement \
-         tests/test_gpu_xdev)
+         tests/test_gpu_xdev tests/cuda_device_identity)
 if [[ $SKIP_BUILD == 0 ]]; then
     make -B -j"$(nproc)" "${targets[@]}" CUDA_ARCH=sm_75 \
         2>&1 | tee "$OUTPUT_DIR/build.log"
@@ -529,6 +916,16 @@ if [[ $SKIP_BUILD == 0 ]]; then
             tail -n 200 "$OUTPUT_DIR/placement-tests.log" >&2
             die "CPU placement tests failed"
         }
+else
+    make -q "${targets[@]}" CUDA_ARCH=sm_75 ||
+        die "SKIP_BUILD=1 found stale targets"
+fi
+
+phase=device-identity
+capture_and_validate_cuda_identity ||
+    die "CUDA ordinal, nvidia-smi identity, or expected NVLink pair validation failed"
+
+if [[ $SKIP_BUILD == 0 ]]; then
     assert_no_compute_processes ||
         die "foreign GPU compute process present before CUDA smoke tests"
     "${clean[@]}" ./tests/cuda_long_context_smoke \
@@ -543,9 +940,6 @@ if [[ $SKIP_BUILD == 0 ]]; then
             tail -n 200 "$OUTPUT_DIR/ordered-dst-copy-tests.log" >&2
             die "ordered destination-stream peer-copy tests failed"
         }
-else
-    make -q "${targets[@]}" CUDA_ARCH=sm_75 ||
-        die "SKIP_BUILD=1 found stale targets"
 fi
 
 phase=manifest
@@ -562,9 +956,16 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
             "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
         printf 'gpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
             "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
+        printf 'cuda_device_order=%s\n' "$CUDA_DEVICE_ORDER"
+        printf 'cuda_identity_validation=strict-full-inventory-bus-uuid-and-exact-two-nvlink-pairs\n'
+        printf 'cuda_identity_inventory=provenance/cuda-device-inventory.csv\n'
+        printf 'nvidia_identity_inventory=provenance/nvidia-device-inventory.csv\n'
+        printf 'selected_device_identity=provenance/selected-device-identity.csv\n'
         printf 'logical_pair_0=physical_0_physical_1\n'
         printf 'logical_pair_1=physical_3_physical_2\n'
-        printf 'small_bar1_pair=%s\nvariants=%s\n' "$SMALL_BAR1_PAIR" "$VARIANTS"
+        printf 'small_bar1_pair=%s\nvariants=%s\none_shot=%s\n' \
+            "$SMALL_BAR1_PAIR" "$VARIANTS" "$ONE_SHOT"
+        printf 'one_shot_timeout_seconds=%s\n' "$ONE_SHOT_TIMEOUT_SECONDS"
         printf 'attention_phase_audit_layer=%s\nattention_phase_audit_pos=%s\n' \
             "$ATTN_PHASE_AUDIT_LAYER" "$ATTN_PHASE_AUDIT_POS"
         printf 'attention_end_fence_layer=%s\nattention_end_fence_pos=%s\n' \
@@ -599,6 +1000,13 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_q8_pre_gather_fence_control=attention-q8-async-completion\n'
         printf 'attention_q8_pre_gather_fence_control_rejects=fence_armed_returned_records\n'
         printf 'attention_q8_pre_gather_fence_interpretation=failure_surface_boundary_not_root_cause\n'
+        printf 'attention_q8_pre_gather_observed_result_gathers_returned=32\n'
+        printf 'attention_q8_pre_gather_observed_next_call=33_activation_h2d_first_surfaced_error\n'
+        printf 'attention_q8_activation_fence_scope=pair0_device_sync_and_exact_marker_before_activation_h2d_plus_existing_pre_gather_bracket\n'
+        printf 'attention_q8_activation_fence_predecessor=attention-q8-pre-gather-fence\n'
+        printf 'attention_q8_activation_fence_contract=fresh_one_shot_only_no_resume_no_control_rerun\n'
+        printf 'attention_q8_activation_fence_perturbation=device_sync_marker_validation_and_host_logging\n'
+        printf 'attention_q8_activation_fence_interpretation=failure_surface_boundary_not_root_cause\n'
         printf 'attention_q8_phase_audit_scope=pair0_q8_partner_phase_checkpoints_and_compute_sync\n'
         printf 'attention_q8_targeted_phase_audit_binding=%s\n' "$Q8_TARGET_BINDING_LABEL"
         printf 'attention_q8_targeted_phase_audit_weight_offset=%s\n' "$Q8_TARGET_WEIGHT_OFFSET"
@@ -795,7 +1203,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -1045,7 +1453,8 @@ validate_success_path() {
             ;;
     esac
     if [[ $variant == attention-q8-async-completion ||
-          $variant == attention-q8-pre-gather-fence ]]; then
+          $variant == attention-q8-pre-gather-fence ||
+          $variant == attention-q8-activation-fence ]]; then
         grep -Fq \
             'CUDA q8 partner async completion audit enabled: logical_pairs=0 marker=partner-default-stream-mapped-host event=dedicated-post-marker interpretation=positive-only' \
             "$log" || return 1
@@ -1056,7 +1465,8 @@ validate_success_path() {
         python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
             --validate-q8-async-completion-log "$log" || return 1
     fi
-    if [[ $variant == attention-q8-pre-gather-fence ]]; then
+    if [[ $variant == attention-q8-pre-gather-fence ||
+          $variant == attention-q8-activation-fence ]]; then
         local fence_enable
         fence_enable='ds4: CUDA q8 partner pre-gather fence audit enabled: logical_pairs=0 boundary=post-marker-event-sync marker=exact-before-result-d2h'
         [[ $(grep -Fxc "$fence_enable" "$log" || true) == 1 ]] || return 1
@@ -1069,8 +1479,14 @@ validate_success_path() {
         python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
             --validate-q8-pre-gather-fence-log "$log" || return 1
     fi
+    if [[ $variant == attention-q8-activation-fence ]]; then
+        python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
+            --validate-q8-pre-activation-fence-log "$log" || return 1
+    fi
     if [[ $variant == attention-q8-async-completion ]]; then
         ! grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
+            "$log" || return 1
+        ! grep -Eq 'CUDA q8 partner pre-activation (fence|armed|returned) ' \
             "$log" || return 1
     fi
     if [[ $variant == attention-q8-host-bounce ]]; then
@@ -1252,7 +1668,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1303,9 +1719,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
                 continue
             fi
-            if [[ $variant == attention-q8-async-completion ]] &&
+            if [[ $variant == attention-q8-async-completion ]] && {
                     grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
-                        "$log"; then
+                        "$log" ||
+                    grep -Eq 'CUDA q8 partner pre-activation (fence|armed|returned) ' \
+                        "$log"; }; then
                 printf 'Retaining contaminated no-fence control as validation-failed: variant=%s repeat=%d\n' \
                     "$variant" "$repeat"
                 write_result "$result" "$variant" validation-failed 129 \
@@ -1328,7 +1746,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1420,6 +1838,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-activation-fence)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-q8-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
@@ -1527,9 +1952,157 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     --prefill-chunk 2048 --gen-tokens "$TG_TOKENS" \
                     --csv "$csv" >"$log" 2>&1 &
         active_case_pid=$!
-        start_telemetry_watch "$telemetry" "$watch_marker" "$active_case_pid"
-        if wait "$active_case_pid"; then run_status=0; else run_status=$?; fi
-        active_case_pid=
+        case_pid=$active_case_pid
+        capture_status=0
+        case_identity=$(capture_process_identity "$active_case_pid") ||
+            capture_status=$?
+        if (( capture_status != 0 )); then
+            if ! pid_is_live "$active_case_pid"; then
+                if wait "$active_case_pid"; then
+                    capture_child_status=0
+                else
+                    capture_child_status=$?
+                fi
+                active_case_pid=
+                die "case exited before immutable identity capture completed (status=$capture_child_status)"
+            fi
+            die "could not capture immutable identity for case PID $case_pid after bounded launch handshake; child may still be live and was not signaled"
+        fi
+        active_case_identity=$case_identity
+        start_telemetry_watch "$telemetry" "$watch_marker" \
+            "$active_case_pid" "$case_identity"
+        one_shot_child_stop_failed=0
+        if [[ $ONE_SHOT == 1 ]]; then
+            run_status=
+            one_shot_deadline=$((SECONDS + ONE_SHOT_TIMEOUT_SECONDS))
+            telemetry_dead_since=0
+            child_exit_noticed=0
+            telemetry_stop_requested=0
+            while :; do
+                if [[ -s $watch_marker && -s $watch_marker.ready ]] &&
+                        grep -Eq '^status=.+$' "$watch_marker" &&
+                        grep -Fxq 'state=critical-actions-complete' \
+                            "$watch_marker.ready"; then
+                    # A CUDA process can remain in uninterruptible kernel wait
+                    # after a watcher event.  The ready handshake is published
+                    # only after the watcher has completed its start-time-
+                    # gated signaling and durably renamed the marker.
+                    run_status=123
+                    stop_active_case || one_shot_child_stop_failed=1
+                    break
+                fi
+                if (( child_exit_noticed == 0 )) &&
+                        ! pid_matches_identity "$active_case_pid" \
+                            "$active_case_identity"; then
+                    publish_child_exit_notice "$watch_marker" "$case_pid"
+                    child_exit_noticed=1
+                    # Publish exit before requesting the watcher's final scan.
+                    # The watcher will not signal after consuming this notice,
+                    # and independently revalidates start-time identity before
+                    # every signal in case Bash has already reaped the job.
+                    signal_bound_process "$telemetry_pid" \
+                        "$telemetry_identity" TERM || true
+                    telemetry_stop_requested=1
+                    telemetry_dead_since=$SECONDS
+                fi
+                if ! pid_is_live "$telemetry_watch_pid"; then
+                    # A concurrently detected watcher event has precedence.
+                    # Re-enter the loop once after watcher exit so a fully
+                    # published marker/ready pair is consumed before accepting
+                    # the child's own exit status.
+                    if [[ -s $watch_marker && -s $watch_marker.ready ]] &&
+                            grep -Eq '^status=.+$' "$watch_marker" &&
+                            grep -Fxq 'state=critical-actions-complete' \
+                                "$watch_marker.ready"; then
+                        continue
+                    fi
+                    if (( child_exit_noticed == 1 )); then
+                        if wait "$active_case_pid"; then
+                            run_status=0
+                        else
+                            run_status=$?
+                        fi
+                        active_case_pid=
+                        active_case_identity=
+                        # A requested final scan that published no event is not
+                        # a telemetry-monitor failure. Preserve the child's
+                        # zero or nonzero status for normal result handling.
+                        break
+                    else
+                        stop_active_case || one_shot_child_stop_failed=1
+                    fi
+                    publish_watch_marker "$watch_marker" \
+                        telemetry-monitor-failed "$case_pid" unknown '' \
+                        watcher-exited-without-ready-handshake
+                    run_status=123
+                    break
+                fi
+                if ! pid_is_live "$telemetry_pid"; then
+                    (( telemetry_dead_since > 0 )) || telemetry_dead_since=$SECONDS
+                    # Once child exit has been noticed, its watcher owns
+                    # the final telemetry scan and durable ready handshake.
+                    # Do not race that handshake merely because we asked the
+                    # telemetry producer to exit; wait for watcher ready,
+                    # confirmed watcher exit, or the global one-shot bound.
+                    if (( child_exit_noticed == 0 &&
+                          SECONDS - telemetry_dead_since >= 5 )); then
+                        stop_telemetry
+                        if [[ -s $watch_marker && -s $watch_marker.ready ]] &&
+                                grep -Eq '^status=.+$' "$watch_marker" &&
+                                grep -Fxq 'state=critical-actions-complete' \
+                                    "$watch_marker.ready"; then
+                            continue
+                        fi
+                        stop_active_case || one_shot_child_stop_failed=1
+                        publish_watch_marker "$watch_marker" \
+                            telemetry-monitor-failed "$case_pid" unknown '' \
+                            "telemetry-exited-watcher-handshake-timeout;requested=${telemetry_stop_requested}"
+                        run_status=123
+                        break
+                    fi
+                else
+                    telemetry_dead_since=0
+                fi
+                if (( SECONDS >= one_shot_deadline )); then
+                    # Ask telemetry to end, then stop/join the watcher before
+                    # creating generic timeout evidence.  A device-loss marker
+                    # completed by that final scan always wins.
+                    signal_bound_process "$telemetry_pid" \
+                        "$telemetry_identity" TERM || true
+                    # Give the watcher a bounded opportunity to consume the
+                    # telemetry tail and naturally publish specific evidence
+                    # before helper cleanup can terminate it.
+                    for _ in {1..50}; do
+                        if [[ -s $watch_marker && -s $watch_marker.ready ]] &&
+                                grep -Eq '^status=.+$' "$watch_marker" &&
+                                grep -Fxq 'state=critical-actions-complete' \
+                                    "$watch_marker.ready"; then
+                            break
+                        fi
+                        pid_is_live "$telemetry_watch_pid" || break
+                        sleep 0.1
+                    done
+                    stop_telemetry
+                    if [[ -s $watch_marker && -s $watch_marker.ready ]] &&
+                            grep -Eq '^status=.+$' "$watch_marker" &&
+                            grep -Fxq 'state=critical-actions-complete' \
+                                "$watch_marker.ready"; then
+                        continue
+                    fi
+                    stop_active_case || one_shot_child_stop_failed=1
+                    publish_watch_marker "$watch_marker" \
+                        one-shot-monitor-timeout "$case_pid" unknown '' \
+                        "timeout_seconds=${ONE_SHOT_TIMEOUT_SECONDS}"
+                    run_status=124
+                    break
+                fi
+                sleep 0.1
+            done
+        else
+            if wait "$active_case_pid"; then run_status=0; else run_status=$?; fi
+            active_case_pid=
+            active_case_identity=
+        fi
         stop_telemetry
         if (( run_status == 0 )) && [[ -e $watch_marker ]]; then
             run_status=123
@@ -1544,7 +2117,15 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             fi
         fi
         post_health_status=0
-        gpu_health_snapshot "$post_health" || post_health_status=124
+        if [[ $ONE_SHOT == 1 && $one_shot_child_stop_failed == 1 ]]; then
+            printf 'date_utc=%s\nstatus=skipped-child-still-present-after-bounded-kill\ncase_pid=%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$case_pid" \
+                >"$post_health"
+            sync "$post_health" 2>/dev/null || sync
+            post_health_status=124
+        else
+            gpu_health_snapshot "$post_health" || post_health_status=124
+        fi
         if (( run_status == 0 && post_health_status != 0 )); then
             run_status=$post_health_status
         fi
@@ -1563,9 +2144,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             tail -n 240 "$log" >&2 || true
             die "variant=$variant contained async-completion records in the no-marker control"
         fi
-        if [[ $variant == attention-q8-async-completion ]] &&
+        if [[ $variant == attention-q8-async-completion ]] && {
                 grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
-                    "$log"; then
+                    "$log" ||
+                grep -Eq 'CUDA q8 partner pre-activation (fence|armed|returned) ' \
+                    "$log"; }; then
             write_result "$result" "$variant" validation-failed 129 \
                 "$progress" "$log"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1574,7 +2157,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 >>"$OUTPUT_DIR/run-journal.tsv"
             sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
             tail -n 240 "$log" >&2 || true
-            die "variant=$variant contained pre-gather-fence records in the no-fence control"
+            die "variant=$variant contained fence records in the no-fence control"
         fi
         if (( run_status != 0 )); then
             watch_status=
@@ -1615,7 +2198,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

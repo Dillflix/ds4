@@ -11,7 +11,8 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
-    "attention-q8-pre-gather-fence", "attention-q8-async-completion",
+    "attention-q8-pre-gather-fence", "attention-q8-activation-fence",
+    "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
     "attention-q8-l14-l15-phase-audit", "attention-q8-l12-phase-audit",
@@ -1053,6 +1054,816 @@ def q8_partner_pre_gather_fence_summary(
     )
 
 
+Q8_PRE_ACTIVATION_MARKER_TAG = 1 << 63
+Q8_PRE_ACTIVATION_IDENTITY_KEYS = (
+    "home_tier", "home_device", "partner_tier", "partner_device", "bytes",
+    "tokens", "in", "out", "binding_label", "passed_label",
+    "weight_offset",
+)
+Q8_PRE_ACTIVATION_ARMED_KEYS = {
+    "current_sequence", "marker_sequence", "marker_complement",
+    "activation_d2h_status", "destination_sync_status",
+    *Q8_PRE_ACTIVATION_IDENTITY_KEYS,
+}
+Q8_PRE_ACTIVATION_RETURNED_KEYS = {
+    "current_sequence", "activation_h2d_status",
+    *Q8_PRE_ACTIVATION_IDENTITY_KEYS,
+}
+Q8_PRE_ACTIVATION_FENCE_KEYS = {
+    "event", "stage", "current_sequence", "marker_sequence",
+    "marker_complement", "marker_matches", "cuda_status",
+    "destination_sync_status", "activation_d2h_attempted",
+    "activation_d2h_completed", "activation_h2d_attempted",
+    "activation_h2d_completed", "interpretation", "attempted", "confirmed",
+    "returned", "failed", *Q8_PRE_ACTIVATION_IDENTITY_KEYS,
+}
+Q8_PRE_ACTIVATION_SUMMARY_KEYS = {
+    "home_tier", "partner_tier", "attempted", "confirmed", "returned",
+    "failed", "last_sequence", "shared_slot_sequence",
+    "shared_slot_complement", "partners_synchronized",
+}
+
+
+def _q8_pre_activation_records(text: str, suffix: str) -> list[dict[str, str]]:
+    prefix = f"ds4: CUDA q8 partner pre-activation {suffix}"
+    records: list[dict[str, str]] = []
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        payload = line[len(prefix):]
+        record: dict[str, str] = {}
+        invalid = False
+        for token in payload.split():
+            if "=" not in token:
+                invalid = True
+                continue
+            key, value = token.split("=", 1)
+            if not key or not value or key in record:
+                invalid = True
+            record[key] = value
+        if invalid:
+            record["__invalid__"] = "yes"
+        records.append(record)
+    return records
+
+
+def q8_partner_pre_activation_fence_enabled(
+        text: str, pair: int = 0) -> bool:
+    exact = (
+        "ds4: CUDA q8 partner pre-activation fence audit enabled: "
+        f"logical_pairs={pair} boundary=post-source-d2h-destination-sync "
+        "marker=destination-default-stream-tagged-exact-before-activation-h2d"
+    )
+    prefix = "ds4: CUDA q8 partner pre-activation fence audit enabled:"
+    observed = [line for line in text.splitlines() if line.startswith(prefix)]
+    return observed == [exact]
+
+
+def q8_partner_pre_activation_fence_records(
+        text: str, kind: str) -> list[dict[str, str]]:
+    suffixes = {
+        "checkpoint": "fence checkpoint ",
+        "failure": "fence failure ",
+        "summary": "fence summary ",
+    }
+    return _q8_pre_activation_records(text, suffixes[kind])
+
+
+def q8_partner_pre_activation_armed_records(
+        text: str) -> list[dict[str, str]]:
+    return _q8_pre_activation_records(text, "armed ")
+
+
+def q8_partner_pre_activation_returned_records(
+        text: str) -> list[dict[str, str]]:
+    return _q8_pre_activation_records(text, "returned ")
+
+
+def q8_partner_pre_activation_record_order_state(text: str) -> str:
+    enable_prefix = (
+        "ds4: CUDA q8 partner pre-activation fence audit enabled:"
+    )
+    record_prefixes = {
+        "armed": "ds4: CUDA q8 partner pre-activation armed ",
+        "returned": "ds4: CUDA q8 partner pre-activation returned ",
+        "checkpoint": (
+            "ds4: CUDA q8 partner pre-activation fence checkpoint "
+        ),
+        "failure": "ds4: CUDA q8 partner pre-activation fence failure ",
+        "summary": "ds4: CUDA q8 partner pre-activation fence summary ",
+    }
+    activation_prefix = "ds4: CUDA q8 partner pre-activation "
+    positions: dict[str, list[int]] = {
+        kind: [] for kind in record_prefixes
+    }
+    enable_positions: list[int] = []
+    for index, line in enumerate(text.splitlines()):
+        if line.startswith(enable_prefix):
+            enable_positions.append(index)
+            continue
+        matched = False
+        for kind, prefix in record_prefixes.items():
+            if line.startswith(prefix):
+                positions[kind].append(index)
+                matched = True
+                break
+        if line.startswith(activation_prefix) and not matched:
+            return "unknown-activation-record"
+    if len(enable_positions) != 1:
+        return f"activation-enable-count:{len(enable_positions)}"
+    evidence_positions = [
+        position for kind_positions in positions.values()
+        for position in kind_positions
+    ]
+    if evidence_positions and min(evidence_positions) < enable_positions[0]:
+        return "activation-enable-order-mismatch"
+    summary_positions = positions["summary"]
+    if (summary_positions and
+            summary_positions[-1] != max(evidence_positions)):
+        return "activation-summary-order-mismatch"
+    return "complete"
+
+
+def _q8_pre_activation_tagged(sequence: int | None) -> int | None:
+    if sequence is None or sequence <= 0 or sequence >= Q8_PRE_ACTIVATION_MARKER_TAG:
+        return None
+    return sequence | Q8_PRE_ACTIVATION_MARKER_TAG
+
+
+def _q8_pre_activation_marker_exact(
+        current: int | None, sequence: int | None,
+        complement: int | None) -> bool:
+    tagged = _q8_pre_activation_tagged(current)
+    return (
+        tagged is not None and sequence == tagged and
+        complement == ((~tagged) & Q8_UINT64_MASK)
+    )
+
+
+def q8_partner_pre_activation_identity_valid(
+        record: dict[str, str]) -> bool:
+    if any(not record.get(key) for key in Q8_PRE_ACTIVATION_IDENTITY_KEYS):
+        return False
+    if (record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1" or
+            record["binding_label"] == "unavailable" or
+            record["passed_label"] == "unavailable"):
+        return False
+    values = {
+        key: _q8_u64(record, key)
+        for key in ("bytes", "tokens", "in", "out", "weight_offset")
+    }
+    return (
+        all(value is not None for value in values.values()) and
+        all(values[key] and values[key] > 0
+            for key in ("bytes", "tokens", "in", "out"))
+    )
+
+
+def q8_partner_pre_activation_identity(
+        record: dict[str, str]) -> tuple[str, ...]:
+    return tuple(record.get(key, "") for key in Q8_PRE_ACTIVATION_IDENTITY_KEYS)
+
+
+def q8_partner_pre_activation_summary_state(
+        summary: dict[str, str], armed: list[dict[str, str]],
+        returned: list[dict[str, str]],
+        failure: dict[str, str] | None = None,
+        allow_unsynchronized: bool = False) -> str:
+    if set(summary) != Q8_PRE_ACTIVATION_SUMMARY_KEYS:
+        return "malformed-activation-summary"
+    if (summary.get("home_tier") != "0" or
+            summary.get("partner_tier") != "2" or
+            summary.get("partners_synchronized") not in {"yes", "no"}):
+        return "malformed-activation-summary"
+    synchronized = summary["partners_synchronized"] == "yes"
+    if not synchronized and not allow_unsynchronized:
+        return "activation-summary-partner-not-synchronized"
+    values = {
+        key: _q8_u64(summary, key) for key in (
+            "attempted", "confirmed", "returned", "failed",
+            "last_sequence", "shared_slot_sequence",
+            "shared_slot_complement",
+        )
+    }
+    if any(value is None for value in values.values()):
+        return "malformed-activation-summary"
+    shared_sequence = values["shared_slot_sequence"]
+    shared_complement = values["shared_slot_complement"]
+    assert shared_sequence is not None and shared_complement is not None
+    # A later post-compute marker may overwrite the activation tag.  A
+    # synchronized teardown still has to observe one internally exact pair.
+    if (synchronized and not failure and
+            shared_complement != ((~shared_sequence) & Q8_UINT64_MASK)):
+        return "activation-summary-shared-slot-mismatch"
+    if failure:
+        expected = {
+            key: _q8_u64(failure, key)
+            for key in ("attempted", "confirmed", "returned", "failed")
+        }
+        if (any(value is None for value in expected.values()) or
+                any(values[key] != expected[key] for key in expected) or
+                values["last_sequence"] != expected["confirmed"]):
+            return "activation-summary-failure-mismatch"
+        return "complete"
+    attempted = values["attempted"]
+    confirmed = values["confirmed"]
+    returned_count = values["returned"]
+    failed = values["failed"]
+    assert attempted is not None and confirmed is not None
+    assert returned_count is not None and failed is not None
+    allowed_return_gap = 1 if not synchronized and allow_unsynchronized else 0
+    if (attempted <= 0 or attempted != confirmed or failed != 0 or
+            returned_count > confirmed or
+            confirmed - returned_count > allowed_return_gap or
+            values["last_sequence"] != attempted or
+            len(armed) != attempted or len(returned) != returned_count):
+        return "activation-summary-count-mismatch"
+    return "complete"
+
+
+def q8_partner_pre_activation_armed_record_valid(
+        record: dict[str, str]) -> bool:
+    if (set(record) != Q8_PRE_ACTIVATION_ARMED_KEYS or
+            record["activation_d2h_status"] != "complete" or
+            record["destination_sync_status"] != "complete" or
+            not q8_partner_pre_activation_identity_valid(record)):
+        return False
+    current = _q8_u64(record, "current_sequence")
+    marker_sequence = _q8_u64(record, "marker_sequence")
+    marker_complement = _q8_u64(record, "marker_complement")
+    return _q8_pre_activation_marker_exact(
+        current, marker_sequence, marker_complement
+    )
+
+
+def q8_partner_pre_activation_returned_record_valid(
+        record: dict[str, str]) -> bool:
+    if (set(record) != Q8_PRE_ACTIVATION_RETURNED_KEYS or
+            record.get("activation_h2d_status") != "success" or
+            not q8_partner_pre_activation_identity_valid(record)):
+        return False
+    current = _q8_u64(record, "current_sequence")
+    return _q8_pre_activation_tagged(current) is not None
+
+
+def format_q8_partner_pre_activation_call_record(
+        record: dict[str, str]) -> str:
+    if not record:
+        return ""
+    keys = (
+        "current_sequence", "marker_sequence", "marker_complement",
+        "activation_d2h_status", "destination_sync_status",
+        "activation_h2d_status", *Q8_PRE_ACTIVATION_IDENTITY_KEYS,
+    )
+    return " ".join(
+        f"{key}={record.get(key, '')}" for key in keys if key in record
+    )
+
+
+def q8_partner_pre_activation_call_sequence_state(text: str) -> str:
+    armed = q8_partner_pre_activation_armed_records(text)
+    returned = q8_partner_pre_activation_returned_records(text)
+    if not armed and not returned:
+        return "empty"
+    if any(not q8_partner_pre_activation_armed_record_valid(record)
+           for record in armed):
+        return "invalid-activation-armed-record"
+    if any(not q8_partner_pre_activation_returned_record_valid(record)
+           for record in returned):
+        return "invalid-activation-returned-record"
+    armed_sequences = [
+        _q8_u64(record, "current_sequence") for record in armed
+    ]
+    returned_sequences = [
+        _q8_u64(record, "current_sequence") for record in returned
+    ]
+    if armed_sequences != list(range(1, len(armed) + 1)):
+        return "activation-armed-sequence-mismatch"
+    if returned_sequences != list(range(1, len(returned) + 1)):
+        return "activation-returned-sequence-mismatch"
+    if len(returned) > len(armed) or len(armed) - len(returned) > 1:
+        return "activation-armed-returned-count-mismatch"
+    if any(
+            q8_partner_pre_activation_identity(armed[index]) !=
+            q8_partner_pre_activation_identity(returned[index])
+            for index in range(len(returned))):
+        return "activation-armed-returned-binding-mismatch"
+
+    observed: list[tuple[str, int | None]] = []
+    armed_prefix = "ds4: CUDA q8 partner pre-activation armed "
+    returned_prefix = "ds4: CUDA q8 partner pre-activation returned "
+    for line in text.splitlines():
+        if line.startswith(armed_prefix):
+            record = _q8_pre_activation_records(line, "armed ")[0]
+            observed.append(("armed", _q8_u64(record, "current_sequence")))
+        elif line.startswith(returned_prefix):
+            record = _q8_pre_activation_records(line, "returned ")[0]
+            observed.append(("returned", _q8_u64(record, "current_sequence")))
+    expected: list[tuple[str, int]] = []
+    for sequence in range(1, len(returned) + 1):
+        expected.extend((("armed", sequence), ("returned", sequence)))
+    if len(armed) > len(returned):
+        expected.append(("armed", len(armed)))
+    return (
+        "complete" if observed == expected
+        else "activation-armed-returned-order-mismatch"
+    )
+
+
+def q8_partner_pre_activation_fence_record_classification(
+        record: dict[str, str], kind: str) -> str:
+    if (set(record) != Q8_PRE_ACTIVATION_FENCE_KEYS or
+            not q8_partner_pre_activation_identity_valid(record)):
+        return "invalid-activation-fence-record"
+    numeric = {
+        key: _q8_u64(record, key) for key in (
+            "current_sequence", "marker_sequence", "marker_complement",
+            "attempted", "confirmed", "returned", "failed",
+        )
+    }
+    if any(value is None for value in numeric.values()):
+        return "invalid-activation-fence-record"
+    current = numeric["current_sequence"]
+    marker_sequence = numeric["marker_sequence"]
+    marker_complement = numeric["marker_complement"]
+    attempted = numeric["attempted"]
+    confirmed = numeric["confirmed"]
+    returned = numeric["returned"]
+    failed = numeric["failed"]
+    assert current is not None and attempted is not None
+    assert confirmed is not None and returned is not None and failed is not None
+    sequence_domain_exhausted = (
+        kind == "failure" and record.get("event") == "state-invalid" and
+        record.get("stage") == "pre-activation-marker" and
+        record.get("cuda_status") == "sequence-domain-exhausted" and
+        current == Q8_PRE_ACTIVATION_MARKER_TAG
+    )
+    if (attempted != current or confirmed > attempted or returned > confirmed or
+            failed > attempted or
+            (_q8_pre_activation_tagged(current) is None and
+             not sequence_domain_exhausted)):
+        return "invalid-activation-fence-record"
+    marker_exact = _q8_pre_activation_marker_exact(
+        current, marker_sequence, marker_complement
+    )
+    marker_claim = record["marker_matches"]
+    if marker_claim not in {"yes", "no"} or \
+            ((marker_claim == "yes") != marker_exact):
+        return "invalid-activation-fence-record"
+    booleans = (
+        "activation_d2h_attempted", "activation_d2h_completed",
+        "activation_h2d_attempted", "activation_h2d_completed",
+    )
+    if any(record[key] not in {"yes", "no"} for key in booleans):
+        return "invalid-activation-fence-record"
+    d2h_attempted = record["activation_d2h_attempted"] == "yes"
+    d2h_completed = record["activation_d2h_completed"] == "yes"
+    h2d_attempted = record["activation_h2d_attempted"] == "yes"
+    h2d_completed = record["activation_h2d_completed"] == "yes"
+    if ((d2h_completed and not d2h_attempted) or
+            (h2d_completed and not h2d_attempted) or
+            (h2d_attempted and not d2h_completed)):
+        return "invalid-activation-fence-record"
+
+    if kind == "checkpoint":
+        valid = (
+            record["event"] == "marker-confirmed" and
+            record["stage"] == "pre-activation-h2d" and
+            record["cuda_status"] == "complete" and
+            record["destination_sync_status"] == "complete" and
+            d2h_attempted and d2h_completed and not h2d_attempted and
+            not h2d_completed and marker_exact and
+            record["interpretation"] ==
+            "activation-d2h-and-destination-stream-confirmed-before-h2d" and
+            confirmed == current and returned + 1 == current and failed == 0
+        )
+        return (
+            "activation-fence-confirmed-before-h2d"
+            if valid else "invalid-activation-fence-record"
+        )
+    if kind != "failure" or failed != 1 or returned + 1 != current:
+        return "invalid-activation-fence-record"
+    event_specs = {
+        "copy-contract-invalid": (
+            "pre-activation-d2h", "not-attempted", "not-attempted",
+            (False, False, False, False), "failure-before-activation-d2h",
+            "activation-audit-state-failed", "zero",
+        ),
+        "bounce-alloc-failed": (
+            "activation-staging", "error", "not-attempted",
+            (False, False, False, False), "failure-before-activation-d2h",
+            "activation-source-or-staging-setup-failed", "zero",
+        ),
+        "bounce-free-failed": (
+            "activation-staging", "error", "not-attempted",
+            (False, False, False, False),
+            "failure-surfaced-by-bounce-free-before-activation-d2h",
+            "activation-source-or-staging-setup-failed", "zero",
+        ),
+        "source-switch-failed": (
+            "activation-d2h", "cudaSetDevice-failed", "not-attempted",
+            (False, False, False, False), "failure-before-activation-d2h",
+            "activation-source-or-staging-setup-failed", "zero",
+        ),
+        "activation-d2h-failed": (
+            "activation-d2h", "error", "not-attempted",
+            (True, False, False, False),
+            "failure-surfaced-by-activation-d2h",
+            "activation-source-d2h-failed", "zero",
+        ),
+        "destination-switch-failed": (
+            "pre-activation-h2d", "cudaSetDevice-failed", "not-attempted",
+            (True, True, False, False),
+            "failure-after-activation-d2h-before-destination-sync",
+            "activation-destination-switch-or-setup-failed", "zero",
+        ),
+        "destination-sync-failed": (
+            "pre-activation-h2d", "error", "failed",
+            (True, True, False, False),
+            "failure-surfaced-by-pre-h2d-destination-device-sync",
+            "activation-pre-h2d-device-sync-failed", "zero",
+        ),
+        "marker-launch-failed": (
+            "pre-activation-marker", "error", "complete",
+            (True, True, False, False),
+            "failure-surfaced-by-pre-h2d-marker-launch",
+            "activation-marker-channel-failure", "zero",
+        ),
+        "event-record-failed": (
+            "pre-activation-marker", "error", "complete",
+            (True, True, False, False),
+            "failure-surfaced-by-pre-h2d-event-record",
+            "activation-marker-channel-failure", "zero",
+        ),
+        "event-sync-failed": (
+            "pre-activation-marker", "error", "complete",
+            (True, True, False, False),
+            "failure-surfaced-by-pre-h2d-event-sync",
+            "activation-marker-channel-failure", "observed",
+        ),
+        "marker-validation-failed": (
+            "pre-activation-marker", "complete", "complete",
+            (True, True, False, False),
+            "pre-h2d-event-confirmed-marker-invalid",
+            "activation-marker-channel-failure", "invalid",
+        ),
+        "activation-h2d-failed": (
+            "activation-h2d", "error", "complete",
+            (True, True, True, False),
+            "failure-surfaced-by-activation-h2d-after-confirmed-boundary",
+            "activation-fence-confirmed-h2d-failed", "exact",
+        ),
+    }
+    if record["event"] == "state-invalid":
+        state_signature = (record["stage"], record["cuda_status"])
+        if state_signature not in {
+                ("pre-activation-d2h", "not-attempted"),
+                ("pre-activation-marker", "sequence-domain-exhausted")}:
+            return "invalid-activation-fence-record"
+        spec = (
+            state_signature[0], state_signature[1], "not-attempted",
+            (False, False, False, False), "failure-before-activation-d2h",
+            "activation-audit-state-failed", "zero",
+        )
+    else:
+        spec = event_specs.get(record["event"])
+    if not spec:
+        return "invalid-activation-fence-record"
+    (stage, cuda_status, destination_sync_status, flags, interpretation,
+     classification, marker_mode) = spec
+    actual_flags = (
+        d2h_attempted, d2h_completed, h2d_attempted, h2d_completed,
+    )
+    cuda_valid = (
+        record["cuda_status"] not in {"", "complete", "not-attempted"}
+        if cuda_status == "error"
+        else record["cuda_status"] == cuda_status
+    )
+    marker_state_valid = {
+        "zero": marker_sequence == 0 and marker_complement == 0 and
+                marker_claim == "no",
+        "observed": (marker_claim == "yes") == marker_exact,
+        "invalid": marker_claim == "no" and not marker_exact,
+        "exact": marker_claim == "yes" and marker_exact,
+    }[marker_mode]
+    expected_confirmed = current if record["event"] == "activation-h2d-failed" \
+        else current - 1
+    valid = (
+        record["stage"] == stage and cuda_valid and
+        record["destination_sync_status"] == destination_sync_status and
+        actual_flags == flags and record["interpretation"] == interpretation and
+        confirmed == expected_confirmed and marker_state_valid
+    )
+    return classification if valid else "invalid-activation-fence-record"
+
+
+def format_q8_partner_pre_activation_fence_record(
+        record: dict[str, str], classification: str) -> str:
+    if not record:
+        return ""
+    keys = (
+        "event", "stage", "current_sequence", "marker_sequence",
+        "marker_complement", "marker_matches", "cuda_status",
+        "destination_sync_status", "activation_d2h_attempted",
+        "activation_d2h_completed", "activation_h2d_attempted",
+        "activation_h2d_completed", "interpretation", "attempted",
+        "confirmed", "returned", "failed", *Q8_PRE_ACTIVATION_IDENTITY_KEYS,
+    )
+    return " ".join(
+        [f"record_classification={classification}"] +
+        [f"{key}={record.get(key, '')}" for key in keys]
+    )
+
+
+def q8_partner_pre_activation_checkpoint_sequence_state(
+        text: str, allow_trailing_gap: bool = False) -> str:
+    armed = q8_partner_pre_activation_armed_records(text)
+    checkpoints = q8_partner_pre_activation_fence_records(text, "checkpoint")
+    if any(
+            q8_partner_pre_activation_fence_record_classification(
+                record, "checkpoint"
+            ) != "activation-fence-confirmed-before-h2d"
+            for record in checkpoints):
+        return "invalid-activation-checkpoint-record"
+    sequences = [
+        _q8_u64(record, "current_sequence") for record in checkpoints
+    ]
+    expected = [sequence for sequence in range(1, len(armed) + 1)
+                if sequence == 1 or sequence % 64 == 0]
+    if (allow_trailing_gap and expected and armed and
+            expected[-1] == len(armed) and sequences == expected[:-1]):
+        expected = expected[:-1]
+    if sequences != expected:
+        return "activation-checkpoint-cadence-mismatch"
+    armed_by_sequence = {
+        _q8_u64(record, "current_sequence"): record for record in armed
+    }
+    positions: dict[str, dict[int, int]] = {
+        "armed": {}, "checkpoint": {}, "returned": {},
+    }
+    prefixes = {
+        "armed": "ds4: CUDA q8 partner pre-activation armed ",
+        "checkpoint": "ds4: CUDA q8 partner pre-activation fence checkpoint ",
+        "returned": "ds4: CUDA q8 partner pre-activation returned ",
+    }
+    for index, line in enumerate(text.splitlines()):
+        for kind, prefix in prefixes.items():
+            if line.startswith(prefix):
+                match = re.search(r"(?:^| )current_sequence=(\d+)(?: |$)", line)
+                sequence = int(match.group(1)) if match else None
+                if sequence is not None:
+                    positions[kind][sequence] = index
+                break
+    for record in checkpoints:
+        sequence = _q8_u64(record, "current_sequence")
+        if sequence is None or sequence not in armed_by_sequence:
+            return "activation-checkpoint-order-mismatch"
+        if q8_partner_pre_activation_identity(record) != \
+                q8_partner_pre_activation_identity(armed_by_sequence[sequence]):
+            return "activation-checkpoint-binding-mismatch"
+        armed_position = positions["armed"].get(sequence, -1)
+        checkpoint_position = positions["checkpoint"].get(sequence, -1)
+        returned_position = positions["returned"].get(sequence)
+        if (armed_position < 0 or checkpoint_position <= armed_position or
+                (returned_position is not None and
+                 checkpoint_position >= returned_position)):
+            return "activation-checkpoint-order-mismatch"
+    return "complete"
+
+
+def q8_partner_pre_activation_failure_history_valid(
+        text: str, failure: dict[str, str]) -> bool:
+    armed = q8_partner_pre_activation_armed_records(text)
+    returned = q8_partner_pre_activation_returned_records(text)
+    current = _q8_u64(failure, "current_sequence")
+    sequence_domain_exhausted = (
+        failure.get("event") == "state-invalid" and
+        failure.get("stage") == "pre-activation-marker" and
+        failure.get("cuda_status") == "sequence-domain-exhausted" and
+        current == Q8_PRE_ACTIVATION_MARKER_TAG
+    )
+    if sequence_domain_exhausted:
+        # A complete per-call history cannot be materialized at 2^63 calls.
+        # The exact terminal counters were already checked by the record
+        # classifier; accept a terminal exhaustion record without pretending
+        # that a short breadcrumb list can represent that history.
+        relationship = not armed and not returned
+    elif failure.get("event") == "activation-h2d-failed":
+        relationship = (
+            current == len(armed) and len(armed) == len(returned) + 1 and
+            bool(armed) and
+            q8_partner_pre_activation_identity(failure) ==
+            q8_partner_pre_activation_identity(armed[-1])
+        )
+    else:
+        relationship = (
+            current == len(armed) + 1 and len(armed) == len(returned)
+        )
+    if not relationship:
+        return False
+    lines = text.splitlines()
+    failure_prefix = "ds4: CUDA q8 partner pre-activation fence failure "
+    evidence_prefixes = (
+        "ds4: CUDA q8 partner pre-activation armed ",
+        "ds4: CUDA q8 partner pre-activation returned ",
+        "ds4: CUDA q8 partner pre-activation fence checkpoint ",
+    )
+    failure_positions = [
+        index for index, line in enumerate(lines) if failure_prefix in line
+    ]
+    evidence_positions = [
+        index for index, line in enumerate(lines)
+        if any(prefix in line for prefix in evidence_prefixes)
+    ]
+    return (
+        len(failure_positions) == 1 and
+        (not evidence_positions or failure_positions[0] > max(evidence_positions))
+    )
+
+
+def q8_partner_pre_activation_fence_marker_state(text: str) -> str:
+    if not q8_partner_pre_activation_fence_enabled(text, 0):
+        return "not-enabled-exactly-once-for-pair0"
+    order_state = q8_partner_pre_activation_record_order_state(text)
+    if order_state != "complete":
+        return order_state
+    call_state = q8_partner_pre_activation_call_sequence_state(text)
+    checkpoint_state = q8_partner_pre_activation_checkpoint_sequence_state(text)
+    armed = q8_partner_pre_activation_armed_records(text)
+    returned = q8_partner_pre_activation_returned_records(text)
+    failures = q8_partner_pre_activation_fence_records(text, "failure")
+    summaries = q8_partner_pre_activation_fence_records(text, "summary")
+    if failures:
+        if len(failures) != 1:
+            return f"activation-failure-count:{len(failures)}"
+        classification = q8_partner_pre_activation_fence_record_classification(
+            failures[0], "failure"
+        )
+        if classification == "invalid-activation-fence-record":
+            return classification
+        if call_state not in {"complete", "empty"}:
+            return call_state
+        if checkpoint_state != "complete":
+            return checkpoint_state
+        if not q8_partner_pre_activation_failure_history_valid(text, failures[0]):
+            return "activation-failure-history-mismatch"
+        if len(summaries) > 1:
+            return f"activation-summary-count:{len(summaries)}"
+        if summaries:
+            summary_state = q8_partner_pre_activation_summary_state(
+                summaries[0], armed, returned, failures[0],
+                allow_unsynchronized=True,
+            )
+            if summary_state != "complete":
+                return summary_state
+        return "failure-record-present"
+    if call_state != "complete":
+        return call_state
+    if checkpoint_state != "complete":
+        return checkpoint_state
+    if len(armed) != len(returned):
+        return "activation-h2d-return-count-mismatch"
+    if len(summaries) != 1:
+        return f"activation-summary-count:{len(summaries)}"
+    return q8_partner_pre_activation_summary_state(
+        summaries[0], armed, returned
+    )
+
+
+def q8_partner_pre_activation_fence_summary(
+        text: str, run_status: str = ""
+) -> tuple[str, str, str, str, str, str, str, str, str, str, str]:
+    if not q8_partner_pre_activation_fence_enabled(text, 0):
+        empty = ("", "", "", "", "", "", "", "", "", "", "")
+        return (
+            ("", "", "", "", "invalid-activation-fence-record",
+             "", "", "", "", "0", "0")
+            if "q8 partner pre-activation" in text else empty
+        )
+    checkpoints = q8_partner_pre_activation_fence_records(text, "checkpoint")
+    failures = q8_partner_pre_activation_fence_records(text, "failure")
+    summaries = q8_partner_pre_activation_fence_records(text, "summary")
+    armed = q8_partner_pre_activation_armed_records(text)
+    returned = q8_partner_pre_activation_returned_records(text)
+    checkpoint = checkpoints[-1] if checkpoints else {}
+    failure = failures[-1] if failures else {}
+    summary = summaries[-1] if summaries else {}
+    last_armed = armed[-1] if armed else {}
+    last_returned = returned[-1] if returned else {}
+    order_state = q8_partner_pre_activation_record_order_state(text)
+    call_state = q8_partner_pre_activation_call_sequence_state(text)
+    device_loss = run_status in {
+        "failed-device-loss", "interrupted-prior-run-device-loss",
+        "interrupted-no-result-device-loss",
+    }
+    failure_classification = (
+        q8_partner_pre_activation_fence_record_classification(
+            failure, "failure"
+        ) if failure else ""
+    )
+    summary_state = ""
+    if len(summaries) == 1:
+        summary_state = q8_partner_pre_activation_summary_state(
+            summary, armed, returned, failure if failure else None,
+            allow_unsynchronized=(device_loss or bool(failure)),
+        )
+    elif summaries:
+        summary_state = f"activation-summary-count:{len(summaries)}"
+    unsynchronized_cleanup_summary = (
+        len(summaries) == 1 and summary_state == "complete" and
+        summary.get("partners_synchronized") == "no"
+    )
+    checkpoint_state = q8_partner_pre_activation_checkpoint_sequence_state(
+        text, allow_trailing_gap=(
+            device_loss and not failures and
+            (not summaries or unsynchronized_cleanup_summary) and
+            len(armed) == len(returned) + 1
+        )
+    )
+    if failure:
+        if (len(failures) != 1 or
+                failure_classification == "invalid-activation-fence-record" or
+                order_state != "complete" or
+                call_state not in {"complete", "empty"} or
+                checkpoint_state != "complete" or
+                (summary and summary_state != "complete") or
+                not q8_partner_pre_activation_failure_history_valid(
+                     text, failure)):
+            classification = "invalid-activation-fence-record"
+        else:
+            classification = failure_classification
+    elif (order_state != "complete" or
+          call_state not in {"complete", "empty"} or
+          checkpoint_state != "complete"):
+        classification = "invalid-activation-fence-record"
+    elif summary:
+        if len(summaries) != 1 or summary_state != "complete":
+            classification = "invalid-activation-fence-record"
+        elif device_loss and len(armed) == len(returned) + 1:
+            checkpoint_sequence = _q8_u64(checkpoint, "current_sequence")
+            armed_sequence = _q8_u64(last_armed, "current_sequence")
+            classification = (
+                "activation-fence-confirmed-h2d-return-not-observed-"
+                "trailing-checkpoint"
+                if checkpoint_sequence == armed_sequence else
+                "activation-fence-confirmed-h2d-return-not-observed"
+            )
+        elif device_loss:
+            classification = "activation-h2d-returned-subsequent-locus-unresolved"
+        else:
+            classification = "completed-all-activation-h2d-returned"
+    elif device_loss and not summary and len(armed) == len(returned) + 1:
+        checkpoint_sequence = _q8_u64(checkpoint, "current_sequence")
+        armed_sequence = _q8_u64(last_armed, "current_sequence")
+        classification = (
+            "activation-fence-confirmed-h2d-return-not-observed-"
+            "trailing-checkpoint"
+            if checkpoint_sequence == armed_sequence else
+            "activation-fence-confirmed-h2d-return-not-observed"
+        )
+    elif device_loss and not summary and armed and len(armed) == len(returned):
+        classification = "activation-h2d-returned-subsequent-locus-unresolved"
+    elif checkpoint:
+        classification = "prior-activation-fence-calls-confirmed-current-unresolved"
+    else:
+        classification = "activation-fence-enabled-no-call-evidence"
+    if failure:
+        source = failure
+    elif summary:
+        source = summary
+    else:
+        # Sparse checkpoints are not current counters.  Validated breadcrumbs
+        # are exact through the last armed/returned call observed in the log.
+        source = {
+            "attempted": str(len(armed)),
+            "confirmed": str(len(armed)),
+            "returned": str(len(returned)),
+            "failed": "0",
+        }
+    return (
+        format_q8_partner_pre_activation_fence_record(
+            checkpoint,
+            q8_partner_pre_activation_fence_record_classification(
+                checkpoint, "checkpoint"
+            ) if checkpoint else "",
+        ),
+        format_q8_partner_pre_activation_fence_record(
+            failure, failure_classification
+        ),
+        format_q8_partner_pre_activation_call_record(last_armed),
+        format_q8_partner_pre_activation_call_record(last_returned),
+        classification,
+        source.get("attempted", str(len(armed))),
+        source.get("confirmed", str(len(armed))),
+        source.get("returned", str(len(returned))),
+        source.get("failed", "0"),
+        str(len(armed)),
+        str(len(returned)),
+    )
+
+
 def q8_partner_phase_audit_markers(
         text: str, pair: int | None) -> list[dict[str, str]]:
     pattern = re.compile(
@@ -1707,6 +2518,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_pre_gather_fence = outcomes.get(
         "attention-q8-pre-gather-fence", "not-run"
     )
+    attention_q8_activation_fence = outcomes.get(
+        "attention-q8-activation-fence", "not-run"
+    )
     attention_q8_phase_audit = outcomes.get(
         "attention-q8-phase-audit", "not-run"
     )
@@ -1760,6 +2574,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_pre_gather_fence_rows = [
         row for row in rows
         if row.get("variant") == "attention-q8-pre-gather-fence"
+    ]
+    attention_q8_activation_fence_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-activation-fence"
     ]
     attention_q8_phase_audit_rows = [
         row for row in rows
@@ -1967,6 +2785,158 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         all(row.get("attention_row_boundary_marker_state") == "complete"
             for row in boundary_rows)
     )
+    if attention_q8_activation_fence != "not-run":
+        invalid_statuses = {
+            "validation-failed", "environment-invalid",
+            "passed-invalidated-watch", "completed-no-result-invalidated-watch",
+        }
+        statuses = {
+            row.get("status", "") for row in attention_q8_activation_fence_rows
+        }
+        device_loss_statuses = {
+            "failed-device-loss", "interrupted-prior-run-device-loss",
+            "interrupted-no-result-device-loss",
+        }
+        evidence_rows = [
+            row for row in attention_q8_activation_fence_rows
+            if row.get("status") in device_loss_statuses
+        ]
+        all_classifications = {
+            row.get("q8_pre_activation_fence_classification", "")
+            for row in attention_q8_activation_fence_rows
+        }
+        classifications = {
+            row.get("q8_pre_activation_fence_classification", "")
+            for row in evidence_rows
+        }
+        failure = next((
+            row.get("q8_pre_activation_fence_last_failure", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_activation_fence_last_failure")
+        ), "")
+        armed = next((
+            row.get("q8_pre_activation_fence_last_armed", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_activation_fence_last_armed")
+        ), "")
+        returned = next((
+            row.get("q8_pre_activation_fence_last_returned", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_activation_fence_last_returned")
+        ), "")
+        checkpoint = next((
+            row.get("q8_pre_activation_fence_last_checkpoint", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_activation_fence_last_checkpoint")
+        ), "")
+        if (statuses & invalid_statuses or
+                attention_q8_activation_fence == "invalid" or
+                "invalid-activation-fence-record" in all_classifications):
+            return (
+                "The pre-activation-fence arm failed its exact enable, tagged marker, "
+                "sequence, pair mapping, binding metadata, counter, or production-path "
+                "validation. Its activation record is invalid for boundary inference."
+            )
+        if len(classifications - {""}) > 1:
+            return (
+                "Repeated pre-activation-fence arms ended at different validated API "
+                "boundaries (`" + "`, `".join(sorted(classifications - {""})) +
+                "`). Preserve the records separately; their combination does not "
+                "identify one failure locus."
+            )
+        classification = next(iter(classifications - {""}), "")
+        if classification == "activation-source-d2h-failed":
+            return (
+                "The activation source D2H call was the first API in this diagnostic "
+                "to report failure; destination synchronization and activation H2D "
+                "were not attempted. A synchronous D2H can surface earlier source-side "
+                "work, so this observation does not prove that D2H traffic caused the "
+                "reset. Last record: " + failure
+            )
+        if classification == "activation-destination-switch-or-setup-failed":
+            return (
+                "Activation D2H completed, then destination context selection failed "
+                "before the pre-H2D device fence or H2D. This localizes the first "
+                "reported error to destination switch/setup, without identifying the "
+                "underlying hardware or software cause. Last record: " + failure
+            )
+        if classification == "activation-pre-h2d-device-sync-failed":
+            return (
+                "Activation D2H and destination selection completed, but the explicit "
+                "destination-wide pre-H2D synchronization first reported failure. The "
+                "current activation H2D was not attempted; the synchronization may be "
+                "surfacing prior destination work or a poisoned context and is not "
+                "itself proven causal. Last record: " + failure
+            )
+        if classification == "activation-marker-channel-failure":
+            return (
+                "Activation D2H and destination synchronization completed before the "
+                "tagged marker launch/event/validation channel failed. No current "
+                "activation H2D was attempted. This identifies the observation-channel "
+                "boundary, not the reset cause. Last record: " + failure
+            )
+        if classification == "activation-fence-confirmed-h2d-failed":
+            return (
+                "The source D2H, destination-wide fence, and exact tagged marker were "
+                "confirmed before activation H2D was invoked; that synchronous H2D "
+                "then reported failure. H2D is the first failing API for this call, "
+                "but the record does not prove that H2D initiated the endpoint reset. "
+                "Last record: " + failure
+            )
+        if classification == (
+                "activation-fence-confirmed-h2d-return-not-observed-"
+                "trailing-checkpoint"):
+            return (
+                "The final armed record and same-sequence durable sparse checkpoint "
+                "confirm source D2H, destination synchronization, and the exact tagged "
+                "marker immediately before activation H2D. No matching returned "
+                "breadcrumb was observed before the device-loss watcher ended the "
+                "process. A kill can occur after API success but before logging, so "
+                "this does not prove H2D failed or caused the reset. Last checkpoint: " +
+                checkpoint + "; last armed: " + armed
+            )
+        if classification == "activation-fence-confirmed-h2d-return-not-observed":
+            return (
+                "The final fflush-only armed record confirms source D2H, destination "
+                "synchronization, and the exact tagged marker before activation H2D, "
+                "but no matching returned breadcrumb was observed before watcher "
+                "termination. This narrows the observation interval without proving "
+                "that H2D failed to return or caused the reset. Last armed: " + armed
+            )
+        if classification == "activation-h2d-returned-subsequent-locus-unresolved":
+            return (
+                "Every observed activation arm has a matching returned breadcrumb, so "
+                "the latest synchronous activation H2D returned successfully and no "
+                "recorded activation H2D is a no-return event. The "
+                "device-loss run has no later activation arm observed, leaving the "
+                "subsequent locus unresolved. Any teardown inability to synchronize the "
+                "partner does not retract the earlier return evidence or identify the "
+                "reset cause. "
+                "Last armed: " + armed +
+                "; last returned: " + returned
+            )
+        if classification in {
+                "activation-audit-state-failed",
+                "activation-source-or-staging-setup-failed"}:
+            return (
+                "The activation diagnostic failed in its audit state or source staging/"
+                "setup before a current activation D2H/H2D boundary was established. "
+                "This is valid software diagnostic evidence, not an identified reset "
+                "cause. Last record: " + failure
+            )
+        if attention_q8_activation_fence == "passed":
+            return (
+                "Every selected activation copy in the completed arm crossed source "
+                "D2H, destination synchronization, the exact tagged marker, and a "
+                "successful synchronous H2D return. The added device-wide fence and "
+                "per-call logging perturb overlap, so survival does not clear the "
+                "unfenced production path."
+            )
+        return (
+            "The pre-activation-fence arm has no validated record resolving the "
+            "device-loss boundary. Sparse checkpoint absence alone is not negative "
+            "evidence."
+        )
     if attention_q8_pre_gather_fence != "not-run":
         invalid_fence_statuses = {
             "validation-failed", "environment-invalid",
@@ -3477,6 +4447,14 @@ def main() -> None:
          q8_fence_returned_count) = q8_partner_pre_gather_fence_summary(
              log_text, status
          )
+        (q8_activation_last, q8_activation_last_failure,
+         q8_activation_last_armed, q8_activation_last_returned,
+         q8_activation_classification, q8_activation_attempted,
+         q8_activation_confirmed, q8_activation_returned,
+         q8_activation_failed, q8_activation_armed_count,
+         q8_activation_returned_count) = q8_partner_pre_activation_fence_summary(
+             log_text, status
+         )
         if variant == "attention-q8-l14-l15-phase-audit":
             (q8_window_last_complete, q8_window_l14_complete,
              q8_window_l15_complete, q8_window_classification) = (
@@ -3524,6 +4502,21 @@ def main() -> None:
             "q8_pre_gather_fence_failed": q8_fence_failed,
             "q8_pre_gather_fence_result_gather_failed_after_confirmed": (
                 q8_fence_gather_failed
+            ),
+            "q8_pre_activation_fence_last_checkpoint": q8_activation_last,
+            "q8_pre_activation_fence_last_failure": q8_activation_last_failure,
+            "q8_pre_activation_fence_last_armed": q8_activation_last_armed,
+            "q8_pre_activation_fence_last_returned": q8_activation_last_returned,
+            "q8_pre_activation_fence_classification": (
+                q8_activation_classification
+            ),
+            "q8_pre_activation_fence_attempted": q8_activation_attempted,
+            "q8_pre_activation_fence_confirmed": q8_activation_confirmed,
+            "q8_pre_activation_fence_returned": q8_activation_returned,
+            "q8_pre_activation_fence_failed": q8_activation_failed,
+            "q8_pre_activation_fence_armed_count": q8_activation_armed_count,
+            "q8_pre_activation_fence_returned_count": (
+                q8_activation_returned_count
             ),
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
@@ -3614,6 +4607,13 @@ def main() -> None:
         "helper returned successfully. A missing returned record means only that its "
         "breadcrumb was not observed before termination; it is not proof that a "
         "CUDA copy API failed to return.",
+        "The pre-activation-fence arm additionally stages activation through host "
+        "memory, synchronizes the destination device, and confirms a high-bit-tagged "
+        "marker on its default stream before synchronous activation H2D. Armed/"
+        "returned records carry the complete binding identity. These records identify "
+        "where CUDA first surfaced an error; they do not establish what caused an "
+        "endpoint reset. The shared marker slot is later reused, so its teardown value "
+        "is not required to equal the last activation tag.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Q8 async classification | Q8 async counts | "
@@ -3622,7 +4622,11 @@ def main() -> None:
         "Q8 pre-gather counts | Q8 pre-gather last checkpoint | "
         "Q8 pre-gather armed/returned count | Q8 pre-gather last armed | "
         "Q8 pre-gather last returned | "
-        "Q8 pre-gather last failure | Pair-0 Q8 begun bytes* | "
+        "Q8 pre-gather last failure | Q8 pre-activation classification | "
+        "Q8 pre-activation counts | Q8 pre-activation last checkpoint | "
+        "Q8 pre-activation armed/returned count | Q8 pre-activation last armed | "
+        "Q8 pre-activation last returned | Q8 pre-activation last failure | "
+        "Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
         "Q8 phase classification | Q8 skipped occurrence | "
         "Q8 selected occurrence | Q8 occurrence mapping | "
@@ -3636,7 +4640,7 @@ def main() -> None:
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| " + " | ".join(["---"] * 49) + " |",
+        "| " + " | ".join(["---"] * 56) + " |",
     ]
     for row in rows:
         lines.append(
@@ -3662,6 +4666,17 @@ def main() -> None:
             f"{row.get('q8_pre_gather_fence_last_armed', '')} | "
             f"{row.get('q8_pre_gather_fence_last_returned', '')} | "
             f"{row.get('q8_pre_gather_fence_last_failure', '')} | "
+            f"{row.get('q8_pre_activation_fence_classification', '')} | "
+            f"{row.get('q8_pre_activation_fence_attempted', '')}/"
+            f"{row.get('q8_pre_activation_fence_confirmed', '')}/"
+            f"{row.get('q8_pre_activation_fence_returned', '')}/"
+            f"{row.get('q8_pre_activation_fence_failed', '')} | "
+            f"{row.get('q8_pre_activation_fence_last_checkpoint', '')} | "
+            f"{row.get('q8_pre_activation_fence_armed_count', '')}/"
+            f"{row.get('q8_pre_activation_fence_returned_count', '')} | "
+            f"{row.get('q8_pre_activation_fence_last_armed', '')} | "
+            f"{row.get('q8_pre_activation_fence_last_returned', '')} | "
+            f"{row.get('q8_pre_activation_fence_last_failure', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
@@ -3724,6 +4739,14 @@ if __name__ == "__main__":
         )
         if state != "complete":
             fail(f"Q8 pre-gather-fence marker state is {state}")
+    elif (len(sys.argv) == 3 and
+            sys.argv[1] == "--validate-q8-pre-activation-fence-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_pre_activation_fence_marker_state(
+            log_path.read_text(errors="replace")
+        )
+        if state != "complete":
+            fail(f"Q8 pre-activation-fence marker state is {state}")
     elif (len(sys.argv) == 4 and
             sys.argv[1] == "--validate-q8-l14-l15-log"):
         log_path = Path(sys.argv[2])

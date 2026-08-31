@@ -1299,6 +1299,22 @@ static std::atomic<uint64_t>
     g_q8_f16_partner_pre_gather_fence_result_gather_failed[DS4_MAX_GPUS] = {};
 static std::atomic<uint64_t>
     g_q8_f16_partner_pre_gather_fence_last_sequence[DS4_MAX_GPUS] = {};
+/* Pair-scoped activation-copy diagnostic.  It reuses the required async
+ * completion slot/event with a disjoint high-bit marker domain.  The
+ * activation event is synchronized before H2D and partner compute; later
+ * post-compute work overwrites the slot with its ordinary untagged sequence
+ * and re-records the same event.  Thus a pre-compute activation marker cannot
+ * be mistaken for positive post-compute evidence. */
+static std::atomic<uint64_t>
+    g_q8_f16_partner_pre_activation_fence_attempted[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_pre_activation_fence_confirmed[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_pre_activation_fence_returned[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_pre_activation_fence_failed[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_pre_activation_fence_last_sequence[DS4_MAX_GPUS] = {};
 static std::atomic<uint64_t> g_t32_f16_fused_local_calls = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_partner_calls = 0;
 
@@ -4475,6 +4491,16 @@ static int cuda_q8_f16_partner_async_completion_init(void) {
             0u, std::memory_order_relaxed);
         g_q8_f16_partner_pre_gather_fence_last_sequence[home_tier].store(
             0u, std::memory_order_relaxed);
+        g_q8_f16_partner_pre_activation_fence_attempted[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_pre_activation_fence_confirmed[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_pre_activation_fence_returned[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_pre_activation_fence_failed[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_pre_activation_fence_last_sequence[home_tier].store(
+            0u, std::memory_order_relaxed);
     }
     if (cudaSetDevice(saved_device) != cudaSuccess) initialized = 0;
     g_current_logical_tier = -1;
@@ -4513,6 +4539,15 @@ static int cuda_q8_f16_partner_async_completion_init(void) {
                 "logical_pairs=%s boundary=post-marker-event-sync "
                 "marker=exact-before-result-d2h\n",
                 pre_gather_fence_pairs);
+    }
+    const char *pre_activation_fence_pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS");
+    if (pre_activation_fence_pairs && pre_activation_fence_pairs[0]) {
+        fprintf(stderr,
+                "ds4: CUDA q8 partner pre-activation fence audit enabled: "
+                "logical_pairs=%s boundary=post-source-d2h-destination-sync "
+                "marker=destination-default-stream-tagged-exact-before-activation-h2d\n",
+                pre_activation_fence_pairs);
     }
     fflush(stderr);
     return 1;
@@ -4567,6 +4602,36 @@ static void cuda_q8_f16_partner_async_completion_report(
                         std::memory_order_relaxed),
                 partner_synchronized && partner_synchronized[home_tier]
                     ? "yes" : "no");
+        if (cuda_env_pair_list_contains(
+                "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS",
+                home_tier)) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 partner pre-activation fence summary "
+                    "home_tier=%d partner_tier=%d attempted=%llu "
+                    "confirmed=%llu returned=%llu failed=%llu "
+                    "last_sequence=%llu shared_slot_sequence=%llu "
+                    "shared_slot_complement=%llu partners_synchronized=%s\n",
+                    home_tier, home_tier + g_n_gpus / 2,
+                    (unsigned long long)
+                        g_q8_f16_partner_pre_activation_fence_attempted[home_tier]
+                            .load(std::memory_order_relaxed),
+                    (unsigned long long)
+                        g_q8_f16_partner_pre_activation_fence_confirmed[home_tier]
+                            .load(std::memory_order_relaxed),
+                    (unsigned long long)
+                        g_q8_f16_partner_pre_activation_fence_returned[home_tier]
+                            .load(std::memory_order_relaxed),
+                    (unsigned long long)
+                        g_q8_f16_partner_pre_activation_fence_failed[home_tier]
+                            .load(std::memory_order_relaxed),
+                    (unsigned long long)
+                        g_q8_f16_partner_pre_activation_fence_last_sequence[home_tier]
+                            .load(std::memory_order_relaxed),
+                    (unsigned long long)sequence,
+                    (unsigned long long)complement,
+                    partner_synchronized && partner_synchronized[home_tier]
+                        ? "yes" : "no");
+        }
     }
     fflush(stderr);
     (void)fsync(fileno(stderr));
@@ -4652,8 +4717,70 @@ static void cuda_q8_f16_partner_async_completion_release(void) {
     g_current_logical_tier = -1;
 }
 
+static void cuda_format_device_uuid(char out[41], const cudaUUID_t *uuid) {
+    const unsigned char *b =
+        uuid ? (const unsigned char *)uuid->bytes : NULL;
+    if (!b) {
+        snprintf(out, 41, "unavailable");
+        return;
+    }
+    snprintf(out, 41,
+             "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+/* Emit the CUDA runtime's complete ordinal identity map before logical tiers
+ * are constructed.  Ordinals are process-global and can differ from
+ * nvidia-smi indices unless CUDA_DEVICE_ORDER is controlled, so recording only
+ * the selected tiers would leave a topology audit unable to prove its device
+ * identities.  Inventory failure is diagnostic only here: normal CUDA
+ * initialization retains its existing error behavior for selected devices. */
+static void cuda_log_device_ordinal_inventory(void) {
+    int count = 0;
+    const cudaError_t count_error = cudaGetDeviceCount(&count);
+    if (count_error != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA ordinal inventory unavailable: %s\n",
+                cudaGetErrorString(count_error));
+        (void)cudaGetLastError();
+        return;
+    }
+    for (int ordinal = 0; ordinal < count; ordinal++) {
+        cudaDeviceProp prop = {};
+        char pci_bus_id[32] = {};
+        const cudaError_t prop_error =
+            cudaGetDeviceProperties(&prop, ordinal);
+        const cudaError_t bus_error = cudaDeviceGetPCIBusId(
+            pci_bus_id, (int)sizeof(pci_bus_id), ordinal);
+        if (prop_error != cudaSuccess || bus_error != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA ordinal inventory ordinal=%d "
+                    "pci_bus_id=unavailable uuid=unavailable "
+                    "query_status=%s/%s\n",
+                    ordinal, cudaGetErrorName(prop_error),
+                    cudaGetErrorName(bus_error));
+            (void)cudaGetLastError();
+            continue;
+        }
+        char uuid[41] = {};
+        cuda_format_device_uuid(uuid, &prop.uuid);
+        fprintf(stderr,
+                "ds4: CUDA ordinal inventory ordinal=%d pci_bus_id=%s "
+                "uuid=%s\n",
+                ordinal, pci_bus_id, uuid);
+    }
+    fflush(stderr);
+}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    const char *pre_activation_fence_pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS");
+    const bool pre_activation_identity_audit =
+        pre_activation_fence_pairs && pre_activation_fence_pairs[0];
+    if (pre_activation_identity_audit) cuda_log_device_ordinal_inventory();
     const char *async_completion_pairs = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS");
     const char *pre_gather_fence_pairs = getenv(
@@ -4673,6 +4800,14 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                 "expected a unique in-range decimal logical-pair list\n");
         return 0;
     }
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            pre_activation_fence_pairs, cfg->n_gpus, false)) {
+        fprintf(stderr,
+                "ds4: invalid "
+                "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS; "
+                "expected a unique in-range decimal logical-pair list\n");
+        return 0;
+    }
     if (pre_gather_fence_pairs && pre_gather_fence_pairs[0]) {
         for (int pair = 0; pair < cfg->n_gpus / 2; pair++) {
             if (!cuda_env_pair_list_contains(
@@ -4687,6 +4822,26 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                         "ds4: Q8 pre-gather fence pair %d requires the same "
                         "pair in both the async-completion and host-bounce "
                         "pair lists\n",
+                        pair);
+                return 0;
+            }
+        }
+    }
+    if (pre_activation_fence_pairs && pre_activation_fence_pairs[0]) {
+        for (int pair = 0; pair < cfg->n_gpus / 2; pair++) {
+            if (!cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS",
+                    pair)) continue;
+            if (!cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", pair) ||
+                !cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS", pair) ||
+                !cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS", pair)) {
+                fprintf(stderr,
+                        "ds4: Q8 pre-activation fence pair %d requires the "
+                        "same pair in the host-bounce, async-completion, and "
+                        "pre-gather-fence pair lists\n",
                         pair);
                 return 0;
             }
@@ -4763,12 +4918,37 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         g_n_gpus = i + 1;
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+        const cudaError_t prop_error =
+            cudaGetDeviceProperties(&prop, c->device_id);
+        if (pre_activation_identity_audit) {
+            char selected_pci_bus_id[32] = {};
+            char selected_uuid[41] = {};
+            const cudaError_t bus_error = cudaDeviceGetPCIBusId(
+                selected_pci_bus_id, (int)sizeof(selected_pci_bus_id),
+                c->device_id);
+            if (prop_error == cudaSuccess) {
+                cuda_format_device_uuid(selected_uuid, &prop.uuid);
+            } else {
+                snprintf(selected_uuid, sizeof(selected_uuid), "unavailable");
+            }
+            if (bus_error != cudaSuccess) {
+                snprintf(selected_pci_bus_id, sizeof(selected_pci_bus_id),
+                         "unavailable");
+            }
+            fprintf(stderr,
+                    "ds4: CUDA selected device identity logical_tier=%d "
+                    "cuda_ordinal=%d pci_bus_id=%s uuid=%s "
+                    "query_status=%s/%s\n",
+                    i, c->device_id, selected_pci_bus_id, selected_uuid,
+                    cudaGetErrorName(prop_error), cudaGetErrorName(bus_error));
+        }
+        if (prop_error == cudaSuccess) {
             c->compute_major = prop.major;
             c->compute_minor = prop.minor;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         }
+        fflush(stderr);
         /* Per-device stream. */
         cudaStream_t s = NULL;
         if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
@@ -17283,6 +17463,418 @@ static void cuda_q8_f16_partner_pre_gather_returned_log(
     fflush(stderr);
 }
 
+static constexpr uint64_t CUDA_Q8_PRE_ACTIVATION_MARKER_TAG =
+    UINT64_C(1) << 63;
+
+static void cuda_q8_f16_partner_pre_activation_count_failure(int home_tier) {
+    if (home_tier < 0 || home_tier >= DS4_MAX_GPUS) return;
+    g_q8_f16_partner_pre_activation_fence_failed[home_tier].fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+static void cuda_q8_f16_partner_pre_activation_fence_log(
+        const char *record_kind, const char *event_name, const char *stage,
+        const char *cuda_status, const char *destination_sync_status,
+        const char *interpretation, bool activation_d2h_attempted,
+        bool activation_d2h_completed, bool activation_h2d_attempted,
+        bool activation_h2d_completed, bool durable,
+        uint64_t current_sequence, uint64_t marker_sequence,
+        uint64_t marker_complement, bool marker_matches,
+        int home_tier, int home_device, int partner_tier, int partner_device,
+        uint64_t bytes, uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset) {
+    if (current_sequence == 0u || home_tier < 0 ||
+        home_tier >= DS4_MAX_GPUS) return;
+    fprintf(stderr,
+            "ds4: CUDA q8 partner pre-activation fence %s "
+            "event=%s stage=%s current_sequence=%llu marker_sequence=%llu "
+            "marker_complement=%llu marker_matches=%s cuda_status=%s "
+            "destination_sync_status=%s activation_d2h_attempted=%s "
+            "activation_d2h_completed=%s activation_h2d_attempted=%s "
+            "activation_h2d_completed=%s interpretation=%s "
+            "attempted=%llu confirmed=%llu returned=%llu failed=%llu "
+            "home_tier=%d home_device=%d partner_tier=%d "
+            "partner_device=%d bytes=%llu tokens=%llu in=%llu out=%llu "
+            "binding_label=%s passed_label=%s weight_offset=%llu\n",
+            record_kind && record_kind[0] ? record_kind : "failure",
+            event_name && event_name[0] ? event_name : "unknown",
+            stage && stage[0] ? stage : "unknown",
+            (unsigned long long)current_sequence,
+            (unsigned long long)marker_sequence,
+            (unsigned long long)marker_complement,
+            marker_matches ? "yes" : "no",
+            cuda_status && cuda_status[0] ? cuda_status : "unknown",
+            destination_sync_status && destination_sync_status[0]
+                ? destination_sync_status : "not-attempted",
+            activation_d2h_attempted ? "yes" : "no",
+            activation_d2h_completed ? "yes" : "no",
+            activation_h2d_attempted ? "yes" : "no",
+            activation_h2d_completed ? "yes" : "no",
+            interpretation && interpretation[0] ? interpretation : "unknown",
+            (unsigned long long)
+                g_q8_f16_partner_pre_activation_fence_attempted[home_tier]
+                    .load(std::memory_order_relaxed),
+            (unsigned long long)
+                g_q8_f16_partner_pre_activation_fence_confirmed[home_tier]
+                    .load(std::memory_order_relaxed),
+            (unsigned long long)
+                g_q8_f16_partner_pre_activation_fence_returned[home_tier]
+                    .load(std::memory_order_relaxed),
+            (unsigned long long)
+                g_q8_f16_partner_pre_activation_fence_failed[home_tier]
+                    .load(std::memory_order_relaxed),
+            home_tier, home_device, partner_tier, partner_device,
+            (unsigned long long)bytes, (unsigned long long)n_tok,
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "unavailable",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+    if (durable) (void)fsync(fileno(stderr));
+}
+
+static void cuda_q8_f16_partner_pre_activation_armed_log(
+        uint64_t current_sequence, uint64_t marker_sequence,
+        uint64_t marker_complement, int home_tier, int home_device,
+        int partner_tier, int partner_device, uint64_t bytes,
+        uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset) {
+    fprintf(stderr,
+            "ds4: CUDA q8 partner pre-activation armed "
+            "current_sequence=%llu marker_sequence=%llu "
+            "marker_complement=%llu activation_d2h_status=complete "
+            "destination_sync_status=complete home_tier=%d home_device=%d "
+            "partner_tier=%d partner_device=%d bytes=%llu tokens=%llu "
+            "in=%llu out=%llu binding_label=%s passed_label=%s "
+            "weight_offset=%llu\n",
+            (unsigned long long)current_sequence,
+            (unsigned long long)marker_sequence,
+            (unsigned long long)marker_complement,
+            home_tier, home_device, partner_tier, partner_device,
+            (unsigned long long)bytes, (unsigned long long)n_tok,
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "unavailable",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+}
+
+static void cuda_q8_f16_partner_pre_activation_returned_log(
+        uint64_t current_sequence, int home_tier, int home_device,
+        int partner_tier, int partner_device, uint64_t bytes,
+        uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset) {
+    fprintf(stderr,
+            "ds4: CUDA q8 partner pre-activation returned "
+            "current_sequence=%llu activation_h2d_status=success "
+            "home_tier=%d home_device=%d partner_tier=%d partner_device=%d "
+            "bytes=%llu tokens=%llu in=%llu out=%llu binding_label=%s "
+            "passed_label=%s weight_offset=%llu\n",
+            (unsigned long long)current_sequence,
+            home_tier, home_device, partner_tier, partner_device,
+            (unsigned long long)bytes, (unsigned long long)n_tok,
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "unavailable",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+}
+
+static int cuda_q8_f16_partner_pre_activation_fence_copy(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes,
+        int home_tier, int home_device, int partner_tier, int partner_device,
+        uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset) {
+    if (home_tier < 0 || home_tier >= DS4_MAX_GPUS) return 0;
+    const uint64_t sequence =
+        g_q8_f16_partner_pre_activation_fence_attempted[home_tier].fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    uint64_t marker_sequence = 0u;
+    uint64_t marker_complement = 0u;
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes ||
+        bytes == 0u || ds4_tensor_device_idx(src) != home_tier ||
+        ds4_tensor_device_idx(dst) != partner_tier) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "copy-contract-invalid", "pre-activation-d2h",
+            "not-attempted", "not-attempted",
+            "failure-before-activation-d2h", false, false, false, false,
+            true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        return 0;
+    }
+    if ((sequence & CUDA_Q8_PRE_ACTIVATION_MARKER_TAG) != 0u) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "state-invalid", "pre-activation-marker",
+            "sequence-domain-exhausted", "not-attempted",
+            "failure-before-activation-d2h", false, false, false, false,
+            true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        return 0;
+    }
+    const uint64_t expected_marker_sequence =
+        sequence | CUDA_Q8_PRE_ACTIVATION_MARKER_TAG;
+    const int sd = ds4_tensor_device_idx(src);
+    const int dd = ds4_tensor_device_idx(dst);
+    cuda_q8_f16_partner_async_completion_slot *device_slot =
+        home_tier >= 0 && home_tier < DS4_MAX_GPUS
+            ? g_q8_f16_partner_async_completion_device[home_tier] : NULL;
+    cudaEvent_t completion_event =
+        home_tier >= 0 && home_tier < DS4_MAX_GPUS
+            ? g_q8_f16_partner_async_completion_event[home_tier] : NULL;
+    if (!g_q8_f16_partner_async_completion_host || !device_slot ||
+        !completion_event || sd < 0 || sd >= g_n_gpus || dd < 0 ||
+        dd >= g_n_gpus) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "state-invalid", "pre-activation-d2h",
+            "not-attempted", "not-attempted",
+            "failure-before-activation-d2h", false, false, false, false,
+            true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        return 0;
+    }
+
+    if (g_xdev_bounce_bytes[sd][dd] < bytes) {
+        if (g_xdev_bounce[sd][dd]) {
+            const cudaError_t free_error =
+                cudaFreeHost(g_xdev_bounce[sd][dd]);
+            if (free_error != cudaSuccess) {
+                cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+                cuda_q8_f16_partner_pre_activation_fence_log(
+                    "failure", "bounce-free-failed", "activation-staging",
+                    cudaGetErrorName(free_error), "not-attempted",
+                    "failure-surfaced-by-bounce-free-before-activation-d2h",
+                    false, false, false, false, true, sequence,
+                    0u, 0u, false,
+                    home_tier, home_device, partner_tier, partner_device,
+                    bytes, n_tok, in_dim, out_dim, binding_label,
+                    passed_label, weight_offset);
+                /* Keep the prior pointer and size intact so teardown can
+                 * still account for the pinned allocation. */
+                (void)cudaGetLastError();
+                return 0;
+            }
+            g_xdev_bounce[sd][dd] = NULL;
+            g_xdev_bounce_bytes[sd][dd] = 0u;
+        }
+        const cudaError_t alloc_error = cudaMallocHost(
+            &g_xdev_bounce[sd][dd], (size_t)bytes);
+        if (alloc_error != cudaSuccess || !g_xdev_bounce[sd][dd]) {
+            cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+            cuda_q8_f16_partner_pre_activation_fence_log(
+                "failure", "bounce-alloc-failed", "activation-staging",
+                cudaGetErrorName(alloc_error), "not-attempted",
+                "failure-before-activation-d2h", false, false, false, false,
+                true, sequence, 0u, 0u, false,
+                home_tier, home_device, partner_tier, partner_device,
+                bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+                weight_offset);
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_xdev_bounce_bytes[sd][dd] = bytes;
+    }
+
+    if (ds4_gpu_set_current_device(home_tier) != 0) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "source-switch-failed", "activation-d2h",
+            "cudaSetDevice-failed", "not-attempted",
+            "failure-before-activation-d2h", false, false, false, false,
+            true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        return 0;
+    }
+    const cudaError_t d2h_error = cudaMemcpy(
+        g_xdev_bounce[sd][dd], src->ptr, (size_t)bytes,
+        cudaMemcpyDeviceToHost);
+    if (d2h_error != cudaSuccess) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "activation-d2h-failed", "activation-d2h",
+            cudaGetErrorName(d2h_error), "not-attempted",
+            "failure-surfaced-by-activation-d2h", true, false,
+            false, false, true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (ds4_gpu_set_current_device(partner_tier) != 0) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "destination-switch-failed", "pre-activation-h2d",
+            "cudaSetDevice-failed", "not-attempted",
+            "failure-after-activation-d2h-before-destination-sync",
+            true, true, false, false, true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation destination switch failure");
+        return 0;
+    }
+
+    const cudaError_t destination_sync = cudaDeviceSynchronize();
+    if (destination_sync != cudaSuccess) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "destination-sync-failed", "pre-activation-h2d",
+            cudaGetErrorName(destination_sync), "failed",
+            "failure-surfaced-by-pre-h2d-destination-device-sync",
+            true, true, false, false, true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cudaGetLastError();
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation destination synchronize failure");
+        return 0;
+    }
+
+    cuda_q8_f16_partner_async_completion_kernel<<<1, 1, 0, 0>>>(
+        device_slot, expected_marker_sequence);
+    const cudaError_t marker_launch = cudaGetLastError();
+    if (marker_launch != cudaSuccess) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "marker-launch-failed", "pre-activation-marker",
+            cudaGetErrorName(marker_launch), "complete",
+            "failure-surfaced-by-pre-h2d-marker-launch",
+            true, true, false, false, true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation marker launch failure");
+        return 0;
+    }
+    const cudaError_t event_record = cudaEventRecord(completion_event, 0);
+    if (event_record != cudaSuccess) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "event-record-failed", "pre-activation-marker",
+            cudaGetErrorName(event_record), "complete",
+            "failure-surfaced-by-pre-h2d-event-record",
+            true, true, false, false, true, sequence, 0u, 0u, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cudaGetLastError();
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation event record failure");
+        return 0;
+    }
+    const cudaError_t event_sync = cudaEventSynchronize(completion_event);
+    if (event_sync != cudaSuccess) {
+        const bool marker_matches =
+            cuda_q8_f16_partner_async_completion_read(
+                home_tier, expected_marker_sequence,
+                &marker_sequence, &marker_complement);
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "event-sync-failed", "pre-activation-marker",
+            cudaGetErrorName(event_sync), "complete",
+            "failure-surfaced-by-pre-h2d-event-sync",
+            true, true, false, false, true, sequence,
+            marker_sequence, marker_complement, marker_matches,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cudaGetLastError();
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation event synchronize failure");
+        return 0;
+    }
+    const bool marker_matches =
+        cuda_q8_f16_partner_async_completion_read(
+            home_tier, expected_marker_sequence,
+            &marker_sequence, &marker_complement);
+    if (!marker_matches) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "marker-validation-failed", "pre-activation-marker",
+            "complete", "complete",
+            "pre-h2d-event-confirmed-marker-invalid",
+            true, true, false, false, true, sequence,
+            marker_sequence, marker_complement, false,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation marker validation failure");
+        return 0;
+    }
+
+    const uint64_t confirmed =
+        g_q8_f16_partner_pre_activation_fence_confirmed[home_tier].fetch_add(
+            1u, std::memory_order_relaxed) + 1u;
+    g_q8_f16_partner_pre_activation_fence_last_sequence[home_tier].store(
+        sequence, std::memory_order_relaxed);
+    cuda_q8_f16_partner_pre_activation_armed_log(
+        sequence, marker_sequence, marker_complement,
+        home_tier, home_device, partner_tier, partner_device,
+        bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+        weight_offset);
+    if (confirmed == 1u || (confirmed & UINT64_C(63)) == 0u) {
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "checkpoint", "marker-confirmed", "pre-activation-h2d",
+            "complete", "complete",
+            "activation-d2h-and-destination-stream-confirmed-before-h2d",
+            true, true, false, false, true, sequence,
+            marker_sequence, marker_complement, true,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+    }
+
+    const cudaError_t h2d_error = cudaMemcpy(
+        dst->ptr, g_xdev_bounce[sd][dd], (size_t)bytes,
+        cudaMemcpyHostToDevice);
+    if (h2d_error != cudaSuccess) {
+        cuda_q8_f16_partner_pre_activation_count_failure(home_tier);
+        cuda_q8_f16_partner_pre_activation_fence_log(
+            "failure", "activation-h2d-failed", "activation-h2d",
+            cudaGetErrorName(h2d_error), "complete",
+            "failure-surfaced-by-activation-h2d-after-confirmed-boundary",
+            true, true, true, false, true, sequence,
+            marker_sequence, marker_complement, true,
+            home_tier, home_device, partner_tier, partner_device,
+            bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+            weight_offset);
+        (void)cudaGetLastError();
+        (void)cuda_q8_f16_restore_home(
+            home_tier, "pre-activation h2d failure");
+        return 0;
+    }
+    g_q8_f16_partner_pre_activation_fence_returned[home_tier].fetch_add(
+        1u, std::memory_order_relaxed);
+    cuda_q8_f16_partner_pre_activation_returned_log(
+        sequence, home_tier, home_device, partner_tier, partner_device,
+        bytes, n_tok, in_dim, out_dim, binding_label, passed_label,
+        weight_offset);
+    /* Leave the destination current on success.  The production caller's
+     * next operation explicitly selects this same partner tier, so avoiding a
+     * home/partner round trip preserves that ordering while keeping the
+     * logical-device cache truthful. */
+    return 1;
+}
+
 static void cuda_q8_f16_partner_async_completion_failure_log(
         const char *failure_stage, bool current_event_recorded,
         uint64_t current_sequence, int home_tier, int home_device,
@@ -17541,10 +18133,23 @@ static int cuda_q8_f16_partner_matmul_impl(
         "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS", home_tier);
     const bool pre_gather_fence_call = cuda_env_pair_list_contains(
         "DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS", home_tier);
+    const bool pre_activation_fence_call = cuda_env_pair_list_contains(
+        "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS", home_tier);
     if (pre_gather_fence_call && (!async_completion_call || !force_host_bounce)) {
         fprintf(stderr,
                 "ds4: fatal Q8 pre-gather fence pair %d lost its required "
                 "async-completion/host-bounce configuration\n",
+                home_tier);
+        fflush(stderr);
+        return -1;
+    }
+    if (pre_activation_fence_call &&
+        (!force_host_bounce || !async_completion_call ||
+         !pre_gather_fence_call)) {
+        fprintf(stderr,
+                "ds4: fatal Q8 pre-activation fence pair %d lost its "
+                "required host-bounce/async-completion/pre-gather "
+                "configuration\n",
                 home_tier);
         fflush(stderr);
         return -1;
@@ -17870,9 +18475,15 @@ static int cuda_q8_f16_partner_matmul_impl(
             fflush(stderr);
         }
     }
-    if (!ds4_gpu_tensor_copy_xdev_default_mode(
-            &activation_dst, &activation_src,
-            activation_transfer_bytes, force_host_bounce)) {
+    const int activation_copy_ok = pre_activation_fence_call
+        ? cuda_q8_f16_partner_pre_activation_fence_copy(
+              &activation_dst, &activation_src, activation_transfer_bytes,
+              home_tier, home_device, partner_tier, partner_device,
+              n_tok, in_dim, out_dim, binding->label, label, weight_offset)
+        : ds4_gpu_tensor_copy_xdev_default_mode(
+              &activation_dst, &activation_src,
+              activation_transfer_bytes, force_host_bounce);
+    if (!activation_copy_ok) {
         if (async_completion_call) {
             cuda_q8_f16_partner_async_completion_failure_log(
                 "activation-copy", false, async_completion_sequence,
