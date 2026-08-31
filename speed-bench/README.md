@@ -3117,6 +3117,37 @@ The tighter row-split-on boundary is:
   instantaneous-load condition; it is diagnostic evidence, not a production
   mitigation.
 
+The separate end-fence runs support a narrower cross-run observation bracket. A layer-17 fence
+completed on partner and home before the run later lost the device, agreeing
+with the earlier four-phase layer-17 audit. A layer-18 fence instead found the
+partner context already failed. Because those fences were exercised in separate
+processes and perturb timing at different points, they suggest rather than prove
+that the pending CUDA error appears after the layer-17 attention result gather
+and by the layer-18 attention completion boundary. They do **not** prove a
+layer-18 kernel defect: the interval also contains the layer-17 tail/MoE/Q8 work
+and layer-18 pre-attention setup.
+
+The next combined diagnostic is:
+
+- `attention-row-boundary-audit`, which keeps the full production workload
+  and adds three ordered observations at the fixed mixed-attention
+  layer-17/layer-18, position-512 boundary. It first
+  applies the end-only pair fence after layer 17 attention, then synchronizes
+  partner and home at the layer-18 row-launch boundary immediately before query
+  copy, and finally enables the existing layer-18 `query-copy`,
+  `partner-attention`, `home-attention`, and
+  `result-gather` phase checkpoints. The entry fence emits durable
+  `begin`, per-device `complete`/failure, and final pair markers under
+  `prefill attention row entry fence`. This is not transformer-layer entry: the
+  upstream layer-18 QKV/cache/indexer preparation has already run. If that entry
+  fence fails, layer-18 query copy has not yet been submitted, so the remaining
+  interval is layer-17 tail/MoE/Q8 through that upstream layer-18 preparation.
+  If entry completes, the
+  phase markers can distinguish the layer-18 row-split operations. A passing
+  arm shows that one or both added boundaries removed a required overlap or
+  instantaneous-load condition; it still does not establish a layer-specific
+  software bug.
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 
@@ -3220,6 +3251,36 @@ TG_TOKENS=256 \
 REPEATS=1 \
 REQUIRED_POWER_LIMIT_W=250 \
 TELEMETRY_INTERVAL_MS=500 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+To audit the adjacent layer-17/layer-18 boundary in one production-shaped arm:
+
+```bash
+cd ~/ds4-iq2-q4
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-boundary-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ATTN_ROW_BOUNDARY_END_LAYER=17 \
+ATTN_ROW_BOUNDARY_ENTRY_LAYER=18 \
+ATTN_ROW_BOUNDARY_POS=512 \
+VARIANTS=attention-row-boundary-audit \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh

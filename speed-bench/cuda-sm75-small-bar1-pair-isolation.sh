@@ -21,6 +21,9 @@ Optional environment:
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
   ATTN_END_FENCE_POS=512
+  ATTN_ROW_BOUNDARY_END_LAYER=17   combined row-boundary audit: prior row layer
+  ATTN_ROW_BOUNDARY_ENTRY_LAYER=18 combined row-boundary audit: next row layer
+  ATTN_ROW_BOUNDARY_POS=512
   PP_TOKENS=32768
   TG_TOKENS=256
   REPEATS=1
@@ -57,6 +60,9 @@ ATTN_PHASE_AUDIT_LAYER=${ATTN_PHASE_AUDIT_LAYER:-17}
 ATTN_PHASE_AUDIT_POS=${ATTN_PHASE_AUDIT_POS:-512}
 ATTN_END_FENCE_LAYER=${ATTN_END_FENCE_LAYER:-21}
 ATTN_END_FENCE_POS=${ATTN_END_FENCE_POS:-512}
+ATTN_ROW_BOUNDARY_END_LAYER=${ATTN_ROW_BOUNDARY_END_LAYER:-17}
+ATTN_ROW_BOUNDARY_ENTRY_LAYER=${ATTN_ROW_BOUNDARY_ENTRY_LAYER:-18}
+ATTN_ROW_BOUNDARY_POS=${ATTN_ROW_BOUNDARY_POS:-512}
 PP_TOKENS=${PP_TOKENS:-32768}
 TG_TOKENS=${TG_TOKENS:-256}
 REPEATS=${REPEATS:-1}
@@ -82,6 +88,9 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
             "ATTN_PHASE_AUDIT_POS:$ATTN_PHASE_AUDIT_POS" \
             "ATTN_END_FENCE_LAYER:$ATTN_END_FENCE_LAYER" \
             "ATTN_END_FENCE_POS:$ATTN_END_FENCE_POS" \
+            "ATTN_ROW_BOUNDARY_END_LAYER:$ATTN_ROW_BOUNDARY_END_LAYER" \
+            "ATTN_ROW_BOUNDARY_ENTRY_LAYER:$ATTN_ROW_BOUNDARY_ENTRY_LAYER" \
+            "ATTN_ROW_BOUNDARY_POS:$ATTN_ROW_BOUNDARY_POS" \
             "REQUIRED_POWER_LIMIT_W:$REQUIRED_POWER_LIMIT_W" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "POST_CASE_SETTLE_SECONDS:$POST_CASE_SETTLE_SECONDS" \
@@ -97,6 +106,9 @@ done
    ATTN_END_FENCE_LAYER < STAGE_SPLIT &&
    ATTN_END_FENCE_POS < PP_TOKENS &&
    ATTN_END_FENCE_POS % 512 == 0 &&
+   ATTN_ROW_BOUNDARY_END_LAYER == 17 &&
+   ATTN_ROW_BOUNDARY_ENTRY_LAYER == 18 &&
+   ATTN_ROW_BOUNDARY_POS == 512 &&
    REPEATS >= 1 && REQUIRED_POWER_LIMIT_W == 250 &&
    TELEMETRY_INTERVAL_MS >= 100 &&
    POST_CASE_SETTLE_SECONDS <= 60 )) ||
@@ -113,7 +125,7 @@ IFS=, read -r -a variants <<<"$VARIANTS"
 declare -A seen_variants=()
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-phase-audit|attention-end-fence|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
@@ -160,6 +172,15 @@ if [[ $RESUME == 1 && -s $OUTPUT_DIR/manifest.txt ]]; then
     grep -Fxq "attention_end_fence_pos=$ATTN_END_FENCE_POS" \
         "$OUTPUT_DIR/manifest.txt" ||
         die "resume attention end-fence position differs from the original isolation"
+    grep -Fxq "attention_row_boundary_end_layer=$ATTN_ROW_BOUNDARY_END_LAYER" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume attention row-boundary end layer differs from the original isolation"
+    grep -Fxq "attention_row_boundary_entry_layer=$ATTN_ROW_BOUNDARY_ENTRY_LAYER" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume attention row-boundary entry layer differs from the original isolation"
+    grep -Fxq "attention_row_boundary_pos=$ATTN_ROW_BOUNDARY_POS" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume attention row-boundary position differs from the original isolation"
 fi
 
 phase=initialization
@@ -421,6 +442,9 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
             "$ATTN_PHASE_AUDIT_LAYER" "$ATTN_PHASE_AUDIT_POS"
         printf 'attention_end_fence_layer=%s\nattention_end_fence_pos=%s\n' \
             "$ATTN_END_FENCE_LAYER" "$ATTN_END_FENCE_POS"
+        printf 'attention_row_boundary_end_layer=%s\nattention_row_boundary_entry_layer=%s\n' \
+            "$ATTN_ROW_BOUNDARY_END_LAYER" "$ATTN_ROW_BOUNDARY_ENTRY_LAYER"
+        printf 'attention_row_boundary_pos=%s\n' "$ATTN_ROW_BOUNDARY_POS"
         printf 'pp_tokens=%s\ntg_tokens=%s\nrepeats=%s\n' \
             "$PP_TOKENS" "$TG_TOKENS" "$REPEATS"
         printf 'required_power_limit_w=%s\n' "$REQUIRED_POWER_LIMIT_W"
@@ -530,6 +554,23 @@ validate_success_path() {
             done
             ! grep -Eq 'prefill attention row end fence event=(submit-failed|device-switch-failed|sync-failed|failed)' \
                 "$log" || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        attention-row-boundary-audit)
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
+                --validate-attention-row-boundary-log "$log" \
+                "$ATTN_ROW_BOUNDARY_END_LAYER" \
+                "$ATTN_ROW_BOUNDARY_ENTRY_LAYER" \
+                "$ATTN_ROW_BOUNDARY_POS" || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -670,6 +711,17 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_LAYER=$ATTN_END_FENCE_LAYER")
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_POS=$ATTN_END_FENCE_POS")
+                ;;
+            attention-row-boundary-audit)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_LAYER=$ATTN_ROW_BOUNDARY_END_LAYER")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_END_FENCE_POS=$ATTN_ROW_BOUNDARY_POS")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_LAYER=$ATTN_ROW_BOUNDARY_ENTRY_LAYER")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_POS=$ATTN_ROW_BOUNDARY_POS")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_LAYER=$ATTN_ROW_BOUNDARY_ENTRY_LAYER")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_POS=$ATTN_ROW_BOUNDARY_POS")
                 ;;
             partner-bounce)
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")

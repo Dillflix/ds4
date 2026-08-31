@@ -20,6 +20,35 @@ def write_healthy_post(root: pathlib.Path, stem: str) -> None:
     )
 
 
+def complete_row_boundary_log() -> str:
+    end_identity = "kind=mixed layer=17 pos=512 tokens=512 home=0 partner=2"
+    entry_identity = "kind=mixed layer=18 pos=512 tokens=512 home=0 partner=2"
+    lines = [
+        f"ds4: CUDA prefill attention row end fence event=begin target=pair {end_identity}",
+        f"ds4: CUDA prefill attention row end fence event=complete target=partner {end_identity}",
+        f"ds4: CUDA prefill attention row end fence event=complete target=home {end_identity}",
+        f"ds4: CUDA prefill attention row end fence event=complete target=pair {end_identity}",
+        f"ds4: CUDA prefill attention row audit dispatch=split {end_identity} q_bytes=1 result_bytes=1",
+        f"ds4: CUDA prefill attention row entry fence event=begin target=pair {entry_identity}",
+        f"ds4: CUDA prefill attention row entry fence event=complete target=partner {entry_identity}",
+        f"ds4: CUDA prefill attention row entry fence event=complete target=home {entry_identity}",
+        f"ds4: CUDA prefill attention row entry fence event=complete target=pair {entry_identity}",
+    ]
+    for phase in (
+            "query-copy", "partner-attention", "home-attention", "result-gather"):
+        lines.extend([
+            f"ds4: CUDA prefill attention row phase audit event=begin phase={phase} "
+            f"{entry_identity}",
+            f"ds4: CUDA prefill attention row phase audit event=complete phase={phase} "
+            f"{entry_identity}",
+        ])
+    lines.append(
+        f"ds4: CUDA prefill attention row audit dispatch=split {entry_identity} "
+        "q_bytes=1 result_bytes=1"
+    )
+    return "\n".join(lines) + "\n"
+
+
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -329,6 +358,270 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             report = (root / "summary.md").read_text()
             self.assertIn("partner synchronization was the first failing", report)
             self.assertIn("Home synchronization was deliberately not attempted", report)
+
+    def test_layer_boundary_audit_localizes_failure_before_l18_query_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+                "last_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=pair kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row entry fence event=begin "
+                "target=pair kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row entry fence event=sync-failed "
+                "target=partner kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row entry fence event=failed "
+                "target=partner kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "failed:partner:mixed:layer18:pos512:tokens512:home0:partner2",
+                report,
+            )
+            self.assertIn("before layer-18 query copy was submitted", report)
+            self.assertIn("layer-17 tail/MoE/Q8 work", report)
+            self.assertIn("does not prove a layer-18 kernel bug", report)
+
+    def test_layer_boundary_audit_reports_failure_inside_l18_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+                "last_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=pair kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row entry fence event=complete "
+                "target=pair kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row phase audit event=sync-failed "
+                "phase=partner-attention kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "sync-failed:partner-attention:mixed:layer18:pos512:tokens512:"
+                "home0:partner2",
+                report,
+            )
+            self.assertIn("layer-18 row-launch/pre-query fence completed", report)
+            self.assertIn("first failure-class marker is inside", report)
+            self.assertIn("not by itself proof of a layer-specific", report)
+
+    def test_reports_passed_layer_boundary_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=passed\n"
+                "exit_status=0\nlast_phase=decode\n"
+                "last_event=frontier-complete\n"
+            )
+            (production / f"{stem}.log").write_text(complete_row_boundary_log())
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["attention_entry_fence_last"],
+                "complete:pair:mixed:layer18:pos512:tokens512:home0:partner2",
+            )
+            self.assertEqual(row["attention_row_boundary_marker_state"], "complete")
+            report = (root / "summary.md").read_text()
+            self.assertIn("healthy post-run snapshot passed", report)
+            self.assertIn("immediately before layer 18 query copy", report)
+            self.assertIn("does not identify a layer-specific software defect", report)
+
+    def test_recovers_completed_boundary_audit_without_result_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-row-boundary-audit\n"
+            )
+            (production / f"{stem}.log").write_text(complete_row_boundary_log())
+            (production / f"{stem}.csv").write_text(
+                "pp_tokens,prefill_tps,gen_tps\n32768,600.0,16.0\n"
+            )
+            (production / f"{stem}-progress.csv").write_text(
+                "realtime_sec,realtime_nsec,phase,event,current,total\n"
+                "1,0,decode,frontier-complete,256,256\n"
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "completed-no-result")
+            report = (root / "summary.md").read_text()
+            self.assertIn("wrapper omitted its final result record", report)
+            self.assertIn("healthy post-run snapshot passed", report)
+
+    def test_ctrl_c_after_complete_phases_is_not_called_gpu_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=failed\n"
+                "exit_status=130\nlast_phase=interrupted\nlast_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(complete_row_boundary_log())
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("No lost-device watcher record", report)
+            self.assertIn("must not be assigned a hardware boundary", report)
+            self.assertNotIn("first observed error is downstream", report)
+
+    def test_lost_device_after_complete_phases_is_downstream_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            telemetry = root / "telemetry"
+            telemetry.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=failed\n"
+                "exit_status=143\nlast_phase=measured-prefill\n"
+                "last_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(complete_row_boundary_log())
+            (telemetry / f"{stem}-watch-event.txt").write_text(
+                "status=lost-device-detected\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("independently detected device loss", report)
+            self.assertIn("downstream of layer-18 attention completion", report)
+
+    def test_validates_exact_row_boundary_marker_state_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = pathlib.Path(temporary) / "boundary.log"
+            complete = complete_row_boundary_log()
+            command = [
+                sys.executable,
+                str(SUMMARIZER),
+                "--validate-attention-row-boundary-log",
+                str(log_path),
+                "17",
+                "18",
+                "512",
+            ]
+            log_path.write_text(complete)
+            subprocess.run(command, check=True)
+
+            mutations = {
+                "wrong-kind": complete.replace(
+                    "phase audit event=begin phase=query-copy kind=mixed",
+                    "phase audit event=begin phase=query-copy kind=indexed",
+                    1,
+                ),
+                "wrong-position": complete.replace(
+                    "entry fence event=begin target=pair kind=mixed layer=18 pos=512",
+                    "entry fence event=begin target=pair kind=mixed layer=18 pos=1024",
+                    1,
+                ),
+                "unexpected-l17-entry": complete.replace(
+                    "prefill attention row audit dispatch=split kind=mixed layer=17",
+                    "prefill attention row entry fence event=begin target=pair "
+                    "kind=mixed layer=17 pos=512 tokens=512 home=0 partner=2\n"
+                    "ds4: CUDA prefill attention row audit dispatch=split "
+                    "kind=mixed layer=17",
+                    1,
+                ),
+                "missing-l18-dispatch": complete.rsplit("\n", 2)[0] + "\n",
+                "duplicate-phase": complete.replace(
+                    "ds4: CUDA prefill attention row phase audit event=complete "
+                    "phase=query-copy",
+                    "ds4: CUDA prefill attention row phase audit event=complete "
+                    "phase=query-copy kind=mixed layer=18 pos=512 tokens=512 "
+                    "home=0 partner=2\n"
+                    "ds4: CUDA prefill attention row phase audit event=complete "
+                    "phase=query-copy",
+                    1,
+                ),
+            }
+            for name, mutated in mutations.items():
+                with self.subTest(name=name):
+                    log_path.write_text(mutated)
+                    result = subprocess.run(
+                        command, text=True, capture_output=True, check=False
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("marker sequence is", result.stderr)
+
+    def test_first_phase_failure_survives_secondary_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-row-boundary-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-row-boundary-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+                "last_event=prefill_chunk\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention row end fence event=complete "
+                "target=pair kind=mixed layer=17 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row entry fence event=complete "
+                "target=pair kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row phase audit event=sync-failed "
+                "phase=query-copy kind=mixed layer=18 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row phase audit "
+                "event=device-switch-failed phase=home-attention kind=mixed "
+                "layer=18 pos=512 tokens=512 home=0 partner=2\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["attention_audit_first_failure"],
+                "phase-audit:sync-failed:query-copy:mixed:layer18:pos512:"
+                "tokens512:home0:partner2",
+            )
+            self.assertEqual(
+                row["attention_phase_audit_last"],
+                "device-switch-failed:home-attention:mixed:layer18:pos512:"
+                "tokens512:home0:partner2",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("phase-audit:sync-failed:query-copy", report)
+            self.assertIn("secondary cleanup failure cannot overwrite", report)
 
     def test_identifies_direct_or_overlap_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

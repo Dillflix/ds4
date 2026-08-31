@@ -28332,6 +28332,16 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
                "DS4_CUDA_TP_PREFILL_ATTN_PHASE_AUDIT_POS", pos0);
 }
 
+static bool metal_graph_cuda_tp_prefill_attention_rows_entry_fence_selected(
+        int home, uint32_t il, uint32_t pos0) {
+    return env_pair_list_contains(
+               "DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_PAIRS", home) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_LAYER", il) &&
+           env_u32_exactly_matches(
+               "DS4_CUDA_TP_PREFILL_ATTN_ENTRY_FENCE_POS", pos0);
+}
+
 static bool metal_graph_cuda_tp_prefill_attention_rows_end_fence_selected(
         int home, uint32_t il, uint32_t pos0) {
     return env_pair_list_contains(
@@ -28378,6 +28388,40 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
     }
     metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
         "complete", phase, kind, il, pos0, n_tokens, home, partner);
+    return true;
+}
+
+static void metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+        const char *event, const char *target,
+        ds4_cuda_prefill_attn_kind kind, uint32_t il, uint32_t pos0,
+        uint32_t n_tokens, int home, int partner) {
+    fprintf(stderr,
+            "ds4: CUDA prefill attention row entry fence event=%s "
+            "target=%s kind=%s layer=%u pos=%u tokens=%u home=%d partner=%d\n",
+            event, target,
+            kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
+            il, pos0, n_tokens, home, partner);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static bool metal_graph_cuda_tp_prefill_attention_rows_entry_fence_sync(
+        const char *target, int tier, ds4_cuda_prefill_attn_kind kind,
+        uint32_t il, uint32_t pos0, uint32_t n_tokens,
+        int home, int partner) {
+    if (ds4_gpu_set_current_device(tier) != 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+            "device-switch-failed", target, kind, il, pos0, n_tokens,
+            home, partner);
+        return false;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+            "sync-failed", target, kind, il, pos0, n_tokens, home, partner);
+        return false;
+    }
+    metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+        "complete", target, kind, il, pos0, n_tokens, home, partner);
     return true;
 }
 
@@ -28446,6 +28490,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     const bool phase_audit =
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_selected(
             home, il, pos0);
+    const bool entry_fence =
+        metal_graph_cuda_tp_prefill_attention_rows_entry_fence_selected(
+            home, il, pos0);
     const bool end_fence =
         metal_graph_cuda_tp_prefill_attention_rows_end_fence_selected(
             home, il, pos0);
@@ -28513,7 +28560,45 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
      * The generic xdev helper uses the engine side stream; the destination-
      * ready handshake also prevents scratch reuse while an earlier operation
      * on the destination device is still in flight. */
-    if (phase_audit) {
+    if (entry_fence) {
+        if (!ok) {
+            metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+                "submit-failed", "pair", kind, il, pos0, n_tokens,
+                home, partner);
+        } else {
+            metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+                "begin", "pair", kind, il, pos0, n_tokens, home, partner);
+            const bool partner_fence_ok =
+                metal_graph_cuda_tp_prefill_attention_rows_entry_fence_sync(
+                    "partner", partner, kind, il, pos0, n_tokens,
+                    home, partner);
+            bool home_fence_ok = false;
+            if (partner_fence_ok) {
+                home_fence_ok =
+                    metal_graph_cuda_tp_prefill_attention_rows_entry_fence_sync(
+                        "home", home, kind, il, pos0, n_tokens,
+                        home, partner);
+            } else if (ds4_gpu_set_current_device(home) != 0) {
+                /* Restore the caller's home-device invariant without issuing
+                 * another synchronization after the first observed failure. */
+                metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+                    "device-switch-failed", "home-restore", kind, il, pos0,
+                    n_tokens, home, partner);
+            }
+            ok = partner_fence_ok && home_fence_ok;
+            const char *pair_target = !partner_fence_ok
+                ? "partner" : (home_fence_ok ? "pair" : "home");
+            metal_graph_cuda_tp_prefill_attention_rows_entry_fence_log(
+                ok ? "complete" : "failed", pair_target, kind, il, pos0,
+                n_tokens, home, partner);
+        }
+    }
+    /* If the selected entry fence fails, retain that as the last causal
+     * checkpoint. Do not emit a secondary query-copy submit failure for work
+     * that was deliberately not submitted. Standalone phase-audit behavior is
+     * unchanged when no entry fence is selected. */
+    const bool active_phase_audit = phase_audit && (!entry_fence || ok);
+    if (active_phase_audit) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "query-copy", kind, il, pos0, n_tokens, home, partner);
     }
@@ -28522,7 +28607,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
              ds4_gpu_tensor_copy_xdev_default(
                  peer_q_dst, peer_q_src, q_partner_bytes) != 0;
     }
-    if (phase_audit) {
+    if (active_phase_audit) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
             ok, "query-copy", partner, kind, il, pos0, n_tokens,
             home, partner);
@@ -28545,7 +28630,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         }
     }
 
-    const bool audit_partner_attention = phase_audit && ok;
+    const bool audit_partner_attention = active_phase_audit && ok;
     if (audit_partner_attention) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "partner-attention", kind, il, pos0, n_tokens,
@@ -28555,7 +28640,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     if (ok) {
         partner_device_ready = ds4_gpu_set_current_device(partner) == 0;
         ok = partner_device_ready;
-        if (phase_audit && !partner_device_ready) {
+        if (active_phase_audit && !partner_device_ready) {
             metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
                 "device-switch-failed", "partner-attention", kind, il, pos0,
                 n_tokens, home, partner);
@@ -28586,13 +28671,13 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     const bool home_device_ready = ds4_gpu_set_current_device(home) == 0;
     if (!home_device_ready) {
         ok = false;
-        if (phase_audit) {
+        if (active_phase_audit) {
             metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
                 "device-switch-failed", "home-attention", kind, il, pos0,
                 n_tokens, home, partner);
         }
     }
-    const bool audit_home_attention = phase_audit && ok;
+    const bool audit_home_attention = active_phase_audit && ok;
     if (audit_home_attention) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "home-attention", kind, il, pos0, n_tokens,
@@ -28618,7 +28703,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             ok, "home-attention", home, kind, il, pos0, n_tokens,
             home, partner);
     }
-    const bool audit_result_gather = phase_audit && ok;
+    const bool audit_result_gather = active_phase_audit && ok;
     if (audit_result_gather) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "result-gather", kind, il, pos0, n_tokens,

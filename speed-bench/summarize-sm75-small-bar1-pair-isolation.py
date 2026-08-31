@@ -11,8 +11,8 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-phase-audit", "attention-end-fence",
-    "partner-bounce", "bounce-indexer-off", "partner-serialized",
-    "indexer-off", "production"
+    "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
+    "partner-serialized", "indexer-off", "production"
 )
 
 
@@ -88,6 +88,116 @@ def last_attention_end_fence(text: str) -> str:
     return last
 
 
+def last_attention_entry_fence(text: str) -> str:
+    last = ""
+    pattern = re.compile(
+        r"prefill attention row entry fence event=(\S+) target=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        r"home=(\d+) partner=(\d+)"
+    )
+    for match in pattern.finditer(text):
+        event, target, kind, layer, pos, tokens, home, partner = match.groups()
+        last = (
+            f"{event}:{target}:{kind}:layer{layer}:pos{pos}:tokens{tokens}:"
+            f"home{home}:partner{partner}"
+        )
+    return last
+
+
+def first_attention_audit_failure(text: str) -> str:
+    fence_pattern = re.compile(
+        r"prefill attention row (end|entry) fence event=(\S+) target=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        r"home=(\d+) partner=(\d+)"
+    )
+    phase_pattern = re.compile(
+        r"prefill attention row phase audit event=(\S+) phase=(\S+) "
+        r"kind=(\S+) layer=(\d+) pos=(\d+) tokens=(\d+) "
+        r"home=(\d+) partner=(\d+)"
+    )
+    failure_events = {
+        "submit-failed", "device-switch-failed", "sync-failed", "failed"
+    }
+    for line in text.splitlines():
+        match = fence_pattern.search(line)
+        if match:
+            family, event, target, kind, layer, pos, tokens, home, partner = (
+                match.groups()
+            )
+            if event in failure_events:
+                return (
+                    f"{family}-fence:{event}:{target}:{kind}:layer{layer}:"
+                    f"pos{pos}:tokens{tokens}:home{home}:partner{partner}"
+                )
+        match = phase_pattern.search(line)
+        if match:
+            event, phase, kind, layer, pos, tokens, home, partner = match.groups()
+            if event in failure_events:
+                return (
+                    f"phase-audit:{event}:{phase}:{kind}:layer{layer}:"
+                    f"pos{pos}:tokens{tokens}:home{home}:partner{partner}"
+                )
+    return ""
+
+
+def attention_row_boundary_marker_state(
+        text: str, end_layer: int, entry_layer: int, pos: int) -> str:
+    identity_end = (
+        f"kind=mixed layer={end_layer} pos={pos} tokens=512 home=0 partner=2"
+    )
+    identity_entry = (
+        f"kind=mixed layer={entry_layer} pos={pos} tokens=512 home=0 partner=2"
+    )
+    expected = [
+        f"prefill attention row end fence event=begin target=pair {identity_end}",
+        f"prefill attention row end fence event=complete target=partner {identity_end}",
+        f"prefill attention row end fence event=complete target=home {identity_end}",
+        f"prefill attention row end fence event=complete target=pair {identity_end}",
+        f"prefill attention row audit dispatch=split {identity_end}",
+        f"prefill attention row entry fence event=begin target=pair {identity_entry}",
+        f"prefill attention row entry fence event=complete target=partner {identity_entry}",
+        f"prefill attention row entry fence event=complete target=home {identity_entry}",
+        f"prefill attention row entry fence event=complete target=pair {identity_entry}",
+    ]
+    for phase in (
+            "query-copy", "partner-attention", "home-attention", "result-gather"):
+        expected.extend([
+            f"prefill attention row phase audit event=begin phase={phase} "
+            f"{identity_entry}",
+            f"prefill attention row phase audit event=complete phase={phase} "
+            f"{identity_entry}",
+        ])
+    expected.append(f"prefill attention row audit dispatch=split {identity_entry}")
+
+    audit_prefixes = (
+        "prefill attention row end fence event=",
+        "prefill attention row entry fence event=",
+        "prefill attention row phase audit event=",
+    )
+    row_pattern = re.compile(
+        r"prefill attention row audit dispatch=\S+ kind=\S+ layer=(\d+) "
+        r"pos=\d+ tokens=\d+ home=(\d+) partner=(\d+)"
+    )
+    observed: list[str] = []
+    for line in text.splitlines():
+        if any(prefix in line for prefix in audit_prefixes):
+            observed.append(line)
+            continue
+        match = row_pattern.search(line)
+        if (match and int(match.group(1)) in {end_layer, entry_layer} and
+                match.group(2) == "0" and match.group(3) == "2"):
+            observed.append(line)
+
+    for index, (actual, wanted) in enumerate(zip(observed, expected), 1):
+        if wanted not in actual:
+            return f"diverged:{index}/{len(expected)}"
+    if len(observed) < len(expected):
+        return f"prefix:{len(observed)}/{len(expected)}"
+    if len(observed) > len(expected):
+        return f"extra:{len(observed)}/{len(expected)}"
+    return "complete"
+
+
 def outcome(statuses: list[str]) -> str:
     if not statuses:
         return "not-run"
@@ -130,6 +240,7 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention = outcomes.get("attention-off", "not-run")
     phase_audit = outcomes.get("attention-phase-audit", "not-run")
     end_fence = outcomes.get("attention-end-fence", "not-run")
+    boundary_audit = outcomes.get("attention-row-boundary-audit", "not-run")
     production = outcomes.get("production", "not-run")
     bounce = outcomes.get("partner-bounce", "not-run")
     bounce_indexer = outcomes.get("bounce-indexer-off", "not-run")
@@ -153,6 +264,127 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
          if row.get("attention_end_fence_last")),
         "",
     )
+    boundary_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-row-boundary-audit"
+    ]
+    boundary_problem_rows = [
+        row for row in boundary_rows
+        if row.get("status") not in {"passed", "completed-no-result"}
+    ]
+    boundary_last = boundary_problem_rows[-1] if boundary_problem_rows else {}
+    boundary_end_marker = boundary_last.get("attention_end_fence_last", "")
+    boundary_entry_marker = boundary_last.get("attention_entry_fence_last", "")
+    boundary_phase_marker = boundary_last.get("attention_phase_audit_last", "")
+    boundary_first_failure = boundary_last.get(
+        "attention_audit_first_failure", ""
+    )
+    boundary_survived_without_result = (
+        bool(boundary_rows) and
+        all(row.get("status") in {"passed", "completed-no-result"}
+            for row in boundary_rows) and
+        all(row.get("attention_row_boundary_marker_state") == "complete"
+            for row in boundary_rows)
+    )
+    if boundary_audit == "passed" or boundary_survived_without_result:
+        recovery_note = (
+            " The benchmark and healthy post-run snapshot completed even though "
+            "the wrapper omitted its final result record."
+            if boundary_survived_without_result and boundary_audit != "passed"
+            else ""
+        )
+        return (
+            "The combined attention-row boundary audit and healthy post-run snapshot "
+            "passed." + recovery_note + " "
+            "It host-confirmed pair-0 completion after layer 17 attention, again "
+            "immediately before layer 18 query copy, and after every layer 18 "
+            "row-split phase. Because the added boundaries perturb overlap and "
+            "instantaneous load, this narrows the trigger to the removed timing "
+            "envelope but does not identify a layer-specific software defect."
+        )
+    if boundary_audit == "invalid":
+        return (
+            "The combined attention-row boundary audit process returned but failed "
+            "its "
+            "production-path or marker-order validation. It is invalid for causal "
+            "inference; inspect the missing durable marker before another run."
+        )
+    if boundary_audit in {"failed", "incomplete"}:
+        if (boundary_first_failure.startswith("end-fence:") or
+                not boundary_end_marker.startswith("complete:pair:")):
+            return (
+                "The combined audit did not host-confirm the layer-17 end fence. "
+                "Its first failure-class marker and last durable end-fence marker "
+                "define the observation boundary; "
+                "this run does not move the prior bracket into layer 18."
+            )
+        if (boundary_first_failure.startswith("entry-fence:") or
+                (not boundary_first_failure and
+                 boundary_entry_marker.startswith((
+                     "failed:", "sync-failed:", "device-switch-failed:",
+                     "submit-failed:")))):
+            return (
+                "The layer-17 attention end fence completed on both devices, but the "
+                "layer-18 row-launch/pre-query fence failed before layer-18 query copy "
+                "was submitted. "
+                "The pending error therefore entered the CUDA observation window after "
+                "the layer-17 attention result gather and by the layer-18 pre-query "
+                "boundary. That interval includes layer-17 tail/MoE/Q8 work and "
+                "upstream layer-18 QKV/cache/indexer preparation; it does not prove a "
+                "layer-18 kernel bug. This is not a transformer-layer entry fence."
+            )
+        if boundary_entry_marker.startswith("complete:pair:"):
+            if (boundary_first_failure.startswith("phase-audit:") or
+                    (not boundary_first_failure and
+                     boundary_phase_marker.startswith((
+                         "submit-failed:", "device-switch-failed:",
+                         "sync-failed:")))):
+                return (
+                    "Both the layer-17 end fence and layer-18 row-launch/pre-query "
+                    "fence completed. The first failure-class marker is inside the "
+                    "named layer-18 row-split phase, so a secondary cleanup failure "
+                    "cannot overwrite that boundary. The entry fence excludes earlier "
+                    "queued work from being the already-pending CUDA error. The marker "
+                    "is an observation boundary, not by itself proof of a layer-specific "
+                    "hardware or kernel defect."
+                )
+            if boundary_phase_marker.startswith("complete:result-gather:"):
+                if "lost-device" in boundary_last.get("watch_status", ""):
+                    return (
+                        "The combined audit host-confirmed both boundary fences and all "
+                        "layer-18 row-split phases before the telemetry watcher "
+                        "independently detected device loss. The first observed error "
+                        "is therefore downstream of layer-18 attention completion, "
+                        "while a delayed physical effect from preceding traffic remains "
+                        "possible."
+                    )
+                if boundary_audit == "failed":
+                    return (
+                        "The combined audit host-confirmed both boundary fences and all "
+                        "layer-18 row-split phases before the benchmark later returned "
+                        "failure. No lost-device watcher record corroborates a GPU "
+                        "failure, so a user interruption or ordinary process failure "
+                        "must not be assigned a hardware boundary."
+                    )
+                return (
+                    "The combined audit host-confirmed both boundary fences and all "
+                    "layer-18 row-split phases before the arm ended without a validated "
+                    "outcome. With no lost-device watcher record, Ctrl-C or another "
+                    "interruption is not evidence of a GPU failure."
+                )
+            return (
+                "The layer-17 end and layer-18 row-launch/pre-query fences completed, "
+                "and the last "
+                "durable layer-18 phase marker is the current observation boundary. "
+                "Inspect that exact marker and GPU health before narrowing further."
+            )
+        return (
+            "Layer-17 attention completion was host-confirmed, but no complete "
+            "layer-18 row-launch/pre-query boundary was recorded. The remaining "
+            "interval is after layer-17 attention and through upstream layer-18 "
+            "QKV/cache/indexer preparation, before query-copy admission; inspect the "
+            "last marker and GPU health without assigning a layer-specific cause."
+        )
     if end_fence == "passed":
         return (
             "The full production path survived after one completion boundary was "
@@ -332,6 +564,13 @@ def main() -> None:
     production = root / "production"
     if not production.is_dir():
         fail(f"production directory not found: {production}")
+    manifest_path = root / "manifest.txt"
+    manifest = read_kv(manifest_path) if manifest_path.exists() else {}
+    boundary_end_layer = int(manifest.get("attention_row_boundary_end_layer", "17"))
+    boundary_entry_layer = int(
+        manifest.get("attention_row_boundary_entry_layer", "18")
+    )
+    boundary_pos = int(manifest.get("attention_row_boundary_pos", "512"))
 
     rows: list[dict[str, str]] = []
     statuses: defaultdict[str, list[str]] = defaultdict(list)
@@ -414,6 +653,14 @@ def main() -> None:
             "pair0_q8_serialized": ",".join(serialized_modes),
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
             "attention_end_fence_last": last_attention_end_fence(log_text),
+            "attention_entry_fence_last": last_attention_entry_fence(log_text),
+            "attention_audit_first_failure": first_attention_audit_failure(log_text),
+            "attention_row_boundary_marker_state": (
+                attention_row_boundary_marker_state(
+                    log_text, boundary_end_layer, boundary_entry_layer, boundary_pos
+                )
+                if variant == "attention-row-boundary-audit" else ""
+            ),
             "post_health": "healthy" if post_health_ok else "unverified",
             "watch_status": watch_values.get("status", ""),
             "result": str(result_path),
@@ -447,8 +694,9 @@ def main() -> None:
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
         "Pair-0 indexer begun bytes | Attention phase checkpoint | "
-        "Attention end fence | Post health | Watch event |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- |",
+        "Attention end fence | Attention entry fence | First attention-audit failure | "
+        "Boundary marker sequence | Post health | Watch event |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -460,6 +708,9 @@ def main() -> None:
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('attention_phase_audit_last', '')} | "
             f"{row.get('attention_end_fence_last', '')} | "
+            f"{row.get('attention_entry_fence_last', '')} | "
+            f"{row.get('attention_audit_first_failure', '')} | "
+            f"{row.get('attention_row_boundary_marker_state', '')} | "
             f"{row.get('post_health', '')} | "
             f"{row.get('watch_status', '')} |"
         )
@@ -479,4 +730,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if (len(sys.argv) == 6 and
+            sys.argv[1] == "--validate-attention-row-boundary-log"):
+        log_path = Path(sys.argv[2])
+        state = attention_row_boundary_marker_state(
+            log_path.read_text(errors="replace"),
+            int(sys.argv[3]),
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+        )
+        if state != "complete":
+            fail(f"attention row-boundary marker sequence is {state}")
+    else:
+        main()
