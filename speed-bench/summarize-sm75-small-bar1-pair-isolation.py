@@ -11,7 +11,8 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
-    "attention-q8-phase-audit", "attention-q8-targeted-phase-audit",
+    "attention-q8-async-completion", "attention-q8-phase-audit",
+    "attention-q8-targeted-phase-audit",
     "attention-q8-l14-l15-phase-audit", "attention-q8-l12-phase-audit",
     "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
@@ -168,6 +169,237 @@ def first_host_bounce_failure_context(text: str) -> str:
                         phase = f"cuda_phase={match.group(1)} "
                 return phase + context
     return ""
+
+
+def _kv_record(line: str, prefix: str) -> dict[str, str]:
+    if prefix not in line:
+        return {}
+    payload = line.split(prefix, 1)[1]
+    record: dict[str, str] = {}
+    for token in payload.split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            record[key] = value
+    return record
+
+
+def q8_partner_async_completion_records(
+        text: str, kind: str) -> list[dict[str, str]]:
+    prefixes = {
+        "checkpoint": "q8 partner async completion checkpoint ",
+        "failure": "q8 partner async completion failure ",
+        "summary": "q8 partner async completion summary ",
+    }
+    prefix = prefixes[kind]
+    return [
+        record for line in text.splitlines()
+        if (record := _kv_record(line, prefix))
+    ]
+
+
+def q8_partner_async_completion_enabled(text: str, pair: int = 0) -> bool:
+    return (
+        "CUDA q8 partner async completion audit enabled: "
+        f"logical_pairs={pair} marker=partner-default-stream-mapped-host "
+        "event=dedicated-post-marker interpretation=positive-only"
+    ) in text
+
+
+Q8_UINT64_MASK = (1 << 64) - 1
+
+
+def _q8_u64(record: dict[str, str], key: str) -> int | None:
+    raw = record.get(key, "")
+    if not re.fullmatch(r"[0-9]+", raw):
+        return None
+    value = int(raw)
+    return value if value <= Q8_UINT64_MASK else None
+
+
+def q8_partner_async_completion_marker_state(text: str) -> str:
+    if not q8_partner_async_completion_enabled(text, 0):
+        return "not-enabled-for-pair0"
+    failures = q8_partner_async_completion_records(text, "failure")
+    if failures:
+        return "failure-record-present"
+    summaries = q8_partner_async_completion_records(text, "summary")
+    if len(summaries) != 1:
+        return f"summary-count:{len(summaries)}"
+    summary = summaries[0]
+    if summary.get("home_tier") != "0" or summary.get("partner_tier") != "2":
+        return "wrong-pair"
+    if summary.get("partners_synchronized") != "yes":
+        return "partner-not-synchronized"
+    begun = _q8_u64(summary, "begun")
+    submitted = _q8_u64(summary, "submitted")
+    confirmed = _q8_u64(summary, "confirmed")
+    sequence = _q8_u64(summary, "last_sequence")
+    complement = _q8_u64(summary, "last_complement")
+    if None in {begun, submitted, confirmed, sequence, complement}:
+        return "malformed-summary"
+    assert begun is not None and submitted is not None
+    assert confirmed is not None and sequence is not None
+    assert complement is not None
+    if begun <= 0 or begun != submitted or submitted != confirmed:
+        return "count-mismatch"
+    if sequence != begun:
+        return "last-sequence-mismatch"
+    if complement != ((~sequence) & Q8_UINT64_MASK):
+        return "last-complement-mismatch"
+    return "complete"
+
+
+def q8_partner_async_completion_checkpoint_valid(
+        record: dict[str, str]) -> bool:
+    if record.get("home_tier") != "0" or record.get("partner_tier") != "2":
+        return False
+    values = {
+        key: _q8_u64(record, key)
+        for key in ("begun", "submitted", "confirmed", "sequence", "complement")
+    }
+    if any(value is None for value in values.values()):
+        return False
+    sequence = values["sequence"]
+    assert sequence is not None
+    return (
+        sequence > 0 and
+        values["begun"] == sequence and
+        values["submitted"] == sequence and
+        values["confirmed"] == sequence and
+        values["complement"] == ((~sequence) & Q8_UINT64_MASK) and
+        record.get("evidence") == "post-compute-confirmed"
+    )
+
+
+def q8_partner_async_completion_failure_classification(
+        record: dict[str, str]) -> str:
+    required = {
+        "stage", "current_sequence", "marker_sequence", "marker_complement",
+        "marker_matches", "event_status", "interpretation", "begun",
+        "submitted", "confirmed", "home_tier", "home_device",
+        "partner_tier", "partner_device", "tokens", "in", "out",
+        "binding_label", "passed_label", "weight_offset",
+    }
+    if any(not record.get(key) for key in required):
+        return "invalid-failure-record"
+    if (record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1"):
+        return "invalid-failure-record"
+    if record["binding_label"] == "unavailable":
+        return "invalid-failure-record"
+    numeric_keys = (
+        "current_sequence", "marker_sequence", "marker_complement", "begun",
+        "submitted", "confirmed", "tokens", "in", "out", "weight_offset",
+    )
+    values = {key: _q8_u64(record, key) for key in numeric_keys}
+    if any(value is None for value in values.values()):
+        return "invalid-failure-record"
+    current = values["current_sequence"]
+    marker_sequence = values["marker_sequence"]
+    marker_complement = values["marker_complement"]
+    begun = values["begun"]
+    submitted = values["submitted"]
+    confirmed = values["confirmed"]
+    assert current is not None and marker_sequence is not None
+    assert marker_complement is not None and begun is not None
+    assert submitted is not None and confirmed is not None
+    if (current == 0 or begun != current or submitted > begun or
+            confirmed > submitted):
+        return "invalid-failure-record"
+    marker_valid = (
+        marker_sequence == current and
+        marker_complement == ((~current) & Q8_UINT64_MASK)
+    )
+    marker_claim = record["marker_matches"]
+    if marker_claim not in {"yes", "no"}:
+        return "invalid-failure-record"
+    if (marker_claim == "yes") != marker_valid:
+        return "invalid-failure-record"
+    event_complete = record["event_status"] == "complete"
+    if event_complete and submitted != current:
+        return "invalid-failure-record"
+    if marker_valid:
+        expected = (
+            "post-compute-confirmed" if event_complete else
+            "post-compute-marker-positive-event-unavailable"
+        )
+        classification = (
+            "current-call-post-compute-confirmed" if event_complete else
+            "current-call-marker-observed-event-unavailable"
+        )
+    elif event_complete:
+        expected = "post-compute-event-confirmed-marker-invalid"
+        classification = (
+            "current-call-post-compute-event-confirmed-marker-invalid"
+        )
+    else:
+        expected = "inconclusive-no-positive-marker"
+        classification = "current-call-inconclusive"
+    if record["interpretation"] != expected:
+        return "invalid-failure-record"
+    return classification
+
+
+def format_q8_partner_async_completion_failure(
+        record: dict[str, str], classification: str) -> str:
+    if not record:
+        return ""
+    keys = (
+        "stage", "current_sequence", "marker_sequence", "marker_complement",
+        "marker_matches", "event_status", "interpretation", "begun",
+        "submitted", "confirmed", "home_tier", "home_device",
+        "partner_tier", "partner_device", "binding_label", "weight_offset",
+    )
+    fields = [f"record_classification={classification}"]
+    fields.extend(f"{key}={record.get(key, '')}" for key in keys)
+    return " ".join(fields)
+
+
+def q8_partner_async_completion_summary(
+        text: str) -> tuple[str, str, str, str, str, str, str]:
+    checkpoints = q8_partner_async_completion_records(text, "checkpoint")
+    failures = q8_partner_async_completion_records(text, "failure")
+    summaries = q8_partner_async_completion_records(text, "summary")
+    checkpoint = checkpoints[-1] if checkpoints else {}
+    failure = failures[-1] if failures else {}
+    summary = summaries[-1] if summaries else {}
+    last_checkpoint = ""
+    checkpoint_valid = q8_partner_async_completion_checkpoint_valid(checkpoint)
+    if checkpoint_valid:
+        last_checkpoint = (
+            f"sequence={checkpoint.get('sequence', '')} "
+            f"begun={checkpoint.get('begun', '')} "
+            f"submitted={checkpoint.get('submitted', '')} "
+            f"confirmed={checkpoint.get('confirmed', '')} "
+            f"evidence={checkpoint.get('evidence', '')}"
+        )
+    failure_classification = (
+        q8_partner_async_completion_failure_classification(failure)
+        if failure else ""
+    )
+    if failure:
+        classification = failure_classification
+    elif q8_partner_async_completion_marker_state(text) == "complete":
+        classification = "completed-all-confirmed"
+    elif checkpoint_valid:
+        classification = "prior-calls-confirmed-current-call-unresolved"
+    elif checkpoint:
+        classification = "invalid-checkpoint-record"
+    elif q8_partner_async_completion_enabled(text, 0):
+        classification = "armed-no-positive-evidence"
+    else:
+        classification = ""
+    return (
+        last_checkpoint,
+        format_q8_partner_async_completion_failure(
+            failure, failure_classification),
+        classification,
+        summary.get("begun", failure.get("begun", "")),
+        summary.get("submitted", failure.get("submitted", "")),
+        summary.get("confirmed", failure.get("confirmed", "")),
+        summary.get("partners_synchronized", ""),
+    )
 
 
 def q8_partner_phase_audit_markers(
@@ -818,6 +1050,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_host_bounce = outcomes.get(
         "attention-q8-host-bounce", "not-run"
     )
+    attention_q8_async_completion = outcomes.get(
+        "attention-q8-async-completion", "not-run"
+    )
     attention_q8_phase_audit = outcomes.get(
         "attention-q8-phase-audit", "not-run"
     )
@@ -863,6 +1098,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "failed-device-loss", "interrupted-prior-run-device-loss",
             "interrupted-no-result-device-loss",
         }
+    ]
+    attention_q8_async_completion_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-async-completion"
     ]
     attention_q8_phase_audit_rows = [
         row for row in rows
@@ -1070,6 +1309,131 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         all(row.get("attention_row_boundary_marker_state") == "complete"
             for row in boundary_rows)
     )
+    if attention_q8_async_completion != "not-run":
+        invalid_async_statuses = {
+            "validation-failed", "environment-invalid",
+            "passed-invalidated-watch", "completed-no-result-invalidated-watch",
+        }
+        async_statuses = {
+            row.get("status", "")
+            for row in attention_q8_async_completion_rows
+        }
+        if async_statuses & invalid_async_statuses:
+            return (
+                "At least one async-completion repeat failed its exact marker/"
+                "count/complement, production-path, environment, or post-run "
+                "health validation. Invalid evidence takes precedence over any "
+                "positive-looking record from another repeat; do not infer a fault "
+                "boundary from this mixed set."
+            )
+        if "inconclusive-underloaded" in async_statuses:
+            return (
+                "At least one async-completion repeat completed below the 500 "
+                "prefill tok/s load floor. Its boundary records are retained, but "
+                "underloaded evidence takes precedence over any positive-looking "
+                "record from another repeat and is invalid as a full-load trigger "
+                "comparison."
+            )
+        if attention_q8_async_completion == "invalid":
+            return (
+                "The async-completion arm returned but failed its exact marker/count/"
+                "complement or production-path validation. Do not infer a fault "
+                "boundary from it; inspect the summary-state mismatch."
+            )
+        device_loss_statuses = {
+            "failed-device-loss", "interrupted-prior-run-device-loss",
+            "interrupted-no-result-device-loss",
+        }
+        evidence_rows = [
+            row for row in attention_q8_async_completion_rows
+            if row.get("status") in device_loss_statuses
+        ]
+        classifications = {
+            row.get("q8_async_completion_classification", "")
+            for row in evidence_rows
+        }
+        failure_context = next((
+            row.get("q8_async_completion_last_failure", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_async_completion_last_failure")
+        ), "")
+        if ("invalid-failure-record" in classifications or
+                "invalid-checkpoint-record" in classifications):
+            return (
+                "The device-loss arm contains a truncated or internally inconsistent "
+                "Q8 async-completion record. It is invalid for boundary inference; "
+                "invalid evidence takes precedence over a positive-looking record "
+                "from another repeat, and no logged interpretation token is trusted "
+                "without pair, physical-device, sequence, complement, counter, and "
+                "event consistency. Last record: " + failure_context
+            )
+        if "current-call-post-compute-confirmed" in classifications:
+            return (
+                "The non-layer-targeted pair-0 Q8 marker positively confirms that "
+                "a recorded Q8 call in the device-loss arm crossed its post-compute "
+                "default-stream boundary before its API failure surfaced. CUDA "
+                "therefore executed that stream "
+                "through the marker after the Q8 compute submission. This narrows the "
+                "first positively observed failing boundary for that recorded call to "
+                "after the marker, but "
+                "does not prove an electrical or software root cause and does not "
+                "exclude the compute load as a trigger for a latent endpoint fault. "
+                "The record is not assumed to be the terminal process call because "
+                "the caller can recover from some copy failures. Last record: " +
+                failure_context
+            )
+        if "current-call-marker-observed-event-unavailable" in classifications:
+            return (
+                "The mapped pair-0 Q8 slot contained the recorded call's exact "
+                "sequence and complement after the API failure surfaced, but the "
+                "dedicated CUDA event could not be queried on the unhealthy "
+                "device/context. This is a positive hardware breadcrumb that the "
+                "marker write became host-visible after compute submission; without "
+                "a successful CUDA completion primitive it is not formal "
+                "same-stream completion proof and does not identify root cause. The "
+                "record is not assumed to be the terminal process call. Last record: "
+                + failure_context
+            )
+        if "current-call-post-compute-event-confirmed-marker-invalid" in classifications:
+            return (
+                "The dedicated event positively confirms that the partner default "
+                "stream crossed the post-compute marker submission for a recorded "
+                "Q8 call, but the mapped-host sequence/complement was invalid. This is "
+                "positive post-compute boundary evidence and a marker-channel "
+                "integrity failure, not evidence that Q8 compute failed and not a "
+                "valid clean arm. The record is not assumed to be the terminal "
+                "process call. Last record: " + failure_context
+            )
+        if "current-call-inconclusive" in classifications:
+            return (
+                "The Q8 audit captured an API failure but no matching positive marker "
+                "for that recorded call. Because the CUDA context/device was "
+                "unhealthy, absence is inconclusive: it is not evidence that the Q8 "
+                "compute itself failed. "
+                "Use the durable prior-call checkpoint only as the last confirmed "
+                "boundary. Last record: " + failure_context
+            )
+        if attention_q8_async_completion == "passed":
+            return (
+                "Every pair-0 partner-Q8 call in the completed full-load arm had "
+                "begun=submitted=confirmed with a valid final complement and a "
+                "healthy synchronized partner context. The added mapped-host marker "
+                "and event are a timing/PCIe perturbation, so survival does not clear "
+                "the original path; compare it with the otherwise identical "
+                "attention-q8-host-bounce no-marker control."
+            )
+        if "prior-calls-confirmed-current-call-unresolved" in classifications:
+            return (
+                "The arm durably confirms earlier pair-0 Q8 post-compute boundaries, "
+                "but it captured no validated positive failure record. The process's "
+                "terminal boundary remains unresolved; a missing marker is not "
+                "negative evidence."
+            )
+        return (
+            "The async-completion arm armed but produced no positive boundary record "
+            "that resolves the failing call. Its result is inconclusive, not evidence "
+            "against partner-Q8 completion."
+        )
     if boundary_audit == "passed" or boundary_survived_without_result:
         recovery_note = (
             " The benchmark and healthy post-run snapshot completed even though "
@@ -2232,6 +2596,9 @@ def main() -> None:
         q8_phase_last, q8_phase_first_failure, q8_phase_classification = (
             q8_partner_phase_audit_summary(log_text, 0)
         )
+        (q8_async_last, q8_async_last_failure, q8_async_classification,
+         q8_async_begun, q8_async_submitted, q8_async_confirmed,
+         q8_async_synchronized) = q8_partner_async_completion_summary(log_text)
         if variant == "attention-q8-l14-l15-phase-audit":
             (q8_window_last_complete, q8_window_l14_complete,
              q8_window_l15_complete, q8_window_classification) = (
@@ -2260,6 +2627,13 @@ def main() -> None:
             "pair0_indexer_complete_bytes": str(row_complete_bytes),
             "pair0_q8_transport": ",".join(transport_modes),
             "pair0_q8_serialized": ",".join(serialized_modes),
+            "q8_async_completion_last_checkpoint": q8_async_last,
+            "q8_async_completion_last_failure": q8_async_last_failure,
+            "q8_async_completion_classification": q8_async_classification,
+            "q8_async_completion_begun": q8_async_begun,
+            "q8_async_completion_submitted": q8_async_submitted,
+            "q8_async_completion_confirmed": q8_async_confirmed,
+            "q8_async_completion_partners_synchronized": q8_async_synchronized,
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
@@ -2337,10 +2711,15 @@ def main() -> None:
         "the same transfer direction and byte count; they change the initiating CUDA "
         "context/default stream, event dependencies, and required peer-access "
         "direction. CUDA chooses the physical transfer engine, which this audit does "
-        "not identify.",
+        "not identify. The async-completion arm adds a mapped-host marker and a "
+        "dedicated event after every selected partner-Q8 compute submission. A "
+        "matching marker is positive boundary evidence; a missing marker after "
+        "device/context loss is explicitly inconclusive.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
-        "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
+        "Q8 transport | Serialized | Q8 async classification | Q8 async counts | "
+        "Q8 async last checkpoint | Q8 async last failure | "
+        "Q8 async partners synchronized | Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
         "Q8 phase classification | Q8 skipped occurrence | "
         "Q8 selected occurrence | Q8 occurrence mapping | "
@@ -2354,7 +2733,7 @@ def main() -> None:
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -2362,6 +2741,13 @@ def main() -> None:
             f"{row.get('decode_tps', '')} | {row['last_phase']} | {row['last_event']} | "
             f"{row.get('pair0_q8_transport', '')} | "
             f"{row.get('pair0_q8_serialized', '')} | "
+            f"{row.get('q8_async_completion_classification', '')} | "
+            f"{row.get('q8_async_completion_begun', '')}/"
+            f"{row.get('q8_async_completion_submitted', '')}/"
+            f"{row.get('q8_async_completion_confirmed', '')} | "
+            f"{row.get('q8_async_completion_last_checkpoint', '')} | "
+            f"{row.get('q8_async_completion_last_failure', '')} | "
+            f"{row.get('q8_async_completion_partners_synchronized', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
@@ -2408,7 +2794,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if (len(sys.argv) == 4 and
+    if (len(sys.argv) == 3 and
+            sys.argv[1] == "--validate-q8-async-completion-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_async_completion_marker_state(
+            log_path.read_text(errors="replace")
+        )
+        if state != "complete":
+            fail(f"Q8 async-completion marker state is {state}")
+    elif (len(sys.argv) == 4 and
             sys.argv[1] == "--validate-q8-l14-l15-log"):
         log_path = Path(sys.argv[2])
         state = q8_partner_phase_audit_window_marker_state(

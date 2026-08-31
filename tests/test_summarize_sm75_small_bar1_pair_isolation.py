@@ -124,6 +124,61 @@ def q8_l12_measured_selection_prefix() -> str:
     )
 
 
+def q8_async_enabled() -> str:
+    return (
+        "ds4: CUDA q8 partner async completion audit enabled: "
+        "logical_pairs=0 marker=partner-default-stream-mapped-host "
+        "event=dedicated-post-marker interpretation=positive-only\n"
+    )
+
+
+def q8_async_checkpoint(sequence: int) -> str:
+    complement = (~sequence) & ((1 << 64) - 1)
+    return (
+        "ds4: CUDA q8 partner async completion checkpoint "
+        "home_tier=0 partner_tier=2 "
+        f"begun={sequence} submitted={sequence} confirmed={sequence} "
+        f"sequence={sequence} complement={complement} "
+        "evidence=post-compute-confirmed\n"
+    )
+
+
+def q8_async_summary(
+        begun: int, submitted: int, confirmed: int, *, synchronized: str = "yes",
+        sequence: int | None = None, complement: int | None = None) -> str:
+    sequence = begun if sequence is None else sequence
+    complement = (
+        ((~sequence) & ((1 << 64) - 1))
+        if complement is None else complement
+    )
+    return (
+        "ds4: CUDA q8 partner async completion summary "
+        "home_tier=0 partner_tier=2 "
+        f"begun={begun} submitted={submitted} confirmed={confirmed} "
+        f"last_sequence={sequence} last_complement={complement} "
+        f"partners_synchronized={synchronized}\n"
+    )
+
+
+def q8_async_failure(
+        sequence: int, *, marker_matches: str, event_status: str,
+        interpretation: str) -> str:
+    marker_sequence = sequence if marker_matches == "yes" else sequence - 1
+    marker_complement = (~marker_sequence) & ((1 << 64) - 1)
+    return (
+        "ds4: CUDA q8 partner async completion failure "
+        f"stage=result-gather current_sequence={sequence} "
+        f"marker_sequence={marker_sequence} marker_complement={marker_complement} "
+        f"marker_matches={marker_matches} event_status={event_status} "
+        f"interpretation={interpretation} begun={sequence} "
+        f"submitted={sequence} confirmed={sequence - 1} "
+        "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+        "tokens=512 in=8192 out=4096 "
+        "binding_label=tensor:blk.0.attn_output_b.weight "
+        "passed_label=attn_output_b weight_offset=141234898176\n"
+    )
+
+
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2414,6 +2469,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                     "attention-q8-l14-l15-phase-audit",
                     "attention-q8-targeted-phase-audit",
                     "attention-q8-phase-audit",
+                    "attention-q8-async-completion",
                     "attention-q8-host-bounce"), 1):
                 stem = f"r1-s{slot}-{variant}"
                 (production / f"{stem}.result").write_text(
@@ -2428,6 +2484,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 [row["variant"] for row in rows],
                 [
                     "attention-q8-host-bounce",
+                    "attention-q8-async-completion",
                     "attention-q8-phase-audit",
                     "attention-q8-targeted-phase-audit",
                     "attention-q8-l14-l15-phase-audit",
@@ -2582,6 +2639,322 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("has no verified outcome", report)
             self.assertIn("not a failed arm and is not a safe pass", report)
             self.assertIn("fresh full matrix", report)
+
+    def test_validates_complete_q8_async_completion_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "async.log"
+            log.write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_summary(128, 128, 128)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-async-completion-log", str(log),
+            ], check=True)
+
+    def test_rejects_q8_async_completion_count_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "async.log"
+            log.write_text(
+                q8_async_enabled() + q8_async_checkpoint(127) +
+                q8_async_summary(128, 128, 127)
+            )
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-async-completion-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("count-mismatch", completed.stderr)
+
+    def test_reports_positive_q8_async_completion_before_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="yes", event_status="complete",
+                    interpretation="post-compute-confirmed",
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "current-call-post-compute-confirmed",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("crossed its post-compute", report)
+            self.assertIn("default-stream boundary", report)
+            self.assertIn("does not prove an electrical or software root cause", report)
+            self.assertIn("does not exclude the compute load as a trigger", report)
+            self.assertIn("not assumed to be the terminal process call", report)
+
+    def test_separates_marker_observation_when_event_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="yes",
+                    event_status="unspecified-launch-failure",
+                    interpretation=(
+                        "post-compute-marker-positive-event-unavailable"
+                    ),
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "current-call-marker-observed-event-unavailable",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("positive hardware breadcrumb", report)
+            self.assertIn("not formal same-stream completion proof", report)
+
+    def test_missing_q8_async_marker_is_explicitly_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="no", event_status="not-ready",
+                    interpretation="inconclusive-no-positive-marker",
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "current-call-inconclusive",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("absence is inconclusive", report)
+            self.assertIn("not evidence that the Q8 compute itself failed", report)
+
+    def test_event_complete_marker_invalid_is_positive_integrity_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="no", event_status="complete",
+                    interpretation=(
+                        "post-compute-event-confirmed-marker-invalid"
+                    ),
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "current-call-post-compute-event-confirmed-marker-invalid",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("positive post-compute boundary evidence", report)
+            self.assertIn("marker-channel integrity failure", report)
+
+    def test_rejects_truncated_positive_q8_async_failure_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                "ds4: CUDA q8 partner async completion failure "
+                "stage=result-gather current_sequence=129 marker_sequence=129 "
+                "marker_complement=18446744073709551486 marker_matches=yes "
+                "event_status=complete interpretation=post-compute-confirmed\n"
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "invalid-failure-record",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("truncated or internally inconsistent", report)
+            self.assertNotIn("marker positively confirms", report)
+
+    def test_rejects_bad_complement_pair_or_device_q8_async_records(self) -> None:
+        for mutation in ("bad-complement", "wrong-pair", "wrong-device"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                production = root / "production"
+                production.mkdir()
+                stem = "r1-s1-attention-q8-async-completion"
+                (production / f"{stem}.result").write_text(
+                    "variant=attention-q8-async-completion\n"
+                    "status=failed-device-loss\nexit_status=124\n"
+                )
+                failure = q8_async_failure(
+                    129, marker_matches="yes", event_status="complete",
+                    interpretation="post-compute-confirmed",
+                )
+                if mutation == "bad-complement":
+                    expected = (~129) & ((1 << 64) - 1)
+                    failure = failure.replace(
+                        f"marker_complement={expected}", "marker_complement=0"
+                    )
+                else:
+                    if mutation == "wrong-pair":
+                        failure = failure.replace("home_tier=0", "home_tier=1")
+                    else:
+                        failure = failure.replace(
+                            "partner_device=1", "partner_device=3"
+                        )
+                (production / f"{stem}.log").write_text(
+                    q8_async_enabled() + q8_async_checkpoint(128) + failure
+                )
+                write_unhealthy_post(root, stem)
+
+                subprocess.run(
+                    [sys.executable, str(SUMMARIZER), str(root)], check=True
+                )
+                with (root / "summary.csv").open(newline="") as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertEqual(
+                    row["q8_async_completion_classification"],
+                    "invalid-failure-record",
+                )
+
+    def test_mixed_invalid_repeat_outranks_positive_q8_async_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            positive = "r1-s1-attention-q8-async-completion"
+            (production / f"{positive}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{positive}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="yes", event_status="complete",
+                    interpretation="post-compute-confirmed",
+                )
+            )
+            write_unhealthy_post(root, positive)
+
+            invalid = "r2-s1-attention-q8-async-completion"
+            (production / f"{invalid}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=validation-failed\nexit_status=127\n"
+            )
+            (production / f"{invalid}.log").write_text(q8_async_enabled())
+            write_healthy_post(root, invalid)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("Invalid evidence takes precedence", report)
+            self.assertNotIn("marker positively confirms", report)
+
+    def test_last_q8_async_failure_record_controls_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="yes", event_status="complete",
+                    interpretation="post-compute-confirmed",
+                ) +
+                q8_async_failure(
+                    130, marker_matches="no", event_status="not-ready",
+                    interpretation="inconclusive-no-positive-marker",
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_async_completion_classification"],
+                "current-call-inconclusive",
+            )
+            self.assertIn(
+                "current_sequence=130", row["q8_async_completion_last_failure"]
+            )
+
+    def test_invalid_outcome_outranks_positive_q8_async_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-async-completion"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-async-completion\n"
+                "status=validation-failed\nexit_status=127\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_async_enabled() + q8_async_checkpoint(128) +
+                q8_async_failure(
+                    129, marker_matches="yes", event_status="complete",
+                    interpretation="post-compute-confirmed",
+                )
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("failed its exact marker/count/complement", report)
+            self.assertNotIn("marker positively confirms", report)
 
     def test_requires_final_production_control(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -3524,26 +3524,63 @@ the failing 512-token 8192-to-4096 call occupies only the first 16 MiB for its
 activation and result. No analogous allocation-tail geometry or runtime scratch
 size mismatch was found. The host-bounce D2H is synchronous, but it can still be
 the first API to report a deferred partner compute/default-stream error or an
-endpoint loss that already occurred. That is why the follow-up fences the exact
-pre-compute, post-compute, and result-copy boundaries instead of assigning
-causality to the surfaced D2H error.
+endpoint loss that already occurred. The surfaced D2H error therefore cannot be
+assigned causality by itself. The mechanism-level diagnostic below observes
+every pair-0 Q8 post-compute boundary
+rather than selecting another presumed layer.
 
-The follow-up one-arm diagnostic is `attention-q8-l12-phase-audit`. It retains
-the same four-GPU 32K/TG256 production workload, 50/50 attention row split,
-partner compute, pair-0 attention/Q8 host-bounce transport cut, pair-1 direct
-transport, and 250 W requirement. It strictly preflights the single exact
-layer-12 tuple, skips target occurrence 1 (the untimed warmup), and audits only
-target occurrence 2 (the first measured layer-12 call). That selected call must
-emit one durable selection record with `selected occurrence=2 sequence=1` and
-one exact seven-event chain from activation preparation through result gather.
-Acceptance also requires strict log order: warmup start, skipped occurrence 1,
-warmup completion, measured chunk begin, then selected occurrence 2. This proves
-the skipped call was the untimed warmup and the fenced call was the first
-measured occurrence. All later target occurrences run without phase fences,
-minimizing perturbation of the production overlap envelope. `SKIP_BUILD=0` is
-mandatory so the fixed CUDA/P2P preflight is repeated after reboot.
+The subsequent `attention-q8-l12-phase-audit` result invalidated that targeting
+strategy. Its measured workload failed before occurrence 2 of the L12 tuple was
+selected. The first API-level Q8 failure instead surfaced while processing the
+layer-0 `attn_output_b` partner projection. That does **not** prove layer 0 or
+that projection caused the endpoint loss; CUDA can report an earlier
+asynchronous failure at a later synchronous API. It does prove that selecting
+another presumed layer from the final engine error cannot answer the fault
+question. Do not continue walking the layer number.
 
-Run it from a clean boot and a fresh output directory:
+The replacement mechanism diagnostic is `attention-q8-async-completion`. It has
+no layer, binding, occurrence, or position selector. It retains the full
+four-GPU 32K/TG256 production workload, 50/50 attention row split, partner
+execution, pair-0 attention/Q8 host-bounce transport cut, pair-1 direct
+transport, and exact 250 W requirement. Every admitted pair-0 partner-Q8 call
+gets a monotonically increasing sequence. Immediately after that call's Q8
+compute submission, on the same partner default stream, a one-thread kernel
+writes the sequence and its complement to mapped host memory and a dedicated
+event is recorded. No synchronization is added at that boundary. A
+**successful** existing synchronous host-bounce result gather is the visibility
+checkpoint.
+
+The audit records `begun`, `submitted`, and `confirmed` separately. A completed
+dedicated event is CUDA-synchronized evidence that the partner default stream
+crossed that call's post-compute marker. If that event completes but the mapped
+marker is invalid, the arm is classified as a marker-channel integrity failure
+rather than a clean result. If the unhealthy device/context makes the event
+unavailable but the mapped slot contains the exact current sequence and
+complement, that is retained separately as a positive hardware breadcrumb—not
+formal CUDA same-stream completion proof. An absent or stale marker in that
+case is explicitly inconclusive; it must not be interpreted as proof that
+compute failed. A clean completion is accepted only when all three counts
+match, the final complement is valid, and that pair's partner context
+synchronizes during teardown.
+
+This arm deliberately adds one tiny kernel, one mapped-host write, one event,
+and three host counter updates per pair-0 partner-Q8 call. After a successful
+gather it also reads the sequence/complement pair, and call 1 plus every 64th
+confirmed call emits an extra marker `fprintf`/`fflush`. Those are timing,
+host-scheduling, and PCIe perturbations. The durable `fsync` at those sparse
+checkpoints is issued by the existing Q8 transfer audit in both this arm and
+its no-marker control; it is not unique to the marker arm. A surviving run
+therefore does not clear the original path and must be compared with the
+otherwise identical `attention-q8-host-bounce` arm, which has no completion
+marker. The diagnostic question is narrower: for a Q8 call that reports an API
+failure, is there positive evidence that its partner compute stream already
+crossed the post-compute boundary? A completed arm must still exceed the 500
+prefill tok/s gate. A crashing arm has no valid throughput result, so identical
+launch settings and telemetry establish the intended load configuration but do
+not by themselves prove an achieved rate.
+
+Run it after a clean boot and use a fresh output directory. `SKIP_BUILD=0` is
+mandatory so the CUDA changes and the fixed CUDA/P2P preflight are both present:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -3562,14 +3599,14 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 unset CUDA_VISIBLE_DEVICES
 unset SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-l12-phase-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-async-completion-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-q8-l12-phase-audit \
+VARIANTS=attention-q8-async-completion,attention-q8-host-bounce \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
@@ -3580,6 +3617,12 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
+
+The marker arm runs first. If either arm causes device loss, reboot and resume
+the same directory with the same two-variant order and `RESUME=1`; do not create
+a replacement directory for that comparison. The no-marker arm explicitly
+rejects any async-completion enable/checkpoint/summary record, so inherited
+diagnostic state cannot silently contaminate the control.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

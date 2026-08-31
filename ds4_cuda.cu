@@ -1261,6 +1261,30 @@ static std::atomic<uint64_t>
     g_q8_f16_partner_phase_audit_selected_occurrence = 0;
 static uint64_t g_q8_f16_partner_phase_audit_skip_occurrences;
 static uint64_t g_q8_f16_partner_phase_audit_max_occurrences;
+/* Low-perturbation fault breadcrumb for the production partner-Q8 stream.
+ * The selected partner writes sequence/complement into mapped host memory
+ * immediately after its GEMM, then records a dedicated event on that same
+ * default stream.  A matching commit is positive evidence that the stream
+ * crossed the post-GEMM boundary.  Its absence after device loss is not proof
+ * that the GEMM failed: an unrecoverable context does not provide a successful
+ * host/device visibility boundary. */
+struct alignas(64) cuda_q8_f16_partner_async_completion_slot {
+    volatile uint64_t sequence;
+    volatile uint64_t complement;
+};
+static cuda_q8_f16_partner_async_completion_slot
+    *g_q8_f16_partner_async_completion_host;
+static bool g_q8_f16_partner_async_completion_retained_after_failure;
+static cuda_q8_f16_partner_async_completion_slot
+    *g_q8_f16_partner_async_completion_device[DS4_MAX_GPUS];
+static cudaEvent_t
+    g_q8_f16_partner_async_completion_event[DS4_MAX_GPUS];
+static std::atomic<uint64_t>
+    g_q8_f16_partner_async_completion_begun[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_async_completion_submitted[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_async_completion_confirmed[DS4_MAX_GPUS] = {};
 static std::atomic<uint64_t> g_t32_f16_fused_local_calls = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_partner_calls = 0;
 
@@ -4330,8 +4354,278 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+__global__ static void cuda_q8_f16_partner_async_completion_kernel(
+        cuda_q8_f16_partner_async_completion_slot *slot,
+        uint64_t sequence) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    slot->sequence = sequence;
+    __threadfence_system();
+    slot->complement = ~sequence;
+    __threadfence_system();
+}
+
+static int cuda_q8_f16_partner_async_completion_init(void) {
+    const char *pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS");
+    if (!pairs || !pairs[0]) return 1;
+    if (g_q8_f16_partner_async_completion_retained_after_failure) {
+        fprintf(stderr,
+                "ds4: CUDA q8 async completion cannot be reinitialized after "
+                "a prior unsynchronized context retained its mapped marker\n");
+        return 0;
+    }
+    if (g_q8_f16_partner_async_completion_host) return 1;
+
+    void *host = NULL;
+    cudaError_t err = cudaHostAlloc(
+        &host,
+        sizeof(cuda_q8_f16_partner_async_completion_slot) * DS4_MAX_GPUS,
+        cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess || !host) {
+        fprintf(stderr,
+                "ds4: CUDA q8 async completion mapped-host allocation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    memset(host, 0,
+           sizeof(cuda_q8_f16_partner_async_completion_slot) * DS4_MAX_GPUS);
+    g_q8_f16_partner_async_completion_host =
+        (cuda_q8_f16_partner_async_completion_slot *)host;
+
+    int saved_device = -1;
+    if (cudaGetDevice(&saved_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(host);
+        g_q8_f16_partner_async_completion_host = NULL;
+        return 0;
+    }
+    int initialized = 1;
+    for (int home_tier = 0; home_tier < g_n_gpus / 2; home_tier++) {
+        if (!cuda_env_pair_list_contains(
+                "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS",
+                home_tier)) continue;
+        const int partner_tier = home_tier + g_n_gpus / 2;
+        const int partner_device = g_gpu[partner_tier].device_id;
+        cudaDeviceProp prop = {};
+        unsigned int device_flags = 0u;
+        /* cudaDeviceMapHost is implicit for runtime-created contexts in
+         * current CUDA, and current cudaSetDeviceFlags does not accept it as
+         * an explicit request.  Verify the effective context flag rather than
+         * trying to change an already-created context. */
+        if (cudaSetDevice(partner_device) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, partner_device) != cudaSuccess ||
+            cudaGetDeviceFlags(&device_flags) != cudaSuccess ||
+            !prop.canMapHostMemory ||
+            (device_flags & cudaDeviceMapHost) == 0u) {
+            initialized = 0;
+            (void)cudaGetLastError();
+            fprintf(stderr,
+                    "ds4: CUDA q8 async completion partner device %d does "
+                    "not expose runtime mapped-host access "
+                    "(can_map=%d device_flags=0x%x)\n",
+                    partner_device, prop.canMapHostMemory ? 1 : 0,
+                    device_flags);
+            break;
+        }
+        void *device = NULL;
+        err = cudaHostGetDevicePointer(&device, host, 0);
+        if (err != cudaSuccess || !device) {
+            initialized = 0;
+            (void)cudaGetLastError();
+            break;
+        }
+        g_q8_f16_partner_async_completion_device[home_tier] =
+            (cuda_q8_f16_partner_async_completion_slot *)device + home_tier;
+        err = cudaEventCreateWithFlags(
+            &g_q8_f16_partner_async_completion_event[home_tier],
+            cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            initialized = 0;
+            (void)cudaGetLastError();
+            break;
+        }
+        g_q8_f16_partner_async_completion_begun[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_async_completion_submitted[home_tier].store(
+            0u, std::memory_order_relaxed);
+        g_q8_f16_partner_async_completion_confirmed[home_tier].store(
+            0u, std::memory_order_relaxed);
+    }
+    if (cudaSetDevice(saved_device) != cudaSuccess) initialized = 0;
+    g_current_logical_tier = -1;
+    if (!initialized) {
+        for (int home_tier = 0; home_tier < DS4_MAX_GPUS; home_tier++) {
+            if (g_q8_f16_partner_async_completion_event[home_tier]) {
+                const int partner_tier = home_tier + g_n_gpus / 2;
+                if (partner_tier < g_n_gpus) {
+                    (void)cudaSetDevice(g_gpu[partner_tier].device_id);
+                }
+                (void)cudaEventDestroy(
+                    g_q8_f16_partner_async_completion_event[home_tier]);
+                g_q8_f16_partner_async_completion_event[home_tier] = NULL;
+            }
+            g_q8_f16_partner_async_completion_device[home_tier] = NULL;
+        }
+        (void)cudaSetDevice(saved_device);
+        (void)cudaFreeHost(host);
+        g_q8_f16_partner_async_completion_host = NULL;
+        g_current_logical_tier = -1;
+        fprintf(stderr,
+                "ds4: CUDA q8 async completion initialization failed\n");
+        return 0;
+    }
+
+    fprintf(stderr,
+            "ds4: CUDA q8 partner async completion audit enabled: "
+            "logical_pairs=%s marker=partner-default-stream-mapped-host "
+            "event=dedicated-post-marker interpretation=positive-only\n",
+            pairs);
+    fflush(stderr);
+    return 1;
+}
+
+static void cuda_q8_f16_partner_async_completion_report(
+        const bool *partner_synchronized) {
+    if (!g_q8_f16_partner_async_completion_host) return;
+    for (int home_tier = 0; home_tier < g_n_gpus / 2; home_tier++) {
+        if (!g_q8_f16_partner_async_completion_device[home_tier]) continue;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const cuda_q8_f16_partner_async_completion_slot &slot =
+            g_q8_f16_partner_async_completion_host[home_tier];
+        const uint64_t complement = slot.complement;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const uint64_t sequence = slot.sequence;
+        fprintf(stderr,
+                "ds4: CUDA q8 partner async completion summary "
+                "home_tier=%d partner_tier=%d begun=%llu submitted=%llu "
+                "confirmed=%llu last_sequence=%llu last_complement=%llu "
+                "partners_synchronized=%s\n",
+                home_tier, home_tier + g_n_gpus / 2,
+                (unsigned long long)
+                    g_q8_f16_partner_async_completion_begun[home_tier].load(
+                        std::memory_order_relaxed),
+                (unsigned long long)
+                    g_q8_f16_partner_async_completion_submitted[home_tier].load(
+                        std::memory_order_relaxed),
+                (unsigned long long)
+                    g_q8_f16_partner_async_completion_confirmed[home_tier].load(
+                        std::memory_order_relaxed),
+                (unsigned long long)sequence,
+                (unsigned long long)complement,
+                partner_synchronized && partner_synchronized[home_tier]
+                    ? "yes" : "no");
+    }
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static void cuda_q8_f16_partner_async_completion_release(void) {
+    if (!g_q8_f16_partner_async_completion_host) return;
+    if (g_q8_f16_partner_async_completion_retained_after_failure) return;
+    bool all_synchronized = true;
+    bool partner_synchronized[DS4_MAX_GPUS] = {};
+    int last_synchronized_device = -1;
+    int saved_device = -1;
+    if (cudaGetDevice(&saved_device) != cudaSuccess) {
+        all_synchronized = false;
+        (void)cudaGetLastError();
+    }
+    for (int home_tier = 0; home_tier < g_n_gpus / 2; home_tier++) {
+        if (!g_q8_f16_partner_async_completion_device[home_tier]) continue;
+        const int partner_tier = home_tier + g_n_gpus / 2;
+        const int partner_device = g_gpu[partner_tier].device_id;
+        const cudaError_t set_error = cudaSetDevice(partner_device);
+        const cudaError_t sync_error = set_error == cudaSuccess
+            ? cudaDeviceSynchronize() : set_error;
+        if (set_error != cudaSuccess || sync_error != cudaSuccess) {
+            all_synchronized = false;
+            fprintf(stderr,
+                    "ds4: CUDA q8 async completion cleanup could not "
+                    "synchronize partner device %d: %s\n",
+                    partner_device, cudaGetErrorString(sync_error));
+            (void)cudaGetLastError();
+        } else {
+            last_synchronized_device = partner_device;
+            partner_synchronized[home_tier] = true;
+        }
+        if (set_error == cudaSuccess &&
+            g_q8_f16_partner_async_completion_event[home_tier]) {
+            const cudaError_t destroy_error = cudaEventDestroy(
+                g_q8_f16_partner_async_completion_event[home_tier]);
+            if (destroy_error != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA q8 async completion event cleanup failed "
+                        "on partner device %d: %s\n",
+                        partner_device, cudaGetErrorString(destroy_error));
+                (void)cudaGetLastError();
+            }
+            g_q8_f16_partner_async_completion_event[home_tier] = NULL;
+        }
+    }
+    cuda_q8_f16_partner_async_completion_report(partner_synchronized);
+    if (all_synchronized) {
+        if (last_synchronized_device >= 0) {
+            (void)cudaSetDevice(last_synchronized_device);
+        }
+        const cudaError_t free_error = cudaFreeHost(
+            g_q8_f16_partner_async_completion_host);
+        if (free_error == cudaSuccess) {
+            g_q8_f16_partner_async_completion_host = NULL;
+        } else {
+            g_q8_f16_partner_async_completion_retained_after_failure = true;
+            fprintf(stderr,
+                    "ds4: CUDA q8 async completion mapped-host cleanup failed; "
+                    "retaining allocation until process exit: %s\n",
+                    cudaGetErrorString(free_error));
+            (void)cudaGetLastError();
+        }
+    } else {
+        g_q8_f16_partner_async_completion_retained_after_failure = true;
+        fprintf(stderr,
+                "ds4: CUDA q8 async completion mapped-host allocation retained "
+                "until process exit after an unsynchronized partner context\n");
+    }
+    /* If a device was lost, leave the tiny pinned allocation registered until
+     * process exit rather than freeing memory a failed GPU may still target. */
+    for (int home_tier = 0; home_tier < DS4_MAX_GPUS; home_tier++) {
+        g_q8_f16_partner_async_completion_device[home_tier] = NULL;
+    }
+    if (saved_device >= 0 && cudaSetDevice(saved_device) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA q8 async completion cleanup could not restore "
+                "physical device %d\n", saved_device);
+        (void)cudaGetLastError();
+    }
+    g_current_logical_tier = -1;
+}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    const char *async_completion_pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS");
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            async_completion_pairs, cfg->n_gpus, false)) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS; "
+                "expected a unique in-range decimal logical-pair list\n");
+        return 0;
+    }
+    if (async_completion_pairs && async_completion_pairs[0]) {
+        for (int pair = 0; pair < cfg->n_gpus / 2; pair++) {
+            if (cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS", pair) &&
+                !cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", pair)) {
+                fprintf(stderr,
+                        "ds4: Q8 async completion audit pair %d requires the "
+                        "same pair in DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS "
+                        "so successful gathers provide a visibility checkpoint\n",
+                        pair);
+                return 0;
+            }
+        }
+    }
     const char *phase_audit_targets = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS");
     const bool phase_audit_targets_requested =
@@ -4571,6 +4865,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         }
     }
 
+    if (!cuda_q8_f16_partner_async_completion_init()) return 0;
     g_cublas_ready = 1;
     return 1;
 }
@@ -4720,6 +5015,8 @@ extern "C" void ds4_gpu_cleanup(void) {
                     g_moe_q4_32_down_decode_prefetch_calls[2].load(
                         std::memory_order_relaxed));
     }
+
+    cuda_q8_f16_partner_async_completion_release();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
@@ -16775,6 +17072,98 @@ static void cuda_q8_f16_partner_host_bounce_failure_log(
     (void)fsync(fileno(stderr));
 }
 
+static bool cuda_q8_f16_partner_async_completion_read(
+        int home_tier, uint64_t expected_sequence,
+        uint64_t *sequence_out, uint64_t *complement_out) {
+    if (!g_q8_f16_partner_async_completion_host ||
+        home_tier < 0 || home_tier >= DS4_MAX_GPUS) return false;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const cuda_q8_f16_partner_async_completion_slot &slot =
+        g_q8_f16_partner_async_completion_host[home_tier];
+    const uint64_t complement = slot.complement;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const uint64_t sequence = slot.sequence;
+    if (sequence_out) *sequence_out = sequence;
+    if (complement_out) *complement_out = complement;
+    return sequence == expected_sequence && complement == ~expected_sequence;
+}
+
+static void cuda_q8_f16_partner_async_completion_failure_log(
+        const char *failure_stage, bool current_event_recorded,
+        uint64_t current_sequence, int home_tier, int home_device,
+        int partner_tier, int partner_device, uint64_t n_tok,
+        uint64_t in_dim, uint64_t out_dim, const char *binding_label,
+        const char *passed_label, uint64_t weight_offset) {
+    if (current_sequence == 0u || home_tier < 0 ||
+        home_tier >= DS4_MAX_GPUS ||
+        !g_q8_f16_partner_async_completion_host) return;
+    const char *event_status = current_event_recorded
+        ? "not-queried" : "not-recorded";
+    cudaError_t event_query = cudaErrorNotReady;
+    if (current_event_recorded && home_tier >= 0 &&
+        home_tier < DS4_MAX_GPUS &&
+        g_q8_f16_partner_async_completion_event[home_tier]) {
+        int actual_device = -1;
+        if (cudaGetDevice(&actual_device) == cudaSuccess &&
+            actual_device == partner_device) {
+            event_query = cudaEventQuery(
+                g_q8_f16_partner_async_completion_event[home_tier]);
+            event_status = event_query == cudaSuccess
+                ? "complete"
+                : (event_query == cudaErrorNotReady
+                       ? "not-ready" : cudaGetErrorName(event_query));
+        } else {
+            event_status = "unavailable-current-device";
+        }
+    }
+    /* Query first.  If the event completes, its same-stream ordering proves
+     * the preceding marker kernel has finished; reading the mapped slot only
+     * afterward avoids classifying a stale pre-completion sample as marker
+     * corruption.  When the event is unavailable/not-ready, the subsequent
+     * read remains positive-only: a match is evidence, absence is not. */
+    uint64_t marker_sequence = 0u;
+    uint64_t marker_complement = 0u;
+    const bool marker_matches = cuda_q8_f16_partner_async_completion_read(
+        home_tier, current_sequence, &marker_sequence, &marker_complement);
+    const char *interpretation = marker_matches
+        ? (event_query == cudaSuccess
+               ? "post-compute-confirmed"
+               : "post-compute-marker-positive-event-unavailable")
+        : (event_query == cudaSuccess
+               ? "post-compute-event-confirmed-marker-invalid"
+               : "inconclusive-no-positive-marker");
+    fprintf(stderr,
+            "ds4: CUDA q8 partner async completion failure "
+            "stage=%s current_sequence=%llu marker_sequence=%llu "
+            "marker_complement=%llu marker_matches=%s event_status=%s "
+            "interpretation=%s begun=%llu submitted=%llu confirmed=%llu "
+            "home_tier=%d home_device=%d "
+            "partner_tier=%d partner_device=%d tokens=%llu in=%llu out=%llu "
+            "binding_label=%s passed_label=%s weight_offset=%llu\n",
+            failure_stage && failure_stage[0] ? failure_stage : "unknown",
+            (unsigned long long)current_sequence,
+            (unsigned long long)marker_sequence,
+            (unsigned long long)marker_complement,
+            marker_matches ? "yes" : "no", event_status, interpretation,
+            (unsigned long long)
+                g_q8_f16_partner_async_completion_begun[home_tier].load(
+                    std::memory_order_relaxed),
+            (unsigned long long)
+                g_q8_f16_partner_async_completion_submitted[home_tier].load(
+                    std::memory_order_relaxed),
+            (unsigned long long)
+                g_q8_f16_partner_async_completion_confirmed[home_tier].load(
+                    std::memory_order_relaxed),
+            home_tier, home_device, partner_tier, partner_device,
+            (unsigned long long)n_tok, (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "unavailable",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
 static void cuda_q8_f16_partner_phase_audit_selection_log(
         uint64_t occurrence, uint64_t sequence,
         const char *binding_label, uint64_t weight_offset) {
@@ -16953,6 +17342,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", home_tier);
     const bool serialize_pair = cuda_env_pair_list_contains(
         "DS4_CUDA_Q8_F16_PARTNER_SERIALIZE_PAIRS", home_tier);
+    const bool async_completion_call = cuda_env_pair_list_contains(
+        "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS", home_tier);
     const char *phase_audit_pair_list = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
     bool phase_audit_pair = false;
@@ -17178,6 +17569,10 @@ static int cuda_q8_f16_partner_matmul_impl(
         ? g_q8_f16_partner_phase_audit_sequence.fetch_add(
               1u, std::memory_order_relaxed) + 1u
         : 0u;
+    const uint64_t async_completion_sequence = async_completion_call
+        ? g_q8_f16_partner_async_completion_begun[home_tier].fetch_add(
+              1u, std::memory_order_relaxed) + 1u
+        : 0u;
     if (phase_audit_call) {
         if (g_q8_f16_partner_phase_audit_skip_occurrences != 0u ||
             g_q8_f16_partner_phase_audit_max_occurrences != 0u) {
@@ -17196,8 +17591,18 @@ static int cuda_q8_f16_partner_matmul_impl(
         arithmetic == CUDA_Q8_PARTNER_W16_X16_SGEMM) {
         f32_to_f16_kernel<<<(activation_count + 255u) / 256u, 256>>>(
             (__half *)home_scratch, (const float *)x->ptr, activation_count);
-        if (!cuda_ok(cudaGetLastError(),
-                     "q8 partner activation f16 convert launch")) return 0;
+        const cudaError_t conversion_launch = cudaGetLastError();
+        if (!cuda_ok(conversion_launch,
+                     "q8 partner activation f16 convert launch")) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "activation-f16-convert-submit", false,
+                    async_completion_sequence, home_tier, home_device,
+                    partner_tier, partner_device, n_tok, in_dim, out_dim,
+                    binding->label, label, weight_offset);
+            }
+            return 0;
+        }
         activation_src = {home_scratch, activation_f16_bytes, 0, home_tier};
         activation_dst = {partner_scratch, activation_f16_bytes, 0,
                           partner_tier};
@@ -17209,8 +17614,18 @@ static int cuda_q8_f16_partner_matmul_impl(
             (int8_t *)home_scratch,
             (float *)(home_scratch + scale_offset),
             (const float *)x->ptr, in_dim, blocks);
-        if (!cuda_ok(cudaGetLastError(),
-                     "q8 partner activation q8 convert launch")) return 0;
+        const cudaError_t conversion_launch = cudaGetLastError();
+        if (!cuda_ok(conversion_launch,
+                     "q8 partner activation q8 convert launch")) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "activation-q8-convert-submit", false,
+                    async_completion_sequence, home_tier, home_device,
+                    partner_tier, partner_device, n_tok, in_dim, out_dim,
+                    binding->label, label, weight_offset);
+            }
+            return 0;
+        }
         activation_src = {home_scratch, transport_bytes, 0, home_tier};
         activation_dst = {partner_scratch, transport_bytes, 0,
                           partner_tier};
@@ -17253,6 +17668,12 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             &activation_dst, &activation_src,
             activation_transfer_bytes, force_host_bounce)) {
+        if (async_completion_call) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "activation-copy", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+        }
         if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "activation-copy-failed",
@@ -17279,6 +17700,12 @@ static int cuda_q8_f16_partner_matmul_impl(
             NULL);
     }
     if (ds4_gpu_set_current_device(partner_tier) != 0) {
+        if (async_completion_call) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "partner-device-switch", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+        }
         return cuda_q8_f16_sync_home_for_fallback(
                    home_tier, "partner device switch") < 0 ? -1 : 0;
     }
@@ -17288,8 +17715,16 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (arithmetic == CUDA_Q8_PARTNER_W16_X16_SGEMM) {
         f16_to_f32_kernel<<<(activation_count + 255u) / 256u, 256>>>(
             partner_x32, (const __half *)partner_scratch, activation_count);
-        if (!cuda_ok(cudaGetLastError(),
+        const cudaError_t widen_launch = cudaGetLastError();
+        if (!cuda_ok(widen_launch,
                      "q8 partner activation f16 widen launch")) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "activation-f16-widen-submit", false,
+                    async_completion_sequence, home_tier, home_device,
+                    partner_tier, partner_device, n_tok, in_dim, out_dim,
+                    binding->label, label, weight_offset);
+            }
             return cuda_q8_f16_sync_home_for_fallback(
                        home_tier, "activation f16 widen") < 0 ? -1 : 0;
         }
@@ -17300,8 +17735,16 @@ static int cuda_q8_f16_partner_matmul_impl(
             partner_x32, (const int8_t *)partner_scratch,
             (const float *)(partner_scratch + scale_offset),
             in_dim, blocks, n_tok);
-        if (!cuda_ok(cudaGetLastError(),
+        const cudaError_t widen_launch = cudaGetLastError();
+        if (!cuda_ok(widen_launch,
                      "q8 partner activation q8 widen launch")) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "activation-q8-widen-submit", false,
+                    async_completion_sequence, home_tier, home_device,
+                    partner_tier, partner_device, n_tok, in_dim, out_dim,
+                    binding->label, label, weight_offset);
+            }
             return cuda_q8_f16_sync_home_for_fallback(
                        home_tier, "activation q8 widen") < 0 ? -1 : 0;
         }
@@ -17316,6 +17759,13 @@ static int cuda_q8_f16_partner_matmul_impl(
             NULL);
         const cudaError_t pre_compute_sync = cudaDeviceSynchronize();
         if (pre_compute_sync != cudaSuccess) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "pre-compute-sync", false, async_completion_sequence,
+                    home_tier, home_device, partner_tier, partner_device,
+                    n_tok, in_dim, out_dim, binding->label, label,
+                    weight_offset);
+            }
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "pre-compute-sync-failed",
                 "pre-compute-sync", binding->label, label, weight_offset,
@@ -17388,6 +17838,12 @@ static int cuda_q8_f16_partner_matmul_impl(
         compute_ok = st == CUBLAS_STATUS_SUCCESS;
     }
     if (!compute_ok) {
+        if (async_completion_call) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "compute-submit", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+        }
         if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "compute-submit-failed", "compute",
@@ -17428,6 +17884,13 @@ static int cuda_q8_f16_partner_matmul_impl(
             NULL);
         const cudaError_t compute_sync = cudaDeviceSynchronize();
         if (compute_sync != cudaSuccess) {
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "compute-sync", false, async_completion_sequence,
+                    home_tier, home_device, partner_tier, partner_device,
+                    n_tok, in_dim, out_dim, binding->label, label,
+                    weight_offset);
+            }
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "compute-sync-failed", "compute-sync",
                 binding->label, label, weight_offset,
@@ -17462,11 +17925,66 @@ static int cuda_q8_f16_partner_matmul_impl(
             NULL);
     }
 
+    bool async_completion_event_recorded = false;
+    if (async_completion_call) {
+        cuda_q8_f16_partner_async_completion_slot *device_slot =
+            home_tier >= 0 && home_tier < DS4_MAX_GPUS
+                ? g_q8_f16_partner_async_completion_device[home_tier] : NULL;
+        cudaEvent_t completion_event =
+            home_tier >= 0 && home_tier < DS4_MAX_GPUS
+                ? g_q8_f16_partner_async_completion_event[home_tier] : NULL;
+        if (!device_slot || !completion_event) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "marker-state-missing", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+            fprintf(stderr,
+                    "ds4: fatal q8 async completion state missing for logical "
+                    "pair %d\n",
+                    home_tier);
+            return -1;
+        }
+        cuda_q8_f16_partner_async_completion_kernel<<<1, 1>>>(
+            device_slot, async_completion_sequence);
+        const cudaError_t marker_launch = cudaGetLastError();
+        if (marker_launch != cudaSuccess) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "marker-submit", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+            fprintf(stderr,
+                    "ds4: CUDA q8 async completion marker launch failed: %s\n",
+                    cudaGetErrorString(marker_launch));
+            return -1;
+        }
+        const cudaError_t event_record = cudaEventRecord(completion_event, 0);
+        if (event_record != cudaSuccess) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "event-record", false, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+            fprintf(stderr,
+                    "ds4: CUDA q8 async completion event record failed: %s\n",
+                    cudaGetErrorString(event_record));
+            return -1;
+        }
+        async_completion_event_recorded = true;
+        g_q8_f16_partner_async_completion_submitted[home_tier].fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
     ds4_gpu_tensor result_src = {
         partner_result, result_bytes, 0, partner_tier
     };
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             out, &result_src, result_bytes, force_host_bounce)) {
+        if (async_completion_call) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "result-gather", async_completion_event_recorded,
+                async_completion_sequence, home_tier, home_device,
+                partner_tier, partner_device, n_tok, in_dim, out_dim,
+                binding->label, label, weight_offset);
+        }
         if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "result-copy-failed", "result-gather",
@@ -17501,6 +18019,50 @@ static int cuda_q8_f16_partner_matmul_impl(
             return -1;
         }
         return 0;
+    }
+    if (async_completion_call) {
+        uint64_t marker_sequence = 0u;
+        uint64_t marker_complement = 0u;
+        if (!cuda_q8_f16_partner_async_completion_read(
+                home_tier, async_completion_sequence,
+                &marker_sequence, &marker_complement)) {
+            cuda_q8_f16_partner_async_completion_failure_log(
+                "result-gather-marker-validation",
+                async_completion_event_recorded, async_completion_sequence,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset);
+            fprintf(stderr,
+                    "ds4: fatal q8 async completion marker mismatch after "
+                    "successful synchronous host gather: expected=%llu "
+                    "observed=%llu complement=%llu\n",
+                    (unsigned long long)async_completion_sequence,
+                    (unsigned long long)marker_sequence,
+                    (unsigned long long)marker_complement);
+            (void)cuda_q8_f16_restore_home(
+                home_tier, "invalid async completion marker");
+            return -1;
+        }
+        const uint64_t confirmed =
+            g_q8_f16_partner_async_completion_confirmed[home_tier].fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+        if (confirmed == 1u || (confirmed & UINT64_C(63)) == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA q8 partner async completion checkpoint "
+                    "home_tier=%d partner_tier=%d begun=%llu submitted=%llu "
+                    "confirmed=%llu sequence=%llu complement=%llu "
+                    "evidence=post-compute-confirmed\n",
+                    home_tier, partner_tier,
+                    (unsigned long long)
+                        g_q8_f16_partner_async_completion_begun[home_tier].load(
+                            std::memory_order_relaxed),
+                    (unsigned long long)
+                        g_q8_f16_partner_async_completion_submitted[home_tier].load(
+                            std::memory_order_relaxed),
+                    (unsigned long long)confirmed,
+                    (unsigned long long)marker_sequence,
+                    (unsigned long long)marker_complement);
+            fflush(stderr);
+        }
     }
     if (phase_audit_call) {
         cuda_q8_f16_partner_phase_audit_log(
@@ -17537,6 +18099,11 @@ static int cuda_q8_f16_partner_matmul_impl(
         }
     } else if (cuda_q8_f16_restore_home(
                    home_tier, "successful result peer copy") < 0) {
+        /* Preserve any already-flushed async marker checkpoint before the
+         * process is likely to exit on an unhealthy context.  This runs only
+         * on the failure path, so it does not perturb the normal marker/control
+         * scheduling comparison. */
+        (void)fsync(fileno(stderr));
         return -1;
     }
 
@@ -17554,6 +18121,11 @@ static int cuda_q8_f16_partner_matmul_impl(
                     (unsigned long long)completed,
                     (unsigned long long)cumulative);
             fflush(stderr);
+            /* Both the marker arm and its no-marker control enable this
+             * existing transfer audit.  Use its shared sparse fsync so the
+             * marker breadcrumb is durable without adding a host-side flush
+             * perturbation unique to the marker arm. */
+            (void)fsync(fileno(stderr));
         }
     }
 

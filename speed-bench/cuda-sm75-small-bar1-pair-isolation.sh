@@ -19,6 +19,7 @@ Optional environment:
   VARIANTS=attention-off,production  scheduling matrix is explicit and fixed
   VARIANTS=attention-host-bounce     host-stage pair-0 attention-owned copies
   VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
+  VARIANTS=attention-q8-async-completion  global pair-0 post-Q8 positive markers
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
   VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
@@ -154,13 +155,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -560,6 +561,9 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_copy_scheduling_transport=ordered_direct_peer_no_fallback\n'
         printf 'attention_host_bounce_scope=pair0_attention_owned_copies_only\n'
         printf 'attention_q8_host_bounce_scope=pair0_attention_owned_and_q8_partner_copies\n'
+        printf 'attention_q8_async_completion_scope=every_pair0_partner_q8_call_no_layer_selector\n'
+        printf 'attention_q8_async_completion_marker=partner_default_stream_mapped_host_then_dedicated_event\n'
+        printf 'attention_q8_async_completion_interpretation=positive_only_absence_is_inconclusive\n'
         printf 'attention_q8_phase_audit_scope=pair0_q8_partner_phase_checkpoints_and_compute_sync\n'
         printf 'attention_q8_targeted_phase_audit_binding=%s\n' "$Q8_TARGET_BINDING_LABEL"
         printf 'attention_q8_targeted_phase_audit_weight_offset=%s\n' "$Q8_TARGET_WEIGHT_OFFSET"
@@ -756,7 +760,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -1005,6 +1009,20 @@ validate_success_path() {
                 'home_tier=1 partner_tier=3' || return 1
             ;;
     esac
+    if [[ $variant == attention-q8-async-completion ]]; then
+        grep -Fq \
+            'CUDA q8 partner async completion audit enabled: logical_pairs=0 marker=partner-default-stream-mapped-host event=dedicated-post-marker interpretation=positive-only' \
+            "$log" || return 1
+        ! grep -Fq 'CUDA q8 partner async completion failure ' "$log" ||
+            return 1
+        ! grep -Eq 'CUDA q8 partner async completion (checkpoint|summary) home_tier=1 ' \
+            "$log" || return 1
+        python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
+            --validate-q8-async-completion-log "$log" || return 1
+    fi
+    if [[ $variant == attention-q8-host-bounce ]]; then
+        ! grep -Fq 'CUDA q8 partner async completion ' "$log" || return 1
+    fi
     if [[ $variant == attention-q8-l14-l15-phase-audit ]]; then
         grep -Fq \
             'CUDA q8 partner phase-audit target preflight validated 2 exact partner tuples against ' \
@@ -1179,7 +1197,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1215,6 +1233,21 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             continue
         fi
         if [[ $RESUME == 1 && -s $started ]]; then
+            if [[ $variant == attention-q8-host-bounce ]] &&
+                    grep -Fq 'CUDA q8 partner async completion ' "$log"; then
+                printf 'Retaining contaminated no-marker control as validation-failed: variant=%s repeat=%d\n' \
+                    "$variant" "$repeat"
+                write_result "$result" "$variant" validation-failed 129 \
+                    "$progress" "$log"
+                fields=$(last_progress_fields "$progress")
+                IFS=$'\t' read -r lp le lc lt <<<"$fields"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                    recovered-validation-failed 129 "$lp" "$le" \
+                    >>"$OUTPUT_DIR/run-journal.tsv"
+                sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+                continue
+            fi
             if [[ -s $csv && $(wc -l <"$csv") == 2 && -s $bindings ]] &&
                     [[ $(wc -l <"$bindings") == 345 ]] &&
                     [[ ! -e $watch_marker ]] &&
@@ -1224,7 +1257,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1305,6 +1338,11 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             attention-q8-host-bounce)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-async-completion)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-q8-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
@@ -1436,6 +1474,18 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 
         fields=$(last_progress_fields "$progress")
         IFS=$'\t' read -r lp le lc lt <<<"$fields"
+        if [[ $variant == attention-q8-host-bounce ]] &&
+                grep -Fq 'CUDA q8 partner async completion ' "$log"; then
+            write_result "$result" "$variant" validation-failed 129 \
+                "$progress" "$log"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                validation-failed 129 "$lp" "$le" \
+                >>"$OUTPUT_DIR/run-journal.tsv"
+            sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+            tail -n 240 "$log" >&2 || true
+            die "variant=$variant contained async-completion records in the no-marker control"
+        fi
         if (( run_status != 0 )); then
             watch_status=
             if [[ -s $watch_marker ]]; then
@@ -1475,7 +1525,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"
