@@ -104,6 +104,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+readonly EXPECTED_SELECTED_IDENTITY="$repo_dir/speed-bench/sm75-small-bar1-expected-device-identity.csv"
 MODEL=${MODEL:-}
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -242,7 +243,7 @@ if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
 fi
 
 for tool in awk basename cat cmp cp cut date dirname env find git grep kill make \
-            mkdir mv nproc nvidia-smi python3 rm sleep sort stat stdbuf sync \
+            mkdir mv nproc nvidia-smi python3 rm sha256sum sleep sort stat stdbuf sync \
             tail tar tee timeout tr wc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -548,14 +549,30 @@ validate_power_limits() {
 }
 
 capture_and_validate_cuda_identity() {
-    local suffix= cuda_inventory nvidia_inventory topology selected_inventory
-    if [[ $RESUME == 1 ]]; then suffix=-resume; fi
+    local suffix= stamp raw_cuda raw_nvidia raw_topology
+    local cuda_inventory nvidia_inventory topology selected_inventory path
+    if [[ $RESUME == 1 ]]; then
+        stamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+        suffix="-resume-${stamp}-$$"
+    fi
+    raw_cuda="$OUTPUT_DIR/provenance/cuda-device-inventory${suffix}.raw.csv"
+    raw_nvidia="$OUTPUT_DIR/provenance/nvidia-device-inventory${suffix}.raw.csv"
+    raw_topology="$OUTPUT_DIR/provenance/nvidia-topology${suffix}.txt"
     cuda_inventory="$OUTPUT_DIR/provenance/cuda-device-inventory${suffix}.csv"
     nvidia_inventory="$OUTPUT_DIR/provenance/nvidia-device-inventory${suffix}.csv"
-    topology="$OUTPUT_DIR/provenance/nvidia-topology${suffix}.txt"
+    topology="$OUTPUT_DIR/provenance/nvidia-topology${suffix}.csv"
     selected_inventory="$OUTPUT_DIR/provenance/selected-device-identity${suffix}.csv"
 
-    "${clean[@]}" ./tests/cuda_device_identity >"$cuda_inventory" || {
+    for path in "$raw_cuda" "$raw_nvidia" "$raw_topology" \
+            "$cuda_inventory" "$nvidia_inventory" "$topology" \
+            "$selected_inventory"; do
+        [[ ! -e $path ]] || {
+            printf 'refusing to overwrite CUDA identity snapshot %s\n' "$path" >&2
+            return 1
+        }
+    done
+
+    "${clean[@]}" ./tests/cuda_device_identity >"$raw_cuda" || {
         printf 'CUDA ordinal inventory failed\n' >&2
         return 1
     }
@@ -564,19 +581,23 @@ capture_and_validate_cuda_identity() {
         timeout --kill-after=5s 20s nvidia-smi \
             --query-gpu=index,pci.bus_id,uuid \
             --format=csv,noheader,nounits
-    } >"$nvidia_inventory" || {
+    } >"$raw_nvidia" || {
         printf 'nvidia-smi identity inventory failed\n' >&2
         return 1
     }
-    timeout --kill-after=5s 20s nvidia-smi topo -m >"$topology" || {
+    timeout --kill-after=5s 20s nvidia-smi topo -m >"$raw_topology" || {
         printf 'nvidia-smi topology inventory failed\n' >&2
         return 1
     }
-    python3 speed-bench/validate-cuda-device-identity.py \
-        --cuda-inventory "$cuda_inventory" \
-        --nvidia-inventory "$nvidia_inventory" \
-        --topology "$topology" \
+    python3 speed-bench/validate-cuda-device-identity.py capture \
+        --cuda-inventory "$raw_cuda" \
+        --nvidia-inventory "$raw_nvidia" \
+        --topology "$raw_topology" \
         --selected "$GPU_DEVICES" \
+        --expected-selected "$EXPECTED_SELECTED_IDENTITY" \
+        --normalized-cuda-output "$cuda_inventory" \
+        --normalized-nvidia-output "$nvidia_inventory" \
+        --normalized-topology-output "$topology" \
         --output "$selected_inventory" || return 1
 
     if [[ $RESUME == 1 ]]; then
@@ -590,12 +611,48 @@ capture_and_validate_cuda_identity() {
                 printf 'resume nvidia-smi identity differs from the original run\n' >&2
                 return 1
             }
+        cmp -s "$OUTPUT_DIR/provenance/nvidia-topology.csv" \
+            "$topology" || {
+                printf 'resume normalized nvidia-smi topology differs from the original run\n' >&2
+                return 1
+            }
         cmp -s "$OUTPUT_DIR/provenance/selected-device-identity.csv" \
             "$selected_inventory" || {
                 printf 'resume selected CUDA/NVLink mapping differs from the original run\n' >&2
                 return 1
             }
     fi
+}
+
+validate_arm_cuda_identity() {
+    local log=$1 evidence=$2 report=$3 status=0
+    python3 speed-bench/validate-cuda-device-identity.py runtime \
+        --runtime-log "$log" \
+        --cuda-inventory "$OUTPUT_DIR/provenance/cuda-device-inventory.csv" \
+        --selected-identity "$OUTPUT_DIR/provenance/selected-device-identity.csv" \
+        --output "$evidence" >"$report" 2>&1 || status=$?
+    if (( status == 0 )); then
+        printf 'status=validated\n' >>"$report"
+    else
+        printf 'status=failed\nexit_status=%s\n' "$status" >>"$report"
+    fi
+    sync "$evidence" "$report" 2>/dev/null || sync
+    return "$status"
+}
+
+record_arm_identity_failure() {
+    local result=$1 variant=$2 repeat=$3 progress=$4 log=$5 report=$6
+    local fields lp le lc lt
+    write_result "$result" "$variant" identity-validation-failed 130 \
+        "$progress" "$log"
+    fields=$(last_progress_fields "$progress")
+    IFS=$'\t' read -r lp le lc lt <<<"$fields"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+        identity-validation-failed 130 "$lp" "$le" \
+        >>"$OUTPUT_DIR/run-journal.tsv"
+    sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+    tail -n 80 "$report" >&2 || true
 }
 
 assert_no_compute_processes() {
@@ -957,12 +1014,19 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'gpu_devices=%s\ngpu_vram=%s\nstage_split=%s/%s\n' \
             "$GPU_DEVICES" "$GPU_VRAM" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))"
         printf 'cuda_device_order=%s\n' "$CUDA_DEVICE_ORDER"
-        printf 'cuda_identity_validation=strict-full-inventory-bus-uuid-and-exact-two-nvlink-pairs\n'
+        printf 'cuda_identity_validation=trusted-baseline-normalized-bus-uuid-join-and-nvml-topology\n'
+        printf 'trusted_selected_identity_baseline=speed-bench/sm75-small-bar1-expected-device-identity.csv\n'
+        printf 'trusted_selected_identity_baseline_sha256=%s\n' \
+            "$(sha256sum "$EXPECTED_SELECTED_IDENTITY" | awk '{print $1}')"
+        printf 'cuda_identity_raw_inventory=provenance/cuda-device-inventory.raw.csv\n'
         printf 'cuda_identity_inventory=provenance/cuda-device-inventory.csv\n'
+        printf 'nvidia_identity_raw_inventory=provenance/nvidia-device-inventory.raw.csv\n'
         printf 'nvidia_identity_inventory=provenance/nvidia-device-inventory.csv\n'
+        printf 'nvidia_topology_raw_inventory=provenance/nvidia-topology.txt\n'
+        printf 'nvidia_topology_inventory=provenance/nvidia-topology.csv\n'
         printf 'selected_device_identity=provenance/selected-device-identity.csv\n'
-        printf 'logical_pair_0=physical_0_physical_1\n'
-        printf 'logical_pair_1=physical_3_physical_2\n'
+        printf 'logical_pair_0=cuda_ordinal_0_cuda_ordinal_1\n'
+        printf 'logical_pair_1=cuda_ordinal_3_cuda_ordinal_2\n'
         printf 'small_bar1_pair=%s\nvariants=%s\none_shot=%s\n' \
             "$SMALL_BAR1_PAIR" "$VARIANTS" "$ONE_SHOT"
         printf 'one_shot_timeout_seconds=%s\n' "$ONE_SHOT_TIMEOUT_SECONDS"
@@ -1693,17 +1757,31 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         bindings="$base-bindings.csv"
         allocations="$base-allocations.csv"
         memory="$base-memory.csv"
+        runtime_identity="$base-device-identity.csv"
+        runtime_identity_report="$base-device-identity-validation.txt"
         telemetry="$OUTPUT_DIR/telemetry/$tag.csv"
         watch_marker="$OUTPUT_DIR/telemetry/$tag-watch-event.txt"
         pre_health="$OUTPUT_DIR/health/$tag-pre.log"
         post_health="$OUTPUT_DIR/health/$tag-post.log"
 
         if [[ -s $result ]]; then
+            if ! validate_arm_cuda_identity "$log" "$runtime_identity" \
+                    "$runtime_identity_report"; then
+                record_arm_identity_failure "$result" "$variant" "$repeat" \
+                    "$progress" "$log" "$runtime_identity_report"
+                die "saved result for variant=$variant lacks exact runtime CUDA identity evidence"
+            fi
             printf 'Reusing completed evidence for variant=%s repeat=%d...\n' \
                 "$variant" "$repeat"
             continue
         fi
         if [[ $RESUME == 1 && -s $started ]]; then
+            if ! validate_arm_cuda_identity "$log" "$runtime_identity" \
+                    "$runtime_identity_report"; then
+                record_arm_identity_failure "$result" "$variant" "$repeat" \
+                    "$progress" "$log" "$runtime_identity_report"
+                die "prior arm for variant=$variant lacks exact runtime CUDA identity evidence"
+            fi
             if [[ $variant == attention-q8-host-bounce ]] &&
                     grep -Fq 'CUDA q8 partner async completion ' "$log"; then
                 printf 'Retaining contaminated no-marker control as validation-failed: variant=%s repeat=%d\n' \
@@ -2128,6 +2206,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         fi
         if (( run_status == 0 && post_health_status != 0 )); then
             run_status=$post_health_status
+        fi
+
+        if ! validate_arm_cuda_identity "$log" "$runtime_identity" \
+                "$runtime_identity_report"; then
+            record_arm_identity_failure "$result" "$variant" "$repeat" \
+                "$progress" "$log" "$runtime_identity_report"
+            die "variant=$variant failed runtime CUDA identity validation"
         fi
 
         fields=$(last_progress_fields "$progress")

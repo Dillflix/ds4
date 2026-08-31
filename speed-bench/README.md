@@ -3067,8 +3067,34 @@ were active when an endpoint disappeared.
 22/21 stage split, Q3A4 K4, Q4 tile32, and the healthy logical pair unchanged.
 Every arm keeps the complete 344/344 dense cache, partner-resident FP16 weights,
 partner cuBLAS projections, activation/result shapes, and arithmetic. It varies
-only logical pair 0 (physical GPU 0<->1 under `GPU_DEVICES=0,3,1,2`). The
+only logical pair 0 (CUDA ordinals 0<->1 under `GPU_DEVICES=0,3,1,2`). The
 completed localization control is:
+
+Every invocation must export `CUDA_DEVICE_ORDER=PCI_BUS_ID` and leave
+`CUDA_VISIBLE_DEVICES` unset. Before CUDA smoke tests or an arm, the harness
+records every CUDA ordinal's PCI domain/bus/device/function and UUID, captures
+the corresponding `nvidia-smi` inventory and topology matrix, and validates
+the complete identity set. CUDA ordinals are joined to `nvidia-smi`/NVML
+indices by the normalized `(PCI bus ID, UUID)` tuple; ordinal equality is never
+assumed. The selected tier, pair, role, ordinal, bus ID, and UUID must exactly
+match `sm75-small-bar1-expected-device-identity.csv`, and the derived NVML
+indices must describe exactly the two NVLink-connected pairs in the full
+topology matrix, with no cross-pair NVLink edge. Each arm then logs the complete
+CUDA ordinal inventory plus every selected logical tier from inside DS4. The
+harness preserves those lines as per-arm CSV evidence and validates them
+against preflight before accepting either a pass or crash classification;
+missing lines, failed CUDA queries, and identity changes fail closed. Resume
+captures timestamped raw snapshots without overwriting prior evidence and
+compares normalized full CUDA, `nvidia-smi`, topology, and selected mappings.
+These records prove which boards and links an arm actually exercised; they do
+not re-test BAR1 size and are not a fault mitigation.
+
+All commands in this section therefore assume:
+
+```bash
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES
+```
 
 - `attention-off`, which retains normal direct partner projections, all mirrored
   attention-cache updates, and pair-0 decode-indexer splitting but runs pair-0

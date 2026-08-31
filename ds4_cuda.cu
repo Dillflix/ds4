@@ -4768,19 +4768,18 @@ static void cuda_log_device_ordinal_inventory(void) {
         cuda_format_device_uuid(uuid, &prop.uuid);
         fprintf(stderr,
                 "ds4: CUDA ordinal inventory ordinal=%d pci_bus_id=%s "
-                "uuid=%s\n",
-                ordinal, pci_bus_id, uuid);
+                "uuid=%s query_status=%s/%s\n",
+                ordinal, pci_bus_id, uuid, cudaGetErrorName(prop_error),
+                cudaGetErrorName(bus_error));
     }
     fflush(stderr);
 }
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    cuda_log_device_ordinal_inventory();
     const char *pre_activation_fence_pairs = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS");
-    const bool pre_activation_identity_audit =
-        pre_activation_fence_pairs && pre_activation_fence_pairs[0];
-    if (pre_activation_identity_audit) cuda_log_device_ordinal_inventory();
     const char *async_completion_pairs = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS");
     const char *pre_gather_fence_pairs = getenv(
@@ -4920,28 +4919,26 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         cudaDeviceProp prop;
         const cudaError_t prop_error =
             cudaGetDeviceProperties(&prop, c->device_id);
-        if (pre_activation_identity_audit) {
-            char selected_pci_bus_id[32] = {};
-            char selected_uuid[41] = {};
-            const cudaError_t bus_error = cudaDeviceGetPCIBusId(
-                selected_pci_bus_id, (int)sizeof(selected_pci_bus_id),
-                c->device_id);
-            if (prop_error == cudaSuccess) {
-                cuda_format_device_uuid(selected_uuid, &prop.uuid);
-            } else {
-                snprintf(selected_uuid, sizeof(selected_uuid), "unavailable");
-            }
-            if (bus_error != cudaSuccess) {
-                snprintf(selected_pci_bus_id, sizeof(selected_pci_bus_id),
-                         "unavailable");
-            }
-            fprintf(stderr,
-                    "ds4: CUDA selected device identity logical_tier=%d "
-                    "cuda_ordinal=%d pci_bus_id=%s uuid=%s "
-                    "query_status=%s/%s\n",
-                    i, c->device_id, selected_pci_bus_id, selected_uuid,
-                    cudaGetErrorName(prop_error), cudaGetErrorName(bus_error));
+        char selected_pci_bus_id[32] = {};
+        char selected_uuid[41] = {};
+        const cudaError_t bus_error = cudaDeviceGetPCIBusId(
+            selected_pci_bus_id, (int)sizeof(selected_pci_bus_id),
+            c->device_id);
+        if (prop_error == cudaSuccess) {
+            cuda_format_device_uuid(selected_uuid, &prop.uuid);
+        } else {
+            snprintf(selected_uuid, sizeof(selected_uuid), "unavailable");
         }
+        if (bus_error != cudaSuccess) {
+            snprintf(selected_pci_bus_id, sizeof(selected_pci_bus_id),
+                     "unavailable");
+        }
+        fprintf(stderr,
+                "ds4: CUDA selected device identity logical_tier=%d "
+                "cuda_ordinal=%d pci_bus_id=%s uuid=%s "
+                "query_status=%s/%s\n",
+                i, c->device_id, selected_pci_bus_id, selected_uuid,
+                cudaGetErrorName(prop_error), cudaGetErrorName(bus_error));
         if (prop_error == cudaSuccess) {
             c->compute_major = prop.major;
             c->compute_minor = prop.minor;

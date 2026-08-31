@@ -1,0 +1,5 @@
+logical_tier,logical_pair,logical_role,cuda_ordinal,pci_bus_id,uuid
+0,0,home,0,00000000:02:00.0,GPU-cca9cdaa-29ba-d17f-e4e1-0c9d47503c62
+1,1,home,3,00000000:82:00.0,GPU-4bd650ce-a8ff-4411-3cc9-0dc3abaad694
+2,0,partner,1,00000000:03:00.0,GPU-ba2c2d0b-6320-580f-208c-59e548ac9227
+3,1,partner,2,00000000:81:00.0,GPU-56707308-5293-2d44-ef0d-1763abc7584f
