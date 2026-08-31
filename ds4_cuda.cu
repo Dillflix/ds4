@@ -16202,6 +16202,27 @@ static int cuda_q8_f16_sync_home_for_fallback(
     return -1;
 }
 
+static void cuda_q8_f16_partner_host_bounce_failure_log(
+        const char *class_name, int src_tier, int dst_tier,
+        uint64_t bytes, uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *label) {
+    const int src_device = src_tier >= 0 && src_tier < g_n_gpus
+        ? g_gpu[src_tier].device_id : -1;
+    const int dst_device = dst_tier >= 0 && dst_tier < g_n_gpus
+        ? g_gpu[dst_tier].device_id : -1;
+    fprintf(stderr,
+            "ds4: CUDA q8 partner host-bounce failure class=%s stage=copy "
+            "source_tier=%d source_device=%d destination_tier=%d "
+            "destination_device=%d bytes=%llu tokens=%llu in=%llu out=%llu "
+            "label=%s\n",
+            class_name, src_tier, src_device, dst_tier, dst_device,
+            (unsigned long long)bytes, (unsigned long long)n_tok,
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            label && label[0] ? label : "q8_0");
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
 /* Execute a planned Q8 projection on its NVLink partner. Production uses the
  * resident F16 expansion. Diagnostic arms can substitute controlled FP32
  * expansions or transfer the native Q8 activations/scales into the existing
@@ -16515,6 +16536,11 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             &activation_dst, &activation_src,
             activation_transfer_bytes, force_host_bounce)) {
+        if (force_host_bounce) {
+            cuda_q8_f16_partner_host_bounce_failure_log(
+                "activation", home_tier, partner_tier,
+                activation_transfer_bytes, n_tok, in_dim, out_dim, label);
+        }
         return cuda_q8_f16_sync_home_for_fallback(
                    home_tier, "activation peer copy") < 0 ? -1 : 0;
     }
@@ -16619,6 +16645,11 @@ static int cuda_q8_f16_partner_matmul_impl(
     };
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             out, &result_src, result_bytes, force_host_bounce)) {
+        if (force_host_bounce) {
+            cuda_q8_f16_partner_host_bounce_failure_log(
+                "result-gather", partner_tier, home_tier,
+                result_bytes, n_tok, in_dim, out_dim, label);
+        }
         /* Make a subsequent native-Q8 overwrite race-free even if the peer
          * copy failed after the partner GEMM had already been submitted. */
         const cudaError_t partner_sync = cudaDeviceSynchronize();

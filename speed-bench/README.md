@@ -3228,6 +3228,94 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
+The pair-0 attention-only host-bounce arm still lost the tested pair after a
+completed measured `pos=512` attention checkpoint. Direct pair-0 attention
+P2P/BAR1 transport is therefore not necessary for that observed failure. Q8
+partner activation/result transport on pair 0 was still direct in that arm,
+while pair 1 also retained all direct traffic.
+
+The next fresh one-arm diagnostic is `attention-q8-host-bounce`. It applies both
+`DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=0` and
+`DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=0`. Pair-0 attention query, cache,
+and result copies and pair-0 Q8 partner activation/result copies are staged
+through pinned host memory. It does **not** disable partner attention, partner
+Q8 projection work, dense-cache admission, either 50/50 attention/indexer row
+split, or any arithmetic. Pair-0 prefill and decode indexer row-split copies
+remain direct peer by design; pair 1 remains direct peer for attention and Q8.
+This is a diagnostic transport cut, not a proposed production mitigation.
+
+A successful arm is accepted only if the log proves all of the following:
+
+- pair-0 Q8 used host bounce in the untimed warmup (`calls=1`) and reached its
+  measured-prefill checkpoint (`calls=128`), while pair 1 used direct peer in
+  warmup and reached `calls=64`;
+- pair-0 attention completed a measured host-bounce row at `pos=512`, while
+  one-time route markers independently prove that raw, attention-compressed,
+  and index-cache mirror copies selected host bounce; pair 1 remained direct
+  peer;
+- both attention and indexer row splits, all 344 dense-cache bindings, and
+  partner execution remained present; and
+- all four GPUs remained healthy at exactly 250 W and measured prefill was at
+  least 500 tok/s.
+
+A completed run below 500 prefill tok/s is recorded as
+`inconclusive-underloaded`, never as a passing transport result. A pair-0 loss
+after both measured checkpoints shows that pair-0 direct attention-owned and
+Q8-partner payload transport is unnecessary for the observed failure, but does
+not exclude the retained direct pair-0 indexer transfers, pair-1 direct traffic,
+partner compute, aggregate load, or their interactions. A healthy >=500 tok/s
+completion implicates one of the two cut pair-0 direct-peer payload routes or
+its timing interaction, without identifying one individual copy family. A loss
+before either measured checkpoint is real but inconclusive for this transport
+cut.
+
+Failure-only diagnostics record the requesting transfer class. When CUDA's
+generic synchronous bounce failure line is immediately adjacent, the summary
+also associates its exact phase (`d2h` or `h2d`) on a best-effort basis.
+Attention records include query, result-gather, top-k, or cache class plus
+layer/position, logical tiers, physical device IDs, and bytes; Q8 records
+distinguish activation from result gather with the same endpoints and tensor
+shape. These identify the first synchronous observation boundary, not
+necessarily the earlier operation that poisoned the CUDA context.
+
+Run it from a clean boot with a new directory; never resume an older variant
+list under this name:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-host-bounce-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-host-bounce \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

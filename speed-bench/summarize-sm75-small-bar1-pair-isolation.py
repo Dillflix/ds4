@@ -10,7 +10,8 @@ from pathlib import Path
 
 
 VARIANT_ORDER = (
-    "attention-off", "attention-host-bounce", "attention-query-dst", "attention-gather-dst",
+    "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
+    "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
     "partner-serialized", "indexer-off", "production"
@@ -100,6 +101,15 @@ def attention_aux_transports(text: str, pair: int) -> tuple[str, str]:
     return ",".join(sorted(cache)), ",".join(sorted(topk))
 
 
+def attention_host_bounce_cache_classes(text: str, pair: int) -> str:
+    classes = set(re.findall(
+        rf"prefill attention cache mirror transport=host-bounce "
+        rf"home_tier={pair} partner_tier=\d+ class=(\S+) event=complete",
+        text,
+    ))
+    return ",".join(sorted(classes))
+
+
 def last_attention_host_bounce_checkpoint(text: str, pair: int) -> str:
     last = ""
     pattern = re.compile(
@@ -114,6 +124,28 @@ def last_attention_host_bounce_checkpoint(text: str, pair: int) -> str:
             f"home{pair}:partner{partner}"
         )
     return last
+
+
+def first_host_bounce_failure_context(text: str) -> str:
+    prefixes = (
+        "ds4: CUDA prefill attention host-bounce failure ",
+        "ds4: CUDA q8 partner host-bounce failure ",
+    )
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                context = line.removeprefix(prefix).strip()
+                phase = ""
+                if index > 0:
+                    match = re.search(
+                        r"CUDA default-stream bounce (alloc|d2h|h2d) failed:",
+                        lines[index - 1],
+                    )
+                    if match:
+                        phase = f"cuda_phase={match.group(1)} "
+                return phase + context
+    return ""
 
 
 def last_attention_phase_audit(text: str) -> str:
@@ -275,6 +307,8 @@ def outcome(statuses: list[str]) -> str:
     }
     if any(status in invalid_statuses for status in statuses):
         return "invalid"
+    if any(status == "inconclusive-underloaded" for status in statuses):
+        return "underloaded"
     return "incomplete"
 
 
@@ -323,6 +357,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         )
     attention = outcomes.get("attention-off", "not-run")
     attention_host_bounce = outcomes.get("attention-host-bounce", "not-run")
+    attention_q8_host_bounce = outcomes.get(
+        "attention-q8-host-bounce", "not-run"
+    )
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -346,12 +383,46 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "interrupted-no-result-device-loss",
         }
     ]
+    attention_q8_host_bounce_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-host-bounce"
+    ]
+    attention_q8_host_bounce_failed_rows = [
+        row for row in attention_q8_host_bounce_rows
+        if row.get("status") in {
+            "failed-device-loss", "interrupted-prior-run-device-loss",
+            "interrupted-no-result-device-loss",
+        }
+    ]
 
     def measured_host_bounce_checkpoint(row: dict[str, str]) -> bool:
         checkpoint = row.get("attention_host_bounce_checkpoint", "")
         return (
             checkpoint.startswith(("begin:", "complete:", "failed:")) and
             ":pos512:tokens512:home0:partner2" in checkpoint
+        )
+
+    def completed_measured_attention_host_bounce(
+            row: dict[str, str]) -> bool:
+        checkpoint = row.get("attention_host_bounce_checkpoint", "")
+        return (
+            checkpoint.startswith("complete:") and
+            measured_host_bounce_checkpoint(row) and
+            row.get("pair0_attention_query_copy_transport") == "host-bounce" and
+            row.get("pair0_attention_gather_copy_transport") == "host-bounce" and
+            row.get("pair0_attention_cache_copy_transport") == "host-bounce" and
+            set(row.get(
+                "pair0_attention_cache_host_bounce_classes", ""
+            ).split(",")) == {"raw", "attn-comp", "index"}
+        )
+
+    def completed_measured_q8_host_bounce(row: dict[str, str]) -> bool:
+        # Pair 0 reaches 64 calls during the untimed warmup.  The next durable
+        # 64-call checkpoint (128) is the first proof that host-bounce Q8 work
+        # completed in measured prefill.
+        return (
+            row.get("pair0_q8_transport") == "host-bounce" and
+            int(row.get("pair0_q8_complete_checkpoint_calls", "0") or 0) >= 128
         )
 
     def pair0_device_loss(row: dict[str, str]) -> bool:
@@ -361,6 +432,46 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 return True
         return False
 
+    def full_production_load(row: dict[str, str]) -> bool:
+        try:
+            return float(row.get("prefill_tps", "")) >= 500.0
+        except (TypeError, ValueError):
+            return False
+
+    def topk_evidence(candidate_rows: list[dict[str, str]]) -> str:
+        transports: set[str] = set()
+        for row in candidate_rows:
+            transports.update(filter(None, row.get(
+                "pair0_attention_topk_copy_transport", ""
+            ).split(",")))
+        if transports and transports <= {"none", "partner-local"}:
+            if transports == {"partner-local"}:
+                return (
+                    " Recorded row-audit markers show that top-k remained "
+                    "partner-local, so no cross-device top-k payload transfer "
+                    "occurred."
+                )
+            if transports == {"none"}:
+                return (
+                    " Recorded row-audit markers show that no top-k payload "
+                    "transfer was required."
+                )
+            return (
+                " Recorded row-audit markers show that top-k was either not "
+                "required or remained partner-local; no cross-device top-k "
+                "payload transfer occurred."
+            )
+        if transports:
+            return (
+                " Recorded row-audit markers observed top-k transport modes `" +
+                ",".join(sorted(transports)) + "`."
+            )
+        return (
+            " No top-k transfer was observed in the available durable row-audit "
+            "records; because no top-k transport marker was captured, this is "
+            "not proof that none occurred."
+        )
+
     attention_host_bounce_failure_reached = any(
         measured_host_bounce_checkpoint(row)
         for row in attention_host_bounce_failed_rows
@@ -369,13 +480,28 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         measured_host_bounce_checkpoint(row) and pair0_device_loss(row)
         for row in attention_host_bounce_failed_rows
     )
+    attention_host_bounce_complete_pair0_failure_reached = any(
+        row.get("attention_host_bounce_checkpoint", "").startswith("complete:") and
+        measured_host_bounce_checkpoint(row) and pair0_device_loss(row)
+        for row in attention_host_bounce_failed_rows
+    )
     attention_host_bounce_pass_verified = (
         bool(attention_host_bounce_rows) and
         all(
-            row.get("attention_host_bounce_checkpoint", "").startswith(
-                "complete:"
-            ) and measured_host_bounce_checkpoint(row)
+             row.get("attention_host_bounce_checkpoint", "").startswith(
+                 "complete:"
+             ) and measured_host_bounce_checkpoint(row) and
+             full_production_load(row)
             for row in attention_host_bounce_rows
+        )
+    )
+    attention_q8_host_bounce_pass_verified = (
+        bool(attention_q8_host_bounce_rows) and
+        all(
+            completed_measured_attention_host_bounce(row) and
+            completed_measured_q8_host_bounce(row) and
+            full_production_load(row)
+            for row in attention_q8_host_bounce_rows
         )
     )
     attention_completed_without_result = (
@@ -599,13 +725,103 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
         )
+    if (attention_q8_host_bounce == "passed" and
+            attention_q8_host_bounce_pass_verified):
+        return (
+            "Pair 0 completed the full production-shaped arm with durable measured "
+            "completion evidence for both attention-owned and Q8 partner "
+            "host-bounce routes. The 50/50 attention row split and both partner "
+            "compute paths remained enabled. The pair-0 prefill and decode indexer "
+            "row-split transfers and pair-1 traffic remained direct peer; they were "
+            "not part of this transport cut. This implicates one of the "
+            "removed pair-0 direct-peer transport paths or the timing/load envelope "
+            "changed by staging both through host memory, but is not by itself a "
+            "power-matched causal proof or a production mitigation."
+        )
+    if attention_q8_host_bounce == "failed":
+        failure_context = next((
+            row.get("host_bounce_failure_context", "")
+            for row in attention_q8_host_bounce_failed_rows
+            if row.get("host_bounce_failure_context", "")
+        ), "")
+        context_sentence = (
+            f" The first contextual host-bounce failure was `{failure_context}`."
+            if failure_context else ""
+        )
+        verified_pair0_failure = any(
+            pair0_device_loss(row) and
+            completed_measured_attention_host_bounce(row) and
+            completed_measured_q8_host_bounce(row)
+            for row in attention_q8_host_bounce_failed_rows
+        )
+        if verified_pair0_failure:
+            return (
+                "The failing arm durably completed measured pair-0 host-bounce "
+                "checkpoints for both attention-owned traffic and Q8 partner "
+                "traffic before pair-0 device loss. Thus direct pair-0 production "
+                "attention-owned and Q8-partner payload transport is unnecessary "
+                "for this observed loss. Pair-0 prefill/decode indexer transfers "
+                "and pair-1 traffic remained direct peer and were not removed. "
+                "Partner attention and Q8 compute, those direct indexer routes, "
+                "aggregate load, pair-1 traffic, or a delayed physical effect "
+                "therefore remain."
+                + topk_evidence(attention_q8_host_bounce_failed_rows)
+                + context_sentence
+            )
+        if not any(pair0_device_loss(row)
+                   for row in attention_q8_host_bounce_failed_rows):
+            return (
+                "The combined host-bounce arm failed, but its durable loss record "
+                "does not identify physical GPU 0 or 1 in pair 0. Pair 1 retained "
+                "direct peer traffic, so this is real failure evidence but cannot "
+                "show that either cut pair-0 payload route was unnecessary."
+                + context_sentence
+            )
+        return (
+            "Pair-0 device loss was corroborated in the combined host-bounce arm, "
+            "but the durable records do not prove that both transport cuts completed "
+            "during measured prefill. A 64-call Q8 checkpoint or an attention "
+            "checkpoint at pos=0 is warmup evidence only. Do not infer that the "
+            "cut pair-0 attention/Q8 payload routes were unnecessary; pair-0 "
+            "indexer and pair-1 traffic also retained direct peer transport."
+            + context_sentence
+        )
+    if attention_q8_host_bounce == "passed":
+        return (
+            "The combined pair-0 host-bounce arm was recorded as passed, but it "
+            "lacks durable measured completion evidence for both host-bounce routes "
+            "at the required >=500 prefill tok/s load. Treat it as inconclusive; "
+            "warmup-only or underloaded evidence does not validate the transport "
+            "cut, and pair-0 indexer plus pair-1 traffic remained direct."
+        )
+    if attention_q8_host_bounce == "invalid":
+        return (
+            "The combined pair-0 host-bounce arm failed its production-path, "
+            "transport-marker, throughput, or health validation. It is invalid for "
+            "causal inference; pair 1 remained direct throughout this arm."
+        )
+    if attention_q8_host_bounce == "underloaded":
+        return (
+            "The combined pair-0 host-bounce arm completed below the required "
+            "500 prefill tok/s production-load floor. It is deliberately classified "
+            "as inconclusive-underloaded: survival at substantially reduced work rate "
+            "cannot show that either cut pair-0 direct payload family is causal. "
+            "Pair-0 indexer and pair-1 traffic remained direct."
+        )
+    if attention_q8_host_bounce == "incomplete":
+        return (
+            "The combined pair-0 host-bounce arm has no verified outcome. Missing "
+            "durable measured completion for either transport family is not proof "
+            "that both pair-0 attention/Q8 payload routes were removed from the "
+            "failing phase; pair-0 indexer and pair-1 traffic remained direct."
+        )
     if (attention_host_bounce == "passed" and
             attention_host_bounce_pass_verified):
         return (
             "Pair 0 completed the full 32K production-shaped row split after only "
             "its attention-owned query, mirrored-cache, and result copies were staged "
-            "through pinned host memory. Any non-split top-k copy uses the same staging, "
-            "although top-k remained partner-local in this arm. Q8 partner transport, "
+            "through pinned host memory. Any non-split top-k copy uses the same staging."
+            + topk_evidence(attention_host_bounce_rows) + " Q8 partner transport, "
             "50/50 attention rows, partner attention arithmetic, and both indexer row "
             "splits remained enabled. This implicates the direct attention P2P/BAR1 "
             "path or its timing envelope, but host staging changes throughput and "
@@ -629,16 +845,28 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "direct peer traffic, this failure is real but inconclusive for "
                 "pair-0 direct attention P2P/BAR1."
             )
+        if attention_host_bounce_complete_pair0_failure_reached:
+            return (
+                "A durable event=complete checkpoint proves that the measured layer "
+                "at pos=512 completed end-to-end through the forced attention "
+                "host-bounce route before pair-0 device loss."
+                + topk_evidence(attention_host_bounce_failed_rows) +
+                " Pair-0 attention-owned direct P2P/BAR1 "
+                "transfer is therefore not necessary for the observed pair-0 "
+                "device loss in this arm. Q8 direct peer traffic, partner attention "
+                "execution, pair-1 direct traffic, aggregate load, or a delayed "
+                "physical effect remains."
+            )
         return (
-            "A durable measured pos=512 checkpoint proves that the failed arm reached "
-            "the forced-host-bounce submission boundary while its attention-owned "
-            "query, mirrored-cache, and result paths had no direct-P2P route; top-k "
-            "remained partner-local. Pair-0 attention-owned direct P2P/BAR1 transfer "
-            "is therefore not necessary for the observed pair-0 device loss in this "
-            "arm. The marker does not claim that the "
-            "pos=512 bounce completed; partner attention execution, host-staged cache "
-            "work, pair-1 direct traffic, aggregate pair load, or a delayed physical "
-            "effect remains."
+            "A durable measured pos=512 begin/failed checkpoint proves only that the "
+            "arm reached the forced-host-bounce submission boundary; it does not "
+            "claim that the pos=512 attention operation completed."
+            + topk_evidence(attention_host_bounce_failed_rows) +
+            " Pair-0 attention-owned direct P2P/BAR1 transfer is not "
+            "necessary for the observed pair-0 device loss because that route was "
+            "disabled by configuration, but the completion boundary is unknown. Q8 "
+            "direct peer traffic, partner attention execution, pair-1 direct traffic, "
+            "aggregate load, or a delayed physical effect remains."
         )
     if attention_host_bounce == "passed":
         return (
@@ -985,9 +1213,15 @@ def main() -> None:
             "pair0_attention_query_copy_transport": query_transport,
             "pair0_attention_gather_copy_transport": gather_transport,
             "pair0_attention_cache_copy_transport": cache_transport,
+            "pair0_attention_cache_host_bounce_classes": (
+                attention_host_bounce_cache_classes(log_text, 0)
+            ),
             "pair0_attention_topk_copy_transport": topk_transport,
             "attention_host_bounce_checkpoint": (
                 last_attention_host_bounce_checkpoint(log_text, 0)
+            ),
+            "host_bounce_failure_context": (
+                first_host_bounce_failure_context(log_text)
             ),
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
             "attention_end_fence_last": last_attention_end_fence(log_text),
@@ -1039,11 +1273,11 @@ def main() -> None:
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
         "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
         "Query copy transport | Gather copy transport | Cache copy transport | "
-        "Top-k copy transport | Host-bounce checkpoint | "
+        "Top-k copy transport | Host-bounce checkpoint | Host-bounce failure context | "
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -1060,6 +1294,7 @@ def main() -> None:
             f"{row.get('pair0_attention_cache_copy_transport', '')} | "
             f"{row.get('pair0_attention_topk_copy_transport', '')} | "
             f"{row.get('attention_host_bounce_checkpoint', '')} | "
+            f"{row.get('host_bounce_failure_context', '')} | "
             f"{row.get('attention_phase_audit_last', '')} | "
             f"{row.get('attention_end_fence_last', '')} | "
             f"{row.get('attention_entry_fence_last', '')} | "

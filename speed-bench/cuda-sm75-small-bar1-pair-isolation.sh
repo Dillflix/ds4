@@ -18,6 +18,7 @@ Optional environment:
   SMALL_BAR1_PAIR=0                 logical home tier; physical 0<->1 here
   VARIANTS=attention-off,production  scheduling matrix is explicit and fixed
   VARIANTS=attention-host-bounce     host-stage pair-0 attention-owned copies
+  VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -128,13 +129,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -533,6 +534,7 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_copy_scheduling_scope=pair0_query_and_gather_independent\n'
         printf 'attention_copy_scheduling_transport=ordered_direct_peer_no_fallback\n'
         printf 'attention_host_bounce_scope=pair0_attention_owned_copies_only\n'
+        printf 'attention_q8_host_bounce_scope=pair0_attention_owned_and_q8_partner_copies\n'
         printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
@@ -594,7 +596,7 @@ validate_attention_copy_transport() {
 }
 
 validate_success_path() {
-    local variant=$1 log=$2 bindings=$3 csv=$4
+    local variant=$1 log=$2 bindings=$3 csv=$4 require_load=${5:-1}
     validate_admission_retained "$bindings" || return 1
     grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
         return 1
@@ -680,7 +682,88 @@ validate_success_path() {
                 return 1
             ! grep -Fq 'prefill attention row end fence event=' "$log" ||
                 return 1
-            validate_full_production_load "$csv" || return 1
+            if (( require_load )); then
+                validate_full_production_load "$csv" || return 1
+            fi
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
+        attention-q8-host-bounce)
+            grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
+                "$log" || return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
+                return 1
+            grep -Fq 'prefill attention row transport override for logical pair 0: pinned-host-bounce' \
+                "$log" || return 1
+
+            # Calls=1 proves that each transport was selected during the
+            # untimed 512-token warmup.  The later fixed counts are reached
+            # only after the measured 32K prefill has begun for this model and
+            # placement, so a warmup-only survival cannot satisfy this arm.
+            grep -Eq 'q8 partner transfer audit event=begin home_tier=0 partner_tier=2 calls=1 .*transport=host-bounce serialized=no' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=complete home_tier=0 partner_tier=2 calls=1 ' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=begin home_tier=0 partner_tier=2 calls=128 .*transport=host-bounce serialized=no' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=complete home_tier=0 partner_tier=2 calls=128 ' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=begin home_tier=1 partner_tier=3 calls=1 .*transport=peer serialized=no' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=complete home_tier=1 partner_tier=3 calls=1 ' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=begin home_tier=1 partner_tier=3 calls=64 .*transport=peer serialized=no' \
+                "$log" || return 1
+            grep -Eq 'q8 partner transfer audit event=complete home_tier=1 partner_tier=3 calls=64 ' \
+                "$log" || return 1
+            ! grep -Eq 'q8 partner transfer audit event=begin home_tier=0 .*transport=peer' \
+                "$log" || return 1
+            ! grep -Eq 'q8 partner transfer audit event=begin home_tier=1 .*transport=host-bounce' \
+                "$log" || return 1
+
+            grep -Eq 'prefill attention host-bounce checkpoint event=complete .*pos=512 tokens=512 home=0 partner=2' \
+                "$log" || return 1
+            for cache_class in raw attn-comp index; do
+                grep -Fq "prefill attention cache mirror transport=host-bounce home_tier=0 partner_tier=2 class=$cache_class event=complete" \
+                    "$log" || return 1
+            done
+            ! grep -Fq 'prefill attention cache mirror transport=host-bounce home_tier=1' \
+                "$log" || return 1
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
+                return 1
+            validate_attention_copy_schedule "$log" 0 2 source source || return 1
+            validate_attention_copy_schedule "$log" 1 3 source source || return 1
+            validate_attention_copy_transport "$log" 0 2 host-bounce host-bounce ||
+                return 1
+            validate_attention_copy_transport "$log" 1 3 peer peer || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split .*home=0 partner=2 .*query_copy_transport=peer|prefill attention row audit dispatch=split .*home=0 partner=2 .*gather_copy_transport=peer' \
+                "$log" || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split .*home=1 partner=3 .*query_copy_transport=host-bounce|prefill attention row audit dispatch=split .*home=1 partner=3 .*gather_copy_transport=host-bounce' \
+                "$log" || return 1
+            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=0 partner=2 .*topk_copy_transport=partner-local' \
+                "$log" || return 1
+            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=1 partner=3 .*topk_copy_transport=partner-local' \
+                "$log" || return 1
+            ! grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=[01] partner=[23] .*topk_copy_transport=(peer|host-bounce)' \
+                "$log" || return 1
+            ! grep -Fq 'ordered destination-stream peer copy unavailable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row phase audit event=' "$log" || return 1
+            ! grep -Fq 'prefill attention row entry fence event=' "$log" || return 1
+            ! grep -Fq 'prefill attention row end fence event=' "$log" || return 1
+            if (( require_load )); then
+                validate_full_production_load "$csv" || return 1
+            fi
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -717,7 +800,9 @@ validate_success_path() {
                 return 1
             ! grep -Fq 'prefill attention row end fence event=' "$log" ||
                 return 1
-            validate_full_production_load "$csv" || return 1
+            if (( require_load )); then
+                validate_full_production_load "$csv" || return 1
+            fi
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -805,7 +890,9 @@ validate_success_path() {
                 return 1
             ! grep -Fq 'prefill attention row end fence event=' "$log" ||
                 return 1
-            validate_full_production_load "$csv" || return 1
+            if (( require_load )); then
+                validate_full_production_load "$csv" || return 1
+            fi
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=0 partner_tier=2' || return 1
             log_line_has "$log" 'decode indexer row audit event=complete' \
@@ -854,6 +941,15 @@ validate_success_path() {
     esac
 }
 
+validate_completed_path() {
+    local variant=$1 log=$2 bindings=$3 csv=$4
+    if [[ $variant == attention-q8-host-bounce ]]; then
+        validate_success_path "$variant" "$log" "$bindings" "$csv" 0
+    else
+        validate_success_path "$variant" "$log" "$bindings" "$csv"
+    fi
+}
+
 ctx_alloc=$((PP_TOKENS + TG_TOKENS + 1))
 slot=0
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
@@ -884,16 +980,38 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             if [[ -s $csv && $(wc -l <"$csv") == 2 && -s $bindings ]] &&
                     [[ $(wc -l <"$bindings") == 345 ]] &&
                     [[ ! -e $watch_marker ]] &&
-                    gpu_health_snapshot_is_healthy "$post_health" &&
-                    validate_success_path "$variant" "$log" "$bindings" "$csv"; then
-                printf 'Recovering completed prior arm: variant=%s repeat=%d...\n' \
+                    gpu_health_snapshot_is_healthy "$post_health"; then
+                if validate_completed_path \
+                        "$variant" "$log" "$bindings" "$csv"; then
+                    recovered_status=passed
+                    recovered_exit=0
+                    if [[ $variant == attention-q8-host-bounce ]] &&
+                            ! validate_full_production_load "$csv"; then
+                        recovered_status=inconclusive-underloaded
+                        recovered_exit=128
+                    fi
+                    printf 'Recovering completed prior arm: variant=%s repeat=%d status=%s...\n' \
+                        "$variant" "$repeat" "$recovered_status"
+                    write_result "$result" "$variant" "$recovered_status" \
+                        "$recovered_exit" "$progress" "$log"
+                    fields=$(last_progress_fields "$progress")
+                    IFS=$'\t' read -r lp le lc lt <<<"$fields"
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                        "recovered-$recovered_status" "$recovered_exit" "$lp" "$le" \
+                        >>"$OUTPUT_DIR/run-journal.tsv"
+                    sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+                    continue
+                fi
+                printf 'Retaining completed prior arm as validation-failed: variant=%s repeat=%d\n' \
                     "$variant" "$repeat"
-                write_result "$result" "$variant" passed 0 "$progress" "$log"
+                write_result "$result" "$variant" validation-failed 127 \
+                    "$progress" "$log"
                 fields=$(last_progress_fields "$progress")
                 IFS=$'\t' read -r lp le lc lt <<<"$fields"
                 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
-                    recovered-passed 0 "$lp" "$le" \
+                    recovered-validation-failed 127 "$lp" "$le" \
                     >>"$OUTPUT_DIR/run-journal.tsv"
                 sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
                 continue
@@ -942,6 +1060,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 ;;
             attention-host-bounce)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-host-bounce)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-query-dst)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
@@ -1069,7 +1191,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if [[ $(wc -l <"$bindings") != 345 ]]; then
             die "variant=$variant omitted its 344-entry binding inventory"
         fi
-        if ! validate_success_path "$variant" "$log" "$bindings" "$csv"; then
+        if ! validate_completed_path "$variant" "$log" "$bindings" "$csv"; then
             write_result "$result" "$variant" validation-failed 127 \
                 "$progress" "$log"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1078,6 +1200,19 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 >>"$OUTPUT_DIR/run-journal.tsv"
             sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
             die "variant=$variant failed production-path validation"
+        fi
+        if [[ $variant == attention-q8-host-bounce ]] &&
+                ! validate_full_production_load "$csv"; then
+            write_result "$result" "$variant" inconclusive-underloaded 128 \
+                "$progress" "$log"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                inconclusive-underloaded 128 "$lp" "$le" \
+                >>"$OUTPUT_DIR/run-journal.tsv"
+            sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+            printf 'error: variant=%s completed below 500 prefill tok/s; evidence is inconclusive\n' \
+                "$variant" >&2
+            exit 128
         fi
         write_result "$result" "$variant" passed 0 "$progress" "$log"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

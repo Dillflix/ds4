@@ -951,6 +951,9 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "variant=attention-host-bounce\nstatus=passed\nexit_status=0\n"
                 "last_phase=decode\nlast_event=frontier-complete\n"
             )
+            (production / f"{stem}.csv").write_text(
+                "ctx_tokens,prefill_tps,gen_tps\n32768,575.00,15.00\n"
+            )
             (production / f"{stem}.log").write_text(
                 "ds4: CUDA prefill attention cache mirror transport=host-bounce "
                 "home_tier=0 partner_tier=2 class=raw event=complete "
@@ -992,6 +995,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             report = (root / "summary.md").read_text()
             self.assertIn("attention-owned query, mirrored-cache", report)
             self.assertIn("top-k remained partner-local", report)
+            self.assertIn("no cross-device top-k payload transfer", report)
             self.assertIn("direct attention P2P/BAR1 path", report)
             self.assertIn("not by itself a power-matched proof", report)
 
@@ -1046,14 +1050,391 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             )
             self.assertEqual(row["lost_devices"], "1@00000000:03:00.0")
             report = (root / "summary.md").read_text()
-            self.assertIn("durable measured pos=512 checkpoint", report)
+            self.assertIn("durable measured pos=512 begin/failed checkpoint", report)
             self.assertIn("forced-host-bounce submission boundary", report)
-            self.assertIn("does not claim that the pos=512 bounce completed", report)
+            self.assertIn(
+                "does not claim that the pos=512 attention operation completed",
+                report,
+            )
+            self.assertIn("No top-k transfer was observed", report)
+            self.assertIn("not proof that none occurred", report)
             self.assertIn(
                 "not necessary for the observed pair-0 device loss", report
             )
             self.assertIn("partner attention execution", report)
             self.assertIn("pair-1 direct traffic", report)
+
+    def test_reports_completed_attention_host_bounce_before_device_loss(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=2 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("event=complete checkpoint", report)
+            self.assertIn(
+                "measured layer at pos=512 completed end-to-end", report
+            )
+            self.assertNotIn(
+                "does not claim that the pos=512 attention operation completed",
+                report,
+            )
+            self.assertIn("No top-k transfer was observed", report)
+            self.assertIn("not proof that none occurred", report)
+
+    def test_combined_host_bounce_failure_requires_both_measured_routes(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner transfer audit event=begin "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096 "
+                "activation_bytes=32 result_bytes=32 tokens=512 "
+                "transport=host-bounce serialized=no\n"
+                "ds4: CUDA q8 partner transfer audit event=complete "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=raw event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=attn-comp event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=index event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=2 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=mixed layer=2 pos=512 tokens=512 home=0 partner=2 "
+                "query_copy_stream=source gather_copy_stream=source "
+                "query_copy_transport=host-bounce "
+                "gather_copy_transport=host-bounce "
+                "topk_copy_transport=none\n"
+                "ds4: CUDA default-stream bounce h2d failed: "
+                "unspecified launch failure\n"
+                "ds4: CUDA prefill attention host-bounce failure "
+                "class=result-gather stage=copy kind=mixed layer=16 pos=512 "
+                "tokens=512 source_tier=2 source_device=1 "
+                "destination_tier=0 destination_device=0 bytes=33554432\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["variant"], "attention-q8-host-bounce")
+            self.assertEqual(
+                row["pair0_q8_complete_checkpoint_calls"], "128"
+            )
+            self.assertEqual(
+                row["pair0_attention_cache_host_bounce_classes"],
+                "attn-comp,index,raw",
+            )
+            self.assertEqual(
+                row["host_bounce_failure_context"],
+                "cuda_phase=h2d class=result-gather stage=copy kind=mixed "
+                "layer=16 pos=512 "
+                "tokens=512 source_tier=2 source_device=1 "
+                "destination_tier=0 destination_device=0 bytes=33554432",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "direct pair-0 production attention-owned and Q8-partner payload "
+                "transport is unnecessary",
+                report,
+            )
+            self.assertIn("pair-1 traffic remained direct peer", report)
+            self.assertIn("were not removed", report)
+
+    def test_combined_host_bounce_warmup_only_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\nstatus=failed\nexit_status=1\n"
+                "last_phase=measured-prefill\nlast_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner transfer audit event=begin "
+                "home_tier=0 partner_tier=2 calls=64 bytes=2048 "
+                "activation_bytes=32 result_bytes=32 tokens=512 "
+                "transport=host-bounce serialized=no\n"
+                "ds4: CUDA q8 partner transfer audit event=complete "
+                "home_tier=0 partner_tier=2 calls=64 bytes=2048\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=0 pos=0 tokens=512 "
+                "home=0 partner=2\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("warmup evidence only", report)
+            self.assertIn(
+                "Do not infer that the cut pair-0 attention/Q8 payload routes were "
+                "unnecessary",
+                report,
+            )
+            self.assertIn("pair-1 traffic also retained direct peer transport", report)
+
+    def test_combined_host_bounce_underloaded_completion_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\n"
+                "status=inconclusive-underloaded\nexit_status=128\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.csv").write_text(
+                "ctx_tokens,prefill_tps,gen_tps\n32768,310.00,15.00\n"
+            )
+            (production / f"{stem}.log").write_text("")
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("inconclusive-underloaded", report)
+            self.assertIn("below the required 500 prefill tok/s", report)
+            self.assertIn("cannot show", report)
+            self.assertIn("pair-1 traffic remained direct", report)
+
+    def test_combined_host_bounce_verified_full_load_pass_is_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\nstatus=passed\nexit_status=0\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.csv").write_text(
+                "ctx_tokens,prefill_tps,gen_tps\n32768,575.00,15.00\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner transfer audit event=begin "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096 "
+                "activation_bytes=32 result_bytes=32 tokens=512 "
+                "transport=host-bounce serialized=no\n"
+                "ds4: CUDA q8 partner transfer audit event=complete "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=raw event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=attn-comp event=complete "
+                "bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=index event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=indexed layer=27 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=indexed layer=27 pos=512 tokens=512 home=0 partner=2 "
+                "query_copy_stream=source gather_copy_stream=source "
+                "query_copy_transport=host-bounce "
+                "gather_copy_transport=host-bounce "
+                "topk_copy_transport=partner-local\n"
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("durable measured completion evidence", report)
+            self.assertIn("prefill and decode indexer", report)
+            self.assertIn("remained direct peer", report)
+            self.assertIn("not by itself a", report)
+
+    def test_combined_pass_markers_below_load_floor_are_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\nstatus=passed\nexit_status=0\n"
+                "last_phase=decode\nlast_event=frontier-complete\n"
+            )
+            (production / f"{stem}.csv").write_text(
+                "ctx_tokens,prefill_tps,gen_tps\n32768,499.00,15.00\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner transfer audit event=begin "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096 "
+                "activation_bytes=32 result_bytes=32 tokens=512 "
+                "transport=host-bounce serialized=no\n"
+                "ds4: CUDA q8 partner transfer audit event=complete "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=raw event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=attn-comp event=complete "
+                "bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=index event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=indexed layer=27 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=indexed layer=27 pos=512 tokens=512 home=0 partner=2 "
+                "query_copy_stream=source gather_copy_stream=source "
+                "query_copy_transport=host-bounce "
+                "gather_copy_transport=host-bounce "
+                "topk_copy_transport=partner-local\n"
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("recorded as passed", report)
+            self.assertIn("required >=500 prefill tok/s load", report)
+            self.assertIn("Treat it as inconclusive", report)
+            self.assertNotIn("This implicates one of the removed", report)
+
+    def test_combined_host_bounce_pair1_only_loss_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-host-bounce"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-host-bounce\nstatus=failed-device-loss\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+                "last_event=chunk-start\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner transfer audit event=begin "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096 "
+                "activation_bytes=32 result_bytes=32 tokens=512 "
+                "transport=host-bounce serialized=no\n"
+                "ds4: CUDA q8 partner transfer audit event=complete "
+                "home_tier=0 partner_tier=2 calls=128 bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=raw event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=attn-comp event=complete "
+                "bytes=4096\n"
+                "ds4: CUDA prefill attention cache mirror transport=host-bounce "
+                "home_tier=0 partner_tier=2 class=index event=complete bytes=4096\n"
+                "ds4: CUDA prefill attention host-bounce checkpoint "
+                "event=complete kind=mixed layer=2 pos=512 tokens=512 "
+                "home=0 partner=2\n"
+                "ds4: CUDA prefill attention row audit dispatch=split "
+                "kind=mixed layer=2 pos=512 tokens=512 home=0 partner=2 "
+                "query_copy_stream=source gather_copy_stream=source "
+                "query_copy_transport=host-bounce "
+                "gather_copy_transport=host-bounce topk_copy_transport=none\n"
+            )
+            write_unhealthy_post(root, stem, device=2)
+            write_lost_watch(root, stem, "2@00000000:81:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("does not identify physical GPU 0 or 1", report)
+            self.assertIn("real failure evidence", report)
+            self.assertIn("cannot show", report)
+
+    def test_invalid_outcome_outranks_underloaded_across_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            for repeat, status in ((1, "inconclusive-underloaded"),
+                                   (2, "validation-failed")):
+                stem = f"r{repeat}-s{repeat}-attention-q8-host-bounce"
+                (production / f"{stem}.result").write_text(
+                    "variant=attention-q8-host-bounce\n"
+                    f"status={status}\nexit_status=127\n"
+                )
+                (production / f"{stem}.log").write_text("")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("failed its production-path", report)
+            self.assertNotIn("inconclusive-underloaded: survival", report)
+
+    def test_parses_q8_activation_host_bounce_failure_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=run-failed-unverified\n"
+                "exit_status=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA default-stream bounce d2h failed: "
+                "unspecified launch failure\n"
+                "ds4: CUDA q8 partner host-bounce failure "
+                "class=activation stage=copy source_tier=0 source_device=0 "
+                "destination_tier=2 destination_device=1 bytes=1048576 "
+                "tokens=512 in=512 out=32768 label=q8_0\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["host_bounce_failure_context"],
+                "cuda_phase=d2h class=activation stage=copy source_tier=0 "
+                "source_device=0 destination_tier=2 destination_device=1 "
+                "bytes=1048576 tokens=512 in=512 out=32768 label=q8_0",
+            )
+
+    def test_parses_attention_cache_host_bounce_failure_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-production"
+            (production / f"{stem}.result").write_text(
+                "variant=production\nstatus=run-failed-unverified\n"
+                "exit_status=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA default-stream bounce h2d failed: "
+                "unspecified launch failure\n"
+                "ds4: CUDA prefill attention host-bounce failure "
+                "class=cache-raw stage=copy layer=16 row=512 "
+                "source_tier=0 source_device=0 destination_tier=2 "
+                "destination_device=1 bytes=1048576\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["host_bounce_failure_context"],
+                "cuda_phase=h2d class=cache-raw stage=copy layer=16 row=512 "
+                "source_tier=0 source_device=0 destination_tier=2 "
+                "destination_device=1 bytes=1048576",
+            )
 
     def test_does_not_attribute_pair1_loss_to_pair0_host_bounce(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
