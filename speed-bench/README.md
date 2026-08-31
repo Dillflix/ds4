@@ -3327,10 +3327,12 @@ perturbs Q8 timing and overlap to localize the failure phase. Pair 1 stays on
 its production direct-peer paths. Pair-0 prefill and decode indexer row-split
 transfers also remain direct peer; this arm does not host-bounce or disable
 them. A successfully completed arm must contain one same-sequence pair-0 marker
-chain from activation preparation through activation copy, compute submission,
-compute synchronization, and result gather, with the same non-placeholder
-binding label, passed label, and weight offset throughout. Pair-1 phase markers
-or any phase-failure marker fail validation.
+chain from activation preparation through activation copy, a pre-compute
+partner synchronization, compute submission, post-compute synchronization,
+and result gather, with the same non-placeholder binding label, passed label,
+and weight offset throughout. The pre-compute boundary separates earlier
+queued partner work from the audited projection. Pair-1 phase markers or any
+phase-failure marker fail validation.
 
 Run it from a clean boot and a fresh output directory with all four GPUs fixed
 at 250 W:
@@ -3359,6 +3361,67 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
 VARIANTS=attention-q8-phase-audit \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+The production-load follow-up is the one-arm
+`attention-q8-targeted-phase-audit`. It retains the same pair-0 attention and
+Q8 host-bounce transport, the 50/50 attention row split, all partner compute,
+and pair-1 direct-peer paths, but restricts Q8 phase checkpoints and the
+explicit partner-device compute synchronization to the exact binding
+reconstructed by joining the earlier failure context with the later broad
+phase audit:
+
+- binding label: `tensor:blk.14.attn_output_b.weight`;
+- weight offset: `143571266304`;
+- passed label: `attn_output_b`;
+- shape at the observed failure: 512 tokens, 8192 inputs, 4096 outputs, and an
+  8 MiB result gather.
+
+Pair-0 prefill and decode indexer transfers remain direct peer. The target
+filters reduce the audit from 4,290 pair-0 Q8 calls in the broad completed arm
+to exactly 65 layer-14 attention-output calls (one warmup plus 64 measured
+microbatches), preserving the failing workload far more closely while retaining
+durable before/after markers at the relevant pre-compute, projection-compute,
+and result-copy boundaries. Every one of those 65 chains must complete in strict
+order; a missing or incomplete chain fails validation. A completed arm below
+500 prefill tok/s is still classified as inconclusive-underloaded.
+
+Run it from a clean boot and a fresh output directory with all four GPUs fixed
+at 250 W:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-targeted-phase-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-targeted-phase-audit \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

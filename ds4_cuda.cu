@@ -16255,6 +16255,28 @@ static void cuda_q8_f16_partner_phase_audit_log(
     (void)fsync(fileno(stderr));
 }
 
+static bool cuda_q8_f16_partner_phase_audit_binding_selected(
+        const char *binding_label, uint64_t weight_offset) {
+    const char *label_filter = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_BINDING_LABEL");
+    const char *offset_filter = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_WEIGHT_OFFSET");
+    if (label_filter && label_filter[0] &&
+        (!binding_label || strcmp(binding_label, label_filter) != 0)) {
+        return false;
+    }
+    if (offset_filter && offset_filter[0]) {
+        errno = 0;
+        char *end = NULL;
+        const unsigned long long parsed = strtoull(offset_filter, &end, 10);
+        if (errno != 0 || end == offset_filter || *end != '\0' ||
+            (uint64_t)parsed != weight_offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Execute a planned Q8 projection on its NVLink partner. Production uses the
  * resident F16 expansion. Diagnostic arms can substitute controlled FP32
  * expansions or transfer the native Q8 activations/scales into the existing
@@ -16331,6 +16353,9 @@ static int cuda_q8_f16_partner_matmul_impl(
         "DS4_CUDA_Q8_F16_PARTNER_SERIALIZE_PAIRS", home_tier);
     const bool phase_audit_pair = cuda_env_pair_list_contains(
         "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS", home_tier);
+    const bool phase_audit_call = phase_audit_pair &&
+        cuda_q8_f16_partner_phase_audit_binding_selected(
+            binding->label, weight_offset);
     if (force_host_bounce || serialize_pair) {
         static std::atomic<uint32_t> logged_bounce_mask = 0u;
         static std::atomic<uint32_t> logged_serialize_mask = 0u;
@@ -16511,11 +16536,11 @@ static int cuda_q8_f16_partner_matmul_impl(
             ? activation_f16_bytes
             : (arithmetic == CUDA_Q8_PARTNER_W32_XQ8_SGEMM || use_native_q8
                    ? transport_bytes : activation_f32_bytes);
-    const uint64_t phase_audit_sequence = phase_audit_pair
+    const uint64_t phase_audit_sequence = phase_audit_call
         ? g_q8_f16_partner_phase_audit_sequence.fetch_add(
               1u, std::memory_order_relaxed) + 1u
         : 0u;
-    if (phase_audit_pair) {
+    if (phase_audit_call) {
         cuda_q8_f16_partner_phase_audit_log(
             phase_audit_sequence, "begin", "activation-prepare",
             binding->label, label, weight_offset,
@@ -16584,7 +16609,7 @@ static int cuda_q8_f16_partner_matmul_impl(
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             &activation_dst, &activation_src,
             activation_transfer_bytes, force_host_bounce)) {
-        if (phase_audit_pair) {
+        if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "activation-copy-failed",
                 "activation-copy", binding->label, label, weight_offset,
@@ -16600,7 +16625,7 @@ static int cuda_q8_f16_partner_matmul_impl(
         return cuda_q8_f16_sync_home_for_fallback(
                    home_tier, "activation peer copy") < 0 ? -1 : 0;
     }
-    if (phase_audit_pair) {
+    if (phase_audit_call) {
         cuda_q8_f16_partner_phase_audit_log(
             phase_audit_sequence, "activation-complete", "activation-copy",
             binding->label, label, weight_offset,
@@ -16635,6 +16660,43 @@ static int cuda_q8_f16_partner_matmul_impl(
             return cuda_q8_f16_sync_home_for_fallback(
                        home_tier, "activation q8 widen") < 0 ? -1 : 0;
         }
+    }
+
+    if (phase_audit_call) {
+        cuda_q8_f16_partner_phase_audit_log(
+            phase_audit_sequence, "pre-compute-sync-begin",
+            "pre-compute-sync", binding->label, label, weight_offset,
+            home_tier, home_device, partner_tier, partner_device,
+            n_tok, in_dim, out_dim, activation_transfer_bytes, result_bytes,
+            NULL);
+        const cudaError_t pre_compute_sync = cudaDeviceSynchronize();
+        if (pre_compute_sync != cudaSuccess) {
+            cuda_q8_f16_partner_phase_audit_log(
+                phase_audit_sequence, "pre-compute-sync-failed",
+                "pre-compute-sync", binding->label, label, weight_offset,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, activation_transfer_bytes,
+                result_bytes, cudaGetErrorString(pre_compute_sync));
+            (void)cudaGetLastError();
+            const int restore_rc = cuda_q8_f16_restore_home(
+                home_tier, "audited partner pre-compute synchronize failure");
+            cuda_q8_f16_partner_phase_audit_log(
+                phase_audit_sequence,
+                restore_rc == 0 ? "home-restored-after-failure"
+                                : "home-restore-failed",
+                "recovery", binding->label, label, weight_offset,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, activation_transfer_bytes,
+                result_bytes,
+                restore_rc == 0 ? NULL : "restore-home-failed");
+            return -1;
+        }
+        cuda_q8_f16_partner_phase_audit_log(
+            phase_audit_sequence, "pre-compute-complete",
+            "pre-compute-sync", binding->label, label, weight_offset,
+            home_tier, home_device, partner_tier, partner_device,
+            n_tok, in_dim, out_dim, activation_transfer_bytes, result_bytes,
+            NULL);
     }
 
     void *partner_result = partner_scratch + result_offset;
@@ -16681,7 +16743,7 @@ static int cuda_q8_f16_partner_matmul_impl(
         compute_ok = st == CUBLAS_STATUS_SUCCESS;
     }
     if (!compute_ok) {
-        if (phase_audit_pair) {
+        if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "compute-submit-failed", "compute",
                 binding->label, label, weight_offset,
@@ -16712,7 +16774,7 @@ static int cuda_q8_f16_partner_matmul_impl(
         }
         return 0;
     }
-    if (phase_audit_pair) {
+    if (phase_audit_call) {
         cuda_q8_f16_partner_phase_audit_log(
             phase_audit_sequence, "compute-submitted", "compute",
             binding->label, label, weight_offset,
@@ -16760,7 +16822,7 @@ static int cuda_q8_f16_partner_matmul_impl(
     };
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             out, &result_src, result_bytes, force_host_bounce)) {
-        if (phase_audit_pair) {
+        if (phase_audit_call) {
             cuda_q8_f16_partner_phase_audit_log(
                 phase_audit_sequence, "result-copy-failed", "result-gather",
                 binding->label, label, weight_offset,
@@ -16794,7 +16856,7 @@ static int cuda_q8_f16_partner_matmul_impl(
         }
         return 0;
     }
-    if (phase_audit_pair) {
+    if (phase_audit_call) {
         cuda_q8_f16_partner_phase_audit_log(
             phase_audit_sequence, "result-complete", "result-gather",
             binding->label, label, weight_offset,

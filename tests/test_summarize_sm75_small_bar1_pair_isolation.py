@@ -77,10 +77,10 @@ def q8_phase_marker(
         "ds4: CUDA q8 partner phase audit "
         f"sequence={sequence} event={event} stage={stage} "
         "binding_label=tensor:blk.14.attn_output_b.weight "
-        "passed_label=attn_output_b weight_offset=144000 "
+        "passed_label=attn_output_b weight_offset=143571266304 "
         f"home_tier={home_tier} home_device={home_device} "
         f"partner_tier={partner_tier} partner_device={partner_device} "
-        "tokens=512 in=8192 out=4096 transfer_bytes=1048576 "
+        "tokens=512 in=8192 out=4096 transfer_bytes=8388608 "
         f"result_bytes=8388608 cuda_error={cuda_error}\n"
     )
 
@@ -1393,6 +1393,12 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             (production / f"{stem}.log").write_text(
                 q8_phase_marker(41, "begin", "activation-prepare")
                 + q8_phase_marker(41, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    41, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    41, "pre-compute-complete", "pre-compute-sync"
+                )
                 + q8_phase_marker(41, "compute-submitted", "compute")
                 + q8_phase_marker(
                     41, "compute-sync-failed", "compute-sync",
@@ -1418,7 +1424,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             )
             self.assertEqual(
                 row["q8_phase_audit_classification"],
-                "partner-compute-or-earlier-async-partner-work",
+                "target-compute-or-concurrent-partner-work",
             )
             self.assertIn(
                 "cuda_error=unspecified launch failure",
@@ -1426,9 +1432,8 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             )
             report = (root / "summary.md").read_text()
             self.assertIn(
-                "partner compute or earlier asynchronous partner-side work", report
+                "audited compute or partner work submitted concurrently", report
             )
-            self.assertIn("before the result gather was attempted", report)
             self.assertIn("not in the result D2H host-bounce copy", report)
             self.assertIn("no pair-0 indexer dispatch was durably logged", report)
 
@@ -1445,6 +1450,12 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             (production / f"{stem}.log").write_text(
                 q8_phase_marker(42, "begin", "activation-prepare")
                 + q8_phase_marker(42, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    42, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    42, "pre-compute-complete", "pre-compute-sync"
+                )
                 + q8_phase_marker(42, "compute-submitted", "compute")
                 + q8_phase_marker(42, "compute-complete", "compute-sync")
                 + "ds4: CUDA default-stream bounce d2h failed: "
@@ -1516,13 +1527,234 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             )
             self.assertNotIn("partner-to-host PCIe leg", report)
 
+    def test_q8_phase_audit_result_failure_requires_precompute_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(10, "compute-complete", "compute-sync")
+                + "ds4: CUDA default-stream bounce d2h failed: "
+                  "unspecified launch failure\n"
+                + q8_phase_marker(
+                    10, "result-copy-failed", "result-gather",
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["q8_phase_audit_classification"], "inconclusive")
+            report = (root / "summary.md").read_text()
+            self.assertNotIn("partner-to-host PCIe leg", report)
+
+    def test_targeted_q8_audit_precompute_failure_is_earlier_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-targeted-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-targeted-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(43, "begin", "activation-prepare")
+                + q8_phase_marker(43, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    43, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    43, "pre-compute-sync-failed", "pre-compute-sync",
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_phase_audit_classification"],
+                "pre-target-partner-error",
+            )
+            self.assertIn(
+                "event=pre-compute-sync-failed stage=pre-compute-sync",
+                row["q8_phase_audit_first_failure"],
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("surfaced before the target submission", report)
+            self.assertIn("does not prove that queued work caused the fault", report)
+            self.assertIn("target projection or result D2H copy", report)
+            self.assertIn("tensor:blk.14.attn_output_b.weight", report)
+
+    def test_targeted_q8_audit_compute_sync_failure_is_target_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-targeted-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-targeted-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(44, "begin", "activation-prepare")
+                + q8_phase_marker(44, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    44, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    44, "pre-compute-complete", "pre-compute-sync"
+                )
+                + q8_phase_marker(44, "compute-submitted", "compute")
+                + q8_phase_marker(
+                    44, "compute-sync-failed", "compute-sync",
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_phase_audit_classification"],
+                "target-compute-or-concurrent-partner-work",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("completed the pre-compute partner boundary", report)
+            self.assertIn("projection or partner work submitted concurrently", report)
+            self.assertIn("not in its result D2H copy", report)
+
+    def test_targeted_q8_audit_d2h_failure_is_result_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-targeted-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-targeted-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=untimed-warmup\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(45, "begin", "activation-prepare")
+                + q8_phase_marker(45, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    45, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    45, "pre-compute-complete", "pre-compute-sync"
+                )
+                + q8_phase_marker(45, "compute-submitted", "compute")
+                + q8_phase_marker(45, "compute-complete", "compute-sync")
+                + "ds4: CUDA default-stream bounce d2h failed: "
+                  "unspecified launch failure\n"
+                + q8_phase_marker(
+                    45, "result-copy-failed", "result-gather",
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_phase_audit_classification"],
+                "result-d2h-pcie-host-bounce-transfer",
+            )
+            self.assertIn("cuda_phase=d2h", row["q8_phase_audit_first_failure"])
+            report = (root / "summary.md").read_text()
+            self.assertIn("completed both pre- and post-compute", report)
+            self.assertIn("partner-to-host transfer call", report)
+            self.assertIn("unresolved physical causes", report)
+
+    def test_targeted_q8_audit_completed_target_then_later_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-targeted-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-targeted-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(46, "begin", "activation-prepare")
+                + q8_phase_marker(46, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    46, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    46, "pre-compute-complete", "pre-compute-sync"
+                )
+                + q8_phase_marker(46, "compute-submitted", "compute")
+                + q8_phase_marker(46, "compute-complete", "compute-sync")
+                + q8_phase_marker(46, "result-complete", "result-gather")
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("outside that recorded target sequence", report)
+            self.assertIn("delayed physical effect remains possible", report)
+
+    def test_targeted_q8_audit_passes_at_validated_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-targeted-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-targeted-phase-audit\nstatus=passed\n"
+                "exit_status=0\nlast_phase=decode\n"
+            )
+            (production / f"{stem}.csv").write_text(
+                "ctx_tokens,prefill_tps,gen_tps\n32768,575.00,15.00\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_phase_marker(47, "begin", "activation-prepare")
+                + q8_phase_marker(47, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    47, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+                + q8_phase_marker(
+                    47, "pre-compute-complete", "pre-compute-sync"
+                )
+                + q8_phase_marker(47, "compute-submitted", "compute")
+                + q8_phase_marker(47, "compute-complete", "compute-sync")
+                + q8_phase_marker(47, "result-complete", "result-gather")
+            )
+            write_healthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("validated production-load floor", report)
+            self.assertIn("does not by itself prove", report)
+            self.assertIn("establish a production mitigation", report)
+
     def test_q8_phase_audit_variant_sorts_after_combined_host_bounce(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
             production.mkdir()
             for slot, variant in enumerate((
-                    "attention-q8-phase-audit", "attention-q8-host-bounce"), 1):
+                    "attention-q8-targeted-phase-audit",
+                    "attention-q8-phase-audit",
+                    "attention-q8-host-bounce"), 1):
                 stem = f"r1-s{slot}-{variant}"
                 (production / f"{stem}.result").write_text(
                     f"variant={variant}\nstatus=validation-failed\nexit_status=127\n"
@@ -1534,7 +1766,11 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(
                 [row["variant"] for row in rows],
-                ["attention-q8-host-bounce", "attention-q8-phase-audit"],
+                [
+                    "attention-q8-host-bounce",
+                    "attention-q8-phase-audit",
+                    "attention-q8-targeted-phase-audit",
+                ],
             )
 
     def test_invalid_outcome_outranks_underloaded_across_repeats(self) -> None:

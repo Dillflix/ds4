@@ -11,7 +11,7 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
-    "attention-q8-phase-audit",
+    "attention-q8-phase-audit", "attention-q8-targeted-phase-audit",
     "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
@@ -212,12 +212,15 @@ def q8_partner_phase_audit_summary(
     markers = q8_partner_phase_audit_markers(text, pair)
     checkpoint_events = {
         "begin", "activation-complete", "activation-copy-failed",
+        "pre-compute-sync-begin", "pre-compute-complete",
+        "pre-compute-sync-failed",
         "compute-submitted", "compute-submit-failed", "compute-complete",
         "compute-sync-failed", "result-complete", "result-copy-failed",
     }
     failure_events = {
         "activation-copy-failed", "compute-submit-failed",
-        "compute-sync-failed", "result-copy-failed", "home-restore-failed",
+        "pre-compute-sync-failed", "compute-sync-failed",
+        "result-copy-failed", "home-restore-failed",
     }
     checkpoints = [
         marker for marker in markers if marker["event"] in checkpoint_events
@@ -233,16 +236,30 @@ def q8_partner_phase_audit_summary(
     classification = ""
     if first_failure:
         event = first_failure["event"]
-        if event == "compute-sync-failed":
-            classification = "partner-compute-or-earlier-async-partner-work"
+        if event == "pre-compute-sync-failed":
+            classification = "pre-target-partner-error"
+        elif event == "compute-sync-failed":
+            sequence = first_failure["sequence"]
+            pre_compute_completed = any(
+                marker["sequence"] == sequence and
+                marker["event"] == "pre-compute-complete"
+                for marker in markers[:first_failure_index]
+            )
+            if pre_compute_completed:
+                classification = "target-compute-or-concurrent-partner-work"
         elif event == "result-copy-failed":
             sequence = first_failure["sequence"]
+            pre_compute_completed = any(
+                marker["sequence"] == sequence and
+                marker["event"] == "pre-compute-complete"
+                for marker in markers[:first_failure_index]
+            )
             compute_completed = any(
                 marker["sequence"] == sequence and
                 marker["event"] == "compute-complete"
                 for marker in markers[:first_failure_index]
             )
-            if compute_completed:
+            if pre_compute_completed and compute_completed:
                 phase = first_failure.get("cuda_phase", "")
                 if phase == "d2h":
                     classification = "result-d2h-pcie-host-bounce-transfer"
@@ -477,6 +494,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_phase_audit = outcomes.get(
         "attention-q8-phase-audit", "not-run"
     )
+    attention_q8_targeted_phase_audit = outcomes.get(
+        "attention-q8-targeted-phase-audit", "not-run"
+    )
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -517,6 +537,14 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     ]
     attention_q8_phase_audit_problem_rows = [
         row for row in attention_q8_phase_audit_rows
+        if row.get("status") not in {"passed", "completed-no-result"}
+    ]
+    attention_q8_targeted_phase_audit_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-targeted-phase-audit"
+    ]
+    attention_q8_targeted_phase_audit_problem_rows = [
+        row for row in attention_q8_targeted_phase_audit_rows
         if row.get("status") not in {"passed", "completed-no-result"}
     ]
 
@@ -872,6 +900,115 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
         )
+    if attention_q8_targeted_phase_audit in {"failed", "incomplete"}:
+        classified_row = next((
+            row for row in attention_q8_targeted_phase_audit_problem_rows
+            if row.get("q8_phase_audit_classification") not in {
+                "", "inconclusive"
+            }
+        ), {})
+        classification = classified_row.get(
+            "q8_phase_audit_classification", "inconclusive"
+        )
+        target_scope = (
+            " The audit target is exactly `tensor:blk.14.attn_output_b.weight` "
+            "at weight offset 143571266304. Pair-0 attention and Q8 payloads "
+            "remained host-bounced, row splitting and partner compute remained "
+            "enabled, the pair-0 indexer route was outside the host-bounce "
+            "override, and pair 1 remained direct."
+            + indexer_observation(attention_q8_targeted_phase_audit_problem_rows)
+        )
+        if classification == "pre-target-partner-error":
+            return (
+                "The targeted Q8 audit failed its pre-compute partner "
+                "synchronization before the layer-14 attention-output projection "
+                "was submitted. The first synchronous error therefore surfaced "
+                "before the target submission and is consistent with earlier "
+                "partner-side work or an already poisoned/lost partner device; it "
+                "does not prove that queued work caused the fault or assign it to "
+                "the target projection or result D2H copy."
+                + target_scope
+            )
+        if classification == "target-compute-or-concurrent-partner-work":
+            return (
+                "The targeted Q8 audit completed the pre-compute partner boundary, "
+                "submitted the layer-14 attention-output projection, then failed its "
+                "post-compute partner synchronization before result gather. The first "
+                "synchronous failure is in that projection or partner work submitted "
+                "concurrently after the pre-compute boundary, not in its result D2H "
+                "copy."
+                + target_scope
+            )
+        if classification == "result-d2h-pcie-host-bounce-transfer":
+            return (
+                "The targeted Q8 audit completed both pre- and post-compute partner "
+                "synchronizations for the layer-14 attention-output projection, then "
+                "recorded the first failure in its result-gather D2H call. This "
+                "localizes the first synchronous failure to that partner-to-host "
+                "transfer call, while leaving the GPU endpoint, PCIe path, host-memory "
+                "path, and driver as unresolved physical causes."
+                + target_scope
+            )
+        if classification in {
+                "result-h2d-pcie-host-bounce-transfer",
+                "result-host-bounce-allocation",
+                "result-host-bounce-copy-after-compute"}:
+            detail = {
+                "result-h2d-pcie-host-bounce-transfer":
+                    "home-device H2D leg of the target result transfer",
+                "result-host-bounce-allocation":
+                    "host-bounce allocation/setup for the target result transfer",
+                "result-host-bounce-copy-after-compute":
+                    "target host-bounce result helper, with its exact leg unrecorded",
+            }[classification]
+            return (
+                "The targeted Q8 audit completed both target compute boundaries "
+                f"before the first synchronous failure in the {detail}."
+                + target_scope
+            )
+        completed_target = any(
+            "event=result-complete" in row.get(
+                "q8_phase_audit_last_checkpoint", ""
+            )
+            for row in attention_q8_targeted_phase_audit_problem_rows
+        )
+        if completed_target:
+            return (
+                "At least one targeted layer-14 attention-output sequence completed "
+                "its pre-compute boundary, projection, post-compute boundary, and "
+                "result gather before the arm later ended without a classified target "
+                "phase failure. The first observed failure lies outside that recorded "
+                "target sequence, although a delayed physical effect remains possible."
+                + target_scope
+            )
+        return (
+            "The targeted Q8 phase-audit arm ended without a complete marker chain "
+            "or a classified target failure. Its last durable targeted checkpoint is "
+            "the observation boundary; the result is otherwise inconclusive."
+            + target_scope
+        )
+    if attention_q8_targeted_phase_audit == "passed":
+        return (
+            "The targeted layer-14 attention-output Q8 phase-audit arm completed at "
+            "the validated production-load floor without a durable target failure. "
+            "Because only the exact target projection was synchronized and durably "
+            "logged, this run shows that the full workload can survive with that "
+            "target overlap window perturbed. It does not by itself prove that the "
+            "target window caused the prior failures, identify a software defect, or "
+            "establish a production mitigation."
+            + indexer_observation(attention_q8_targeted_phase_audit_rows)
+        )
+    if attention_q8_targeted_phase_audit == "underloaded":
+        return (
+            "The targeted layer-14 attention-output Q8 phase-audit arm completed "
+            "below the required 500 prefill tok/s floor. Its markers remain useful, "
+            "but survival under reduced load cannot identify the trigger."
+        )
+    if attention_q8_targeted_phase_audit == "invalid":
+        return (
+            "The targeted Q8 phase-audit arm failed target-marker, production-path, "
+            "throughput, or health validation and is invalid for causal comparison."
+        )
     if attention_q8_phase_audit in {"failed", "incomplete"}:
         classified_row = next((
             row for row in attention_q8_phase_audit_problem_rows
@@ -887,13 +1024,24 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             + indexer_observation(attention_q8_phase_audit_problem_rows)
             + " Pair-1 traffic retained direct-peer transport."
         )
-        if classification == "partner-compute-or-earlier-async-partner-work":
+        if classification == "pre-target-partner-error":
             return (
-                "The Q8 phase audit recorded compute submission followed by an "
-                "explicit partner-device compute synchronization failure before the "
-                "result gather was attempted. The first synchronous failure is "
-                "therefore in partner compute or earlier asynchronous partner-side "
-                "work, not in the result D2H host-bounce copy."
+                "The Q8 phase audit failed its explicit pre-compute partner "
+                "synchronization before the audited projection was submitted. The "
+                "first synchronous error therefore surfaced before that submission "
+                "and is consistent with earlier partner-side work or an already "
+                "poisoned/lost partner device; it does not prove that queued work "
+                "caused the fault or assign it to the audited projection/result copy."
+                + common_scope
+            )
+        if classification == "target-compute-or-concurrent-partner-work":
+            return (
+                "The Q8 phase audit completed its pre-compute partner boundary, "
+                "recorded compute submission, then failed the post-compute partner "
+                "synchronization before result gather. The first synchronous failure "
+                "is therefore in the audited compute or partner work submitted "
+                "concurrently after the pre-compute boundary, not in the result D2H "
+                "host-bounce copy."
                 + common_scope
             )
         if classification == "result-d2h-pcie-host-bounce-transfer":
