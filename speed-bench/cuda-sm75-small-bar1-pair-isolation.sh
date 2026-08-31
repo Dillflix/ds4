@@ -22,6 +22,7 @@ Optional environment:
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
   VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
+  VARIANTS=attention-q8-l12-phase-audit       first measured layer-12 audit only
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -73,6 +74,13 @@ Q8_TARGET_RESULT_BYTES=8388608
 Q8_WINDOW_L15_BINDING_LABEL=tensor:blk.15.attn_output_b.weight
 Q8_WINDOW_L15_WEIGHT_OFFSET=143723876608
 Q8_WINDOW_TARGETS="${Q8_TARGET_BINDING_LABEL}@${Q8_TARGET_WEIGHT_OFFSET},${Q8_WINDOW_L15_BINDING_LABEL}@${Q8_WINDOW_L15_WEIGHT_OFFSET}"
+Q8_L12_BINDING_LABEL=tensor:blk.12.attn_output_b.weight
+Q8_L12_WEIGHT_OFFSET=143236281600
+Q8_L12_TARGET="${Q8_L12_BINDING_LABEL}@${Q8_L12_WEIGHT_OFFSET}"
+Q8_L12_SKIP_OCCURRENCES=1
+Q8_L12_MAX_OCCURRENCES=1
+Q8_L12_SELECTED_OCCURRENCE=2
+Q8_L12_EXPECTED_SEQUENCES=1
 VARIANTS=${VARIANTS:-attention-off,production}
 ATTN_PHASE_AUDIT_LAYER=${ATTN_PHASE_AUDIT_LAYER:-17}
 ATTN_PHASE_AUDIT_POS=${ATTN_PHASE_AUDIT_POS:-512}
@@ -146,13 +154,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -161,7 +169,7 @@ if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
     die "attention copy diagnostic arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
 fi
 
-for tool in awk basename cat cmp cp date dirname env find git grep kill make \
+for tool in awk basename cat cmp cp cut date dirname env find git grep kill make \
             mkdir mv nproc nvidia-smi python3 rm sleep sort stat stdbuf sync \
             tail tar tee timeout tr wc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -572,6 +580,27 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_q8_l14_l15_phase_audit_expected_total_sequences=%s\n' \
             "$Q8_WINDOW_EXPECTED_TOTAL_SEQUENCES"
         printf 'attention_q8_l14_l15_phase_audit_target_preflight=exact-partner-tuples-against-materialized-binding-inventory\n'
+        printf 'attention_q8_l12_phase_audit_target=%s\n' "$Q8_L12_TARGET"
+        printf 'attention_q8_l12_phase_audit_binding=%s\n' "$Q8_L12_BINDING_LABEL"
+        printf 'attention_q8_l12_phase_audit_weight_offset=%s\n' "$Q8_L12_WEIGHT_OFFSET"
+        printf 'attention_q8_l12_phase_audit_passed_label=%s\n' "$Q8_TARGET_PASSED_LABEL"
+        printf 'attention_q8_l12_phase_audit_shape=%sx%sx%s\n' \
+            "$Q8_TARGET_TOKENS" "$Q8_TARGET_IN_DIM" "$Q8_TARGET_OUT_DIM"
+        printf 'attention_q8_l12_phase_audit_expected_weight_bytes=%s\n' \
+            "$Q8_TARGET_WEIGHT_BYTES"
+        printf 'attention_q8_l12_phase_audit_transfer_bytes=%s\n' \
+            "$Q8_TARGET_TRANSFER_BYTES"
+        printf 'attention_q8_l12_phase_audit_result_bytes=%s\n' \
+            "$Q8_TARGET_RESULT_BYTES"
+        printf 'attention_q8_l12_phase_audit_skip_occurrences=%s\n' \
+            "$Q8_L12_SKIP_OCCURRENCES"
+        printf 'attention_q8_l12_phase_audit_max_occurrences=%s\n' \
+            "$Q8_L12_MAX_OCCURRENCES"
+        printf 'attention_q8_l12_phase_audit_selected_occurrence=%s\n' \
+            "$Q8_L12_SELECTED_OCCURRENCE"
+        printf 'attention_q8_l12_phase_audit_expected_sequences=%s\n' \
+            "$Q8_L12_EXPECTED_SEQUENCES"
+        printf 'attention_q8_l12_phase_audit_target_preflight=one-exact-partner-tuple-against-materialized-binding-inventory\n'
         printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
@@ -727,7 +756,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
+        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -984,14 +1013,52 @@ validate_success_path() {
             --validate-q8-l14-l15-log "$log" \
             "$Q8_TARGET_EXPECTED_SEQUENCES" || return 1
     fi
+    if [[ $variant == attention-q8-l12-phase-audit ]]; then
+        local l12_selection_count l12_skip_count
+        local l12_skip_line l12_warmup_start_line l12_warmup_complete_line
+        local l12_chunk_begin_line l12_selection_line
+        local l12_skip_record l12_selection_record
+        grep -Fq \
+            'CUDA q8 partner phase-audit target preflight validated 1 exact partner tuples against ' \
+            "$log" || return 1
+        grep -Fq \
+            "audited_pairs=${SMALL_BAR1_PAIR} expected_weight_bytes=${Q8_TARGET_WEIGHT_BYTES} expected_in=${Q8_TARGET_IN_DIM} expected_out=${Q8_TARGET_OUT_DIM} skip_occurrences=${Q8_L12_SKIP_OCCURRENCES} max_occurrences=${Q8_L12_MAX_OCCURRENCES}" \
+            "$log" || return 1
+        l12_skip_record="CUDA q8 partner phase audit skipped occurrence=${Q8_L12_SKIP_OCCURRENCES} binding_label=${Q8_L12_BINDING_LABEL} weight_offset=${Q8_L12_WEIGHT_OFFSET}"
+        l12_selection_record="CUDA q8 partner phase audit selected occurrence=${Q8_L12_SELECTED_OCCURRENCE} sequence=1 binding_label=${Q8_L12_BINDING_LABEL} weight_offset=${Q8_L12_WEIGHT_OFFSET}"
+        l12_skip_count=$(grep -Fc "$l12_skip_record" "$log" || true)
+        l12_selection_count=$(grep -Fc \
+            "$l12_selection_record" \
+            "$log" || true)
+        (( l12_skip_count == 1 )) || return 1
+        (( l12_selection_count == 1 )) || return 1
+        l12_warmup_start_line=$(grep -nFm1 \
+            'starting untimed CUDA warm-up frontier' "$log" | cut -d: -f1 || true)
+        l12_skip_line=$(grep -nFm1 "$l12_skip_record" "$log" | cut -d: -f1 || true)
+        l12_warmup_complete_line=$(grep -nFm1 \
+            'completed untimed CUDA warm-up frontier' "$log" | cut -d: -f1 || true)
+        l12_chunk_begin_line=$(grep -nFm1 \
+            'prefill fault breadcrumb event=chunk-begin' "$log" | cut -d: -f1 || true)
+        l12_selection_line=$(grep -nFm1 "$l12_selection_record" "$log" | cut -d: -f1 || true)
+        [[ -n $l12_warmup_start_line && -n $l12_skip_line &&
+           -n $l12_warmup_complete_line && -n $l12_chunk_begin_line &&
+           -n $l12_selection_line ]] || return 1
+        (( l12_warmup_start_line < l12_skip_line &&
+           l12_skip_line < l12_warmup_complete_line &&
+           l12_warmup_complete_line < l12_chunk_begin_line &&
+           l12_chunk_begin_line < l12_selection_line )) || return 1
+    fi
     if [[ $variant == attention-q8-phase-audit ||
-          $variant == attention-q8-targeted-phase-audit ]]; then
+          $variant == attention-q8-targeted-phase-audit ||
+          $variant == attention-q8-l12-phase-audit ]]; then
         # Require every observed pair-0 sequence to have an identical binding
-        # identity and strict phase order.  The targeted arm must contain all
-        # 65 calls established by the broad audit: one 512-token warmup plus
-        # 64 measured 512-token microbatches. Any pair-1 marker, failure,
-        # incomplete chain, or missing target call invalidates the arm. The
-        # case validation above independently proves pair 0 bounced and pair 1
+        # identity and strict phase order. The original targeted arm must
+        # contain all 65 calls established by the broad audit: one 512-token
+        # warmup plus 64 measured 512-token microbatches. The layer-12 arm
+        # instead skips the warmup occurrence and requires exactly the first
+        # measured occurrence. Any pair-1 marker, failure, incomplete chain,
+        # or missing selected target call invalidates the arm. The case
+        # validation above independently proves pair 0 bounced and pair 1
         # retained direct transport.
         local required_binding= required_offset= required_passed=
         local required_tokens= required_in= required_out=
@@ -1006,6 +1073,16 @@ validate_success_path() {
             required_transfer=$Q8_TARGET_TRANSFER_BYTES
             required_result=$Q8_TARGET_RESULT_BYTES
             required_sequences=$Q8_TARGET_EXPECTED_SEQUENCES
+        elif [[ $variant == attention-q8-l12-phase-audit ]]; then
+            required_binding=$Q8_L12_BINDING_LABEL
+            required_offset=$Q8_L12_WEIGHT_OFFSET
+            required_passed=$Q8_TARGET_PASSED_LABEL
+            required_tokens=$Q8_TARGET_TOKENS
+            required_in=$Q8_TARGET_IN_DIM
+            required_out=$Q8_TARGET_OUT_DIM
+            required_transfer=$Q8_TARGET_TRANSFER_BYTES
+            required_result=$Q8_TARGET_RESULT_BYTES
+            required_sequences=$Q8_L12_EXPECTED_SEQUENCES
         fi
         awk -v required_binding="$required_binding" \
             -v required_offset="$required_offset" \
@@ -1102,7 +1179,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
+        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1147,7 +1224,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
+                        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1249,6 +1326,17 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_WEIGHT_BYTES=$Q8_TARGET_WEIGHT_BYTES")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_IN_DIM=$Q8_TARGET_IN_DIM")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_OUT_DIM=$Q8_TARGET_OUT_DIM")
+                ;;
+            attention-q8-l12-phase-audit)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS=$Q8_L12_TARGET")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_WEIGHT_BYTES=$Q8_TARGET_WEIGHT_BYTES")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_IN_DIM=$Q8_TARGET_IN_DIM")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_OUT_DIM=$Q8_TARGET_OUT_DIM")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_SKIP_OCCURRENCES=$Q8_L12_SKIP_OCCURRENCES")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_MAX_OCCURRENCES=$Q8_L12_MAX_OCCURRENCES")
                 ;;
             attention-query-dst)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
@@ -1387,7 +1475,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
+            attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

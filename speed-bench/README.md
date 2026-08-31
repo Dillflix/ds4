@@ -3502,6 +3502,85 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
+The resulting
+`sm75-attention-q8-l14-l15-phase-audit-20260831T163552Z` archive does not show
+the measured failure moving beyond layers 14 and 15. Both complete target
+chains occurred inside the untimed 512-token warmup. After the warmup completed,
+the first measured 2,048-token chunk began without reaching either measured
+target marker; the pair-0 Q8 host-bounce result D2H then surfaced
+`unspecified launch failure`, and the engine reported layer 12 attention encode
+failure. Joining that failure with the materialized binding inventory strongly
+correlates it with the exact tuple
+`tensor:blk.12.attn_output_b.weight@143236281600` (512 tokens, 8192 inputs,
+4096 outputs, 35,651,584 weight bytes, and 8 MiB activation/result transfers).
+Warmup-only layer-14/layer-15 completions therefore must not be used as evidence
+that the first measured failure occurred downstream of that window.
+
+The code audit also compared this path with the earlier `b9b0c7e` GPU-loss fix.
+That defect was an unconditional second-word load at the exact end of a packed
+Q8 allocation. The present partner-resident F16/cuBLAS projection does not call
+that loader, and its 2,048-token partner scratch reservation is at least 64 MiB;
+the failing 512-token 8192-to-4096 call occupies only the first 16 MiB for its
+activation and result. No analogous allocation-tail geometry or runtime scratch
+size mismatch was found. The host-bounce D2H is synchronous, but it can still be
+the first API to report a deferred partner compute/default-stream error or an
+endpoint loss that already occurred. That is why the follow-up fences the exact
+pre-compute, post-compute, and result-copy boundaries instead of assigning
+causality to the surfaced D2H error.
+
+The follow-up one-arm diagnostic is `attention-q8-l12-phase-audit`. It retains
+the same four-GPU 32K/TG256 production workload, 50/50 attention row split,
+partner compute, pair-0 attention/Q8 host-bounce transport cut, pair-1 direct
+transport, and 250 W requirement. It strictly preflights the single exact
+layer-12 tuple, skips target occurrence 1 (the untimed warmup), and audits only
+target occurrence 2 (the first measured layer-12 call). That selected call must
+emit one durable selection record with `selected occurrence=2 sequence=1` and
+one exact seven-event chain from activation preparation through result gather.
+Acceptance also requires strict log order: warmup start, skipped occurrence 1,
+warmup completion, measured chunk begin, then selected occurrence 2. This proves
+the skipped call was the untimed warmup and the fenced call was the first
+measured occurrence. All later target occurrences run without phase fences,
+minimizing perturbation of the production overlap envelope. `SKIP_BUILD=0` is
+mandatory so the fixed CUDA/P2P preflight is repeated after reboot.
+
+Run it from a clean boot and a fresh output directory:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset CUDA_VISIBLE_DEVICES
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-l12-phase-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-l12-phase-audit \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

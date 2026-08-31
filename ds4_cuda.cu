@@ -1162,6 +1162,40 @@ static bool cuda_q8_f16_partner_phase_audit_parse_positive_u64(
     return true;
 }
 
+static bool cuda_q8_f16_partner_phase_audit_parse_optional_u64(
+        const char *value, uint64_t *parsed_out) {
+    if (!parsed_out) return false;
+    if (!value || !value[0]) {
+        *parsed_out = 0u;
+        return true;
+    }
+    uint64_t parsed = 0u;
+    for (const char *p = value; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (parsed > UINT64_MAX / 10u ||
+            (parsed == UINT64_MAX / 10u && digit > UINT64_MAX % 10u)) {
+            return false;
+        }
+        parsed = parsed * 10u + digit;
+    }
+    *parsed_out = parsed;
+    return true;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_occurrence_policy_load(
+        uint64_t *skip_occurrences, uint64_t *max_occurrences) {
+    return skip_occurrences && max_occurrences &&
+           cuda_q8_f16_partner_phase_audit_parse_optional_u64(
+               getenv(
+                   "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_SKIP_OCCURRENCES"),
+               skip_occurrences) &&
+           cuda_q8_f16_partner_phase_audit_parse_optional_u64(
+               getenv(
+                   "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_MAX_OCCURRENCES"),
+               max_occurrences);
+}
+
 static bool cuda_q8_f16_partner_phase_audit_expectation_load(
         cuda_q8_f16_partner_phase_audit_expectation *expected) {
     if (!expected) return false;
@@ -1223,6 +1257,10 @@ static std::atomic<uint64_t> g_q8_f16_partner_result_bytes = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_f16_result_offloads = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_execution_suppressed = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_phase_audit_sequence = 0;
+static std::atomic<uint64_t>
+    g_q8_f16_partner_phase_audit_selected_occurrence = 0;
+static uint64_t g_q8_f16_partner_phase_audit_skip_occurrences;
+static uint64_t g_q8_f16_partner_phase_audit_max_occurrences;
 static std::atomic<uint64_t> g_t32_f16_fused_local_calls = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_partner_calls = 0;
 
@@ -1861,6 +1899,10 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_f16_partner_f16_result_offloads.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_execution_suppressed.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_phase_audit_sequence.store(0, std::memory_order_relaxed);
+    g_q8_f16_partner_phase_audit_selected_occurrence.store(
+        0, std::memory_order_relaxed);
+    g_q8_f16_partner_phase_audit_skip_occurrences = 0u;
+    g_q8_f16_partner_phase_audit_max_occurrences = 0u;
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
 }
@@ -2473,11 +2515,15 @@ static bool cuda_q8_f16_partner_phase_audit_targets_match_bindings(
             "ds4: CUDA q8 partner phase-audit target preflight validated "
             "%zu exact partner tuples against %zu materialized bindings "
             "audited_pairs=%s expected_weight_bytes=%llu expected_in=%llu "
-            "expected_out=%llu\n",
+            "expected_out=%llu skip_occurrences=%llu max_occurrences=%llu\n",
             target_count, g_q8_f16_bindings.size(), pair_list,
             (unsigned long long)expected.weight_bytes,
             (unsigned long long)expected.in_dim,
-            (unsigned long long)expected.out_dim);
+            (unsigned long long)expected.out_dim,
+            (unsigned long long)
+                g_q8_f16_partner_phase_audit_skip_occurrences,
+            (unsigned long long)
+                g_q8_f16_partner_phase_audit_max_occurrences);
     fflush(stderr);
     (void)fsync(fileno(stderr));
     return true;
@@ -6795,6 +6841,11 @@ extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
     g_q8_f16_partner_result_bytes.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_f16_result_offloads.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_execution_suppressed.store(0, std::memory_order_relaxed);
+    g_q8_f16_partner_phase_audit_sequence.store(0, std::memory_order_relaxed);
+    g_q8_f16_partner_phase_audit_selected_occurrence.store(
+        0, std::memory_order_relaxed);
+    g_q8_f16_partner_phase_audit_skip_occurrences = 0u;
+    g_q8_f16_partner_phase_audit_max_occurrences = 0u;
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
 }
@@ -6856,14 +6907,22 @@ extern "C" void ds4_gpu_q8_f16_plan_end(void) {
         const char *phase_audit_pairs = getenv(
             "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
         cuda_q8_f16_partner_phase_audit_expectation expected = {};
+        uint64_t skip_occurrences = 0u;
+        uint64_t max_occurrences = 0u;
         if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
                 phase_audit_pairs, g_n_gpus, true) ||
             !cuda_q8_f16_partner_phase_audit_expectation_load(&expected) ||
+            !cuda_q8_f16_partner_phase_audit_occurrence_policy_load(
+                &skip_occurrences, &max_occurrences) ||
             !cuda_q8_f16_partner_phase_audit_targets_match_plan(
                 phase_audit_targets, phase_audit_pairs, expected)) {
             fflush(stderr);
             abort();
         }
+        g_q8_f16_partner_phase_audit_skip_occurrences = skip_occurrences;
+        g_q8_f16_partner_phase_audit_max_occurrences = max_occurrences;
+        g_q8_f16_partner_phase_audit_selected_occurrence.store(
+            0, std::memory_order_relaxed);
     }
     g_q8_f16_plan_finalized = 1;
     fprintf(stderr,
@@ -16695,7 +16754,8 @@ static int cuda_q8_f16_sync_home_for_fallback(
 static void cuda_q8_f16_partner_host_bounce_failure_log(
         const char *class_name, int src_tier, int dst_tier,
         uint64_t bytes, uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
-        const char *label) {
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset) {
     const int src_device = src_tier >= 0 && src_tier < g_n_gpus
         ? g_gpu[src_tier].device_id : -1;
     const int dst_device = dst_tier >= 0 && dst_tier < g_n_gpus
@@ -16704,11 +16764,40 @@ static void cuda_q8_f16_partner_host_bounce_failure_log(
             "ds4: CUDA q8 partner host-bounce failure class=%s stage=copy "
             "source_tier=%d source_device=%d destination_tier=%d "
             "destination_device=%d bytes=%llu tokens=%llu in=%llu out=%llu "
-            "label=%s\n",
+            "binding_label=%s passed_label=%s weight_offset=%llu\n",
             class_name, src_tier, src_device, dst_tier, dst_device,
             (unsigned long long)bytes, (unsigned long long)n_tok,
             (unsigned long long)in_dim, (unsigned long long)out_dim,
-            label && label[0] ? label : "q8_0");
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "q8_0",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static void cuda_q8_f16_partner_phase_audit_selection_log(
+        uint64_t occurrence, uint64_t sequence,
+        const char *binding_label, uint64_t weight_offset) {
+    fprintf(stderr,
+            "ds4: CUDA q8 partner phase audit selected occurrence=%llu "
+            "sequence=%llu binding_label=%s weight_offset=%llu\n",
+            (unsigned long long)occurrence,
+            (unsigned long long)sequence,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+}
+
+static void cuda_q8_f16_partner_phase_audit_skip_log(
+        uint64_t occurrence, const char *binding_label,
+        uint64_t weight_offset) {
+    fprintf(stderr,
+            "ds4: CUDA q8 partner phase audit skipped occurrence=%llu "
+            "binding_label=%s weight_offset=%llu\n",
+            (unsigned long long)occurrence,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            (unsigned long long)weight_offset);
     fflush(stderr);
     (void)fsync(fileno(stderr));
 }
@@ -16879,9 +16968,11 @@ static int cuda_q8_f16_partner_matmul_impl(
         phase_audit_pair = cuda_q8_f16_partner_phase_audit_pair_selected(
             phase_audit_pair_list, g_n_gpus, home_tier);
     }
-    const bool phase_audit_call = phase_audit_pair &&
+    const bool phase_audit_selected = phase_audit_pair &&
         cuda_q8_f16_partner_phase_audit_binding_selected(
             binding->label, weight_offset);
+    uint64_t phase_audit_occurrence = 0u;
+    bool phase_audit_call = false;
     if (force_host_bounce || serialize_pair) {
         static std::atomic<uint32_t> logged_bounce_mask = 0u;
         static std::atomic<uint32_t> logged_serialize_mask = 0u;
@@ -17035,6 +17126,27 @@ static int cuda_q8_f16_partner_matmul_impl(
         binding->partner_offload = 0;
         return 0;
     }
+    /* Count only calls that passed every partner-binding, arithmetic, range,
+     * device, overflow, and scratch viability check.  A failed diagnostic
+     * precondition must not consume the occurrence selected for fencing. */
+    if (phase_audit_selected) {
+        phase_audit_occurrence =
+            g_q8_f16_partner_phase_audit_selected_occurrence.fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+        if (phase_audit_occurrence <=
+                g_q8_f16_partner_phase_audit_skip_occurrences) {
+            cuda_q8_f16_partner_phase_audit_skip_log(
+                phase_audit_occurrence, binding->label, weight_offset);
+        }
+        phase_audit_call = phase_audit_occurrence >
+            g_q8_f16_partner_phase_audit_skip_occurrences;
+        if (phase_audit_call &&
+            g_q8_f16_partner_phase_audit_max_occurrences != 0u) {
+            phase_audit_call = phase_audit_occurrence -
+                g_q8_f16_partner_phase_audit_skip_occurrences <=
+                    g_q8_f16_partner_phase_audit_max_occurrences;
+        }
+    }
     unsigned char *home_scratch =
         (unsigned char *)g_gpu[home_tier].scratch;
     unsigned char *partner_scratch =
@@ -17067,6 +17179,12 @@ static int cuda_q8_f16_partner_matmul_impl(
               1u, std::memory_order_relaxed) + 1u
         : 0u;
     if (phase_audit_call) {
+        if (g_q8_f16_partner_phase_audit_skip_occurrences != 0u ||
+            g_q8_f16_partner_phase_audit_max_occurrences != 0u) {
+            cuda_q8_f16_partner_phase_audit_selection_log(
+                phase_audit_occurrence, phase_audit_sequence,
+                binding->label, weight_offset);
+        }
         cuda_q8_f16_partner_phase_audit_log(
             phase_audit_sequence, "begin", "activation-prepare",
             binding->label, label, weight_offset,
@@ -17146,7 +17264,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         if (force_host_bounce) {
             cuda_q8_f16_partner_host_bounce_failure_log(
                 "activation", home_tier, partner_tier,
-                activation_transfer_bytes, n_tok, in_dim, out_dim, label);
+                activation_transfer_bytes, n_tok, in_dim, out_dim,
+                binding->label, label, weight_offset);
         }
         return cuda_q8_f16_sync_home_for_fallback(
                    home_tier, "activation peer copy") < 0 ? -1 : 0;
@@ -17359,7 +17478,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         if (force_host_bounce) {
             cuda_q8_f16_partner_host_bounce_failure_log(
                 "result-gather", partner_tier, home_tier,
-                result_bytes, n_tok, in_dim, out_dim, label);
+                result_bytes, n_tok, in_dim, out_dim,
+                binding->label, label, weight_offset);
         }
         /* Make a subsequent native-Q8 overwrite race-free even if the peer
          * copy failed after the partner GEMM had already been submitted. */

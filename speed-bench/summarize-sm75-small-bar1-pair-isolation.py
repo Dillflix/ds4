@@ -12,7 +12,7 @@ from pathlib import Path
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
     "attention-q8-phase-audit", "attention-q8-targeted-phase-audit",
-    "attention-q8-l14-l15-phase-audit",
+    "attention-q8-l14-l15-phase-audit", "attention-q8-l12-phase-audit",
     "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
@@ -23,6 +23,8 @@ Q8_WINDOW_L14_LABEL = "tensor:blk.14.attn_output_b.weight"
 Q8_WINDOW_L14_OFFSET = "143571266304"
 Q8_WINDOW_L15_LABEL = "tensor:blk.15.attn_output_b.weight"
 Q8_WINDOW_L15_OFFSET = "143723876608"
+Q8_L12_LABEL = "tensor:blk.12.attn_output_b.weight"
+Q8_L12_OFFSET = "143236281600"
 Q8_WINDOW_TARGETS = {
     Q8_WINDOW_L14_LABEL: Q8_WINDOW_L14_OFFSET,
     Q8_WINDOW_L15_LABEL: Q8_WINDOW_L15_OFFSET,
@@ -180,7 +182,14 @@ def q8_partner_phase_audit_markers(
     )
     markers: list[dict[str, str]] = []
     lines = text.splitlines()
+    run_phase = "startup"
     for index, line in enumerate(lines):
+        if "starting untimed CUDA warm-up frontier" in line:
+            run_phase = "warmup"
+        elif "completed untimed CUDA warm-up frontier" in line:
+            run_phase = "post-warmup"
+        elif "prefill fault breadcrumb event=chunk-begin" in line:
+            run_phase = "measured-prefill"
         match = pattern.search(line)
         if not match:
             continue
@@ -193,6 +202,7 @@ def q8_partner_phase_audit_markers(
         marker = dict(zip(fields, match.groups()))
         if pair is not None and marker["home_tier"] != str(pair):
             continue
+        marker["run_phase"] = run_phase
         marker["cuda_phase"] = ""
         if index > 0:
             phase_match = re.search(
@@ -203,6 +213,92 @@ def q8_partner_phase_audit_markers(
                 marker["cuda_phase"] = phase_match.group(1)
         markers.append(marker)
     return markers
+
+
+def q8_partner_phase_audit_occurrence_records(
+        text: str) -> list[dict[str, str]]:
+    pattern = re.compile(
+        r"q8 partner phase audit (skipped|selected) occurrence=(\d+) "
+        r"(?:sequence=(\d+) )?binding_label=(\S+) weight_offset=(\d+)"
+    )
+    records: list[dict[str, str]] = []
+    run_phase = "startup"
+    for line in text.splitlines():
+        if "starting untimed CUDA warm-up frontier" in line:
+            run_phase = "warmup"
+        elif "completed untimed CUDA warm-up frontier" in line:
+            run_phase = "post-warmup"
+        elif "prefill fault breadcrumb event=chunk-begin" in line:
+            run_phase = "measured-prefill"
+        match = pattern.search(line)
+        if not match:
+            continue
+        disposition, occurrence, sequence, binding_label, weight_offset = (
+            match.groups()
+        )
+        records.append({
+            "disposition": disposition,
+            "occurrence": occurrence,
+            "sequence": sequence or "",
+            "binding_label": binding_label,
+            "weight_offset": weight_offset,
+            "run_phase": run_phase,
+        })
+    return records
+
+
+def format_q8_partner_phase_audit_occurrence(
+        record: dict[str, str]) -> str:
+    sequence = (
+        f" sequence={record['sequence']}" if record.get("sequence") else ""
+    )
+    return (
+        f"disposition={record['disposition']} "
+        f"occurrence={record['occurrence']}{sequence} "
+        f"binding_label={record['binding_label']} "
+        f"weight_offset={record['weight_offset']} "
+        f"run_phase={record['run_phase']}"
+    )
+
+
+def q8_partner_phase_audit_occurrence_summary(
+        text: str, disposition: str) -> str:
+    records = [
+        record for record in q8_partner_phase_audit_occurrence_records(text)
+        if record["disposition"] == disposition
+    ]
+    return (
+        format_q8_partner_phase_audit_occurrence(records[-1])
+        if records else ""
+    )
+
+
+def q8_l12_occurrence_mapping_state(text: str) -> str:
+    records = q8_partner_phase_audit_occurrence_records(text)
+    if not records:
+        return "not-observed"
+    if len(records) != 2:
+        return f"invalid-record-count:{len(records)}"
+    skipped, selected = records
+    if (
+            skipped == {
+                "disposition": "skipped",
+                "occurrence": "1",
+                "sequence": "",
+                "binding_label": Q8_L12_LABEL,
+                "weight_offset": Q8_L12_OFFSET,
+                "run_phase": "warmup",
+            } and
+            selected == {
+                "disposition": "selected",
+                "occurrence": "2",
+                "sequence": "1",
+                "binding_label": Q8_L12_LABEL,
+                "weight_offset": Q8_L12_OFFSET,
+                "run_phase": "measured-prefill",
+            }):
+        return "verified"
+    return "invalid-order-phase-or-identity"
 
 
 def q8_partner_phase_audit_window_marker_state(
@@ -270,12 +366,22 @@ def q8_partner_phase_audit_window_summary(
             marker["weight_offset"] == Q8_WINDOW_TARGETS[
                 marker["binding_label"]])
     ]
+    measured_started = "prefill fault breadcrumb event=chunk-begin" in text
+    measured_markers = [
+        marker for marker in exact_markers
+        if marker.get("run_phase") == "measured-prefill"
+    ]
+    analysis_markers = measured_markers if measured_started else exact_markers
     failure_events = {
         "activation-copy-failed", "pre-compute-sync-failed",
         "compute-submit-failed", "compute-sync-failed",
         "result-copy-failed", "home-restore-failed",
     }
     complete_markers = [
+        marker for marker in analysis_markers
+        if marker["event"] == "result-complete"
+    ]
+    all_complete_markers = [
         marker for marker in exact_markers
         if marker["event"] == "result-complete"
     ]
@@ -286,20 +392,34 @@ def q8_partner_phase_audit_window_summary(
         }
         for label in Q8_WINDOW_TARGETS
     }
+    all_complete_sequences = {
+        label: {
+            marker["sequence"] for marker in all_complete_markers
+            if marker["binding_label"] == label
+        }
+        for label in Q8_WINDOW_TARGETS
+    }
     last_complete = (
-        format_q8_partner_phase_audit_marker(complete_markers[-1])
-        if complete_markers else ""
+        format_q8_partner_phase_audit_marker(all_complete_markers[-1])
+        if all_complete_markers else ""
     )
     first_failure_index = next((
-        index for index, marker in enumerate(exact_markers)
+        index for index, marker in enumerate(analysis_markers)
         if marker["event"] in failure_events
     ), None)
     first_failure = (
-        exact_markers[first_failure_index]
+        analysis_markers[first_failure_index]
         if first_failure_index is not None else {}
     )
     classification = "inconclusive"
-    if first_failure:
+    if measured_started and not measured_markers:
+        warmup_completed = {
+            marker["binding_label"] for marker in all_complete_markers
+            if marker.get("run_phase") == "warmup"
+        }
+        if warmup_completed == set(Q8_WINDOW_TARGETS):
+            classification = "measured-target-window-not-reached"
+    elif first_failure:
         binding = first_failure["binding_label"]
         event = first_failure["event"]
         if binding == Q8_WINDOW_L14_LABEL:
@@ -320,7 +440,7 @@ def q8_partner_phase_audit_window_summary(
                     else "layer14-result-copy-after-compute"
                 )
         else:
-            prior_markers = exact_markers[:first_failure_index]
+            prior_markers = analysis_markers[:first_failure_index]
             l15_started = {
                 marker["sequence"] for marker in prior_markers
                 if (marker["binding_label"] == Q8_WINDOW_L15_LABEL and
@@ -356,8 +476,8 @@ def q8_partner_phase_audit_window_summary(
                 )
             else:
                 classification = "layer15-recovery-failure-after-layer14"
-    elif exact_markers and exact_markers[-1]["event"] != "result-complete":
-        if exact_markers[-1]["binding_label"] == Q8_WINDOW_L14_LABEL:
+    elif analysis_markers and analysis_markers[-1]["event"] != "result-complete":
+        if analysis_markers[-1]["binding_label"] == Q8_WINDOW_L14_LABEL:
             classification = (
                 "layer14-partial-after-prior-completion"
                 if complete_markers else "layer14-partial-no-completion"
@@ -375,8 +495,8 @@ def q8_partner_phase_audit_window_summary(
         classification = "both-targets-complete"
     return (
         last_complete,
-        str(len(complete_sequences[Q8_WINDOW_L14_LABEL])),
-        str(len(complete_sequences[Q8_WINDOW_L15_LABEL])),
+        str(len(all_complete_sequences[Q8_WINDOW_L14_LABEL])),
+        str(len(all_complete_sequences[Q8_WINDOW_L15_LABEL])),
         classification,
     )
 
@@ -386,6 +506,9 @@ def format_q8_partner_phase_audit_marker(marker: dict[str, str]) -> str:
         return ""
     cuda_phase = (
         f" cuda_phase={marker['cuda_phase']}" if marker.get("cuda_phase") else ""
+    )
+    run_phase = (
+        f" run_phase={marker['run_phase']}" if marker.get("run_phase") else ""
     )
     return (
         f"sequence={marker['sequence']} event={marker['event']} "
@@ -398,8 +521,17 @@ def format_q8_partner_phase_audit_marker(marker: dict[str, str]) -> str:
         f"in={marker['in']} out={marker['out']} "
         f"transfer_bytes={marker['transfer_bytes']} "
         f"result_bytes={marker['result_bytes']}"
+        f"{run_phase}"
         f"{cuda_phase} cuda_error={marker['cuda_error']}"
     )
+
+
+def first_gpu_layer_failure(text: str) -> str:
+    match = re.search(r"ds4: gpu layer (\d+) ([^\n]+?) failed(?:\n|$)", text)
+    if not match:
+        return ""
+    operation = re.sub(r"\s+", "-", match.group(2).strip())
+    return f"layer={match.group(1)} operation={operation}"
 
 
 def q8_partner_phase_audit_summary(
@@ -695,6 +827,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_l14_l15_phase_audit = outcomes.get(
         "attention-q8-l14-l15-phase-audit", "not-run"
     )
+    attention_q8_l12_phase_audit = outcomes.get(
+        "attention-q8-l12-phase-audit", "not-run"
+    )
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -753,6 +888,17 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         row for row in attention_q8_l14_l15_phase_audit_rows
         if row.get("status") not in {"passed", "completed-no-result"}
     ]
+    attention_q8_l12_phase_audit_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-l12-phase-audit"
+    ]
+    attention_q8_l12_phase_audit_problem_rows = [
+        row for row in attention_q8_l12_phase_audit_rows
+        if row.get("status") not in {"passed", "completed-no-result"}
+    ]
+
+    def l12_occurrence_mapping_verified(row: dict[str, str]) -> bool:
+        return row.get("q8_phase_audit_occurrence_mapping") == "verified"
 
     def measured_host_bounce_checkpoint(row: dict[str, str]) -> bool:
         checkpoint = row.get("attention_host_bounce_checkpoint", "")
@@ -1106,6 +1252,116 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
         )
+    if attention_q8_l12_phase_audit == "passed":
+        if not any(
+                l12_occurrence_mapping_verified(row)
+                for row in attention_q8_l12_phase_audit_rows):
+            return (
+                "The layer-12 arm reports completion, but its durable records do "
+                "not prove warmup occurrence 1 was skipped and measured occurrence "
+                "2 was selected. Treat the result as validation-inconsistent rather "
+                "than as survival of the intended first measured target."
+            )
+        return (
+            "The exact occurrence-2 layer-12 audit completed at full production "
+            "load with a healthy post-run snapshot. Its clean pre-compute, compute, "
+            "and result-gather boundaries show that this narrowly fenced first "
+            "measured call can survive; they do not prove the unfenced production "
+            "overlap is safe or that layer 12 cannot contribute a delayed physical "
+            "effect."
+        )
+    if attention_q8_l12_phase_audit == "invalid":
+        return (
+            "The exact occurrence-2 layer-12 arm failed environment, production-"
+            "path, tuple, occurrence, or marker validation. It is invalid for causal "
+            "inference; inspect the missing hard gate before another GPU run."
+        )
+    if attention_q8_l12_phase_audit == "underloaded":
+        return (
+            "The exact occurrence-2 layer-12 arm completed below the required "
+            "production-load floor. It cannot be used to exclude the full-load "
+            "trigger."
+        )
+    if attention_q8_l12_phase_audit in {"failed", "incomplete"}:
+        problem_rows = attention_q8_l12_phase_audit_problem_rows
+        corroborated = [
+            row for row in problem_rows
+            if (
+                row.get("status") in {
+                    "failed-device-loss", "interrupted-prior-run-device-loss",
+                    "interrupted-no-result-device-loss",
+                } or row.get("watch_status") == "lost-device-detected" or
+                row.get("post_health") == "unhealthy"
+            )
+        ]
+        if not corroborated:
+            return (
+                "The layer-12 occurrence-gated arm ended without an independent "
+                "lost-device watcher record or unhealthy post-run snapshot. Its "
+                "last marker is retained, but the result is not causal GPU-loss "
+                "evidence. It was configured to skip warmup occurrence 1 and select "
+                "measured occurrence 2, but configuration is not proof that the "
+                "target was reached."
+                + indexer_observation(problem_rows)
+            )
+        row = corroborated[-1]
+        if not l12_occurrence_mapping_verified(row):
+            return (
+                "Device loss is independently corroborated, but the durable log "
+                "does not prove both the warmup skip and the measured occurrence-2 "
+                "selection for the exact layer-12 tuple. Do not assign the loss to "
+                "that target or interpret any unverified phase marker as the first "
+                "measured call."
+                + indexer_observation(problem_rows)
+            )
+        scope = (
+            " The durable ordering proves occurrence 1 was the skipped warmup call "
+            "and occurrence 2 was the first measured call of exact tuple "
+            "`tensor:blk.12.attn_output_b.weight@143236281600`; pair-0 attention "
+            "and Q8 payloads remain host-bounced, the 50/50 row split and all "
+            "partner compute remain enabled, and pair 1 remains direct."
+            + indexer_observation(problem_rows)
+        )
+        classification = row.get("q8_phase_audit_classification", "")
+        checkpoint = row.get("q8_phase_audit_last_checkpoint", "")
+        if classification == "pre-target-partner-error":
+            return (
+                "The first measured layer-12 target reached its activation-copy "
+                "boundary, but the partner pre-compute synchronization found an "
+                "already-pending CUDA error. This excludes layer-12 Q8 compute and "
+                "its result gather as the operation that first created that pending "
+                "error; earlier or concurrent layer-12 attention/partner work remains "
+                "inside the trigger window." + scope
+            )
+        if classification == "target-compute-or-concurrent-partner-work":
+            return (
+                "The layer-12 partner pre-compute boundary was clean and its Q8 "
+                "projection was submitted, but the post-compute synchronization "
+                "failed. The first synchronous error lies in that compute interval "
+                "or concurrent partner work, before the result gather." + scope
+            )
+        if classification.startswith("result-"):
+            return (
+                "The exact layer-12 Q8 compute completed behind a clean partner "
+                "synchronization before CUDA first reported failure in the result "
+                "host-bounce path. This sharply separates the projection from the "
+                "first observed copy boundary, but does not prove that the transfer "
+                "electrically initiated the endpoint loss." + scope
+            )
+        if "event=result-complete" in checkpoint:
+            return (
+                "The exact first measured layer-12 activation, pre-compute boundary, "
+                "Q8 compute, and result gather all completed before the pair later "
+                "became unhealthy. The failure moved past this narrowly fenced call; "
+                "a delayed physical effect or different concurrent work remains in "
+                "scope." + scope
+            )
+        return (
+            "The exact first measured layer-12 arm lost the pair without a complete "
+            "classified phase-failure marker. Preserve its final durable checkpoint "
+            "as the observation boundary instead of assigning the fault to the "
+            "result-copy line." + scope
+        )
     if attention_q8_l14_l15_phase_audit in {"failed", "incomplete"}:
         problem_rows = attention_q8_l14_l15_phase_audit_problem_rows
         corroborated_problem_rows = [
@@ -1230,6 +1486,23 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "instrumented window, arguing against one unique layer-14 or layer-15 "
                 "binding defect; a cumulative workload/overlap trigger or delayed "
                 "physical effect remains possible."
+                + window_scope
+            )
+        if classification == "measured-target-window-not-reached":
+            first_layer = classified_row.get("first_gpu_layer_failure", "")
+            layer_note = (
+                f" The first engine failure was `{first_layer}`."
+                if first_layer else ""
+            )
+            return (
+                "Both exact layer-14/layer-15 chains completed only during the "
+                "512-token warmup. The measured 32K pipeline then failed before its "
+                "first layer-14 marker, so the earlier summary's claim that failure "
+                "moved downstream of the instrumented window was incorrect."
+                + layer_note +
+                " The measured target window was never reached; this result instead "
+                "supports phase/scheduling or cumulative-state dependence and "
+                "requires bracketing the earlier measured layer-12 boundary."
                 + window_scope
             )
         if classification.startswith("layer14-partial-"):
@@ -1990,6 +2263,16 @@ def main() -> None:
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
+            "q8_phase_audit_skipped_occurrence": (
+                q8_partner_phase_audit_occurrence_summary(log_text, "skipped")
+            ),
+            "q8_phase_audit_selected_occurrence": (
+                q8_partner_phase_audit_occurrence_summary(log_text, "selected")
+            ),
+            "q8_phase_audit_occurrence_mapping": (
+                q8_l12_occurrence_mapping_state(log_text)
+                if variant == "attention-q8-l12-phase-audit" else ""
+            ),
             "q8_window_last_complete": q8_window_last_complete,
             "q8_window_l14_complete": q8_window_l14_complete,
             "q8_window_l15_complete": q8_window_l15_complete,
@@ -2009,6 +2292,7 @@ def main() -> None:
             "host_bounce_failure_context": (
                 first_host_bounce_failure_context(log_text)
             ),
+            "first_gpu_layer_failure": first_gpu_layer_failure(log_text),
             "attention_phase_audit_last": last_attention_phase_audit(log_text),
             "attention_end_fence_last": last_attention_end_fence(log_text),
             "attention_entry_fence_last": last_attention_entry_fence(log_text),
@@ -2058,16 +2342,19 @@ def main() -> None:
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
-        "Q8 phase classification | Q8 window last complete | "
+        "Q8 phase classification | Q8 skipped occurrence | "
+        "Q8 selected occurrence | Q8 occurrence mapping | "
+        "Q8 window last complete | "
         "Q8 window L14 complete | Q8 window L15 complete | "
         "Q8 window classification | "
+        "First GPU-layer failure | "
         "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
         "Query copy transport | Gather copy transport | Cache copy transport | "
         "Top-k copy transport | Host-bounce checkpoint | Host-bounce failure context | "
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -2079,10 +2366,14 @@ def main() -> None:
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
             f"{row.get('q8_phase_audit_classification', '')} | "
+            f"{row.get('q8_phase_audit_skipped_occurrence', '')} | "
+            f"{row.get('q8_phase_audit_selected_occurrence', '')} | "
+            f"{row.get('q8_phase_audit_occurrence_mapping', '')} | "
             f"{row.get('q8_window_last_complete', '')} | "
             f"{row.get('q8_window_l14_complete', '0')} | "
             f"{row.get('q8_window_l15_complete', '0')} | "
             f"{row.get('q8_window_classification', '')} | "
+            f"{row.get('first_gpu_layer_failure', '')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('pair0_attention_query_copy_schedule', '')} | "
             f"{row.get('pair0_attention_gather_copy_schedule', '')} | "
