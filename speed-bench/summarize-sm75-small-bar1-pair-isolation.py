@@ -11,7 +11,8 @@ from pathlib import Path
 
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
-    "attention-q8-async-completion", "attention-q8-phase-audit",
+    "attention-q8-pre-gather-fence", "attention-q8-async-completion",
+    "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
     "attention-q8-l14-l15-phase-audit", "attention-q8-l12-phase-audit",
     "attention-query-dst", "attention-gather-dst",
@@ -192,8 +193,8 @@ def q8_partner_async_completion_records(
     }
     prefix = prefixes[kind]
     return [
-        record for line in text.splitlines()
-        if (record := _kv_record(line, prefix))
+        _kv_record(line, prefix) for line in text.splitlines()
+        if prefix in line
     ]
 
 
@@ -399,6 +400,656 @@ def q8_partner_async_completion_summary(
         summary.get("submitted", failure.get("submitted", "")),
         summary.get("confirmed", failure.get("confirmed", "")),
         summary.get("partners_synchronized", ""),
+    )
+
+
+def q8_partner_pre_gather_fence_records(
+        text: str, kind: str) -> list[dict[str, str]]:
+    prefixes = {
+        "checkpoint": "q8 partner pre-gather fence checkpoint ",
+        "failure": "q8 partner pre-gather fence failure ",
+    }
+    prefix = prefixes[kind]
+    return [
+        record for line in text.splitlines()
+        if (record := _kv_record(line, prefix))
+    ]
+
+
+def q8_partner_pre_gather_fence_enabled(text: str, pair: int = 0) -> bool:
+    return (
+        "CUDA q8 partner pre-gather fence audit enabled: "
+        f"logical_pairs={pair} boundary=post-marker-event-sync "
+        "marker=exact-before-result-d2h"
+    ) in text
+
+
+def q8_partner_pre_gather_armed_records(text: str) -> list[dict[str, str]]:
+    prefix = "q8 partner pre-gather armed "
+    return [
+        _kv_record(line, prefix) for line in text.splitlines()
+        if prefix in line
+    ]
+
+
+def q8_partner_pre_gather_armed_record_valid(
+        record: dict[str, str]) -> bool:
+    required = {
+        "current_sequence", "marker_sequence", "marker_complement",
+        "home_tier", "home_device", "partner_tier", "partner_device",
+    }
+    if any(not record.get(key) for key in required):
+        return False
+    if (record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1"):
+        return False
+    current = _q8_u64(record, "current_sequence")
+    marker_sequence = _q8_u64(record, "marker_sequence")
+    marker_complement = _q8_u64(record, "marker_complement")
+    if current is None or marker_sequence is None or marker_complement is None:
+        return False
+    return (
+        current > 0 and marker_sequence == current and
+        marker_complement == ((~current) & Q8_UINT64_MASK)
+    )
+
+
+def q8_partner_pre_gather_armed_sequence_state(
+        records: list[dict[str, str]]) -> str:
+    if not records:
+        return "armed-count:0"
+    if any(not q8_partner_pre_gather_armed_record_valid(record)
+           for record in records):
+        return "invalid-armed-record"
+    sequences = [
+        _q8_u64(record, "current_sequence") for record in records
+    ]
+    if sequences != list(range(1, len(records) + 1)):
+        return "armed-sequence-mismatch"
+    return "complete"
+
+
+def format_q8_partner_pre_gather_armed_record(
+        record: dict[str, str]) -> str:
+    if not record:
+        return ""
+    keys = (
+        "current_sequence", "marker_sequence", "marker_complement",
+        "home_tier", "home_device", "partner_tier", "partner_device",
+    )
+    return " ".join(f"{key}={record.get(key, '')}" for key in keys)
+
+
+def q8_partner_pre_gather_returned_records(text: str) -> list[dict[str, str]]:
+    prefix = "q8 partner pre-gather returned "
+    return [
+        _kv_record(line, prefix) for line in text.splitlines()
+        if prefix in line
+    ]
+
+
+def q8_partner_pre_gather_returned_record_valid(
+        record: dict[str, str]) -> bool:
+    required = {
+        "current_sequence", "result_gather_status", "home_tier",
+        "home_device", "partner_tier", "partner_device",
+    }
+    if any(not record.get(key) for key in required):
+        return False
+    if (record["result_gather_status"] != "success" or
+            record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1"):
+        return False
+    current = _q8_u64(record, "current_sequence")
+    return current is not None and current > 0
+
+
+def format_q8_partner_pre_gather_returned_record(
+        record: dict[str, str]) -> str:
+    if not record:
+        return ""
+    keys = (
+        "current_sequence", "result_gather_status", "home_tier",
+        "home_device", "partner_tier", "partner_device",
+    )
+    return " ".join(f"{key}={record.get(key, '')}" for key in keys)
+
+
+def q8_partner_pre_gather_call_sequence_state(text: str) -> str:
+    armed = q8_partner_pre_gather_armed_records(text)
+    returned = q8_partner_pre_gather_returned_records(text)
+    if not armed and not returned:
+        return "empty"
+    armed_state = q8_partner_pre_gather_armed_sequence_state(armed)
+    if armed_state != "complete":
+        return armed_state
+    if any(not q8_partner_pre_gather_returned_record_valid(record)
+           for record in returned):
+        return "invalid-returned-record"
+    returned_sequences = [
+        _q8_u64(record, "current_sequence") for record in returned
+    ]
+    if returned_sequences != list(range(1, len(returned) + 1)):
+        return "returned-sequence-mismatch"
+    if len(returned) > len(armed) or len(armed) - len(returned) > 1:
+        return "armed-returned-count-mismatch"
+
+    observed: list[tuple[str, int | None]] = []
+    armed_prefix = "q8 partner pre-gather armed "
+    returned_prefix = "q8 partner pre-gather returned "
+    for line in text.splitlines():
+        if armed_prefix in line:
+            record = _kv_record(line, armed_prefix)
+            observed.append(("armed", _q8_u64(record, "current_sequence")))
+        elif returned_prefix in line:
+            record = _kv_record(line, returned_prefix)
+            observed.append(("returned", _q8_u64(record, "current_sequence")))
+    expected: list[tuple[str, int]] = []
+    for sequence in range(1, len(returned) + 1):
+        expected.extend((("armed", sequence), ("returned", sequence)))
+    if len(armed) > len(returned):
+        expected.append(("armed", len(armed)))
+    if observed != expected:
+        return "armed-returned-order-mismatch"
+    return "complete"
+
+
+def q8_partner_pre_gather_checkpoint_sequence_state(
+        text: str, armed_count: int) -> str:
+    checkpoints = q8_partner_pre_gather_fence_records(text, "checkpoint")
+    if any(
+            q8_partner_pre_gather_fence_record_classification(
+                record, "checkpoint"
+            ) == "invalid-fence-record"
+            for record in checkpoints):
+        return "invalid-checkpoint-record"
+    sequences = [
+        _q8_u64(record, "current_sequence") for record in checkpoints
+    ]
+    expected: list[int] = []
+    if armed_count > 0:
+        expected.append(1)
+        expected.extend(range(64, armed_count + 1, 64))
+    next_sequence = armed_count + 1
+    trailing_allowed = next_sequence == 1 or next_sequence % 64 == 0
+    trailing = trailing_allowed and sequences == expected + [next_sequence]
+    if sequences != expected and not trailing:
+        return "checkpoint-cadence-mismatch"
+
+    checkpoint_prefix = "q8 partner pre-gather fence checkpoint "
+    armed_prefix = "q8 partner pre-gather armed "
+    checkpoint_positions: dict[int, int] = {}
+    armed_positions: dict[int, int] = {}
+    returned_positions: dict[int, int] = {}
+    returned_prefix = "q8 partner pre-gather returned "
+    for index, line in enumerate(text.splitlines()):
+        if checkpoint_prefix in line:
+            record = _kv_record(line, checkpoint_prefix)
+            sequence = _q8_u64(record, "current_sequence")
+            if sequence is not None:
+                checkpoint_positions[sequence] = index
+        elif armed_prefix in line:
+            record = _kv_record(line, armed_prefix)
+            sequence = _q8_u64(record, "current_sequence")
+            if sequence is not None:
+                armed_positions[sequence] = index
+        elif returned_prefix in line:
+            record = _kv_record(line, returned_prefix)
+            sequence = _q8_u64(record, "current_sequence")
+            if sequence is not None:
+                returned_positions[sequence] = index
+    if any(
+            sequence not in armed_positions or
+            checkpoint_positions.get(sequence, -1) >= armed_positions[sequence] or
+            (sequence > 1 and
+             checkpoint_positions.get(sequence, -1) <=
+             returned_positions.get(sequence - 1, -1))
+            for sequence in expected):
+        return "checkpoint-order-mismatch"
+    if trailing:
+        trailing_position = checkpoint_positions.get(next_sequence, -1)
+        if (trailing_position < 0 or
+                (armed_count > 0 and trailing_position <=
+                 returned_positions.get(armed_count, -1)) or
+                next_sequence in armed_positions):
+            return "checkpoint-order-mismatch"
+        return "complete-trailing-checkpoint"
+    return "complete"
+
+
+def q8_partner_pre_gather_failure_order_valid(text: str) -> bool:
+    failure_prefix = "q8 partner pre-gather fence failure "
+    evidence_prefixes = (
+        "q8 partner pre-gather armed ",
+        "q8 partner pre-gather returned ",
+    )
+    lines = text.splitlines()
+    failure_positions = [
+        index for index, line in enumerate(lines) if failure_prefix in line
+    ]
+    if len(failure_positions) != 1:
+        return False
+    evidence_positions = [
+        index for index, line in enumerate(lines)
+        if any(prefix in line for prefix in evidence_prefixes)
+    ]
+    return not evidence_positions or failure_positions[0] > max(evidence_positions)
+
+
+def q8_partner_pre_gather_fence_record_classification(
+        record: dict[str, str], kind: str) -> str:
+    required = {
+        "event", "stage", "current_sequence", "marker_sequence",
+        "marker_complement", "marker_matches", "event_status",
+        "result_d2h_attempted", "result_d2h_completed",
+        "result_h2d_attempted", "result_h2d_completed", "interpretation",
+        "attempted",
+        "confirmed", "failed", "result_gather_failed_after_confirmed",
+        "home_tier", "home_device", "partner_tier", "partner_device",
+        "tokens", "in", "out", "binding_label", "passed_label",
+        "weight_offset",
+    }
+    if any(not record.get(key) for key in required):
+        return "invalid-fence-record"
+    if (record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1" or
+            record["binding_label"] == "unavailable" or
+            record["passed_label"] == "unavailable"):
+        return "invalid-fence-record"
+    numeric_keys = (
+        "current_sequence", "marker_sequence", "marker_complement",
+        "attempted", "confirmed", "failed",
+        "result_gather_failed_after_confirmed", "tokens", "in", "out",
+        "weight_offset",
+    )
+    values = {key: _q8_u64(record, key) for key in numeric_keys}
+    if any(value is None for value in values.values()):
+        return "invalid-fence-record"
+    current = values["current_sequence"]
+    marker_sequence = values["marker_sequence"]
+    marker_complement = values["marker_complement"]
+    attempted = values["attempted"]
+    confirmed = values["confirmed"]
+    failed = values["failed"]
+    gather_failed = values["result_gather_failed_after_confirmed"]
+    assert current is not None and marker_sequence is not None
+    assert marker_complement is not None and attempted is not None
+    assert confirmed is not None and failed is not None
+    assert gather_failed is not None
+    if any(values[key] == 0 for key in ("tokens", "in", "out")):
+        return "invalid-fence-record"
+    if (current == 0 or attempted == 0 or confirmed > attempted or
+            failed > attempted or gather_failed > attempted):
+        return "invalid-fence-record"
+    marker_valid = (
+        marker_sequence == current and
+        marker_complement == ((~current) & Q8_UINT64_MASK)
+    )
+    if record["marker_matches"] not in {"yes", "no"}:
+        return "invalid-fence-record"
+    if (record["marker_matches"] == "yes") != marker_valid:
+        return "invalid-fence-record"
+
+    event = record["event"]
+    stage = record["stage"]
+    event_status = record["event_status"]
+    d2h_attempted = record["result_d2h_attempted"]
+    d2h_completed = record["result_d2h_completed"]
+    h2d_attempted = record["result_h2d_attempted"]
+    h2d_completed = record["result_h2d_completed"]
+    interpretation = record["interpretation"]
+    if any(value not in {"yes", "no"} for value in (
+            d2h_attempted, d2h_completed, h2d_attempted, h2d_completed)):
+        return "invalid-fence-record"
+    if (d2h_attempted == "no" and d2h_completed == "yes") or \
+            (h2d_attempted == "no" and h2d_completed == "yes") or \
+            (h2d_attempted == "yes" and d2h_completed != "yes"):
+        return "invalid-fence-record"
+    if event != "state-invalid" and attempted != current:
+        return "invalid-fence-record"
+    if kind == "checkpoint":
+        valid = (
+            event == "complete" and stage == "pre-result-d2h" and
+            event_status == "complete" and marker_valid and
+            d2h_attempted == "no" and d2h_completed == "no" and
+            h2d_attempted == "no" and h2d_completed == "no" and
+            interpretation == "post-compute-confirmed-before-result-d2h" and
+            confirmed == attempted and failed == 0 and gather_failed == 0
+        )
+        if not valid:
+            return "invalid-fence-record"
+        return "post-compute-confirmed-before-result-gather"
+    if kind != "failure":
+        return "invalid-fence-record"
+    if event == "state-invalid":
+        valid = (
+            stage == "pre-result-d2h" and
+            event_status == "not-synchronized" and
+            d2h_attempted == "no" and d2h_completed == "no" and
+            h2d_attempted == "no" and h2d_completed == "no" and
+            interpretation == "failure-surfaced-before-result-d2h" and
+            current != attempted and confirmed + 1 == attempted and
+            failed == 1 and gather_failed == 0
+        )
+        return "pre-gather-state-failure" if valid else "invalid-fence-record"
+    if event == "sync-failed":
+        valid = (
+            stage == "pre-result-d2h" and event_status != "complete" and
+            d2h_attempted == "no" and d2h_completed == "no" and
+            h2d_attempted == "no" and h2d_completed == "no" and
+            interpretation == "failure-surfaced-before-result-d2h" and
+            confirmed + 1 == attempted and failed == 1 and gather_failed == 0
+        )
+        return "pre-gather-stream-failure" if valid else "invalid-fence-record"
+    if event == "marker-invalid":
+        valid = (
+            stage == "pre-result-d2h" and event_status == "complete" and
+            not marker_valid and d2h_attempted == "no" and
+            d2h_completed == "no" and
+            h2d_attempted == "no" and h2d_completed == "no" and
+            interpretation == "post-compute-event-confirmed-marker-invalid" and
+            confirmed + 1 == attempted and failed == 1 and gather_failed == 0
+        )
+        return "marker-channel-failure" if valid else "invalid-fence-record"
+    if event == "result-gather-failed":
+        copy_boundary_valid = (
+            (d2h_attempted == "yes" and d2h_completed == "no" and
+             h2d_attempted == "no" and h2d_completed == "no" and
+             interpretation ==
+             "failure-surfaced-after-confirmed-result-d2h-attempt") or
+            (d2h_attempted == "yes" and d2h_completed == "yes" and
+             h2d_attempted == "no" and h2d_completed == "no" and
+             interpretation ==
+             "failure-surfaced-after-confirmed-result-d2h-complete-before-result-h2d") or
+            (d2h_attempted == "yes" and d2h_completed == "yes" and
+             h2d_attempted == "yes" and h2d_completed == "no" and
+             interpretation ==
+             "failure-surfaced-after-confirmed-result-h2d-attempt") or
+            (d2h_attempted == "yes" and d2h_completed == "yes" and
+             h2d_attempted == "yes" and h2d_completed == "yes" and
+             interpretation ==
+             "failure-surfaced-after-confirmed-result-h2d-complete") or
+            (d2h_attempted == "no" and d2h_completed == "no" and
+             h2d_attempted == "no" and h2d_completed == "no" and
+             interpretation ==
+             "failure-surfaced-after-confirmed-before-result-d2h")
+        )
+        valid = (
+            stage == "result-gather" and event_status == "complete" and
+            marker_valid and copy_boundary_valid and
+            confirmed == attempted and failed == 0 and gather_failed == 1
+        )
+        if not valid:
+            return "invalid-fence-record"
+        return (
+            "post-compute-confirmed-result-gather-failed-before-d2h-attempt"
+            if d2h_attempted == "no" else
+            "post-compute-confirmed-result-d2h-failed"
+            if d2h_completed == "no" else
+            "post-compute-confirmed-result-d2h-complete-result-h2d-not-attempted"
+            if h2d_attempted == "no" else
+            "post-compute-confirmed-result-h2d-failed"
+            if h2d_completed == "no" else
+            "post-compute-confirmed-result-h2d-complete-later-gather-failure"
+        )
+    return "invalid-fence-record"
+
+
+def format_q8_partner_pre_gather_fence_record(
+        record: dict[str, str], classification: str) -> str:
+    if not record:
+        return ""
+    keys = (
+        "event", "stage", "current_sequence", "marker_sequence",
+        "marker_complement", "marker_matches", "event_status",
+        "result_d2h_attempted", "result_d2h_completed",
+        "result_h2d_attempted", "result_h2d_completed", "interpretation",
+        "attempted", "confirmed",
+        "failed", "result_gather_failed_after_confirmed", "home_tier",
+        "home_device", "partner_tier", "partner_device", "binding_label",
+        "weight_offset",
+    )
+    fields = [f"record_classification={classification}"]
+    fields.extend(f"{key}={record.get(key, '')}" for key in keys)
+    return " ".join(fields)
+
+
+def q8_partner_pre_gather_fence_marker_state(text: str) -> str:
+    if not q8_partner_pre_gather_fence_enabled(text, 0):
+        return "not-enabled-for-pair0"
+    armed = q8_partner_pre_gather_armed_records(text)
+    returned = q8_partner_pre_gather_returned_records(text)
+    call_state = q8_partner_pre_gather_call_sequence_state(text)
+    checkpoint_state = q8_partner_pre_gather_checkpoint_sequence_state(
+        text, len(armed)
+    )
+    failures = q8_partner_pre_gather_fence_records(text, "failure")
+    if failures:
+        if len(failures) != 1:
+            return f"failure-count:{len(failures)}"
+        classification = q8_partner_pre_gather_fence_record_classification(
+            failures[-1], "failure"
+        )
+        if call_state not in {"complete", "empty"}:
+            return call_state
+        if checkpoint_state != "complete":
+            return checkpoint_state
+        current = _q8_u64(failures[-1], "current_sequence")
+        attempted = _q8_u64(failures[-1], "attempted")
+        last_armed = len(armed)
+        event = failures[-1].get("event", "")
+        relationship_valid = (
+            attempted == last_armed + 1 and current != attempted and
+            len(returned) == last_armed
+            if event == "state-invalid"
+            else current == last_armed + 1 and len(returned) == last_armed
+            if event in {"sync-failed", "marker-invalid"}
+            else (current == last_armed and last_armed > 0 and
+                  len(returned) == last_armed - 1)
+            if event == "result-gather-failed" else False
+        )
+        if (not relationship_valid or
+                not q8_partner_pre_gather_failure_order_valid(text)):
+            return "failure-armed-sequence-mismatch"
+        return (
+            "failure-record-present" if classification != "invalid-fence-record"
+            else "invalid-failure-record"
+        )
+    if call_state != "complete":
+        return call_state
+    if checkpoint_state != "complete":
+        return checkpoint_state
+    checkpoints = q8_partner_pre_gather_fence_records(text, "checkpoint")
+    if not checkpoints:
+        return "checkpoint-count:0"
+    if any(
+            q8_partner_pre_gather_fence_record_classification(
+                record, "checkpoint"
+            ) == "invalid-fence-record"
+            for record in checkpoints):
+        return "invalid-checkpoint-record"
+    checkpoint_sequences = [
+        _q8_u64(record, "current_sequence") for record in checkpoints
+    ]
+    if (any(sequence is None for sequence in checkpoint_sequences) or
+            checkpoint_sequences != sorted(set(checkpoint_sequences))):
+        return "checkpoint-order-mismatch"
+    summaries = q8_partner_async_completion_records(text, "summary")
+    if len(summaries) != 1:
+        return f"summary-count:{len(summaries)}"
+    summary = summaries[0]
+    if summary.get("home_tier") != "0" or summary.get("partner_tier") != "2":
+        return "wrong-pair"
+    counts = {
+        key: _q8_u64(summary, key)
+        for key in (
+            "pre_gather_attempted", "pre_gather_confirmed",
+            "pre_gather_failed",
+            "pre_gather_result_gather_failed_after_confirmed",
+            "pre_gather_last_sequence",
+        )
+    }
+    if any(value is None for value in counts.values()):
+        return "malformed-summary"
+    attempted = counts["pre_gather_attempted"]
+    confirmed = counts["pre_gather_confirmed"]
+    failed = counts["pre_gather_failed"]
+    gather_failed = counts[
+        "pre_gather_result_gather_failed_after_confirmed"
+    ]
+    last_sequence = counts["pre_gather_last_sequence"]
+    assert attempted is not None and confirmed is not None
+    assert failed is not None and gather_failed is not None
+    assert last_sequence is not None
+    if (attempted <= 0 or attempted != confirmed or failed != 0 or
+            gather_failed != 0 or last_sequence != attempted):
+        return "count-mismatch"
+    if len(armed) != attempted or len(returned) != attempted:
+        return "call-attempted-count-mismatch"
+    async_begun = _q8_u64(summary, "begun")
+    async_submitted = _q8_u64(summary, "submitted")
+    async_confirmed = _q8_u64(summary, "confirmed")
+    async_sequence = _q8_u64(summary, "last_sequence")
+    if any(value != attempted for value in (
+            async_begun, async_submitted, async_confirmed, async_sequence)):
+        return "async-fence-count-mismatch"
+    expected_checkpoints = [1]
+    expected_checkpoints.extend(range(64, attempted + 1, 64))
+    if checkpoint_sequences != expected_checkpoints:
+        return "checkpoint-cadence-mismatch"
+    if q8_partner_async_completion_marker_state(text) != "complete":
+        return "async-summary-not-complete"
+    return "complete"
+
+
+def q8_partner_pre_gather_fence_summary(
+        text: str, run_status: str = ""
+) -> tuple[str, str, str, str, str, str, str, str, str, str, str]:
+    if not q8_partner_pre_gather_fence_enabled(text, 0):
+        return ("", "", "", "", "", "", "", "", "", "", "")
+    checkpoints = q8_partner_pre_gather_fence_records(text, "checkpoint")
+    failures = q8_partner_pre_gather_fence_records(text, "failure")
+    summaries = q8_partner_async_completion_records(text, "summary")
+    armed = q8_partner_pre_gather_armed_records(text)
+    returned = q8_partner_pre_gather_returned_records(text)
+    checkpoint = checkpoints[-1] if checkpoints else {}
+    failure = failures[-1] if failures else {}
+    summary = summaries[-1] if summaries else {}
+    last_armed = armed[-1] if armed else {}
+    last_returned = returned[-1] if returned else {}
+    call_state = q8_partner_pre_gather_call_sequence_state(text)
+    checkpoint_state = q8_partner_pre_gather_checkpoint_sequence_state(
+        text, len(armed)
+    )
+    checkpoint_classification = (
+        q8_partner_pre_gather_fence_record_classification(
+            checkpoint, "checkpoint"
+        ) if checkpoint else ""
+    )
+    failure_classification = (
+        q8_partner_pre_gather_fence_record_classification(failure, "failure")
+        if failure else ""
+    )
+    corroborated_device_loss = run_status in {
+        "failed-device-loss", "interrupted-prior-run-device-loss",
+        "interrupted-no-result-device-loss",
+    }
+    if failure:
+        current = _q8_u64(failure, "current_sequence")
+        attempted_count = _q8_u64(failure, "attempted")
+        event = failure.get("event", "")
+        failure_relationship_valid = (
+            attempted_count == len(armed) + 1 and
+            current != attempted_count and len(returned) == len(armed)
+            if event == "state-invalid"
+            else current == len(armed) + 1 and len(returned) == len(armed)
+            if event in {"sync-failed", "marker-invalid"}
+            else (current == len(armed) and bool(armed) and
+                  len(returned) == len(armed) - 1)
+            if event == "result-gather-failed" else False
+        )
+        if (len(failures) != 1 or
+                call_state not in {"complete", "empty"} or
+                checkpoint_state != "complete" or
+                not failure_relationship_valid or
+                not q8_partner_pre_gather_failure_order_valid(text)):
+            classification = "invalid-fence-record"
+        else:
+            classification = failure_classification
+    elif q8_partner_pre_gather_fence_marker_state(text) == "complete":
+        classification = "completed-all-pre-gather-confirmed"
+    elif (armed or returned) and call_state != "complete":
+        classification = "invalid-fence-record"
+    elif (corroborated_device_loss and not summary and
+          checkpoint_state == "complete-trailing-checkpoint" and
+          call_state in {"complete", "empty"}):
+        classification = (
+            "post-compute-confirmed-before-result-gather-armed-status-not-observed"
+        )
+    elif checkpoint_state != "complete":
+        classification = "invalid-fence-record"
+    elif (corroborated_device_loss and
+          call_state == "complete" and len(armed) == len(returned) + 1 and
+          not summary):
+        classification = (
+            "post-compute-confirmed-result-gather-return-not-observed"
+        )
+    elif (corroborated_device_loss and
+          call_state == "complete" and bool(armed) and
+          len(armed) == len(returned) and not summary):
+        classification = "last-confirmed-gather-returned-subsequent-locus-unresolved"
+    elif summary:
+        classification = "invalid-fence-record"
+    elif checkpoint_classification == "post-compute-confirmed-before-result-gather":
+        classification = "prior-pre-gather-calls-confirmed-current-call-unresolved"
+    elif checkpoint:
+        classification = "invalid-fence-record"
+    elif q8_partner_pre_gather_fence_enabled(text, 0):
+        classification = "armed-no-fence-evidence"
+    else:
+        classification = ""
+    source = summary if summary else (failure if failure else checkpoint)
+    attempted = source.get(
+        "pre_gather_attempted", source.get("attempted", "")
+    )
+    confirmed = source.get(
+        "pre_gather_confirmed", source.get("confirmed", "")
+    )
+    failed = source.get("pre_gather_failed", source.get("failed", ""))
+    gather_failed = source.get(
+        "pre_gather_result_gather_failed_after_confirmed",
+        source.get("result_gather_failed_after_confirmed", ""),
+    )
+    if (not summary and not failure and call_state == "complete" and
+            last_armed):
+        attempted = last_armed.get("current_sequence", "")
+        confirmed = attempted
+        failed = "0"
+        gather_failed = "0"
+    formatted_failure_classification = (
+        "invalid-fence-record"
+        if failure and classification == "invalid-fence-record"
+        else failure_classification
+    )
+    return (
+        format_q8_partner_pre_gather_fence_record(
+            checkpoint, checkpoint_classification
+        ),
+        format_q8_partner_pre_gather_fence_record(
+            failure, formatted_failure_classification
+        ),
+        format_q8_partner_pre_gather_armed_record(last_armed),
+        format_q8_partner_pre_gather_returned_record(last_returned),
+        classification,
+        attempted,
+        confirmed,
+        failed,
+        gather_failed,
+        str(len(armed)),
+        str(len(returned)),
     )
 
 
@@ -1053,6 +1704,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_async_completion = outcomes.get(
         "attention-q8-async-completion", "not-run"
     )
+    attention_q8_pre_gather_fence = outcomes.get(
+        "attention-q8-pre-gather-fence", "not-run"
+    )
     attention_q8_phase_audit = outcomes.get(
         "attention-q8-phase-audit", "not-run"
     )
@@ -1102,6 +1756,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_async_completion_rows = [
         row for row in rows
         if row.get("variant") == "attention-q8-async-completion"
+    ]
+    attention_q8_pre_gather_fence_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-pre-gather-fence"
     ]
     attention_q8_phase_audit_rows = [
         row for row in rows
@@ -1309,6 +1967,219 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         all(row.get("attention_row_boundary_marker_state") == "complete"
             for row in boundary_rows)
     )
+    if attention_q8_pre_gather_fence != "not-run":
+        invalid_fence_statuses = {
+            "validation-failed", "environment-invalid",
+            "passed-invalidated-watch", "completed-no-result-invalidated-watch",
+        }
+        fence_statuses = {
+            row.get("status", "") for row in attention_q8_pre_gather_fence_rows
+        }
+        if fence_statuses & invalid_fence_statuses or \
+                attention_q8_pre_gather_fence == "invalid":
+            return (
+                "The pre-gather-fence arm failed its exact event/marker/counter, "
+                "production-path, environment, or post-run validation. It is "
+                "invalid for boundary inference; do not treat a malformed positive-"
+                "looking record as evidence."
+            )
+        if "inconclusive-underloaded" in fence_statuses:
+            return (
+                "The pre-gather-fence arm completed below the 500 prefill tok/s "
+                "load floor. Its records are retained, but the underloaded arm is "
+                "not a valid full-load trigger comparison."
+            )
+        device_loss_statuses = {
+            "failed-device-loss", "interrupted-prior-run-device-loss",
+            "interrupted-no-result-device-loss",
+        }
+        evidence_rows = [
+            row for row in attention_q8_pre_gather_fence_rows
+            if row.get("status") in device_loss_statuses
+        ]
+        classifications = {
+            row.get("q8_pre_gather_fence_classification", "")
+            for row in evidence_rows
+        }
+        failure_context = next((
+            row.get("q8_pre_gather_fence_last_failure", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_gather_fence_last_failure")
+        ), "")
+        armed_context = next((
+            row.get("q8_pre_gather_fence_last_armed", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_gather_fence_last_armed")
+        ), "")
+        returned_context = next((
+            row.get("q8_pre_gather_fence_last_returned", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_gather_fence_last_returned")
+        ), "")
+        checkpoint_context = next((
+            row.get("q8_pre_gather_fence_last_checkpoint", "")
+            for row in reversed(evidence_rows)
+            if row.get("q8_pre_gather_fence_last_checkpoint")
+        ), "")
+        if "invalid-fence-record" in classifications:
+            return (
+                "The device-loss arm contains a truncated or internally "
+                "inconsistent Q8 pre-gather-fence record. Pair, physical-device, "
+                "sequence, complement, event, D2H/H2D attempt/completion, breadcrumb "
+                "order, and counter consistency are required before interpreting it. "
+                "Last record: " +
+                failure_context
+            )
+        if "pre-gather-stream-failure" in classifications:
+            return (
+                "The dedicated post-marker event synchronization failed before the "
+                "result D2H was attempted. For this recorded call, the pending CUDA "
+                "failure therefore arose in the partner default-stream completion "
+                "domain (the Q8 compute/marker chain or earlier concurrent device "
+                "work), not from attempting its result D2H. This identifies an API "
+                "observation boundary, not the electrical or software root cause. "
+                "Last record: " + failure_context
+            )
+        if "pre-gather-state-failure" in classifications:
+            return (
+                "The pre-gather diagnostic found an internally inconsistent event/"
+                "sequence state before synchronizing and before attempting result "
+                "D2H. This is a valid diagnostic failure record but indicates a "
+                "software audit-state invariant failure, not a resolved GPU fault "
+                "boundary. Last record: " + failure_context
+            )
+        if "marker-channel-failure" in classifications:
+            return (
+                "The dedicated post-marker event synchronized successfully, but the "
+                "exact mapped-host sequence/complement was invalid, and no result "
+                "D2H was attempted. The partner stream crossed the event boundary; "
+                "this is a marker-channel integrity failure and excludes this "
+                "call's result D2H attempt as the trigger. Last record: " +
+                failure_context
+            )
+        if (
+            "post-compute-confirmed-result-gather-failed-before-d2h-attempt"
+            in classifications
+        ):
+            return (
+                "The dedicated event synchronized and the exact marker matched "
+                "before result-gather setup, which then failed before D2H was "
+                "attempted. The current Q8 compute is positively confirmed, and "
+                "this call attempted no result D2H; the host-bounce allocation/"
+                "setup boundary is the first observed failing API interval. This "
+                "does not by itself identify the endpoint-reset root cause. Last "
+                "record: " + failure_context
+            )
+        if "post-compute-confirmed-result-d2h-failed" in classifications:
+            return (
+                "The dedicated event synchronized and the exact marker matched "
+                "before result D2H was attempted; that D2H API was invoked but did "
+                "not complete successfully. The current Q8 compute is positively "
+                "confirmed and D2H is the first observed failing result-gather API, "
+                "but this does not by itself prove the electrical or software root "
+                "cause of the endpoint reset. Last record: " +
+                failure_context
+            )
+        if (
+            "post-compute-confirmed-result-d2h-complete-result-h2d-not-attempted"
+            in classifications
+        ):
+            return (
+                "The dedicated event synchronized, the exact marker matched, and "
+                "the result D2H completed successfully, but result-gather failed "
+                "before destination H2D was attempted. This moves the first observed "
+                "failing interval after D2H completion and before H2D invocation. "
+                "It does not prove that the preceding D2H traffic was physically "
+                "irrelevant to a latent endpoint reset. Last record: " +
+                failure_context
+            )
+        if "post-compute-confirmed-result-h2d-failed" in classifications:
+            return (
+                "The dedicated event synchronized, the exact marker matched, and "
+                "the result D2H completed successfully. Destination H2D was then "
+                "invoked but did not complete successfully, making H2D the first "
+                "observed failing result-gather API for this recorded call. This API "
+                "boundary does not by itself prove the reset's physical or software "
+                "cause. Last record: " + failure_context
+            )
+        if (
+            "post-compute-confirmed-result-h2d-complete-later-gather-failure"
+            in classifications
+        ):
+            return (
+                "The dedicated event synchronized, the exact marker matched, and "
+                "both result D2H and destination H2D completed successfully before a "
+                "later result-gather step reported failure. This defensive record "
+                "moves the first observed failure after both copy calls without "
+                "proving the cause of the endpoint reset. Last record: " +
+                failure_context
+            )
+        if (
+            "post-compute-confirmed-before-result-gather-armed-status-not-observed"
+            in classifications
+        ):
+            return (
+                "A trailing sparse checkpoint proves that the current pair-0 partner "
+                "stream synchronized and its exact marker matched before result "
+                "gather. No matching armed breadcrumb was observed before "
+                "corroborated device loss ended the run, so whether "
+                "that gather was attempted or returned is not established. This "
+                "narrows the observation interval to after confirmed compute and "
+                "marker validation without identifying the reset cause. Last "
+                "checkpoint: " + checkpoint_context
+            )
+        if (
+            "post-compute-confirmed-result-gather-return-not-observed"
+            in classifications
+        ):
+            return (
+                "The exact final armed record proves the current pair-0 partner "
+                "stream crossed the post-compute event/marker boundary immediately "
+                "before result gather. Every earlier armed sequence, if any, has a "
+                "matching successful return, but no matching returned breadcrumb for "
+                "the current gather was "
+                "observed before corroborated device loss ended the run. A SIGKILL "
+                "can land after helper success but before that "
+                "breadcrumb is emitted, so this identifies the subsequent result-"
+                "gather/reset observation interval without proving that the CUDA "
+                "copy failed to return or caused the reset. Last armed: " + armed_context +
+                "; last returned: " + returned_context
+            )
+        if (
+            "last-confirmed-gather-returned-subsequent-locus-unresolved"
+            in classifications
+        ):
+            return (
+                "The exact final armed and returned records prove that the latest "
+                "confirmed pair-0 partner-Q8 result gather returned successfully. "
+                "Corroborated device loss occurred afterward and before the "
+                "next armed boundary, so the subsequent locus remains unresolved; "
+                "the completed gather is not a no-return event and these records do "
+                "not identify the reset cause. Last armed: " + armed_context +
+                "; last returned: " + returned_context
+            )
+        if attention_q8_pre_gather_fence == "passed":
+            return (
+                "Every pair-0 partner-Q8 call in the completed full-load arm crossed "
+                "the pre-result-D2H event and exact-marker boundary, with zero "
+                "pre-gather or post-confirmation gather failures. Event "
+                "synchronization and per-call armed/returned logging perturb timing, "
+                "so survival does not clear the unfenced path; compare it with the "
+                "async-completion control while preserving that caveat."
+            )
+        if "prior-pre-gather-calls-confirmed-current-call-unresolved" in {
+                row.get("q8_pre_gather_fence_classification", "")
+                for row in evidence_rows}:
+            return (
+                "Periodic checkpoints confirm earlier pre-result-D2H boundaries, "
+                "but no validated failure record resolves the current call. "
+                "Checkpoint absence between periodic emissions is not negative "
+                "evidence."
+            )
+        return (
+            "The pre-gather fence armed but produced no validated record resolving "
+            "the failing call. The result is inconclusive."
+        )
     if attention_q8_async_completion != "not-run":
         invalid_async_statuses = {
             "validation-failed", "environment-invalid",
@@ -2599,6 +3470,13 @@ def main() -> None:
         (q8_async_last, q8_async_last_failure, q8_async_classification,
          q8_async_begun, q8_async_submitted, q8_async_confirmed,
          q8_async_synchronized) = q8_partner_async_completion_summary(log_text)
+        (q8_fence_last, q8_fence_last_failure, q8_fence_last_armed,
+         q8_fence_last_returned, q8_fence_classification,
+         q8_fence_attempted, q8_fence_confirmed, q8_fence_failed,
+         q8_fence_gather_failed, q8_fence_armed_count,
+         q8_fence_returned_count) = q8_partner_pre_gather_fence_summary(
+             log_text, status
+         )
         if variant == "attention-q8-l14-l15-phase-audit":
             (q8_window_last_complete, q8_window_l14_complete,
              q8_window_l15_complete, q8_window_classification) = (
@@ -2634,6 +3512,19 @@ def main() -> None:
             "q8_async_completion_submitted": q8_async_submitted,
             "q8_async_completion_confirmed": q8_async_confirmed,
             "q8_async_completion_partners_synchronized": q8_async_synchronized,
+            "q8_pre_gather_fence_last_checkpoint": q8_fence_last,
+            "q8_pre_gather_fence_last_failure": q8_fence_last_failure,
+            "q8_pre_gather_fence_last_armed": q8_fence_last_armed,
+            "q8_pre_gather_fence_armed_count": q8_fence_armed_count,
+            "q8_pre_gather_fence_last_returned": q8_fence_last_returned,
+            "q8_pre_gather_fence_returned_count": q8_fence_returned_count,
+            "q8_pre_gather_fence_classification": q8_fence_classification,
+            "q8_pre_gather_fence_attempted": q8_fence_attempted,
+            "q8_pre_gather_fence_confirmed": q8_fence_confirmed,
+            "q8_pre_gather_fence_failed": q8_fence_failed,
+            "q8_pre_gather_fence_result_gather_failed_after_confirmed": (
+                q8_fence_gather_failed
+            ),
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
@@ -2714,12 +3605,24 @@ def main() -> None:
         "not identify. The async-completion arm adds a mapped-host marker and a "
         "dedicated event after every selected partner-Q8 compute submission. A "
         "matching marker is positive boundary evidence; a missing marker after "
-        "device/context loss is explicitly inconclusive.",
+        "device/context loss is explicitly inconclusive. The pre-gather-fence arm "
+        "synchronizes that event and validates the exact marker immediately before "
+        "result D2H submission. Its success checkpoints are periodic, so a missing "
+        "per-call checkpoint is not negative evidence. A compact, fflush-only "
+        "armed record positively confirms the pre-gather event/marker boundary on "
+        "every call, and its matching returned record proves the synchronous copy "
+        "helper returned successfully. A missing returned record means only that its "
+        "breadcrumb was not observed before termination; it is not proof that a "
+        "CUDA copy API failed to return.",
         "",
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Q8 async classification | Q8 async counts | "
         "Q8 async last checkpoint | Q8 async last failure | "
-        "Q8 async partners synchronized | Pair-0 Q8 begun bytes* | "
+        "Q8 async partners synchronized | Q8 pre-gather classification | "
+        "Q8 pre-gather counts | Q8 pre-gather last checkpoint | "
+        "Q8 pre-gather armed/returned count | Q8 pre-gather last armed | "
+        "Q8 pre-gather last returned | "
+        "Q8 pre-gather last failure | Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
         "Q8 phase classification | Q8 skipped occurrence | "
         "Q8 selected occurrence | Q8 occurrence mapping | "
@@ -2733,7 +3636,7 @@ def main() -> None:
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| " + " | ".join(["---"] * 49) + " |",
     ]
     for row in rows:
         lines.append(
@@ -2748,6 +3651,17 @@ def main() -> None:
             f"{row.get('q8_async_completion_last_checkpoint', '')} | "
             f"{row.get('q8_async_completion_last_failure', '')} | "
             f"{row.get('q8_async_completion_partners_synchronized', '')} | "
+            f"{row.get('q8_pre_gather_fence_classification', '')} | "
+            f"{row.get('q8_pre_gather_fence_attempted', '')}/"
+            f"{row.get('q8_pre_gather_fence_confirmed', '')}/"
+            f"{row.get('q8_pre_gather_fence_failed', '')}/"
+            f"{row.get('q8_pre_gather_fence_result_gather_failed_after_confirmed', '')} | "
+            f"{row.get('q8_pre_gather_fence_last_checkpoint', '')} | "
+            f"{row.get('q8_pre_gather_fence_armed_count', '')}/"
+            f"{row.get('q8_pre_gather_fence_returned_count', '')} | "
+            f"{row.get('q8_pre_gather_fence_last_armed', '')} | "
+            f"{row.get('q8_pre_gather_fence_last_returned', '')} | "
+            f"{row.get('q8_pre_gather_fence_last_failure', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
@@ -2802,6 +3716,14 @@ if __name__ == "__main__":
         )
         if state != "complete":
             fail(f"Q8 async-completion marker state is {state}")
+    elif (len(sys.argv) == 3 and
+            sys.argv[1] == "--validate-q8-pre-gather-fence-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_pre_gather_fence_marker_state(
+            log_path.read_text(errors="replace")
+        )
+        if state != "complete":
+            fail(f"Q8 pre-gather-fence marker state is {state}")
     elif (len(sys.argv) == 4 and
             sys.argv[1] == "--validate-q8-l14-l15-log"):
         log_path = Path(sys.argv[2])

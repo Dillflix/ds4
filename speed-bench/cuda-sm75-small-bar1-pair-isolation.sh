@@ -20,6 +20,7 @@ Optional environment:
   VARIANTS=attention-host-bounce     host-stage pair-0 attention-owned copies
   VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
   VARIANTS=attention-q8-async-completion  global pair-0 post-Q8 positive markers
+  VARIANTS=attention-q8-pre-gather-fence  confirm pair-0 Q8 completion before result D2H
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
   VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
@@ -44,6 +45,26 @@ Optional environment:
 
 The transport/scheduling diagnostic arms run before the known full-production
 reproducer. They preserve arithmetic work but can change its timing envelope.
+For the pre-gather completion bracket, use the fixed comparison order
+VARIANTS=attention-q8-pre-gather-fence,attention-q8-async-completion.
+The fence arm emits a compact fflush-only `pre-gather armed` breadcrumb per
+confirmed call immediately before result gather:
+  ds4: CUDA q8 partner pre-gather armed current_sequence=N marker_sequence=N
+  marker_complement=X home_tier=H home_device=HD partner_tier=P partner_device=PD
+After the synchronous helper returns success it emits the matching compact line:
+  ds4: CUDA q8 partner pre-gather returned current_sequence=N
+  result_gather_status=success home_tier=H home_device=HD partner_tier=P partner_device=PD
+These are two fence-arm-only `fprintf`/`fflush` records per successful call;
+neither adds an `fsync`. Full checkpoints stay sparse. Completed validation
+requires alternating, contiguous armed/returned pairs. After watcher
+termination, armed N without returned N is classified only as
+`result-gather-return-not-observed`: SIGKILL can land after helper success but
+before the returned line. Returned N proves that gather succeeded; the locus
+of any later failure remains unresolved. The no-fence control rejects fence,
+armed, and returned records as contamination.
+Structured failures record D2H and H2D attempt/completion separately. After a
+completed D2H, H2D not attempted isolates destination switch/setup; H2D
+attempted but not completed identifies an entered-but-failed H2D API.
 If a GPU loss interrupts the shell, reboot, set RESUME=1 and reuse the printed
 SMALL_BAR1_ISOLATION_DIR. The incomplete arm is retained without silently
 retrying it. It counts as a failed arm only when a durable lost-device watch
@@ -155,13 +176,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -564,6 +585,20 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_q8_async_completion_scope=every_pair0_partner_q8_call_no_layer_selector\n'
         printf 'attention_q8_async_completion_marker=partner_default_stream_mapped_host_then_dedicated_event\n'
         printf 'attention_q8_async_completion_interpretation=positive_only_absence_is_inconclusive\n'
+        printf 'attention_q8_pre_gather_fence_scope=every_pair0_partner_q8_call_immediately_before_result_d2h\n'
+        printf 'attention_q8_pre_gather_fence_boundary=post_marker_event_synchronize_and_exact_marker_validation\n'
+        printf 'attention_q8_pre_gather_fence_armed_record=ds4: CUDA q8 partner pre-gather armed current_sequence=N marker_sequence=N marker_complement=X home_tier=H home_device=HD partner_tier=P partner_device=PD\n'
+        printf 'attention_q8_pre_gather_fence_armed_breadcrumb=every_confirmed_call_before_result_gather_fflush_only\n'
+        printf 'attention_q8_pre_gather_fence_returned_record=ds4: CUDA q8 partner pre-gather returned current_sequence=N result_gather_status=success home_tier=H home_device=HD partner_tier=P partner_device=PD\n'
+        printf 'attention_q8_pre_gather_fence_returned_breadcrumb=every_successful_result_gather_return_fflush_only\n'
+        printf 'attention_q8_pre_gather_fence_success_checkpoints=first_and_every_64_confirmed_calls\n'
+        printf 'attention_q8_pre_gather_fence_failure_records=durable_with_result_d2h_and_result_h2d_attempt_and_completion_state\n'
+        printf 'attention_q8_pre_gather_fence_completed_validation=alternating_contiguous_armed_returned_pairs_required\n'
+        printf 'attention_q8_pre_gather_fence_return_not_observed=armed_without_matching_returned_is_not_proof_of_failure\n'
+        printf 'attention_q8_pre_gather_fence_durability=two_unique_fence_arm_fprintf_fflush_records_per_successful_call_no_per_call_fsync_full_checkpoints_sparse_failures_durable\n'
+        printf 'attention_q8_pre_gather_fence_control=attention-q8-async-completion\n'
+        printf 'attention_q8_pre_gather_fence_control_rejects=fence_armed_returned_records\n'
+        printf 'attention_q8_pre_gather_fence_interpretation=failure_surface_boundary_not_root_cause\n'
         printf 'attention_q8_phase_audit_scope=pair0_q8_partner_phase_checkpoints_and_compute_sync\n'
         printf 'attention_q8_targeted_phase_audit_binding=%s\n' "$Q8_TARGET_BINDING_LABEL"
         printf 'attention_q8_targeted_phase_audit_weight_offset=%s\n' "$Q8_TARGET_WEIGHT_OFFSET"
@@ -760,7 +795,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -1009,7 +1044,8 @@ validate_success_path() {
                 'home_tier=1 partner_tier=3' || return 1
             ;;
     esac
-    if [[ $variant == attention-q8-async-completion ]]; then
+    if [[ $variant == attention-q8-async-completion ||
+          $variant == attention-q8-pre-gather-fence ]]; then
         grep -Fq \
             'CUDA q8 partner async completion audit enabled: logical_pairs=0 marker=partner-default-stream-mapped-host event=dedicated-post-marker interpretation=positive-only' \
             "$log" || return 1
@@ -1020,8 +1056,27 @@ validate_success_path() {
         python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
             --validate-q8-async-completion-log "$log" || return 1
     fi
+    if [[ $variant == attention-q8-pre-gather-fence ]]; then
+        local fence_enable
+        fence_enable='ds4: CUDA q8 partner pre-gather fence audit enabled: logical_pairs=0 boundary=post-marker-event-sync marker=exact-before-result-d2h'
+        [[ $(grep -Fxc "$fence_enable" "$log" || true) == 1 ]] || return 1
+        [[ $(grep -Fc 'CUDA q8 partner pre-gather fence audit enabled:' \
+            "$log" || true) == 1 ]] || return 1
+        ! grep -Fq 'CUDA q8 partner pre-gather fence failure ' "$log" ||
+            return 1
+        ! grep -Eq 'CUDA q8 partner pre-gather (fence (checkpoint|failure)|armed|returned) .*home_tier=1 ' \
+            "$log" || return 1
+        python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
+            --validate-q8-pre-gather-fence-log "$log" || return 1
+    fi
+    if [[ $variant == attention-q8-async-completion ]]; then
+        ! grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
+            "$log" || return 1
+    fi
     if [[ $variant == attention-q8-host-bounce ]]; then
         ! grep -Fq 'CUDA q8 partner async completion ' "$log" || return 1
+        ! grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
+            "$log" || return 1
     fi
     if [[ $variant == attention-q8-l14-l15-phase-audit ]]; then
         grep -Fq \
@@ -1197,7 +1252,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1248,6 +1303,22 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
                 continue
             fi
+            if [[ $variant == attention-q8-async-completion ]] &&
+                    grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
+                        "$log"; then
+                printf 'Retaining contaminated no-fence control as validation-failed: variant=%s repeat=%d\n' \
+                    "$variant" "$repeat"
+                write_result "$result" "$variant" validation-failed 129 \
+                    "$progress" "$log"
+                fields=$(last_progress_fields "$progress")
+                IFS=$'\t' read -r lp le lc lt <<<"$fields"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                    recovered-validation-failed 129 "$lp" "$le" \
+                    >>"$OUTPUT_DIR/run-journal.tsv"
+                sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+                continue
+            fi
             if [[ -s $csv && $(wc -l <"$csv") == 2 && -s $bindings ]] &&
                     [[ $(wc -l <"$bindings") == 345 ]] &&
                     [[ ! -e $watch_marker ]] &&
@@ -1257,7 +1328,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1343,6 +1414,12 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-pre-gather-fence)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
             attention-q8-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
@@ -1486,6 +1563,19 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             tail -n 240 "$log" >&2 || true
             die "variant=$variant contained async-completion records in the no-marker control"
         fi
+        if [[ $variant == attention-q8-async-completion ]] &&
+                grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
+                    "$log"; then
+            write_result "$result" "$variant" validation-failed 129 \
+                "$progress" "$log"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$variant" "$repeat" \
+                validation-failed 129 "$lp" "$le" \
+                >>"$OUTPUT_DIR/run-journal.tsv"
+            sync "$OUTPUT_DIR/run-journal.tsv" 2>/dev/null || sync
+            tail -n 240 "$log" >&2 || true
+            die "variant=$variant contained pre-gather-fence records in the no-fence control"
+        fi
         if (( run_status != 0 )); then
             watch_status=
             if [[ -s $watch_marker ]]; then
@@ -1525,7 +1615,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

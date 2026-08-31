@@ -179,6 +179,166 @@ def q8_async_failure(
     )
 
 
+def q8_pre_gather_enabled() -> str:
+    return (
+        q8_async_enabled() +
+        "ds4: CUDA q8 partner pre-gather fence audit enabled: "
+        "logical_pairs=0 boundary=post-marker-event-sync "
+        "marker=exact-before-result-d2h\n"
+    )
+
+
+def q8_pre_gather_checkpoint(sequence: int) -> str:
+    complement = (~sequence) & ((1 << 64) - 1)
+    return (
+        "ds4: CUDA q8 partner pre-gather fence checkpoint "
+        "event=complete stage=pre-result-d2h "
+        f"current_sequence={sequence} marker_sequence={sequence} "
+        f"marker_complement={complement} marker_matches=yes "
+        "event_status=complete result_d2h_attempted=no result_d2h_completed=no "
+        "result_h2d_attempted=no result_h2d_completed=no "
+        "interpretation=post-compute-confirmed-before-result-d2h "
+        f"attempted={sequence} confirmed={sequence} failed=0 "
+        "result_gather_failed_after_confirmed=0 "
+        "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+        "tokens=512 in=8192 out=4096 "
+        "binding_label=tensor:blk.0.attn_output_b.weight "
+        "passed_label=attn_output_b weight_offset=141234898176\n"
+    )
+
+
+def q8_pre_gather_armed(sequence: int) -> str:
+    complement = (~sequence) & ((1 << 64) - 1)
+    return (
+        "ds4: CUDA q8 partner pre-gather armed "
+        f"current_sequence={sequence} marker_sequence={sequence} "
+        f"marker_complement={complement} home_tier=0 home_device=0 "
+        "partner_tier=2 partner_device=1\n"
+    )
+
+
+def q8_pre_gather_returned(sequence: int) -> str:
+    return (
+        "ds4: CUDA q8 partner pre-gather returned "
+        f"current_sequence={sequence} result_gather_status=success "
+        "home_tier=0 home_device=0 partner_tier=2 partner_device=1\n"
+    )
+
+
+def q8_pre_gather_completed_calls(count: int) -> str:
+    return "".join(
+        q8_pre_gather_armed(sequence) + q8_pre_gather_returned(sequence)
+        for sequence in range(1, count + 1)
+    )
+
+
+def q8_pre_gather_checkpointed_calls(count: int) -> str:
+    lines = []
+    for sequence in range(1, count + 1):
+        if sequence == 1 or sequence % 64 == 0:
+            lines.append(q8_pre_gather_checkpoint(sequence))
+        lines.append(q8_pre_gather_armed(sequence))
+        lines.append(q8_pre_gather_returned(sequence))
+    return "".join(lines)
+
+
+def q8_pre_gather_failure(
+        sequence: int, event: str, *, d2h_attempted_override: str | None = None,
+        d2h_completed_override: str | None = None,
+        h2d_attempted_override: str | None = None,
+        h2d_completed_override: str | None = None,
+        attempted_override: int | None = None
+) -> str:
+    if event == "state-invalid":
+        attempted = attempted_override or sequence
+        marker_sequence = sequence - 1
+        event_status = "not-synchronized"
+        d2h_attempted = "no"
+        d2h_completed = "no"
+        h2d_attempted = "no"
+        h2d_completed = "no"
+        interpretation = "failure-surfaced-before-result-d2h"
+        confirmed = attempted - 1
+        failed = 1
+        gather_failed = 0
+    elif event == "sync-failed":
+        attempted = sequence
+        marker_sequence = sequence - 1
+        event_status = "unspecified-launch-failure"
+        d2h_attempted = "no"
+        d2h_completed = "no"
+        h2d_attempted = "no"
+        h2d_completed = "no"
+        interpretation = "failure-surfaced-before-result-d2h"
+        confirmed = sequence - 1
+        failed = 1
+        gather_failed = 0
+    elif event == "marker-invalid":
+        attempted = sequence
+        marker_sequence = sequence - 1
+        event_status = "complete"
+        d2h_attempted = "no"
+        d2h_completed = "no"
+        h2d_attempted = "no"
+        h2d_completed = "no"
+        interpretation = "post-compute-event-confirmed-marker-invalid"
+        confirmed = sequence - 1
+        failed = 1
+        gather_failed = 0
+    elif event == "result-gather-failed":
+        attempted = sequence
+        marker_sequence = sequence
+        event_status = "complete"
+        d2h_attempted = d2h_attempted_override or "yes"
+        d2h_completed = d2h_completed_override or "no"
+        h2d_attempted = h2d_attempted_override or "no"
+        h2d_completed = h2d_completed_override or "no"
+        interpretation = (
+            "failure-surfaced-after-confirmed-result-h2d-complete"
+            if h2d_completed == "yes" else
+            "failure-surfaced-after-confirmed-result-h2d-attempt"
+            if h2d_attempted == "yes" else
+            "failure-surfaced-after-confirmed-result-d2h-complete-before-result-h2d"
+            if d2h_completed == "yes" else
+            "failure-surfaced-after-confirmed-result-d2h-attempt"
+            if d2h_attempted == "yes" else
+            "failure-surfaced-after-confirmed-before-result-d2h"
+        )
+        confirmed = sequence
+        failed = 0
+        gather_failed = 1
+    else:
+        raise AssertionError(f"unknown event: {event}")
+    complement = (~marker_sequence) & ((1 << 64) - 1)
+    marker_matches = "yes" if marker_sequence == sequence else "no"
+    stage = "result-gather" if event == "result-gather-failed" else "pre-result-d2h"
+    return (
+        "ds4: CUDA q8 partner pre-gather fence failure "
+        f"event={event} stage={stage} current_sequence={sequence} "
+        f"marker_sequence={marker_sequence} marker_complement={complement} "
+        f"marker_matches={marker_matches} event_status={event_status} "
+        f"result_d2h_attempted={d2h_attempted} "
+        f"result_d2h_completed={d2h_completed} "
+        f"result_h2d_attempted={h2d_attempted} "
+        f"result_h2d_completed={h2d_completed} interpretation={interpretation} "
+        f"attempted={attempted} confirmed={confirmed} failed={failed} "
+        f"result_gather_failed_after_confirmed={gather_failed} "
+        "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+        "tokens=512 in=8192 out=4096 "
+        "binding_label=tensor:blk.0.attn_output_b.weight "
+        "passed_label=attn_output_b weight_offset=141234898176\n"
+    )
+
+
+def q8_pre_gather_summary(sequence: int) -> str:
+    return q8_async_summary(sequence, sequence, sequence).rstrip("\n") + (
+        f" pre_gather_attempted={sequence} "
+        f"pre_gather_confirmed={sequence} pre_gather_failed=0 "
+        "pre_gather_result_gather_failed_after_confirmed=0 "
+        f"pre_gather_last_sequence={sequence}\n"
+    )
+
+
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2639,6 +2799,734 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("has no verified outcome", report)
             self.assertIn("not a failed arm and is not a safe pass", report)
             self.assertIn("fresh full matrix", report)
+
+    def test_validates_complete_q8_pre_gather_fence_with_periodic_checkpoint(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "fence.log"
+            log.write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpointed_calls(70) +
+                q8_pre_gather_summary(70)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-pre-gather-fence-log", str(log),
+            ], check=True)
+
+    def test_classifies_unreturned_armed_call_for_all_device_loss_statuses(
+            self) -> None:
+        cases = (
+            ("failed", "failed-device-loss", True),
+            ("interrupted-prior-run", "interrupted-prior-run-device-loss", True),
+            ("started-only", "interrupted-no-result-device-loss", False),
+        )
+        for source_status, expected_status, has_result in cases:
+            with self.subTest(status=expected_status), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                production = root / "production"
+                production.mkdir()
+                stem = "r1-s1-attention-q8-pre-gather-fence"
+                if has_result:
+                    (production / f"{stem}.result").write_text(
+                        "variant=attention-q8-pre-gather-fence\n"
+                        f"status={source_status}\nexit_status=124\n"
+                    )
+                else:
+                    (production / f"{stem}.started").write_text(
+                        "variant=attention-q8-pre-gather-fence\nrepeat=1\n"
+                    )
+                (production / f"{stem}.log").write_text(
+                    q8_pre_gather_enabled() +
+                    q8_pre_gather_checkpointed_calls(64) +
+                    q8_pre_gather_armed(65)
+                )
+                write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+                subprocess.run(
+                    [sys.executable, str(SUMMARIZER), str(root)], check=True
+                )
+                with (root / "summary.csv").open(newline="") as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertEqual(row["status"], expected_status)
+                self.assertEqual(
+                    row["q8_pre_gather_fence_classification"],
+                    "post-compute-confirmed-result-gather-return-not-observed",
+                )
+                self.assertEqual(row["q8_pre_gather_fence_armed_count"], "65")
+                self.assertEqual(row["q8_pre_gather_fence_returned_count"], "64")
+                self.assertIn(
+                    "current_sequence=65",
+                    row["q8_pre_gather_fence_last_armed"],
+                )
+                self.assertIn(
+                    "current_sequence=64",
+                    row["q8_pre_gather_fence_last_returned"],
+                )
+                report = (root / "summary.md").read_text()
+                self.assertIn("no matching returned breadcrumb", report)
+                self.assertIn("observation interval", report)
+                self.assertIn("without proving", report)
+
+    def test_classifies_first_armed_call_without_prior_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-q8-pre-gather-fence\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpoint(1) +
+                q8_pre_gather_armed(1)
+            )
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-gather-return-not-observed",
+            )
+            self.assertEqual(row["q8_pre_gather_fence_returned_count"], "0")
+            report = (root / "summary.md").read_text()
+            self.assertIn(
+                "Every earlier armed sequence, if any, has a matching successful "
+                "return",
+                report,
+            )
+            self.assertNotIn("preceding sequence returned", report)
+
+    def test_classifies_trailing_checkpoint_before_armed_breadcrumb(self) -> None:
+        cases = (
+            (q8_pre_gather_checkpoint(1), "1", "0"),
+            (
+                q8_pre_gather_checkpointed_calls(63) +
+                q8_pre_gather_checkpoint(64),
+                "64",
+                "63",
+            ),
+        )
+        for log_body, checkpoint_sequence, armed_count in cases:
+            with self.subTest(sequence=checkpoint_sequence), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                production = root / "production"
+                production.mkdir()
+                stem = "r1-s1-attention-q8-pre-gather-fence"
+                (production / f"{stem}.started").write_text(
+                    "variant=attention-q8-pre-gather-fence\nrepeat=1\n"
+                )
+                (production / f"{stem}.log").write_text(
+                    q8_pre_gather_enabled() + log_body
+                )
+                write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+                subprocess.run(
+                    [sys.executable, str(SUMMARIZER), str(root)], check=True
+                )
+                with (root / "summary.csv").open(newline="") as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertEqual(
+                    row["q8_pre_gather_fence_classification"],
+                    "post-compute-confirmed-before-result-gather-"
+                    "armed-status-not-observed",
+                )
+                self.assertEqual(
+                    row["q8_pre_gather_fence_armed_count"], armed_count
+                )
+                self.assertIn(
+                    f"current_sequence={checkpoint_sequence}",
+                    row["q8_pre_gather_fence_last_checkpoint"],
+                )
+                report = (root / "summary.md").read_text()
+                self.assertIn("trailing sparse checkpoint proves", report)
+                self.assertIn("whether that gather was attempted", report)
+
+    def test_classifies_returned_final_gather_as_subsequent_locus_unresolved(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-q8-pre-gather-fence\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpointed_calls(65)
+            )
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "last-confirmed-gather-returned-subsequent-locus-unresolved",
+            )
+            self.assertEqual(row["q8_pre_gather_fence_armed_count"], "65")
+            self.assertEqual(row["q8_pre_gather_fence_returned_count"], "65")
+            report = (root / "summary.md").read_text()
+            self.assertIn("result gather returned successfully", report)
+            self.assertIn("subsequent locus remains unresolved", report)
+
+    def test_rejects_wrong_armed_returned_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpoint(1) +
+                q8_pre_gather_armed(1) + q8_pre_gather_armed(2) +
+                q8_pre_gather_returned(1) + q8_pre_gather_returned(2)
+            )
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
+            self.assertIn(
+                "truncated or internally inconsistent",
+                (root / "summary.md").read_text(),
+            )
+
+    def test_rejects_invalid_armed_or_returned_identity(self) -> None:
+        complement = (~1) & ((1 << 64) - 1)
+        cases = (
+            (
+                q8_pre_gather_armed(1).replace(
+                    f"marker_complement={complement}", "marker_complement=0"
+                ),
+                q8_pre_gather_returned(1),
+                "invalid-armed-record",
+            ),
+            (
+                q8_pre_gather_armed(1).replace(
+                    "partner_device=1", "partner_device=3"
+                ),
+                q8_pre_gather_returned(1),
+                "invalid-armed-record",
+            ),
+            (
+                q8_pre_gather_armed(1),
+                q8_pre_gather_returned(1).replace(
+                    "partner_device=1", "partner_device=3"
+                ),
+                "invalid-returned-record",
+            ),
+        )
+        for armed, returned, expected_state in cases:
+            with self.subTest(state=expected_state), \
+                    tempfile.TemporaryDirectory() as temporary:
+                log = pathlib.Path(temporary) / "fence.log"
+                log.write_text(
+                    q8_pre_gather_enabled() + q8_pre_gather_checkpoint(1) +
+                    armed + returned + q8_pre_gather_summary(1)
+                )
+                completed = subprocess.run([
+                    sys.executable, str(SUMMARIZER),
+                    "--validate-q8-pre-gather-fence-log", str(log),
+                ], capture_output=True, text=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_state, completed.stderr)
+
+    def test_rejects_checkpoint_emitted_before_prior_call_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "fence.log"
+            log.write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpoint(1) +
+                q8_pre_gather_checkpoint(64) +
+                q8_pre_gather_completed_calls(64) +
+                q8_pre_gather_summary(64)
+            )
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-pre-gather-fence-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("checkpoint-order-mismatch", completed.stderr)
+
+    def test_rejects_missing_first_checkpoint_in_interrupted_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-q8-pre-gather-fence\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_completed_calls(1) +
+                q8_pre_gather_armed(2)
+            )
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
+
+    def test_classifies_q8_pre_gather_stream_failure_before_d2h(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_failure(65, "sync-failed")
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "pre-gather-stream-failure",
+            )
+            self.assertIn("result_d2h_attempted=no", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("failed before the result D2H was attempted", report)
+            self.assertIn("not from attempting its result D2H", report)
+            table_lines = [
+                line for line in report.splitlines()
+                if (line.startswith("| Variant |") or
+                    line.startswith("| --- |") or
+                    line.startswith("| attention-q8-pre-gather-fence |"))
+            ]
+            self.assertEqual(len({line.count("|") for line in table_lines}), 1)
+
+    def test_classifies_state_invalid_sequence_gap_before_d2h(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_failure(
+                    67, "state-invalid", attempted_override=65
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "pre-gather-state-failure",
+            )
+            self.assertIn("current_sequence=67", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            self.assertIn("attempted=65", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("software audit-state invariant failure", report)
+
+    def test_rejects_state_invalid_without_sequence_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_failure(
+                    65, "state-invalid", attempted_override=65
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
+
+    def test_rejects_missing_periodic_q8_pre_gather_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "fence.log"
+            log.write_text(
+                q8_pre_gather_enabled() + q8_pre_gather_checkpoint(64) +
+                q8_pre_gather_completed_calls(70) +
+                q8_pre_gather_summary(70)
+            )
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-pre-gather-fence-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("checkpoint-cadence-mismatch", completed.stderr)
+
+    def test_classifies_q8_pre_gather_marker_channel_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_failure(65, "marker-invalid")
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "marker-channel-failure",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("event synchronized successfully", report)
+            self.assertIn("marker-channel integrity failure", report)
+
+    def test_classifies_result_d2h_failure_after_confirmed_q8_compute(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(65, "result-gather-failed")
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-d2h-failed",
+            )
+            self.assertEqual(
+                row[
+                    "q8_pre_gather_fence_result_gather_failed_after_confirmed"
+                ],
+                "1",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("exact marker matched before result D2H", report)
+            self.assertIn("D2H API was invoked", report)
+            self.assertIn("does not by itself prove", report)
+
+    def test_classifies_host_bounce_allocation_failure_before_result_d2h(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_attempted_override="no"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-gather-failed-before-d2h-attempt",
+            )
+            self.assertIn("result_d2h_attempted=no", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("before D2H was attempted", report)
+
+    def test_classifies_pre_h2d_failure_after_result_d2h_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_completed_override="yes"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-d2h-complete-result-h2d-not-attempted",
+            )
+            self.assertIn("result_d2h_attempted=yes", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            self.assertIn("result_d2h_completed=yes", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("result D2H completed successfully", report)
+            self.assertIn("before destination H2D was attempted", report)
+            self.assertIn("does not prove", report)
+
+    def test_classifies_result_h2d_failure_after_result_d2h_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_completed_override="yes",
+                    h2d_attempted_override="yes"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-h2d-failed",
+            )
+            self.assertIn("result_h2d_attempted=yes", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            self.assertIn("result_h2d_completed=no", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("Destination H2D was then invoked", report)
+            self.assertIn("first observed failing result-gather API", report)
+
+    def test_classifies_later_failure_after_result_h2d_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_completed_override="yes",
+                    h2d_attempted_override="yes", h2d_completed_override="yes"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "post-compute-confirmed-result-h2d-complete-later-gather-failure",
+            )
+            self.assertIn("result_h2d_completed=yes", row[
+                "q8_pre_gather_fence_last_failure"
+            ])
+            report = (root / "summary.md").read_text()
+            self.assertIn("both result D2H and destination H2D completed", report)
+
+    def test_rejects_inconsistent_q8_pre_gather_fence_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            invalid = q8_pre_gather_failure(65, "sync-failed").replace(
+                "result_d2h_attempted=no", "result_d2h_attempted=yes"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) + invalid
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("truncated or internally inconsistent", report)
+
+    def test_rejects_failure_sequence_that_does_not_match_call_history(
+            self) -> None:
+        cases = (
+            (
+                q8_pre_gather_checkpointed_calls(63) +
+                q8_pre_gather_failure(65, "sync-failed")
+            ),
+            (
+                q8_pre_gather_checkpointed_calls(65) +
+                q8_pre_gather_failure(65, "result-gather-failed")
+            ),
+        )
+        for body in cases:
+            with self.subTest(body=body[-100:]), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                production = root / "production"
+                production.mkdir()
+                stem = "r1-s1-attention-q8-pre-gather-fence"
+                (production / f"{stem}.result").write_text(
+                    "variant=attention-q8-pre-gather-fence\n"
+                    "status=failed-device-loss\nexit_status=124\n"
+                )
+                (production / f"{stem}.log").write_text(
+                    q8_pre_gather_enabled() + body
+                )
+                write_unhealthy_post(root, stem)
+
+                subprocess.run(
+                    [sys.executable, str(SUMMARIZER), str(root)], check=True
+                )
+                with (root / "summary.csv").open(newline="") as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertEqual(
+                    row["q8_pre_gather_fence_classification"],
+                    "invalid-fence-record",
+                )
+
+    def test_rejects_completed_result_d2h_that_was_not_attempted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_attempted_override="no",
+                    d2h_completed_override="yes"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
+
+    def test_rejects_completed_result_h2d_that_was_not_attempted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-pre-gather-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-pre-gather-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(64) +
+                q8_pre_gather_armed(65) +
+                q8_pre_gather_failure(
+                    65, "result-gather-failed", d2h_completed_override="yes",
+                    h2d_attempted_override="no", h2d_completed_override="yes"
+                )
+            )
+            write_unhealthy_post(root, stem)
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "invalid-fence-record",
+            )
 
     def test_validates_complete_q8_async_completion_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

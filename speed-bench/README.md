@@ -3569,15 +3569,95 @@ gather it also reads the sequence/complement pair, and call 1 plus every 64th
 confirmed call emits an extra marker `fprintf`/`fflush`. Those are timing,
 host-scheduling, and PCIe perturbations. The durable `fsync` at those sparse
 checkpoints is issued by the existing Q8 transfer audit in both this arm and
-its no-marker control; it is not unique to the marker arm. A surviving run
-therefore does not clear the original path and must be compared with the
-otherwise identical `attention-q8-host-bounce` arm, which has no completion
-marker. The diagnostic question is narrower: for a Q8 call that reports an API
-failure, is there positive evidence that its partner compute stream already
-crossed the post-compute boundary? A completed arm must still exceed the 500
-prefill tok/s gate. A crashing arm has no valid throughput result, so identical
-launch settings and telemetry establish the intended load configuration but do
-not by themselves prove an achieved rate.
+its no-marker control; it is not unique to the marker arm. A completed arm
+must still exceed the 500 prefill tok/s gate. A crashing arm has no valid
+throughput result, so identical launch settings and telemetry establish the
+intended load configuration but do not by themselves prove an achieved rate.
+
+That comparison has now been run. The async-completion arm and its otherwise
+identical no-marker host-bounce control both lost the pair-0 devices. In the
+marker arm the final current call had `begun=53`, `submitted=53`, and
+`confirmed=52`; its dedicated event query reported `cudaErrorLaunchFailure`
+only after the synchronous result D2H had failed. In the no-marker control the
+512-token warmup completed and the first measured-prefill pair-0
+`attn_output_b` result D2H again surfaced the failure. This rules out the
+post-compute marker as a necessary trigger, but it still does **not** identify
+the result D2H as the cause: that synchronous copy can be the first API to
+report an asynchronous partner-stream or endpoint failure.
+
+The next mechanism-level bracket is `attention-q8-pre-gather-fence`. It uses
+the same GPU compute and copy configuration as
+`attention-q8-async-completion`, but immediately before attempting each
+synchronous host-bounce result D2H it synchronizes the already recorded
+post-marker event and validates the exact mapped-host sequence and complement.
+It also adds the paired per-call host-log records described below. The fence
+does not select a layer or binding. It records a sparse
+success checkpoint on the first confirmed call and every 64th confirmed call;
+every failure record is flushed and synchronized durably. In addition, every
+call whose event and marker pass emits this compact fflush-only breadcrumb
+immediately before result gathering:
+
+`ds4: CUDA q8 partner pre-gather armed current_sequence=N marker_sequence=N marker_complement=X home_tier=H home_device=HD partner_tier=P partner_device=PD`
+
+Immediately after the synchronous helper returns success, it emits the paired
+compact line:
+
+`ds4: CUDA q8 partner pre-gather returned current_sequence=N result_gather_status=success home_tier=H home_device=HD partner_tier=P partner_device=PD`
+
+Neither breadcrumb is a full structured checkpoint. Together they add two
+fence-arm-only `fprintf`/`fflush` records per successful call, but no per-call
+`fsync`. Completed-run validation requires strictly alternating, contiguous
+`armed N`/`returned N` pairs. The paired breadcrumbs exist because the
+telemetry watcher can terminate the process after device loss before either a
+structured CUDA failure record or teardown summary is written. In that case,
+`armed N` without `returned N` is classified only as
+`result-gather-return-not-observed`. It is not proof that the helper failed or
+never returned: SIGKILL can land after helper success but before the returned
+line is printed. Conversely, `returned N` proves that result gather succeeded
+for that sequence; the locus of any later failure remains unresolved.
+
+Structured failure records state separately whether the result D2H and H2D
+APIs were attempted and whether each completed. This distinguishes failure
+during destination-device switch/setup after a completed D2H from failure
+reported by an H2D API that was actually entered. Together, the structured
+records and paired breadcrumbs support exactly these outcomes:
+
+- event synchronization reports failure with `result_d2h_attempted=no` and
+  `result_d2h_completed=no`: the failure surfaced at the partner default-stream
+  boundary before result transport was attempted;
+- the event completes but the marker is invalid: the marker channel itself is
+  inconsistent, and result D2H is neither attempted nor completed;
+- the event and marker both pass, but result gathering fails with
+  `result_d2h_attempted=no` and `result_d2h_completed=no`: partner compute was
+  positively confirmed and the failure surfaced inside result-gather setup
+  before the D2H API;
+- the event and marker both pass, followed by `result_d2h_attempted=yes`,
+  `result_d2h_completed=no`, and a result-gather failure: the D2H API was
+  entered but did not complete successfully; H2D remains unattempted and
+  incomplete;
+- the event and marker both pass, followed by `result_d2h_attempted=yes`,
+  `result_d2h_completed=yes`, `result_h2d_attempted=no`, and
+  `result_h2d_completed=no`: D2H completed, then destination-device
+  switch/setup failed before the H2D API was entered;
+- the event and marker both pass, followed by `result_d2h_attempted=yes`,
+  `result_d2h_completed=yes`, `result_h2d_attempted=yes`, and
+  `result_h2d_completed=no`: D2H completed and the H2D API was entered but did
+  not complete successfully;
+- `armed N` lacks a matching `returned N`: result-gather return was not
+  observed before termination, but helper failure versus post-success SIGKILL
+  remains unresolved;
+- `armed N` has a matching `returned N`: that complete result gather succeeded,
+  so any failure first observed later belongs to an unresolved downstream
+  interval; or
+- the arm completes: the fence changed the failure behavior and is a timing/
+  ordering perturbation, not a production fix.
+
+Compare it directly against the no-fence async-completion arm. The GPU
+compute/copy configuration is otherwise identical, and both arms retain the
+same mapped-host marker kernel and event record. The fence arm uniquely adds
+the event synchronization, marker validation, and paired per-call
+`fprintf`/`fflush` writes. All of those perturb timing, so survival of the fence
+arm cannot be attributed specifically to the CUDA event fence alone.
 
 Run it after a clean boot and use a fresh output directory. `SKIP_BUILD=0` is
 mandatory so the CUDA changes and the fixed CUDA/P2P preflight are both present:
@@ -3599,14 +3679,14 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 unset CUDA_VISIBLE_DEVICES
 unset SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-async-completion-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-pre-gather-fence-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-q8-async-completion,attention-q8-host-bounce \
+VARIANTS=attention-q8-pre-gather-fence,attention-q8-async-completion \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
@@ -3618,11 +3698,15 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-The marker arm runs first. If either arm causes device loss, reboot and resume
-the same directory with the same two-variant order and `RESUME=1`; do not create
-a replacement directory for that comparison. The no-marker arm explicitly
-rejects any async-completion enable/checkpoint/summary record, so inherited
-diagnostic state cannot silently contaminate the control.
+The pre-gather-fence arm runs first. If either arm causes device loss, reboot
+and resume the same directory with the same two-variant order and `RESUME=1`;
+do not create a replacement directory for that comparison. The no-fence
+async-completion control explicitly rejects every pre-gather-fence enable,
+armed or returned breadcrumb, checkpoint, or failure record, so inherited
+diagnostic state cannot silently contaminate the control. The fence arm
+requires the exact pair-0 enable record, rejects pair-1 fence records, requires
+contiguous paired armed/returned sequences, and validates its sparse
+checkpoints and final counter summary before accepting a completed run.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
