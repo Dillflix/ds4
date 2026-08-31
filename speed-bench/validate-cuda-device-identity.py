@@ -25,6 +25,7 @@ UUID_RE = re.compile(
 )
 GPU_TOKEN_RE = re.compile(r"^GPU(?P<index>[0-9]+)$")
 NVLINK_RE = re.compile(r"^NV[1-9][0-9]*$")
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 TOPOLOGY_LABELS = frozenset(
     {"X", "SYS", "NODE", "PHB", "PXB", "PIX", "C2C", "SOC", "N/A"}
 )
@@ -270,7 +271,8 @@ def read_topology(path: Path) -> Topology:
 
     header: list[int] | None = None
     header_line = 0
-    for line_number, line in enumerate(lines, start=1):
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = ANSI_CSI_RE.sub("", raw_line)
         tokens = line.split()
         if not tokens or GPU_TOKEN_RE.fullmatch(tokens[0]) is None:
             continue
@@ -291,7 +293,10 @@ def read_topology(path: Path) -> Topology:
 
     matrix: dict[tuple[int, int], str] = {}
     seen_rows: set[int] = set()
-    for line_number, line in enumerate(lines[header_line:], start=header_line + 1):
+    for line_number, raw_line in enumerate(
+        lines[header_line:], start=header_line + 1
+    ):
+        line = ANSI_CSI_RE.sub("", raw_line)
         tokens = line.split()
         if not tokens:
             continue

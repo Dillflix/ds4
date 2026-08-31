@@ -268,6 +268,21 @@ class ValidateCudaDeviceIdentityTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_topology_accepts_ansi_underlined_header_from_nvidia_smi(self):
+        topology = TOPOLOGY.replace(
+            "        GPU0    GPU1    GPU2    GPU3    CPU Affinity    NUMA Affinity",
+            "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\tNUMA Affinity"
+            "\tGPU NUMA ID\x1b[0m",
+        )
+        path = self._write_topology(topology)
+        try:
+            parsed = MODULE.read_topology(path)
+            self.assertEqual(parsed.indices, (0, 1, 2, 3))
+            self.assertEqual(parsed[(0, 1)], "NV2")
+            self.assertEqual(parsed[(2, 3)], "NV2")
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_topology_rejects_missing_rows(self):
         text = "\n".join(
             line for line in TOPOLOGY.splitlines() if not line.startswith("GPU3 ")
