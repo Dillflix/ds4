@@ -21,6 +21,7 @@ Optional environment:
   VARIANTS=attention-q8-host-bounce  host-stage pair-0 attention and Q8 copies
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
+  VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
   ATTN_PHASE_AUDIT_POS=512
   ATTN_END_FENCE_LAYER=21          one end-only production completion fence
@@ -66,8 +67,12 @@ Q8_TARGET_PASSED_LABEL=attn_output_b
 Q8_TARGET_TOKENS=512
 Q8_TARGET_IN_DIM=8192
 Q8_TARGET_OUT_DIM=4096
+Q8_TARGET_WEIGHT_BYTES=35651584
 Q8_TARGET_TRANSFER_BYTES=8388608
 Q8_TARGET_RESULT_BYTES=8388608
+Q8_WINDOW_L15_BINDING_LABEL=tensor:blk.15.attn_output_b.weight
+Q8_WINDOW_L15_WEIGHT_OFFSET=143723876608
+Q8_WINDOW_TARGETS="${Q8_TARGET_BINDING_LABEL}@${Q8_TARGET_WEIGHT_OFFSET},${Q8_WINDOW_L15_BINDING_LABEL}@${Q8_WINDOW_L15_WEIGHT_OFFSET}"
 VARIANTS=${VARIANTS:-attention-off,production}
 ATTN_PHASE_AUDIT_LAYER=${ATTN_PHASE_AUDIT_LAYER:-17}
 ATTN_PHASE_AUDIT_POS=${ATTN_PHASE_AUDIT_POS:-512}
@@ -79,6 +84,7 @@ ATTN_ROW_BOUNDARY_POS=${ATTN_ROW_BOUNDARY_POS:-512}
 PP_TOKENS=${PP_TOKENS:-32768}
 TG_TOKENS=${TG_TOKENS:-256}
 Q8_TARGET_EXPECTED_SEQUENCES=$((PP_TOKENS / 512 + 1))
+Q8_WINDOW_EXPECTED_TOTAL_SEQUENCES=$((Q8_TARGET_EXPECTED_SEQUENCES * 2))
 REPEATS=${REPEATS:-1}
 REQUIRED_POWER_LIMIT_W=${REQUIRED_POWER_LIMIT_W:-250}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-500}
@@ -140,13 +146,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -558,6 +564,14 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
             "$Q8_TARGET_RESULT_BYTES"
         printf 'attention_q8_targeted_phase_audit_expected_sequences=%s\n' \
             "$Q8_TARGET_EXPECTED_SEQUENCES"
+        printf 'attention_q8_l14_l15_phase_audit_targets=%s\n' "$Q8_WINDOW_TARGETS"
+        printf 'attention_q8_l14_l15_phase_audit_expected_weight_bytes=%s\n' \
+            "$Q8_TARGET_WEIGHT_BYTES"
+        printf 'attention_q8_l14_l15_phase_audit_expected_per_binding=%s\n' \
+            "$Q8_TARGET_EXPECTED_SEQUENCES"
+        printf 'attention_q8_l14_l15_phase_audit_expected_total_sequences=%s\n' \
+            "$Q8_WINDOW_EXPECTED_TOTAL_SEQUENCES"
+        printf 'attention_q8_l14_l15_phase_audit_target_preflight=exact-partner-tuples-against-materialized-binding-inventory\n'
         printf 'attention_copy_scheduling_preflight=build-smoke-ordered-copy-every-run\n'
         printf 'q8_transfer_audit=begin_complete_64-call-checkpoints\n'
         printf 'indexer_transfer_audit=every-dispatch-begin-complete\n'
@@ -713,7 +727,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit)
+        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -962,6 +976,14 @@ validate_success_path() {
                 'home_tier=1 partner_tier=3' || return 1
             ;;
     esac
+    if [[ $variant == attention-q8-l14-l15-phase-audit ]]; then
+        grep -Fq \
+            'CUDA q8 partner phase-audit target preflight validated 2 exact partner tuples against ' \
+            "$log" || return 1
+        python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
+            --validate-q8-l14-l15-log "$log" \
+            "$Q8_TARGET_EXPECTED_SEQUENCES" || return 1
+    fi
     if [[ $variant == attention-q8-phase-audit ||
           $variant == attention-q8-targeted-phase-audit ]]; then
         # Require every observed pair-0 sequence to have an identical binding
@@ -1080,7 +1102,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit)
+        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1125,7 +1147,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit)
+                        attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1218,6 +1240,15 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_BINDING_LABEL=$Q8_TARGET_BINDING_LABEL")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_WEIGHT_OFFSET=$Q8_TARGET_WEIGHT_OFFSET")
+                ;;
+            attention-q8-l14-l15-phase-audit)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS=$Q8_WINDOW_TARGETS")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_WEIGHT_BYTES=$Q8_TARGET_WEIGHT_BYTES")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_IN_DIM=$Q8_TARGET_IN_DIM")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_OUT_DIM=$Q8_TARGET_OUT_DIM")
                 ;;
             attention-query-dst)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS=$SMALL_BAR1_PAIR")
@@ -1356,7 +1387,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit)
+            attention-q8-host-bounce|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

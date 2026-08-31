@@ -985,6 +985,206 @@ struct cuda_q8_f16_binding {
     char label[128];
 };
 
+struct cuda_q8_f16_partner_phase_audit_target {
+    const char *label;
+    size_t label_len;
+    uint64_t weight_offset;
+};
+
+struct cuda_q8_f16_partner_phase_audit_expectation {
+    uint64_t weight_bytes;
+    uint64_t in_dim;
+    uint64_t out_dim;
+};
+
+/* Parse one exact binding@offset selector without allocating.  The caller
+ * owns the environment string, so the returned label is a bounded view into
+ * that string.  Return 1 for one entry, 0 at the end, and -1 for malformed
+ * input. */
+static int cuda_q8_f16_partner_phase_audit_target_next(
+        const char **cursor,
+        cuda_q8_f16_partner_phase_audit_target *target) {
+    if (!cursor || !*cursor || !target) return -1;
+    const char *entry = *cursor;
+    if (!entry[0]) return 0;
+
+    const char *at = NULL;
+    const char *end = entry;
+    for (; *end && *end != ','; ++end) {
+        if (*end == '@') {
+            if (at) return -1;
+            at = end;
+        }
+        if (*end == ' ' || *end == '\t' || *end == '\n' ||
+            *end == '\r' || *end == '\f' || *end == '\v') return -1;
+    }
+    if (end == entry || !at || at == entry || at + 1 == end ||
+        (uint64_t)(at - entry) > (uint64_t)INT_MAX) return -1;
+
+    uint64_t parsed = 0u;
+    for (const char *digit_ptr = at + 1; digit_ptr < end; ++digit_ptr) {
+        if (*digit_ptr < '0' || *digit_ptr > '9') return -1;
+        const uint64_t digit = (uint64_t)(*digit_ptr - '0');
+        if (parsed > UINT64_MAX / 10u ||
+            (parsed == UINT64_MAX / 10u && digit > UINT64_MAX % 10u)) {
+            return -1;
+        }
+        parsed = parsed * 10u + digit;
+    }
+
+    target->label = entry;
+    target->label_len = (size_t)(at - entry);
+    target->weight_offset = parsed;
+    if (*end == ',') {
+        if (!end[1]) return -1;
+        *cursor = end + 1;
+    } else {
+        *cursor = end;
+    }
+    return 1;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_targets_valid(
+        const char *target_list) {
+    if (!target_list || !target_list[0]) return false;
+    const char *cursor = target_list;
+    cuda_q8_f16_partner_phase_audit_target target = {};
+    int rc = 0;
+    while ((rc = cuda_q8_f16_partner_phase_audit_target_next(
+                &cursor, &target)) > 0) {}
+    return rc == 0;
+}
+
+static int cuda_q8_f16_partner_phase_audit_pair_next(
+        const char **cursor, int *pair) {
+    if (!cursor || !*cursor || !pair) return -1;
+    const char *p = *cursor;
+    if (!p[0]) return 0;
+    if (*p < '0' || *p > '9') return -1;
+
+    uint64_t value = 0u;
+    do {
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (value > ((uint64_t)INT_MAX - digit) / 10u) return -1;
+        value = value * 10u + digit;
+        p++;
+    } while (*p >= '0' && *p <= '9');
+
+    if (*p == ',') {
+        if (!p[1]) return -1;
+        *cursor = p + 1;
+    } else if (*p == '\0') {
+        *cursor = p;
+    } else {
+        return -1;
+    }
+    *pair = (int)value;
+    return 1;
+}
+
+/* Validate the complete list instead of returning at the first matching pair.
+ * This is deliberately stricter than the older pair-scoped diagnostic helper:
+ * a selector such as `0,bad` must never arm pair 0 and hide its malformed
+ * suffix. Empty is retained as "no audit pairs" unless a target list requires
+ * at least one pair. */
+static bool cuda_q8_f16_partner_phase_audit_pairs_valid(
+        const char *pair_list, int n_gpus, bool require_nonempty) {
+    if (!pair_list || !pair_list[0]) return !require_nonempty;
+    if (n_gpus < 2 || (n_gpus & 1) != 0 || n_gpus > DS4_MAX_GPUS) {
+        return false;
+    }
+
+    bool seen[DS4_MAX_GPUS] = {};
+    size_t count = 0u;
+    const char *cursor = pair_list;
+    int pair = -1;
+    int rc = 0;
+    while ((rc = cuda_q8_f16_partner_phase_audit_pair_next(
+                &cursor, &pair)) > 0) {
+        if (pair < 0 || pair >= n_gpus / 2 || seen[pair]) return false;
+        seen[pair] = true;
+        count++;
+    }
+    return rc == 0 && (!require_nonempty || count != 0u);
+}
+
+static bool cuda_q8_f16_partner_phase_audit_pair_selected(
+        const char *pair_list, int n_gpus, int requested_pair) {
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            pair_list, n_gpus, false)) {
+        return false;
+    }
+    bool selected = false;
+    const char *cursor = pair_list;
+    int pair = -1;
+    while (cuda_q8_f16_partner_phase_audit_pair_next(
+               &cursor, &pair) > 0) {
+        if (pair == requested_pair) selected = true;
+    }
+    return selected;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_devices_selected(
+        const char *pair_list, int consumer_device, int resident_device) {
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            pair_list, g_n_gpus, true)) {
+        return false;
+    }
+    bool selected = false;
+    const char *cursor = pair_list;
+    int pair = -1;
+    while (cuda_q8_f16_partner_phase_audit_pair_next(
+               &cursor, &pair) > 0) {
+        const int partner_tier = pair + g_n_gpus / 2;
+        if (g_gpu[pair].device_id == consumer_device &&
+            g_gpu[partner_tier].device_id == resident_device) {
+            selected = true;
+        }
+    }
+    return selected;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_parse_positive_u64(
+        const char *value, uint64_t *parsed_out) {
+    if (!value || !value[0] || !parsed_out) return false;
+    uint64_t parsed = 0u;
+    for (const char *p = value; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (parsed > UINT64_MAX / 10u ||
+            (parsed == UINT64_MAX / 10u && digit > UINT64_MAX % 10u)) {
+            return false;
+        }
+        parsed = parsed * 10u + digit;
+    }
+    if (parsed == 0u) return false;
+    *parsed_out = parsed;
+    return true;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_expectation_load(
+        cuda_q8_f16_partner_phase_audit_expectation *expected) {
+    if (!expected) return false;
+    if (!cuda_q8_f16_partner_phase_audit_parse_positive_u64(
+            getenv("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_WEIGHT_BYTES"),
+            &expected->weight_bytes) ||
+        !cuda_q8_f16_partner_phase_audit_parse_positive_u64(
+            getenv("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_IN_DIM"),
+            &expected->in_dim) ||
+        !cuda_q8_f16_partner_phase_audit_parse_positive_u64(
+            getenv("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_EXPECTED_OUT_DIM"),
+            &expected->out_dim)) {
+        return false;
+    }
+
+    if (expected->in_dim > UINT64_MAX - 31u) return false;
+    const uint64_t blocks = (expected->in_dim + 31u) / 32u;
+    return blocks != 0u &&
+           blocks <= UINT64_MAX / 34u &&
+           expected->out_dim <= UINT64_MAX / (blocks * 34u) &&
+           expected->weight_bytes == expected->out_dim * blocks * 34u;
+}
+
 enum cuda_q8_f16_fill_status {
     CUDA_Q8_F16_FILL_ERROR = 0,
     CUDA_Q8_F16_FILL_SUCCESS = 1,
@@ -2064,6 +2264,225 @@ static void cuda_q8_f16_plan_audit_write(
     }
 }
 
+static bool cuda_q8_f16_partner_phase_audit_targets_match_plan(
+        const char *target_list, const char *pair_list,
+        const cuda_q8_f16_partner_phase_audit_expectation &expected) {
+    if (!target_list || !target_list[0]) return true;
+
+    std::vector<cuda_q8_f16_partner_phase_audit_target> targets;
+    const char *cursor = target_list;
+    cuda_q8_f16_partner_phase_audit_target target = {};
+    int parse_rc = 0;
+    while ((parse_rc = cuda_q8_f16_partner_phase_audit_target_next(
+                &cursor, &target)) > 0) {
+        for (const cuda_q8_f16_partner_phase_audit_target &prior : targets) {
+            if (prior.label_len == target.label_len &&
+                memcmp(prior.label, target.label, target.label_len) == 0 &&
+                prior.weight_offset == target.weight_offset) {
+                fprintf(stderr,
+                        "ds4: fatal Q8 partner phase-audit candidate preflight: "
+                        "duplicate tuple %.*s@%llu\n",
+                        (int)target.label_len, target.label,
+                        (unsigned long long)target.weight_offset);
+                return false;
+            }
+        }
+        targets.push_back(target);
+    }
+    if (parse_rc < 0) {
+        fprintf(stderr,
+                "ds4: fatal Q8 partner phase-audit candidate preflight: malformed "
+                "binding@decimal-offset tuple list\n");
+        return false;
+    }
+
+    for (const cuda_q8_f16_partner_phase_audit_target &requested : targets) {
+        size_t exact_matches = 0u;
+        size_t label_matches = 0u;
+        size_t offset_matches = 0u;
+        const cuda_q8_f16_plan_candidate *exact_candidate = NULL;
+        for (const cuda_q8_f16_plan_candidate &candidate : g_q8_f16_plan) {
+            const bool label_matches_candidate =
+                strlen(candidate.label) == requested.label_len &&
+                memcmp(candidate.label, requested.label,
+                       requested.label_len) == 0;
+            const bool offset_matches_candidate =
+                candidate.offset == requested.weight_offset;
+            if (label_matches_candidate) label_matches++;
+            if (offset_matches_candidate) offset_matches++;
+            if (label_matches_candidate && offset_matches_candidate) {
+                exact_matches++;
+                exact_candidate = &candidate;
+            }
+        }
+        if (exact_matches != 1u) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit candidate preflight: "
+                    "tuple %.*s@%llu resolved exact=%zu label=%zu offset=%zu "
+                    "against %zu planned bindings\n",
+                    (int)requested.label_len, requested.label,
+                    (unsigned long long)requested.weight_offset,
+                    exact_matches, label_matches, offset_matches,
+                    g_q8_f16_plan.size());
+            return false;
+        }
+        if (!exact_candidate ||
+            exact_candidate->weight_bytes != expected.weight_bytes ||
+            exact_candidate->in_dim != expected.in_dim ||
+            exact_candidate->out_dim != expected.out_dim) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit candidate preflight: "
+                    "tuple %.*s@%llu has weight_bytes=%llu in=%llu out=%llu; "
+                    "expected weight_bytes=%llu in=%llu out=%llu\n",
+                    (int)requested.label_len, requested.label,
+                    (unsigned long long)requested.weight_offset,
+                    (unsigned long long)(exact_candidate
+                        ? exact_candidate->weight_bytes : 0u),
+                    (unsigned long long)(exact_candidate
+                        ? exact_candidate->in_dim : 0u),
+                    (unsigned long long)(exact_candidate
+                        ? exact_candidate->out_dim : 0u),
+                    (unsigned long long)expected.weight_bytes,
+                    (unsigned long long)expected.in_dim,
+                    (unsigned long long)expected.out_dim);
+            return false;
+        }
+        if (!cuda_q8_f16_partner_phase_audit_devices_selected(
+                pair_list, exact_candidate->physical_device,
+                exact_candidate->fallback_physical_device)) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit candidate preflight: "
+                    "tuple %.*s@%llu plans consumer_device=%d "
+                    "fallback_device=%d outside audited logical pairs %s\n",
+                    (int)requested.label_len, requested.label,
+                    (unsigned long long)requested.weight_offset,
+                    exact_candidate->physical_device,
+                    exact_candidate->fallback_physical_device,
+                    pair_list && pair_list[0] ? pair_list : "none");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool cuda_q8_f16_partner_phase_audit_targets_match_bindings(
+        const char *target_list, const char *pair_list,
+        const cuda_q8_f16_partner_phase_audit_expectation &expected) {
+    if (!target_list || !target_list[0]) return true;
+
+    std::vector<cuda_q8_f16_partner_phase_audit_target> targets;
+    size_t target_count = 0u;
+    const char *cursor = target_list;
+    cuda_q8_f16_partner_phase_audit_target target = {};
+    int parse_rc = 0;
+    while ((parse_rc = cuda_q8_f16_partner_phase_audit_target_next(
+                &cursor, &target)) > 0) {
+        for (const cuda_q8_f16_partner_phase_audit_target &prior : targets) {
+            if (prior.label_len == target.label_len &&
+                memcmp(prior.label, target.label, target.label_len) == 0 &&
+                prior.weight_offset == target.weight_offset) {
+                fprintf(stderr,
+                        "ds4: fatal Q8 partner phase-audit materialized-binding "
+                        "preflight: duplicate tuple %.*s@%llu\n",
+                        (int)target.label_len, target.label,
+                        (unsigned long long)target.weight_offset);
+                return false;
+            }
+        }
+        targets.push_back(target);
+        size_t exact_matches = 0u;
+        const cuda_q8_f16_binding *exact_binding = NULL;
+        for (const cuda_q8_f16_binding &binding : g_q8_f16_bindings) {
+            if (strlen(binding.label) != target.label_len ||
+                memcmp(binding.label, target.label, target.label_len) != 0 ||
+                binding.offset != target.weight_offset) {
+                continue;
+            }
+            exact_matches++;
+            exact_binding = &binding;
+        }
+        if (exact_matches != 1u) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit materialized-binding "
+                    "preflight: tuple %.*s@%llu resolved exact=%zu against "
+                    "%zu materialized bindings\n",
+                    (int)target.label_len, target.label,
+                    (unsigned long long)target.weight_offset,
+                    exact_matches, g_q8_f16_bindings.size());
+            return false;
+        }
+        if (!exact_binding || !exact_binding->partner_offload ||
+            exact_binding->partner_scratch_tokens == 0u ||
+            exact_binding->partner_arithmetic ==
+                CUDA_Q8_PARTNER_ARITHMETIC_INVALID) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit materialized-binding "
+                    "preflight: tuple %.*s@%llu is not an executable partner "
+                    "binding (partner=%d scratch_tokens=%llu arithmetic=%d)\n",
+                    (int)target.label_len, target.label,
+                    (unsigned long long)target.weight_offset,
+                    exact_binding ? exact_binding->partner_offload : 0,
+                    (unsigned long long)(exact_binding
+                        ? exact_binding->partner_scratch_tokens : 0u),
+                    exact_binding ? exact_binding->partner_arithmetic
+                                  : CUDA_Q8_PARTNER_ARITHMETIC_INVALID);
+            return false;
+        }
+        if (exact_binding->weight_bytes != expected.weight_bytes ||
+            exact_binding->in_dim != expected.in_dim ||
+            exact_binding->out_dim != expected.out_dim) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit materialized-binding "
+                    "preflight: tuple %.*s@%llu has weight_bytes=%llu in=%llu "
+                    "out=%llu; expected weight_bytes=%llu in=%llu out=%llu\n",
+                    (int)target.label_len, target.label,
+                    (unsigned long long)target.weight_offset,
+                    (unsigned long long)exact_binding->weight_bytes,
+                    (unsigned long long)exact_binding->in_dim,
+                    (unsigned long long)exact_binding->out_dim,
+                    (unsigned long long)expected.weight_bytes,
+                    (unsigned long long)expected.in_dim,
+                    (unsigned long long)expected.out_dim);
+            return false;
+        }
+        if (!cuda_q8_f16_partner_phase_audit_devices_selected(
+                pair_list, exact_binding->consumer_device,
+                exact_binding->resident_device)) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit materialized-binding "
+                    "preflight: tuple %.*s@%llu resolved consumer_device=%d "
+                    "resident_device=%d outside audited logical pairs %s\n",
+                    (int)target.label_len, target.label,
+                    (unsigned long long)target.weight_offset,
+                    exact_binding->consumer_device,
+                    exact_binding->resident_device,
+                    pair_list && pair_list[0] ? pair_list : "none");
+            return false;
+        }
+        target_count++;
+    }
+    if (parse_rc < 0) {
+        fprintf(stderr,
+                "ds4: fatal Q8 partner phase-audit materialized-binding "
+                "preflight: malformed binding@decimal-offset tuple list\n");
+        return false;
+    }
+
+    fprintf(stderr,
+            "ds4: CUDA q8 partner phase-audit target preflight validated "
+            "%zu exact partner tuples against %zu materialized bindings "
+            "audited_pairs=%s expected_weight_bytes=%llu expected_in=%llu "
+            "expected_out=%llu\n",
+            target_count, g_q8_f16_bindings.size(), pair_list,
+            (unsigned long long)expected.weight_bytes,
+            (unsigned long long)expected.in_dim,
+            (unsigned long long)expected.out_dim);
+    fflush(stderr);
+    (void)fsync(fileno(stderr));
+    return true;
+}
+
 static int cuda_q8_partner_arithmetic_mode(void) {
     const char *value = getenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
     if (!value || !value[0] || strcmp(value, "f16") == 0) {
@@ -2943,6 +3362,26 @@ static void cuda_q8_f16_plan_materialize(void) {
         }
     }
     g_q8_f16_plan_active = 0;
+
+    /* Preserve the shipping first-use materialization point.  A targeted
+     * audit validates the now-final binding inventory before the lookup that
+     * triggered materialization can return and before the materialized state
+     * is published for any projection to use. */
+    const char *phase_audit_targets = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS");
+    if (phase_audit_targets && phase_audit_targets[0]) {
+        const char *phase_audit_pairs = getenv(
+            "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
+        cuda_q8_f16_partner_phase_audit_expectation expected = {};
+        if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+                phase_audit_pairs, g_n_gpus, true) ||
+            !cuda_q8_f16_partner_phase_audit_expectation_load(&expected) ||
+            !cuda_q8_f16_partner_phase_audit_targets_match_bindings(
+                phase_audit_targets, phase_audit_pairs, expected)) {
+            fflush(stderr);
+            abort();
+        }
+    }
     g_q8_f16_plan_materializing = 0;
     g_q8_f16_plan_materialized = 1;
     fprintf(stderr,
@@ -3847,6 +4286,39 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    const char *phase_audit_targets = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS");
+    const bool phase_audit_targets_requested =
+        phase_audit_targets && phase_audit_targets[0];
+    if (phase_audit_targets &&
+        !cuda_q8_f16_partner_phase_audit_targets_valid(
+            phase_audit_targets)) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS; "
+                "expected binding@decimal-offset[,binding@decimal-offset...]\n");
+        return 0;
+    }
+    const char *phase_audit_pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            phase_audit_pairs, cfg->n_gpus,
+            phase_audit_targets_requested)) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS; "
+                "expected a unique in-range decimal pair list, and TARGETS "
+                "requires at least one selected pair\n");
+        return 0;
+    }
+    if (phase_audit_targets_requested) {
+        cuda_q8_f16_partner_phase_audit_expectation expected = {};
+        if (!cuda_q8_f16_partner_phase_audit_expectation_load(&expected)) {
+            fprintf(stderr,
+                    "ds4: targeted Q8 partner phase audit requires exact positive "
+                    "EXPECTED_WEIGHT_BYTES, EXPECTED_IN_DIM, and EXPECTED_OUT_DIM "
+                    "whose values form a valid Q8_0 matrix\n");
+            return 0;
+        }
+    }
     cuda_xdev_env_refresh();
     cuda_decode_dispatch_env_refresh();
     g_current_logical_tier = -1;
@@ -6378,9 +6850,25 @@ extern "C" int ds4_gpu_cache_q8_f16_range_on_device(
 
 extern "C" void ds4_gpu_q8_f16_plan_end(void) {
     g_q8_f16_plan_active = 0;
+    const char *phase_audit_targets = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS");
+    if (phase_audit_targets && phase_audit_targets[0]) {
+        const char *phase_audit_pairs = getenv(
+            "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
+        cuda_q8_f16_partner_phase_audit_expectation expected = {};
+        if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+                phase_audit_pairs, g_n_gpus, true) ||
+            !cuda_q8_f16_partner_phase_audit_expectation_load(&expected) ||
+            !cuda_q8_f16_partner_phase_audit_targets_match_plan(
+                phase_audit_targets, phase_audit_pairs, expected)) {
+            fflush(stderr);
+            abort();
+        }
+    }
     g_q8_f16_plan_finalized = 1;
     fprintf(stderr,
-            "ds4: CUDA q8 fp16 benefit plan registered %llu candidates for deferred materialization\n",
+            "ds4: CUDA q8 fp16 benefit plan registered %llu candidates for "
+            "deferred materialization\n",
             (unsigned long long)g_q8_f16_plan_candidates);
 }
 
@@ -16257,6 +16745,31 @@ static void cuda_q8_f16_partner_phase_audit_log(
 
 static bool cuda_q8_f16_partner_phase_audit_binding_selected(
         const char *binding_label, uint64_t weight_offset) {
+    const char *target_list = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_TARGETS");
+    if (target_list && target_list[0]) {
+        bool matched = false;
+        const char *cursor = target_list;
+        cuda_q8_f16_partner_phase_audit_target target = {};
+        int parse_rc = 0;
+        while ((parse_rc = cuda_q8_f16_partner_phase_audit_target_next(
+                    &cursor, &target)) > 0) {
+            if (binding_label && strlen(binding_label) == target.label_len &&
+                memcmp(binding_label, target.label, target.label_len) == 0 &&
+                target.weight_offset == weight_offset) {
+                matched = true;
+            }
+        }
+        if (parse_rc < 0) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit target tuple list "
+                    "became malformed after initialization\n");
+            fflush(stderr);
+            abort();
+        }
+        return matched;
+    }
+
     const char *label_filter = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_BINDING_LABEL");
     const char *offset_filter = getenv(
@@ -16351,8 +16864,21 @@ static int cuda_q8_f16_partner_matmul_impl(
         "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", home_tier);
     const bool serialize_pair = cuda_env_pair_list_contains(
         "DS4_CUDA_Q8_F16_PARTNER_SERIALIZE_PAIRS", home_tier);
-    const bool phase_audit_pair = cuda_env_pair_list_contains(
-        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS", home_tier);
+    const char *phase_audit_pair_list = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS");
+    bool phase_audit_pair = false;
+    if (phase_audit_pair_list && phase_audit_pair_list[0]) {
+        if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+                phase_audit_pair_list, g_n_gpus, false)) {
+            fprintf(stderr,
+                    "ds4: fatal Q8 partner phase-audit pair list became "
+                    "malformed after initialization\n");
+            fflush(stderr);
+            abort();
+        }
+        phase_audit_pair = cuda_q8_f16_partner_phase_audit_pair_selected(
+            phase_audit_pair_list, g_n_gpus, home_tier);
+    }
     const bool phase_audit_call = phase_audit_pair &&
         cuda_q8_f16_partner_phase_audit_binding_selected(
             binding->label, weight_offset);

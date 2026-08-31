@@ -3433,6 +3433,75 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
+The targeted layer-14 archive completed both of its strict seven-event chains
+(warmup and the first measured microbatch). The immediately following
+uninstrumented layer-15 `attn_output_b` result D2H then surfaced
+`unspecified launch failure`, and both pair-0 recovery synchronizations failed.
+That evidence rules out a synchronous failure inside either audited layer-14
+chain and argues against layer 14 as a unique failing binding, while leaving a
+delayed physical effect possible. It cannot tell whether layer-15 compute failed
+asynchronously or its result-copy call was the first failing operation because
+layer 15 had no pre/post-compute fences.
+
+The next one-arm diagnostic is `attention-q8-l14-l15-phase-audit`. It preserves
+the layer-14 checkpoints so the known clean boundary is not removed, and adds
+the same checkpoints to the adjacent exact tuple
+`tensor:blk.15.attn_output_b.weight@143723876608`. The selector consumes paired
+`binding@offset` identities, not independent label and offset lists. A completed
+arm must contain 65 complete chains for each binding (130 chains and 910 marker
+lines total), with no layer-15 start outrunning the corresponding count of
+layer-14 starts. At initialization the backend strictly validates the target
+tuple list, audited logical-pair list, and exact expected Q8 shape. It checks
+each label/absolute-offset pair and its home/partner direction against the
+active model's Q8 plan. Materialization remains at the ordinary production
+first-use boundary; before that first lookup can return, the backend requires
+exactly one executable partner binding of the expected shape and physical pair
+for each tuple. A stale or ambiguous hard-coded offset, malformed pair list, or
+wrong binding therefore terminates the process instead of silently disabling
+its markers, without moving cache planning ahead of session allocation.
+Pair-0 attention/Q8 host-bounce, 50/50 row splitting, partner
+compute, pair-1 direct transport, the 250 W power requirement, and the 500
+prefill tok/s success floor remain unchanged. A passing arm means only that the
+workload survived after perturbing both adjacent overlap windows; it is not a
+production mitigation or root-cause proof.
+
+Run it from a clean boot and a fresh output directory:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-l14-l15-phase-audit-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-l14-l15-phase-audit \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

@@ -12,10 +12,29 @@ from pathlib import Path
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
     "attention-q8-phase-audit", "attention-q8-targeted-phase-audit",
+    "attention-q8-l14-l15-phase-audit",
     "attention-query-dst", "attention-gather-dst",
     "attention-both-dst", "attention-phase-audit", "attention-end-fence",
     "attention-row-boundary-audit", "partner-bounce", "bounce-indexer-off",
     "partner-serialized", "indexer-off", "production"
+)
+
+Q8_WINDOW_L14_LABEL = "tensor:blk.14.attn_output_b.weight"
+Q8_WINDOW_L14_OFFSET = "143571266304"
+Q8_WINDOW_L15_LABEL = "tensor:blk.15.attn_output_b.weight"
+Q8_WINDOW_L15_OFFSET = "143723876608"
+Q8_WINDOW_TARGETS = {
+    Q8_WINDOW_L14_LABEL: Q8_WINDOW_L14_OFFSET,
+    Q8_WINDOW_L15_LABEL: Q8_WINDOW_L15_OFFSET,
+}
+Q8_WINDOW_CHAIN = (
+    ("begin", "activation-prepare"),
+    ("activation-complete", "activation-copy"),
+    ("pre-compute-sync-begin", "pre-compute-sync"),
+    ("pre-compute-complete", "pre-compute-sync"),
+    ("compute-submitted", "compute"),
+    ("compute-complete", "compute-sync"),
+    ("result-complete", "result-gather"),
 )
 
 
@@ -150,7 +169,7 @@ def first_host_bounce_failure_context(text: str) -> str:
 
 
 def q8_partner_phase_audit_markers(
-        text: str, pair: int) -> list[dict[str, str]]:
+        text: str, pair: int | None) -> list[dict[str, str]]:
     pattern = re.compile(
         r"q8 partner phase audit sequence=(\d+) event=(\S+) stage=(\S+) "
         r"binding_label=(\S+) passed_label=(\S+) weight_offset=(\d+) "
@@ -172,7 +191,7 @@ def q8_partner_phase_audit_markers(
             "result_bytes", "cuda_error",
         )
         marker = dict(zip(fields, match.groups()))
-        if marker["home_tier"] != str(pair):
+        if pair is not None and marker["home_tier"] != str(pair):
             continue
         marker["cuda_phase"] = ""
         if index > 0:
@@ -184,6 +203,182 @@ def q8_partner_phase_audit_markers(
                 marker["cuda_phase"] = phase_match.group(1)
         markers.append(marker)
     return markers
+
+
+def q8_partner_phase_audit_window_marker_state(
+        text: str, expected_per_binding: int) -> str:
+    if expected_per_binding <= 0:
+        return "invalid-expected-count"
+    marker_prefix = "ds4: CUDA q8 partner phase audit sequence="
+    raw_count = sum(marker_prefix in line for line in text.splitlines())
+    markers = q8_partner_phase_audit_markers(text, None)
+    if len(markers) != raw_count:
+        return "malformed-marker"
+
+    chains: defaultdict[int, list[tuple[str, str]]] = defaultdict(list)
+    sequence_binding: dict[int, str] = {}
+    for marker in markers:
+        if (marker["home_tier"] != "0" or marker["home_device"] != "0" or
+                marker["partner_tier"] != "2" or
+                marker["partner_device"] != "1"):
+            return "wrong-pair-or-device"
+        binding = marker["binding_label"]
+        if (binding not in Q8_WINDOW_TARGETS or
+                marker["weight_offset"] != Q8_WINDOW_TARGETS[binding]):
+            return "wrong-target-tuple"
+        if (marker["passed_label"] != "attn_output_b" or
+                marker["tokens"] != "512" or marker["in"] != "8192" or
+                marker["out"] != "4096" or
+                marker["transfer_bytes"] != "8388608" or
+                marker["result_bytes"] != "8388608" or
+                marker["cuda_error"] != "none"):
+            return "wrong-target-shape-or-result"
+        sequence = int(marker["sequence"])
+        prior_binding = sequence_binding.setdefault(sequence, binding)
+        if prior_binding != binding:
+            return "sequence-identity-changed"
+        chains[sequence].append((marker["event"], marker["stage"]))
+
+    expected_total = expected_per_binding * 2
+    if set(chains) != set(range(1, expected_total + 1)):
+        return "sequence-set-mismatch"
+    counts = {label: 0 for label in Q8_WINDOW_TARGETS}
+    layer14_seen = 0
+    layer15_seen = 0
+    for sequence in range(1, expected_total + 1):
+        if tuple(chains[sequence]) != Q8_WINDOW_CHAIN:
+            return f"sequence-{sequence}-chain-mismatch"
+        binding = sequence_binding[sequence]
+        counts[binding] += 1
+        if binding == Q8_WINDOW_L14_LABEL:
+            layer14_seen += 1
+        else:
+            layer15_seen += 1
+            if layer15_seen > layer14_seen:
+                return "layer15-preceded-layer14"
+    if any(count != expected_per_binding for count in counts.values()):
+        return "per-binding-count-mismatch"
+    return "complete"
+
+
+def q8_partner_phase_audit_window_summary(
+        text: str, pair: int) -> tuple[str, str, str, str]:
+    markers = q8_partner_phase_audit_markers(text, pair)
+    exact_markers = [
+        marker for marker in markers
+        if (marker["binding_label"] in Q8_WINDOW_TARGETS and
+            marker["weight_offset"] == Q8_WINDOW_TARGETS[
+                marker["binding_label"]])
+    ]
+    failure_events = {
+        "activation-copy-failed", "pre-compute-sync-failed",
+        "compute-submit-failed", "compute-sync-failed",
+        "result-copy-failed", "home-restore-failed",
+    }
+    complete_markers = [
+        marker for marker in exact_markers
+        if marker["event"] == "result-complete"
+    ]
+    complete_sequences = {
+        label: {
+            marker["sequence"] for marker in complete_markers
+            if marker["binding_label"] == label
+        }
+        for label in Q8_WINDOW_TARGETS
+    }
+    last_complete = (
+        format_q8_partner_phase_audit_marker(complete_markers[-1])
+        if complete_markers else ""
+    )
+    first_failure_index = next((
+        index for index, marker in enumerate(exact_markers)
+        if marker["event"] in failure_events
+    ), None)
+    first_failure = (
+        exact_markers[first_failure_index]
+        if first_failure_index is not None else {}
+    )
+    classification = "inconclusive"
+    if first_failure:
+        binding = first_failure["binding_label"]
+        event = first_failure["event"]
+        if binding == Q8_WINDOW_L14_LABEL:
+            classification = {
+                "activation-copy-failed": "layer14-activation-copy",
+                "pre-compute-sync-failed": "before-layer14-compute",
+                "compute-submit-failed": "layer14-compute-submit",
+                "compute-sync-failed":
+                    "layer14-compute-or-concurrent-partner-work",
+            }.get(event, "layer14-recovery-failure")
+            if event == "result-copy-failed":
+                _, _, base_classification = q8_partner_phase_audit_summary(
+                    text, pair
+                )
+                classification = (
+                    "layer14-" + base_classification
+                    if base_classification != "inconclusive"
+                    else "layer14-result-copy-after-compute"
+                )
+        else:
+            prior_markers = exact_markers[:first_failure_index]
+            l15_started = {
+                marker["sequence"] for marker in prior_markers
+                if (marker["binding_label"] == Q8_WINDOW_L15_LABEL and
+                    marker["event"] == "begin")
+            }
+            l14_completed = {
+                marker["sequence"] for marker in prior_markers
+                if (marker["binding_label"] == Q8_WINDOW_L14_LABEL and
+                    marker["event"] == "result-complete")
+            }
+            prior_l14_complete = (
+                first_failure["sequence"] in l15_started and
+                len(l14_completed) >= len(l15_started)
+            )
+            if not prior_l14_complete:
+                classification = (
+                    "layer15-failure-without-prior-layer14-completion"
+                )
+            elif event in {"activation-copy-failed", "pre-compute-sync-failed"}:
+                classification = "between-layer14-result-and-layer15-compute"
+            elif event == "compute-submit-failed":
+                classification = "layer15-compute-submit-after-layer14"
+            elif event == "compute-sync-failed":
+                classification = "layer15-compute-or-concurrent-partner-work"
+            elif event == "result-copy-failed":
+                _, _, base_classification = q8_partner_phase_audit_summary(
+                    text, pair
+                )
+                classification = (
+                    "layer15-" + base_classification
+                    if base_classification != "inconclusive"
+                    else "layer15-result-copy-after-compute"
+                )
+            else:
+                classification = "layer15-recovery-failure-after-layer14"
+    elif exact_markers and exact_markers[-1]["event"] != "result-complete":
+        if exact_markers[-1]["binding_label"] == Q8_WINDOW_L14_LABEL:
+            classification = (
+                "layer14-partial-after-prior-completion"
+                if complete_markers else "layer14-partial-no-completion"
+            )
+        elif (len(complete_sequences[Q8_WINDOW_L14_LABEL]) >
+              len(complete_sequences[Q8_WINDOW_L15_LABEL])):
+            classification = "layer14-complete-layer15-not-complete"
+        else:
+            classification = "layer15-partial-without-confirmed-layer14"
+    elif (len(complete_sequences[Q8_WINDOW_L14_LABEL]) >
+          len(complete_sequences[Q8_WINDOW_L15_LABEL])):
+        classification = "layer14-complete-layer15-not-complete"
+    elif complete_sequences[Q8_WINDOW_L14_LABEL] and complete_sequences[
+            Q8_WINDOW_L15_LABEL]:
+        classification = "both-targets-complete"
+    return (
+        last_complete,
+        str(len(complete_sequences[Q8_WINDOW_L14_LABEL])),
+        str(len(complete_sequences[Q8_WINDOW_L15_LABEL])),
+        classification,
+    )
 
 
 def format_q8_partner_phase_audit_marker(marker: dict[str, str]) -> str:
@@ -497,6 +692,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     attention_q8_targeted_phase_audit = outcomes.get(
         "attention-q8-targeted-phase-audit", "not-run"
     )
+    attention_q8_l14_l15_phase_audit = outcomes.get(
+        "attention-q8-l14-l15-phase-audit", "not-run"
+    )
     query_dst = outcomes.get("attention-query-dst", "not-run")
     gather_dst = outcomes.get("attention-gather-dst", "not-run")
     both_dst = outcomes.get("attention-both-dst", "not-run")
@@ -545,6 +743,14 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     ]
     attention_q8_targeted_phase_audit_problem_rows = [
         row for row in attention_q8_targeted_phase_audit_rows
+        if row.get("status") not in {"passed", "completed-no-result"}
+    ]
+    attention_q8_l14_l15_phase_audit_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-l14-l15-phase-audit"
+    ]
+    attention_q8_l14_l15_phase_audit_problem_rows = [
+        row for row in attention_q8_l14_l15_phase_audit_rows
         if row.get("status") not in {"passed", "completed-no-result"}
     ]
 
@@ -899,6 +1105,184 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "Its last durable query-copy, partner-attention, home-attention, or "
             "result-gather record, if present, remains the observation boundary; "
             "determine GPU health before classifying the arm as passed or failed."
+        )
+    if attention_q8_l14_l15_phase_audit in {"failed", "incomplete"}:
+        problem_rows = attention_q8_l14_l15_phase_audit_problem_rows
+        corroborated_problem_rows = [
+            row for row in problem_rows
+            if (
+                row.get("status") in {
+                    "failed-device-loss", "interrupted-prior-run-device-loss",
+                    "interrupted-no-result-device-loss",
+                } or row.get("watch_status") == "lost-device-detected" or
+                row.get("post_health") == "unhealthy"
+            )
+        ]
+        classifications = sorted({
+            row.get("q8_window_classification", "")
+            for row in corroborated_problem_rows
+            if row.get("q8_window_classification", "") not in {
+                "", "inconclusive"
+            }
+        })
+        window_scope = (
+            " The cumulative window targets the exact tuples "
+            "`tensor:blk.14.attn_output_b.weight@143571266304` and "
+            "`tensor:blk.15.attn_output_b.weight@143723876608`. Pair-0 "
+            "attention and Q8 payloads remain host-bounced, the 50/50 row split "
+            "and all partner compute remain enabled, and pair 1 remains direct."
+            + indexer_observation(problem_rows)
+        )
+        if not corroborated_problem_rows:
+            return (
+                "The cumulative layer-14/layer-15 arm ended without a watcher record "
+                "or unhealthy post-run snapshot corroborating device loss. Its last "
+                "durable completed binding and any later partial-chain marker are "
+                "preserved, but a Ctrl-C or ordinary process failure is not causal GPU-"
+                "loss evidence."
+                + window_scope
+            )
+        if len(classifications) > 1:
+            return (
+                "Repeated cumulative layer-14/layer-15 arms produced different "
+                "first-boundary classifications (`" + "`, `".join(classifications) +
+                "`). Preserve each repeat separately; the combined result does not "
+                "support one causal boundary." + window_scope
+            )
+        classified_row = next((
+            row for row in reversed(corroborated_problem_rows)
+            if row.get("q8_window_classification", "") not in {
+                "", "inconclusive"
+            }
+        ), {})
+        classification = classified_row.get(
+            "q8_window_classification", "inconclusive"
+        )
+        if classification in {"layer14-activation-copy", "before-layer14-compute"}:
+            return (
+                "The cumulative audit surfaced its first synchronous error before "
+                "layer 14 partner compute was submitted. The boundary includes the "
+                "layer-14 activation-copy helper and earlier/concurrent partner work; "
+                "it does not assign the fault to layer-14 compute or result gather."
+                + window_scope
+            )
+        if classification == "layer14-compute-submit":
+            return (
+                "The layer-14 pre-compute boundary completed, but submission of the "
+                "layer-14 attention-output projection failed. The first observed "
+                "error is after the clean pre-boundary and before a completed target "
+                "kernel; it does not identify the physical endpoint."
+                + window_scope
+            )
+        if classification == "layer14-compute-or-concurrent-partner-work":
+            return (
+                "The layer-14 pre-compute boundary completed and its projection was "
+                "submitted, but the post-compute partner synchronization failed. The "
+                "first synchronous error lies in that compute interval or concurrent "
+                "partner work, before the layer-14 result copy."
+                + window_scope
+            )
+        if classification.startswith("layer14-result-"):
+            return (
+                "Layer 14 completed both compute boundaries before its result-copy "
+                "helper failed. This localizes where CUDA first surfaced the error, "
+                "but does not prove that the transfer caused the endpoint loss or "
+                "distinguish GPU, PCIe, host-memory, power, and driver causes."
+                + window_scope
+            )
+        if classification == "between-layer14-result-and-layer15-compute":
+            return (
+                "A layer-14 result chain completed before the layer-15 activation or "
+                "pre-compute boundary failed. The first observed error is therefore "
+                "after completed layer-14 result handling and before layer-15 compute "
+                "was submitted; intervening/concurrent partner work remains in scope."
+                + window_scope
+            )
+        if classification == "layer15-compute-submit-after-layer14":
+            return (
+                "Layer 14 completed, and the layer-15 pre-compute boundary was reached, "
+                "but layer-15 projection submission failed. This separates the failure "
+                "from the completed layer-14 result path without assigning a physical "
+                "root cause."
+                + window_scope
+            )
+        if classification == "layer15-compute-or-concurrent-partner-work":
+            return (
+                "Layer 14 completed and layer-15 compute was submitted after a clean "
+                "pre-compute boundary, but layer-15 post-compute synchronization "
+                "failed. The first synchronous error lies in layer-15 compute or "
+                "concurrent partner work, not its result copy."
+                + window_scope
+            )
+        if classification.startswith("layer15-result-"):
+            return (
+                "Both layer-14 and layer-15 compute boundaries completed before the "
+                "layer-15 result-copy helper failed. This is the strongest software "
+                "observation boundary for that transfer call, but it is still not proof "
+                "that PCIe transfer caused the physical endpoint loss."
+                + window_scope
+            )
+        if classification == "both-targets-complete":
+            return (
+                "At least one complete layer-14/layer-15 target pair crossed every "
+                "activation, compute, and result boundary before the arm later lost a "
+                "device or ended. The first observed failure moved downstream of the "
+                "instrumented window, arguing against one unique layer-14 or layer-15 "
+                "binding defect; a cumulative workload/overlap trigger or delayed "
+                "physical effect remains possible."
+                + window_scope
+            )
+        if classification.startswith("layer14-partial-"):
+            return (
+                "A prior target chain completed, but the final durable observation is "
+                "inside a later layer-14 chain with no explicit phase-failure marker. "
+                "The failure therefore did not demonstrably move downstream of the "
+                "instrumented window; the exact last checkpoint remains the boundary."
+                + window_scope
+            )
+        if classification == "layer14-complete-layer15-not-complete":
+            return (
+                "The last durable completed target is layer 14, while layer 15 did not "
+                "complete and emitted no classified phase-failure marker. The current "
+                "observation window is after layer-14 result completion and within or "
+                "before layer-15 handling; do not relabel the disappearance as a proven "
+                "layer-15 transfer failure."
+                + window_scope
+            )
+        if classification == "layer15-partial-without-confirmed-layer14":
+            return (
+                "The final durable observation is a partial layer-15 chain without "
+                "enough completed layer-14 chains to establish the intended paired "
+                "boundary. Preserve the raw ordering, but do not make a layer-specific "
+                "causal inference from this arm."
+                + window_scope
+            )
+        return (
+            "The cumulative layer-14/layer-15 arm ended without a classified target "
+            "failure. Its separately recorded last completed binding and first partial "
+            "chain are the observation boundary; the result is otherwise inconclusive."
+            + window_scope
+        )
+    if attention_q8_l14_l15_phase_audit == "passed":
+        return (
+            "The cumulative layer-14/layer-15 Q8 audit completed all 65 chains for "
+            "each exact binding at the validated production-load floor. Survival means "
+            "the workload can complete when both adjacent overlap windows are perturbed; "
+            "it does not prove either window caused prior failures, identify the root "
+            "cause, or establish a production mitigation."
+            + indexer_observation(attention_q8_l14_l15_phase_audit_rows)
+        )
+    if attention_q8_l14_l15_phase_audit == "underloaded":
+        return (
+            "The cumulative layer-14/layer-15 Q8 audit completed below the required "
+            "500 prefill tok/s floor. Its marker chains remain useful, but underloaded "
+            "survival cannot identify the trigger."
+        )
+    if attention_q8_l14_l15_phase_audit == "invalid":
+        return (
+            "The cumulative layer-14/layer-15 Q8 audit failed paired-target marker, "
+            "production-path, throughput, or health validation and is invalid for "
+            "causal comparison."
         )
     if attention_q8_targeted_phase_audit in {"failed", "incomplete"}:
         classified_row = next((
@@ -1575,6 +1959,14 @@ def main() -> None:
         q8_phase_last, q8_phase_first_failure, q8_phase_classification = (
             q8_partner_phase_audit_summary(log_text, 0)
         )
+        if variant == "attention-q8-l14-l15-phase-audit":
+            (q8_window_last_complete, q8_window_l14_complete,
+             q8_window_l15_complete, q8_window_classification) = (
+                q8_partner_phase_audit_window_summary(log_text, 0)
+            )
+        else:
+            (q8_window_last_complete, q8_window_l14_complete,
+             q8_window_l15_complete, q8_window_classification) = ("", "", "", "")
         row = {
             "variant": variant,
             "status": status,
@@ -1598,6 +1990,10 @@ def main() -> None:
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
+            "q8_window_last_complete": q8_window_last_complete,
+            "q8_window_l14_complete": q8_window_l14_complete,
+            "q8_window_l15_complete": q8_window_l15_complete,
+            "q8_window_classification": q8_window_classification,
             "pair0_attention_query_copy_schedule": query_schedule,
             "pair0_attention_gather_copy_schedule": gather_schedule,
             "pair0_attention_query_copy_transport": query_transport,
@@ -1662,14 +2058,16 @@ def main() -> None:
         "| Variant | Outcome | Prefill tok/s | Decode tok/s | Last phase | Last event | "
         "Q8 transport | Serialized | Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
-        "Q8 phase classification | "
+        "Q8 phase classification | Q8 window last complete | "
+        "Q8 window L14 complete | Q8 window L15 complete | "
+        "Q8 window classification | "
         "Pair-0 indexer begun bytes | Query copy schedule | Gather copy schedule | "
         "Query copy transport | Gather copy transport | Cache copy transport | "
         "Top-k copy transport | Host-bounce checkpoint | Host-bounce failure context | "
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | ---: | ---: | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
@@ -1681,6 +2079,10 @@ def main() -> None:
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
             f"{row.get('q8_phase_audit_classification', '')} | "
+            f"{row.get('q8_window_last_complete', '')} | "
+            f"{row.get('q8_window_l14_complete', '0')} | "
+            f"{row.get('q8_window_l15_complete', '0')} | "
+            f"{row.get('q8_window_classification', '')} | "
             f"{row.get('pair0_indexer_begin_bytes', '0')} | "
             f"{row.get('pair0_attention_query_copy_schedule', '')} | "
             f"{row.get('pair0_attention_gather_copy_schedule', '')} | "
@@ -1715,7 +2117,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if (len(sys.argv) == 6 and
+    if (len(sys.argv) == 4 and
+            sys.argv[1] == "--validate-q8-l14-l15-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_phase_audit_window_marker_state(
+            log_path.read_text(errors="replace"),
+            int(sys.argv[3]),
+        )
+        if state != "complete":
+            fail(f"Q8 layer-14/layer-15 marker sequence is {state}")
+    elif (len(sys.argv) == 6 and
             sys.argv[1] == "--validate-attention-row-boundary-log"):
         log_path = Path(sys.argv[2])
         state = attention_row_boundary_marker_state(

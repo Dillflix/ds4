@@ -72,16 +72,40 @@ def complete_row_boundary_log() -> str:
 def q8_phase_marker(
         sequence: int, event: str, stage: str, *, home_tier: int = 0,
         home_device: int = 0, partner_tier: int = 2,
-        partner_device: int = 1, cuda_error: str = "none") -> str:
+        partner_device: int = 1, cuda_error: str = "none",
+        binding_label: str = "tensor:blk.14.attn_output_b.weight",
+        weight_offset: int = 143571266304) -> str:
     return (
         "ds4: CUDA q8 partner phase audit "
         f"sequence={sequence} event={event} stage={stage} "
-        "binding_label=tensor:blk.14.attn_output_b.weight "
-        "passed_label=attn_output_b weight_offset=143571266304 "
+        f"binding_label={binding_label} "
+        f"passed_label=attn_output_b weight_offset={weight_offset} "
         f"home_tier={home_tier} home_device={home_device} "
         f"partner_tier={partner_tier} partner_device={partner_device} "
         "tokens=512 in=8192 out=4096 transfer_bytes=8388608 "
         f"result_bytes=8388608 cuda_error={cuda_error}\n"
+    )
+
+
+def q8_phase_chain(
+        sequence: int, *,
+        binding_label: str = "tensor:blk.14.attn_output_b.weight",
+        weight_offset: int = 143571266304) -> str:
+    return "".join(
+        q8_phase_marker(
+            sequence, event, stage,
+            binding_label=binding_label,
+            weight_offset=weight_offset,
+        )
+        for event, stage in (
+            ("begin", "activation-prepare"),
+            ("activation-complete", "activation-copy"),
+            ("pre-compute-sync-begin", "pre-compute-sync"),
+            ("pre-compute-complete", "pre-compute-sync"),
+            ("compute-submitted", "compute"),
+            ("compute-complete", "compute-sync"),
+            ("result-complete", "result-gather"),
+        )
     )
 
 
@@ -1746,12 +1770,369 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("does not by itself prove", report)
             self.assertIn("establish a production mitigation", report)
 
+    def test_q8_l14_l15_validator_accepts_paired_complete_chains(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "window.log"
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            log.write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2)
+                + q8_phase_chain(3, binding_label=l15,
+                                 weight_offset=143723876608)
+                + q8_phase_chain(4, binding_label=l15,
+                                 weight_offset=143723876608)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-l14-l15-log", str(log), "2",
+            ], check=True)
+
+    def test_q8_l14_l15_validator_rejects_cross_product_tuple(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "window.log"
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            log.write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143571266304)
+            )
+            result = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-l14-l15-log", str(log), "1",
+            ], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("wrong-target-tuple", result.stderr)
+
+    def test_q8_l14_l15_validator_rejects_layer15_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "window.log"
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            log.write_text(
+                q8_phase_chain(1, binding_label=l15,
+                               weight_offset=143723876608)
+                + q8_phase_chain(2)
+            )
+            result = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-l14-l15-log", str(log), "1",
+            ], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("layer15-preceded-layer14", result.stderr)
+
+    def test_q8_l14_l15_precompute_failure_is_between_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_marker(
+                    2, "begin", "activation-prepare",
+                    binding_label=l15, weight_offset=143723876608,
+                )
+                + q8_phase_marker(
+                    2, "activation-complete", "activation-copy",
+                    binding_label=l15, weight_offset=143723876608,
+                )
+                + q8_phase_marker(
+                    2, "pre-compute-sync-begin", "pre-compute-sync",
+                    binding_label=l15, weight_offset=143723876608,
+                )
+                + q8_phase_marker(
+                    2, "pre-compute-sync-failed", "pre-compute-sync",
+                    binding_label=l15, weight_offset=143723876608,
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_window_classification"],
+                "between-layer14-result-and-layer15-compute",
+            )
+            self.assertEqual(row["q8_window_l14_complete"], "1")
+            self.assertEqual(row["q8_window_l15_complete"], "0")
+            report = (root / "summary.md").read_text()
+            self.assertIn("after completed layer-14 result handling", report)
+            self.assertIn("before layer-15 compute was submitted", report)
+
+    def test_q8_l14_l15_d2h_failure_is_layer15_result_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            prefix = q8_phase_chain(1)
+            for event, stage in (
+                    ("begin", "activation-prepare"),
+                    ("activation-complete", "activation-copy"),
+                    ("pre-compute-sync-begin", "pre-compute-sync"),
+                    ("pre-compute-complete", "pre-compute-sync"),
+                    ("compute-submitted", "compute"),
+                    ("compute-complete", "compute-sync")):
+                prefix += q8_phase_marker(
+                    2, event, stage, binding_label=l15,
+                    weight_offset=143723876608,
+                )
+            (production / f"{stem}.log").write_text(
+                prefix
+                + "ds4: CUDA default-stream bounce d2h failed: "
+                  "unspecified launch failure\n"
+                + q8_phase_marker(
+                    2, "result-copy-failed", "result-gather",
+                    binding_label=l15, weight_offset=143723876608,
+                    cuda_error="unspecified launch failure",
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_window_classification"],
+                "layer15-result-d2h-pcie-host-bounce-transfer",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("layer-15 result-copy helper failed", report)
+            self.assertIn("not proof that PCIe transfer caused", report)
+
+    def test_q8_l14_l15_both_complete_then_later_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143723876608)
+                + "ds4: gpu layer 16 attention batch encode failed\n"
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["q8_window_classification"], "both-targets-complete")
+            self.assertIn(
+                "binding_label=tensor:blk.15.attn_output_b.weight",
+                row["q8_window_last_complete"],
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("moved downstream of the instrumented window", report)
+            self.assertIn("cumulative workload/overlap trigger", report)
+            table_lines = [
+                line for line in report.splitlines() if line.startswith("|")
+            ]
+            self.assertEqual(len({line.count("|") for line in table_lines}), 1)
+
+    def test_q8_l14_l15_later_partial_layer14_is_not_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143723876608)
+                + q8_phase_marker(3, "begin", "activation-prepare")
+                + q8_phase_marker(3, "activation-complete", "activation-copy")
+                + q8_phase_marker(
+                    3, "pre-compute-sync-begin", "pre-compute-sync"
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_window_classification"],
+                "layer14-partial-after-prior-completion",
+            )
+            self.assertIn(
+                "binding_label=tensor:blk.15.attn_output_b.weight",
+                row["q8_window_last_complete"],
+            )
+            self.assertIn(
+                "binding_label=tensor:blk.14.attn_output_b.weight",
+                row["q8_phase_audit_last_checkpoint"],
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("inside a later layer-14 chain", report)
+            self.assertIn("did not demonstrably move downstream", report)
+            self.assertNotIn("moved downstream of the instrumented window", report)
+
+    def test_q8_l14_l15_later_complete_unpaired_layer14_is_not_downstream(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143723876608)
+                + q8_phase_chain(3)
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_window_classification"],
+                "layer14-complete-layer15-not-complete",
+            )
+            self.assertEqual(row["q8_window_l14_complete"], "2")
+            self.assertEqual(row["q8_window_l15_complete"], "1")
+            report = (root / "summary.md").read_text()
+            self.assertIn("last durable completed target is layer 14", report)
+            self.assertNotIn("moved downstream of the instrumented window", report)
+
+    def test_q8_l14_l15_interruption_without_loss_is_not_causal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nrepeat=1\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143723876608)
+            )
+            (production / f"{stem}-progress.csv").write_text(
+                "realtime_sec,realtime_nsec,phase,event,current,total\n"
+                "1,0,measured-prefill,chunk-start,512,32768\n"
+            )
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "interrupted-no-result")
+            self.assertEqual(row["q8_window_classification"], "both-targets-complete")
+            report = (root / "summary.md").read_text()
+            self.assertIn("without a watcher record", report)
+            self.assertIn("not causal GPU-loss evidence", report)
+            self.assertNotIn("moved downstream of the instrumented window", report)
+
+    def test_q8_l14_l15_repeat_cannot_borrow_loss_corroboration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            l15 = "tensor:blk.15.attn_output_b.weight"
+
+            interrupted_stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{interrupted_stem}.started").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nrepeat=1\n"
+            )
+            (production / f"{interrupted_stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_chain(2, binding_label=l15,
+                                 weight_offset=143723876608)
+            )
+
+            lost_stem = "r2-s2-attention-q8-l14-l15-phase-audit"
+            (production / f"{lost_stem}.started").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nrepeat=2\n"
+            )
+            (production / f"{lost_stem}.log").write_text("")
+            write_unhealthy_post(root, lost_stem)
+            write_lost_watch(root, lost_stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            report = (root / "summary.md").read_text()
+            self.assertIn("ended without a classified target failure", report)
+            self.assertNotIn("moved downstream of the instrumented window", report)
+
+    def test_q8_l14_l15_partial_layer15_preserves_last_complete_layer14(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-l14-l15-phase-audit"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-l14-l15-phase-audit\nstatus=failed\n"
+                "exit_status=1\nlast_phase=measured-prefill\n"
+            )
+            l15 = "tensor:blk.15.attn_output_b.weight"
+            (production / f"{stem}.log").write_text(
+                q8_phase_chain(1)
+                + q8_phase_marker(
+                    2, "begin", "activation-prepare",
+                    binding_label=l15, weight_offset=143723876608,
+                )
+            )
+            write_unhealthy_post(root, stem)
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_window_classification"],
+                "layer14-complete-layer15-not-complete",
+            )
+            self.assertIn(
+                "binding_label=tensor:blk.14.attn_output_b.weight",
+                row["q8_window_last_complete"],
+            )
+            self.assertIn(
+                "binding_label=tensor:blk.15.attn_output_b.weight",
+                row["q8_phase_audit_last_checkpoint"],
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("last durable completed target is layer 14", report)
+
     def test_q8_phase_audit_variant_sorts_after_combined_host_bounce(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             production = root / "production"
             production.mkdir()
             for slot, variant in enumerate((
+                    "attention-q8-l14-l15-phase-audit",
                     "attention-q8-targeted-phase-audit",
                     "attention-q8-phase-audit",
                     "attention-q8-host-bounce"), 1):
@@ -1770,6 +2151,7 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                     "attention-q8-host-bounce",
                     "attention-q8-phase-audit",
                     "attention-q8-targeted-phase-audit",
+                    "attention-q8-l14-l15-phase-audit",
                 ],
             )
 
