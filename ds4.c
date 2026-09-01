@@ -15558,6 +15558,17 @@ static bool cuda_tp_prefill_attn_host_bounce_pair_enabled(int home_tier) {
     return env_pair_list_contains(
         "DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS", home_tier);
 }
+
+/* Diagnostic-only execution-order cut. This retains both row halves, their
+ * exact kernels, partner-local caches, and all transport bytes, but prevents
+ * the partner and home attention kernels from overlapping. It distinguishes
+ * a concurrency/electrical trigger from a deterministic row-addressing bug
+ * without falling back to the single-GPU attention implementation. */
+static bool cuda_tp_prefill_attn_serialize_compute_pair_enabled(
+        int home_tier) {
+    return env_pair_list_contains(
+        "DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS", home_tier);
+}
 #endif
 
 /* Kept outside the GPU-only graph implementation so the CPU placement test
@@ -28725,6 +28736,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home);
     const bool host_bounce =
         metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(home);
+    const bool serialize_compute =
+        cuda_tp_prefill_attn_serialize_compute_pair_enabled(home);
     if (host_bounce && (query_copy_dst || gather_copy_dst)) {
         fprintf(stderr,
                 "ds4: CUDA prefill attention row transport override for "
@@ -28981,6 +28994,21 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             pos0 + home_rows, n_raw, raw_cap, raw_start, n_comp, window,
             ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
+    if (ok && serialize_compute) {
+        const cudaError_t sync = cudaDeviceSynchronize();
+        if (sync != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA prefill attention serialized compute failed "
+                    "target=partner kind=%s layer=%u pos=%u tokens=%u "
+                    "home=%d partner=%d status=%s\n",
+                    kind == DS4_CUDA_PREFILL_ATTN_INDEXED
+                        ? "indexed" : "mixed",
+                    il, pos0, n_tokens, home, partner,
+                    cudaGetErrorString(sync));
+            fflush(stderr);
+            ok = false;
+        }
+    }
     if (audit_partner_attention && partner_device_ready) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
             ok, "partner-attention", partner, kind, il, pos0, n_tokens,
@@ -29015,6 +29043,21 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             metal_graph_attn_comp_cache_is_f16(), NULL, 0u, home_rows, pos0,
             home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+    }
+    if (ok && serialize_compute) {
+        const cudaError_t sync = cudaDeviceSynchronize();
+        if (sync != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA prefill attention serialized compute failed "
+                    "target=home kind=%s layer=%u pos=%u tokens=%u "
+                    "home=%d partner=%d status=%s\n",
+                    kind == DS4_CUDA_PREFILL_ATTN_INDEXED
+                        ? "indexed" : "mixed",
+                    il, pos0, n_tokens, home, partner,
+                    cudaGetErrorString(sync));
+            fflush(stderr);
+            ok = false;
+        }
     }
     if (audit_home_attention) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
@@ -29097,6 +29140,17 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     }
 
     static uint32_t logged_home_mask = 0u;
+    static uint32_t logged_serialized_home_mask = 0u;
+    if (ok && serialize_compute && home >= 0 && home < 32 &&
+        (logged_serialized_home_mask & (1u << (uint32_t)home)) == 0u) {
+        logged_serialized_home_mask |= 1u << (uint32_t)home;
+        fprintf(stderr,
+                "ds4: CUDA prefill attention row compute serialization "
+                "enabled: logical pair %d->%d order=partner-sync,home-sync; "
+                "row ownership, kernels, caches, and transport retained\n",
+                home, partner);
+        fflush(stderr);
+    }
     if (ok && home >= 0 && home < 32 &&
         (logged_home_mask & (1u << (uint32_t)home)) == 0u) {
         logged_home_mask |= 1u << (uint32_t)home;
@@ -58792,6 +58846,11 @@ bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
 bool ds4_test_cuda_tp_prefill_attn_host_bounce_pair_enabled(
         int home_tier) {
     return cuda_tp_prefill_attn_host_bounce_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(
+        int home_tier) {
+    return cuda_tp_prefill_attn_serialize_compute_pair_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void) {

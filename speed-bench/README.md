@@ -3820,6 +3820,58 @@ entered but fails; or the complete gather returns. A dynamic binding identity
 is evidence for the final observed boundary only and is never reported as the
 cause of the reset.
 
+The direct-gather run proved that pair-0 partner Q8 compute had completed
+before the synchronous result D2H surfaced the poisoned CUDA context. It did
+not fence concurrent home-device work. The next single-variable cut is
+`attention-q8-rows-serialized`: it retains the same row split, row ownership,
+partner-local caches, attention kernels, host-bounce bytes, Q8 work, and 250 W
+limits, but orders each pair-0 split dispatch as partner attention, partner
+device synchronization, home attention, home device synchronization. Pair 1
+remains unmodified. A failure at either synchronization names the execution
+half on which CUDA observed the error. A full pass proves that overlap is
+required for this reproducer; it does not by itself distinguish an electrical
+concurrency limit from a driver scheduling defect.
+
+Run it once from a clean boot with `ONE_SHOT=1`; never resume this arm:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset CUDA_VISIBLE_DEVICES
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-rows-serialized-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-rows-serialized \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

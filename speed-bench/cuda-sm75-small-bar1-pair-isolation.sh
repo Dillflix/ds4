@@ -25,6 +25,7 @@ Optional environment:
   VARIANTS=attention-q8-activation-fence  also fence before pair-0 activation H2D
   VARIANTS=attention-q8-global-compute-fence  fence every pair-0 partner Q8 compute
   VARIANTS=attention-q8-direct-gather-fence  compute-sync then direct host-bounce gather, without mapped markers
+  VARIANTS=attention-q8-rows-serialized  same cut, plus partner/home attention compute serialization
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit one exact Q8 binding only
   Q8_TARGETED_BINDING_LABEL=...   default: tensor:blk.14.attn_output_b.weight
@@ -222,13 +223,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -249,7 +250,8 @@ PY
 fi
 if [[ ( -n ${seen_variants[attention-q8-activation-fence]:-} ||
         -n ${seen_variants[attention-q8-global-compute-fence]:-} ||
-        -n ${seen_variants[attention-q8-direct-gather-fence]:-} ) &&
+        -n ${seen_variants[attention-q8-direct-gather-fence]:-} ||
+        -n ${seen_variants[attention-q8-rows-serialized]:-} ) &&
       $ONE_SHOT != 1 ]]; then
     die "Q8 activation/compute fence variants require ONE_SHOT=1"
 fi
@@ -1288,7 +1290,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -1578,7 +1580,8 @@ validate_success_path() {
         python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
             --validate-q8-compute-fence-log "$log" || return 1
     fi
-    if [[ $variant == attention-q8-direct-gather-fence ]]; then
+    if [[ $variant == attention-q8-direct-gather-fence ||
+          $variant == attention-q8-rows-serialized ]]; then
         grep -Fxq \
             'ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 boundary=post-submit-device-sync scope=every-selected-partner-call identity=dynamic' \
             "$log" || return 1
@@ -1591,6 +1594,17 @@ validate_success_path() {
             --validate-q8-compute-fence-log "$log" || return 1
         python3 speed-bench/summarize-sm75-small-bar1-pair-isolation.py \
             --validate-q8-direct-gather-log "$log" || return 1
+    fi
+    if [[ $variant == attention-q8-rows-serialized ]]; then
+        grep -Fxq \
+            'ds4: CUDA prefill attention row compute serialization enabled: logical pair 0->2 order=partner-sync,home-sync; row ownership, kernels, caches, and transport retained' \
+            "$log" || return 1
+        ! grep -Fq \
+            'CUDA prefill attention row compute serialization enabled: logical pair 1->3' \
+            "$log" || return 1
+        ! grep -Fq \
+            'CUDA prefill attention serialized compute failed ' \
+            "$log" || return 1
     fi
     if [[ $variant == attention-q8-async-completion ]]; then
         ! grep -Eq 'CUDA q8 partner pre-gather (fence|armed|returned) ' \
@@ -1777,7 +1791,7 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
@@ -1869,7 +1883,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1979,6 +1993,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 ;;
             attention-q8-direct-gather-fence)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-rows-serialized)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
@@ -2342,7 +2363,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

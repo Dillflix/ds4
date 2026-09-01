@@ -49,6 +49,8 @@ bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
         int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_host_bounce_pair_enabled(
         int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(
+        int home_tier);
 bool ds4_test_cuda_tp_decode_indexer_rows_enabled(void);
 bool ds4_test_cuda_tp_decode_indexer_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
@@ -911,6 +913,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -966,6 +969,23 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     CHECK(!ds4_test_cuda_tp_prefill_attn_host_bounce_pair_enabled(0) &&
           !ds4_test_cuda_tp_prefill_attn_host_bounce_pair_enabled(1),
           "malformed attention host-bounce pair lists fail closed");
+
+    CHECK(!ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(1),
+          "attention row halves overlap by default");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS", "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(1),
+          "attention compute serialization is scoped to logical pair 0");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS", "1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(1),
+          "attention compute serialization is scoped to logical pair 1");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS", "0,", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_serialize_compute_pair_enabled(1),
+          "malformed attention serialization pair lists fail closed");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
 
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
