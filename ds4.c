@@ -28994,20 +28994,16 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             pos0 + home_rows, n_raw, raw_cap, raw_start, n_comp, window,
             ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ok && serialize_compute) {
-        const cudaError_t sync = cudaDeviceSynchronize();
-        if (sync != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA prefill attention serialized compute failed "
-                    "target=partner kind=%s layer=%u pos=%u tokens=%u "
-                    "home=%d partner=%d status=%s\n",
-                    kind == DS4_CUDA_PREFILL_ATTN_INDEXED
-                        ? "indexed" : "mixed",
-                    il, pos0, n_tokens, home, partner,
-                    cudaGetErrorString(sync));
-            fflush(stderr);
-            ok = false;
-        }
+    if (ok && serialize_compute && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr,
+                "ds4: CUDA prefill attention serialized compute failed "
+                "target=partner kind=%s layer=%u pos=%u tokens=%u "
+                "home=%d partner=%d status=failed\n",
+                kind == DS4_CUDA_PREFILL_ATTN_INDEXED
+                    ? "indexed" : "mixed",
+                il, pos0, n_tokens, home, partner);
+        fflush(stderr);
+        ok = false;
     }
     if (audit_partner_attention && partner_device_ready) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
@@ -29044,20 +29040,16 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home_n_raw, raw_cap, raw_start, n_comp, window, ratio,
             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     }
-    if (ok && serialize_compute) {
-        const cudaError_t sync = cudaDeviceSynchronize();
-        if (sync != cudaSuccess) {
-            fprintf(stderr,
-                    "ds4: CUDA prefill attention serialized compute failed "
-                    "target=home kind=%s layer=%u pos=%u tokens=%u "
-                    "home=%d partner=%d status=%s\n",
-                    kind == DS4_CUDA_PREFILL_ATTN_INDEXED
-                        ? "indexed" : "mixed",
-                    il, pos0, n_tokens, home, partner,
-                    cudaGetErrorString(sync));
-            fflush(stderr);
-            ok = false;
-        }
+    if (ok && serialize_compute && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr,
+                "ds4: CUDA prefill attention serialized compute failed "
+                "target=home kind=%s layer=%u pos=%u tokens=%u "
+                "home=%d partner=%d status=failed\n",
+                kind == DS4_CUDA_PREFILL_ATTN_INDEXED
+                    ? "indexed" : "mixed",
+                il, pos0, n_tokens, home, partner);
+        fflush(stderr);
+        ok = false;
     }
     if (audit_home_attention) {
         ok = metal_graph_cuda_tp_prefill_attention_rows_phase_audit_complete(
