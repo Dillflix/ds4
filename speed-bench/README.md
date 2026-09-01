@@ -3987,6 +3987,14 @@ cut of pair-0 attention-owned work:
   the selected pair's partner-attention launch. Full-home attention still
   produces the accepted output. This determines whether partner attention
   execution is required in the remaining trigger bundle.
+- `attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow`
+  retains the exact production partner-attention kernel, query and cache reads,
+  and arithmetic, but redirects its discarded output from production
+  `peer_heads` into the non-overlapping second half of the dedicated partner
+  diagnostic allocation. The static P2P source remains in the first half, so
+  its address, contents, direction, two 16 MiB chunks, pacing, and full-home
+  accepted output are unchanged. This isolates the production attention-output
+  destination/write from the rest of the retained partner-attention workload.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4110,11 +4118,20 @@ The preinitialized-source arm also lost the pair after proving the exact
 static scratch-to-scratch schedule. Its one-time source initialization,
 durable armed/scheduled markers, and first complete shadow checkpoint all
 preceded the later device loss. Production attention-result contents, the
-result allocation/address, and every read of that result are therefore
-excluded. The next one-shot differential is
+result read, and every downstream use of that result are therefore excluded.
+The next one-shot differential was
 `attention-row-gather-preinitialized-source-no-partner-paced-shadow`: it keeps
 the direct query handoff and identical static paced reverse transfer under the
 full surrounding workload, but omits only pair 0's partner-attention launch.
+
+That no-partner arm passed the complete 32K/256-token workload with all four
+GPUs healthy: 481.45 prefill tok/s and 16.91 decode tok/s. Its exact first
+mixed-row checkpoint proved the 32 MiB pre-zeroed source transfer, and the run
+completed all 256 decode tokens. This establishes that partner attention is
+required in the measured trigger bundle. It does not yet exclude the failed
+arm's write to production `peer_heads`, even though that result was never read.
+The next arm therefore retains the exact attention kernel and cache workload
+while redirecting only that output write to non-overlapping partner scratch.
 
 Run that arm from a fresh boot and directory at the cards' native limits:
 
@@ -4198,7 +4215,7 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-Run the no-partner-attention differential after a fresh reboot:
+Run the partner-output-scratch differential after a fresh reboot:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -4218,7 +4235,7 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-preinitialized-source-no-partner-paced-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-partner-output-scratch-paced-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
 ONE_SHOT=1 \
@@ -4227,7 +4244,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-row-gather-preinitialized-source-no-partner-paced-shadow \
+VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

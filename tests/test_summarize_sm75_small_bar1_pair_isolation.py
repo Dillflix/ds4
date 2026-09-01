@@ -4174,6 +4174,32 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        (
+                            "attention-row-gather-preinitialized-source-"
+                            "partner-output-scratch-paced-shadow"
+                        ),
+                        "failed-device-loss",
+                    ),
+                ),
+                "Using the production `peer_heads` row address as the kernel "
+                "destination, and any write or later read through it, are therefore "
+                "not required",
+            ),
+            (
+                (
+                    (
+                        (
+                            "attention-row-gather-preinitialized-source-"
+                            "partner-output-scratch-paced-shadow"
+                        ),
+                        "passed",
+                    ),
+                ),
+                "isolated trigger axis is the production output allocation/address",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

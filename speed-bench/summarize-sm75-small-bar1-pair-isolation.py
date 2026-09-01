@@ -22,6 +22,7 @@ VARIANT_ORDER = (
     "attention-row-gather-source-scratch-paced-shadow",
     "attention-row-gather-preinitialized-source-paced-shadow",
     "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
+    "attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2830,6 +2831,39 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
         "not-run",
     )
+    gather_preinitialized_source_partner_output_scratch_paced_state = outcomes.get(
+        (
+            "attention-row-gather-preinitialized-source-"
+            "partner-output-scratch-paced-shadow"
+        ),
+        "not-run",
+    )
+    if gather_preinitialized_source_partner_output_scratch_paced_state == "failed":
+        return (
+            "The pair lost a device after the selected pair's partner-attention "
+            "output was redirected to non-overlapping dedicated partner scratch. "
+            "Using the production `peer_heads` row address as the kernel destination, "
+            "and any write or later read through it, are therefore not required "
+            "(the containing allocation still exists). The retained trigger "
+            "window is the production attention kernel's query/cache reads and "
+            "arithmetic, its scratch-output write, and—if the scheduled marker was "
+            "reached—the unchanged static paced reverse P2P transfer under the full "
+            "surrounding workload. Next retain the scratch-output attention kernel "
+            "but omit that reverse transfer to separate attention/cache execution "
+            "from its interaction with the P2P schedule."
+        )
+    if gather_preinitialized_source_partner_output_scratch_paced_state == "passed":
+        return (
+            "The exact partner-attention kernel, cache accesses, query handoff, and "
+            "static paced reverse P2P schedule all survived when only the partner "
+            "attention output destination changed from production `peer_heads` to "
+            "non-overlapping dedicated scratch. Because neither arm reads that "
+            "attention output, the isolated trigger axis is the production output "
+            "allocation/address or the kernel's write to it—not attention arithmetic "
+            "or the static transfer alone. Next redirect the discarded output to an "
+            "unused region of the production `batch_heads` allocation to distinguish "
+            "allocation identity from the exact production row address/lifetime."
+        )
     if gather_preinitialized_source_no_partner_paced_state == "failed":
         return (
             "The pair still lost a device with the selected pair's partner "
@@ -2847,10 +2881,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "GPUs when only the selected pair's partner attention launch was "
             "omitted. Against the failed arm that retained that launch, partner "
             "attention execution is required in the measured trigger bundle; "
-            "production result contents and reads remain excluded. Next replace "
-            "that launch with calibrated partner-local compute and memory traffic "
-            "before the same P2P schedule to distinguish a kernel/access-specific "
-            "fault from generic load or ordering pressure."
+            "production result contents and reads remain excluded, but the failed "
+            "arm still wrote the normal production output allocation. Next retain "
+            "the exact attention kernel and cache accesses while redirecting only "
+            "that output write to non-overlapping dedicated partner scratch."
         )
     if gather_preinitialized_source_paced_state == "failed":
         return (
@@ -3000,6 +3034,13 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         (
             "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
             "result-gather-preinitialized-source-no-partner-paced",
+        ),
+        (
+            (
+                "attention-row-gather-preinitialized-source-"
+                "partner-output-scratch-paced-shadow"
+            ),
+            "result-gather-preinitialized-source-partner-output-scratch-paced",
         ),
     ):
         state = outcomes.get(variant, "not-run")
