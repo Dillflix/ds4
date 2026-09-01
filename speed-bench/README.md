@@ -3927,11 +3927,78 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-A failure in this arm implicates the row-split prerequisite state/traffic (or
-another concurrent production path), not split attention compute. Survival at
-full production load means actual split row execution/gather is additionally
-required for the reproducer. Neither outcome alone identifies a hardware or
-driver root cause.
+This arm did lose the pair, and its startup marker proved that pair-0 split
+indexer/attention computation and gathers were disabled. The failure was first
+observed at a pair-0 Q8 result D2H after the fenced partner computation had
+completed. That does **not** isolate row-cache admission or mirror traffic: the
+arm also changed pair-0 attention and Q8 transport to pinned-host bounce and
+added Q8 compute/gather fences. The earlier healthy `attention-off` control
+retained the same graph-wide partner-cache allocations and mirrors while using
+ordinary direct Q8 transport. The defensible result is therefore narrower:
+split attention computation is not required for a loss under that heavily
+instrumented transport schedule, but the result cannot explain the original
+production direct-P2P failure.
+
+The replacement diagnostic uses production direct-P2P/default-stream
+transport and no Q8 audit fences. Three one-shot shadow phases form a monotonic
+cut of pair-0 attention-owned work:
+
+- `attention-row-query-shadow` performs only the direct query-row handoff;
+- `attention-row-partner-shadow` additionally performs partner attention; and
+- `attention-row-gather-shadow` additionally gathers the partner rows.
+
+Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
+can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
+Q8 partner projections remain production paths. Each retained phase is device-
+synchronized before home recomputation; this is an intentional diagnostic
+completion boundary, not a performance candidate. Start with the smallest
+cut, in a fresh one-shot directory:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-query-shadow-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-row-query-shadow \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+If query-only survives, the next fresh arm is `attention-row-partner-shadow`;
+if that survives, the final fresh arm is `attention-row-gather-shadow`. Stop at
+the first device loss. This orders the trigger boundary without returning to
+layer-by-layer guesses. A failed run is accepted as an activated shadow arm
+only after its exact `event=begin` marker is durable; a loss before that marker
+is reported as `experiment-not-activated`, not attributed to the selected cut.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

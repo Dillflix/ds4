@@ -14,6 +14,8 @@ VARIANT_ORDER = (
     "attention-q8-pre-gather-fence", "attention-q8-activation-fence",
     "attention-q8-global-compute-fence", "attention-q8-direct-gather-fence",
     "attention-q8-rows-serialized", "attention-q8-row-compute-off",
+    "attention-row-query-shadow", "attention-row-partner-shadow",
+    "attention-row-gather-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2767,6 +2769,60 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "At least one arm overlapped an unexpected GPU compute process. That arm "
             "is invalid for causal comparison; identify the external launcher and "
             "rerun it without the foreign workload."
+        )
+    shadow_variants = (
+        ("attention-row-query-shadow", "query-copy"),
+        ("attention-row-partner-shadow", "partner-compute"),
+        ("attention-row-gather-shadow", "result-gather"),
+    )
+    for variant, phase in shadow_variants:
+        state = outcomes.get(variant, "not-run")
+        if state == "failed":
+            return (
+                f"The production-transport `{phase}` shadow arm lost a device. "
+                "Its accepted attention output was assigned to the unchanged home "
+                "kernel, so the retained direct-P2P row phase (or its interaction "
+                "with concurrent production work) is sufficient under this explicit "
+                "completion boundary. Do not run broader shadow phases before "
+                "inspecting this artifact."
+            )
+    for variant, phase in shadow_variants:
+        state = outcomes.get(variant, "not-run")
+        if state in {"invalid", "underloaded"}:
+            return (
+                f"The `{phase}` shadow arm is `{state}` rather than causal "
+                "evidence. Inspect its activation, path, load, and health gates, "
+                "then repeat only that arm in a fresh one-shot directory."
+            )
+    for variant, phase in shadow_variants:
+        state = outcomes.get(variant, "not-run")
+        if state == "incomplete":
+            return (
+                f"The `{phase}` shadow arm has no verified outcome. Preserve it and "
+                "repeat that same single arm in a fresh directory; do not resume it."
+            )
+    passed_shadow_phases = [
+        phase for variant, phase in shadow_variants
+        if outcomes.get(variant, "not-run") == "passed"
+    ]
+    if passed_shadow_phases:
+        phase = passed_shadow_phases[-1]
+        next_phase = {
+            "query-copy": "partner-compute",
+            "partner-compute": "result-gather",
+            "result-gather": "none",
+        }[phase]
+        if next_phase == "none":
+            return (
+                "The full direct query/partner-attention/result-gather shadow arm "
+                "survived. The production row operations alone were not sufficient "
+                "under the shadow arm's completion boundary; compare overlap and "
+                "downstream-consumption semantics next."
+            )
+        return (
+            f"The production-transport `{phase}` shadow arm survived with healthy "
+            f"post-run GPUs. Run `{next_phase}` as a fresh one-shot arm; do not "
+            "resume or combine expected-crash arms."
         )
     compute_rows = [
         row for row in rows

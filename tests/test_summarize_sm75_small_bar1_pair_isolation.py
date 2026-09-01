@@ -4047,6 +4047,64 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("production control has not run yet", report)
             self.assertIn("requires the final control", report)
 
+    def test_shadow_phase_inference_advances_or_stops_at_decisive_arm(self) -> None:
+        cases = (
+            (
+                (("attention-row-query-shadow", "failed-device-loss"),),
+                "production-transport `query-copy` shadow arm lost a device",
+            ),
+            (
+                (("attention-row-query-shadow", "passed"),),
+                "Run `partner-compute` as a fresh one-shot arm",
+            ),
+            (
+                (("attention-row-query-shadow", "validation-failed"),),
+                "`query-copy` shadow arm is `invalid` rather than causal evidence",
+            ),
+            (
+                (("attention-row-partner-shadow", "passed"),),
+                "Run `result-gather` as a fresh one-shot arm",
+            ),
+            (
+                (("attention-row-gather-shadow", "passed"),),
+                "full direct query/partner-attention/result-gather shadow arm survived",
+            ),
+            (
+                (
+                    ("attention-row-query-shadow", "passed"),
+                    ("attention-row-partner-shadow", "failed-device-loss"),
+                ),
+                "production-transport `partner-compute` shadow arm lost a device",
+            ),
+        )
+        for records, expected in cases:
+            with self.subTest(records=records):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    production = root / "production"
+                    production.mkdir()
+                    for slot, (variant, status) in enumerate(records, start=1):
+                        stem = f"r1-s{slot}-{variant}"
+                        exit_status = 0 if status == "passed" else 124
+                        (production / f"{stem}.result").write_text(
+                            f"variant={variant}\nstatus={status}\n"
+                            f"exit_status={exit_status}\n"
+                        )
+                        (production / f"{stem}.log").write_text("")
+                        if status == "passed":
+                            write_healthy_post(root, stem)
+                        else:
+                            write_lost_watch(
+                                root, stem, "1@00000000:03:00.0"
+                            )
+
+                    subprocess.run(
+                        [sys.executable, str(SUMMARIZER), str(root)],
+                        check=True,
+                    )
+                    report = (root / "summary.md").read_text()
+                    self.assertIn(expected, report)
+
     def _summarize_activation(
             self, log_text: str, source_status: str = "failed"
     ) -> tuple[dict[str, str], str]:

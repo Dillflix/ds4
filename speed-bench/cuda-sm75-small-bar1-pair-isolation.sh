@@ -27,6 +27,9 @@ Optional environment:
   VARIANTS=attention-q8-direct-gather-fence  compute-sync then direct host-bounce gather, without mapped markers
   VARIANTS=attention-q8-rows-serialized  same cut, plus partner/home attention compute serialization
   VARIANTS=attention-q8-row-compute-off  retain pair-0 cache mirrors, suppress only split row compute/gathers
+  VARIANTS=attention-row-query-shadow    direct query handoff, then exact home recompute
+  VARIANTS=attention-row-partner-shadow  direct query + partner attention, then exact home recompute
+  VARIANTS=attention-row-gather-shadow   direct query + partner attention + gather, then exact home recompute
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit one exact Q8 binding only
   Q8_TARGETED_BINDING_LABEL=...   default: tensor:blk.14.attn_output_b.weight
@@ -115,6 +118,15 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 readonly EXPECTED_SELECTED_IDENTITY="$repo_dir/speed-bench/sm75-small-bar1-expected-device-identity.csv"
 readonly ROW_COMPUTE_OFF_MARKER='ds4: CUDA prefill attention row compute pair-scoped disable: logical-pairs=0; partner cache allocation and mirror traffic retained; disabled pairs use home attention/indexer fallback'
+
+row_shadow_phase() {
+    case "$1" in
+        attention-row-query-shadow) printf '%s\n' query-copy ;;
+        attention-row-partner-shadow) printf '%s\n' partner-compute ;;
+        attention-row-gather-shadow) printf '%s\n' result-gather ;;
+        *) return 1 ;;
+    esac
+}
 MODEL=${MODEL:-}
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -225,13 +237,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -254,9 +266,12 @@ if [[ ( -n ${seen_variants[attention-q8-activation-fence]:-} ||
         -n ${seen_variants[attention-q8-global-compute-fence]:-} ||
         -n ${seen_variants[attention-q8-direct-gather-fence]:-} ||
         -n ${seen_variants[attention-q8-rows-serialized]:-} ||
-        -n ${seen_variants[attention-q8-row-compute-off]:-} ) &&
+        -n ${seen_variants[attention-q8-row-compute-off]:-} ||
+        -n ${seen_variants[attention-row-query-shadow]:-} ||
+        -n ${seen_variants[attention-row-partner-shadow]:-} ||
+        -n ${seen_variants[attention-row-gather-shadow]:-} ) &&
       $ONE_SHOT != 1 ]]; then
-    die "Q8 activation/compute fence variants require ONE_SHOT=1"
+    die "destructive fence/row-shadow diagnostics require ONE_SHOT=1"
 fi
 if (( attention_copy_matrix_requested )) && [[ $SKIP_BUILD != 0 ]]; then
     die "attention copy diagnostic arms require SKIP_BUILD=0 so every reboot repeats the fixed CUDA/P2P preflight"
@@ -1233,6 +1248,50 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
+        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow)
+            local shadow_phase
+            shadow_phase=$(row_shadow_phase "$variant") || return 1
+            ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
+                return 1
+            ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row transport override for logical pair 0' \
+                "$log" || return 1
+            grep -Fxq \
+                "ds4: CUDA prefill attention row shadow audit enabled: logical-pairs=0 phase=$shadow_phase; production direct-P2P transport retained; accepted output recomputed on home" \
+                "$log" || return 1
+            grep -Eq \
+                "prefill attention row shadow audit event=begin phase=$shadow_phase .*home=0 partner=2" \
+                "$log" || return 1
+            grep -Eq \
+                "prefill attention row shadow audit event=complete phase=$shadow_phase .*home=0 partner=2" \
+                "$log" || return 1
+            log_line_has "$log" 'q8 partner transfer audit event=begin home_tier=0' \
+                'transport=peer' || return 1
+            log_line_has "$log" 'q8 partner transfer audit event=begin home_tier=1' \
+                'transport=peer' || return 1
+            ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention row compute pair-scoped disable' "$log" ||
+                return 1
+            ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+                return 1
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+                return 1
+            ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
+                "$log" || return 1
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                "$log" || return 1
+            ! grep -Fq 'prefill attention row phase audit event=' "$log" || return 1
+            ! grep -Fq 'prefill attention row entry fence event=' "$log" || return 1
+            ! grep -Fq 'prefill attention row end fence event=' "$log" || return 1
+            ! grep -Fq 'CUDA q8 partner compute fence audit enabled:' "$log" || return 1
+            ! grep -Fq 'CUDA q8 partner direct gather audit enabled:' "$log" || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=0 partner_tier=2' || return 1
+            log_line_has "$log" 'decode indexer row audit event=complete' \
+                'home_tier=1 partner_tier=3' || return 1
+            ;;
         attention-host-bounce)
             ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
                 return 1
@@ -1831,6 +1890,16 @@ failed_arm_activation_proven() {
         attention-q8-row-compute-off)
             grep -Fxq "$ROW_COMPUTE_OFF_MARKER" "$log"
             ;;
+        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow)
+            local shadow_phase
+            shadow_phase=$(row_shadow_phase "$variant") || return 1
+            grep -Fxq \
+                "ds4: CUDA prefill attention row shadow audit enabled: logical-pairs=0 phase=$shadow_phase; production direct-P2P transport retained; accepted output recomputed on home" \
+                "$log" &&
+                grep -Eq \
+                    "prefill attention row shadow audit event=begin phase=$shadow_phase .*home=0 partner=2" \
+                    "$log"
+            ;;
         attention-q8-rows-serialized)
             grep -Fxq \
                 'ds4: CUDA prefill attention row compute serialization enabled: logical pair 0->2 order=partner-sync,home-sync; row ownership, kernels, caches, and transport retained' \
@@ -2059,6 +2128,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE=$(row_shadow_phase "$variant")")
                 ;;
             attention-q8-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")

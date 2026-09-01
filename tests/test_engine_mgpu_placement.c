@@ -45,6 +45,7 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier);
+int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
         int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
@@ -1017,6 +1018,30 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           !ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
           "malformed attention row-compute suppression lists fail closed");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
+
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0 &&
+          ds4_test_cuda_tp_prefill_attn_row_shadow_phase(1) == 0,
+          "attention row shadow auditing is disabled by default");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS", "0", 1);
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "query-copy", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 1 &&
+          ds4_test_cuda_tp_prefill_attn_row_shadow_phase(1) == 0,
+          "query-copy shadow auditing is scoped to logical pair 0");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "partner-compute", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 2,
+          "partner-compute shadow phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "result-gather", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 3,
+          "result-gather shadow phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "invalid", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
+          "invalid attention row shadow phases fail closed");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS", "0,", 1);
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "query-copy", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
+          "malformed attention row shadow pair lists fail closed");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE");
 
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
