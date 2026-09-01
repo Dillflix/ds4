@@ -4114,6 +4114,25 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-source-scratch-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "Neither P2P endpoint allocation/address nor downstream "
+                "consumption is required",
+            ),
+            (
+                (
+                    (
+                        "attention-row-gather-source-scratch-paced-shadow",
+                        "passed",
+                    ),
+                ),
+                "direct P2P source being the production partner result allocation",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

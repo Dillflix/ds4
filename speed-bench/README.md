@@ -3966,6 +3966,13 @@ cut of pair-0 attention-owned work:
   full-home recomputation, but receives the discarded result in a dedicated
   home allocation that no model kernel reads or reuses. The allocation exists
   only for this diagnostic and has graph-workspace lifetime.
+- `attention-row-gather-source-scratch-paced-shadow` retains that dedicated
+  home destination and first stages the completed production partner result
+  into a dedicated partner allocation with an ordered D2D copy on the partner
+  default stream. The same paced two-chunk helper then reads partner scratch
+  and writes home scratch. This changes the P2P source allocation and adds an
+  explicit source-ready dependency without changing attention compute, bytes,
+  physical direction, pacing, or accepted full-home recomputation.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4059,6 +4066,17 @@ allocation/address and removes downstream reuse of the received bytes. A pass
 isolates the production `batch_heads` destination view/allocation or its reuse;
 another loss proves that destination is not required and advances the audit to
 the production partner source allocation.
+
+The dedicated-home-scratch arm also lost the pair after proving the exact
+paced 32 MiB schedule. The production destination allocation/address and its
+downstream reuse are therefore not required. The next fresh one-shot arm is
+`attention-row-gather-source-scratch-paced-shadow`: production partner
+attention still writes its normal result, but an ordered partner-local D2D
+copy stages those rows into dedicated partner scratch before the paced P2P
+copy reads them. A pass isolates the direct P2P source allocation/address or
+its immediate readiness relationship. Another loss proves that neither P2P
+endpoint allocation is required, while leaving the local read of the freshly
+produced source as the next differential.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

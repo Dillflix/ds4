@@ -19,6 +19,7 @@ VARIANT_ORDER = (
     "attention-row-gather-chunk16-shadow",
     "attention-row-gather-chunk16-paced-shadow",
     "attention-row-gather-scratch-paced-shadow",
+    "attention-row-gather-source-scratch-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2816,6 +2817,31 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     gather_scratch_paced_state = outcomes.get(
         "attention-row-gather-scratch-paced-shadow", "not-run"
     )
+    gather_source_scratch_paced_state = outcomes.get(
+        "attention-row-gather-source-scratch-paced-shadow", "not-run"
+    )
+    if gather_source_scratch_paced_state == "failed":
+        return (
+            "The paced partner-to-home copy still lost the pair when both P2P "
+            "endpoints were dedicated scratch allocations and the production "
+            "partner result was first staged locally on the partner default "
+            "stream. Neither P2P endpoint allocation/address nor downstream "
+            "consumption is required. The staging operation still read the "
+            "fresh production partner result, so the next differential is a "
+            "preinitialized dedicated partner source: retain partner attention "
+            "but do not read its output before the same scratch-to-scratch paced "
+            "P2P copy."
+        )
+    if gather_source_scratch_paced_state == "passed":
+        return (
+            "The scratch-to-scratch paced gather survived with healthy GPUs "
+            "after the completed production partner rows were staged locally. "
+            "The prior failure with the same paced bytes and dedicated home "
+            "destination therefore depends on the direct P2P source being the "
+            "production partner result allocation or on its immediate readiness "
+            "relationship. Audit that source boundary before treating staging "
+            "as a production candidate."
+        )
     if gather_scratch_paced_state == "failed":
         return (
             "The same paced 32 MiB partner result still lost the pair when its "
@@ -2906,6 +2932,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         (
             "attention-row-gather-scratch-paced-shadow",
             "result-gather-scratch-paced",
+        ),
+        (
+            "attention-row-gather-source-scratch-paced-shadow",
+            "result-gather-source-scratch-paced",
         ),
     ):
         state = outcomes.get(variant, "not-run")
