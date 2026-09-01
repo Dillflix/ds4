@@ -1033,6 +1033,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "result-gather", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 3,
           "result-gather shadow phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE",
+           "result-gather-dst", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 4,
+          "destination-ordered result-gather shadow phase is recognized");
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "invalid", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
           "invalid attention row shadow phases fail closed");

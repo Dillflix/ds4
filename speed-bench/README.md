@@ -3946,6 +3946,10 @@ cut of pair-0 attention-owned work:
 - `attention-row-query-shadow` performs only the direct query-row handoff;
 - `attention-row-partner-shadow` additionally performs partner attention; and
 - `attention-row-gather-shadow` additionally gathers the partner rows.
+- `attention-row-gather-dst-shadow` repeats the gather shadow with the same
+  partner-to-home bytes and direct-P2P direction, but submits the gather from
+  the destination/home CUDA context and default-stream ordering domain, which
+  also reverses the required peer-access direction.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -3999,6 +4003,17 @@ the first device loss. This orders the trigger boundary without returning to
 layer-by-layer guesses. A failed run is accepted as an activated shadow arm
 only after its exact `event=begin` marker is durable; a loss before that marker
 is reported as `experiment-not-activated`, not attributed to the selected cut.
+
+The first three arms established a direction-sensitive boundary: query-only
+and partner-compute survived, while the source-scheduled partner-to-home gather
+lost the pair even though its result was discarded before full-home
+recomputation. The next arm is therefore `attention-row-gather-dst-shadow`, not
+another layer fence. It changes only the gather's submitting CUDA context and
+default-stream ordering plus the required peer-access direction; the physical
+data direction and bytes stay fixed. If it survives, that software mechanism
+is the next production-fix candidate. If it also loses the device, vary gather
+granularity next while holding the partner-to-home direction and total bytes
+fixed.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

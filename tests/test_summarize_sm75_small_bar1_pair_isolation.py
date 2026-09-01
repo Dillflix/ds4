@@ -4066,8 +4066,16 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
                 "Run `result-gather` as a fresh one-shot arm",
             ),
             (
-                (("attention-row-gather-shadow", "passed"),),
-                "full direct query/partner-attention/result-gather shadow arm survived",
+                (("attention-row-gather-shadow", "failed-device-loss"),),
+                "Run `result-gather-dst` as a fresh one-shot arm",
+            ),
+            (
+                (("attention-row-gather-dst-shadow", "passed"),),
+                "peer-access direction are the isolated axis",
+            ),
+            (
+                (("attention-row-gather-dst-shadow", "failed-device-loss"),),
+                "failure therefore follows the repeated 32 MiB partner-to-home transfer",
             ),
             (
                 (

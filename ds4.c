@@ -15586,6 +15586,7 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_QUERY_COPY = 1,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_COMPUTE = 2,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER = 3,
+    DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST = 4,
 } ds4_cuda_prefill_attn_row_shadow_phase;
 
 /* Diagnostic-only production-transport cut.  A selected phase executes on
@@ -15610,6 +15611,9 @@ cuda_tp_prefill_attn_row_shadow_phase_for_pair(int home_tier) {
     }
     if (strcmp(phase, "result-gather") == 0) {
         return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER;
+    }
+    if (strcmp(phase, "result-gather-dst") == 0) {
+        return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST;
     }
     return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE;
 }
@@ -28563,6 +28567,8 @@ static const char *metal_graph_cuda_tp_prefill_attention_rows_shadow_name(
             return "partner-compute";
         case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER:
             return "result-gather";
+        case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST:
+            return "result-gather-dst";
         default:
             return "none";
     }
@@ -28574,8 +28580,8 @@ static void metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
         uint32_t n_tokens, int home, int partner) {
     static uint32_t begin_mask = 0u;
     static uint32_t complete_mask = 0u;
-    const uint32_t bit = home >= 0 && home < 8 && phase > 0 && phase < 4
-        ? 1u << ((uint32_t)home * 4u + (uint32_t)phase)
+    const uint32_t bit = home >= 0 && home < 6 && phase > 0 && phase <= 4
+        ? 1u << ((uint32_t)home * 5u + (uint32_t)phase)
         : 0u;
     uint32_t *mask = strcmp(event, "begin") == 0 ? &begin_mask : &complete_mask;
     if (bit == 0u || (*mask & bit) != 0u) return;
@@ -28912,6 +28918,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         cuda_tp_prefill_attn_query_copy_dst_pair_enabled(home);
     const bool gather_copy_dst =
         cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home);
+    const bool shadow_gather_dst = shadow_phase ==
+        DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST;
     const bool host_bounce =
         metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(home);
     const bool serialize_compute =
@@ -28937,11 +28945,11 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         metal_graph_cuda_tp_prefill_attention_rows_end_fence_selected(
             home, il, pos0);
     if (shadow_phase != DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE &&
-        (query_copy_dst || gather_copy_dst || host_bounce || serialize_compute ||
-         phase_audit || entry_fence || end_fence)) {
+        (query_copy_dst || gather_copy_dst != shadow_gather_dst || host_bounce ||
+         serialize_compute || phase_audit || entry_fence || end_fence)) {
         fprintf(stderr,
                 "ds4: CUDA prefill attention row shadow audit requires the "
-                "production direct-P2P/default-stream row schedule\n");
+                "selected direct-P2P/default-stream row schedule\n");
         return false;
     }
     uint32_t home_rows = metal_graph_cuda_tp_prefill_fixed_half_rows(n_tokens);
@@ -29214,14 +29222,20 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             window, ratio, home, partner);
         goto attention_rows_cleanup;
     }
-    if (shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER) {
+    if (shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER ||
+        shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST) {
         if (ok && ds4_gpu_set_current_device(home) != 0) ok = false;
         if (ok) {
-            const bool ready_ok =
-                ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0;
-            ok = ready_ok &&
-                 ds4_gpu_tensor_copy_xdev_default(
-                     gather_dst, peer_heads, q_partner_bytes) != 0;
+            if (shadow_gather_dst) {
+                ok = ds4_gpu_tensor_copy_xdev_default_dst_ordered(
+                         gather_dst, peer_heads, q_partner_bytes) != 0;
+            } else {
+                const bool ready_ok =
+                    ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0;
+                ok = ready_ok &&
+                     ds4_gpu_tensor_copy_xdev_default(
+                         gather_dst, peer_heads, q_partner_bytes) != 0;
+            }
         }
         ok = metal_graph_cuda_tp_prefill_attention_rows_shadow_finish(
             ok, home, g, model, layer, il, shadow_phase, kind, topk,

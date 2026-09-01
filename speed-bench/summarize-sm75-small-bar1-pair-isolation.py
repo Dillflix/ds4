@@ -15,7 +15,7 @@ VARIANT_ORDER = (
     "attention-q8-global-compute-fence", "attention-q8-direct-gather-fence",
     "attention-q8-rows-serialized", "attention-q8-row-compute-off",
     "attention-row-query-shadow", "attention-row-partner-shadow",
-    "attention-row-gather-shadow",
+    "attention-row-gather-shadow", "attention-row-gather-dst-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2770,12 +2770,11 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "is invalid for causal comparison; identify the external launcher and "
             "rerun it without the foreign workload."
         )
-    shadow_variants = (
+    shadow_prefix_variants = (
         ("attention-row-query-shadow", "query-copy"),
         ("attention-row-partner-shadow", "partner-compute"),
-        ("attention-row-gather-shadow", "result-gather"),
     )
-    for variant, phase in shadow_variants:
+    for variant, phase in shadow_prefix_variants:
         state = outcomes.get(variant, "not-run")
         if state == "failed":
             return (
@@ -2786,7 +2785,7 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "completion boundary. Do not run broader shadow phases before "
                 "inspecting this artifact."
             )
-    for variant, phase in shadow_variants:
+    for variant, phase in shadow_prefix_variants:
         state = outcomes.get(variant, "not-run")
         if state in {"invalid", "underloaded"}:
             return (
@@ -2794,31 +2793,77 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "evidence. Inspect its activation, path, load, and health gates, "
                 "then repeat only that arm in a fresh one-shot directory."
             )
-    for variant, phase in shadow_variants:
+    for variant, phase in shadow_prefix_variants:
         state = outcomes.get(variant, "not-run")
         if state == "incomplete":
             return (
                 f"The `{phase}` shadow arm has no verified outcome. Preserve it and "
                 "repeat that same single arm in a fresh directory; do not resume it."
             )
+    gather_state = outcomes.get("attention-row-gather-shadow", "not-run")
+    gather_dst_state = outcomes.get(
+        "attention-row-gather-dst-shadow", "not-run"
+    )
+    if gather_state == "failed":
+        return (
+            "The source-scheduled partner-to-home result-gather shadow lost a "
+            "device even though the gathered rows were discarded before unchanged "
+            "home recomputation. Query-only and partner-compute shadows therefore "
+            "do not contain the added trigger. Run `result-gather-dst` as a fresh "
+            "one-shot arm: it preserves the 32 MiB direction and bytes while "
+            "changing the submitting CUDA context/default-stream ordering and "
+            "required peer-access direction."
+        )
+    if gather_dst_state == "failed":
+        return (
+            "The destination-ordered partner-to-home result-gather shadow also lost "
+            "a device. The failure therefore follows the repeated 32 MiB "
+            "partner-to-home transfer independently of which CUDA context submits "
+            "it. Test transfer granularity next while preserving direction, total "
+            "bytes, row ownership, and accepted home recomputation."
+        )
+    if gather_dst_state == "passed":
+        return (
+            "The destination-ordered partner-to-home result-gather shadow survived "
+            "with healthy GPUs. Compared with the prior failed source-scheduled "
+            "shadow, the direct-P2P bytes and physical direction are unchanged; the "
+            "submission context/default-stream ordering and peer-access direction "
+            "are the isolated axis. "
+            "Confirm it in the full production row path before promotion."
+        )
+    for variant, phase in (
+        ("attention-row-gather-shadow", "result-gather"),
+        ("attention-row-gather-dst-shadow", "result-gather-dst"),
+    ):
+        state = outcomes.get(variant, "not-run")
+        if state in {"invalid", "underloaded"}:
+            return (
+                f"The `{phase}` shadow arm is `{state}` rather than causal "
+                "evidence. Inspect its activation, path, load, and health gates, "
+                "then repeat only that arm in a fresh one-shot directory."
+            )
+        if state == "incomplete":
+            return (
+                f"The `{phase}` shadow arm has no verified outcome. Preserve it and "
+                "repeat that same single arm in a fresh directory; do not resume it."
+            )
     passed_shadow_phases = [
-        phase for variant, phase in shadow_variants
+        phase for variant, phase in shadow_prefix_variants
         if outcomes.get(variant, "not-run") == "passed"
     ]
+    if gather_state == "passed":
+        return (
+            "The full direct query/partner-attention/result-gather shadow arm "
+            "survived. The production row operations alone were not sufficient "
+            "under the shadow arm's completion boundary; compare overlap and "
+            "downstream-consumption semantics next."
+        )
     if passed_shadow_phases:
         phase = passed_shadow_phases[-1]
         next_phase = {
             "query-copy": "partner-compute",
             "partner-compute": "result-gather",
-            "result-gather": "none",
         }[phase]
-        if next_phase == "none":
-            return (
-                "The full direct query/partner-attention/result-gather shadow arm "
-                "survived. The production row operations alone were not sufficient "
-                "under the shadow arm's completion boundary; compare overlap and "
-                "downstream-consumption semantics next."
-            )
         return (
             f"The production-transport `{phase}` shadow arm survived with healthy "
             f"post-run GPUs. Run `{next_phase}` as a fresh one-shot arm; do not "
