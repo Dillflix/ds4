@@ -12,7 +12,7 @@ from pathlib import Path
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
     "attention-q8-pre-gather-fence", "attention-q8-activation-fence",
-    "attention-q8-global-compute-fence",
+    "attention-q8-global-compute-fence", "attention-q8-direct-gather-fence",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -656,6 +656,159 @@ def q8_partner_compute_fence_summary(
     )
 
 
+def q8_partner_direct_gather_records(
+        text: str) -> list[tuple[str, dict[str, str], str]]:
+    prefix = "q8 partner direct gather "
+    records: list[tuple[str, dict[str, str], str]] = []
+    for line in text.splitlines():
+        if "q8 partner direct gather audit enabled:" in line:
+            continue
+        if prefix not in line:
+            continue
+        before, _, tail = line.partition(prefix)
+        if not before.endswith("CUDA "):
+            records.append(("invalid", {}, line.strip()))
+            continue
+        kind, separator, fields = tail.partition(" ")
+        if not separator or kind not in {"armed", "returned", "failure"}:
+            records.append(("invalid", {}, line.strip()))
+            continue
+        records.append((
+            kind, _kv_record("record " + fields, "record "), line.strip()
+        ))
+    return records
+
+
+def q8_partner_direct_gather_record_classification(
+        kind: str, record: dict[str, str]) -> str:
+    required = {
+        "sequence", "status", "result_d2h_attempted",
+        "result_d2h_completed", "result_h2d_attempted",
+        "result_h2d_completed", "home_tier", "home_device",
+        "partner_tier", "partner_device", "tokens", "in", "out",
+        "binding_label", "passed_label", "weight_offset",
+    }
+    if kind not in {"armed", "returned", "failure"} or any(
+            not record.get(key) for key in required):
+        return "invalid-direct-gather-record"
+    if (record["home_tier"] != "0" or record["home_device"] != "0" or
+            record["partner_tier"] != "2" or
+            record["partner_device"] != "1" or
+            record["binding_label"] == "unavailable" or
+            record["passed_label"] == "unavailable" or
+            any((_q8_u64(record, key) or 0) == 0 for key in (
+                "sequence", "tokens", "in", "out", "weight_offset"
+            ))):
+        return "invalid-direct-gather-record"
+    flags = tuple(record[key] for key in (
+        "result_d2h_attempted", "result_d2h_completed",
+        "result_h2d_attempted", "result_h2d_completed",
+    ))
+    if any(flag not in {"yes", "no"} for flag in flags):
+        return "invalid-direct-gather-record"
+    d2h_attempted, d2h_completed, h2d_attempted, h2d_completed = flags
+    if ((d2h_attempted == "no" and d2h_completed == "yes") or
+            (h2d_attempted == "no" and h2d_completed == "yes") or
+            (h2d_attempted == "yes" and d2h_completed != "yes")):
+        return "invalid-direct-gather-record"
+    if kind == "armed":
+        return (
+            "post-compute-sync-before-result-d2h"
+            if record["status"] == "post-compute-sync" and
+            flags == ("no", "no", "no", "no") else
+            "invalid-direct-gather-record"
+        )
+    if kind == "returned":
+        return (
+            "result-d2h-and-h2d-completed"
+            if record["status"] == "copy-complete" and
+            flags == ("yes", "yes", "yes", "yes") else
+            "invalid-direct-gather-record"
+        )
+    if record["status"] != "copy-failed":
+        return "invalid-direct-gather-record"
+    if flags == ("no", "no", "no", "no"):
+        return "failure-before-result-d2h-attempt"
+    if flags == ("yes", "no", "no", "no"):
+        return "result-d2h-attempt-failed"
+    if flags == ("yes", "yes", "no", "no"):
+        return "result-d2h-complete-before-result-h2d-attempt"
+    if flags == ("yes", "yes", "yes", "no"):
+        return "result-h2d-attempt-failed"
+    if flags == ("yes", "yes", "yes", "yes"):
+        return "failure-after-result-h2d-completed"
+    return "invalid-direct-gather-record"
+
+
+def q8_partner_direct_gather_marker_state(text: str) -> str:
+    enable = (
+        "ds4: CUDA q8 partner direct gather audit enabled: logical_pairs=0 "
+        "boundary=compute-sync-to-synchronous-host-bounce "
+        "mapped_host_marker=no event=no identity=dynamic"
+    )
+    if text.splitlines().count(enable) != 1:
+        return "invalid-enable-record"
+    records = q8_partner_direct_gather_records(text)
+    if not records:
+        return "empty"
+    expected_sequence = 1
+    index = 0
+    while index < len(records):
+        kind, armed, _ = records[index]
+        if kind != "armed" or q8_partner_direct_gather_record_classification(
+                kind, armed) == "invalid-direct-gather-record":
+            return "invalid-armed-record"
+        if _q8_u64(armed, "sequence") != expected_sequence:
+            return "sequence-mismatch"
+        if index + 1 >= len(records):
+            return "unmatched-armed-record"
+        completed_kind, completed, _ = records[index + 1]
+        classification = q8_partner_direct_gather_record_classification(
+            completed_kind, completed
+        )
+        if classification == "invalid-direct-gather-record":
+            return "invalid-completion-record"
+        identity_keys = (
+            "sequence", "home_tier", "home_device", "partner_tier",
+            "partner_device", "tokens", "in", "out", "binding_label",
+            "passed_label", "weight_offset",
+        )
+        if any(armed[key] != completed[key] for key in identity_keys):
+            return "armed-completion-identity-mismatch"
+        if completed_kind == "failure":
+            return f"copy-failure:{classification}"
+        if completed_kind != "returned":
+            return "armed-completion-order-mismatch"
+        expected_sequence += 1
+        index += 2
+    return "complete"
+
+
+def q8_partner_direct_gather_summary(
+        text: str) -> tuple[str, str, str, str, str]:
+    records = q8_partner_direct_gather_records(text)
+    armed = [raw for kind, _, raw in records if kind == "armed"]
+    returned = [raw for kind, _, raw in records if kind == "returned"]
+    failures = [
+        (record, raw) for kind, record, raw in records if kind == "failure"
+    ]
+    state = (
+        q8_partner_direct_gather_marker_state(text)
+        if records or "q8 partner direct gather audit enabled:" in text
+        else "not-run"
+    )
+    classification = state
+    if failures and state.startswith("copy-failure:"):
+        classification = state.removeprefix("copy-failure:")
+    return (
+        armed[-1] if armed else "",
+        returned[-1] if returned else "",
+        failures[-1][1] if failures else "",
+        classification,
+        f"{len(armed)}/{len(returned)}/{len(failures)}",
+    )
+
+
 def q8_partner_pre_gather_checkpoint_sequence_state(
         text: str, armed_count: int) -> str:
     checkpoints = q8_partner_pre_gather_fence_records(text, "checkpoint")
@@ -843,7 +996,15 @@ def q8_partner_pre_gather_fence_record_classification(
             interpretation == "failure-surfaced-before-result-d2h" and
             confirmed + 1 == attempted and failed == 1 and gather_failed == 0
         )
-        return "pre-gather-stream-failure" if valid else "invalid-fence-record"
+        if not valid:
+            return "invalid-fence-record"
+        activation_tag = current | (1 << 63)
+        activation_complement = (~activation_tag) & Q8_UINT64_MASK
+        if (marker_sequence == current and
+                marker_complement == activation_complement and
+                record["marker_matches"] == "no"):
+            return "mapped-host-marker-partial-write"
+        return "pre-gather-stream-failure"
     if event == "marker-invalid":
         valid = (
             stage == "pre-result-d2h" and event_status == "complete" and
@@ -2614,13 +2775,67 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             compute_rows):
         row = compute_rows[-1]
         classification = row.get("q8_compute_fence_classification", "")
+        pre_gather_classification = row.get(
+            "q8_pre_gather_fence_classification", ""
+        )
         last = (row.get("q8_compute_fence_last_failure") or
                 row.get("q8_compute_fence_last_armed", ""))
+        if (classification == "all-observed-compute-fences-returned" and
+                pre_gather_classification ==
+                "mapped-host-marker-partial-write"):
+            return (
+                "Every observed pair-0 partner-Q8 compute synchronization returned. "
+                "The next diagnostic mapped-host marker made its current sequence "
+                "visible, but its complement remained the stale complement of the "
+                "preceding high-bit activation marker; result D2H was never attempted. "
+                "The first observed failure is therefore inside the diagnostic's own "
+                "mapped-host marker/system-visibility boundary (or concurrent work), "
+                "not the named Q8 compute binding. Remove that marker path before "
+                "bracketing the production result gather."
+            )
         return (
             "The global pair-0 partner-Q8 compute fence failed with "
             f"classification `{classification}`. The dynamically observed final "
             f"boundary record was `{last}`. This localizes where CUDA surfaced "
             "the reset without asserting that the named binding caused it."
+        )
+    direct_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-direct-gather-fence"
+    ]
+    if (outcomes.get("attention-q8-direct-gather-fence") == "failed" and
+            direct_rows):
+        row = direct_rows[-1]
+        classification = row.get("q8_direct_gather_classification", "")
+        compute_classification = row.get(
+            "q8_compute_fence_classification", ""
+        )
+        if compute_classification != "all-observed-compute-fences-returned":
+            last_compute = (
+                row.get("q8_compute_fence_last_failure") or
+                row.get("q8_compute_fence_last_armed", "")
+            )
+            return (
+                "The marker-free direct-gather arm failed before its next result "
+                "copy was armed, with compute-fence classification "
+                f"`{compute_classification}` and final compute record "
+                f"`{last_compute}`. No direct-gather boundary is attributed."
+            )
+        last = (row.get("q8_direct_gather_last_failure") or
+                row.get("q8_direct_gather_last_armed", ""))
+        if classification == "complete":
+            return (
+                "Every observed marker-free compute synchronization and direct "
+                "result D2H/H2D gather returned. The reset surfaced after the last "
+                f"confirmed boundary `{last}` or in concurrent work; no observed "
+                "selected Q8 result-copy boundary failed."
+            )
+        return (
+            "The marker-free direct-gather bracket failed with classification "
+            f"`{classification}` after the immediately preceding partner-compute "
+            "synchronization returned. Its final dynamic boundary record was "
+            f"`{last}`. This identifies which synchronous result-copy boundary "
+            "returned or failed without introducing mapped-host marker traffic."
         )
     attention = outcomes.get("attention-off", "not-run")
     attention_host_bounce = outcomes.get("attention-host-bounce", "not-run")
@@ -4573,6 +4788,9 @@ def main() -> None:
         (q8_compute_last_armed, q8_compute_last_returned,
          q8_compute_last_failure, q8_compute_classification,
          q8_compute_counts) = q8_partner_compute_fence_summary(log_text)
+        (q8_direct_last_armed, q8_direct_last_returned,
+         q8_direct_last_failure, q8_direct_classification,
+         q8_direct_counts) = q8_partner_direct_gather_summary(log_text)
         if variant == "attention-q8-l14-l15-phase-audit":
             (q8_window_last_complete, q8_window_l14_complete,
              q8_window_l15_complete, q8_window_classification) = (
@@ -4641,6 +4859,11 @@ def main() -> None:
             "q8_compute_fence_last_failure": q8_compute_last_failure,
             "q8_compute_fence_classification": q8_compute_classification,
             "q8_compute_fence_armed_returned_count": q8_compute_counts,
+            "q8_direct_gather_last_armed": q8_direct_last_armed,
+            "q8_direct_gather_last_returned": q8_direct_last_returned,
+            "q8_direct_gather_last_failure": q8_direct_last_failure,
+            "q8_direct_gather_classification": q8_direct_classification,
+            "q8_direct_gather_armed_returned_failure_count": q8_direct_counts,
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
@@ -4749,6 +4972,8 @@ def main() -> None:
         "Q8 pre-activation counts | Q8 pre-activation last checkpoint | "
         "Q8 pre-activation armed/returned count | Q8 pre-activation last armed | "
         "Q8 pre-activation last returned | Q8 pre-activation last failure | "
+        "Q8 direct-gather classification | Q8 direct-gather counts | "
+        "Q8 direct-gather last boundary | "
         "Pair-0 Q8 begun bytes* | "
         "Q8 phase last checkpoint | Q8 phase first failure | "
         "Q8 phase classification | Q8 skipped occurrence | "
@@ -4763,7 +4988,7 @@ def main() -> None:
         "Attention phase checkpoint | "
         "Attention end fence | Attention entry fence | First attention-audit failure | "
         "Boundary marker sequence | Post health | Watch event | Lost devices |",
-        "| " + " | ".join(["---"] * 56) + " |",
+        "| " + " | ".join(["---"] * 59) + " |",
     ]
     for row in rows:
         lines.append(
@@ -4800,6 +5025,9 @@ def main() -> None:
             f"{row.get('q8_pre_activation_fence_last_armed', '')} | "
             f"{row.get('q8_pre_activation_fence_last_returned', '')} | "
             f"{row.get('q8_pre_activation_fence_last_failure', '')} | "
+            f"{row.get('q8_direct_gather_classification', '')} | "
+            f"{row.get('q8_direct_gather_armed_returned_failure_count', '')} | "
+            f"{row.get('q8_direct_gather_last_failure') or row.get('q8_direct_gather_last_returned') or row.get('q8_direct_gather_last_armed', '')} | "
             f"{row.get('pair0_q8_begin_checkpoint_bytes', '0')} | "
             f"{row.get('q8_phase_audit_last_checkpoint', '')} | "
             f"{row.get('q8_phase_audit_first_failure', '')} | "
@@ -4878,6 +5106,14 @@ if __name__ == "__main__":
         )
         if state != "complete":
             fail(f"Q8 compute-fence marker state is {state}")
+    elif (len(sys.argv) == 3 and
+            sys.argv[1] == "--validate-q8-direct-gather-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_direct_gather_marker_state(
+            log_path.read_text(errors="replace")
+        )
+        if state != "complete":
+            fail(f"Q8 direct-gather marker state is {state}")
     elif (len(sys.argv) == 4 and
             sys.argv[1] == "--validate-q8-l14-l15-log"):
         log_path = Path(sys.argv[2])

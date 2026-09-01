@@ -4460,6 +4460,191 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertIn("dynamically observed final boundary", report)
             self.assertIn("without asserting", report)
 
+    def test_classifies_partial_mapped_host_marker_after_compute_return(
+            self) -> None:
+        sequence = 65
+        stale_complement = (~(sequence | (1 << 63))) & ((1 << 64) - 1)
+        failure = q8_pre_gather_failure(sequence, "sync-failed")
+        failure = failure.replace(
+            f"marker_sequence={sequence - 1} "
+            f"marker_complement={(~(sequence - 1)) & ((1 << 64) - 1)}",
+            f"marker_sequence={sequence} marker_complement={stale_complement}",
+        )
+        compute_enable = (
+            "ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 "
+            "boundary=post-submit-device-sync "
+            "scope=every-selected-partner-call identity=dynamic\n"
+        )
+        compute_identity = (
+            "sequence=1 home_tier=0 home_device=0 partner_tier=2 "
+            "partner_device=1 tokens=512 in=8192 out=4096 "
+            "binding_label=tensor:blk.11.attn_output_b.weight "
+            "passed_label=attn_output_b weight_offset=143053907200\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-global-compute-fence"
+            (production / f"{stem}.result").write_text(
+                "variant=attention-q8-global-compute-fence\n"
+                "status=failed-device-loss\nexit_status=124\n"
+            )
+            (production / f"{stem}.log").write_text(
+                compute_enable +
+                "ds4: CUDA q8 partner compute fence armed status=submitted " +
+                compute_identity +
+                "ds4: CUDA q8 partner compute fence returned status=complete " +
+                compute_identity + q8_pre_gather_enabled() +
+                q8_pre_gather_checkpointed_calls(sequence - 1) + failure
+            )
+            write_unhealthy_post(root, stem)
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_compute_fence_classification"],
+                "all-observed-compute-fences-returned",
+            )
+            self.assertEqual(
+                row["q8_pre_gather_fence_classification"],
+                "mapped-host-marker-partial-write",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("complement remained the stale complement", report)
+            self.assertIn("result D2H was never attempted", report)
+
+    def test_validates_marker_free_direct_gather_sequence(self) -> None:
+        enable = (
+            "ds4: CUDA q8 partner direct gather audit enabled: "
+            "logical_pairs=0 boundary=compute-sync-to-synchronous-host-bounce "
+            "mapped_host_marker=no event=no identity=dynamic\n"
+        )
+
+        def record(kind: str, sequence: int, status: str, flags: str) -> str:
+            return (
+                f"ds4: CUDA q8 partner direct gather {kind} "
+                f"sequence={sequence} status={status} {flags} "
+                "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+                "tokens=512 in=8192 out=4096 "
+                "binding_label=tensor:blk.11.attn_output_b.weight "
+                "passed_label=attn_output_b weight_offset=143053907200\n"
+            )
+
+        empty = (
+            "result_d2h_attempted=no result_d2h_completed=no "
+            "result_h2d_attempted=no result_h2d_completed=no"
+        )
+        complete = (
+            "result_d2h_attempted=yes result_d2h_completed=yes "
+            "result_h2d_attempted=yes result_h2d_completed=yes"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "direct.log"
+            log.write_text(
+                enable + record("armed", 1, "post-compute-sync", empty) +
+                record("returned", 1, "copy-complete", complete) +
+                record("armed", 2, "post-compute-sync", empty) +
+                record("returned", 2, "copy-complete", complete)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-direct-gather-log", str(log),
+            ], check=True)
+
+    def test_classifies_direct_gather_copy_boundaries(self) -> None:
+        enable = (
+            "ds4: CUDA q8 partner direct gather audit enabled: "
+            "logical_pairs=0 boundary=compute-sync-to-synchronous-host-bounce "
+            "mapped_host_marker=no event=no identity=dynamic\n"
+        )
+        identity = (
+            "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+            "tokens=512 in=8192 out=4096 "
+            "binding_label=tensor:blk.11.attn_output_b.weight "
+            "passed_label=attn_output_b weight_offset=143053907200"
+        )
+        armed = (
+            "ds4: CUDA q8 partner direct gather armed sequence=1 "
+            "status=post-compute-sync result_d2h_attempted=no "
+            "result_d2h_completed=no result_h2d_attempted=no "
+            f"result_h2d_completed=no {identity}\n"
+        )
+        cases = {
+            "result-d2h-attempt-failed": (
+                "yes", "no", "no", "no"
+            ),
+            "result-h2d-attempt-failed": (
+                "yes", "yes", "yes", "no"
+            ),
+        }
+        for expected, flags in cases.items():
+            with self.subTest(expected=expected):
+                d2ha, d2hc, h2da, h2dc = flags
+                failure = (
+                    "ds4: CUDA q8 partner direct gather failure sequence=1 "
+                    "status=copy-failed "
+                    f"result_d2h_attempted={d2ha} "
+                    f"result_d2h_completed={d2hc} "
+                    f"result_h2d_attempted={h2da} "
+                    f"result_h2d_completed={h2dc} {identity}\n"
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    production = root / "production"
+                    production.mkdir()
+                    stem = "r1-s1-attention-q8-direct-gather-fence"
+                    (production / f"{stem}.result").write_text(
+                        "variant=attention-q8-direct-gather-fence\n"
+                        "status=failed-device-loss\nexit_status=124\n"
+                    )
+                    (production / f"{stem}.log").write_text(
+                        enable + armed + failure
+                    )
+                    write_unhealthy_post(root, stem)
+                    subprocess.run([
+                        sys.executable, str(SUMMARIZER), str(root)
+                    ], check=True)
+                    with (root / "summary.csv").open(newline="") as handle:
+                        row = next(csv.DictReader(handle))
+                    self.assertEqual(
+                        row["q8_direct_gather_classification"], expected
+                    )
+
+    def test_rejects_direct_gather_identity_mismatch(self) -> None:
+        enable = (
+            "ds4: CUDA q8 partner direct gather audit enabled: "
+            "logical_pairs=0 boundary=compute-sync-to-synchronous-host-bounce "
+            "mapped_host_marker=no event=no identity=dynamic\n"
+        )
+        common = (
+            "home_tier=0 home_device=0 partner_tier=2 partner_device=1 "
+            "tokens=512 in=8192 out=4096 passed_label=attn_output_b "
+            "weight_offset=143053907200"
+        )
+        log_body = (
+            enable +
+            "ds4: CUDA q8 partner direct gather armed sequence=1 "
+            "status=post-compute-sync result_d2h_attempted=no "
+            "result_d2h_completed=no result_h2d_attempted=no "
+            "result_h2d_completed=no " + common +
+            " binding_label=tensor:blk.11.attn_output_b.weight\n" +
+            "ds4: CUDA q8 partner direct gather returned sequence=1 "
+            "status=copy-complete result_d2h_attempted=yes "
+            "result_d2h_completed=yes result_h2d_attempted=yes "
+            "result_h2d_completed=yes " + common +
+            " binding_label=tensor:blk.12.attn_output_b.weight\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "direct.log"
+            log.write_text(log_body)
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-direct-gather-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("armed-completion-identity-mismatch", completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

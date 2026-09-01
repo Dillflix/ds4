@@ -3758,6 +3758,68 @@ created from this fresh one-shot directory. The existing pre-gather archive is
 the predecessor evidence; this is a serial boundary refinement, not a new
 multi-stage A/B.
 
+The global-compute-fence evidence supersedes the earlier layer-specific
+interpretation. Every observed pair-0 partner-Q8 `cudaDeviceSynchronize()`
+returned. On sequence 101, the following mapped-host marker exposed its new
+sequence to the CPU but retained the complement from the immediately preceding
+high-bit activation marker. The result D2H was never attempted. This is a
+partial write/visibility failure in the diagnostic marker path itself (or an
+error from concurrent work), not evidence against the named layer-11 Q8
+binding. It also means another mapped-host marker cannot safely refine the
+original production failure.
+
+`attention-q8-direct-gather-fence` removes that instrumentation. It retains the
+same production row split and pair-0 attention/Q8 host-bounce transports, then
+performs only a partner-device compute synchronization followed immediately by
+the ordinary synchronous result D2H/H2D helper. CPU-side records bracket the
+copy and report whether D2H and H2D were attempted and completed. There is no
+mapped-host allocation, marker kernel, system fence, or completion event in
+this arm. Run it once from a clean boot; do not resume it after device loss:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 1 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+unset CUDA_VISIBLE_DEVICES
+unset SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-q8-direct-gather-fence-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-q8-direct-gather-fence \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMIT_W=250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+The accepted outcomes are deliberately narrow: compute synchronization fails;
+result D2H is entered but fails; D2H completes and H2D is not entered; H2D is
+entered but fails; or the complete gather returns. A dynamic binding identity
+is evidence for the final observed boundary only and is never reported as the
+cause of the reset.
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 

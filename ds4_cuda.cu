@@ -1285,6 +1285,8 @@ static std::atomic<uint64_t>
     g_q8_f16_partner_async_completion_submitted[DS4_MAX_GPUS] = {};
 static std::atomic<uint64_t>
     g_q8_f16_partner_async_completion_confirmed[DS4_MAX_GPUS] = {};
+static std::atomic<uint64_t>
+    g_q8_f16_partner_compute_fence_sequence[DS4_MAX_GPUS] = {};
 /* Pair-scoped diagnostic fence immediately before a forced host-bounce result
  * gather.  The fence reuses the async-completion event/marker above so it can
  * distinguish a failure surfaced by the post-compute event from one surfaced
@@ -1955,6 +1957,10 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_f16_partner_phase_audit_sequence.store(0, std::memory_order_relaxed);
     g_q8_f16_partner_phase_audit_selected_occurrence.store(
         0, std::memory_order_relaxed);
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        g_q8_f16_partner_compute_fence_sequence[tier].store(
+            0u, std::memory_order_relaxed);
+    }
     g_q8_f16_partner_phase_audit_skip_occurrences = 0u;
     g_q8_f16_partner_phase_audit_max_occurrences = 0u;
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
@@ -4549,15 +4555,6 @@ static int cuda_q8_f16_partner_async_completion_init(void) {
                 "marker=destination-default-stream-tagged-exact-before-activation-h2d\n",
                 pre_activation_fence_pairs);
     }
-    const char *compute_fence_pairs = getenv(
-        "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS");
-    if (compute_fence_pairs && compute_fence_pairs[0]) {
-        fprintf(stderr,
-                "ds4: CUDA q8 partner compute fence audit enabled: "
-                "logical_pairs=%s boundary=post-submit-device-sync "
-                "scope=every-selected-partner-call identity=dynamic\n",
-                compute_fence_pairs);
-    }
     fflush(stderr);
     return 1;
 }
@@ -4795,6 +4792,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         "DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS");
     const char *compute_fence_pairs = getenv(
         "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS");
+    const char *direct_gather_fence_pairs = getenv(
+        "DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS");
     if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
             async_completion_pairs, cfg->n_gpus, false)) {
         fprintf(stderr,
@@ -4823,6 +4822,14 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         fprintf(stderr,
                 "ds4: invalid "
                 "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS; "
+                "expected a unique in-range decimal logical-pair list\n");
+        return 0;
+    }
+    if (!cuda_q8_f16_partner_phase_audit_pairs_valid(
+            direct_gather_fence_pairs, cfg->n_gpus, false)) {
+        fprintf(stderr,
+                "ds4: invalid "
+                "DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS; "
                 "expected a unique in-range decimal logical-pair list\n");
         return 0;
     }
@@ -4871,23 +4878,55 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                     "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS",
                     pair)) continue;
             if (!cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", pair)) {
+                fprintf(stderr,
+                    "ds4: Q8 compute fence pair %d requires the same "
+                    "pair in the host-bounce pair list\n",
+                    pair);
+                return 0;
+            }
+        }
+    }
+    if (direct_gather_fence_pairs && direct_gather_fence_pairs[0]) {
+        for (int pair = 0; pair < cfg->n_gpus / 2; pair++) {
+            if (!cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS",
+                    pair)) continue;
+            if (!cuda_env_pair_list_contains(
                     "DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS", pair) ||
                 !cuda_env_pair_list_contains(
+                    "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS", pair) ||
+                cuda_env_pair_list_contains(
                     "DS4_CUDA_Q8_F16_PARTNER_ASYNC_COMPLETION_PAIRS", pair) ||
-                !cuda_env_pair_list_contains(
+                cuda_env_pair_list_contains(
                     "DS4_CUDA_Q8_F16_PARTNER_PRE_GATHER_FENCE_PAIRS", pair) ||
-                !cuda_env_pair_list_contains(
+                cuda_env_pair_list_contains(
                     "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS",
                     pair)) {
                 fprintf(stderr,
-                        "ds4: Q8 compute fence pair %d requires the same "
-                        "pair in the host-bounce, async-completion, "
-                        "pre-gather-fence, and pre-activation-fence lists\n",
+                        "ds4: Q8 direct-gather fence pair %d requires "
+                        "host-bounce plus compute-fence and forbids mapped-host "
+                        "async/pre-gather/pre-activation markers\n",
                         pair);
                 return 0;
             }
         }
     }
+    if (compute_fence_pairs && compute_fence_pairs[0]) {
+        fprintf(stderr,
+                "ds4: CUDA q8 partner compute fence audit enabled: "
+                "logical_pairs=%s boundary=post-submit-device-sync "
+                "scope=every-selected-partner-call identity=dynamic\n",
+                compute_fence_pairs);
+    }
+    if (direct_gather_fence_pairs && direct_gather_fence_pairs[0]) {
+        fprintf(stderr,
+                "ds4: CUDA q8 partner direct gather audit enabled: "
+                "logical_pairs=%s boundary=compute-sync-to-synchronous-host-bounce "
+                "mapped_host_marker=no event=no identity=dynamic\n",
+                direct_gather_fence_pairs);
+    }
+    fflush(stderr);
     if (async_completion_pairs && async_completion_pairs[0]) {
         for (int pair = 0; pair < cfg->n_gpus / 2; pair++) {
             if (cuda_env_pair_list_contains(
@@ -17417,6 +17456,38 @@ static void cuda_q8_f16_partner_compute_fence_log(
     if (durable) (void)fsync(fileno(stderr));
 }
 
+static void cuda_q8_f16_partner_direct_gather_log(
+        const char *record_kind, uint64_t sequence, const char *status,
+        bool result_d2h_attempted, bool result_d2h_completed,
+        bool result_h2d_attempted, bool result_h2d_completed,
+        int home_tier, int home_device, int partner_tier, int partner_device,
+        uint64_t n_tok, uint64_t in_dim, uint64_t out_dim,
+        const char *binding_label, const char *passed_label,
+        uint64_t weight_offset, bool durable) {
+    fprintf(stderr,
+            "ds4: CUDA q8 partner direct gather %s sequence=%llu status=%s "
+            "result_d2h_attempted=%s result_d2h_completed=%s "
+            "result_h2d_attempted=%s result_h2d_completed=%s "
+            "home_tier=%d home_device=%d partner_tier=%d partner_device=%d "
+            "tokens=%llu in=%llu out=%llu binding_label=%s passed_label=%s "
+            "weight_offset=%llu\n",
+            record_kind && record_kind[0] ? record_kind : "failure",
+            (unsigned long long)sequence,
+            status && status[0] ? status : "unknown",
+            result_d2h_attempted ? "yes" : "no",
+            result_d2h_completed ? "yes" : "no",
+            result_h2d_attempted ? "yes" : "no",
+            result_h2d_completed ? "yes" : "no",
+            home_tier, home_device, partner_tier, partner_device,
+            (unsigned long long)n_tok, (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            binding_label && binding_label[0] ? binding_label : "unavailable",
+            passed_label && passed_label[0] ? passed_label : "q8_0",
+            (unsigned long long)weight_offset);
+    fflush(stderr);
+    if (durable) (void)fsync(fileno(stderr));
+}
+
 static bool cuda_q8_f16_partner_async_completion_read(
         int home_tier, uint64_t expected_sequence,
         uint64_t *sequence_out, uint64_t *complement_out) {
@@ -18200,6 +18271,8 @@ static int cuda_q8_f16_partner_matmul_impl(
         "DS4_CUDA_Q8_F16_PARTNER_PRE_ACTIVATION_FENCE_PAIRS", home_tier);
     const bool compute_fence_call = cuda_env_pair_list_contains(
         "DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS", home_tier);
+    const bool direct_gather_fence_call = cuda_env_pair_list_contains(
+        "DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS", home_tier);
     if (pre_gather_fence_call && (!async_completion_call || !force_host_bounce)) {
         fprintf(stderr,
                 "ds4: fatal Q8 pre-gather fence pair %d lost its required "
@@ -18219,13 +18292,20 @@ static int cuda_q8_f16_partner_matmul_impl(
         fflush(stderr);
         return -1;
     }
-    if (compute_fence_call &&
-        (!force_host_bounce || !async_completion_call ||
-         !pre_gather_fence_call || !pre_activation_fence_call)) {
+    if (compute_fence_call && !force_host_bounce) {
         fprintf(stderr,
                 "ds4: fatal Q8 compute fence pair %d lost its required "
-                "activation/pre-gather/async-completion/host-bounce "
-                "configuration\n",
+                "host-bounce configuration\n",
+                home_tier);
+        fflush(stderr);
+        return -1;
+    }
+    if (direct_gather_fence_call &&
+        (!force_host_bounce || !compute_fence_call || async_completion_call ||
+         pre_gather_fence_call || pre_activation_fence_call)) {
+        fprintf(stderr,
+                "ds4: fatal Q8 direct-gather fence pair %d lost its "
+                "compute-fence/host-bounce/no-mapped-marker configuration\n",
                 home_tier);
         fflush(stderr);
         return -1;
@@ -18457,6 +18537,10 @@ static int cuda_q8_f16_partner_matmul_impl(
         : 0u;
     const uint64_t async_completion_sequence = async_completion_call
         ? g_q8_f16_partner_async_completion_begun[home_tier].fetch_add(
+              1u, std::memory_order_relaxed) + 1u
+        : 0u;
+    const uint64_t compute_fence_sequence = compute_fence_call
+        ? g_q8_f16_partner_compute_fence_sequence[home_tier].fetch_add(
               1u, std::memory_order_relaxed) + 1u
         : 0u;
     if (phase_audit_call) {
@@ -18769,30 +18853,32 @@ static int cuda_q8_f16_partner_matmul_impl(
     }
     if (compute_fence_call) {
         cuda_q8_f16_partner_compute_fence_log(
-            "armed", async_completion_sequence, "submitted",
+            "armed", compute_fence_sequence, "submitted",
             home_tier, home_device, partner_tier, partner_device,
             n_tok, in_dim, out_dim, binding->label, label, weight_offset,
             false);
         const cudaError_t compute_fence_sync = cudaDeviceSynchronize();
         if (compute_fence_sync != cudaSuccess) {
             cuda_q8_f16_partner_compute_fence_log(
-                "failure", async_completion_sequence,
+                "failure", compute_fence_sequence,
                 cudaGetErrorName(compute_fence_sync),
                 home_tier, home_device, partner_tier, partner_device,
                 n_tok, in_dim, out_dim, binding->label, label,
                 weight_offset, true);
-            cuda_q8_f16_partner_async_completion_failure_log(
-                "compute-fence-sync", false,
-                async_completion_sequence, home_tier, home_device,
-                partner_tier, partner_device, n_tok, in_dim, out_dim,
-                binding->label, label, weight_offset);
+            if (async_completion_call) {
+                cuda_q8_f16_partner_async_completion_failure_log(
+                    "compute-fence-sync", false,
+                    async_completion_sequence, home_tier, home_device,
+                    partner_tier, partner_device, n_tok, in_dim, out_dim,
+                    binding->label, label, weight_offset);
+            }
             (void)cudaGetLastError();
             (void)cuda_q8_f16_restore_home(
                 home_tier, "global partner compute fence failure");
             return -1;
         }
         cuda_q8_f16_partner_compute_fence_log(
-            "returned", async_completion_sequence, "complete",
+            "returned", compute_fence_sequence, "complete",
             home_tier, home_device, partner_tier, partner_device,
             n_tok, in_dim, out_dim, binding->label, label, weight_offset,
             false);
@@ -19008,6 +19094,15 @@ static int cuda_q8_f16_partner_matmul_impl(
             home_tier, home_device, partner_tier, partner_device);
     }
 
+    if (direct_gather_fence_call) {
+        cuda_q8_f16_partner_direct_gather_log(
+            "armed", compute_fence_sequence, "post-compute-sync",
+            false, false, false, false,
+            home_tier, home_device, partner_tier, partner_device,
+            n_tok, in_dim, out_dim, binding->label, label, weight_offset,
+            false);
+    }
+
     ds4_gpu_tensor result_src = {
         partner_result, result_bytes, 0, partner_tier
     };
@@ -19017,10 +19112,23 @@ static int cuda_q8_f16_partner_matmul_impl(
     bool result_h2d_completed = false;
     if (!ds4_gpu_tensor_copy_xdev_default_mode(
             out, &result_src, result_bytes, force_host_bounce,
-            pre_gather_fence_call ? &result_d2h_attempted : NULL,
-            pre_gather_fence_call ? &result_d2h_completed : NULL,
-            pre_gather_fence_call ? &result_h2d_attempted : NULL,
-            pre_gather_fence_call ? &result_h2d_completed : NULL)) {
+            (pre_gather_fence_call || direct_gather_fence_call)
+                ? &result_d2h_attempted : NULL,
+            (pre_gather_fence_call || direct_gather_fence_call)
+                ? &result_d2h_completed : NULL,
+            (pre_gather_fence_call || direct_gather_fence_call)
+                ? &result_h2d_attempted : NULL,
+            (pre_gather_fence_call || direct_gather_fence_call)
+                ? &result_h2d_completed : NULL)) {
+        if (direct_gather_fence_call) {
+            cuda_q8_f16_partner_direct_gather_log(
+                "failure", compute_fence_sequence, "copy-failed",
+                result_d2h_attempted, result_d2h_completed,
+                result_h2d_attempted, result_h2d_completed,
+                home_tier, home_device, partner_tier, partner_device,
+                n_tok, in_dim, out_dim, binding->label, label, weight_offset,
+                true);
+        }
         if (pre_gather_fence_confirmed) {
             g_q8_f16_partner_pre_gather_fence_result_gather_failed[home_tier]
                 .fetch_add(1u, std::memory_order_relaxed);
@@ -19176,6 +19284,15 @@ static int cuda_q8_f16_partner_matmul_impl(
          * scheduling comparison. */
         (void)fsync(fileno(stderr));
         return -1;
+    }
+    if (direct_gather_fence_call) {
+        cuda_q8_f16_partner_direct_gather_log(
+            "returned", compute_fence_sequence, "copy-complete",
+            result_d2h_attempted, result_d2h_completed,
+            result_h2d_attempted, result_h2d_completed,
+            home_tier, home_device, partner_tier, partner_device,
+            n_tok, in_dim, out_dim, binding->label, label, weight_offset,
+            false);
     }
 
     if (transfer_audit && home_tier >= 0 && home_tier < DS4_MAX_GPUS) {
