@@ -4078,6 +4078,47 @@ its immediate readiness relationship. Another loss proves that neither P2P
 endpoint allocation is required, while leaving the local read of the freshly
 produced source as the next differential.
 
+Run that arm from a fresh boot and directory at the cards' native limits:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+sudo nvidia-smi -i 1 -pl 260
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.default_limit,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-source-scratch-paced-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-row-gather-source-scratch-paced-shadow \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
 
@@ -4098,8 +4139,9 @@ attention row splitting began. Decode-indexer-only controls therefore do not
 isolate the observed prefill failure; `attention-off` controls the relevant
 path.
 
-All four GPUs must report an exact 250 W power limit before every arm and for
-the entire run. The telemetry watcher aborts the active case if a limit changes
+The current fault-audit arm requires each card's native ceiling by physical
+index: GPU0=250 W, GPU1 (the workstation card)=260 W, GPU2=250 W, and
+GPU3=250 W. The telemetry watcher aborts the active case if any limit changes
 or a device becomes unavailable. This matters because the serialized archive
 recorded an external sequential rewrite from 250 W to 225 W during engine
 startup; accepting that run as a 250 W arm would be invalid. The
@@ -4132,9 +4174,10 @@ older directory.
 cd ~/ds4-iq2-q4
 
 sudo nvidia-smi -pm 1
-for gpu in 0 1 2 3; do
+for gpu in 0 2 3; do
   sudo nvidia-smi -i "$gpu" -pl 250
 done
+sudo nvidia-smi -i 1 -pl 260
 nvidia-smi \
   --query-gpu=index,pci.bus_id,uuid,serial,power.limit \
   --format=csv
@@ -4150,7 +4193,7 @@ VARIANTS=attention-off,production \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \
-REQUIRED_POWER_LIMIT_W=250 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 TELEMETRY_INTERVAL_MS=500 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \

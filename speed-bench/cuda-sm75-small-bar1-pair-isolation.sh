@@ -51,7 +51,7 @@ Optional environment:
   PP_TOKENS=32768
   TG_TOKENS=256
   REPEATS=1
-  REQUIRED_POWER_LIMIT_W=250
+  REQUIRED_POWER_LIMITS_W=250,260,250,250  physical GPU0..3 native limits
   TELEMETRY_INTERVAL_MS=500
   POST_CASE_SETTLE_SECONDS=5
   SKIP_BUILD=0
@@ -180,7 +180,15 @@ TG_TOKENS=${TG_TOKENS:-256}
 Q8_TARGET_EXPECTED_SEQUENCES=$((PP_TOKENS / 512 + 1))
 Q8_WINDOW_EXPECTED_TOTAL_SEQUENCES=$((Q8_TARGET_EXPECTED_SEQUENCES * 2))
 REPEATS=${REPEATS:-1}
-REQUIRED_POWER_LIMIT_W=${REQUIRED_POWER_LIMIT_W:-250}
+if [[ -n ${REQUIRED_POWER_LIMITS_W+x} ]]; then
+    REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W}
+elif [[ -n ${REQUIRED_POWER_LIMIT_W:-} ]]; then
+    # Compatibility for historical 250 W matrices. New fault-audit arms use
+    # the native physical-index profile below.
+    REQUIRED_POWER_LIMITS_W="${REQUIRED_POWER_LIMIT_W},${REQUIRED_POWER_LIMIT_W},${REQUIRED_POWER_LIMIT_W},${REQUIRED_POWER_LIMIT_W}"
+else
+    REQUIRED_POWER_LIMITS_W=250,260,250,250
+fi
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-500}
 POST_CASE_SETTLE_SECONDS=${POST_CASE_SETTLE_SECONDS:-5}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -207,7 +215,6 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
             "ATTN_ROW_BOUNDARY_END_LAYER:$ATTN_ROW_BOUNDARY_END_LAYER" \
             "ATTN_ROW_BOUNDARY_ENTRY_LAYER:$ATTN_ROW_BOUNDARY_ENTRY_LAYER" \
             "ATTN_ROW_BOUNDARY_POS:$ATTN_ROW_BOUNDARY_POS" \
-            "REQUIRED_POWER_LIMIT_W:$REQUIRED_POWER_LIMIT_W" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "POST_CASE_SETTLE_SECONDS:$POST_CASE_SETTLE_SECONDS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
@@ -230,11 +237,15 @@ done
    ATTN_ROW_BOUNDARY_END_LAYER == 17 &&
    ATTN_ROW_BOUNDARY_ENTRY_LAYER == 18 &&
    ATTN_ROW_BOUNDARY_POS == 512 &&
-   REPEATS >= 1 && REQUIRED_POWER_LIMIT_W == 250 &&
+   REPEATS >= 1 &&
    TELEMETRY_INTERVAL_MS >= 100 &&
    POST_CASE_SETTLE_SECONDS <= 60 &&
    ONE_SHOT_TIMEOUT_SECONDS >= 60 && ONE_SHOT_TIMEOUT_SECONDS <= 3600 )) ||
     die "invalid fixed production isolation configuration"
+case "$REQUIRED_POWER_LIMITS_W" in
+    250,260,250,250|250,250,250,250) ;;
+    *) die "require native 250,260,250,250 W or historical 250 W profile" ;;
+esac
 for flag in SKIP_BUILD CREATE_ARCHIVE RESUME ONE_SHOT; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
@@ -347,9 +358,9 @@ if [[ $RESUME == 1 ]]; then
     grep -Fxq "attention_q8_targeted_phase_audit_weight_offset=$Q8_TARGETED_WEIGHT_OFFSET" \
         "$OUTPUT_DIR/manifest.txt" ||
         die "resume targeted Q8 weight offset differs from the original isolation"
-    grep -Fxq "required_power_limit_w=$REQUIRED_POWER_LIMIT_W" \
+    grep -Fxq "required_power_limits_w=$REQUIRED_POWER_LIMITS_W" \
         "$OUTPUT_DIR/manifest.txt" ||
-        die "resume power limit differs from the original isolation"
+        die "resume power-limit profile differs from the original isolation"
     grep -Fxq "attention_phase_audit_layer=$ATTN_PHASE_AUDIT_LAYER" \
         "$OUTPUT_DIR/manifest.txt" ||
         die "resume attention phase-audit layer differs from the original isolation"
@@ -595,14 +606,23 @@ for name in "${inherited_ds4[@]}"; do clean+=(-u "$name"); done
 
 IFS=, read -r -a gpu_ids <<<"$GPU_DEVICES"
 (( ${#gpu_ids[@]} == 4 )) || die "GPU_DEVICES must contain four IDs"
+IFS=, read -r -a required_power_limits <<<"$REQUIRED_POWER_LIMITS_W"
+(( ${#required_power_limits[@]} == 4 )) ||
+    die "REQUIRED_POWER_LIMITS_W must contain physical GPU0..3 limits"
+for limit in "${required_power_limits[@]}"; do
+    [[ $limit =~ ^[0-9]+$ ]] ||
+        die "REQUIRED_POWER_LIMITS_W entries must be integer watts"
+done
 
 validate_power_limits() {
-    local gpu limit
+    local gpu limit required
     for gpu in "${gpu_ids[@]}"; do
+        required=${required_power_limits[$gpu]:-}
+        [[ -n $required ]] || return 1
         limit=$(timeout --kill-after=5s 20s nvidia-smi -i "$gpu" \
             --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null |
             awk 'NR==1 {print $1}') || return 1
-        awk -v actual="$limit" -v required="$REQUIRED_POWER_LIMIT_W" \
+        awk -v actual="$limit" -v required="$required" \
             'BEGIN {exit !(actual + 0.0 == required + 0.0)}' || return 1
     done
 }
@@ -782,9 +802,9 @@ publish_watch_marker() {
     ready="${marker}.ready"
     ready_tmp="${ready}.tmp.$BASHPID.$RANDOM"
     marker_dir=$(dirname "$marker")
-    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\nmonitor_detail=%s\n' \
+    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limits_w=%s\nlost_devices=%s\nforeign_processes=%q\nmonitor_detail=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" "$case_pid" \
-        "$REQUIRED_POWER_LIMIT_W" "$lost_devices" "$foreign_processes" \
+        "$REQUIRED_POWER_LIMITS_W" "$lost_devices" "$foreign_processes" \
         "$monitor_detail" >"$marker_tmp"
     sync "$marker_tmp" 2>/dev/null || sync
     if ! mv -n -- "$marker_tmp" "$marker" || [[ -e $marker_tmp ]]; then
@@ -913,7 +933,8 @@ start_telemetry_watch() {
                 ' <<<"$recent_tail")
                 [[ -n $lost_devices ]] || lost_devices=unknown
             elif printf '%s\n' "$recent_tail" |
-                    awk -F, -v required="$REQUIRED_POWER_LIMIT_W" '
+                    awk -F, -v profile="$REQUIRED_POWER_LIMITS_W" '
+                        BEGIN {split(profile, required, ",")}
                         {
                             index_field=$2
                             limit=$7
@@ -922,7 +943,7 @@ start_telemetry_watch() {
                             sub(/[[:space:]]+W$/, "", limit)
                             if (index_field ~ /^[0-9]+$/ &&
                                 limit ~ /^[0-9]+([.][0-9]+)?$/ &&
-                                limit + 0.0 != required + 0.0) found=1
+                                limit + 0.0 != required[index_field + 1] + 0.0) found=1
                         }
                         END {exit !found}
                     '; then
@@ -938,9 +959,9 @@ start_telemetry_watch() {
                         "$case_pid" "$lost_devices" "$foreign_processes" \
                         "$case_identity"
                 else
-                    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limit_w=%s\nlost_devices=%s\nforeign_processes=%q\n' \
+                    printf 'timestamp_utc=%s\nstatus=%s\ncase_pid=%s\nrequired_power_limits_w=%s\nlost_devices=%s\nforeign_processes=%q\n' \
                         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$watch_status" \
-                        "$case_pid" "$REQUIRED_POWER_LIMIT_W" "$lost_devices" \
+                        "$case_pid" "$REQUIRED_POWER_LIMITS_W" "$lost_devices" \
                         "$foreign_processes" >"$marker"
                     sync "$marker" 2>/dev/null || sync
                     kill "$telemetry_pid" >/dev/null 2>&1 || true
@@ -1062,7 +1083,7 @@ phase=manifest
 gpu_health_snapshot "$OUTPUT_DIR/health/initial.log" ||
     die "initial four-GPU health check failed"
 validate_power_limits ||
-    die "all four selected GPUs must be fixed at ${REQUIRED_POWER_LIMIT_W} W"
+    die "selected GPUs must match physical-index power profile ${REQUIRED_POWER_LIMITS_W} W"
 if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
     {
         printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
@@ -1098,7 +1119,7 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_row_boundary_pos=%s\n' "$ATTN_ROW_BOUNDARY_POS"
         printf 'pp_tokens=%s\ntg_tokens=%s\nrepeats=%s\n' \
             "$PP_TOKENS" "$TG_TOKENS" "$REPEATS"
-        printf 'required_power_limit_w=%s\n' "$REQUIRED_POWER_LIMIT_W"
+        printf 'required_power_limits_w=%s\n' "$REQUIRED_POWER_LIMITS_W"
         printf 'partner_work_retained=yes\ndecode_indexer_pair_fallback=home\n'
         printf 'host_bounce_scope=q8_partner_activation_and_result_only\n'
         printf 'serialization_scope=q8_partner_projection_pair_only\n'
@@ -2195,7 +2216,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         gpu_health_snapshot "$pre_health" ||
             die "GPU health failed before variant=$variant"
         validate_power_limits ||
-            die "power limit changed before variant=$variant; require ${REQUIRED_POWER_LIMIT_W} W"
+            die "power limit changed before variant=$variant; require physical-index profile ${REQUIRED_POWER_LIMITS_W} W"
         assert_no_compute_processes ||
             die "foreign GPU compute process present before variant=$variant"
         printf 'timestamp_utc=%s\nvariant=%s\nrepeat=%s\n' \
@@ -2531,9 +2552,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         if (( run_status == 0 )) && ! validate_power_limits; then
             run_status=126
             if [[ ! -s $watch_marker ]]; then
-                printf 'timestamp_utc=%s\nstatus=post-run-power-limit-drift\nrequired_power_limit_w=%s\n' \
+                printf 'timestamp_utc=%s\nstatus=post-run-power-limit-drift\nrequired_power_limits_w=%s\n' \
                     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                    "$REQUIRED_POWER_LIMIT_W" >"$watch_marker"
+                    "$REQUIRED_POWER_LIMITS_W" >"$watch_marker"
                 sync "$watch_marker" 2>/dev/null || sync
             fi
         fi

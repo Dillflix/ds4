@@ -2763,7 +2763,8 @@ def healthy_post_snapshot(path: Path) -> bool:
 def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     if any("power-limit-drift" in row.get("watch_status", "") for row in rows):
         return (
-            "At least one arm changed power limit after its 250 W preflight. That arm "
+            "At least one arm changed power limit after its required profile "
+            "preflight. That arm "
             "is invalid for causal comparison; identify the external power-limit writer "
             "and rerun it."
         )
