@@ -43,6 +43,8 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
+        int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
         int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
@@ -884,6 +886,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
         "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     char *old_host_bounce = save_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
+    char *old_serialize = save_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
+    char *old_compute_suppressed = save_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
     const int old_n_gpus = g_n_gpus;
     ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
     int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
@@ -914,6 +920,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -987,6 +994,30 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           "malformed attention serialization pair lists fail closed");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
 
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(0) &&
+          !ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
+          "attention row computation is enabled on both pairs by default");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS", "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(0) &&
+          !ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
+          "attention row-compute suppression is scoped to logical pair 0");
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "row-compute suppression does not disable row-pair selection");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS", "1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(0) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
+          "attention row-compute suppression is scoped to logical pair 1");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS", "0,1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(0) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
+          "attention row-compute suppression accepts both logical pairs");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS", "0,", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(0) &&
+          !ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(1),
+          "malformed attention row-compute suppression lists fail closed");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
+
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "automatic query-row splitting stays scoped to measured four-GPU layout");
@@ -1016,6 +1047,11 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
         "DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS", old_gather_dst);
     restore_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS", old_host_bounce);
+    restore_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS", old_serialize);
+    restore_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS",
+        old_compute_suppressed);
 }
 
 static void test_cuda_tp_decode_indexer_rows_default(void) {

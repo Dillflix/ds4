@@ -26,6 +26,7 @@ Optional environment:
   VARIANTS=attention-q8-global-compute-fence  fence every pair-0 partner Q8 compute
   VARIANTS=attention-q8-direct-gather-fence  compute-sync then direct host-bounce gather, without mapped markers
   VARIANTS=attention-q8-rows-serialized  same cut, plus partner/home attention compute serialization
+  VARIANTS=attention-q8-row-compute-off  retain pair-0 cache mirrors, suppress only split row compute/gathers
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit one exact Q8 binding only
   Q8_TARGETED_BINDING_LABEL=...   default: tensor:blk.14.attn_output_b.weight
@@ -113,6 +114,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 readonly EXPECTED_SELECTED_IDENTITY="$repo_dir/speed-bench/sm75-small-bar1-expected-device-identity.csv"
+readonly ROW_COMPUTE_OFF_MARKER='ds4: CUDA prefill attention row compute pair-scoped disable: logical-pairs=0; partner cache allocation and mirror traffic retained; disabled pairs use home attention/indexer fallback'
 MODEL=${MODEL:-}
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -223,13 +225,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -251,7 +253,8 @@ fi
 if [[ ( -n ${seen_variants[attention-q8-activation-fence]:-} ||
         -n ${seen_variants[attention-q8-global-compute-fence]:-} ||
         -n ${seen_variants[attention-q8-direct-gather-fence]:-} ||
-        -n ${seen_variants[attention-q8-rows-serialized]:-} ) &&
+        -n ${seen_variants[attention-q8-rows-serialized]:-} ||
+        -n ${seen_variants[attention-q8-row-compute-off]:-} ) &&
       $ONE_SHOT != 1 ]]; then
     die "Q8 activation/compute fence variants require ONE_SHOT=1"
 fi
@@ -1290,7 +1293,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             grep -Fq 'partner transport override for logical pair 0: pinned-host-bounce' \
                 "$log" || return 1
             ! grep -Fq 'partner scheduling override for logical pair 0' "$log" ||
@@ -1323,8 +1326,6 @@ validate_success_path() {
             ! grep -Eq 'q8 partner transfer audit event=begin home_tier=1 .*transport=host-bounce' \
                 "$log" || return 1
 
-            grep -Eq 'prefill attention host-bounce checkpoint event=complete .*pos=512 tokens=512 home=0 partner=2' \
-                "$log" || return 1
             for cache_class in raw attn-comp index; do
                 grep -Fq "prefill attention cache mirror transport=host-bounce home_tier=0 partner_tier=2 class=$cache_class event=complete" \
                     "$log" || return 1
@@ -1333,27 +1334,50 @@ validate_success_path() {
                 "$log" || return 1
             ! grep -Fq 'prefill attention row split pair-scoped disable' "$log" ||
                 return 1
-            grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
-                return 1
-            grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
-                return 1
-            grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" ||
-                return 1
-            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" ||
-                return 1
-            validate_attention_copy_schedule "$log" 0 2 source source || return 1
-            validate_attention_copy_schedule "$log" 1 3 source source || return 1
-            validate_attention_copy_transport "$log" 0 2 host-bounce host-bounce ||
-                return 1
-            validate_attention_copy_transport "$log" 1 3 peer peer || return 1
-            ! grep -Eq 'prefill attention row audit dispatch=split .*home=0 partner=2 .*query_copy_transport=peer|prefill attention row audit dispatch=split .*home=0 partner=2 .*gather_copy_transport=peer' \
-                "$log" || return 1
-            ! grep -Eq 'prefill attention row audit dispatch=split .*home=1 partner=3 .*query_copy_transport=host-bounce|prefill attention row audit dispatch=split .*home=1 partner=3 .*gather_copy_transport=host-bounce' \
-                "$log" || return 1
-            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=0 partner=2 .*topk_copy_transport=partner-local' \
-                "$log" || return 1
-            grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=1 partner=3 .*topk_copy_transport=partner-local' \
-                "$log" || return 1
+            if [[ $variant == attention-q8-row-compute-off ]]; then
+                grep -Fxq "$ROW_COMPUTE_OFF_MARKER" "$log" || return 1
+                ! grep -Fq 'prefill attention host-bounce checkpoint event=complete ' \
+                    "$log" || return 1
+                ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+                    "$log" || return 1
+                ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
+                    "$log" || return 1
+                ! grep -Eq 'prefill attention row audit dispatch=split .*home=0 partner=2' \
+                    "$log" || return 1
+                grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
+                    "$log" || return 1
+                grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                    "$log" || return 1
+                validate_attention_copy_schedule "$log" 1 3 source source ||
+                    return 1
+                validate_attention_copy_transport "$log" 1 3 peer peer || return 1
+                grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=1 partner=3 .*topk_copy_transport=partner-local' \
+                    "$log" || return 1
+            else
+                grep -Eq 'prefill attention host-bounce checkpoint event=complete .*pos=512 tokens=512 home=0 partner=2' \
+                    "$log" || return 1
+                grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+                    "$log" || return 1
+                grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
+                    "$log" || return 1
+                grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
+                    "$log" || return 1
+                grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                    "$log" || return 1
+                validate_attention_copy_schedule "$log" 0 2 source source || return 1
+                validate_attention_copy_schedule "$log" 1 3 source source || return 1
+                validate_attention_copy_transport "$log" 0 2 host-bounce host-bounce ||
+                    return 1
+                validate_attention_copy_transport "$log" 1 3 peer peer || return 1
+                ! grep -Eq 'prefill attention row audit dispatch=split .*home=0 partner=2 .*query_copy_transport=peer|prefill attention row audit dispatch=split .*home=0 partner=2 .*gather_copy_transport=peer' \
+                    "$log" || return 1
+                ! grep -Eq 'prefill attention row audit dispatch=split .*home=1 partner=3 .*query_copy_transport=host-bounce|prefill attention row audit dispatch=split .*home=1 partner=3 .*gather_copy_transport=host-bounce' \
+                    "$log" || return 1
+                grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=0 partner=2 .*topk_copy_transport=partner-local' \
+                    "$log" || return 1
+                grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=1 partner=3 .*topk_copy_transport=partner-local' \
+                    "$log" || return 1
+            fi
             ! grep -Eq 'prefill attention row audit dispatch=split kind=indexed .*home=[01] partner=[23] .*topk_copy_transport=(peer|host-bounce)' \
                 "$log" || return 1
             ! grep -Fq 'ordered destination-stream peer copy unavailable' "$log" ||
@@ -1581,7 +1605,8 @@ validate_success_path() {
             --validate-q8-compute-fence-log "$log" || return 1
     fi
     if [[ $variant == attention-q8-direct-gather-fence ||
-          $variant == attention-q8-rows-serialized ]]; then
+          $variant == attention-q8-rows-serialized ||
+          $variant == attention-q8-row-compute-off ]]; then
         grep -Fxq \
             'ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 boundary=post-submit-device-sync scope=every-selected-partner-call identity=dynamic' \
             "$log" || return 1
@@ -1791,11 +1816,28 @@ validate_success_path() {
 validate_completed_path() {
     local variant=$1 log=$2 bindings=$3 csv=$4
     case "$variant" in
-        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
             validate_success_path "$variant" "$log" "$bindings" "$csv" 0
             ;;
         *)
             validate_success_path "$variant" "$log" "$bindings" "$csv"
+            ;;
+    esac
+}
+
+failed_arm_activation_proven() {
+    local variant=$1 log=$2
+    case "$variant" in
+        attention-q8-row-compute-off)
+            grep -Fxq "$ROW_COMPUTE_OFF_MARKER" "$log"
+            ;;
+        attention-q8-rows-serialized)
+            grep -Fxq \
+                'ds4: CUDA prefill attention row compute serialization enabled: logical pair 0->2 order=partner-sync,home-sync; row ownership, kernels, caches, and transport retained' \
+                "$log"
+            ;;
+        *)
+            return 0
             ;;
     esac
 }
@@ -1883,7 +1925,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     recovered_status=passed
                     recovered_exit=0
                     case "$variant" in
-                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+                        attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                             if ! validate_full_production_load "$csv"; then
                                 recovered_status=inconclusive-underloaded
                                 recovered_exit=128
@@ -1923,8 +1965,15 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                     gpu_health_snapshot_is_unhealthy "$post_health"; then
                 retained_status=interrupted-prior-run-device-loss
                 retained_exit=124
-                printf 'Retaining interrupted prior arm as corroborated device-loss failure: variant=%s repeat=%d\n' \
-                    "$variant" "$repeat"
+                if ! failed_arm_activation_proven "$variant" "$log"; then
+                    retained_status=interrupted-prior-run-experiment-not-activated
+                    retained_exit=123
+                    printf 'Retaining interrupted prior arm as device loss before required experiment activation: variant=%s repeat=%d\n' \
+                        "$variant" "$repeat"
+                else
+                    printf 'Retaining interrupted prior arm as corroborated device-loss failure: variant=%s repeat=%d\n' \
+                        "$variant" "$repeat"
+                fi
             else
                 printf 'Retaining interrupted prior arm as incomplete evidence: variant=%s repeat=%d\n' \
                     "$variant" "$repeat"
@@ -2000,6 +2049,13 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             attention-q8-rows-serialized)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
+                ;;
+            attention-q8-row-compute-off)
+                variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
+                variant_env+=("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
@@ -2330,7 +2386,9 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 watch_status=$(awk -F= '$1=="status" {print $2; exit}' "$watch_marker")
             fi
             result_status=run-failed-unverified
-            if [[ $watch_status == lost-device-detected ]] ||
+            if ! failed_arm_activation_proven "$variant" "$log"; then
+                result_status=experiment-not-activated
+            elif [[ $watch_status == lost-device-detected ]] ||
                     gpu_health_snapshot_is_unhealthy "$post_health"; then
                 result_status=failed-device-loss
             elif [[ -n $watch_status ]]; then
@@ -2363,7 +2421,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "variant=$variant failed production-path validation"
         fi
         case "$variant" in
-            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
+            attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit)
                 if ! validate_full_production_load "$csv"; then
                     write_result "$result" "$variant" inconclusive-underloaded 128 \
                         "$progress" "$log"

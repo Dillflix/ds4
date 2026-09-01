@@ -13,6 +13,7 @@ VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
     "attention-q8-pre-gather-fence", "attention-q8-activation-fence",
     "attention-q8-global-compute-fence", "attention-q8-direct-gather-fence",
+    "attention-q8-rows-serialized", "attention-q8-row-compute-off",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
