@@ -3957,6 +3957,10 @@ cut of pair-0 attention-owned work:
   accepted only when the CUDA helper reports exactly 32 MiB, two 16 MiB
   submissions, source tier 2, destination tier 0, both readiness operations,
   and both completion operations.
+- `attention-row-gather-chunk16-paced-shadow` preserves those two 16 MiB copy
+  operations, but the destination acknowledges completion of chunk 1 and the
+  source waits for that acknowledgement before submitting chunk 2. Its exact
+  runtime marker is required for both successful and device-loss evidence.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4030,6 +4034,16 @@ The next one-shot arm is `attention-row-gather-chunk16-shadow`. A pass isolates
 the 32 MiB CUDA operation size; another loss means the next differential must
 pace the two 16 MiB chunks with an acknowledgement between them rather than
 merely segmenting one continuous transfer burst.
+
+The back-to-back 16 MiB arm also lost the same physical pair after its exact
+schedule marker and first shadow completion. Operation size alone is therefore
+not sufficient. The next one-shot arm is
+`attention-row-gather-chunk16-paced-shadow`; it adds a destination
+acknowledgement between chunks while retaining source scheduling, direct P2P,
+32 MiB total, row ownership, compute, destination address, and accepted home
+recomputation. If it survives, continuous gather burst/overlap is isolated. If
+it loses the device, the next differential is the destination allocation: send
+the same paced result into dedicated home scratch that is never consumed.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

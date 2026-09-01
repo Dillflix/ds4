@@ -4087,6 +4087,19 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-chunk16-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "Neither individual operation size nor an unbroken transfer burst",
+            ),
+            (
+                (("attention-row-gather-chunk16-paced-shadow", "passed"),),
+                "Continuous gather burst/overlap is the isolated axis",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

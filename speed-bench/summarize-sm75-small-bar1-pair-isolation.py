@@ -17,6 +17,7 @@ VARIANT_ORDER = (
     "attention-row-query-shadow", "attention-row-partner-shadow",
     "attention-row-gather-shadow", "attention-row-gather-dst-shadow",
     "attention-row-gather-chunk16-shadow",
+    "attention-row-gather-chunk16-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2808,6 +2809,26 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     gather_chunk16_state = outcomes.get(
         "attention-row-gather-chunk16-shadow", "not-run"
     )
+    gather_chunk16_paced_state = outcomes.get(
+        "attention-row-gather-chunk16-paced-shadow", "not-run"
+    )
+    if gather_chunk16_paced_state == "failed":
+        return (
+            "The two 16 MiB gathers still lost a device when the destination "
+            "acknowledged completion of chunk 1 before the source could submit "
+            "chunk 2. Neither individual operation size nor an unbroken transfer "
+            "burst is sufficient. Isolate the production destination view next by "
+            "copying the same paced partner result into a dedicated home scratch "
+            "allocation that is never consumed."
+        )
+    if gather_chunk16_paced_state == "passed":
+        return (
+            "The destination-acknowledged 16 MiB chunks survived with healthy GPUs "
+            "while back-to-back 16 MiB chunks and both 32 MiB schedules lost the "
+            "pair. Continuous gather burst/overlap is the isolated axis; confirm "
+            "the paced schedule in the complete production row path before "
+            "considering promotion."
+        )
     if gather_state == "failed":
         return (
             "The source-scheduled partner-to-home result-gather shadow lost a "
@@ -2855,6 +2876,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         ("attention-row-gather-shadow", "result-gather"),
         ("attention-row-gather-dst-shadow", "result-gather-dst"),
         ("attention-row-gather-chunk16-shadow", "result-gather-chunk16"),
+        (
+            "attention-row-gather-chunk16-paced-shadow",
+            "result-gather-chunk16-paced",
+        ),
     ):
         state = outcomes.get(variant, "not-run")
         if state in {"invalid", "underloaded"}:

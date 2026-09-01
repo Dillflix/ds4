@@ -8,7 +8,8 @@
  *     (when 2+ GPUs are visible).
  *   - destination-stream ordered peer-copy exactness, immediate source-buffer
  *     reuse ordering, and fail-closed forced-host-bounce behavior.
- *   - source-stream chunked peer-copy exactness, including a tail chunk. */
+ *   - source-stream chunked and destination-acknowledged peer-copy exactness,
+ *     including a tail chunk. */
 
 /* ds4_gpu_mgpu.h is standalone-C-compatible — it now provides the
  * complete ds4_gpu_tensor struct + typedef so callers can use the
@@ -408,6 +409,17 @@ static int run_chunked_source_copy(void) {
               "chunked source result read");
         CHECK(memcmp(expected, got, bytes) == 0,
               "chunked source exact result");
+
+        memset(got, 0x2d, bytes);
+        CHECK(ds4_gpu_tensor_write(dst, 0, got, bytes),
+              "paced chunked destination seed");
+        CHECK(ds4_gpu_tensor_copy_xdev_default_chunked_peer_paced(
+                  dst, src, bytes, chunk_bytes),
+              "paced chunked peer copy");
+        CHECK(ds4_gpu_tensor_read(dst, 0, got, bytes),
+              "paced chunked result read");
+        CHECK(memcmp(expected, got, bytes) == 0,
+              "paced chunked exact result");
     }
 
     ds4_gpu_tensor_free_in_place(&tier0);

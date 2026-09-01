@@ -6159,6 +6159,125 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default_chunked_peer(
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_copy_xdev_default_chunked_peer_paced(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t bytes,
+        uint64_t chunk_bytes) {
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes ||
+        chunk_bytes == 0u) return 0;
+    if (bytes == 0u) return 1;
+    const int sd = ds4_tensor_device_idx(src);
+    const int dd = ds4_tensor_device_idx(dst);
+    if (sd == dd) {
+        int ok = 1;
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            for (uint64_t offset = 0u; ok && offset < bytes;) {
+                const uint64_t remaining = bytes - offset;
+                const size_t count = (size_t)(remaining < chunk_bytes
+                    ? remaining : chunk_bytes);
+                ok = cuda_ok(cudaMemcpyAsync(
+                                 (char *)dst->ptr + offset,
+                                 (const char *)src->ptr + offset, count,
+                                 cudaMemcpyDeviceToDevice, 0),
+                             "paced chunked same-device copy");
+                offset += count;
+            }
+        }
+        return ok;
+    }
+
+    int peer = g_gpu_peer_ok[sd][dd];
+    if (g_xdev_force_cuda_peer) peer = 1;
+    if (g_xdev_force_host_bounce || !peer) {
+        fprintf(stderr,
+                "ds4: paced chunked peer copy unavailable: "
+                "source_tier=%d destination_tier=%d host_bounce=%d\n",
+                sd, dd, g_xdev_force_host_bounce ? 1 : 0);
+        return 0;
+    }
+
+    int ok = 0;
+    WITH_DEVICE(g_gpu[dd].device_id) {
+        ok = cuda_ok(cudaEventRecord(
+                         (cudaEvent_t)g_gpu[dd].boundary_event, 0),
+                     "paced chunked destination-ready record");
+    }
+    if (ok) {
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            ok = cuda_ok(cudaStreamWaitEvent(
+                             0, (cudaEvent_t)g_gpu[dd].boundary_event, 0),
+                         "paced chunked source ready wait");
+        }
+    }
+    if (!ok) return 0;
+
+    uint64_t offset = 0u;
+    while (ok && offset < bytes) {
+        const uint64_t remaining = bytes - offset;
+        const size_t count = (size_t)(remaining < chunk_bytes
+            ? remaining : chunk_bytes);
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            ok = cuda_ok(cudaMemcpyPeerAsync(
+                             (char *)dst->ptr + offset,
+                             g_gpu[dd].device_id,
+                             (const char *)src->ptr + offset,
+                             g_gpu[sd].device_id, count, 0),
+                         "paced chunked peer copy");
+            if (ok) {
+                ok = cuda_ok(cudaEventRecord(
+                                 (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                             "paced chunked source completion record");
+            }
+        }
+        if (!ok) break;
+
+        WITH_DEVICE(g_gpu[dd].device_id) {
+            ok = cuda_ok(cudaStreamWaitEvent(
+                             0, (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                         "paced chunked destination completion wait");
+        }
+        if (!ok) break;
+
+        offset += count;
+        if (offset < bytes) {
+            WITH_DEVICE(g_gpu[dd].device_id) {
+                ok = cuda_ok(cudaEventRecord(
+                                 (cudaEvent_t)g_gpu[dd].boundary_event, 0),
+                             "paced chunked destination acknowledgement");
+            }
+            if (ok) {
+                WITH_DEVICE(g_gpu[sd].device_id) {
+                    ok = cuda_ok(cudaStreamWaitEvent(
+                                     0,
+                                     (cudaEvent_t)g_gpu[dd].boundary_event,
+                                     0),
+                                 "paced chunked source acknowledgement wait");
+                }
+            }
+        }
+    }
+    if (ok) {
+        static int logged = 0;
+        if (!logged) {
+            const uint64_t submissions = 1u + (bytes - 1u) / chunk_bytes;
+            fprintf(stderr,
+                    "ds4: CUDA paced chunked default-stream peer copy "
+                    "scheduled: source_tier=%d destination_tier=%d "
+                    "bytes=%llu chunk_bytes=%llu submissions=%llu "
+                    "readiness=one-destination-event-one-source-wait "
+                    "inter_chunk=one-destination-ack-event-one-source-wait "
+                    "completion=per-chunk-source-event-destination-wait\n",
+                    sd, dd, (unsigned long long)bytes,
+                    (unsigned long long)chunk_bytes,
+                    (unsigned long long)submissions);
+            fflush(stderr);
+            logged = 1;
+        }
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
         ds4_gpu_tensor *dst0,
         const ds4_gpu_tensor *src0,

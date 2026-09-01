@@ -1041,6 +1041,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
            "result-gather-chunk16", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 5,
           "16 MiB-chunked result-gather shadow phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE",
+           "result-gather-chunk16-paced", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 6,
+          "paced 16 MiB-chunked result-gather shadow phase is recognized");
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "invalid", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
           "invalid attention row shadow phases fail closed");

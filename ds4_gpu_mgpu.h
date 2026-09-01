@@ -182,6 +182,16 @@ int ds4_gpu_tensor_copy_xdev_default_chunked_peer(
         uint64_t              bytes,
         uint64_t              chunk_bytes);
 
+/* Diagnostic variant of the chunked source-default-stream copy that makes
+ * each chunk individually visible to the destination. Between chunks the
+ * destination records an acknowledgement and the source waits for it before
+ * submitting the next copy. Direct peer transport is mandatory. */
+int ds4_gpu_tensor_copy_xdev_default_chunked_peer_paced(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t              bytes,
+        uint64_t              chunk_bytes);
+
 /* Grouped default-stream handoff whose copies execute on the destination
  * device. The source default stream records readiness; the destination waits,
  * performs all three copies, then naturally orders its following kernels.
