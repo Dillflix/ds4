@@ -4378,6 +4378,88 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("activation-checkpoint-binding-mismatch", completed.stderr)
 
+    def test_validates_global_q8_compute_fence_dynamic_bindings(self) -> None:
+        enabled = (
+            "ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 "
+            "boundary=post-submit-device-sync "
+            "scope=every-selected-partner-call identity=dynamic\n"
+        )
+
+        def record(kind: str, sequence: int, layer: int) -> str:
+            status = "submitted" if kind == "armed" else "complete"
+            return (
+                f"ds4: CUDA q8 partner compute fence {kind} "
+                f"sequence={sequence} status={status} home_tier=0 "
+                "home_device=0 partner_tier=2 partner_device=1 tokens=512 "
+                f"in=8192 out=4096 binding_label=tensor:blk.{layer}."
+                "attn_output_b.weight passed_label=attn_output_b "
+                f"weight_offset={143000000000 + layer}\n"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "compute.log"
+            log.write_text(
+                enabled + record("armed", 1, 7) + record("returned", 1, 7) +
+                record("armed", 2, 13) + record("returned", 2, 13)
+            )
+            subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-compute-fence-log", str(log),
+            ], check=True)
+
+    def test_rejects_unmatched_global_q8_compute_fence_arm(self) -> None:
+        log_body = (
+            "ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 "
+            "boundary=post-submit-device-sync "
+            "scope=every-selected-partner-call identity=dynamic\n"
+            "ds4: CUDA q8 partner compute fence armed sequence=1 "
+            "status=submitted home_tier=0 home_device=0 partner_tier=2 "
+            "partner_device=1 tokens=512 in=8192 out=4096 "
+            "binding_label=tensor:blk.13.attn_output_b.weight "
+            "passed_label=attn_output_b weight_offset=143388891904\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "compute.log"
+            log.write_text(log_body)
+            completed = subprocess.run([
+                sys.executable, str(SUMMARIZER),
+                "--validate-q8-compute-fence-log", str(log),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("unmatched-armed-record", completed.stderr)
+
+    def test_summarizes_unmatched_global_compute_arm_without_layer_claim(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            production = root / "production"
+            production.mkdir()
+            stem = "r1-s1-attention-q8-global-compute-fence"
+            (production / f"{stem}.started").write_text(
+                "variant=attention-q8-global-compute-fence\nrepeat=1\n"
+            )
+            (production / f"{stem}.log").write_text(
+                "ds4: CUDA q8 partner compute fence audit enabled: "
+                "logical_pairs=0 boundary=post-submit-device-sync "
+                "scope=every-selected-partner-call identity=dynamic\n"
+                "ds4: CUDA q8 partner compute fence armed sequence=41 "
+                "status=submitted home_tier=0 home_device=0 partner_tier=2 "
+                "partner_device=1 tokens=512 in=8192 out=4096 "
+                "binding_label=tensor:blk.13.attn_output_b.weight "
+                "passed_label=attn_output_b weight_offset=143388891904\n"
+            )
+            write_lost_watch(root, stem, "1@00000000:03:00.0")
+            subprocess.run([sys.executable, str(SUMMARIZER), str(root)], check=True)
+            with (root / "summary.csv").open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(
+                row["q8_compute_fence_classification"],
+                "compute-fence-return-not-observed",
+            )
+            report = (root / "summary.md").read_text()
+            self.assertIn("dynamically observed final boundary", report)
+            self.assertIn("without asserting", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from pathlib import Path
 VARIANT_ORDER = (
     "attention-off", "attention-host-bounce", "attention-q8-host-bounce",
     "attention-q8-pre-gather-fence", "attention-q8-activation-fence",
+    "attention-q8-global-compute-fence",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -555,6 +556,104 @@ def q8_partner_pre_gather_call_sequence_state(text: str) -> str:
     if observed != expected:
         return "armed-returned-order-mismatch"
     return "complete"
+
+
+def q8_partner_compute_fence_marker_state(text: str) -> str:
+    enable = (
+        "ds4: CUDA q8 partner compute fence audit enabled: logical_pairs=0 "
+        "boundary=post-submit-device-sync "
+        "scope=every-selected-partner-call identity=dynamic"
+    )
+    if text.splitlines().count(enable) != 1:
+        return "invalid-enable-record"
+
+    prefix = "q8 partner compute fence "
+    observed: list[tuple[str, dict[str, str]]] = []
+    for line in text.splitlines():
+        if line == enable:
+            continue
+        if prefix not in line:
+            continue
+        before, _, tail = line.partition(prefix)
+        if not before.endswith("CUDA "):
+            return "invalid-record-prefix"
+        kind, separator, fields = tail.partition(" ")
+        if not separator or kind not in {"armed", "returned", "failure"}:
+            return "invalid-record-kind"
+        observed.append((kind, _kv_record("record " + fields, "record ")))
+    if not observed:
+        return "empty"
+    if any(kind == "failure" for kind, _ in observed):
+        return "compute-sync-failure"
+
+    required = {
+        "sequence", "status", "home_tier", "home_device",
+        "partner_tier", "partner_device", "tokens", "in", "out",
+        "binding_label", "passed_label", "weight_offset",
+    }
+    expected_sequence = 1
+    index = 0
+    while index < len(observed):
+        if index + 1 >= len(observed):
+            return "unmatched-armed-record"
+        armed_kind, armed = observed[index]
+        returned_kind, returned = observed[index + 1]
+        if armed_kind != "armed" or returned_kind != "returned":
+            return "armed-returned-order-mismatch"
+        if any(not armed.get(key) or not returned.get(key) for key in required):
+            return "invalid-record"
+        armed_without_status = dict(armed)
+        returned_without_status = dict(returned)
+        armed_status = armed_without_status.pop("status", None)
+        returned_status = returned_without_status.pop("status", None)
+        if (armed_without_status != returned_without_status or
+                armed_status != "submitted" or
+                returned_status != "complete"):
+            return "armed-returned-identity-mismatch"
+        if (_q8_u64(armed, "sequence") != expected_sequence or
+                armed["home_tier"] != "0" or armed["home_device"] != "0" or
+                armed["partner_tier"] != "2" or
+                armed["partner_device"] != "1" or
+                armed["binding_label"] == "unavailable" or
+                armed["passed_label"] == "unavailable" or
+                any((_q8_u64(armed, key) or 0) == 0
+                    for key in ("tokens", "in", "out", "weight_offset"))):
+            return "invalid-record"
+        expected_sequence += 1
+        index += 2
+    return "complete"
+
+
+def q8_partner_compute_fence_summary(
+        text: str) -> tuple[str, str, str, str, str]:
+    records: dict[str, list[str]] = {
+        "armed": [], "returned": [], "failure": [],
+    }
+    for line in text.splitlines():
+        for kind in records:
+            marker = f"ds4: CUDA q8 partner compute fence {kind} "
+            if marker in line:
+                records[kind].append(line.strip())
+                break
+    armed_count = len(records["armed"])
+    returned_count = len(records["returned"])
+    last_armed = records["armed"][-1] if armed_count else ""
+    last_returned = records["returned"][-1] if returned_count else ""
+    last_failure = records["failure"][-1] if records["failure"] else ""
+    if records["failure"]:
+        classification = "compute-synchronize-failed"
+    elif armed_count == 0 and returned_count == 0:
+        classification = "not-run"
+    elif armed_count == returned_count:
+        classification = "all-observed-compute-fences-returned"
+    elif armed_count == returned_count + 1:
+        classification = "compute-fence-return-not-observed"
+    else:
+        classification = "invalid-compute-fence-record"
+    return (
+        last_armed, last_returned, last_failure,
+        classification, f"{armed_count}/{returned_count}",
+    )
 
 
 def q8_partner_pre_gather_checkpoint_sequence_state(
@@ -2507,6 +2606,22 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "is invalid for causal comparison; identify the external launcher and "
             "rerun it without the foreign workload."
         )
+    compute_rows = [
+        row for row in rows
+        if row.get("variant") == "attention-q8-global-compute-fence"
+    ]
+    if (outcomes.get("attention-q8-global-compute-fence") == "failed" and
+            compute_rows):
+        row = compute_rows[-1]
+        classification = row.get("q8_compute_fence_classification", "")
+        last = (row.get("q8_compute_fence_last_failure") or
+                row.get("q8_compute_fence_last_armed", ""))
+        return (
+            "The global pair-0 partner-Q8 compute fence failed with "
+            f"classification `{classification}`. The dynamically observed final "
+            f"boundary record was `{last}`. This localizes where CUDA surfaced "
+            "the reset without asserting that the named binding caused it."
+        )
     attention = outcomes.get("attention-off", "not-run")
     attention_host_bounce = outcomes.get("attention-host-bounce", "not-run")
     attention_q8_host_bounce = outcomes.get(
@@ -4455,6 +4570,9 @@ def main() -> None:
          q8_activation_returned_count) = q8_partner_pre_activation_fence_summary(
              log_text, status
          )
+        (q8_compute_last_armed, q8_compute_last_returned,
+         q8_compute_last_failure, q8_compute_classification,
+         q8_compute_counts) = q8_partner_compute_fence_summary(log_text)
         if variant == "attention-q8-l14-l15-phase-audit":
             (q8_window_last_complete, q8_window_l14_complete,
              q8_window_l15_complete, q8_window_classification) = (
@@ -4518,6 +4636,11 @@ def main() -> None:
             "q8_pre_activation_fence_returned_count": (
                 q8_activation_returned_count
             ),
+            "q8_compute_fence_last_armed": q8_compute_last_armed,
+            "q8_compute_fence_last_returned": q8_compute_last_returned,
+            "q8_compute_fence_last_failure": q8_compute_last_failure,
+            "q8_compute_fence_classification": q8_compute_classification,
+            "q8_compute_fence_armed_returned_count": q8_compute_counts,
             "q8_phase_audit_last_checkpoint": q8_phase_last,
             "q8_phase_audit_first_failure": q8_phase_first_failure,
             "q8_phase_audit_classification": q8_phase_classification,
@@ -4747,6 +4870,14 @@ if __name__ == "__main__":
         )
         if state != "complete":
             fail(f"Q8 pre-activation-fence marker state is {state}")
+    elif (len(sys.argv) == 3 and
+            sys.argv[1] == "--validate-q8-compute-fence-log"):
+        log_path = Path(sys.argv[2])
+        state = q8_partner_compute_fence_marker_state(
+            log_path.read_text(errors="replace")
+        )
+        if state != "complete":
+            fail(f"Q8 compute-fence marker state is {state}")
     elif (len(sys.argv) == 4 and
             sys.argv[1] == "--validate-q8-l14-l15-log"):
         log_path = Path(sys.argv[2])
