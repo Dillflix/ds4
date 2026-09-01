@@ -3973,6 +3973,14 @@ cut of pair-0 attention-owned work:
   and writes home scratch. This changes the P2P source allocation and adds an
   explicit source-ready dependency without changing attention compute, bytes,
   physical direction, pacing, or accepted full-home recomputation.
+- `attention-row-gather-preinitialized-source-paced-shadow` pre-zeroes the
+  same dedicated partner scratch on the partner default stream before the
+  production partner attention launch, then performs the identical paced
+  scratch-to-scratch P2P copy. The partner result allocation is never read.
+  This preserves partner compute, post-compute source-stream ordering,
+  direction, bytes, chunking, pacing, both dedicated endpoints, and accepted
+  full-home recomputation while removing result contents and result-specific
+  source readiness from the transfer.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4078,6 +4086,20 @@ its immediate readiness relationship. Another loss proves that neither P2P
 endpoint allocation is required, while leaving the local read of the freshly
 produced source as the next differential.
 
+The source-and-destination-scratch arm also lost the pair after its exact
+activation and completion marker. The cards remained at the requested native
+250/260/250/250 W profile, and the production result was staged locally before
+the same paced P2P copy. Neither P2P endpoint allocation/address nor downstream
+consumption is required; however, that arm still read the freshly produced
+partner result. The next one-shot arm is
+`attention-row-gather-preinitialized-source-paced-shadow`. It keeps production
+partner attention and its source-stream ordering but transfers a pre-zeroed
+partner scratch allocation that never aliases or reads the attention output.
+A loss reduces the necessary bundle to partner attention followed by generic
+partner-to-home direct P2P under the production working set. A pass isolates
+the fresh result read/staging boundary, which should then be tested without
+result P2P.
+
 Run that arm from a fresh boot and directory at the cards' native limits:
 
 ```bash
@@ -4108,6 +4130,47 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
 VARIANTS=attention-row-gather-source-scratch-paced-shadow \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+Run the preinitialized-source differential after a fresh reboot:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+sudo nvidia-smi -i 1 -pl 260
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.default_limit,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-preinitialized-source-paced-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-row-gather-preinitialized-source-paced-shadow \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

@@ -4133,6 +4133,27 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-preinitialized-source-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "Production result contents, its allocation/address, a read from "
+                "it, both P2P endpoint allocations, and downstream consumption "
+                "are not required",
+            ),
+            (
+                (
+                    (
+                        "attention-row-gather-preinitialized-source-paced-shadow",
+                        "passed",
+                    ),
+                ),
+                "isolated difference is reading/staging the freshly produced "
+                "partner result",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),
