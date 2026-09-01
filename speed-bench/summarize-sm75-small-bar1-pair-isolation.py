@@ -18,6 +18,7 @@ VARIANT_ORDER = (
     "attention-row-gather-shadow", "attention-row-gather-dst-shadow",
     "attention-row-gather-chunk16-shadow",
     "attention-row-gather-chunk16-paced-shadow",
+    "attention-row-gather-scratch-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2812,6 +2813,28 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     gather_chunk16_paced_state = outcomes.get(
         "attention-row-gather-chunk16-paced-shadow", "not-run"
     )
+    gather_scratch_paced_state = outcomes.get(
+        "attention-row-gather-scratch-paced-shadow", "not-run"
+    )
+    if gather_scratch_paced_state == "failed":
+        return (
+            "The same paced 32 MiB partner result still lost the pair when its "
+            "destination was a dedicated home allocation that model execution "
+            "never reads or reuses. The production destination view, its address, "
+            "and downstream consumption are therefore not required. Isolate the "
+            "production partner source allocation next: stage the completed "
+            "partner rows into dedicated partner scratch, then repeat the same "
+            "paced direct-P2P copy into dedicated home scratch."
+        )
+    if gather_scratch_paced_state == "passed":
+        return (
+            "The paced gather into dedicated home scratch survived with healthy "
+            "GPUs while the identical paced transfer into the production "
+            "batch-heads row view lost the pair. The isolated axis is the "
+            "production destination allocation/address or its reuse, not copy "
+            "size, pacing, source allocation, payload, or physical direction. "
+            "Audit a production receive-scratch plus ordered local-home copy next."
+        )
     if gather_chunk16_paced_state == "failed":
         return (
             "The two 16 MiB gathers still lost a device when the destination "
@@ -2879,6 +2902,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         (
             "attention-row-gather-chunk16-paced-shadow",
             "result-gather-chunk16-paced",
+        ),
+        (
+            "attention-row-gather-scratch-paced-shadow",
+            "result-gather-scratch-paced",
         ),
     ):
         state = outcomes.get(variant, "not-run")

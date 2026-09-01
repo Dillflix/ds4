@@ -4100,6 +4100,20 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-scratch-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "production destination view, its address, and downstream "
+                "consumption are therefore not required",
+            ),
+            (
+                (("attention-row-gather-scratch-paced-shadow", "passed"),),
+                "isolated axis is the production destination allocation/address",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

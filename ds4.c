@@ -15601,6 +15601,7 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST = 4,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16 = 5,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED = 6,
+    DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED = 7,
 } ds4_cuda_prefill_attn_row_shadow_phase;
 
 /* Diagnostic-only production-transport cut.  A selected phase executes on
@@ -15634,6 +15635,9 @@ cuda_tp_prefill_attn_row_shadow_phase_for_pair(int home_tier) {
     }
     if (strcmp(phase, "result-gather-chunk16-paced") == 0) {
         return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED;
+    }
+    if (strcmp(phase, "result-gather-scratch-paced") == 0) {
+        return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED;
     }
     return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE;
 }
@@ -15901,6 +15905,11 @@ typedef struct {
     ds4_gpu_tensor *batch_indexer_q_f16_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_indexer_weights_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_heads_by_tier[DS4_MAX_GPUS];
+    /* Diagnostic-only destination allocation for the row-gather shadow.
+     * It is never read by model execution.  Keeping it in the shared prefill
+     * workspace gives it a stable lifetime without changing the production
+     * batch_heads allocation or its row views. */
+    ds4_gpu_tensor *batch_attn_row_shadow_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_attn_low_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_attn_out_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_group_tmp_by_tier[DS4_MAX_GPUS];
@@ -16035,6 +16044,7 @@ typedef struct {
     X(batch_group_tmp)                      \
     X(batch_attn_out)                       \
     X(batch_attn_low)                       \
+    X(batch_attn_row_shadow)                \
     X(batch_heads)                          \
     X(batch_indexer_weights)                \
     X(batch_indexer_q_f16)                  \
@@ -17812,6 +17822,11 @@ static bool metal_graph_alloc_raw_cap(
         getenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS");
     const char *prefill_attn_shadow_phase =
         getenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE");
+    const bool prefill_attn_shadow_scratch =
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(0) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED ||
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(1) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED;
     if (g->cuda_tp_prefill_attn_rows && prefill_attn_shadow_pairs &&
         prefill_attn_shadow_pairs[0] && prefill_attn_shadow_phase &&
         prefill_attn_shadow_phase[0] &&
@@ -18218,6 +18233,12 @@ static bool metal_graph_alloc_raw_cap(
             }
             g->batch_indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_INDEXER_HEAD * sizeof(float));
             g->batch_heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
+            if (cuda_tp_prefill_attn_row_shadow_phase_for_pair(t) ==
+                    DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED) {
+                g->batch_attn_row_shadow_by_tier[t] =
+                    ds4_gpu_tensor_alloc_ptr_on(
+                        t, pc * q_dim * sizeof(float));
+            }
             g->batch_attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * low_dim * sizeof(float));
             g->batch_attn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
             g->batch_group_tmp_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * group_dim * sizeof(float));
@@ -18315,7 +18336,12 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_comp_kv_by_tier[t] && g->batch_comp_sc_by_tier[t] &&
             g->batch_indexer_q_by_tier[t] && g->batch_indexer_weights_by_tier[t] &&
             (!g->index_comp_cache_f16 || g->batch_indexer_q_f16_by_tier[t]) &&
-            g->batch_heads_by_tier[t] && g->batch_attn_low_by_tier[t] && g->batch_attn_out_by_tier[t] &&
+            g->batch_heads_by_tier[t] &&
+            (!prefill_attn_shadow_scratch ||
+             cuda_tp_prefill_attn_row_shadow_phase_for_pair(t) !=
+                 DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED ||
+             g->batch_attn_row_shadow_by_tier[t]) &&
+            g->batch_attn_low_by_tier[t] && g->batch_attn_out_by_tier[t] &&
             g->batch_group_tmp_by_tier[t] && g->batch_low_tmp_by_tier[t] && g->batch_after_attn_hc_by_tier[t] &&
             g->batch_ffn_cur_by_tier[t] && g->batch_ffn_norm_by_tier[t] &&
             g->batch_shared_gate_by_tier[t] && g->batch_shared_up_by_tier[t] &&
@@ -28593,6 +28619,8 @@ static const char *metal_graph_cuda_tp_prefill_attention_rows_shadow_name(
             return "result-gather-chunk16";
         case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED:
             return "result-gather-chunk16-paced";
+        case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED:
+            return "result-gather-scratch-paced";
         default:
             return "none";
     }
@@ -28604,8 +28632,8 @@ static void metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
         uint32_t n_tokens, int home, int partner) {
     static uint32_t begin_mask = 0u;
     static uint32_t complete_mask = 0u;
-    const uint32_t bit = home >= 0 && home < 4 && phase > 0 && phase <= 6
-        ? 1u << ((uint32_t)home * 7u + (uint32_t)phase)
+    const uint32_t bit = home >= 0 && home < 4 && phase > 0 && phase <= 7
+        ? 1u << ((uint32_t)home * 8u + (uint32_t)phase)
         : 0u;
     uint32_t *mask = strcmp(event, "begin") == 0 ? &begin_mask : &complete_mask;
     if (bit == 0u || (*mask & bit) != 0u) return;
@@ -28944,6 +28972,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(home);
     const bool shadow_gather_dst = shadow_phase ==
         DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST;
+    const bool shadow_gather_scratch = shadow_phase ==
+        DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED;
     const bool host_bounce =
         metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(home);
     const bool serialize_compute =
@@ -29035,11 +29065,17 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         g->batch_heads_by_tier[partner], 0, partner_rows, q_row_values);
     ds4_gpu_tensor *gather_dst = metal_graph_tensor_row_range_view(
         g->batch_heads_by_tier[home], home_rows, partner_rows, q_row_values);
+    ds4_gpu_tensor *shadow_scratch_dst = shadow_gather_scratch &&
+        g->batch_attn_row_shadow_by_tier[home]
+            ? ds4_gpu_tensor_view(
+                  g->batch_attn_row_shadow_by_tier[home], 0,
+                  q_partner_bytes)
+            : NULL;
     ds4_gpu_tensor *home_topk = NULL;
     ds4_gpu_tensor *peer_topk_src = NULL;
     ds4_gpu_tensor *peer_topk_dst = NULL;
     bool ok = home_q && peer_q_src && peer_q_dst && home_heads && peer_heads &&
-              gather_dst;
+              gather_dst && (!shadow_gather_scratch || shadow_scratch_dst);
     if (ok && shadow_phase != DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE) {
         metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
             "begin", shadow_phase, kind, il, pos0, n_tokens, home, partner);
@@ -29250,7 +29286,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST ||
         shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16 ||
         shadow_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED) {
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED ||
+        shadow_gather_scratch) {
         if (ok && ds4_gpu_set_current_device(home) != 0) ok = false;
         if (ok) {
             if (shadow_gather_dst) {
@@ -29266,6 +29303,29 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                 ok = ds4_gpu_tensor_copy_xdev_default_chunked_peer_paced(
                          gather_dst, peer_heads, q_partner_bytes,
                          16ull * 1024ull * 1024ull) != 0;
+            } else if (shadow_gather_scratch) {
+                ok = ds4_gpu_tensor_copy_xdev_default_chunked_peer_paced(
+                         shadow_scratch_dst, peer_heads, q_partner_bytes,
+                         16ull * 1024ull * 1024ull) != 0;
+                static uint32_t logged_scratch_home_mask = 0u;
+                const uint32_t scratch_bit = home >= 0 && home < 32
+                    ? 1u << (uint32_t)home : 0u;
+                if (ok && scratch_bit != 0u &&
+                    (logged_scratch_home_mask & scratch_bit) == 0u) {
+                    logged_scratch_home_mask |= scratch_bit;
+                    fprintf(stderr,
+                            "ds4: CUDA prefill attention row scratch gather "
+                            "scheduled: source_tier=%d destination_tier=%d "
+                            "transfer_bytes=%llu scratch_allocation_bytes=%llu "
+                            "destination=dedicated-home-allocation "
+                            "accepted_output=full-home-recompute\n",
+                            partner, home,
+                            (unsigned long long)q_partner_bytes,
+                            (unsigned long long)ds4_gpu_tensor_bytes(
+                                g->batch_attn_row_shadow_by_tier[home]));
+                    fflush(stderr);
+                    (void)fsync(fileno(stderr));
+                }
             } else {
                 const bool ready_ok =
                     ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0;
@@ -29447,6 +29507,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     }
 
 attention_rows_cleanup:
+    ds4_gpu_tensor_free(shadow_scratch_dst);
     ds4_gpu_tensor_free(peer_topk_dst);
     ds4_gpu_tensor_free(peer_topk_src);
     ds4_gpu_tensor_free(home_topk);
@@ -50716,6 +50777,14 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     }
     total += pc * (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float); /* batch_indexer_weights */
     total += pc * q_dim * sizeof(float);                   /* batch_heads_by_tier */
+    if (cuda_tp_prefill_attn_row_shadow_phase_for_pair(0) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED ||
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(1) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED) {
+        /* Diagnostic allocation exists only on a selected home tier. Charge
+         * every tier conservatively because this estimate is per-tier. */
+        total += pc * q_dim * sizeof(float);               /* batch_attn_row_shadow */
+    }
     total += pc * low_dim * sizeof(float);                 /* batch_attn_low_by_tier */
     total += pc * (uint64_t)DS4_N_EMBD * sizeof(float);    /* batch_attn_out_by_tier */
     total += pc * group_dim * sizeof(float);               /* batch_group_tmp_by_tier */

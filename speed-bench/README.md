@@ -3961,6 +3961,11 @@ cut of pair-0 attention-owned work:
   operations, but the destination acknowledges completion of chunk 1 and the
   source waits for that acknowledgement before submitting chunk 2. Its exact
   runtime marker is required for both successful and device-loss evidence.
+- `attention-row-gather-scratch-paced-shadow` preserves the paced helper,
+  partner-produced source, direction, total bytes, row ownership and accepted
+  full-home recomputation, but receives the discarded result in a dedicated
+  home allocation that no model kernel reads or reuses. The allocation exists
+  only for this diagnostic and has graph-workspace lifetime.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4044,6 +4049,16 @@ acknowledgement between chunks while retaining source scheduling, direct P2P,
 recomputation. If it survives, continuous gather burst/overlap is isolated. If
 it loses the device, the next differential is the destination allocation: send
 the same paced result into dedicated home scratch that is never consumed.
+
+The destination-acknowledged two-chunk arm also lost the same pair after its
+exact schedule marker and first synchronized shadow completion. Individual
+copy size, a continuous 32 MiB burst, and missing inter-chunk acknowledgement
+are therefore not sufficient explanations. The next one-shot arm is
+`attention-row-gather-scratch-paced-shadow`. It changes only the receiving
+allocation/address and removes downstream reuse of the received bytes. A pass
+isolates the production `batch_heads` destination view/allocation or its reuse;
+another loss proves that destination is not required and advances the audit to
+the production partner source allocation.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:
