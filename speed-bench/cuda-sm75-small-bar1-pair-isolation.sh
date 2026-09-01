@@ -24,7 +24,9 @@ Optional environment:
   VARIANTS=attention-q8-pre-gather-fence  confirm pair-0 Q8 completion before result D2H
   VARIANTS=attention-q8-activation-fence  also fence before pair-0 activation H2D
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
-  VARIANTS=attention-q8-targeted-phase-audit  phase-audit layer-14 attn_output_b only
+  VARIANTS=attention-q8-targeted-phase-audit  phase-audit one exact Q8 binding only
+  Q8_TARGETED_BINDING_LABEL=...   default: tensor:blk.14.attn_output_b.weight
+  Q8_TARGETED_WEIGHT_OFFSET=...   default: 143571266304
   VARIANTS=attention-q8-l14-l15-phase-audit   cumulative layer-14/layer-15 audit
   VARIANTS=attention-q8-l12-phase-audit       first measured layer-12 audit only
   ATTN_PHASE_AUDIT_LAYER=17        one production row-split dispatch only
@@ -113,6 +115,8 @@ STAGE_SPLIT=${STAGE_SPLIT:-22}
 SMALL_BAR1_PAIR=${SMALL_BAR1_PAIR:-0}
 Q8_TARGET_BINDING_LABEL=tensor:blk.14.attn_output_b.weight
 Q8_TARGET_WEIGHT_OFFSET=143571266304
+Q8_TARGETED_BINDING_LABEL=${Q8_TARGETED_BINDING_LABEL:-$Q8_TARGET_BINDING_LABEL}
+Q8_TARGETED_WEIGHT_OFFSET=${Q8_TARGETED_WEIGHT_OFFSET:-$Q8_TARGET_WEIGHT_OFFSET}
 Q8_TARGET_PASSED_LABEL=attn_output_b
 Q8_TARGET_TOKENS=512
 Q8_TARGET_IN_DIM=8192
@@ -179,6 +183,10 @@ for item in "SMALL_BAR1_PAIR:$SMALL_BAR1_PAIR" "PP_TOKENS:$PP_TOKENS" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
+[[ $Q8_TARGETED_BINDING_LABEL =~ ^tensor:blk\.[0-9]+\.attn_output_b\.weight$ ]] ||
+    die "Q8_TARGETED_BINDING_LABEL must name one tensor:blk.N.attn_output_b.weight binding"
+[[ $Q8_TARGETED_WEIGHT_OFFSET =~ ^[0-9]+$ ]] ||
+    die "Q8_TARGETED_WEIGHT_OFFSET must be a decimal byte offset"
 (( SMALL_BAR1_PAIR == 0 && PP_TOKENS == 32768 && TG_TOKENS == 256 &&
    ATTN_PHASE_AUDIT_LAYER < STAGE_SPLIT &&
    ATTN_PHASE_AUDIT_POS < PP_TOKENS &&
@@ -288,6 +296,12 @@ if [[ $RESUME == 1 ]]; then
         die "resume decode length differs from the original isolation"
     grep -Fxq "repeats=$REPEATS" "$OUTPUT_DIR/manifest.txt" ||
         die "resume repeat count differs from the original isolation"
+    grep -Fxq "attention_q8_targeted_phase_audit_binding=$Q8_TARGETED_BINDING_LABEL" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume targeted Q8 binding differs from the original isolation"
+    grep -Fxq "attention_q8_targeted_phase_audit_weight_offset=$Q8_TARGETED_WEIGHT_OFFSET" \
+        "$OUTPUT_DIR/manifest.txt" ||
+        die "resume targeted Q8 weight offset differs from the original isolation"
     grep -Fxq "required_power_limit_w=$REQUIRED_POWER_LIMIT_W" \
         "$OUTPUT_DIR/manifest.txt" ||
         die "resume power limit differs from the original isolation"
@@ -1072,8 +1086,8 @@ if [[ $RESUME == 0 || ! -s $OUTPUT_DIR/manifest.txt ]]; then
         printf 'attention_q8_activation_fence_perturbation=device_sync_marker_validation_and_host_logging\n'
         printf 'attention_q8_activation_fence_interpretation=failure_surface_boundary_not_root_cause\n'
         printf 'attention_q8_phase_audit_scope=pair0_q8_partner_phase_checkpoints_and_compute_sync\n'
-        printf 'attention_q8_targeted_phase_audit_binding=%s\n' "$Q8_TARGET_BINDING_LABEL"
-        printf 'attention_q8_targeted_phase_audit_weight_offset=%s\n' "$Q8_TARGET_WEIGHT_OFFSET"
+        printf 'attention_q8_targeted_phase_audit_binding=%s\n' "$Q8_TARGETED_BINDING_LABEL"
+        printf 'attention_q8_targeted_phase_audit_weight_offset=%s\n' "$Q8_TARGETED_WEIGHT_OFFSET"
         printf 'attention_q8_targeted_phase_audit_passed_label=%s\n' "$Q8_TARGET_PASSED_LABEL"
         printf 'attention_q8_targeted_phase_audit_shape=%sx%sx%s\n' \
             "$Q8_TARGET_TOKENS" "$Q8_TARGET_IN_DIM" "$Q8_TARGET_OUT_DIM"
@@ -1617,8 +1631,8 @@ validate_success_path() {
         local required_tokens= required_in= required_out=
         local required_transfer= required_result= required_sequences=
         if [[ $variant == attention-q8-targeted-phase-audit ]]; then
-            required_binding=$Q8_TARGET_BINDING_LABEL
-            required_offset=$Q8_TARGET_WEIGHT_OFFSET
+            required_binding=$Q8_TARGETED_BINDING_LABEL
+            required_offset=$Q8_TARGETED_WEIGHT_OFFSET
             required_passed=$Q8_TARGET_PASSED_LABEL
             required_tokens=$Q8_TARGET_TOKENS
             required_in=$Q8_TARGET_IN_DIM
@@ -1933,8 +1947,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_PAIRS=$SMALL_BAR1_PAIR")
-                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_BINDING_LABEL=$Q8_TARGET_BINDING_LABEL")
-                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_WEIGHT_OFFSET=$Q8_TARGET_WEIGHT_OFFSET")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_BINDING_LABEL=$Q8_TARGETED_BINDING_LABEL")
+                variant_env+=("DS4_CUDA_Q8_F16_PARTNER_PHASE_AUDIT_WEIGHT_OFFSET=$Q8_TARGETED_WEIGHT_OFFSET")
                 ;;
             attention-q8-l14-l15-phase-audit)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS=$SMALL_BAR1_PAIR")
