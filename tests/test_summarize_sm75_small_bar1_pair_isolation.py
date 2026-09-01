@@ -4075,7 +4075,15 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (("attention-row-gather-dst-shadow", "failed-device-loss"),),
-                "failure therefore follows the repeated 32 MiB partner-to-home transfer",
+                "Run `result-gather-chunk16` next",
+            ),
+            (
+                (("attention-row-gather-chunk16-shadow", "passed"),),
+                "single CUDA copy-operation size is the isolated axis",
+            ),
+            (
+                (("attention-row-gather-chunk16-shadow", "failed-device-loss"),),
+                "Operation size alone is not sufficient",
             ),
             (
                 (

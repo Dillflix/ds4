@@ -3950,6 +3950,13 @@ cut of pair-0 attention-owned work:
   partner-to-home bytes and direct-P2P direction, but submits the gather from
   the destination/home CUDA context and default-stream ordering domain, which
   also reverses the required peer-access direction.
+- `attention-row-gather-chunk16-shadow` returns to source scheduling but emits
+  the same 32 MiB gather as two 16 MiB `cudaMemcpyPeerAsync` operations before
+  the same single completion event and destination wait. It also retains the
+  production destination-ready event/source-wait before the copy. Evidence is
+  accepted only when the CUDA helper reports exactly 32 MiB, two 16 MiB
+  submissions, source tier 2, destination tier 0, both readiness operations,
+  and both completion operations.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4014,6 +4021,15 @@ data direction and bytes stay fixed. If it survives, that software mechanism
 is the next production-fix candidate. If it also loses the device, vary gather
 granularity next while holding the partner-to-home direction and total bytes
 fixed.
+
+Both one-operation gather schedules lost the same physical pair. The
+destination-ordered arm completed its first gather and then surfaced the
+poisoned context at layer 15 in that same 512-token microbatch. Consequently,
+submission context and peer-access direction are not sufficient explanations.
+The next one-shot arm is `attention-row-gather-chunk16-shadow`. A pass isolates
+the 32 MiB CUDA operation size; another loss means the next differential must
+pace the two 16 MiB chunks with an acknowledgement between them rather than
+merely segmenting one continuous transfer burst.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

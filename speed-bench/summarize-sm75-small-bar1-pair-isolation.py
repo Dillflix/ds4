@@ -16,6 +16,7 @@ VARIANT_ORDER = (
     "attention-q8-rows-serialized", "attention-q8-row-compute-off",
     "attention-row-query-shadow", "attention-row-partner-shadow",
     "attention-row-gather-shadow", "attention-row-gather-dst-shadow",
+    "attention-row-gather-chunk16-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2804,6 +2805,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     gather_dst_state = outcomes.get(
         "attention-row-gather-dst-shadow", "not-run"
     )
+    gather_chunk16_state = outcomes.get(
+        "attention-row-gather-chunk16-shadow", "not-run"
+    )
     if gather_state == "failed":
         return (
             "The source-scheduled partner-to-home result-gather shadow lost a "
@@ -2819,8 +2823,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "The destination-ordered partner-to-home result-gather shadow also lost "
             "a device. The failure therefore follows the repeated 32 MiB "
             "partner-to-home transfer independently of which CUDA context submits "
-            "it. Test transfer granularity next while preserving direction, total "
-            "bytes, row ownership, and accepted home recomputation."
+            "it. Run `result-gather-chunk16` next: it preserves source scheduling, "
+            "direction, total bytes, row ownership, and one final completion event "
+            "while splitting the CUDA copy into 16 MiB submissions."
         )
     if gather_dst_state == "passed":
         return (
@@ -2831,9 +2836,25 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "are the isolated axis. "
             "Confirm it in the full production row path before promotion."
         )
+    if gather_chunk16_state == "failed":
+        return (
+            "The source-scheduled gather still lost a device when its unchanged "
+            "32 MiB total was submitted as two 16 MiB CUDA peer copies before one "
+            "completion event. Operation size alone is not sufficient. Add a "
+            "destination acknowledgement between the two 16 MiB chunks next to "
+            "separate continuous burst/overlap from transfer direction and volume."
+        )
+    if gather_chunk16_state == "passed":
+        return (
+            "The 16 MiB-chunked source-scheduled gather survived with healthy GPUs "
+            "while both one-operation 32 MiB gather schedules lost the pair. The "
+            "single CUDA copy-operation size is the isolated axis; confirm chunked "
+            "gathers in the complete production row path before promotion."
+        )
     for variant, phase in (
         ("attention-row-gather-shadow", "result-gather"),
         ("attention-row-gather-dst-shadow", "result-gather-dst"),
+        ("attention-row-gather-chunk16-shadow", "result-gather-chunk16"),
     ):
         state = outcomes.get(variant, "not-run")
         if state in {"invalid", "underloaded"}:

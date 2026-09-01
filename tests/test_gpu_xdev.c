@@ -7,7 +7,8 @@
  *   - ds4_gpu_tensor_copy_xdev peer-auto and DS4_FORCE_HOST_BOUNCE paths
  *     (when 2+ GPUs are visible).
  *   - destination-stream ordered peer-copy exactness, immediate source-buffer
- *     reuse ordering, and fail-closed forced-host-bounce behavior. */
+ *     reuse ordering, and fail-closed forced-host-bounce behavior.
+ *   - source-stream chunked peer-copy exactness, including a tail chunk. */
 
 /* ds4_gpu_mgpu.h is standalone-C-compatible — it now provides the
  * complete ds4_gpu_tensor struct + typedef so callers can use the
@@ -352,6 +353,72 @@ static int run_ordered_destination_copy(int force_bounce, int require_peer) {
                 force_bounce, iters, bytes / (1024u * 1024u));
     }
     return total_ok ? 0 : 1;
+}
+
+/* Smoke the source-default-stream chunking helper with a non-multiple tail in
+ * both directions. Production validation supplies the 32 MiB transfer shape;
+ * this test checks byte coverage and ordering without adding another large
+ * synthetic stressor before an expected-loss diagnostic. */
+static int run_chunked_source_copy(void) {
+    int dev_count = 0;
+    (void)cudaGetDeviceCount(&dev_count);
+    if (dev_count < 2) {
+        fprintf(stderr, "  skipping chunked source copy (need >= 2 devices)\n");
+        return 0;
+    }
+
+    unsetenv("DS4_FORCE_HOST_BOUNCE");
+    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    CHECK(ds4_gpu_init_multi(&cfg), "chunked source init_multi");
+    CHECK(g_gpu_peer_ok[0][1] && g_gpu_peer_ok[1][0],
+          "chunked source copy requires bidirectional direct peer access");
+
+    const size_t chunk_bytes = 1u * 1024u * 1024u;
+    const size_t bytes = 2u * chunk_bytes + 4096u;
+    unsigned char *expected = (unsigned char *)malloc(bytes);
+    unsigned char *got = (unsigned char *)malloc(bytes);
+    CHECK(expected && got, "chunked source host alloc");
+
+    ds4_gpu_tensor tier0; memset(&tier0, 0, sizeof(tier0));
+    ds4_gpu_tensor tier1; memset(&tier1, 0, sizeof(tier1));
+    CHECK(ds4_gpu_tensor_alloc_on(&tier0, 0, bytes) == 0,
+          "chunked source alloc tier0");
+    CHECK(ds4_gpu_tensor_alloc_on(&tier1, 1, bytes) == 0,
+          "chunked source alloc tier1");
+
+    for (int direction = 0; direction < 2; direction++) {
+        ds4_gpu_tensor *src = direction == 0 ? &tier0 : &tier1;
+        ds4_gpu_tensor *dst = direction == 0 ? &tier1 : &tier0;
+        for (size_t k = 0; k < bytes; k++) {
+            expected[k] = (unsigned char)
+                ((k * 29u + (size_t)direction * 101u + 7u) & 0xffu);
+        }
+        memset(got, 0x5c, bytes);
+        CHECK(ds4_gpu_tensor_write(src, 0, expected, bytes),
+              "chunked source input write");
+        CHECK(ds4_gpu_tensor_write(dst, 0, got, bytes),
+              "chunked source destination seed");
+        CHECK(ds4_gpu_tensor_copy_xdev_default_chunked_peer(
+                  dst, src, bytes, chunk_bytes),
+              "chunked source peer copy");
+        CHECK(ds4_gpu_tensor_read(dst, 0, got, bytes),
+              "chunked source result read");
+        CHECK(memcmp(expected, got, bytes) == 0,
+              "chunked source exact result");
+    }
+
+    ds4_gpu_tensor_free_in_place(&tier0);
+    ds4_gpu_tensor_free_in_place(&tier1);
+    free(expected);
+    free(got);
+    ds4_gpu_cleanup();
+    fprintf(stderr,
+            "  chunked source copy OK (directions=2, bytes=%zu, chunk=%zu)\n",
+            bytes, chunk_bytes);
+    return 0;
 }
 
 static int run_top1(void) {
@@ -2567,6 +2634,7 @@ int main(int argc, char **argv) {
         }
         if (run_ordered_destination_copy(0, 1)) return 1;
         if (run_ordered_destination_copy(1, 1)) return 1;
+        if (run_chunked_source_copy()) return 1;
         fprintf(stdout, "harness_status=ok\n");
         return 0;
     }

@@ -141,6 +141,12 @@ int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
         ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
     return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
 }
+int ds4_gpu_tensor_copy_xdev_default_chunked_peer(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes,
+        uint64_t chunk_bytes) {
+    (void)chunk_bytes;
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+}
 int ds4_gpu_tensor_copy_xdev3_default_dst(
         ds4_gpu_tensor *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
         ds4_gpu_tensor *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
@@ -15587,6 +15593,7 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_COMPUTE = 2,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER = 3,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST = 4,
+    DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16 = 5,
 } ds4_cuda_prefill_attn_row_shadow_phase;
 
 /* Diagnostic-only production-transport cut.  A selected phase executes on
@@ -15614,6 +15621,9 @@ cuda_tp_prefill_attn_row_shadow_phase_for_pair(int home_tier) {
     }
     if (strcmp(phase, "result-gather-dst") == 0) {
         return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST;
+    }
+    if (strcmp(phase, "result-gather-chunk16") == 0) {
+        return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16;
     }
     return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE;
 }
@@ -28569,6 +28579,8 @@ static const char *metal_graph_cuda_tp_prefill_attention_rows_shadow_name(
             return "result-gather";
         case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST:
             return "result-gather-dst";
+        case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16:
+            return "result-gather-chunk16";
         default:
             return "none";
     }
@@ -28580,8 +28592,8 @@ static void metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
         uint32_t n_tokens, int home, int partner) {
     static uint32_t begin_mask = 0u;
     static uint32_t complete_mask = 0u;
-    const uint32_t bit = home >= 0 && home < 6 && phase > 0 && phase <= 4
-        ? 1u << ((uint32_t)home * 5u + (uint32_t)phase)
+    const uint32_t bit = home >= 0 && home < 5 && phase > 0 && phase <= 5
+        ? 1u << ((uint32_t)home * 6u + (uint32_t)phase)
         : 0u;
     uint32_t *mask = strcmp(event, "begin") == 0 ? &begin_mask : &complete_mask;
     if (bit == 0u || (*mask & bit) != 0u) return;
@@ -29223,12 +29235,18 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         goto attention_rows_cleanup;
     }
     if (shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER ||
-        shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST) {
+        shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_DST ||
+        shadow_phase == DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16) {
         if (ok && ds4_gpu_set_current_device(home) != 0) ok = false;
         if (ok) {
             if (shadow_gather_dst) {
                 ok = ds4_gpu_tensor_copy_xdev_default_dst_ordered(
                          gather_dst, peer_heads, q_partner_bytes) != 0;
+            } else if (shadow_phase ==
+                       DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16) {
+                ok = ds4_gpu_tensor_copy_xdev_default_chunked_peer(
+                         gather_dst, peer_heads, q_partner_bytes,
+                         16ull * 1024ull * 1024ull) != 0;
             } else {
                 const bool ready_ok =
                     ds4_gpu_tensor_wait_xdev_default(gather_dst, partner) != 0;

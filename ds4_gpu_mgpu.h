@@ -170,6 +170,18 @@ int ds4_gpu_tensor_copy_xdev_default_dst_ordered(
         const ds4_gpu_tensor *src,
         uint64_t              bytes);
 
+/* Diagnostic source-default-stream direct-P2P copy split into bounded CUDA
+ * copy submissions. It preserves the production destination-ready event/wait,
+ * then orders the full byte range before one source completion event and
+ * destination wait, so only cudaMemcpyPeerAsync operation count/size changes.
+ * It fails closed when direct peer transport is unavailable or host bounce is
+ * forced. */
+int ds4_gpu_tensor_copy_xdev_default_chunked_peer(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t              bytes,
+        uint64_t              chunk_bytes);
+
 /* Grouped default-stream handoff whose copies execute on the destination
  * device. The source default stream records readiness; the destination waits,
  * performs all three copies, then naturally orders its following kernels.
