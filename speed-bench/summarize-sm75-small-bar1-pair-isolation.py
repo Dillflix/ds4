@@ -21,6 +21,7 @@ VARIANT_ORDER = (
     "attention-row-gather-scratch-paced-shadow",
     "attention-row-gather-source-scratch-paced-shadow",
     "attention-row-gather-preinitialized-source-paced-shadow",
+    "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2825,6 +2826,32 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     gather_preinitialized_source_paced_state = outcomes.get(
         "attention-row-gather-preinitialized-source-paced-shadow", "not-run"
     )
+    gather_preinitialized_source_no_partner_paced_state = outcomes.get(
+        "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
+        "not-run",
+    )
+    if gather_preinitialized_source_no_partner_paced_state == "failed":
+        return (
+            "The pair still lost a device with the selected pair's partner "
+            "attention launch omitted. The production query handoff and the same "
+            "paced 32 MiB preinitialized scratch transfer remained active under "
+            "the full surrounding model/Q8 workload. Partner attention compute, "
+            "its output, and any read of that output are therefore not required "
+            "for this trigger. The next reduction is a same-process reproducer "
+            "that retains the production-sized allocations and this forward-query "
+            "plus reverse-paced-P2P schedule, then removes the query handoff."
+        )
+    if gather_preinitialized_source_no_partner_paced_state == "passed":
+        return (
+            "The identical preinitialized scratch transfer survived with healthy "
+            "GPUs when only the selected pair's partner attention launch was "
+            "omitted. Against the failed arm that retained that launch, partner "
+            "attention execution is required in the measured trigger bundle; "
+            "production result contents and reads remain excluded. Next replace "
+            "that launch with calibrated partner-local compute and memory traffic "
+            "before the same P2P schedule to distinguish a kernel/access-specific "
+            "fault from generic load or ordering pressure."
+        )
     if gather_preinitialized_source_paced_state == "failed":
         return (
             "The pair still lost a device after production partner attention "
@@ -2969,6 +2996,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         (
             "attention-row-gather-preinitialized-source-paced-shadow",
             "result-gather-preinitialized-source-paced",
+        ),
+        (
+            "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
+            "result-gather-preinitialized-source-no-partner-paced",
         ),
     ):
         state = outcomes.get(variant, "not-run")

@@ -3981,6 +3981,12 @@ cut of pair-0 attention-owned work:
   direction, bytes, chunking, pacing, both dedicated endpoints, and accepted
   full-home recomputation while removing result contents and result-specific
   source readiness from the transfer.
+- `attention-row-gather-preinitialized-source-no-partner-paced-shadow` keeps
+  that pre-zeroed partner source, dedicated home destination, direct query
+  handoff, and identical two-chunk paced partner-to-home copy, but omits only
+  the selected pair's partner-attention launch. Full-home attention still
+  produces the accepted output. This determines whether partner attention
+  execution is required in the remaining trigger bundle.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4100,6 +4106,16 @@ partner-to-home direct P2P under the production working set. A pass isolates
 the fresh result read/staging boundary, which should then be tested without
 result P2P.
 
+The preinitialized-source arm also lost the pair after proving the exact
+static scratch-to-scratch schedule. Its one-time source initialization,
+durable armed/scheduled markers, and first complete shadow checkpoint all
+preceded the later device loss. Production attention-result contents, the
+result allocation/address, and every read of that result are therefore
+excluded. The next one-shot differential is
+`attention-row-gather-preinitialized-source-no-partner-paced-shadow`: it keeps
+the direct query handoff and identical static paced reverse transfer under the
+full surrounding workload, but omits only pair 0's partner-attention launch.
+
 Run that arm from a fresh boot and directory at the cards' native limits:
 
 ```bash
@@ -4171,6 +4187,47 @@ GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
 VARIANTS=attention-row-gather-preinitialized-source-paced-shadow \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+Run the no-partner-attention differential after a fresh reboot:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+sudo nvidia-smi -i 1 -pl 260
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.default_limit,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-preinitialized-source-no-partner-paced-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-row-gather-preinitialized-source-no-partner-paced-shadow \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

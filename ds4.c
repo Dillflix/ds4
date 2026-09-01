@@ -15604,6 +15604,7 @@ typedef enum {
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED = 7,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED = 8,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED = 9,
+    DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED = 10,
 } ds4_cuda_prefill_attn_row_shadow_phase;
 
 /* Diagnostic-only production-transport cut.  A selected phase executes on
@@ -15646,6 +15647,11 @@ cuda_tp_prefill_attn_row_shadow_phase_for_pair(int home_tier) {
     }
     if (strcmp(phase, "result-gather-preinitialized-source-paced") == 0) {
         return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED;
+    }
+    if (strcmp(
+            phase,
+            "result-gather-preinitialized-source-no-partner-paced") == 0) {
+        return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED;
     }
     return DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE;
 }
@@ -17613,7 +17619,9 @@ static bool metal_graph_cuda_tp_prefill_attn_row_shadow_scratch_needed(
         own_phase ==
             DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
         own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED) {
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED) {
         return true;
     }
     if (g_n_gpus < 2 || (g_n_gpus & 1) != 0) return false;
@@ -17624,7 +17632,9 @@ static bool metal_graph_cuda_tp_prefill_attn_row_shadow_scratch_needed(
     return home_phase ==
                DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
            home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED;
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED;
 }
 
 static uint32_t metal_graph_cuda_tp_output_tiers(
@@ -28653,6 +28663,8 @@ static const char *metal_graph_cuda_tp_prefill_attention_rows_shadow_name(
             return "result-gather-source-scratch-paced";
         case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED:
             return "result-gather-preinitialized-source-paced";
+        case DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED:
+            return "result-gather-preinitialized-source-no-partner-paced";
         default:
             return "none";
     }
@@ -28664,8 +28676,8 @@ static void metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
         uint32_t n_tokens, int home, int partner) {
     static uint64_t begin_mask = 0u;
     static uint64_t complete_mask = 0u;
-    const uint64_t bit = home >= 0 && home < 4 && phase > 0 && phase <= 9
-        ? 1ull << ((uint32_t)home * 10u + (uint32_t)phase)
+    const uint64_t bit = home >= 0 && home < 4 && phase > 0 && phase <= 10
+        ? 1ull << ((uint32_t)home * 11u + (uint32_t)phase)
         : 0u;
     uint64_t *mask = strcmp(event, "begin") == 0 ? &begin_mask : &complete_mask;
     if (bit == 0u || (*mask & bit) != 0u) return;
@@ -29010,6 +29022,11 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED;
     const bool shadow_gather_preinitialized_source = shadow_phase ==
         DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED;
+    const bool shadow_gather_preinitialized_source_no_partner = shadow_phase ==
+        DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED;
+    const bool shadow_gather_preinitialized_source_any =
+        shadow_gather_preinitialized_source ||
+        shadow_gather_preinitialized_source_no_partner;
     const bool host_bounce =
         metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(home);
     const bool serialize_compute =
@@ -29103,7 +29120,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         g->batch_heads_by_tier[home], home_rows, partner_rows, q_row_values);
     ds4_gpu_tensor *shadow_scratch_dst =
         (shadow_gather_scratch || shadow_gather_source_scratch ||
-         shadow_gather_preinitialized_source) &&
+         shadow_gather_preinitialized_source_any) &&
         g->batch_attn_row_shadow_by_tier[home]
             ? ds4_gpu_tensor_view(
                   g->batch_attn_row_shadow_by_tier[home], 0,
@@ -29111,7 +29128,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             : NULL;
     ds4_gpu_tensor *shadow_scratch_src =
         (shadow_gather_source_scratch ||
-         shadow_gather_preinitialized_source) &&
+         shadow_gather_preinitialized_source_any) &&
         g->batch_attn_row_shadow_by_tier[partner]
             ? ds4_gpu_tensor_view(
                   g->batch_attn_row_shadow_by_tier[partner], 0,
@@ -29123,10 +29140,10 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
     bool ok = home_q && peer_q_src && peer_q_dst && home_heads && peer_heads &&
               gather_dst &&
               (!(shadow_gather_scratch || shadow_gather_source_scratch ||
-                 shadow_gather_preinitialized_source) ||
+                 shadow_gather_preinitialized_source_any) ||
                shadow_scratch_dst) &&
               (!(shadow_gather_source_scratch ||
-                 shadow_gather_preinitialized_source) ||
+                 shadow_gather_preinitialized_source_any) ||
                shadow_scratch_src);
     if (ok && shadow_phase != DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE) {
         metal_graph_cuda_tp_prefill_attention_rows_shadow_log_once(
@@ -29278,13 +29295,12 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         }
     }
 
-    /* Preinitialize the complete diagnostic P2P source allocation once,
-     * before its first partner-attention launch on that same default stream.
-     * Later row calls only read the stable zeroed scratch. The subsequent
-     * transfer therefore retains the production query handoff, partner
-     * launch, stream dependency, direction, bytes, chunking and pacing
-     * without reading peer_heads or adding per-call staging traffic. */
-    if (ok && shadow_gather_preinitialized_source) {
+    /* Preinitialize the complete diagnostic P2P source allocation once on the
+     * partner default stream. Later row calls only read the stable zeroed
+     * scratch. One arm retains the following partner attention launch; the
+     * next differential omits only that launch while preserving query handoff,
+     * transfer direction, bytes, chunking, pacing and both scratch endpoints. */
+    if (ok && shadow_gather_preinitialized_source_any) {
         static const ds4_gpu_tensor *initialized_source_by_home[DS4_MAX_GPUS] = {
             NULL
         };
@@ -29298,7 +29314,10 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         }
     }
 
-    const bool audit_partner_attention = active_phase_audit && ok;
+    const bool omit_partner_attention =
+        shadow_gather_preinitialized_source_no_partner;
+    const bool audit_partner_attention =
+        active_phase_audit && ok && !omit_partner_attention;
     if (audit_partner_attention) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "partner-attention", kind, il, pos0, n_tokens,
@@ -29314,7 +29333,8 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                 n_tokens, home, partner);
         }
     }
-    if (ok && kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
+    if (ok && !omit_partner_attention &&
+        kind == DS4_CUDA_PREFILL_ATTN_INDEXED) {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
             peer_q_dst, g->layer_raw_cache_tp[il],
@@ -29322,7 +29342,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             metal_graph_attn_comp_cache_is_f16(), peer_topk_dst, partner_rows,
             pos0 + home_rows, n_raw, raw_cap, raw_start, n_comp, top_k,
             window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
-    } else if (ok) {
+    } else if (ok && !omit_partner_attention) {
         ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(
             peer_heads, model->map, model->size, layer->attn_sinks->abs_offset,
             peer_q_dst, g->layer_raw_cache_tp[il],
@@ -29360,7 +29380,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         shadow_phase ==
             DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_CHUNK16_PACED ||
         shadow_gather_scratch || shadow_gather_source_scratch ||
-        shadow_gather_preinitialized_source) {
+        shadow_gather_preinitialized_source_any) {
         if (ok && ds4_gpu_set_current_device(home) != 0) ok = false;
         if (ok) {
             if (shadow_gather_dst) {
@@ -29399,25 +29419,32 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                     fflush(stderr);
                     (void)fsync(fileno(stderr));
                 }
-            } else if (shadow_gather_preinitialized_source) {
+            } else if (shadow_gather_preinitialized_source_any) {
                 static uint32_t armed_preinitialized_source_home_mask = 0u;
+                static uint32_t armed_preinitialized_no_partner_home_mask = 0u;
+                uint32_t *armed_mask = omit_partner_attention
+                    ? &armed_preinitialized_no_partner_home_mask
+                    : &armed_preinitialized_source_home_mask;
                 const uint32_t scratch_bit = home >= 0 && home < 32
                     ? 1u << (uint32_t)home : 0u;
                 if (scratch_bit != 0u &&
-                    (armed_preinitialized_source_home_mask & scratch_bit) == 0u) {
-                    armed_preinitialized_source_home_mask |= scratch_bit;
+                    (*armed_mask & scratch_bit) == 0u) {
+                    *armed_mask |= scratch_bit;
                     fprintf(stderr,
                             "ds4: CUDA prefill attention row preinitialized "
-                            "source gather armed: production_source_tier=%d "
+                            "source%s gather armed: production_source_tier=%d "
                             "source_tier=%d destination_tier=%d "
                             "transfer_bytes=%llu source_initialization="
                             "one-time-partner-default-stream-zero-fill "
+                            "partner_attention=%s "
                             "production_source_read=no "
                             "source=dedicated-partner-allocation "
                             "destination=dedicated-home-allocation "
                             "accepted_output=full-home-recompute\n",
+                            omit_partner_attention ? " no-partner" : "",
                             partner, partner, home,
-                            (unsigned long long)q_partner_bytes);
+                            (unsigned long long)q_partner_bytes,
+                            omit_partner_attention ? "omitted" : "retained");
                     fflush(stderr);
                     (void)fsync(fileno(stderr));
                 }
@@ -29426,23 +29453,30 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                          q_partner_bytes,
                          16ull * 1024ull * 1024ull) != 0;
                 static uint32_t logged_preinitialized_source_home_mask = 0u;
+                static uint32_t logged_preinitialized_no_partner_home_mask = 0u;
+                uint32_t *logged_mask = omit_partner_attention
+                    ? &logged_preinitialized_no_partner_home_mask
+                    : &logged_preinitialized_source_home_mask;
                 if (ok && scratch_bit != 0u &&
-                    (logged_preinitialized_source_home_mask & scratch_bit) == 0u) {
-                    logged_preinitialized_source_home_mask |= scratch_bit;
+                    (*logged_mask & scratch_bit) == 0u) {
+                    *logged_mask |= scratch_bit;
                     fprintf(stderr,
                             "ds4: CUDA prefill attention row preinitialized "
-                            "source gather scheduled: production_source_tier=%d "
+                            "source%s gather scheduled: production_source_tier=%d "
                             "source_tier=%d destination_tier=%d "
                             "transfer_bytes=%llu source_initialization="
                             "one-time-partner-default-stream-zero-fill "
+                            "partner_attention=%s "
                             "production_source_read=no "
                             "source_scratch_allocation_bytes=%llu "
                             "destination_scratch_allocation_bytes=%llu "
                             "source=dedicated-partner-allocation "
                             "destination=dedicated-home-allocation "
                             "accepted_output=full-home-recompute\n",
+                            omit_partner_attention ? " no-partner" : "",
                             partner, partner, home,
                             (unsigned long long)q_partner_bytes,
+                            omit_partner_attention ? "omitted" : "retained",
                             (unsigned long long)ds4_gpu_tensor_bytes(
                                 g->batch_attn_row_shadow_by_tier[partner]),
                             (unsigned long long)ds4_gpu_tensor_bytes(
@@ -50952,7 +50986,11 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
         cuda_tp_prefill_attn_row_shadow_phase_for_pair(0) ==
             DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
         cuda_tp_prefill_attn_row_shadow_phase_for_pair(1) ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED) {
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(0) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED ||
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(1) ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED) {
         /* Each selected diagnostic endpoint owns at most one allocation.
          * Charge every tier conservatively because this estimate is per-tier. */
         total += pc * q_dim * sizeof(float);               /* batch_attn_row_shadow */

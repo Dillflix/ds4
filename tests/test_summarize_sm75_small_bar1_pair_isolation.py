@@ -4154,6 +4154,26 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "Partner attention compute, its output, and any read of that "
+                "output are therefore not required",
+            ),
+            (
+                (
+                    (
+                        "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
+                        "passed",
+                    ),
+                ),
+                "partner attention execution is required in the measured trigger "
+                "bundle",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),
