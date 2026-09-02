@@ -189,7 +189,7 @@ validate_exact() {
 }
 
 validate_topology() {
-    local log=$1 marker route
+    local log=$1 require_row_split=${2:-1} marker route
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   't256-placement=stage-aware' \
                   'dense-placement=stage-aware-fixed-22-21' \
@@ -200,10 +200,12 @@ validate_topology() {
         grep -Fq "$route" "$log" || return 1
     done
     ! grep -Fq 'required but unavailable' "$log" || return 1
-    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
-    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || return 1
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log"
+    if [[ $require_row_split == 1 ]]; then
+        ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
+        grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || return 1
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" || return 1
+    fi
 }
 
 validate_selector() {
@@ -280,7 +282,10 @@ for index in 0 1; do
             validate_health "$base" || die "$layout $variant PP=$context GPU health changed"
             validate_exact "$base" "$context" "$logits" ||
                 die "$layout $variant PP=$context exact output is incomplete"
-            validate_topology "$base.log" ||
+            # A fixed PP=512 exact run is below the row-split dispatch threshold.
+            # Validate the physical/pipeline topology here; the 512..32768 timing
+            # arm above separately proves the production row-split policy.
+            validate_topology "$base.log" 0 ||
                 die "$layout $variant PP=$context topology validation failed"
             validate_selector "$variant" "$base.log" ||
                 die "$layout $variant PP=$context fusion dispatch validation failed"
