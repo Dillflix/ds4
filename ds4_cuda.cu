@@ -13638,24 +13638,14 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
     __syncthreads();
 
     /* Pass A: recompute scores tilewise and preserve each logical thread's
-     * row, row+256, ... max sequence without retaining the score surface. */
+     * row, row+256, ... max sequence without retaining the score surface.
+     * Score directly from the source row, as the shipping kernel does.  The
+     * production 32K stage probe localizes the first one-ULP divergence to
+     * this score/max phase, so shared-row score loads are an avoidable codegen
+     * difference.  Pass B still stages each row once for multi-head PV reuse. */
     for (uint32_t row0 = 0u; row0 < n_score; row0 += ROWS_PER_STAGE) {
         const uint32_t nr = n_score - row0 < ROWS_PER_STAGE
             ? n_score - row0 : ROWS_PER_STAGE;
-        for (uint32_t off = threadIdx.x; off < nr * 128u;
-             off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            const uint32_t row = row0 + rr;
-            const float4 *src = row < raw_count
-                ? (const float4 *)(raw_kv +
-                    (uint64_t)raw_rows[row] * head_dim)
-                : (const float4 *)(comp_kv +
-                    (uint64_t)comp_rows[row - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
-        }
-        __syncthreads();
-
         uint32_t score_row = UINT32_MAX;
         if (comp_count == 0u) {
             score_row = (threadIdx.x + 256u - (row0 & 255u)) & 255u;
@@ -13666,8 +13656,11 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                     const uint32_t head = head_base + local_head;
                     if (head >= n_head) continue;
                     const float *qh = q + (uint64_t)head * head_dim;
-                    const float *kvrow =
-                        (const float *)(kv_shared + score_row * 128u);
+                    const uint32_t row = row0 + score_row;
+                    const float *kvrow = row < raw_count
+                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                        : comp_kv +
+                            (uint64_t)comp_rows[row - raw_count] * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
                         dot += qh[d] * kvrow[d];
@@ -13688,8 +13681,11 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                     const uint32_t head = head_base + local_head;
                     if (head >= n_head) continue;
                     const float *qh = q + (uint64_t)head * head_dim;
-                    const float *kvrow =
-                        (const float *)(kv_shared + score_row * 128u);
+                    const uint32_t row = row0 + score_row;
+                    const float *kvrow = row < raw_count
+                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                        : comp_kv +
+                            (uint64_t)comp_rows[row - raw_count] * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
                         dot += qh[d] * kvrow[d];
@@ -13787,8 +13783,11 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                     const uint32_t head = head_base + local_head;
                     if (head >= n_head) continue;
                     const float *qh = q + (uint64_t)head * head_dim;
-                    const float *kvrow =
-                        (const float *)(kv_shared + score_row * 128u);
+                    const uint32_t row = row0 + score_row;
+                    const float *kvrow = row < raw_count
+                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                        : comp_kv +
+                            (uint64_t)comp_rows[row - raw_count] * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
                         dot += qh[d] * kvrow[d];
@@ -13806,8 +13805,11 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                     const uint32_t head = head_base + local_head;
                     if (head >= n_head) continue;
                     const float *qh = q + (uint64_t)head * head_dim;
-                    const float *kvrow =
-                        (const float *)(kv_shared + score_row * 128u);
+                    const uint32_t row = row0 + score_row;
+                    const float *kvrow = row < raw_count
+                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                        : comp_kv +
+                            (uint64_t)comp_rows[row - raw_count] * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
                         dot += qh[d] * kvrow[d];
