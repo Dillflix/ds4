@@ -15713,6 +15713,61 @@ static uint32_t metal_graph_cuda_tp_prefill_fixed_half_rows(
     return rows;
 }
 
+/* Scratch selection is configuration policy, not a CUDA operation. Keep it
+ * outside the GPU-only graph implementation so the CPU placement regression
+ * can verify that every scratch-backed phase allocates both pair endpoints. */
+static bool metal_graph_cuda_tp_prefill_attn_row_shadow_scratch_needed(
+        int tier) {
+    if (tier < 0 || tier >= g_n_gpus) return false;
+    const ds4_cuda_prefill_attn_row_shadow_phase own_phase =
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(tier);
+    if (own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_OUTPUT_SCRATCH_NO_GATHER ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED_FENCED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_ATTENTION_PRIME_ONCE_THEN_TRANSFER_ONLY_FENCED ||
+        own_phase ==
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_TRANSFER_PRIME_ONCE_THEN_ATTENTION_ONLY_FENCED) {
+        return true;
+    }
+    if (g_n_gpus < 2 || (g_n_gpus & 1) != 0) return false;
+    const int half = g_n_gpus / 2;
+    if (tier < half) return false;
+    const ds4_cuda_prefill_attn_row_shadow_phase home_phase =
+        cuda_tp_prefill_attn_row_shadow_phase_for_pair(tier - half);
+    return home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_OUTPUT_SCRATCH_NO_GATHER ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED_FENCED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_ATTENTION_PRIME_ONCE_THEN_TRANSFER_ONLY_FENCED ||
+           home_phase ==
+               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_TRANSFER_PRIME_ONCE_THEN_ATTENTION_ONLY_FENCED;
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -17637,62 +17692,6 @@ static int metal_graph_cuda_tp_partner_tier(int tier) {
     const int half = g_n_gpus / 2;
     if (tier < 0 || tier >= half) return -1;
     return tier + half;
-}
-
-/* The destination-scratch diagnostic owns one home allocation.  The
- * source-scratch differential owns one allocation on each endpoint: the
- * home slot receives the paced P2P copy and the partner slot receives a
- * default-stream D2D staging copy of the completed production result. */
-static bool metal_graph_cuda_tp_prefill_attn_row_shadow_scratch_needed(
-        int tier) {
-    if (tier < 0 || tier >= g_n_gpus) return false;
-    const ds4_cuda_prefill_attn_row_shadow_phase own_phase =
-        cuda_tp_prefill_attn_row_shadow_phase_for_pair(tier);
-    if (own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SCRATCH_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_OUTPUT_SCRATCH_NO_GATHER ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED_FENCED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_ATTENTION_PRIME_ONCE_THEN_TRANSFER_ONLY_FENCED ||
-        own_phase ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_TRANSFER_PRIME_ONCE_THEN_ATTENTION_ONLY_FENCED) {
-        return true;
-    }
-    if (g_n_gpus < 2 || (g_n_gpus & 1) != 0) return false;
-    const int half = g_n_gpus / 2;
-    if (tier < half) return false;
-    const ds4_cuda_prefill_attn_row_shadow_phase home_phase =
-        cuda_tp_prefill_attn_row_shadow_phase_for_pair(tier - half);
-    return home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_SOURCE_SCRATCH_PACED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PACED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_NO_PARTNER_PACED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PACED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_PARTNER_OUTPUT_SCRATCH_NO_GATHER ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_RESULT_GATHER_PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_PRE_ATTN_PACED_FENCED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_ATTENTION_PRIME_ONCE_THEN_TRANSFER_ONLY_FENCED ||
-           home_phase ==
-               DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_TRANSFER_PRIME_ONCE_THEN_ATTENTION_ONLY_FENCED;
 }
 
 static uint32_t metal_graph_cuda_tp_output_tiers(
