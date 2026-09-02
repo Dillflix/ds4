@@ -8,6 +8,7 @@
 
 extern void ds4_gpu_test_reset_attention_indexed_streaming_exact_launches(void);
 extern void ds4_gpu_test_set_attention_indexed_streaming_exact_heads(uint32_t);
+extern void ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(uint32_t);
 extern uint64_t ds4_gpu_test_get_attention_indexed_streaming_exact_launches(uint32_t);
 extern int ds4_gpu_test_get_attention_indexed_streaming_exact_resources(
     uint32_t, uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *);
@@ -92,6 +93,29 @@ static int compare_exact(const exact_case *t, uint32_t group,
     uint32_t rb = 0, gb = 0; memcpy(&rb, ref + i, 4); memcpy(&gb, got + i, 4);
     fprintf(stderr, "mismatch case=%s group=%u index=%llu ref=%a/0x%08x got=%a/0x%08x\n",
             t->name, group, (unsigned long long)i,
+            (double)ref[i], rb, (double)got[i], gb);
+    return 0;
+}
+
+static int compare_stage(const exact_case *t, uint32_t group, uint32_t mode,
+                         const float *ref, const float *got, uint64_t n) {
+    static const char *names[] = {
+        "output", "max-score", "denominator", "numerator"
+    };
+    if (!memcmp(ref, got, (size_t)n * sizeof(float))) {
+        printf("stage-exact,case=%s,group=%u,stage=%s\n",
+               t->name, group, names[mode]);
+        return 1;
+    }
+    uint64_t i = 0u;
+    while (i < n && !memcmp(ref + i, got + i, sizeof(float))) i++;
+    uint32_t rb = 0u, gb = 0u;
+    memcpy(&rb, ref + i, sizeof(rb));
+    memcpy(&gb, got + i, sizeof(gb));
+    fprintf(stderr,
+            "stage-mismatch case=%s group=%u stage=%s index=%llu "
+            "ref=%a/0x%08x got=%a/0x%08x\n",
+            t->name, group, names[mode], (unsigned long long)i,
             (double)ref[i], rb, (double)got[i], gb);
     return 0;
 }
@@ -312,6 +336,22 @@ int main(void) {
         }
         if(!nonzero) goto cleanup;
         for(uint32_t group=4;group<=8;group+=4) {
+            if (ci == 0u) {
+                for (uint32_t mode = 1u; mode <= 3u; mode++) {
+                    ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(mode);
+                    if (!run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,0,ref) ||
+                        !run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,group,got))
+                        goto cleanup;
+                    if (!compare_stage(t,group,mode,ref,got,
+                                       (uint64_t)t->n_head*HEAD_DIM)) {
+                        ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(0u);
+                        goto cleanup;
+                    }
+                }
+                ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(0u);
+                if (!run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,0,ref))
+                    goto cleanup;
+            }
             if(!run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,group,got) ||
                !compare_exact(t,group,ref,got,(uint64_t)t->n_head*HEAD_DIM)) goto cleanup;
             printf("exact,case=%s,group=%u,values=%llu\n",t->name,group,
@@ -335,6 +375,7 @@ int main(void) {
        memcmp(sinks,sinks_copy,MAX_HEADS*4u)) goto cleanup;
     puts("immutability,q=pass,raw=pass,comp=pass,topk=pass,sinks=pass"); rc=0;
 cleanup:
+    ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(0u);
     ds4_gpu_test_set_attention_indexed_streaming_exact_heads(0u);
     ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(base); ds4_gpu_tensor_free(topk);
     ds4_gpu_tensor_free(comp); ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(q);

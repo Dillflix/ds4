@@ -175,6 +175,7 @@ static int g_cuda_no_setdevice_cache;
  * selector, so the production dispatch has neither an environment lookup nor
  * a user-visible opt-in surface. */
 static uint32_t g_attention_indexed_streaming_exact_heads;
+static uint32_t g_attention_indexed_streaming_exact_audit_mode;
 static std::atomic<uint64_t>
     g_attention_indexed_streaming_exact_launches[2] = {};
 static int g_cuda_exact_score_split_graph;
@@ -877,6 +878,11 @@ extern "C" void
 ds4_gpu_test_set_attention_indexed_streaming_exact_heads(uint32_t heads) {
     g_attention_indexed_streaming_exact_heads =
         heads == 4u || heads == 8u ? heads : 0u;
+}
+
+extern "C" void
+ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(uint32_t mode) {
+    g_attention_indexed_streaming_exact_audit_mode = mode <= 3u ? mode : 0u;
 }
 
 extern "C" uint64_t
@@ -13378,7 +13384,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t exact_audit_mode) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -13500,8 +13507,12 @@ __global__ static void attention_indexed_mixed_kernel(
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
         }
-        oh[d0] = acc0 / denom;
-        oh[d1] = acc1 / denom;
+        oh[d0] = exact_audit_mode == 1u ? max_s :
+                 exact_audit_mode == 2u ? denom :
+                 exact_audit_mode == 3u ? acc0 : acc0 / denom;
+        oh[d1] = exact_audit_mode == 1u ? max_s :
+                 exact_audit_mode == 2u ? denom :
+                 exact_audit_mode == 3u ? acc1 : acc1 / denom;
     } else {
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
@@ -13548,7 +13559,8 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t exact_audit_mode) {
     static_assert(HEADS_PER_GROUP == 4u || HEADS_PER_GROUP == 8u,
                   "bounded exact-streaming indexed-decode group size");
     constexpr uint32_t ROWS_PER_STAGE = 32u / HEADS_PER_GROUP;
@@ -13658,7 +13670,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
+                        dot += qh[d] * kvrow[d];
                     }
                     score_tile[local_head][score_row] = dot * scale;
                 }
@@ -13680,7 +13692,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
-                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
+                        dot += qh[d] * kvrow[d];
                     }
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -13779,7 +13791,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
+                        dot += qh[d] * kvrow[d];
                     }
                     score_tile[local_head][score_row] = dot * scale;
                 }
@@ -13798,7 +13810,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
-                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
+                        dot += qh[d] * kvrow[d];
                     }
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -13833,11 +13845,8 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                  local_head < HEADS_PER_GROUP; local_head++) {
                 if (head_base + local_head >= n_head) continue;
                 const float weight = weight_tile[local_head][rr];
-                acc[local_head][0] = __fmaf_rn(
-                    kvrow[threadIdx.x], weight, acc[local_head][0]);
-                acc[local_head][1] = __fmaf_rn(
-                    kvrow[threadIdx.x + 256u], weight,
-                    acc[local_head][1]);
+                acc[local_head][0] += kvrow[threadIdx.x] * weight;
+                acc[local_head][1] += kvrow[threadIdx.x + 256u] * weight;
             }
         }
         __syncthreads();
@@ -13870,8 +13879,15 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
         float *out = heads + (uint64_t)head * head_dim;
         const float den = denom[local_head];
 #pragma unroll
-        out[threadIdx.x] = acc[local_head][0] / den;
-        out[threadIdx.x + 256u] = acc[local_head][1] / den;
+        out[threadIdx.x] = exact_audit_mode == 1u ? max_s[local_head] :
+            (exact_audit_mode == 2u ? den :
+             (exact_audit_mode == 3u ? acc[local_head][0] :
+              acc[local_head][0] / den));
+        out[threadIdx.x + 256u] =
+            exact_audit_mode == 1u ? max_s[local_head] :
+            (exact_audit_mode == 2u ? den :
+             (exact_audit_mode == 3u ? acc[local_head][1] :
+              acc[local_head][1] / den));
     }
 }
 
@@ -23316,7 +23332,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         (float *)heads->ptr, sinks, (const float *)q->ptr, \
         (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, topk_ptr, \
         pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio, \
-        n_head, head_dim
+        n_head, head_dim, g_attention_indexed_streaming_exact_audit_mode
         if (streaming_exact_heads == 8u) {
             attention_indexed_mixed_decode_streaming_exact_kernel<8u>
                 <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
@@ -23409,7 +23425,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   window,
                                                   ratio,
                                                   n_head,
-                                                  head_dim);
+                                                  head_dim,
+                                                  g_attention_indexed_streaming_exact_audit_mode);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
