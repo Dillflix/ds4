@@ -150,7 +150,7 @@ if [[ $RESUME == 1 ]]; then
         "$exact_log" || die "resume exact-regression evidence is invalid"
     grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' "$exact_log" ||
         die "resume environment-selector evidence is invalid"
-    grep -q 'SM75 Q3A4 tile32-dp4a-k4 production default' "$exact_log" ||
+    grep -q 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' "$exact_log" ||
         die "resume K4 production-default evidence is invalid"
     grep -q '^cuda long-context regression: OK$' "$exact_log" ||
         die "resume exact-regression completion marker is missing"
@@ -309,7 +309,7 @@ env -u DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG \
 grep -q 'SM75 Q3A4 tile32-dp4a K1/K2/K4 in-CTA gate/up and owned decode exact/reuse' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "Q3A4 K-split exact marker missing"
-grep -q 'SM75 Q3A4 tile32-dp4a-k4 production default' \
+grep -q 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
     "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
     die "K4 production-default assertion missing"
 grep -q 'SM75 Q3A4 K1/K2/K4 environment selector exact' \
@@ -335,7 +335,7 @@ for variant in k1 k2 k4; do
     case "$variant" in
         k1) dispatch_marker='mapping=tile32-dp4a' ;;
         k2) dispatch_marker='mapping=tile32-dp4a-k2' ;;
-        k4) dispatch_marker='mapping=tile32-dp4a-k4 (production default)' ;;
+        k4) dispatch_marker='mapping=tile32-dp4a-k4' ;;
     esac
     grep -Fxq -- "ds4: SM75 Q3A4 decode gate/up $dispatch_marker" \
         "$OUTPUT_DIR/smoke/$variant.log" ||

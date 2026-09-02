@@ -213,7 +213,7 @@ if [[ $RESUME == 1 ]]; then
     exact_log="$OUTPUT_DIR/smoke/cuda-long-context.log"
     grep -Fq "$exact_marker" "$exact_log" ||
         die "resume nonzero exact-regression evidence is invalid"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' "$exact_log" ||
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' "$exact_log" ||
         die "resume K4 production-default evidence is invalid"
     grep -Fxq 'cuda long-context regression: OK' "$exact_log" ||
         die "resume exact-regression completion marker is missing"
@@ -338,7 +338,7 @@ else
         }
     grep -Fq "$exact_marker" "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
         die "Q3A4 K4 prefetch nonzero exact marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
         "$OUTPUT_DIR/smoke/cuda-long-context.log" ||
         die "K4 production-default assertion missing"
     grep -Fxq 'cuda long-context regression: OK' \

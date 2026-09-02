@@ -192,7 +192,7 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 native exact marker missing"
     grep -Fq 'SM75 Q3A4 DP4A byte packing exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 DP4A packing marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||

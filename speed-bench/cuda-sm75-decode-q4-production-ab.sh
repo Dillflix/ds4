@@ -176,6 +176,7 @@ production_env=(
     DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG=1
     DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a
     DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=4
+    DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH=2
     DS4_CUDA_MOE_Q3A4_DECODE_MAPPING_AUDIT=1
     DS4_CUDA_MOE_Q4_32_DECODE_MAPPING_AUDIT=1
     DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING_AUDIT=1
@@ -203,7 +204,7 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q4 down signed-zero marker missing"
     grep -Fq 'SM75 Q4-32 tile32-mma gate/up + tile32 down production defaults' \
         "$OUTPUT_DIR/smoke.log" || die "Q4 production-default marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
@@ -384,7 +385,7 @@ q3a4_active_count() {
     awk '
         /SM75 Q3A4 decode mapping audit/ {
             seen++
-            c=h=t=d=k1=k2=k4=-1
+            c=h=t=d=k1=k2=k4=pf0=pf1=pf2=-1
             for (i=1; i<=NF; i++) {
                 split($i, a, "=")
                 if (a[1]=="control") c=a[2]+0
@@ -394,9 +395,13 @@ q3a4_active_count() {
                 if (a[1]=="k1") k1=a[2]+0
                 if (a[1]=="k2") k2=a[2]+0
                 if (a[1]=="k4") k4=a[2]+0
+                if (a[1]=="pf0") pf0=a[2]+0
+                if (a[1]=="pf1") pf1=a[2]+0
+                if (a[1]=="pf2") pf2=a[2]+0
             }
             good=(c==0 && h==0 && t==0 && d>0 &&
-                  k1==0 && k2==0 && k4==d)
+                  k1==0 && k2==0 && k4==d &&
+                  pf0==0 && pf1==0 && pf2==d)
             active=d
         }
         END {
@@ -422,7 +427,7 @@ validate_dispatch_audit() {
         grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=control (explicit fallback)' \
             "$log" || return 1
     fi
-    grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)' \
+    grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4-prefetch2 (production default)' \
         "$log" || return 1
     q4_gate_active_count "$variant" "$log" >/dev/null &&
         q4_down_active_count "$variant" "$log" >/dev/null &&

@@ -192,10 +192,21 @@ sanitizer, resource, timing, source, and binary evidence.
 Prefetch depth 2 improved the complete bounded Q3A4 K4 owned call by 7.8%
 (1.078x), passed exactness and sanitizer, used 64 registers with no stack,
 spill, or SASS local traffic, and reduced the profiled kernel from 93.664 to
-77.696 microseconds. It is nevertheless still default-off because no real
-four-GPU production A/B has yet established its end-to-end gain and exact
-decode output. This is the only current Q3A4 gate/up candidate flag awaiting
-that production acceptance pass; tile32-DP4A and K4 are already defaults.
+77.696 microseconds. The all-43-layer four-GPU production A/B then measured
+gains of 1.787%, 1.387%, and 1.189% at PP512, PP4096, and PP32768,
+respectively, with low paired variance. All 96 checked logits were
+byte-identical, and dense-Q8 plans and Q3A4 dispatch counts matched between
+arms. Prefetch depth 2 is therefore the eligible tile32-DP4A K4 production
+default. Set `DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH=0` for the explicit
+rollback.
+
+Depth 1 remains architecture-harness-only, and there is no depth-4 kernel.
+The current kernel has only eight inner groups; extending the pipeline would
+increase live operand state beyond the already-qualified 64-register depth-2
+kernel. A depth-4 implementation is not justified unless focused profiling
+first shows substantial residual long-scoreboard latency that depth 2 does
+not cover, after which it would require fresh exactness, sanitizer,
+PTXAS/SASS resource, bounded timing, and four-GPU production acceptance.
 
 ```bash
 PROFILE_GPU=0 \
@@ -208,9 +219,9 @@ SKIP_BUILD=0 \
 ./speed-bench/cuda-sm75-decode-q3a4-prefetch.sh
 ```
 
-If the bounded audit selects prefetch depth 2, use
-`cuda-sm75-decode-q3a4-prefetch2-production-ab.sh` for the real-model
-acceptance pass. It compares ordinary production K4 (depth 0) with depth 2
+`cuda-sm75-decode-q3a4-prefetch2-production-ab.sh` preserves the real-model
+acceptance comparison. It compares explicit rollback K4 (depth 0) with the
+production-default depth 2
 while fixing every other dispatch, the 22/21 stage split, complete 344/344
 dense-F16 admission, and the four-GPU topology. The runner alternates paired
 TG256 measurements at PP512/4096/32768 and requires 16 byte-identical decode
@@ -286,10 +297,13 @@ registers, and a two-CTA/SM register gate. Inclusive timing covers the complete
 production-owned call. Focused Nsight Compute captures report duration, DRAM
 traffic, long-scoreboard pressure, and eligible warps for all nine kernels.
 
-This is intentionally only the bounded acceptance screen. A winning Q4 depth
-must still pass a real four-GPU production A/B with exact decode logits before
-it can become a default. Gate/up, down-slots, and down-packed may select
-different depths—or reject prefetch independently.
+The bounded audit rejected Q4 prefetch. Gate/up depth 1 and 2 measured
+0.99967x and 0.99967x; down `owned_slots` measured 1.00021x and 0.99982x;
+and down `owned_packed` measured 0.99741x and 0.99163x. With no material win
+and a clear packed-path regression, all three Q4 production paths remain at
+depth 0 and no Q4 candidate advances to a four-GPU production A/B. There is
+also no Q4 depth-4 specialization; the existing kernels support only depths
+0, 1, and 2.
 
 ```bash
 PROFILE_GPU=0 \

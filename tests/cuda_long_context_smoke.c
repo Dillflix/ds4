@@ -1347,7 +1347,7 @@ static int check_sm75_q3a4_ksplit_env(void) {
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
         ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
-        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u)
+        ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 2u)
         goto cleanup;
 
     if (setenv("DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT", "3", 1) != 0 ||
@@ -1379,7 +1379,7 @@ cleanup:
     if (rc == 0 &&
         (ds4_gpu_test_get_moe_q3a4_decode_mapping() != 3u ||
          ds4_gpu_test_get_moe_q3a4_decode_ksplit() != 4u ||
-         ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u))
+         ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 2u))
         rc = 1;
     if (rc == 0) {
         fputs("cuda-regression: SM75 Q3A4 K1/K2/K4 environment selector exact\n",
@@ -2889,10 +2889,10 @@ int main(void) {
         free(idle_model_map);
         return 1;
     }
-    if (ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 0u) {
+    if (ds4_gpu_test_get_moe_q3a4_decode_prefetch_depth() != 2u) {
         fprintf(stderr,
-                "cuda-regression: SM75 Q3A4 production K4 unexpectedly "
-                "enables prefetch candidate\n");
+                "cuda-regression: SM75 Q3A4 production K4 prefetch depth "
+                "is not 2\n");
         ds4_gpu_cleanup();
         free(idle_model_map);
         return 1;
@@ -2917,7 +2917,8 @@ int main(void) {
             "cuda-regression: SM75 Q4-32 tile32-mma gate/up + tile32 down "
             "production defaults\n");
     fprintf(stderr,
-            "cuda-regression: SM75 Q3A4 tile32-dp4a-k4 production default\n");
+            "cuda-regression: SM75 Q3A4 tile32-dp4a-k4-prefetch2 "
+            "production default\n");
     if (!retire_temporary_model_map()) {
         ds4_gpu_cleanup();
         free(idle_model_map);

@@ -198,7 +198,7 @@ if [[ $SKIP_BUILD == 0 ]]; then
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 K-split selector marker missing"
     grep -Fq 'SM75 Q3A4 tile32-dp4a K1/K2/K4 in-CTA gate/up and owned decode exact/reuse' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 K-split exact marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 production-default marker missing"
 else
     make -q ds4-bench tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
@@ -313,22 +313,20 @@ mapping_active_count() {
 }
 
 validate_mapping_audit() {
-    local variant=$1 log=$2 marker default_marker
+    local variant=$1 log=$2 marker
     if [[ $variant == k1 ]]; then
         marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a'
-        default_marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a (production default)'
     else
         marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4'
-        default_marker='SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)'
     fi
-    grep -Fxq "ds4: $marker" "$log" ||
-        grep -Fxq "ds4: $default_marker" "$log" || return 1
+    grep -Fxq "ds4: $marker" "$log" || return 1
     mapping_active_count "$variant" "$log" >/dev/null
 }
 
 variant_env() {
     local variant=$1
     printf 'DS4_CUDA_MOE_Q3A4_DECODE_MAPPING=tile32-dp4a\n'
+    printf 'DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH=0\n'
     case "$variant" in
         k1) printf 'DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=1\n' ;;
         k4) printf 'DS4_CUDA_MOE_Q3A4_DECODE_KSPLIT=4\n' ;;

@@ -1307,7 +1307,7 @@ validate_success_path() {
     grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' "$log" ||
         return 1
     grep -Fq 'CUDA EP forced pipeline split 22/21' "$log" || return 1
-    grep -Fq 'SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)' \
+    grep -Fq 'SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4-prefetch2 (production default)' \
         "$log" || return 1
     ! grep -Eiq 'illegal memory|GPU is lost|Unknown Error|CUDA .* failed' "$log" ||
         return 1

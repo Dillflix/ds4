@@ -217,10 +217,12 @@ static uint32_t g_cuda_moe_q3a4_decode_mapping;
 static const uint32_t CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT = 4u;
 static uint32_t g_cuda_moe_q3a4_decode_ksplit =
     CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
-/* K4 software-pipeline selector.  Production remains the ordinary depth-zero
- * K4 kernel.  A bounded runtime experiment may select depth two; depth one is
- * retained only for the architecture harness through the test setter below. */
-static uint32_t g_cuda_moe_q3a4_decode_prefetch_depth;
+/* K4 software-pipeline selector.  Depth two is the SM75 production default;
+ * depth zero remains an explicit rollback, and depth one is retained only for
+ * the architecture harness through the test setter below. */
+static const uint32_t CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT = 2u;
+static uint32_t g_cuda_moe_q3a4_decode_prefetch_depth =
+    CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT;
 static int g_cuda_moe_q3a4_decode_mapping_audit;
 static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_ksplit_calls[3] = {};
@@ -827,13 +829,16 @@ static void cuda_decode_dispatch_env_refresh(void) {
                 CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT;
         }
     }
-    const char *q3a4_prefetch_depth =
-        getenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
-    if (q3a4_prefetch_depth && q3a4_ksplit_valid &&
-        !q3a4_mapping_disabled &&
+    const bool q3a4_prefetch_eligible =
+        q3a4_ksplit_valid && !q3a4_mapping_disabled &&
         g_cuda_moe_q3a4_decode_mapping ==
             CUDA_MOE_Q3A4_DECODE_TILE32_DP4A &&
-        g_cuda_moe_q3a4_decode_ksplit == 4u) {
+        g_cuda_moe_q3a4_decode_ksplit == 4u;
+    g_cuda_moe_q3a4_decode_prefetch_depth = q3a4_prefetch_eligible
+        ? CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT : 0u;
+    const char *q3a4_prefetch_depth =
+        getenv("DS4_CUDA_MOE_Q3A4_DECODE_PREFETCH_DEPTH");
+    if (q3a4_prefetch_depth && q3a4_prefetch_eligible) {
         if (strcmp(q3a4_prefetch_depth, "0") == 0) {
             g_cuda_moe_q3a4_decode_prefetch_depth = 0u;
         } else if (strcmp(q3a4_prefetch_depth, "2") == 0) {
@@ -841,9 +846,10 @@ static void cuda_decode_dispatch_env_refresh(void) {
         } else {
             fprintf(stderr,
                     "ds4: invalid Q3A4 decode prefetch depth '%s'; "
-                    "using depth 0\n",
+                    "using production depth 2\n",
                     q3a4_prefetch_depth);
-            g_cuda_moe_q3a4_decode_prefetch_depth = 0u;
+            g_cuda_moe_q3a4_decode_prefetch_depth =
+                CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT;
         }
     }
 }
@@ -32688,7 +32694,8 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                     q3a4_decode_mapping == CUDA_MOE_Q3A4_DECODE_TILE32_DP4A &&
                     q3a4_decode_ksplit ==
                         CUDA_MOE_Q3A4_DECODE_KSPLIT_DEFAULT &&
-                    q3a4_decode_prefetch_depth == 0u
+                    q3a4_decode_prefetch_depth ==
+                        CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT
                         ? " (production default)" : "");
         }
     }

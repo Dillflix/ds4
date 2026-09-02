@@ -234,8 +234,8 @@ if [[ $SKIP_BUILD == 0 ]]; then
     }
     grep -Fq 'SM75 Q3A4 tile32-dp4a K4 prefetch-depth 1/2 nonzero exact' \
         "$OUTPUT_DIR/smoke.log" || die "Q3A4 prefetch exact marker missing"
-    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4 production default' \
-        "$OUTPUT_DIR/smoke.log" || die "ordinary K4 production-default marker missing"
+    grep -Fq 'SM75 Q3A4 tile32-dp4a-k4-prefetch2 production default' \
+        "$OUTPUT_DIR/smoke.log" || die "K4 prefetch2 production-default marker missing"
     grep -Fq 'SM75 Q4-32 tile32-mma gate/up + tile32 down production defaults' \
         "$OUTPUT_DIR/smoke.log" || die "Q4 production-default marker missing"
     grep -Fq 'SM75 Q3A4 K4 prefetch depth 0/2 environment selector exact' \
@@ -501,10 +501,10 @@ mapping_active_count() {
 validate_mapping_audit() {
     local variant=$1 log=$2 marker
     if [[ $variant == control ]]; then
-        grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4 (production default)' \
+        grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4' \
             "$log" || return 1
     else
-        grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4-prefetch2' \
+        grep -Fxq 'ds4: SM75 Q3A4 decode gate/up mapping=tile32-dp4a-k4-prefetch2 (production default)' \
             "$log" || return 1
     fi
     mapping_active_count "$variant" "$log" >/dev/null
