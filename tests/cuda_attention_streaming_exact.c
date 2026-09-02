@@ -100,7 +100,8 @@ static int compare_exact(const exact_case *t, uint32_t group,
 static int compare_stage(const exact_case *t, uint32_t group, uint32_t mode,
                          const float *ref, const float *got, uint64_t n) {
     static const char *names[] = {
-        "output", "max-score", "denominator", "numerator"
+        "output", "max-score", "denominator", "numerator",
+        "score-rows-0-511", "score-rows-512-767"
     };
     if (!memcmp(ref, got, (size_t)n * sizeof(float))) {
         printf("stage-exact,case=%s,group=%u,stage=%s\n",
@@ -112,11 +113,22 @@ static int compare_stage(const exact_case *t, uint32_t group, uint32_t mode,
     uint32_t rb = 0u, gb = 0u;
     memcpy(&rb, ref + i, sizeof(rb));
     memcpy(&gb, got + i, sizeof(gb));
-    fprintf(stderr,
-            "stage-mismatch case=%s group=%u stage=%s index=%llu "
-            "ref=%a/0x%08x got=%a/0x%08x\n",
-            t->name, group, names[mode], (unsigned long long)i,
-            (double)ref[i], rb, (double)got[i], gb);
+    if (mode == 4u || mode == 5u) {
+        fprintf(stderr,
+                "stage-mismatch case=%s group=%u stage=%s index=%llu "
+                "head=%llu score_row=%llu ref=%a/0x%08x got=%a/0x%08x\n",
+                t->name, group, names[mode], (unsigned long long)i,
+                (unsigned long long)(i / HEAD_DIM),
+                (unsigned long long)((i % HEAD_DIM) +
+                    (mode == 5u ? 512u : 0u)),
+                (double)ref[i], rb, (double)got[i], gb);
+    } else {
+        fprintf(stderr,
+                "stage-mismatch case=%s group=%u stage=%s index=%llu "
+                "ref=%a/0x%08x got=%a/0x%08x\n",
+                t->name, group, names[mode], (unsigned long long)i,
+                (double)ref[i], rb, (double)got[i], gb);
+    }
     return 0;
 }
 
@@ -340,7 +352,10 @@ int main(void) {
         for (uint32_t gi = 0u; gi < sizeof(groups) / sizeof(groups[0]); gi++) {
             const uint32_t group = groups[gi];
             if (ci == 0u) {
-                for (uint32_t mode = 1u; mode <= 3u; mode++) {
+                static const uint32_t audit_order[] = {4u, 5u, 1u, 2u, 3u};
+                for (uint32_t ai = 0u;
+                     ai < sizeof(audit_order) / sizeof(audit_order[0]); ai++) {
+                    const uint32_t mode = audit_order[ai];
                     ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(mode);
                     if (!run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,0,ref) ||
                         !run_exact(base,heads,hi,ho,sinks,q,raw,comp,topk,t,group,got))

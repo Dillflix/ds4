@@ -4765,6 +4765,11 @@ signed-zero, inactive output tail, input immutability, and prefix/suffix guard
 cases are also checked. The candidate is an exact **two-score-pass** design;
 it is not a one-pass online softmax.
 
+For the live 32K fixture, the exact gate also compares the score surface before
+the max reduction in two windows (`0..511` and `512..767`). A failure reports
+the first divergent head and logical score row. This separates score-generation
+or row-mapping defects from max-tree, denominator, and numerator differences.
+
 The harness forces a fresh SM75 build, enforces per-symbol zero PTXAS stack and
 spill bytes plus zero SASS `LDL`/`STL`, retains the runtime register/occupancy
 gates, and runs Compute Sanitizer by default. Timing uses the live H32 fixture,

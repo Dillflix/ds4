@@ -882,7 +882,7 @@ ds4_gpu_test_set_attention_indexed_streaming_exact_heads(uint32_t heads) {
 
 extern "C" void
 ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(uint32_t mode) {
-    g_attention_indexed_streaming_exact_audit_mode = mode <= 3u ? mode : 0u;
+    g_attention_indexed_streaming_exact_audit_mode = mode <= 5u ? mode : 0u;
 }
 
 extern "C" uint64_t
@@ -13477,6 +13477,15 @@ __global__ static void attention_indexed_mixed_kernel(
     }
     if (threadIdx.x == 0) max_s = partial[0];
     __syncthreads();
+    if (exact_audit_mode == 4u || exact_audit_mode == 5u) {
+        const uint32_t score_base = exact_audit_mode == 4u ? 0u : 512u;
+        float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            const uint32_t row = score_base + d;
+            oh[d] = row < n_score ? scores[row] : -INFINITY;
+        }
+        return;
+    }
     float den_local = 0.0f;
     for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
         scores[i] = expf(scores[i] - max_s);
@@ -13640,6 +13649,12 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
         const uint32_t head = head_base + local_head;
         partial[local_head][threadIdx.x] =
             head < n_head ? sinks[head] : -INFINITY;
+        if (head < n_head &&
+            (exact_audit_mode == 4u || exact_audit_mode == 5u)) {
+            float *out = heads + (uint64_t)head * head_dim;
+            out[threadIdx.x] = -INFINITY;
+            out[threadIdx.x + 256u] = -INFINITY;
+        }
     }
     __syncthreads();
 
@@ -13716,10 +13731,24 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                 float *dst = &partial[local_head][row & 255u];
                 *dst = fmaxf(*dst,
                              score_tile[local_head][score_row]);
+                if (exact_audit_mode == 4u || exact_audit_mode == 5u) {
+                    const uint32_t score_base =
+                        exact_audit_mode == 4u ? 0u : 512u;
+                    if (row >= score_base && row < score_base + head_dim) {
+                        float *out = heads +
+                            (uint64_t)(head_base + local_head) * head_dim;
+                        out[row - score_base] =
+                            score_tile[local_head][score_row];
+                    }
+                }
             }
         }
         __syncthreads();
     }
+
+    /* Modes 4/5 expose the raw score surface before max reduction.  They are
+     * diagnostic-only and intentionally avoid the recompute/PV pass. */
+    if (exact_audit_mode == 4u || exact_audit_mode == 5u) return;
 
     /* The per-head loop changes only scheduling; each tree has the exact
      * reference operands and stride order. */
