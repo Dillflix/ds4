@@ -1790,8 +1790,9 @@ Q4_K down-projection follow-up. It compares the standard layout with native-W,
 prepacked native-A/W consumption, and the combined activation-pack plus
 native-A/W path. `native-aw-consumer` measures only the consumer after native-A
 packing is complete; `native-aw-combined` charges the activation transform to
-the timed result, while `pack-a` reports that transform separately. Ten rounds
-balance every one of the five variants across every sample position. The early
+the timed result, while `pack-a` reports that transform separately. The two
+N-split candidates are retained as bounded comparisons. Fourteen rounds
+balance every one of the seven variants across every sample position. The early
 layer-3 shape has 1,879 routed token/expert pairs,
 99 active experts, 183 tile16 launches, and 1,049 padded slots. The late
 layer-36 shape has 2,186 pairs, 76 active experts, 189 tile16 launches, and 838

@@ -9,7 +9,7 @@ down-projection native-packing harness.
 Optional environment:
   PROFILE_GPU=0
   CUDA_ARCH=sm_75
-  BENCH_ROUNDS=10
+  BENCH_ROUNDS=14
   BENCH_LAUNCHES=20
   PROFILE_SCENARIO=early    early or late
   SKIP_BUILD=0
@@ -42,7 +42,15 @@ workflow_rel=.github/workflows/cuda-quantizer-build.yml
 readme_rel=speed-bench/README.md
 validator_rel=speed-bench/validate-ncu-capture.py
 
-benchmark_variants=(standard native-w native-aw-consumer native-aw-combined pack-a)
+benchmark_variants=(
+    standard
+    native-w
+    native-aw-consumer
+    native-aw-combined
+    pack-a
+    native-aw-nsplit4
+    native-aw-nsplit8
+)
 profile_variants=(standard native-w native-aw-consumer pack-a)
 profile_labels=(baseline native-w native-aw activation-pack)
 # Skip matching warmups so the one captured launch is inside the harness's
@@ -69,7 +77,7 @@ sass_kernels=(
 
 PROFILE_GPU=${PROFILE_GPU:-0}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
-BENCH_ROUNDS=${BENCH_ROUNDS:-10}
+BENCH_ROUNDS=${BENCH_ROUNDS:-14}
 BENCH_LAUNCHES=${BENCH_LAUNCHES:-20}
 PROFILE_SCENARIO=${PROFILE_SCENARIO:-early}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -83,8 +91,8 @@ OUTPUT_DIR=${Q4_DOWN_NATIVE_DIR:-$repo_dir/sm75-q4-down-native-$RUN_STAMP}
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be a physical GPU index"
 [[ $CUDA_ARCH == sm_75 ]] || die "CUDA_ARCH must be exactly sm_75"
 [[ $BENCH_ROUNDS =~ ^[1-9][0-9]*$ ]] || die "BENCH_ROUNDS must be a positive integer"
-(( 10#$BENCH_ROUNDS % 10 == 0 )) ||
-    die "BENCH_ROUNDS must be a multiple of 10 to balance five variants across sample positions"
+(( 10#$BENCH_ROUNDS % 14 == 0 )) ||
+    die "BENCH_ROUNDS must be a multiple of 14 to balance seven variants across sample positions"
 [[ $BENCH_LAUNCHES =~ ^[1-9][0-9]*$ ]] || die "BENCH_LAUNCHES must be a positive integer"
 [[ $PROFILE_SCENARIO == early || $PROFILE_SCENARIO == late ]] ||
     die "PROFILE_SCENARIO must be early or late"
