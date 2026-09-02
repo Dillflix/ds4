@@ -5502,12 +5502,18 @@ bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 ### Bounded exact compact-attention KV codec
 
 `cuda-sm75-compact-attention-kv.sh` does not alter production dispatch. It
-packs the existing 512-float compressed-attention row into a 736-byte exact
-representation: seven F32 power-of-two scales, 448 E4M3 sign/index bytes, and
-64 untouched F32 RoPE values. The harness requires bit-identical unpack and
-consumer output, rejects non-finite or non-representable rows, checks guarded
-allocations under Compute Sanitizer, records PTXAS/SASS resources, and times a
-full-row F32 consumer against compact decode plus consume. The reported SASS
+uses the shipping `ds4_cuda.o` quantizer, built with production flags, to
+produce the reference 512-float compressed-attention row and packs it into a
+736-byte exact representation: seven F32 power-of-two scales, 448 E4M3
+sign/index bytes, and 64 untouched F32 RoPE values. The harness requires
+bit-identical unpack and consumer output, rejects non-finite or
+non-representable rows, checks guarded allocations under Compute Sanitizer,
+covers scale-floor, alternate-scale, upper-exponent, and signed-zero
+boundaries, records PTXAS/SASS resources, and times a paired, alternating
+full-row F32 consumer against compact decode plus consume. This bounded
+synthetic timing is diagnostic, not promotion evidence. Pack status completes
+asynchronously; a future caller must observe `PACK_OK` before committing or
+using a destination row. The reported SASS
 LDL/STL counts are explicitly whole-binary diagnostics, not a per-kernel
 acceptance gate.
 

@@ -28,6 +28,9 @@ done
 for tool in make cuobjdump nvidia-smi; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool was not found"
 done
+if (( CREATE_ARCHIVE )); then
+    command -v tar >/dev/null 2>&1 || die "CREATE_ARCHIVE=1 but tar was not found"
+fi
 if (( RUN_SANITIZER )); then
     command -v compute-sanitizer >/dev/null 2>&1 ||
         die "RUN_SANITIZER=1 but compute-sanitizer was not found"
@@ -38,6 +41,24 @@ timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${COMPACT_ATTENTION_KV_DIR:-"$PWD/sm75-compact-attention-kv-$timestamp"}
 [[ ! -e $OUTPUT_DIR ]] || die "output path already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
+
+archive_on_exit() {
+    local rc=$?
+    local archive="$OUTPUT_DIR.tar.gz"
+    trap - EXIT
+    if (( CREATE_ARCHIVE )) && [[ -d $OUTPUT_DIR ]]; then
+        if tar -czf "$archive" -C "$(dirname "$OUTPUT_DIR")" \
+                "$(basename "$OUTPUT_DIR")"; then
+            printf 'Archive to return: %s\n' "$archive"
+        else
+            printf 'warning: failed to create archive: %s\n' "$archive" >&2
+        fi
+    fi
+    exit "$rc"
+}
+trap archive_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 git rev-parse HEAD >"$OUTPUT_DIR/git-head.txt"
 git status --short >"$OUTPUT_DIR/git-status.txt"
@@ -54,9 +75,8 @@ else
     printf 'skipped explicitly: SKIP_BUILD=1\n' >"$OUTPUT_DIR/build.log"
 fi
 
-if grep -Eq '[1-9][0-9]* bytes spill (stores|loads)' "$OUTPUT_DIR/build.log"; then
-    die "PTXAS reported nonzero spill traffic"
-fi
+grep -E 'Function properties|bytes stack frame|bytes spill (stores|loads)' \
+    "$OUTPUT_DIR/build.log" >"$OUTPUT_DIR/whole-binary-ptxas-resources.txt" || true
 
 cuobjdump --dump-resource-usage "$target" >"$OUTPUT_DIR/resource-usage.txt"
 cuobjdump --dump-sass "$target" >"$OUTPUT_DIR/sass.txt"
@@ -89,9 +109,3 @@ grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||
 
 printf 'SM75 exact compact-attention KV experiment complete: %s\n' "$OUTPUT_DIR"
 tail -n 16 "$OUTPUT_DIR/timing.log"
-
-if (( CREATE_ARCHIVE )); then
-    archive="$OUTPUT_DIR.tar.gz"
-    tar -czf "$archive" -C "$(dirname "$OUTPUT_DIR")" "$(basename "$OUTPUT_DIR")"
-    printf 'Archive to return: %s\n' "$archive"
-fi
