@@ -512,6 +512,40 @@ def q8_activation_summary(
 
 
 class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
+    def test_pre_attention_interop_fence_honors_device_status_contract(
+            self) -> None:
+        source = (REPO / "ds4.c").read_text(encoding="utf-8")
+        helper_start = source.index(
+            "static bool "
+            "metal_graph_cuda_tp_prefill_attention_rows_interop_fence_sync("
+        )
+        helper_end = source.index(
+            "static void metal_graph_cuda_tp_prefill_attention_rows_end_fence_log(",
+            helper_start,
+        )
+        helper = source[helper_start:helper_end]
+        self.assertIn(
+            "if (ds4_gpu_set_current_device(tier) != 0)", helper
+        )
+        self.assertNotIn(
+            "if (ds4_gpu_set_current_device(tier) == 0)", helper
+        )
+
+        call_start = source.index(
+            "if (ok && "
+            "shadow_partner_output_scratch_pre_attention_gather_fenced)"
+        )
+        call_end = source.index(
+            "const bool audit_partner_attention", call_start
+        )
+        call_site = source[call_start:call_end]
+        self.assertIn(
+            "else if (ds4_gpu_set_current_device(home) != 0)", call_site
+        )
+        self.assertNotIn(
+            "else if (ds4_gpu_set_current_device(home) == 0)", call_site
+        )
+
     def test_identifies_prefill_attention_rows_as_necessary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

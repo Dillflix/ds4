@@ -28974,7 +28974,10 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_interop_fence_sync(
         const char *target, int tier, ds4_cuda_prefill_attn_kind kind,
         uint32_t il, uint32_t pos0, uint32_t n_tokens,
         int home, int partner) {
-    if (ds4_gpu_set_current_device(tier) == 0) {
+    /* ds4_gpu_set_current_device follows the C status convention: zero is
+     * success. ds4_gpu_synchronize follows the CUDA-backend boolean
+     * convention: nonzero is success. Keep the two checks explicit. */
+    if (ds4_gpu_set_current_device(tier) != 0) {
         metal_graph_cuda_tp_prefill_attention_rows_interop_fence_log(
             "device-switch-failed", target, kind, il, pos0, n_tokens,
             home, partner);
@@ -29563,7 +29566,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             home_fence_ok =
                 metal_graph_cuda_tp_prefill_attention_rows_interop_fence_sync(
                     "home", home, kind, il, pos0, n_tokens, home, partner);
-        } else if (ds4_gpu_set_current_device(home) == 0) {
+        } else if (ds4_gpu_set_current_device(home) != 0) {
             metal_graph_cuda_tp_prefill_attention_rows_interop_fence_log(
                 "device-switch-failed", "home-restore", kind, il, pos0,
                 n_tokens, home, partner);
