@@ -26,6 +26,8 @@ VARIANT_ORDER = (
     "attention-row-partner-output-scratch-no-gather-shadow",
     "attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow",
     "attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-fenced-shadow",
+    "attention-row-attention-prime-once-then-transfer-only-shadow",
+    "attention-row-transfer-prime-once-then-attention-only-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2858,6 +2860,50 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         ),
         "not-run",
     )
+    attention_prime_then_transfer_only_state = outcomes.get(
+        "attention-row-attention-prime-once-then-transfer-only-shadow",
+        "not-run",
+    )
+    transfer_prime_then_attention_only_state = outcomes.get(
+        "attention-row-transfer-prime-once-then-attention-only-shadow",
+        "not-run",
+    )
+    if attention_prime_then_transfer_only_state == "failed":
+        return (
+            "After one fenced partner-attention occurrence completed, a later "
+            "occurrence containing only the full-size fenced reverse transfer lost "
+            "a device. Same-occurrence adjacency and overlap are not required: the "
+            "partner-attention operation leaves persistent pair/device state that "
+            "the later reverse transfer exposes. Next instrument or replace the "
+            "stateful boundary between those two operation classes, not transfer "
+            "size or layer selection."
+        )
+    if attention_prime_then_transfer_only_state == "passed":
+        return (
+            "One fenced partner-attention occurrence followed by only full-size "
+            "fenced reverse transfers completed under the required load. A single "
+            "earlier attention operation is therefore insufficient to prime the "
+            "failure; repeated alternation, accumulated attention activity, or the "
+            "opposite temporal direction remains required. Run only the transfer-"
+            "prime then attention-only arm next."
+        )
+    if transfer_prime_then_attention_only_state == "failed":
+        return (
+            "After one full-size fenced reverse-transfer occurrence completed, a "
+            "later attention-only occurrence lost a device at its pre-action fence, "
+            "attention submission, or completion boundary. Same-occurrence adjacency "
+            "and overlap are not required: the reverse transfer leaves persistent "
+            "pair/device state that the next synchronized attention step exposes. "
+            "Use the temporal marker sequence to identify the first failing boundary "
+            "before changing the stateful transition."
+        )
+    if transfer_prime_then_attention_only_state == "passed":
+        return (
+            "One full-size fenced reverse-transfer occurrence followed by only "
+            "synchronized partner attention completed under the required load. A "
+            "single earlier reverse transfer is therefore insufficient to prime "
+            "the failure; repeated alternation or accumulated work is required."
+        )
     if partner_output_scratch_pre_attention_gather_fenced_state == "failed":
         return (
             "The pair still lost a device after the pre-attention static transfer "
@@ -2866,8 +2912,9 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "each pass, while their combination fails in both orders and now with "
             "a quiescent boundary. Immediate adjacency, overlap, and an outstanding "
             "cross-device event from that transfer are therefore not required. "
-            "Next retain this fence and reduce only reverse-transfer bytes or duty "
-            "to locate the cumulative traffic/work threshold."
+            "Next run the two temporal-priming arms separately: one completed "
+            "attention followed only by fenced reverse transfers, then one "
+            "completed reverse transfer followed only by synchronized attention."
         )
     if partner_output_scratch_pre_attention_gather_fenced_state == "passed":
         return (
@@ -3141,6 +3188,14 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "scratch-pre-attention-paced-fenced-shadow",
             "result-gather-preinitialized-source-partner-output-scratch-"
             "pre-attention-paced-fenced",
+        ),
+        (
+            "attention-row-attention-prime-once-then-transfer-only-shadow",
+            "attention-prime-once-then-transfer-only-fenced",
+        ),
+        (
+            "attention-row-transfer-prime-once-then-attention-only-shadow",
+            "transfer-prime-once-then-attention-only-fenced",
         ),
     ):
         state = outcomes.get(variant, "not-run")

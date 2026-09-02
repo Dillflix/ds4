@@ -4295,6 +4295,47 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-attention-prime-once-then-transfer-only-"
+                        "shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "later occurrence containing only the full-size fenced reverse "
+                "transfer lost a device",
+            ),
+            (
+                (
+                    (
+                        "attention-row-attention-prime-once-then-transfer-only-"
+                        "shadow",
+                        "passed",
+                    ),
+                ),
+                "single earlier attention operation is therefore insufficient",
+            ),
+            (
+                (
+                    (
+                        "attention-row-transfer-prime-once-then-attention-only-"
+                        "shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "later attention-only occurrence lost a device",
+            ),
+            (
+                (
+                    (
+                        "attention-row-transfer-prime-once-then-attention-only-"
+                        "shadow",
+                        "passed",
+                    ),
+                ),
+                "single earlier reverse transfer is therefore insufficient",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

@@ -4018,6 +4018,22 @@ cut of pair-0 attention-owned work:
   surviving run below 400 prefill tok/s is classified as underloaded rather
   than accepted; the two preceding single-component controls sustained 459.89
   and 481.45 tok/s, so this rejects a gross scheduling/load collapse.
+- `attention-row-attention-prime-once-then-transfer-only-shadow` executes one
+  occurrence with synchronized partner attention and no reverse transfer. All
+  later occurrences omit partner attention and execute only the same full
+  32 MiB paced reverse transfer, with the same partner-then-home pair fence.
+- `attention-row-transfer-prime-once-then-attention-only-shadow` performs the
+  converse: one full-size fenced reverse transfer, then synchronized partner
+  attention without reverse transfers on all later occurrences.
+
+The temporal arms do not remove row splitting or reduce the production
+surrounding workload. Direct query handoff, cache residency, pair 1, Q8 partner
+projections, full-home accepted-output recomputation, PP32768/TG256, and the
+native power profile remain fixed. Here “attention-only” and “transfer-only”
+name only the selected pair-0 shadow subphase. Durable per-occurrence markers
+prove the first action completed and identify the second action submitted (or
+failed to submit) before a device-loss result is accepted. The two arms must be
+run separately after fresh boots; they are deliberately non-resumable.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4340,6 +4356,56 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
+
+The fenced combined arm still lost the pair, and its existing
+`shadow_finish()` boundary already synchronizes partner attention. The next
+causal test is therefore temporal priming, not a byte sweep. Run the
+attention-prime arm first after a fresh reboot:
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-attention-rowsplit-fault-audit
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+for gpu in 0 2 3; do
+  sudo nvidia-smi -i "$gpu" -pl 250
+done
+sudo nvidia-smi -i 1 -pl 260
+nvidia-smi \
+  --query-gpu=index,pci.bus_id,uuid,serial,power.default_limit,power.limit \
+  --format=csv
+
+export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
+export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-attention-prime-transfer-only-$(date -u +%Y%m%dT%H%M%SZ)"
+
+RESUME=0 \
+ONE_SHOT=1 \
+ONE_SHOT_TIMEOUT_SECONDS=900 \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+SMALL_BAR1_PAIR=0 \
+VARIANTS=attention-row-attention-prime-once-then-transfer-only-shadow \
+PP_TOKENS=32768 \
+TG_TOKENS=256 \
+REPEATS=1 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TELEMETRY_INTERVAL_MS=500 \
+POST_CASE_SETTLE_SECONDS=5 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
+```
+
+After preserving that archive and rebooting, replace only the output-directory
+prefix and variant with
+`sm75-attention-row-transfer-prime-attention-only-...` and
+`attention-row-transfer-prime-once-then-attention-only-shadow` to run the
+converse arm.
 
 The earlier workload-preserving transport and scheduling arms remain accepted
 for reproducing existing evidence:

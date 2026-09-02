@@ -46,6 +46,7 @@ bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier);
 int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(int tier);
 bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
         int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_gather_copy_dst_pair_enabled(
@@ -1079,6 +1080,24 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
            "pre-attention-paced-fenced", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 14,
           "fenced partner-output-scratch pre-attention gather phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE",
+           "attention-prime-once-then-transfer-only-fenced", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 15,
+          "one-attention-prime then transfer-only phase is recognized");
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(0) &&
+          ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(2) &&
+          !ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(1) &&
+          !ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(3),
+          "attention-prime temporal phase allocates scratch on both pair-0 endpoints");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE",
+           "transfer-prime-once-then-attention-only-fenced", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 16,
+          "one-transfer-prime then attention-only phase is recognized");
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(0) &&
+          ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(2) &&
+          !ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(1) &&
+          !ds4_test_cuda_tp_prefill_attn_row_shadow_scratch_needed(3),
+          "transfer-prime temporal phase allocates scratch on both pair-0 endpoints");
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "invalid", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
           "invalid attention row shadow phases fail closed");
