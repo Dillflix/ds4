@@ -15559,10 +15559,10 @@ static bool cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier) {
         return env_pair_list_contains(
             "DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS", home_tier);
     }
-    /* Match the stable automatic topology without sharing the attention
-     * selector.  The positive pair list can independently enable pair 0 for
-     * an indexer-only production probe. */
-    return home_tier != 0;
+    /* Prefill indexer ownership is independent of attention ownership.  Both
+     * pairs are exact and beneficial when pair 0 gathers its selected rows
+     * home for unsplit attention. */
+    return home_tier == 0 || home_tier == 1;
 }
 
 static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {

@@ -1234,9 +1234,10 @@ decision boundary. It leaves the stage-aware 344/344 Q8 plan, automatic
 T32/T256/shared-down placement, prefill pipeline, and native indexer defaults
 unchanged in both arms. On the qualified machine it also keeps the known-stable
 prefill attention topology fixed: query-row splitting is disabled only for
-pair 0 and remains enabled for pair 1. The corresponding prefill indexer
-row split is therefore also active only for pair 1; the independent decode
-indexer row split remains unchanged.
+pair 0 and remains enabled for pair 1. Prefill indexer ownership is independent:
+its row split is active on both pairs, with pair 0 gathering selected rows home
+for unsplit attention. The independent decode indexer row split remains
+unchanged.
 
 The runner executes an alternating control/fused A/B at 512, 4096, and 32768
 tokens for both the existing mixed15 model and the new all43-Q3A4 gate/up
@@ -1280,8 +1281,8 @@ new matrix after reboot rather than combining process histories with resume.
 
 `cuda-sm75-t32-f16-rowsplit-probe.sh` is retained only as a fault-reproduction
 harness. It fixes fused T32 output on, explicitly restores attention and
-indexer row splitting on pair 0, and executes exactly one mixed15 32K prefill
-process. That experiment still lost the GPU1 PCIe endpoint after 19 pair-0
+indexer row splitting on pair 0, and executes exactly one mixed15 or all43 32K
+prefill process. The mixed15 experiment lost the GPU1 PCIe endpoint after 19 pair-0
 attention splits even though partner result traffic was reduced. It therefore
 rejects the hypothesis that T32 traffic reduction makes the all-pairs row-split
 topology stable. Pair 1, the 344/344 placement, all-partner T32 ownership,
@@ -1301,6 +1302,14 @@ with `REFERENCE_DIR` pointing at the candidate directory; the control then
 requires every dumped frontier-logit file to be byte-identical. Separate
 processes are mandatory because a GPU-loss arm requires a reboot.
 
+The accepted mixed15 candidate/control pair measured 510.42 versus 498.81
+tok/s (+2.33%); the all43-Q3A4 pair measured 479.59 versus 468.11 tok/s
+(+2.45%). Both comparisons were byte-exact, both candidate runs completed 600
+pair-0 indexer splits with pair-0 attention disabled, and all four GPUs remained
+healthy. Pair-0 prefill indexer splitting is therefore a production default;
+this runner remains the exactness and performance regression boundary for the
+independent policy.
+
 ```bash
 VARIANT=indexer-on \
 MODEL_LAYOUT=mixed15 \
@@ -1314,9 +1323,9 @@ REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 bash ./speed-bench/cuda-sm75-prefill-indexer-pair0-probe.sh
 ```
 
-Repeat the same pair with `MODEL_LAYOUT=all43` only after mixed15 establishes
-stability and exactness. This is a prefill-indexer qualification; it does not
-alter or retest the independently promoted one-token decode-indexer split.
+Repeat the same pair with `MODEL_LAYOUT=all43` when requalifying a change. This
+is a prefill-indexer qualification; it does not alter or retest the
+independently promoted one-token decode-indexer split.
 
 Set physical GPU power limits before launching. The default requirement is
 250 W on passive GPUs 0, 2, and 3 and the workstation board's full 260 W on

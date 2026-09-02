@@ -851,12 +851,14 @@ links of at least 18 GiB/s. It improved bit-exact production prefill by 4.25% at
 4x RTX 8000 NVLink-pair target. Production now suppresses logical pair 0 and
 retains the stable pair-1 split: repeated all-pairs 32K runs lost the GPU1 PCIe
 endpoint, while disabling pair 0 completed cleanly. Prefill indexer splitting
-has an independent pair selector. Its conservative automatic policy currently
-matches attention (pair 1 only), while
-`DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS=0,1` enables an indexer-only pair-0
-qualification without re-enabling pair-0 attention. In that mode the partner's
-top-k integer rows are gathered home before the unchanged home attention
-launch. The independently qualified decode indexer row split is unchanged.
+has an independent pair selector and is enabled on both qualified pairs by
+default. Pair 0 gathers the partner's top-k integer rows home before the
+unchanged home-attention launch; 32K mixed15 and all43-Q3A4 qualification was
+byte-exact, left all GPUs healthy, and improved prefill by 2.33% and 2.45%
+respectively. `DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=0` disables only that
+pair, while `DS4_CUDA_TP_PREFILL_INDEXER_ROWS=0` disables the entire prefill
+indexer split. The independently qualified decode indexer row split is
+unchanged.
 `DS4_CUDA_TP_PREFILL_ATTN_ROWS=0` disables all prefill attention row splitting;
 `=1` explicitly restores both qualified pairs for fault reproduction and other
 controlled measurements. The path covers indexed and nonzero-prefix mixed attention. It

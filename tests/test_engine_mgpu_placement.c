@@ -940,9 +940,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           "stable default suppresses pair 0 and keeps pair 1 row splitting");
 
     CHECK(ds4_test_cuda_tp_prefill_indexer_rows_requested() &&
-          !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
-          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
-          "prefill indexer has an independent stable pair policy");
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1) &&
+          !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(2),
+          "prefill indexer enables both independently qualified pairs");
     setenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
           !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
