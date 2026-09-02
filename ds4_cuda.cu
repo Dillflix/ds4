@@ -13658,7 +13658,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot += qh[d] * kvrow[d];
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     score_tile[local_head][score_row] = dot * scale;
                 }
@@ -13680,7 +13680,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
-                        dot += qh[d] * kvrow[d];
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -13779,7 +13779,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot += qh[d] * kvrow[d];
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     score_tile[local_head][score_row] = dot * scale;
                 }
@@ -13798,7 +13798,7 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                         (const float *)(kv_shared + score_row * 128u);
                     float dot = 0.0f;
                     for (uint32_t d = score_lane; d < head_dim; d += 8u) {
-                        dot += qh[d] * kvrow[d];
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -13833,8 +13833,11 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
                  local_head < HEADS_PER_GROUP; local_head++) {
                 if (head_base + local_head >= n_head) continue;
                 const float weight = weight_tile[local_head][rr];
-                acc[local_head][0] += kvrow[threadIdx.x] * weight;
-                acc[local_head][1] += kvrow[threadIdx.x + 256u] * weight;
+                acc[local_head][0] = __fmaf_rn(
+                    kvrow[threadIdx.x], weight, acc[local_head][0]);
+                acc[local_head][1] = __fmaf_rn(
+                    kvrow[threadIdx.x + 256u], weight,
+                    acc[local_head][1]);
             }
         }
         __syncthreads();
