@@ -15583,6 +15583,41 @@ static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
     return home_tier != 0;
 }
 
+enum {
+    DS4_CUDA_TP_CACHE_MIRROR_ATTN  = 1u << 0,
+    DS4_CUDA_TP_CACHE_MIRROR_INDEX = 1u << 1,
+};
+
+/* Cache residency follows the consumer, not the graph-wide feature switch.
+ * Attention row splitting needs raw and attention-compressed KV on its
+ * partner. Indexer splitting needs only the native index-cache mirror. Keep
+ * decode in this policy because its 50/50 score path consumes the same index
+ * mirror even when prefill indexer work is disabled for a pair. */
+static uint32_t cuda_tp_cache_mirror_classes_for_pair(
+        bool prefill_attn_rows,
+        bool prefill_indexer_rows,
+        bool decode_indexer_rows,
+        int  home_tier) {
+    if (home_tier < 0 || home_tier >= g_n_gpus / 2) return 0u;
+    uint32_t classes = 0u;
+    if (prefill_attn_rows &&
+        cuda_tp_prefill_attn_rows_pair_enabled(home_tier)) {
+        classes |= DS4_CUDA_TP_CACHE_MIRROR_ATTN;
+    }
+    if ((prefill_indexer_rows &&
+         cuda_tp_prefill_indexer_rows_pair_enabled(home_tier)) ||
+        (decode_indexer_rows &&
+         cuda_tp_decode_indexer_rows_pair_enabled(home_tier))) {
+        classes |= DS4_CUDA_TP_CACHE_MIRROR_INDEX;
+    }
+    return classes;
+}
+
+static bool cuda_tp_pair_mask_contains(uint32_t pair_mask, int home_tier) {
+    return home_tier >= 0 && home_tier < 32 &&
+           (pair_mask & (1u << (uint32_t)home_tier)) != 0u;
+}
+
 /* Diagnostic-only copy scheduling switches. Production keeps both row-split
  * transfers on the source device's default stream. A selected pair instead
  * submits the named peer copy from the destination CUDA context/default
@@ -16019,7 +16054,11 @@ typedef struct {
     bool cuda_tp_decode;
     bool cuda_tp_attn;
     bool cuda_tp_attn_peer_read;
-    bool cuda_tp_attn_cache_dup;
+    /* Frozen at graph creation so allocation, incremental cache updates, and
+     * full-cache restoration cannot disagree if the process environment is
+     * changed later. Bits name lower-half logical home tiers. */
+    uint32_t cuda_tp_attn_cache_dup_pair_mask;
+    uint32_t cuda_tp_index_cache_dup_pair_mask;
     bool cuda_tp_moe;
     bool cuda_tp_ep;
     bool cuda_tp_ep_pack_exact;
@@ -17774,7 +17813,6 @@ static bool metal_graph_alloc_raw_cap(
     g->cuda_tp_attn_peer_read = metal_graph_cuda_tp_attn_peer_read_requested();
     g->cuda_tp_prefill_attn_rows =
         g->cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_rows_requested();
-    g->cuda_tp_attn_cache_dup = g->cuda_tp_prefill_attn_rows;
     g->cuda_tp_moe = g->cuda_tp_decode && metal_graph_cuda_tp_moe_requested();
     g->cuda_tp_ep = g->cuda_tp_moe && cuda_tensor_parallel;
     g->cuda_tp_ep_pack_exact =
@@ -17915,14 +17953,36 @@ static bool metal_graph_alloc_raw_cap(
         g->cuda_tp_decode && cuda_tp_prefill_indexer_rows_env_enabled() &&
         g->index_comp_cache_f16 &&
         getenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS") == NULL;
-    g->cuda_tp_attn_cache_dup =
-        g->cuda_tp_prefill_attn_rows || g->cuda_tp_prefill_indexer_rows;
-    /* The exact 50/50 decode score split reuses the prefill-owned native-F16
-     * mirror and adds no persistent allocation. Keep a negative diagnostic
-     * switch for controlled A/Bs; the supported SM75 production path is on. */
+    /* The exact 50/50 decode score split consumes the same native-F16 index
+     * mirror as prefill when both are active. A decode-only pair still retains
+     * that index mirror without forcing raw/attention-compressed residency. */
     g->cuda_tp_decode_indexer_rows =
         g->cuda_tp_prefill_indexer_rows &&
         cuda_tp_decode_indexer_rows_env_enabled();
+    if (g->cuda_tp_decode) {
+        const int half = g_n_gpus / 2;
+        for (int home = 0; home < half && home < 32; home++) {
+            if (!used_tier[home]) continue;
+            const uint32_t classes = cuda_tp_cache_mirror_classes_for_pair(
+                    g->cuda_tp_prefill_attn_rows,
+                    g->cuda_tp_prefill_indexer_rows,
+                    g->cuda_tp_decode_indexer_rows,
+                    home);
+            if ((classes & DS4_CUDA_TP_CACHE_MIRROR_ATTN) != 0u) {
+                g->cuda_tp_attn_cache_dup_pair_mask |=
+                    1u << (uint32_t)home;
+            }
+            if ((classes & DS4_CUDA_TP_CACHE_MIRROR_INDEX) != 0u) {
+                g->cuda_tp_index_cache_dup_pair_mask |=
+                    1u << (uint32_t)home;
+            }
+        }
+        fprintf(stderr,
+                "ds4: CUDA TP cache mirror policy: attention-pair-mask=0x%x "
+                "index-pair-mask=0x%x\n",
+                g->cuda_tp_attn_cache_dup_pair_mask,
+                g->cuda_tp_index_cache_dup_pair_mask);
+    }
     const char *prefill_attn_disabled_pairs =
         getenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
     if (g->cuda_tp_prefill_attn_rows && prefill_attn_disabled_pairs &&
@@ -18092,12 +18152,18 @@ static bool metal_graph_alloc_raw_cap(
                 managed_kv_cache,
                 layer_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        const int layer_tp_partner = g->cuda_tp_attn_cache_dup
+        const bool layer_attn_cache_dup = cuda_tp_pair_mask_contains(
+                g->cuda_tp_attn_cache_dup_pair_mask, layer_tier);
+        const bool layer_index_cache_dup = cuda_tp_pair_mask_contains(
+                g->cuda_tp_index_cache_dup_pair_mask, layer_tier);
+        const int layer_attn_tp_partner = layer_attn_cache_dup
             ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
-        if (layer_tp_partner >= 0) {
+        const int layer_index_tp_partner = layer_index_cache_dup
+            ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
+        if (layer_attn_tp_partner >= 0) {
             g->layer_raw_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
-                    layer_tp_partner,
+                    layer_attn_tp_partner,
                     (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -18110,10 +18176,10 @@ static bool metal_graph_alloc_raw_cap(
                     layer_tier,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
-            if (layer_tp_partner >= 0) {
+            if (layer_attn_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
-                        layer_tp_partner,
+                        layer_attn_tp_partner,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             }
@@ -18151,12 +18217,11 @@ static bool metal_graph_alloc_raw_cap(
                         layer_tier,
                         index_cache_rows * DS4_N_INDEXER_HEAD_DIM *
                         (g->index_comp_cache_f16 ? sizeof(uint16_t) : sizeof(float)));
-                if (layer_tp_partner >= 0 &&
-                    g->cuda_tp_prefill_indexer_rows) {
+                if (layer_index_tp_partner >= 0) {
                     g->layer_index_comp_cache_tp[il] =
                         metal_graph_alloc_kv_cache_tensor_on(
                             managed_kv_cache,
-                            layer_tp_partner,
+                            layer_index_tp_partner,
                             index_cache_rows * DS4_N_INDEXER_HEAD_DIM *
                             (g->index_comp_cache_f16
                                 ? sizeof(uint16_t) : sizeof(float)));
@@ -18411,14 +18476,19 @@ static bool metal_graph_alloc_raw_cap(
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) continue;
+        const int layer_tier = placement ? placement[il + 1] : 0;
+        const bool need_attn_cache_mirror = cuda_tp_pair_mask_contains(
+                g->cuda_tp_attn_cache_dup_pair_mask, layer_tier);
+        const bool need_index_cache_mirror = cuda_tp_pair_mask_contains(
+                g->cuda_tp_index_cache_dup_pair_mask, layer_tier);
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
-        if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
+        if (layer_cache_ok && need_attn_cache_mirror) {
             layer_cache_ok = g->layer_raw_cache_tp[il] != NULL;
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
-                             (!g->cuda_tp_attn_cache_dup ||
+                             (!need_attn_cache_mirror ||
                               g->layer_attn_comp_cache_tp[il] != NULL) &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
@@ -18431,7 +18501,7 @@ static bool metal_graph_alloc_raw_cap(
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
-                             (!g->cuda_tp_prefill_indexer_rows ||
+                             (!need_index_cache_mirror ||
                               g->layer_index_comp_cache_tp[il] != NULL) &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL &&
@@ -21102,8 +21172,7 @@ static bool metal_graph_store_index_comp_stage(
             metal_graph_index_comp_stage(g),
             0,
             (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM) != 0;
-    if (ok && g->cuda_tp_prefill_indexer_rows &&
-        g->layer_index_comp_cache_tp[il]) {
+    if (ok && g->layer_index_comp_cache_tp[il]) {
         const uint64_t row_bytes = metal_graph_index_comp_cache_row_bytes(g);
         ok = metal_graph_cuda_tp_attn_cache_copy_row(
                 g->layer_index_comp_cache_tp[il],
@@ -21463,11 +21532,15 @@ static bool metal_graph_indexer_scores_batch(
 static bool metal_graph_cuda_tp_attn_cache_dup_layer_ready(
         const ds4_gpu_graph *g,
         uint32_t             il) {
-    if (!g || il >= DS4_N_LAYER || !g->cuda_tp_attn_cache_dup) return false;
-    if (!g->placement || !g->layer_raw_cache[il] || !g->layer_raw_cache_tp[il]) {
+    if (!g || il >= DS4_N_LAYER || !g->placement) return false;
+    const int layer_tier = g->placement[il + 1];
+    if (!cuda_tp_pair_mask_contains(
+            g->cuda_tp_attn_cache_dup_pair_mask, layer_tier)) {
         return false;
     }
-    const int layer_tier = g->placement[il + 1];
+    if (!g->layer_raw_cache[il] || !g->layer_raw_cache_tp[il]) {
+        return false;
+    }
     if (metal_graph_cuda_tp_partner_tier(layer_tier) < 0) return false;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     if (ratio != 0 &&
@@ -21476,6 +21549,26 @@ static bool metal_graph_cuda_tp_attn_cache_dup_layer_ready(
         return false;
     }
     return true;
+}
+
+static bool metal_graph_cuda_tp_index_cache_dup_layer_ready(
+        const ds4_gpu_graph *g,
+        uint32_t             il) {
+    if (!g || il >= DS4_N_LAYER || !g->placement ||
+        ds4_layer_compress_ratio(il) != 4u) {
+        return false;
+    }
+    const int layer_tier = g->placement[il + 1];
+    return cuda_tp_pair_mask_contains(
+               g->cuda_tp_index_cache_dup_pair_mask, layer_tier) &&
+           metal_graph_cuda_tp_partner_tier(layer_tier) >= 0 &&
+           g->layer_index_comp_cache[il] &&
+           g->layer_index_comp_cache_tp[il];
+}
+
+static bool metal_graph_cuda_tp_any_cache_dup(const ds4_gpu_graph *g) {
+    return g && (g->cuda_tp_attn_cache_dup_pair_mask != 0u ||
+                 g->cuda_tp_index_cache_dup_pair_mask != 0u);
 }
 
 static bool metal_graph_cuda_tp_prefill_attn_host_bounce_enabled(
@@ -21689,42 +21782,55 @@ static bool metal_graph_cuda_tp_attn_cache_sync_raw_row(
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_all(ds4_gpu_graph *g) {
-    if (!g || !g->cuda_tp_attn_cache_dup) return true;
+    if (!metal_graph_cuda_tp_any_cache_dup(g)) return true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) return false;
-        const uint64_t raw_bytes =
-            (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
-        if (!metal_graph_cuda_tp_attn_cache_copy_row(
-                g->layer_raw_cache_tp[il],
-                g->layer_raw_cache[il], 0, raw_bytes,
-                il, 0u,
-                DS4_CUDA_TP_ATTN_CACHE_RAW)) {
-            return false;
-        }
+        if (!g->placement) return false;
+        const int layer_tier = g->placement[il + 1];
+        const bool sync_attn = cuda_tp_pair_mask_contains(
+                g->cuda_tp_attn_cache_dup_pair_mask, layer_tier);
+        const bool sync_index = cuda_tp_pair_mask_contains(
+                g->cuda_tp_index_cache_dup_pair_mask, layer_tier);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
-        const uint32_t n_comp = g->layer_n_comp[il];
-        if (ratio != 0 && n_comp != 0) {
-            const uint64_t comp_bytes =
-                (uint64_t)n_comp * metal_graph_attn_comp_cache_row_bytes();
-            if (!metal_graph_cuda_tp_attn_cache_copy_row(
-                    g->layer_attn_comp_cache_tp[il],
-                    g->layer_attn_comp_cache[il], 0, comp_bytes,
-                    il, 0u,
-                    DS4_CUDA_TP_ATTN_CACHE_COMP)) {
+        if (sync_attn) {
+            if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) {
                 return false;
             }
+            const uint64_t raw_bytes =
+                (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+            if (!metal_graph_cuda_tp_attn_cache_copy_row(
+                    g->layer_raw_cache_tp[il],
+                    g->layer_raw_cache[il], 0, raw_bytes,
+                    il, 0u,
+                    DS4_CUDA_TP_ATTN_CACHE_RAW)) {
+                return false;
+            }
+            const uint32_t n_comp = g->layer_n_comp[il];
+            if (ratio != 0 && n_comp != 0) {
+                const uint64_t comp_bytes =
+                    (uint64_t)n_comp *
+                    metal_graph_attn_comp_cache_row_bytes();
+                if (!metal_graph_cuda_tp_attn_cache_copy_row(
+                        g->layer_attn_comp_cache_tp[il],
+                        g->layer_attn_comp_cache[il], 0, comp_bytes,
+                        il, 0u,
+                        DS4_CUDA_TP_ATTN_CACHE_COMP)) {
+                    return false;
+                }
+            }
         }
-        if (ratio == 4 && g->cuda_tp_prefill_indexer_rows) {
+        if (ratio == 4 && sync_index) {
+            if (!metal_graph_cuda_tp_index_cache_dup_layer_ready(g, il)) {
+                return false;
+            }
             const uint32_t n_index = g->layer_n_index_comp[il];
-            if (!g->layer_index_comp_cache_tp[il] ||
-                (n_index != 0 &&
+            if (n_index != 0 &&
                  !metal_graph_cuda_tp_attn_cache_copy_row(
                     g->layer_index_comp_cache_tp[il],
                     g->layer_index_comp_cache[il], 0,
                     (uint64_t)n_index *
                     metal_graph_index_comp_cache_row_bytes(g),
                     il, 0u,
-                    DS4_CUDA_TP_ATTN_CACHE_INDEX))) {
+                    DS4_CUDA_TP_ATTN_CACHE_INDEX)) {
                 return false;
             }
         }
@@ -59789,6 +59895,18 @@ bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier) {
     return cuda_tp_prefill_indexer_rows_pair_enabled(home_tier);
 }
 
+uint32_t ds4_test_cuda_tp_cache_mirror_classes_for_pair(
+        int home_tier,
+        int prefill_attn_rows,
+        int prefill_indexer_rows,
+        int decode_indexer_rows) {
+    return cuda_tp_cache_mirror_classes_for_pair(
+            prefill_attn_rows != 0,
+            prefill_indexer_rows != 0,
+            decode_indexer_rows != 0,
+            home_tier);
+}
+
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier) {
     return cuda_tp_prefill_attn_row_compute_pair_suppressed(home_tier);
@@ -66299,11 +66417,13 @@ static bool metal_graph_session_batch_kv_store_supported(
         return false;
     }
     ds4_gpu_graph *first = &items[0].session->graph;
-    if (!first->placement || first->cuda_tp_attn_cache_dup) return false;
+    if (!first->placement || metal_graph_cuda_tp_any_cache_dup(first)) {
+        return false;
+    }
     for (int i = 0; i < count; i++) {
         ds4_gpu_graph *g = &items[i].session->graph;
         if (!g->placement || g->raw_cap == 0u ||
-            g->cuda_tp_attn_cache_dup) {
+            metal_graph_cuda_tp_any_cache_dup(g)) {
             return false;
         }
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {

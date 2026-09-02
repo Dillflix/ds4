@@ -855,7 +855,12 @@ has an independent pair selector and is enabled on both qualified pairs by
 default. Pair 0 gathers the partner's top-k integer rows home before the
 unchanged home-attention launch; 32K mixed15 and all43-Q3A4 qualification was
 byte-exact, left all GPUs healthy, and improved prefill by 2.33% and 2.45%
-respectively. `DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=0` disables only that
+respectively. Partner cache residency follows those independent consumers:
+pair 0 keeps only its native-F16 indexer-cache mirror, while pair 1 keeps raw
+and compressed attention-cache mirrors as well as its indexer-cache mirror.
+Thus disabling pair-0 attention splitting does not retain unused pair-0
+attention-cache allocation or update traffic.
+`DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=0` disables only that
 pair, while `DS4_CUDA_TP_PREFILL_INDEXER_ROWS=0` disables the entire prefill
 indexer split. The independently qualified decode indexer row split is
 unchanged.

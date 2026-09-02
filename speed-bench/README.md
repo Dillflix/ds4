@@ -1308,7 +1308,9 @@ tok/s (+2.33%); the all43-Q3A4 pair measured 479.59 versus 468.11 tok/s
 pair-0 indexer splits with pair-0 attention disabled, and all four GPUs remained
 healthy. Pair-0 prefill indexer splitting is therefore a production default;
 this runner remains the exactness and performance regression boundary for the
-independent policy.
+independent policy. The corresponding cache policy is also independent: pair 0
+allocates and updates only the native-F16 indexer mirror, while pair 1 retains
+both attention-cache mirrors and its indexer mirror.
 
 ```bash
 VARIANT=indexer-on \

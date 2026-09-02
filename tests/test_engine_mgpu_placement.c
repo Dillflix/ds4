@@ -45,6 +45,11 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier);
+uint32_t ds4_test_cuda_tp_cache_mirror_classes_for_pair(
+        int home_tier,
+        int prefill_attn_rows,
+        int prefill_indexer_rows,
+        int decode_indexer_rows);
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier);
 int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier);
@@ -889,6 +894,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
         "DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
     char *old_no_indexer_pairs = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    char *old_no_decode_indexer = save_env_value(
+        "DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+    char *old_no_decode_indexer_pairs = save_env_value(
+        "DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
     char *old_query_dst = save_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
     char *old_gather_dst = save_env_value(
@@ -928,6 +937,8 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
     unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS");
+    unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
@@ -944,6 +955,18 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1) &&
           !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(2),
           "prefill indexer enables both independently qualified pairs");
+    CHECK(ds4_test_cuda_tp_cache_mirror_classes_for_pair(0, 1, 1, 1) == 2u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(1, 1, 1, 1) == 3u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(2, 1, 1, 1) == 0u,
+          "stable cache policy gives pair 0 only an index mirror and pair 1 both classes");
+    CHECK(ds4_test_cuda_tp_cache_mirror_classes_for_pair(0, 0, 0, 1) == 2u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(1, 0, 0, 1) == 2u,
+          "decode-only indexer splitting independently retains each index mirror");
+    setenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", "0", 1);
+    CHECK(ds4_test_cuda_tp_cache_mirror_classes_for_pair(0, 0, 0, 1) == 0u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(1, 0, 0, 1) == 2u,
+          "decode index-mirror allocation obeys its independent pair rollback");
+    unsetenv("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS");
     setenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
           !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
@@ -967,11 +990,17 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
           ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
           "explicit row-split opt-in restores both qualified pairs");
+    CHECK(ds4_test_cuda_tp_cache_mirror_classes_for_pair(0, 1, 1, 1) == 3u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(1, 1, 1, 1) == 3u,
+          "explicit all-pair attention splitting restores both cache classes");
 
     setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
           ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
           "pair-scoped switch disables only prefill attention pair 0");
+    CHECK(ds4_test_cuda_tp_cache_mirror_classes_for_pair(0, 1, 1, 1) == 2u &&
+          ds4_test_cuda_tp_cache_mirror_classes_for_pair(1, 1, 1, 1) == 3u,
+          "pair-scoped attention rollback removes only pair 0 attention mirrors");
 
     setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "1", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -1158,6 +1187,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
                       old_indexer_pairs);
     restore_env_value("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS",
                       old_no_indexer_pairs);
+    restore_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS",
+                      old_no_decode_indexer);
+    restore_env_value("DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS",
+                      old_no_decode_indexer_pairs);
     restore_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS", old_query_dst);
     restore_env_value(

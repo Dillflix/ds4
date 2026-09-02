@@ -256,6 +256,9 @@ cmp -s "$OUTPUT_DIR/case.pre-gpu.csv" "$OUTPUT_DIR/case.post-gpu.csv" ||
 
 grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
     "$OUTPUT_DIR/case.log" || die "pair-0 attention suppression was not active"
+grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' \
+    "$OUTPUT_DIR/case.log" ||
+    die "pair-specific attention/index cache mirror policy was not active"
 ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
     "$OUTPUT_DIR/case.log" || die "pair-0 attention row splitting dispatched"
 grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
