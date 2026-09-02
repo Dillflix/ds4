@@ -346,10 +346,7 @@ validate_common_log() {
                   'materialized 344/344 candidates' \
                   'SM75 routed Q32 layout enabled' \
                   'CUDA decode TP enabled' \
-                  'SM75 native F16 indexer cache and streaming WMMA64 enabled' \
-                  'CUDA decode indexer score row split enabled' \
-                  'SM75 indexed attention selected: 8 heads / 256 threads' \
-                  'CUDA prefill attention query-row split enabled'; do
+                  'SM75 native F16 indexer cache and streaming WMMA64 enabled'; do
         grep -Fq "$marker" "$log" || return 1
     done
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
@@ -405,8 +402,12 @@ validate_common_log() {
     ' "$log"
 }
 
-validate_eligible_prefill_dispatch() {
+validate_eligible_row_split_dispatch() {
     local log=$1
+    grep -Fq 'CUDA decode indexer score row split enabled' "$log" ||
+        return 1
+    grep -Fq 'SM75 indexed attention selected: 8 heads / 256 threads' "$log" ||
+        return 1
     grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
         return 1
     grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 .*selected_mode=gather-home' \
@@ -647,7 +648,7 @@ validate_throughput_run() {
     validate_gpu_health_pair "$base" && validate_q8_state_files "$base" &&
         validate_throughput_csv "$base.csv" && validate_common_log "$base.log" &&
         validate_mapping_audit "$variant" "$base.log" &&
-        validate_eligible_prefill_dispatch "$base.log"
+        validate_eligible_row_split_dispatch "$base.log"
 }
 
 validate_exact_run() {
