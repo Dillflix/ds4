@@ -1228,6 +1228,46 @@ REPEATS=3 \
 bash ./speed-bench/cuda-q8-t32-fused-ab.sh
 ```
 
+That result is historical isolation evidence, not a current-production
+acceptance run. `cuda-sm75-t32-f16-production-ab.sh` is the replacement
+decision boundary. It leaves the stage-aware 344/344 Q8 plan, automatic
+T32/T256/shared-down placement, prefill pipeline, and native indexer defaults
+unchanged in both arms. On the qualified machine it also keeps the known-stable
+prefill attention topology fixed: query-row splitting is disabled only for
+pair 0 and remains enabled for pair 1, while indexer row splitting remains
+enabled on both pairs.
+
+The runner executes an alternating control/fused A/B at 512, 4096, and 32768
+tokens for both the existing mixed15 model and the new all43-Q3A4 gate/up
+model. Each process records the exact 344-entry plan and canonical binding
+state, pre/post GPU identity and power limits, routed quantization for all 43
+layers, FP16-result call counts, and full-vocabulary raw logits. It rejects a
+plan change, missing production path, power-limit change, within-arm
+nondeterminism, or any frontier top-1 change. A passing performance/numerical
+screen requires a median win at 32K on both models and permits no measured
+frontier below 0.995x. It still requires a subsequent multi-prompt quality A/B
+on both models before `DS4_CUDA_T32_F16_FUSED` may become the engine default.
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REPEATS=3 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-f16-production-ab.sh
+```
+
+Return `sm75-t32-f16-production-ab-<timestamp>.tar.gz`. The runner is
+deliberately one-shot; after a GPU loss, retain the partial archive and start a
+new matrix after reboot rather than combining process histories with resume.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver

@@ -829,8 +829,14 @@ The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
 existing half-size Q scratch and then performs head RMS normalization plus
 RoPE in one half-input kernel. A partner-resident T32 slice returns that FP16
 intermediate over NVLink instead of the generic FP32 result, halving result
-traffic. The established FP32-output path remains the default until the fixed
-four-way local/partner A/B establishes an end-to-end win; use
+traffic. The established FP32-output path remains the default. The historical
+four-way local/partner isolation forced an obsolete T32-only overflow policy:
+it measured only a 0.5--1.0% incremental gain and changed the 4096-token top
+prediction in every repeat. Current promotion therefore requires the
+dual-model production A/B in
+`speed-bench/cuda-sm75-t32-f16-production-ab.sh`, followed by the existing
+multi-prompt quality methodology applied to both the mixed15 and all43 Q3A4
+layouts. Use
 `DS4_CUDA_NO_T32_F16_FUSED=1` as an explicit diagnostic override.
 `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables the complete cache for
 memory-pressure diagnosis; it is not the performance default.
