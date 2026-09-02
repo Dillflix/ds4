@@ -374,8 +374,12 @@ validate_common_log() {
     ! grep -Fq 'required but unavailable' "$log" || return 1
     ! grep -Fq 'SM75 Q32 owned decode CUDA Graph enabled' "$log" || return 1
     ! grep -Fq 'SM75 Q32 decode graph audit' "$log" || return 1
-    grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
-        "$log" || return 1
+    if (( Q4_GATE_LAYER_COUNT > 0 )); then
+        grep -Fxq 'ds4: SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
+            "$log" || return 1
+    else
+        ! grep -Fq 'SM75 Q4-32 decode gate/up mapping=' "$log" || return 1
+    fi
     grep -Fxq 'ds4: SM75 Q4-32 down decode mapping=tile32-int4 (production default)' \
         "$log" || return 1
     awk -v expected_count="$Q3A4_LAYER_COUNT" \
