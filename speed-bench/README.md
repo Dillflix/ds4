@@ -4765,3 +4765,23 @@ bash ./speed-bench/cuda-sm75-compressor-state-fusion.sh
 This is deliberately synthetic evidence. The fusion remains disabled by
 default and must not be promoted until a real-model engine A/B proves exact
 outputs, dispatch selection, and an end-to-end win on the production topology.
+
+### SM75 compressor projection/state-store production A/B
+
+`cuda-sm75-compressor-state-production-ab.sh` runs a one-repeat, one-shot
+four-GPU A/B for the exact fused compressor pair projection and recurrent-state
+append. It covers the mixed15 and all43 models at the 512, 4096, and 32768
+frontiers, requires the stable 22/21 topology, proves dispatch of all three
+production widths, and requires byte-identical frontier logits before accepting
+the result. It deliberately has no resume mode because a GPU-loss run must be
+restarted from a clean host state.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-state-production-ab.sh
+```

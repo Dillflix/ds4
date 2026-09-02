@@ -233,6 +233,9 @@ static std::atomic<bool> g_cuda_moe_q3a4_decode_mapping_logged = false;
 static int g_cuda_compressor_pair_state_store;
 static int g_cuda_compressor_pair_state_store_disabled;
 static int g_cuda_compressor_pair_state_store_incompatible;
+static int g_cuda_compressor_pair_state_store_audit;
+static std::atomic<uint64_t> g_cuda_compressor_pair_state_store_calls[3] = {};
+static std::atomic<bool> g_cuda_compressor_pair_state_store_logged[3] = {};
 /* Q4-32 down tile32 packed-INT4 is the SM75 tagged-layout production default.
  * The former quarter-warp scalar kernel remains an explicit fallback. */
 enum cuda_moe_q4_32_down_decode_mapping {
@@ -664,6 +667,12 @@ static void cuda_decode_dispatch_env_refresh(void) {
         getenv("DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE") != NULL;
     g_cuda_compressor_pair_state_store_disabled =
         getenv("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE") != NULL;
+    g_cuda_compressor_pair_state_store_audit =
+        getenv("DS4_CUDA_COMPRESSOR_PAIR_STATE_STORE_AUDIT") != NULL;
+    for (unsigned i = 0; i < 3u; ++i) {
+        g_cuda_compressor_pair_state_store_calls[i].store(0u);
+        g_cuda_compressor_pair_state_store_logged[i].store(false);
+    }
     g_cuda_compressor_pair_state_store_incompatible =
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
@@ -21085,8 +21094,21 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             width,
             ratio,
             pos);
-    return cuda_ok(cudaGetLastError(),
-                   "f16 compressor pair projection/state-store launch") ? 1 : -1;
+    if (!cuda_ok(cudaGetLastError(),
+                 "f16 compressor pair projection/state-store launch")) {
+        return -1;
+    }
+    const unsigned shape = width == 256u ? 0u : (width == 512u ? 1u : 2u);
+    const uint64_t call =
+        g_cuda_compressor_pair_state_store_calls[shape].fetch_add(1u) + 1u;
+    if (g_cuda_compressor_pair_state_store_audit &&
+        !g_cuda_compressor_pair_state_store_logged[shape].exchange(true)) {
+        fprintf(stderr,
+                "ds4: SM75 compressor pair/state fusion selected "
+                "width=%u ratio=%u first_call=%llu\n",
+                width, ratio, (unsigned long long)call);
+    }
+    return 1;
 }
 
 /* Internal evidence API; intentionally absent from the public backend header. */
