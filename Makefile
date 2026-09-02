@@ -48,7 +48,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression cuda-attention-streaming-exact strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -217,6 +217,9 @@ ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distrib
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
 
+tests/cuda_attention_streaming_exact.o: tests/cuda_attention_streaming_exact.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_attention_streaming_exact.c
+
 tests/cuda_sm75_profile_harness.o: tests/cuda_sm75_profile_harness.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sm75_profile_harness.c
 
@@ -267,6 +270,13 @@ ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/cuda_attention_streaming_exact: tests/cuda_attention_streaming_exact.o ds4_cuda.o
+	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+cuda-attention-streaming-exact: tests/cuda_attention_streaming_exact
+	./tests/cuda_attention_streaming_exact
 
 tests/cuda_sm75_profile_harness: tests/cuda_sm75_profile_harness.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -444,4 +454,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/cuda_sm75_pair_stability tests/cuda_device_identity tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_decode_weight_profile tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/cuda_attention_streaming_exact tests/cuda_sm75_pair_stability tests/cuda_device_identity tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_decode_weight_profile tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native

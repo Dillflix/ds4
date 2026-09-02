@@ -4743,3 +4743,39 @@ REPEAT_LEVELS=1,64,256,512,1536 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 ```
+
+### Diagnostic exact two-score-pass indexed decode
+
+`cuda-sm75-attention-streaming-exact.sh` evaluates H4 and H8 CTA groupings
+without changing the production default. It compares both candidates byte for
+byte with the shipping score-buffer path using the actual four-GPU shard at the
+first generated token after a 32K prompt: `pos=32768`, 32 heads, 128 live raw
+rows, window 128, ring capacity 2,304, ring start 385 (that is,
+`(32768 + 1 - 128) % 2304`), 8,192 compressed rows, and top-k 512. This
+position follows the engine contract: decode passes `checkpoint.len`, while
+prefill has already populated absolute positions 0 through 32,767. The raw
+span helper returns 128 and the ring-start helper maps its first absolute
+position to 385. The old 64-head/768-selected-row shape remains explicitly
+labelled `stress-only`; it
+is not presented as the live production shape. Ring-wrap, invalid/duplicate
+top-k, visible-cutoff, partial-head-group, genuinely selected equal-score rows,
+signed-zero, inactive output tail, input immutability, and prefix/suffix guard
+cases are also checked. The candidate is an exact **two-score-pass** design;
+it is not a one-pass online softmax.
+
+The harness forces a fresh SM75 build, enforces per-symbol zero PTXAS stack and
+spill bytes plus zero SASS `LDL`/`STL`, retains the runtime register/occupancy
+gates, and runs Compute Sanitizer by default. Timing uses the live H32 fixture,
+alternates control/candidate order over paired rounds, and reports medians,
+paired-speedup standard deviation, and range.
+
+```bash
+cd ~/ds4-iq2-q4
+
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=100 \
+RUN_SANITIZER=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-attention-streaming-exact.sh
+```

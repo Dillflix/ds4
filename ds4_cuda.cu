@@ -170,6 +170,13 @@ static int g_cuda_no_decode_value512;
 static int g_cuda_no_top1;
 static int g_cuda_end_stream_sync;
 static int g_cuda_no_setdevice_cache;
+/* Diagnostic-only selector and accounting for the exact two-score-pass
+ * indexed-decode experiment.  Only an internal test hook can change the
+ * selector, so the production dispatch has neither an environment lookup nor
+ * a user-visible opt-in surface. */
+static uint32_t g_attention_indexed_streaming_exact_heads;
+static std::atomic<uint64_t>
+    g_attention_indexed_streaming_exact_launches[2] = {};
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
 static int g_cuda_exact_score_split_vec4;
@@ -856,6 +863,29 @@ static void cuda_decode_dispatch_env_refresh(void) {
 
 extern "C" void ds4_gpu_test_refresh_decode_dispatch_env(void) {
     cuda_decode_dispatch_env_refresh();
+}
+
+extern "C" void
+ds4_gpu_test_reset_attention_indexed_streaming_exact_launches(void) {
+    for (uint32_t i = 0; i < 2u; i++) {
+        g_attention_indexed_streaming_exact_launches[i].store(
+            0u, std::memory_order_relaxed);
+    }
+}
+
+extern "C" void
+ds4_gpu_test_set_attention_indexed_streaming_exact_heads(uint32_t heads) {
+    g_attention_indexed_streaming_exact_heads =
+        heads == 4u || heads == 8u ? heads : 0u;
+}
+
+extern "C" uint64_t
+ds4_gpu_test_get_attention_indexed_streaming_exact_launches(uint32_t heads) {
+    const uint32_t slot = heads == 4u ? 0u : (heads == 8u ? 1u : 2u);
+    return slot < 2u
+        ? g_attention_indexed_streaming_exact_launches[slot].load(
+              std::memory_order_relaxed)
+        : 0u;
 }
 
 /* WITH_DEVICE(d) { ... } scope macro.
@@ -13482,6 +13512,412 @@ __global__ static void attention_indexed_mixed_kernel(
     }
 }
 
+/* Diagnostic-only exact streaming indexed-decode experiment.
+ *
+ * This is deliberately a two-score-pass algorithm, not a one-pass online
+ * softmax.  A running-max recurrence changes expf inputs, reduction grouping,
+ * and numerator rescaling, so it cannot be byte-identical to the established
+ * score-buffer kernel in general.  Instead this kernel removes the complete
+ * H x 768 score materialization while replaying that kernel's arithmetic:
+ *
+ *   pass A: exact score dots -> the same 256 logical local-max sequences/tree;
+ *   pass B: recompute exact scores -> the same exp/denominator sequences/tree,
+ *           while accumulating values in raw-then-compressed row order;
+ *   output: the same final acc / denominator operation.
+ *
+ * Four or eight heads share each staged KV row.  For the indexed path, every
+ * score retains the reference eight-lane dimension partition and 4/2/1 shuffle
+ * tree.  The all-invalid-top-k case retains the reference scalar score chain.
+ * Keep both instantiations reachable only through the internal test selector
+ * until hostile-data exactness, resource, and production timing gates pass. */
+template <uint32_t HEADS_PER_GROUP>
+__global__ __launch_bounds__(256, 2) static void
+attention_indexed_mixed_decode_streaming_exact_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    static_assert(HEADS_PER_GROUP == 4u || HEADS_PER_GROUP == 8u,
+                  "bounded exact-streaming indexed-decode group size");
+    constexpr uint32_t ROWS_PER_STAGE = 32u / HEADS_PER_GROUP;
+
+    const uint32_t head_base = blockIdx.x * HEADS_PER_GROUP;
+    if (head_base >= n_head || head_dim != 512u) return;
+
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count;
+    __shared__ uint32_t comp_warp_offsets[8];
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128u];
+    __shared__ float score_tile[HEADS_PER_GROUP][ROWS_PER_STAGE];
+    __shared__ float weight_tile[HEADS_PER_GROUP][ROWS_PER_STAGE];
+    /* The reference owns 256 local max/denominator chains per head.  Preserve
+     * those chains explicitly, then reuse the storage between the two passes. */
+    __shared__ float partial[HEADS_PER_GROUP][256];
+    __shared__ float max_s[HEADS_PER_GROUP];
+    __shared__ float denom[HEADS_PER_GROUP];
+
+    const uint32_t qpos = pos0;
+    const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    if (threadIdx.x == 0u) {
+        raw_count = 0u;
+        raw_first_idx = 0u;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    attention_compact_topk_stable(
+        comp_rows, &comp_count, comp_warp_offsets,
+        topk, top_k, visible_comp);
+
+    const uint32_t n_score = raw_count + comp_count;
+    /* Dispatch proves the conservative upper bound before launch; keep the
+     * post-compaction bound explicit at the point where it becomes exact. */
+    if (raw_count > 256u || comp_count > 512u || n_score > 768u) return;
+    const float scale = rsqrtf((float)head_dim);
+    const uint32_t score_lane = threadIdx.x & 7u;
+    const uint32_t score_group = threadIdx.x >> 3u;
+
+    /* Each entry starts with the sink exactly as local_max does in every
+     * reference thread. */
+#pragma unroll
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        const uint32_t head = head_base + local_head;
+        partial[local_head][threadIdx.x] =
+            head < n_head ? sinks[head] : -INFINITY;
+    }
+    __syncthreads();
+
+    /* Pass A: recompute scores tilewise and preserve each logical thread's
+     * row, row+256, ... max sequence without retaining the score surface. */
+    for (uint32_t row0 = 0u; row0 < n_score; row0 += ROWS_PER_STAGE) {
+        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE
+            ? n_score - row0 : ROWS_PER_STAGE;
+        for (uint32_t off = threadIdx.x; off < nr * 128u;
+             off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t row = row0 + rr;
+            const float4 *src = row < raw_count
+                ? (const float4 *)(raw_kv +
+                    (uint64_t)raw_rows[row] * head_dim)
+                : (const float4 *)(comp_kv +
+                    (uint64_t)comp_rows[row - raw_count] * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+
+        uint32_t score_row = UINT32_MAX;
+        if (comp_count == 0u) {
+            score_row = (threadIdx.x + 256u - (row0 & 255u)) & 255u;
+            if (score_row < nr) {
+#pragma unroll
+                for (uint32_t local_head = 0u;
+                     local_head < HEADS_PER_GROUP; local_head++) {
+                    const uint32_t head = head_base + local_head;
+                    if (head >= n_head) continue;
+                    const float *qh = q + (uint64_t)head * head_dim;
+                    const float *kvrow =
+                        (const float *)(kv_shared + score_row * 128u);
+                    float dot = 0.0f;
+                    for (uint32_t d = 0u; d < head_dim; d++) {
+                        dot += qh[d] * kvrow[d];
+                    }
+                    score_tile[local_head][score_row] = dot * scale;
+                }
+            }
+        } else {
+            /* Shipping assigns score row r to physical 8-lane subgroup
+             * r&31.  Retain that subgroup/lane identity while a subgroup
+             * evaluates the grouped heads sequentially. */
+            score_row = (score_group + 32u - (row0 & 31u)) & 31u;
+            if (score_row < nr) {
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+#pragma unroll
+                for (uint32_t local_head = 0u;
+                     local_head < HEADS_PER_GROUP; local_head++) {
+                    const uint32_t head = head_base + local_head;
+                    if (head >= n_head) continue;
+                    const float *qh = q + (uint64_t)head * head_dim;
+                    const float *kvrow =
+                        (const float *)(kv_shared + score_row * 128u);
+                    float dot = 0.0f;
+                    for (uint32_t d = score_lane; d < head_dim; d += 8u) {
+                        dot += qh[d] * kvrow[d];
+                    }
+                    for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                        dot += __shfl_down_sync(mask, dot, off, 8);
+                    }
+                    if (score_lane == 0u) {
+                        score_tile[local_head][score_row] = dot * scale;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (score_row < nr &&
+            (comp_count == 0u || score_lane == 0u)) {
+            const uint32_t row = row0 + score_row;
+#pragma unroll
+            for (uint32_t local_head = 0u;
+                 local_head < HEADS_PER_GROUP; local_head++) {
+                if (head_base + local_head >= n_head) continue;
+                float *dst = &partial[local_head][row & 255u];
+                *dst = fmaxf(*dst,
+                             score_tile[local_head][score_row]);
+            }
+        }
+        __syncthreads();
+    }
+
+    /* The per-head loop changes only scheduling; each tree has the exact
+     * reference operands and stride order. */
+#pragma unroll
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+            if (threadIdx.x < stride) {
+                partial[local_head][threadIdx.x] = fmaxf(
+                    partial[local_head][threadIdx.x],
+                    partial[local_head][threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) {
+            max_s[local_head] = partial[local_head][0];
+        }
+        __syncthreads();
+    }
+
+    /* Reuse the 256-way partial surface for the reference denominator chains. */
+#pragma unroll
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        partial[local_head][threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    /* Preserve shipping's 256-worker/head PV mapping exactly.  Every physical
+     * worker owns dimensions tid and tid+256 for each grouped head; grouping
+     * changes only how many independent two-accumulator chains it carries. */
+    float acc[HEADS_PER_GROUP][2];
+#pragma unroll
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        acc[local_head][0] = 0.0f;
+        acc[local_head][1] = 0.0f;
+    }
+
+    /* Pass B: recompute the same score, evaluate expf against the fixed global
+     * max, update the same logical denominator chain, and consume only this
+     * tile's weights for the raw-then-compressed PV sequence. */
+    for (uint32_t row0 = 0u; row0 < n_score; row0 += ROWS_PER_STAGE) {
+        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE
+            ? n_score - row0 : ROWS_PER_STAGE;
+        for (uint32_t off = threadIdx.x; off < nr * 128u;
+             off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t row = row0 + rr;
+            const float4 *src = row < raw_count
+                ? (const float4 *)(raw_kv +
+                    (uint64_t)raw_rows[row] * head_dim)
+                : (const float4 *)(comp_kv +
+                    (uint64_t)comp_rows[row - raw_count] * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+
+        uint32_t score_row = UINT32_MAX;
+        if (comp_count == 0u) {
+            score_row = (threadIdx.x + 256u - (row0 & 255u)) & 255u;
+            if (score_row < nr) {
+#pragma unroll
+                for (uint32_t local_head = 0u;
+                     local_head < HEADS_PER_GROUP; local_head++) {
+                    const uint32_t head = head_base + local_head;
+                    if (head >= n_head) continue;
+                    const float *qh = q + (uint64_t)head * head_dim;
+                    const float *kvrow =
+                        (const float *)(kv_shared + score_row * 128u);
+                    float dot = 0.0f;
+                    for (uint32_t d = 0u; d < head_dim; d++) {
+                        dot += qh[d] * kvrow[d];
+                    }
+                    score_tile[local_head][score_row] = dot * scale;
+                }
+            }
+        } else {
+            score_row = (score_group + 32u - (row0 & 31u)) & 31u;
+            if (score_row < nr) {
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+#pragma unroll
+                for (uint32_t local_head = 0u;
+                     local_head < HEADS_PER_GROUP; local_head++) {
+                    const uint32_t head = head_base + local_head;
+                    if (head >= n_head) continue;
+                    const float *qh = q + (uint64_t)head * head_dim;
+                    const float *kvrow =
+                        (const float *)(kv_shared + score_row * 128u);
+                    float dot = 0.0f;
+                    for (uint32_t d = score_lane; d < head_dim; d += 8u) {
+                        dot += qh[d] * kvrow[d];
+                    }
+                    for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                        dot += __shfl_down_sync(mask, dot, off, 8);
+                    }
+                    if (score_lane == 0u) {
+                        score_tile[local_head][score_row] = dot * scale;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (score_row < nr &&
+            (comp_count == 0u || score_lane == 0u)) {
+            const uint32_t row = row0 + score_row;
+#pragma unroll
+            for (uint32_t local_head = 0u;
+                 local_head < HEADS_PER_GROUP; local_head++) {
+                if (head_base + local_head >= n_head) continue;
+                const float weight = expf(
+                    score_tile[local_head][score_row] - max_s[local_head]);
+                weight_tile[local_head][score_row] = weight;
+                partial[local_head][row & 255u] += weight;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t rr = 0u; rr < nr; rr++) {
+            const float *kvrow =
+                (const float *)(kv_shared + rr * 128u);
+#pragma unroll
+            for (uint32_t local_head = 0u;
+                 local_head < HEADS_PER_GROUP; local_head++) {
+                if (head_base + local_head >= n_head) continue;
+                const float weight = weight_tile[local_head][rr];
+                acc[local_head][0] += kvrow[threadIdx.x] * weight;
+                acc[local_head][1] += kvrow[threadIdx.x + 256u] * weight;
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+            if (threadIdx.x < stride) {
+                partial[local_head][threadIdx.x] +=
+                    partial[local_head][threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0u) {
+            const uint32_t head = head_base + local_head;
+            denom[local_head] = head < n_head
+                ? partial[local_head][0] +
+                    expf(sinks[head] - max_s[local_head])
+                : 1.0f;
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t local_head = 0u; local_head < HEADS_PER_GROUP;
+         local_head++) {
+        const uint32_t head = head_base + local_head;
+        if (head >= n_head) continue;
+        float *out = heads + (uint64_t)head * head_dim;
+        const float den = denom[local_head];
+#pragma unroll
+        out[threadIdx.x] = acc[local_head][0] / den;
+        out[threadIdx.x + 256u] = acc[local_head][1] / den;
+    }
+}
+
+/* Return the compiler/device resource identity of one diagnostic
+ * instantiation.  This is intentionally a private test hook rather than a
+ * production API. */
+extern "C" int
+ds4_gpu_test_get_attention_indexed_streaming_exact_resources(
+        uint32_t heads_per_group,
+        uint32_t *registers,
+        uint32_t *static_shared_bytes,
+        uint32_t *local_bytes,
+        uint32_t *max_threads_per_block,
+        uint32_t *active_blocks_per_sm) {
+    cudaFuncAttributes attr;
+    cudaError_t err;
+    int active = 0;
+#define DS4_QUERY_INDEXED_STREAMING_EXACT(H) do { \
+        err = cudaFuncGetAttributes( \
+            &attr, attention_indexed_mixed_decode_streaming_exact_kernel<H>); \
+        if (err == cudaSuccess) { \
+            err = cudaOccupancyMaxActiveBlocksPerMultiprocessor( \
+                &active, \
+                attention_indexed_mixed_decode_streaming_exact_kernel<H>, \
+                256, 0); \
+        } \
+    } while (0)
+    if (heads_per_group == 4u) {
+        DS4_QUERY_INDEXED_STREAMING_EXACT(4u);
+    } else if (heads_per_group == 8u) {
+        DS4_QUERY_INDEXED_STREAMING_EXACT(8u);
+    } else {
+        return 0;
+    }
+#undef DS4_QUERY_INDEXED_STREAMING_EXACT
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (registers) *registers = (uint32_t)attr.numRegs;
+    if (static_shared_bytes)
+        *static_shared_bytes = (uint32_t)attr.sharedSizeBytes;
+    if (local_bytes) *local_bytes = (uint32_t)attr.localSizeBytes;
+    if (max_threads_per_block)
+        *max_threads_per_block = (uint32_t)attr.maxThreadsPerBlock;
+    if (active_blocks_per_sm) *active_blocks_per_sm = (uint32_t)active;
+    return 1;
+}
+
 __global__ static void attention_indexed_mixed_decode_rows_kernel(
         float *heads,
         const float *sinks,
@@ -22833,6 +23269,66 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    const uint32_t streaming_exact_heads =
+        g_attention_indexed_streaming_exact_heads;
+    if (n_tokens == 1u && head_dim == 512u &&
+        (streaming_exact_heads == 4u || streaming_exact_heads == 8u)) {
+        if (!cuda_sm75_mma_ok()) {
+            fprintf(stderr,
+                    "ds4: exact streaming indexed decode requires sm_75\n");
+            return 0;
+        }
+        /* The API normally carries 128 live raw rows at first decode after a
+         * 32K prompt, while the backing ring capacity is 2,304.  Synthetic
+         * stress fixtures may carry a larger span; indexed decode admits at
+         * most 256 visible raw rows.  Bound that effective count rather than
+         * the allocated ring capacity. */
+        uint32_t streaming_raw_count = 0u;
+        const uint32_t streaming_first_raw_pos = pos0 + 1u - n_raw;
+        const uint32_t streaming_raw_last_pos =
+            streaming_first_raw_pos + n_raw - 1u;
+        if (pos0 >= streaming_first_raw_pos) {
+            uint32_t lo = streaming_first_raw_pos;
+            if (window != 0u && pos0 + 1u > window) {
+                const uint32_t wlo = pos0 + 1u - window;
+                if (wlo > lo) lo = wlo;
+            }
+            const uint32_t hi =
+                pos0 < streaming_raw_last_pos ? pos0 : streaming_raw_last_pos;
+            if (hi >= lo) {
+                streaming_raw_count = hi - lo + 1u;
+                if (streaming_raw_count > 256u) streaming_raw_count = 256u;
+            }
+        }
+        if (streaming_raw_count > 256u || top_k > 512u ||
+            streaming_raw_count + top_k > 768u) {
+            fprintf(stderr,
+                    "ds4: exact two-score-pass indexed decode shape exceeds "
+                    "raw=256, selected=512, or total=768\n");
+            return 0;
+        }
+        const uint32_t blocks =
+            (n_head + streaming_exact_heads - 1u) / streaming_exact_heads;
+#define DS4_INDEXED_STREAMING_EXACT_ARGS \
+        (float *)heads->ptr, sinks, (const float *)q->ptr, \
+        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, topk_ptr, \
+        pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio, \
+        n_head, head_dim
+        if (streaming_exact_heads == 8u) {
+            attention_indexed_mixed_decode_streaming_exact_kernel<8u>
+                <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
+            g_attention_indexed_streaming_exact_launches[1].fetch_add(
+                1u, std::memory_order_relaxed);
+        } else {
+            attention_indexed_mixed_decode_streaming_exact_kernel<4u>
+                <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
+            g_attention_indexed_streaming_exact_launches[0].fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+#undef DS4_INDEXED_STREAMING_EXACT_ARGS
+        return cuda_ok(cudaGetLastError(),
+                       "attention indexed decode exact streaming launch");
+    }
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
