@@ -4008,6 +4008,16 @@ cut of pair-0 attention-owned work:
   Query handoff, allocations, source/destination addresses, chunking, pacing,
   attention/cache work, scratch output, and accepted full-home result are
   unchanged. This isolates transfer/attention ordering from combined work.
+- `attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-fenced-shadow`
+  keeps that pre-attention ordering and inserts a partner-device synchronization
+  followed by a home-device synchronization after the paced copy helper returns
+  and before partner attention is submitted. Both required operations, their
+  bytes, endpoints, kernels, caches, and accepted output remain unchanged. This
+  tests whether their combination fails only while transfer events/work remain
+  outstanding, or still fails after an explicit quiescent pair boundary. A
+  surviving run below 400 prefill tok/s is classified as underloaded rather
+  than accepted; the two preceding single-component controls sustained 459.89
+  and 481.45 tok/s, so this rejects a gross scheduling/load collapse.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4288,7 +4298,9 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-Run the pre-attention-transfer ordering differential after a fresh reboot:
+Run the explicit inter-operation completion-fence differential after a fresh
+reboot. The unfenced transfer-before-attention arm has already failed and should
+not be repeated:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -4308,7 +4320,7 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-before-partner-attention-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-before-partner-attention-fenced-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
 ONE_SHOT=1 \
@@ -4317,7 +4329,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow \
+VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-fenced-shadow \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

@@ -4241,6 +4241,26 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-preinitialized-source-partner-"
+                        "output-scratch-pre-attention-paced-fenced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "now with a quiescent boundary",
+            ),
+            (
+                (
+                    (
+                        "attention-row-gather-preinitialized-source-partner-"
+                        "output-scratch-pre-attention-paced-fenced-shadow",
+                        "passed",
+                    ),
+                ),
+                "unfenced cross-device handoff or overlap is required",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

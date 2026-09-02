@@ -25,6 +25,7 @@ VARIANT_ORDER = (
     "attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow",
     "attention-row-partner-output-scratch-no-gather-shadow",
     "attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow",
+    "attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-fenced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2850,6 +2851,34 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         ),
         "not-run",
     )
+    partner_output_scratch_pre_attention_gather_fenced_state = outcomes.get(
+        (
+            "attention-row-gather-preinitialized-source-partner-output-"
+            "scratch-pre-attention-paced-fenced-shadow"
+        ),
+        "not-run",
+    )
+    if partner_output_scratch_pre_attention_gather_fenced_state == "failed":
+        return (
+            "The pair still lost a device after the pre-attention static transfer "
+            "was completed by an explicit partner-then-home device fence before "
+            "partner attention was submitted. Transfer-only and attention-only "
+            "each pass, while their combination fails in both orders and now with "
+            "a quiescent boundary. Immediate adjacency, overlap, and an outstanding "
+            "cross-device event from that transfer are therefore not required. "
+            "Next retain this fence and reduce only reverse-transfer bytes or duty "
+            "to locate the cumulative traffic/work threshold."
+        )
+    if partner_output_scratch_pre_attention_gather_fenced_state == "passed":
+        return (
+            "The complete production workload survived when an explicit partner-"
+            "then-home device fence separated the pre-attention static transfer "
+            "from partner attention. The same operations fail without that "
+            "quiescent boundary, so their cumulative bytes alone are insufficient; "
+            "an unfenced cross-device handoff or overlap is required. Next add the "
+            "same pair fence to the independently failing post-attention ordering "
+            "to determine whether this is a general completion/lifetime defect."
+        )
     if partner_output_scratch_pre_attention_gather_state == "failed":
         return (
             "The pair lost a device with the same static paced reverse transfer "
@@ -3106,6 +3135,12 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
             "scratch-pre-attention-paced-shadow",
             "result-gather-preinitialized-source-partner-output-scratch-"
             "pre-attention-paced",
+        ),
+        (
+            "attention-row-gather-preinitialized-source-partner-output-"
+            "scratch-pre-attention-paced-fenced-shadow",
+            "result-gather-preinitialized-source-partner-output-scratch-"
+            "pre-attention-paced-fenced",
         ),
     ):
         state = outcomes.get(variant, "not-run")
