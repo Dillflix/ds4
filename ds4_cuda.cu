@@ -13590,7 +13590,7 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
                         raw_kv + (uint64_t)raw_rows[r] * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot += qh[d] * kvrow[d];
+                        dot = __fmaf_rn(qh[d], kvrow[d], dot);
                     }
                     scores[local_head][r] = dot * scale;
                 }
@@ -13632,7 +13632,7 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
                 float dot = 0.0f;
                 const float *kvrow = kv_shared + staged_row * head_dim;
                 for (uint32_t d = qlane; d < head_dim; d += 8u) {
-                    dot += qh[d] * kvrow[d];
+                    dot = __fmaf_rn(qh[d], kvrow[d], dot);
                 }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
@@ -13745,8 +13745,10 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
                  local_head++) {
                 if (head_base + local_head < n_head) {
                     const float p = scores[local_head][row0 + rr];
-                    acc0[local_head] += v0 * p;
-                    acc1[local_head] += v1 * p;
+                    acc0[local_head] =
+                        __fmaf_rn(v0, p, acc0[local_head]);
+                    acc1[local_head] =
+                        __fmaf_rn(v1, p, acc1[local_head]);
                 }
             }
         }
