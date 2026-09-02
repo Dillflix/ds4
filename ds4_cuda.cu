@@ -13581,7 +13581,10 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
         HEADS_PER_GROUP == 1u ? 8u : 32u / HEADS_PER_GROUP;
 
     const uint32_t head_base = blockIdx.x * HEADS_PER_GROUP;
-    if (head_base >= n_head || head_dim != 512u) return;
+    if (head_base >= n_head) return;
+    /* Host dispatch admits this kernel only for head_dim=512.  Do not repeat
+     * that equality test here: unlike the shipping kernel, it lets NVCC prove
+     * the dot-loop trip count and changes fast-math instruction formation. */
 
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];

@@ -4772,6 +4772,9 @@ or row-mapping defects from max-tree, denominator, and numerator differences.
 The candidate's first score pass uses the shipping kernel's fixed 32-row warp
 group cadence independently of the smaller KV staging tile used by its second
 pass; score arithmetic no longer inherits a 4/8-row staging schedule.
+The 512-wide shape remains a host-dispatch requirement rather than an
+in-kernel equality branch, keeping the score loop runtime-bounded like the
+shipping kernel and preventing compile-time fast-math reassociation.
 
 The harness forces a fresh SM75 build, enforces per-symbol zero PTXAS stack and
 spill bytes plus zero SASS `LDL`/`STL`, retains the runtime register/occupancy
