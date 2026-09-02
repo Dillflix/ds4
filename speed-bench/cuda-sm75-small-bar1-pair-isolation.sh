@@ -39,6 +39,7 @@ Optional environment:
   VARIANTS=attention-row-gather-preinitialized-source-no-partner-paced-shadow  same static copy, omit partner attention
   VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow  retain attention, redirect its output
   VARIANTS=attention-row-partner-output-scratch-no-gather-shadow  retain scratch-output attention, omit reverse transfer
+  VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow  move reverse transfer before attention
   VARIANTS=attention-q8-phase-audit  same cut plus pair-0 Q8 phase checkpoints
   VARIANTS=attention-q8-targeted-phase-audit  phase-audit one exact Q8 binding only
   Q8_TARGETED_BINDING_LABEL=...   default: tensor:blk.14.attn_output_b.weight
@@ -137,6 +138,8 @@ readonly PREINITIALIZED_SOURCE_NO_PARTNER_GATHER_MARKER='ds4: CUDA prefill atten
 readonly PARTNER_OUTPUT_SCRATCH_ARMED_MARKER='ds4: CUDA prefill attention row partner output scratch armed:'
 readonly PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_GATHER_ARMED_MARKER='ds4: CUDA prefill attention row preinitialized source partner-output-scratch gather armed:'
 readonly PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER='ds4: CUDA prefill attention row preinitialized source partner-output-scratch gather scheduled:'
+readonly PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_ARMED_MARKER='ds4: CUDA prefill attention row preinitialized source partner-output-scratch pre-attention gather armed:'
+readonly PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER='ds4: CUDA prefill attention row preinitialized source partner-output-scratch pre-attention gather scheduled:'
 
 row_shadow_phase() {
     case "$1" in
@@ -152,6 +155,7 @@ row_shadow_phase() {
         attention-row-gather-preinitialized-source-no-partner-paced-shadow) printf '%s\n' result-gather-preinitialized-source-no-partner-paced ;;
         attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow) printf '%s\n' result-gather-preinitialized-source-partner-output-scratch-paced ;;
         attention-row-partner-output-scratch-no-gather-shadow) printf '%s\n' partner-output-scratch-no-gather ;;
+        attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow) printf '%s\n' result-gather-preinitialized-source-partner-output-scratch-pre-attention-paced ;;
         *) return 1 ;;
     esac
 }
@@ -276,13 +280,13 @@ declare -A seen_variants=()
 attention_copy_matrix_requested=0
 for variant in "${variants[@]}"; do
     case "$variant" in
-        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
+        attention-off|attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst|attention-phase-audit|attention-end-fence|attention-row-boundary-audit|partner-bounce|bounce-indexer-off|partner-serialized|indexer-off|production) ;;
         *) die "unknown variant: $variant" ;;
     esac
     [[ -z ${seen_variants[$variant]:-} ]] || die "duplicate variant: $variant"
     seen_variants[$variant]=1
     case "$variant" in
-        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
+        attention-host-bounce|attention-q8-host-bounce|attention-q8-async-completion|attention-q8-pre-gather-fence|attention-q8-activation-fence|attention-q8-global-compute-fence|attention-q8-direct-gather-fence|attention-q8-rows-serialized|attention-q8-row-compute-off|attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow|attention-q8-phase-audit|attention-q8-targeted-phase-audit|attention-q8-l14-l15-phase-audit|attention-q8-l12-phase-audit|attention-query-dst|attention-gather-dst|attention-both-dst)
             attention_copy_matrix_requested=1
             ;;
     esac
@@ -317,7 +321,8 @@ if [[ ( -n ${seen_variants[attention-q8-activation-fence]:-} ||
         -n ${seen_variants[attention-row-gather-preinitialized-source-paced-shadow]:-} ||
         -n ${seen_variants[attention-row-gather-preinitialized-source-no-partner-paced-shadow]:-} ||
         -n ${seen_variants[attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow]:-} ||
-        -n ${seen_variants[attention-row-partner-output-scratch-no-gather-shadow]:-} ) &&
+        -n ${seen_variants[attention-row-partner-output-scratch-no-gather-shadow]:-} ||
+        -n ${seen_variants[attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow]:-} ) &&
       $ONE_SHOT != 1 ]]; then
     die "destructive fence/row-shadow diagnostics require ONE_SHOT=1"
 fi
@@ -1327,7 +1332,7 @@ validate_success_path() {
             log_line_has "$log" 'decode indexer row audit event=complete' \
                 'home_tier=1 partner_tier=3' || return 1
             ;;
-        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow)
+        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow)
             local shadow_phase
             shadow_phase=$(row_shadow_phase "$variant") || return 1
             ! grep -Fq 'partner transport override for logical pair 0' "$log" ||
@@ -1514,6 +1519,53 @@ validate_success_path() {
                 ! grep -Fq "$PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER" \
                     "$log" || return 1
                 ! grep -Fxq "$PACED_CHUNK_MARKER" "$log" || return 1
+            fi
+            if [[ $variant == attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow ]]; then
+                log_line_has_all "$log" "$PARTNER_OUTPUT_SCRATCH_ARMED_MARKER" \
+                    'output_tier=2' \
+                    'output_offset_bytes=134217728' \
+                    'output_bytes=33554432' \
+                    'partner_attention=retained' \
+                    'production_output_write=no production_output_read=no' \
+                    'query_handoff=retained' \
+                    'source_initialization=one-time-partner-default-stream-zero-fill' \
+                    'reverse_transfer=paced-static' \
+                    'transfer_order=before-partner-attention' \
+                    'output=dedicated-partner-allocation' \
+                    'accepted_output=full-home-recompute' || return 1
+                log_line_has_all "$log" "$PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_ARMED_MARKER" \
+                    'production_source_tier=2 source_tier=2 destination_tier=0' \
+                    'transfer_bytes=33554432' \
+                    'source_initialization=one-time-partner-default-stream-zero-fill' \
+                    'partner_attention=retained' \
+                    'production_source_read=no' \
+                    'source=dedicated-partner-allocation' \
+                    'destination=dedicated-home-allocation' \
+                    'transfer_order=before-partner-attention' \
+                    'accepted_output=full-home-recompute' || return 1
+                grep -Fxq "$PACED_CHUNK_MARKER" "$log" || return 1
+                log_line_has_all "$log" "$PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER" \
+                    'production_source_tier=2 source_tier=2 destination_tier=0' \
+                    'transfer_bytes=33554432' \
+                    'source_initialization=one-time-partner-default-stream-zero-fill' \
+                    'partner_attention=retained' \
+                    'production_source_read=no' \
+                    'source_scratch_allocation_bytes=268435456' \
+                    'destination_scratch_allocation_bytes=268435456' \
+                    'source=dedicated-partner-allocation' \
+                    'destination=dedicated-home-allocation' \
+                    'transfer_order=before-partner-attention' \
+                    'accepted_output=full-home-recompute' || return 1
+                grep -Fxq \
+                    'ds4: CUDA prefill attention row shadow audit event=begin phase=result-gather-preinitialized-source-partner-output-scratch-pre-attention-paced kind=mixed layer=2 pos=512 tokens=512 home=0 partner=2' \
+                    "$log" || return 1
+                grep -Fxq \
+                    'ds4: CUDA prefill attention row shadow audit event=complete phase=result-gather-preinitialized-source-partner-output-scratch-pre-attention-paced kind=mixed layer=2 pos=512 tokens=512 home=0 partner=2' \
+                    "$log" || return 1
+                ! grep -Fq "$PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_GATHER_ARMED_MARKER" \
+                    "$log" || return 1
+                ! grep -Fq "$PREINITIALIZED_SOURCE_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER" \
+                    "$log" || return 1
             fi
             log_line_has "$log" 'q8 partner transfer audit event=begin home_tier=0' \
                 'transport=peer' || return 1
@@ -2139,7 +2191,7 @@ failed_arm_activation_proven() {
         attention-q8-row-compute-off)
             grep -Fxq "$ROW_COMPUTE_OFF_MARKER" "$log"
             ;;
-        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow)
+        attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow)
             local shadow_phase
             shadow_phase=$(row_shadow_phase "$variant") || return 1
             grep -Fxq \
@@ -2234,6 +2286,33 @@ failed_arm_activation_proven() {
                     'reverse_transfer=omitted' \
                     'output=dedicated-partner-allocation' \
                     'accepted_output=full-home-recompute'
+            elif [[ $variant == attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow ]]; then
+                grep -Fxq \
+                    'ds4: CUDA prefill attention row shadow audit event=begin phase=result-gather-preinitialized-source-partner-output-scratch-pre-attention-paced kind=mixed layer=2 pos=512 tokens=512 home=0 partner=2' \
+                    "$log" || return 1
+                log_line_has_all "$log" "$PARTNER_OUTPUT_SCRATCH_ARMED_MARKER" \
+                    'output_tier=2' \
+                    'output_offset_bytes=134217728' \
+                    'output_bytes=33554432' \
+                    'partner_attention=retained' \
+                    'production_output_write=no production_output_read=no' \
+                    'query_handoff=retained' \
+                    'source_initialization=one-time-partner-default-stream-zero-fill' \
+                    'reverse_transfer=paced-static' \
+                    'transfer_order=before-partner-attention' \
+                    'output=dedicated-partner-allocation' \
+                    'accepted_output=full-home-recompute' || return 1
+                log_line_has_all "$log" "$PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_ARMED_MARKER" \
+                    'production_source_tier=2 source_tier=2 destination_tier=0' \
+                    'transfer_bytes=33554432' \
+                    'partner_attention=retained' \
+                    'transfer_order=before-partner-attention' || return 1
+                grep -Fxq "$PACED_CHUNK_MARKER" "$log" || return 1
+                log_line_has_all "$log" "$PRE_ATTENTION_PARTNER_OUTPUT_SCRATCH_GATHER_MARKER" \
+                    'production_source_tier=2 source_tier=2 destination_tier=0' \
+                    'transfer_bytes=33554432' \
+                    'partner_attention=retained' \
+                    'transfer_order=before-partner-attention'
             else
                 grep -Eq \
                     "prefill attention row shadow audit event=begin phase=$shadow_phase .*home=0 partner=2" \
@@ -2469,7 +2548,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_COMPUTE_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_Q8_F16_PARTNER_DIRECT_GATHER_FENCE_PAIRS=$SMALL_BAR1_PAIR")
                 ;;
-            attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow)
+            attention-row-query-shadow|attention-row-partner-shadow|attention-row-gather-shadow|attention-row-gather-dst-shadow|attention-row-gather-chunk16-shadow|attention-row-gather-chunk16-paced-shadow|attention-row-gather-scratch-paced-shadow|attention-row-gather-source-scratch-paced-shadow|attention-row-gather-preinitialized-source-paced-shadow|attention-row-gather-preinitialized-source-no-partner-paced-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow|attention-row-partner-output-scratch-no-gather-shadow|attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow)
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS=$SMALL_BAR1_PAIR")
                 variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE=$(row_shadow_phase "$variant")")
                 if [[ $variant == attention-row-gather-dst-shadow ]]; then

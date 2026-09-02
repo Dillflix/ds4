@@ -4220,6 +4220,27 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-gather-preinitialized-source-partner-"
+                        "output-scratch-pre-attention-paced-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "both orderings of the combined work failed",
+            ),
+            (
+                (
+                    (
+                        "attention-row-gather-preinitialized-source-partner-"
+                        "output-scratch-pre-attention-paced-shadow",
+                        "passed",
+                    ),
+                ),
+                "isolates the required ordering to partner attention followed by "
+                "reverse P2P",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),

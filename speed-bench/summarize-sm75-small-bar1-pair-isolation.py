@@ -24,6 +24,7 @@ VARIANT_ORDER = (
     "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
     "attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow",
     "attention-row-partner-output-scratch-no-gather-shadow",
+    "attention-row-gather-preinitialized-source-partner-output-scratch-pre-attention-paced-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2842,6 +2843,34 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
     partner_output_scratch_no_gather_state = outcomes.get(
         "attention-row-partner-output-scratch-no-gather-shadow", "not-run"
     )
+    partner_output_scratch_pre_attention_gather_state = outcomes.get(
+        (
+            "attention-row-gather-preinitialized-source-partner-output-"
+            "scratch-pre-attention-paced-shadow"
+        ),
+        "not-run",
+    )
+    if partner_output_scratch_pre_attention_gather_state == "failed":
+        return (
+            "The pair lost a device with the same static paced reverse transfer "
+            "moved before the retained partner-attention/cache workload. The "
+            "transfer-only and attention-only arms each passed, while both orderings "
+            "of the combined work failed. Neither the production result buffers nor "
+            "the attention-before-transfer ordering are required; the combined "
+            "per-row workload is the retained trigger. Next place an explicit pair "
+            "completion fence between the pre-attention transfer and attention "
+            "launch to distinguish back-to-back execution from cumulative work."
+        )
+    if partner_output_scratch_pre_attention_gather_state == "passed":
+        return (
+            "The complete production workload survived when the identical static "
+            "paced reverse transfer was moved before partner attention. Together "
+            "with the failed post-attention arm and the two passing single-component "
+            "arms, this isolates the required ordering to partner attention followed "
+            "by reverse P2P. Next retain that failing order but insert an explicit "
+            "partner completion fence before the reverse transfer to distinguish an "
+            "asynchronous completion defect from the ordered operations themselves."
+        )
     if partner_output_scratch_no_gather_state == "failed":
         return (
             "The pair lost a device with the static partner-to-home result transfer "
@@ -3071,6 +3100,12 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         (
             "attention-row-partner-output-scratch-no-gather-shadow",
             "partner-output-scratch-no-gather",
+        ),
+        (
+            "attention-row-gather-preinitialized-source-partner-output-"
+            "scratch-pre-attention-paced-shadow",
+            "result-gather-preinitialized-source-partner-output-scratch-"
+            "pre-attention-paced",
         ),
     ):
         state = outcomes.get(variant, "not-run")
