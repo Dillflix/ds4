@@ -177,7 +177,7 @@ static int g_cuda_no_setdevice_cache;
 static uint32_t g_attention_indexed_streaming_exact_heads;
 static uint32_t g_attention_indexed_streaming_exact_audit_mode;
 static std::atomic<uint64_t>
-    g_attention_indexed_streaming_exact_launches[2] = {};
+    g_attention_indexed_streaming_exact_launches[3] = {};
 static int g_cuda_exact_score_split_graph;
 static int g_cuda_exact_score_split_ldg;
 static int g_cuda_exact_score_split_vec4;
@@ -868,7 +868,7 @@ extern "C" void ds4_gpu_test_refresh_decode_dispatch_env(void) {
 
 extern "C" void
 ds4_gpu_test_reset_attention_indexed_streaming_exact_launches(void) {
-    for (uint32_t i = 0; i < 2u; i++) {
+    for (uint32_t i = 0; i < 3u; i++) {
         g_attention_indexed_streaming_exact_launches[i].store(
             0u, std::memory_order_relaxed);
     }
@@ -877,7 +877,7 @@ ds4_gpu_test_reset_attention_indexed_streaming_exact_launches(void) {
 extern "C" void
 ds4_gpu_test_set_attention_indexed_streaming_exact_heads(uint32_t heads) {
     g_attention_indexed_streaming_exact_heads =
-        heads == 4u || heads == 8u ? heads : 0u;
+        heads == 1u || heads == 4u || heads == 8u ? heads : 0u;
 }
 
 extern "C" void
@@ -887,8 +887,9 @@ ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(uint32_t mode) {
 
 extern "C" uint64_t
 ds4_gpu_test_get_attention_indexed_streaming_exact_launches(uint32_t heads) {
-    const uint32_t slot = heads == 4u ? 0u : (heads == 8u ? 1u : 2u);
-    return slot < 2u
+    const uint32_t slot = heads == 1u ? 0u :
+                          (heads == 4u ? 1u : (heads == 8u ? 2u : 3u));
+    return slot < 3u
         ? g_attention_indexed_streaming_exact_launches[slot].load(
               std::memory_order_relaxed)
         : 0u;
@@ -13561,9 +13562,14 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t exact_audit_mode) {
-    static_assert(HEADS_PER_GROUP == 4u || HEADS_PER_GROUP == 8u,
+    static_assert(HEADS_PER_GROUP == 1u || HEADS_PER_GROUP == 4u ||
+                      HEADS_PER_GROUP == 8u,
                   "bounded exact-streaming indexed-decode group size");
-    constexpr uint32_t ROWS_PER_STAGE = 32u / HEADS_PER_GROUP;
+    /* H1 is a diagnostic control for separating the streaming/recompute
+     * schedule from multi-head code generation.  Give it H4's row tile so the
+     * kernel remains below SM75's shared-memory limit. */
+    constexpr uint32_t ROWS_PER_STAGE =
+        HEADS_PER_GROUP == 1u ? 8u : 32u / HEADS_PER_GROUP;
 
     const uint32_t head_base = blockIdx.x * HEADS_PER_GROUP;
     if (head_base >= n_head || head_dim != 512u) return;
@@ -13917,7 +13923,9 @@ ds4_gpu_test_get_attention_indexed_streaming_exact_resources(
                 256, 0); \
         } \
     } while (0)
-    if (heads_per_group == 4u) {
+    if (heads_per_group == 1u) {
+        DS4_QUERY_INDEXED_STREAMING_EXACT(1u);
+    } else if (heads_per_group == 4u) {
         DS4_QUERY_INDEXED_STREAMING_EXACT(4u);
     } else if (heads_per_group == 8u) {
         DS4_QUERY_INDEXED_STREAMING_EXACT(8u);
@@ -23293,7 +23301,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const uint32_t streaming_exact_heads =
         g_attention_indexed_streaming_exact_heads;
     if (n_tokens == 1u && head_dim == 512u &&
-        (streaming_exact_heads == 4u || streaming_exact_heads == 8u)) {
+        (streaming_exact_heads == 1u || streaming_exact_heads == 4u ||
+         streaming_exact_heads == 8u)) {
         if (!cuda_sm75_mma_ok()) {
             fprintf(stderr,
                     "ds4: exact streaming indexed decode requires sm_75\n");
@@ -23338,10 +23347,15 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (streaming_exact_heads == 8u) {
             attention_indexed_mixed_decode_streaming_exact_kernel<8u>
                 <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
+            g_attention_indexed_streaming_exact_launches[2].fetch_add(
+                1u, std::memory_order_relaxed);
+        } else if (streaming_exact_heads == 4u) {
+            attention_indexed_mixed_decode_streaming_exact_kernel<4u>
+                <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
             g_attention_indexed_streaming_exact_launches[1].fetch_add(
                 1u, std::memory_order_relaxed);
         } else {
-            attention_indexed_mixed_decode_streaming_exact_kernel<4u>
+            attention_indexed_mixed_decode_streaming_exact_kernel<1u>
                 <<<blocks, 256>>>(DS4_INDEXED_STREAMING_EXACT_ARGS);
             g_attention_indexed_streaming_exact_launches[0].fetch_add(
                 1u, std::memory_order_relaxed);

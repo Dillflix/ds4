@@ -265,6 +265,7 @@ static int tensor_matches(const char *label, const ds4_gpu_tensor *t,
 }
 
 int main(void) {
+    static const uint32_t groups[] = {1u, 4u, 8u};
     static const exact_case cases[] = {
         {"production-four-gpu-shard-after-32k", "production", SHARD_HEADS,
          FIRST_DECODE_POS, LIVE_RAW, FIRST_DECODE_RAW_START, LIVE_WINDOW, TOPK_PRODUCTION},
@@ -305,7 +306,8 @@ int main(void) {
     for (uint64_t i = 0; i < hn; i++) hi[i] =
         i < GUARD_FLOATS || i >= GUARD_FLOATS + qn ? fixture_value(i, 0xa55aa55au) : SENTINEL;
     if (!ds4_gpu_init()) goto cleanup; initialized = 1;
-    for (uint32_t group = 4u; group <= 8u; group += 4u) {
+    for (uint32_t gi = 0u; gi < sizeof(groups) / sizeof(groups[0]); gi++) {
+        const uint32_t group = groups[gi];
         uint32_t regs=0, shared=0, local=0, threads=0, blocks=0;
         if (!ds4_gpu_test_get_attention_indexed_streaming_exact_resources(
                 group, &regs, &shared, &local, &threads, &blocks)) goto cleanup;
@@ -335,7 +337,8 @@ int main(void) {
             nonzero += ref[i]!=0.0f;
         }
         if(!nonzero) goto cleanup;
-        for(uint32_t group=4;group<=8;group+=4) {
+        for (uint32_t gi = 0u; gi < sizeof(groups) / sizeof(groups[0]); gi++) {
+            const uint32_t group = groups[gi];
             if (ci == 0u) {
                 for (uint32_t mode = 1u; mode <= 3u; mode++) {
                     ds4_gpu_test_set_attention_indexed_streaming_exact_audit_mode(mode);
@@ -366,8 +369,10 @@ int main(void) {
         if(rounds) {
             const exact_case *t=&cases[0]; fill_topk(kh,t->pattern,N_COMP);
             if(!ds4_gpu_tensor_write(topk,0,kh,TOP_K*4u)) goto cleanup;
-            for(uint32_t group=4;group<=8;group+=4)
+            for (uint32_t gi = 0u; gi < sizeof(groups) / sizeof(groups[0]); gi++) {
+                const uint32_t group = groups[gi];
                 if(!paired_timing(heads,sinks,q,raw,comp,topk,t,group,rounds,repeats)) goto cleanup;
+            }
         }
     }
     if(!tensor_matches("q",q,qh,qn*4u)||!tensor_matches("raw",raw,rh,rn*4u)||

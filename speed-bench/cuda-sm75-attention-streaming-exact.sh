@@ -4,12 +4,13 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Build and test the diagnostic SM75 exact two-score-pass indexed-decode
-attention candidates (four or eight heads per CTA).
+attention candidates (one, four, or eight heads per CTA). H1 is a diagnostic
+control; H4/H8 remain the grouped optimization candidates.
 
 This does not enable a production default.  It requires byte-exact output for
 the actual 32K decode shape and hostile fixtures, enforces runtime resource and
 occupancy gates, optionally runs Compute Sanitizer, records per-symbol SASS,
-and optionally times the reference/H4/H8 paths.
+and optionally times the reference/H1/H4/H8 paths.
 
 Optional environment:
   PROFILE_GPU=0
@@ -128,7 +129,7 @@ fi
 c++filt <"$OUTPUT_DIR/build.log" >"$OUTPUT_DIR/build.demangled.log"
 
 current_phase=exact-and-resource-gates
-printf 'Exact/resource regression: shipping reference versus H4/H8...\n'
+printf 'Exact/resource regression: shipping reference versus diagnostic H1 and H4/H8...\n'
 env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
     DS4_STREAMING_EXACT_TIMING_ROUNDS=0 \
     DS4_STREAMING_EXACT_TIMING_REPEATS=0 \
@@ -136,6 +137,8 @@ env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         tail -n 180 "$OUTPUT_DIR/exact.log" >&2 || true
         die "exact/resource regression failed"
     }
+grep -q '^resources,group=1,' "$OUTPUT_DIR/exact.log" ||
+    die "H1 diagnostic runtime resource identity is missing"
 grep -q '^resources,group=4,' "$OUTPUT_DIR/exact.log" ||
     die "H4 runtime resource identity is missing"
 grep -q '^resources,group=8,' "$OUTPUT_DIR/exact.log" ||
@@ -228,7 +231,7 @@ cat "$OUTPUT_DIR/sass-symbol-diagnostics.csv"
 
 if [[ $RUN_SANITIZER == 1 ]]; then
     current_phase=compute-sanitizer
-    printf 'Compute Sanitizer: exact/adversarial H4/H8 regression...\n'
+    printf 'Compute Sanitizer: exact/adversarial H1/H4/H8 regression...\n'
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         DS4_STREAMING_EXACT_TIMING_ROUNDS=0 \
         DS4_STREAMING_EXACT_TIMING_REPEATS=0 \
@@ -243,7 +246,7 @@ fi
 
 if (( TIMING_REPEATS > 0 )); then
     current_phase=timing
-    printf 'Paired timing shipping versus H4/H8 at the four-GPU H32 shape...\n'
+    printf 'Paired timing shipping versus diagnostic H1 and H4/H8 at the four-GPU H32 shape...\n'
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
         DS4_STREAMING_EXACT_TIMING_ROUNDS="$TIMING_ROUNDS" \
         DS4_STREAMING_EXACT_TIMING_REPEATS="$TIMING_REPEATS" \
@@ -253,8 +256,8 @@ if (( TIMING_REPEATS > 0 )); then
         }
     grep '^timing,' "$OUTPUT_DIR/timing.log" \
         >"$OUTPUT_DIR/timing-summary.csv"
-    [[ $(wc -l <"$OUTPUT_DIR/timing-summary.csv") -eq 2 ]] ||
-        die "timing run did not report paired H4 and H8 comparisons"
+    [[ $(wc -l <"$OUTPUT_DIR/timing-summary.csv") -eq 3 ]] ||
+        die "timing run did not report paired H1, H4, and H8 comparisons"
     cat "$OUTPUT_DIR/timing-summary.csv"
 fi
 

@@ -4746,9 +4746,11 @@ bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 
 ### Diagnostic exact two-score-pass indexed decode
 
-`cuda-sm75-attention-streaming-exact.sh` evaluates H4 and H8 CTA groupings
-without changing the production default. It compares both candidates byte for
-byte with the shipping score-buffer path using the actual four-GPU shard at the
+`cuda-sm75-attention-streaming-exact.sh` evaluates H4 and H8 CTA groupings,
+plus an H1 diagnostic control that separates the streaming/recompute schedule
+from multi-head code generation, without changing the production default. It
+compares all three experimental paths byte for byte with the shipping
+score-buffer path using the actual four-GPU shard at the
 first generated token after a 32K prompt: `pos=32768`, 32 heads, 128 live raw
 rows, window 128, ring capacity 2,304, ring start 385 (that is,
 `(32768 + 1 - 128) % 2304`), 8,192 compressed rows, and top-k 512. This
