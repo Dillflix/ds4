@@ -1065,6 +1065,10 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
            "result-gather-preinitialized-source-partner-output-scratch-paced", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 11,
           "partner-output-scratch paced result-gather phase is recognized");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE",
+           "partner-output-scratch-no-gather", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 12,
+          "partner-output-scratch no-gather phase is recognized");
     setenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE", "invalid", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0,
           "invalid attention row shadow phases fail closed");

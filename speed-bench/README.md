@@ -3995,6 +3995,13 @@ cut of pair-0 attention-owned work:
   its address, contents, direction, two 16 MiB chunks, pacing, and full-home
   accepted output are unchanged. This isolates the production attention-output
   destination/write from the rest of the retained partner-attention workload.
+- `attention-row-partner-output-scratch-no-gather-shadow` retains the same
+  direct query handoff, production partner-attention kernel/cache accesses,
+  non-overlapping scratch output, diagnostic allocation initialization, and
+  full-home accepted output, but submits no partner-to-home result transfer.
+  Its partner synchronization proves completion of the retained attention
+  kernel before home recomputation. This separates attention/cache execution
+  from its interaction with the static reverse P2P schedule.
 
 Pair-0 prefill indexer top-k stays on home in these arms so the accepted output
 can be recomputed by the unchanged full-home attention kernel. Pair 1 and all
@@ -4133,7 +4140,16 @@ arm's write to production `peer_heads`, even though that result was never read.
 The next arm therefore retains the exact attention kernel and cache workload
 while redirecting only that output write to non-overlapping partner scratch.
 
-Run that arm from a fresh boot and directory at the cards' native limits:
+That scratch-output arm also lost the physical 02:00.0/03:00.0 pair. It proved
+the exact output redirection, static 32 MiB paced transfer, and complete first
+mixed-row checkpoint before CUDA later surfaced an unspecified launch failure
+at layer 15. The watcher independently recorded both pair endpoints lost, with
+no foreign GPU process. Using production `peer_heads` as the attention-kernel
+destination is therefore not required. The next differential omits only the
+static reverse transfer while preserving direct query handoff, partner
+attention/cache work, scratch output, allocation shape, and full-home result.
+
+Historical source-scratch reproduction command:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -4215,7 +4231,7 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-small-bar1-pair-isolation.sh
 ```
 
-Run the partner-output-scratch differential after a fresh reboot:
+Run the partner-output-scratch/no-gather differential after a fresh reboot:
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -4235,7 +4251,7 @@ export MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf"
 export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 unset CUDA_VISIBLE_DEVICES REQUIRED_POWER_LIMIT_W SMALL_BAR1_ISOLATION_DIR
-export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-gather-partner-output-scratch-paced-$(date -u +%Y%m%dT%H%M%SZ)"
+export SMALL_BAR1_ISOLATION_DIR="$PWD/sm75-attention-row-partner-output-scratch-no-gather-$(date -u +%Y%m%dT%H%M%SZ)"
 
 RESUME=0 \
 ONE_SHOT=1 \
@@ -4244,7 +4260,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 SMALL_BAR1_PAIR=0 \
-VARIANTS=attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow \
+VARIANTS=attention-row-partner-output-scratch-no-gather-shadow \
 PP_TOKENS=32768 \
 TG_TOKENS=256 \
 REPEATS=1 \

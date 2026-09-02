@@ -23,6 +23,7 @@ VARIANT_ORDER = (
     "attention-row-gather-preinitialized-source-paced-shadow",
     "attention-row-gather-preinitialized-source-no-partner-paced-shadow",
     "attention-row-gather-preinitialized-source-partner-output-scratch-paced-shadow",
+    "attention-row-partner-output-scratch-no-gather-shadow",
     "attention-q8-async-completion",
     "attention-q8-phase-audit",
     "attention-q8-targeted-phase-audit",
@@ -2838,6 +2839,31 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
         ),
         "not-run",
     )
+    partner_output_scratch_no_gather_state = outcomes.get(
+        "attention-row-partner-output-scratch-no-gather-shadow", "not-run"
+    )
+    if partner_output_scratch_no_gather_state == "failed":
+        return (
+            "The pair lost a device with the static partner-to-home result transfer "
+            "omitted. The direct query handoff and production partner-attention "
+            "kernel/cache workload remained, its discarded output went only to "
+            "dedicated scratch, and full-home recomputation supplied the accepted "
+            "result. The reverse 32 MiB P2P transfer and all production result "
+            "addresses/contents are therefore not required. Next replace the direct "
+            "query handoff with a preinitialized partner-local query while retaining "
+            "the same attention/cache execution shape to separate forward P2P from "
+            "partner attention and cache access."
+        )
+    if partner_output_scratch_no_gather_state == "passed":
+        return (
+            "The exact partner-attention/cache workload with scratch output survived "
+            "when only the static paced reverse transfer was omitted. Against the "
+            "failed scratch-output arm, partner attention alone and the static "
+            "transfer alone are each insufficient; their combined ordered workload "
+            "is required. Next run the identical static reverse transfer before the "
+            "partner-attention launch to distinguish cumulative traffic/load from "
+            "the current post-attention ordering relationship."
+        )
     if gather_preinitialized_source_partner_output_scratch_paced_state == "failed":
         return (
             "The pair lost a device after the selected pair's partner-attention "
@@ -3041,6 +3067,10 @@ def inference(outcomes: dict[str, str], rows: list[dict[str, str]]) -> str:
                 "partner-output-scratch-paced-shadow"
             ),
             "result-gather-preinitialized-source-partner-output-scratch-paced",
+        ),
+        (
+            "attention-row-partner-output-scratch-no-gather-shadow",
+            "partner-output-scratch-no-gather",
         ),
     ):
         state = outcomes.get(variant, "not-run")

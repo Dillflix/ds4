@@ -4200,6 +4200,26 @@ class SummarizeSmallBar1PairIsolationTest(unittest.TestCase):
             ),
             (
                 (
+                    (
+                        "attention-row-partner-output-scratch-no-gather-shadow",
+                        "failed-device-loss",
+                    ),
+                ),
+                "reverse 32 MiB P2P transfer and all production result "
+                "addresses/contents are therefore not required",
+            ),
+            (
+                (
+                    (
+                        "attention-row-partner-output-scratch-no-gather-shadow",
+                        "passed",
+                    ),
+                ),
+                "partner attention alone and the static transfer alone are each "
+                "insufficient",
+            ),
+            (
+                (
                     ("attention-row-query-shadow", "passed"),
                     ("attention-row-partner-shadow", "failed-device-loss"),
                 ),
