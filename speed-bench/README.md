@@ -1272,6 +1272,51 @@ Return `sm75-t32-f16-production-ab-<timestamp>.tar.gz`. The runner is
 deliberately one-shot; after a GPU loss, retain the partial archive and start a
 new matrix after reboot rather than combining process histories with resume.
 
+Before expanding that stable-topology A/B, use
+`cuda-sm75-t32-f16-rowsplit-probe.sh` to answer the narrower stability
+question created by the candidate's approximately 41% reduction in Q8 partner
+result traffic. The probe fixes fused T32 output on, restores attention and
+indexer row splitting on pair 0, and executes exactly one mixed15 32K prefill
+process. Pair 1, the 344/344 placement, all-partner T32 ownership, direct peer
+routes, power limits, and every other production selector remain fixed. There
+is no control arm and no resume path because a GPU-loss result requires a
+reboot and must not be combined with a later process history.
+
+Set physical GPU power limits before launching. The default requirement is
+250 W on passive GPUs 0, 2, and 3 and the workstation board's full 260 W on
+GPU 1:
+
+```bash
+cd ~/ds4-iq2-q4
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+sudo nvidia-smi -i 0 -pl 250
+sudo nvidia-smi -i 1 -pl 260
+sudo nvidia-smi -i 2 -pl 250
+sudo nvidia-smi -i 3 -pl 250
+
+unset CUDA_VISIBLE_DEVICES
+unset T32_F16_ROWSPLIT_PROBE_DIR
+
+MODEL_LAYOUT=mixed15 \
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-f16-rowsplit-probe.sh
+```
+
+If the mixed15 probe completes with healthy post-run devices, repeat it only
+after reboot with `MODEL_LAYOUT=all43` and `ALL43_MODEL` pointing to the
+all-Q3A4 gate/up model. Direction-reversal experiments remain separate
+follow-ups: combining them with this probe would confound transfer volume with
+source/destination role and compute placement.
+
 ### Production scalar-slot evidence
 
 `cuda-sm75-production-scalar.sh` is the bounded, model-free acceptance driver
