@@ -2129,7 +2129,11 @@ static int run_q8_partner_projection_case(
     (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
     if (t32_fused) {
         (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
-        (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
+        if (t32_fused == 1) {
+            (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
+        } else {
+            (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+        }
     } else {
         (void)setenv("DS4_CUDA_NO_T32_F16_FUSED", "1", 1);
         (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
@@ -2479,7 +2483,7 @@ static int run_q8_partner_projection(void) {
 
     if (run_q8_partner_projection_case(
             "T32", "tensor:blk.1.attn_q_b.weight",
-            1024u, 32768u, 17u, 0, 1, 1u)) return 1;
+            1024u, 32768u, 17u, 0, 2, 1u)) return 1;
     if (run_q8_partner_projection_case(
             "T256", "tensor:blk.1.attn_output_b.weight",
             8192u, 4096u, 17u, 0, 1, 1u)) return 1;

@@ -15489,6 +15489,16 @@ static bool cuda_tp_prefill_attn_rows_env_enabled(void) {
 #endif
 }
 
+static bool cuda_tp_prefill_indexer_rows_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return cuda_tp_prefill_attn_rows_default_qualified();
+#endif
+}
+
 static bool cuda_tp_decode_indexer_rows_env_enabled(void) {
     /* The exact 50/50 score split is the supported SM75 production path.
      * Presence of the negative switch is intentionally sufficient for a
@@ -15538,10 +15548,39 @@ static bool cuda_tp_decode_indexer_rows_pair_enabled(int home_tier) {
                "DS4_CUDA_NO_TP_DECODE_INDEXER_ROWS_PAIRS", home_tier);
 }
 
+static bool cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier) {
+    if (!cuda_tp_prefill_indexer_rows_env_enabled() ||
+        env_pair_list_contains(
+            "DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS", home_tier)) {
+        return false;
+    }
+    const char *pairs = getenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    if (pairs && pairs[0]) {
+        return env_pair_list_contains(
+            "DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS", home_tier);
+    }
+    /* Match the stable automatic topology without sharing the attention
+     * selector.  The positive pair list can independently enable pair 0 for
+     * an indexer-only production probe. */
+    return home_tier != 0;
+}
+
 static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
-    return cuda_tp_prefill_attn_rows_env_enabled() &&
-           !env_pair_list_contains(
-               "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", home_tier);
+    if (!cuda_tp_prefill_attn_rows_env_enabled() ||
+        env_pair_list_contains(
+            "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", home_tier)) {
+        return false;
+    }
+
+    /* The qualified 0/2 logical pair maps to the physical GPU0/GPU1 stage
+     * on the production 0,3,1,2 placement.  Repeated full-load evidence
+     * loses that PCIe endpoint only when this pair's prefill row split is
+     * active; pair 1 remains stable and beneficial.  Keep pair 0 out of the
+     * automatic policy, while an explicit positive selector still permits
+     * the fault-audit harnesses to reproduce the all-pairs topology. */
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    if (env && env[0]) return strcmp(env, "0") != 0;
+    return home_tier != 0;
 }
 
 /* Diagnostic-only copy scheduling switches. Production keeps both row-split
@@ -15999,10 +16038,12 @@ typedef struct {
     bool cuda_tp_prefill_attn_rows;
     bool cuda_tp_prefill_indexer_rows;
     bool cuda_tp_decode_indexer_rows;
-    /* A pair-split indexer launch leaves each row range's selected indices on
-     * its executing device. The immediately following indexed-attention
-     * launch consumes this ticket and avoids a partner->home->partner top-k
-     * round trip. */
+    /* When the same pair also splits attention, a pair-split indexer launch
+     * leaves each row range's selected indices on its executing device. The
+     * immediately following indexed-attention launch consumes this ticket and
+     * avoids a partner->home->partner top-k round trip. Indexer-only splitting
+     * instead gathers the partner's integer top-k rows back to the home
+     * tensor and intentionally leaves this ticket invalid. */
     bool cuda_tp_indexer_selected_split_valid;
     int cuda_tp_indexer_selected_home;
     int cuda_tp_indexer_selected_partner;
@@ -17871,8 +17912,11 @@ static bool metal_graph_alloc_raw_cap(
     g->index_comp_cache_f16 =
         metal_graph_cuda_sm75_indexer_native_requested(used_tier);
     g->cuda_tp_prefill_indexer_rows =
-        g->cuda_tp_prefill_attn_rows && g->index_comp_cache_f16 &&
+        g->cuda_tp_decode && cuda_tp_prefill_indexer_rows_env_enabled() &&
+        g->index_comp_cache_f16 &&
         getenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS") == NULL;
+    g->cuda_tp_attn_cache_dup =
+        g->cuda_tp_prefill_attn_rows || g->cuda_tp_prefill_indexer_rows;
     /* The exact 50/50 decode score split reuses the prefill-owned native-F16
      * mirror and adds no persistent allocation. Keep a negative diagnostic
      * switch for controlled A/Bs; the supported SM75 production path is on. */
@@ -17888,6 +17932,23 @@ static bool metal_graph_alloc_raw_cap(
                 "logical-pairs=%s; disabled pairs use home fallback\n",
                 prefill_attn_disabled_pairs);
     }
+    const char *prefill_indexer_pairs =
+        getenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    const char *prefill_indexer_disabled_pairs =
+        getenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    if (g->cuda_tp_prefill_indexer_rows &&
+        ((prefill_indexer_pairs && prefill_indexer_pairs[0]) ||
+         (prefill_indexer_disabled_pairs &&
+          prefill_indexer_disabled_pairs[0]))) {
+        fprintf(stderr,
+                "ds4: CUDA prefill indexer row split pair policy: "
+                "enabled-pairs=%s disabled-pairs=%s\n",
+                prefill_indexer_pairs && prefill_indexer_pairs[0]
+                    ? prefill_indexer_pairs : "automatic",
+                prefill_indexer_disabled_pairs &&
+                        prefill_indexer_disabled_pairs[0]
+                    ? prefill_indexer_disabled_pairs : "none");
+    }
     const char *prefill_attn_compute_disabled_pairs =
         getenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
     if (g->cuda_tp_prefill_attn_rows &&
@@ -17898,7 +17959,8 @@ static bool metal_graph_alloc_raw_cap(
         fprintf(stderr,
                 "ds4: CUDA prefill attention row compute pair-scoped disable: "
                 "logical-pairs=%s; partner cache allocation and mirror traffic "
-                "retained; disabled pairs use home attention/indexer fallback\n",
+                "retained; disabled pairs use home attention while indexer "
+                "dispatch follows its independent pair policy\n",
                 prefill_attn_compute_disabled_pairs);
         fflush(stderr);
     }
@@ -21686,6 +21748,7 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_active(
         metal_graph_debug_wants("indexer_scores", il, pos0) ||
         metal_graph_debug_wants("indexer_topk", il, pos0)) return false;
     const int home = g->active_tier;
+    if (!cuda_tp_prefill_indexer_rows_pair_enabled(home)) return false;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
     return partner >= 0 && g_gpu_peer_ok[home][partner] &&
            g_gpu_peer_ok[partner][home] &&
@@ -21706,10 +21769,12 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
         uint32_t       pos0,
         uint32_t       n_raw,
         uint32_t       ratio,
-        float          scale) {
+        float          scale,
+        bool           keep_partner_selected) {
 #if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
     (void)g; (void)il; (void)n_comp; (void)n_tokens;
     (void)pos0; (void)n_raw; (void)ratio; (void)scale;
+    (void)keep_partner_selected;
     return false;
 #else
     if (!metal_graph_cuda_tp_prefill_indexer_rows_active(
@@ -21771,9 +21836,26 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
         g->comp_selected_by_tier[home], 0, selected_home_bytes);
     ds4_gpu_tensor *peer_selected = ds4_gpu_tensor_view(
         g->comp_selected_by_tier[partner], 0, selected_partner_bytes);
+    ds4_gpu_tensor *gather_selected = keep_partner_selected
+        ? NULL
+        : ds4_gpu_tensor_view(
+              g->comp_selected_by_tier[home], selected_home_bytes,
+              selected_partner_bytes);
     bool ok = home_q && peer_q_src && peer_q_dst && home_q_f16 && peer_q_f16 &&
               home_weights && peer_weights_src && peer_weights_dst &&
-              home_scores && peer_scores && home_selected && peer_selected;
+              home_scores && peer_scores && home_selected && peer_selected &&
+              (keep_partner_selected || gather_selected);
+    const bool audit =
+        getenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_AUDIT") != NULL;
+    if (ok && audit) {
+        fprintf(stderr,
+                "ds4: CUDA prefill indexer row audit event=begin "
+                "layer=%u pos=%u tokens=%u home_tier=%d partner_tier=%d "
+                "selected_mode=%s\n",
+                il, pos0, n_tokens, home, partner,
+                keep_partner_selected ? "partner-local" : "gather-home");
+        fflush(stderr);
+    }
     if (ok) {
         ok = ds4_gpu_tensor_wait_xdev_default(peer_q_dst, home) != 0 &&
              ds4_gpu_tensor_copy_xdev_default(
@@ -21803,15 +21885,24 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
                 home_selected, home_scores, n_comp, home_rows,
                 DS4_N_INDEXER_TOP_K) != 0;
     }
+    if (ok && !keep_partner_selected) {
+        ok = ds4_gpu_tensor_wait_xdev_default(
+                 gather_selected, partner) != 0 &&
+             ds4_gpu_tensor_copy_xdev_default(
+                 gather_selected, peer_selected,
+                 selected_partner_bytes) != 0;
+    }
     if (ok) {
-        g->cuda_tp_indexer_selected_split_valid = true;
-        g->cuda_tp_indexer_selected_home = home;
-        g->cuda_tp_indexer_selected_partner = partner;
-        g->cuda_tp_indexer_selected_layer = il;
-        g->cuda_tp_indexer_selected_pos0 = pos0;
-        g->cuda_tp_indexer_selected_tokens = n_tokens;
-        g->cuda_tp_indexer_selected_home_rows = home_rows;
-        g->cuda_tp_indexer_selected_partner_rows = partner_rows;
+        g->cuda_tp_indexer_selected_split_valid = keep_partner_selected;
+        if (keep_partner_selected) {
+            g->cuda_tp_indexer_selected_home = home;
+            g->cuda_tp_indexer_selected_partner = partner;
+            g->cuda_tp_indexer_selected_layer = il;
+            g->cuda_tp_indexer_selected_pos0 = pos0;
+            g->cuda_tp_indexer_selected_tokens = n_tokens;
+            g->cuda_tp_indexer_selected_home_rows = home_rows;
+            g->cuda_tp_indexer_selected_partner_rows = partner_rows;
+        }
     }
 
     static uint32_t logged_home_mask = 0u;
@@ -21821,9 +21912,21 @@ static bool metal_graph_cuda_tp_prefill_indexer_rows_launch(
         fprintf(stderr,
                 "ds4: CUDA prefill indexer score/top-k row split enabled: "
                 "tier %d rows [0,%u), tier %d rows [%u,%u); "
-                "partner-local native-F16 index cache and selected rows\n",
-                home, home_rows, partner, home_rows, n_tokens);
+                "partner-local native-F16 index cache; selected-mode=%s\n",
+                home, home_rows, partner, home_rows, n_tokens,
+                keep_partner_selected ? "partner-local" : "gather-home");
     }
+    if (ok && audit) {
+        fprintf(stderr,
+                "ds4: CUDA prefill indexer row audit event=complete "
+                "dispatch=split layer=%u pos=%u tokens=%u home_tier=%d "
+                "partner_tier=%d home_rows=%u partner_rows=%u "
+                "selected_mode=%s\n",
+                il, pos0, n_tokens, home, partner, home_rows, partner_rows,
+                keep_partner_selected ? "partner-local" : "gather-home");
+        fflush(stderr);
+    }
+    ds4_gpu_tensor_free(gather_selected);
     ds4_gpu_tensor_free(peer_selected);
     ds4_gpu_tensor_free(home_selected);
     ds4_gpu_tensor_free(peer_scores);
@@ -21854,14 +21957,16 @@ static bool metal_graph_indexer_scores_topk_batch(
         bool           allow_pair_split) {
     if (!g) return false;
     g->cuda_tp_indexer_selected_split_valid = false;
+    const bool attention_rows_active =
+        metal_graph_cuda_tp_prefill_attention_rows_active(
+            g, layer, il, pos0, n_tokens, n_raw);
     if (metal_graph_cuda_tp_prefill_indexer_rows_active(
             g, il, pos0, n_tokens, n_comp) && allow_pair_split &&
         cuda_tp_prefill_attn_row_shadow_phase_for_pair(g->active_tier) ==
-            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE &&
-        metal_graph_cuda_tp_prefill_attention_rows_active(
-            g, layer, il, pos0, n_tokens, n_raw)) {
+            DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE) {
         return metal_graph_cuda_tp_prefill_indexer_rows_launch(
-            g, il, n_comp, n_tokens, pos0, n_raw, ratio, scale);
+            g, il, n_comp, n_tokens, pos0, n_raw, ratio, scale,
+            attention_rows_active);
     }
     return metal_graph_indexer_scores_batch(
             g, il, n_comp, n_tokens, pos0, ratio, scale) &&
@@ -59674,6 +59779,14 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
     return cuda_tp_prefill_attn_rows_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void) {
+    return cuda_tp_prefill_indexer_rows_env_enabled();
+}
+
+bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier) {
+    return cuda_tp_prefill_indexer_rows_pair_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(

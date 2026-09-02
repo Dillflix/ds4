@@ -38532,7 +38532,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     const char *fused_env = getenv("DS4_CUDA_T32_F16_FUSED");
-    if (!fused_env || !fused_env[0] || strcmp(fused_env, "0") == 0 ||
+    if ((fused_env && fused_env[0] && strcmp(fused_env, "0") == 0) ||
         getenv("DS4_CUDA_NO_T32_F16_FUSED") != NULL ||
         !g_cublas_ready || !out || !x || !model_map ||
         n_tok <= 1u || n_head == 0u || head_dim == 0u ||

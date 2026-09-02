@@ -824,20 +824,17 @@ Unset selects `stage-aware`; the other modes are explicit diagnostics.
 Stage-aware is accepted only for the fixed four-GPU 22/21 layout. The
 production mixed model is sized for complete dense-F16 coverage at its target
 allocation, so this is not a cache-hit subset or overflow heuristic.
-The T32 `attn_q_b` projection also has an evidence-gated FP16-output candidate:
-`DS4_CUDA_T32_F16_FUSED=1` makes cuBLAS write the 32768-wide projection to the
-existing half-size Q scratch and then performs head RMS normalization plus
-RoPE in one half-input kernel. A partner-resident T32 slice returns that FP16
-intermediate over NVLink instead of the generic FP32 result, halving result
-traffic. The established FP32-output path remains the default. The historical
-four-way local/partner isolation forced an obsolete T32-only overflow policy:
-it measured only a 0.5--1.0% incremental gain and changed the 4096-token top
-prediction in every repeat. Current promotion therefore requires the
-dual-model production A/B in
-`speed-bench/cuda-sm75-t32-f16-production-ab.sh`, followed by the existing
-multi-prompt quality methodology applied to both the mixed15 and all43 Q3A4
-layouts. Use
-`DS4_CUDA_NO_T32_F16_FUSED=1` as an explicit diagnostic override.
+The T32 `attn_q_b` projection uses the FP16-output fused path by default when
+its production shape and cache-placement gates are satisfied. It makes cuBLAS
+write the 32768-wide projection to the existing half-size Q scratch and then
+performs head RMS normalization plus RoPE in one half-input kernel. A
+partner-resident T32 slice returns that FP16 intermediate over NVLink instead
+of the generic FP32 result, halving result traffic. In the stable
+pair-0-disabled mixed15 production topology, the first paired run improved
+prefill by 9.05% at 512, 2.04% at 4096, and 0.76% at 32768 tokens while
+reducing partner result traffic from 212.27 to 124.92 GiB.
+`DS4_CUDA_T32_F16_FUSED=0` or `DS4_CUDA_NO_T32_F16_FUSED=1` restores the
+established FP32-output path for controlled rollback.
 `DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=0` disables the complete cache for
 memory-pressure diagnosis; it is not the performance default.
 The experimental 32/32 head split can be enabled with
@@ -847,13 +844,22 @@ halves concurrently, gathers the packed low-rank halves, and runs one full
 cached output-B GEMM. It is not the performance default because both tested
 output strategies regressed prefill by roughly 20% across 2K..65K on the
 4x RTX 8000 NVLink-pair target.
-Query-row splitting is the production default when CUDA TP resolves to exactly
-four SM75 devices and both logical pairs have validated bidirectional links of
-at least 18 GiB/s. It improved bit-exact production prefill by 4.25% at 2K,
+Query-row splitting is automatically considered when CUDA TP resolves to
+exactly four SM75 devices and both logical pairs have validated bidirectional
+links of at least 18 GiB/s. It improved bit-exact production prefill by 4.25% at 2K,
 8.95% at 4K, 9.13% at 8K, 10.43% at 16K, and 12.39% at 32K on the qualified
-4x RTX 8000 NVLink-pair target. `DS4_CUDA_TP_PREFILL_ATTN_ROWS=0` is the
-diagnostic rollback; `=1` is an explicit strict opt-in for other measured
-layouts. The path covers indexed and nonzero-prefix mixed attention. It
+4x RTX 8000 NVLink-pair target. Production now suppresses logical pair 0 and
+retains the stable pair-1 split: repeated all-pairs 32K runs lost the GPU1 PCIe
+endpoint, while disabling pair 0 completed cleanly. Prefill indexer splitting
+has an independent pair selector. Its conservative automatic policy currently
+matches attention (pair 1 only), while
+`DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS=0,1` enables an indexer-only pair-0
+qualification without re-enabling pair-0 attention. In that mode the partner's
+top-k integer rows are gathered home before the unchanged home attention
+launch. The independently qualified decode indexer row split is unchanged.
+`DS4_CUDA_TP_PREFILL_ATTN_ROWS=0` disables all prefill attention row splitting;
+`=1` explicitly restores both qualified pairs for fault reproduction and other
+controlled measurements. The path covers indexed and nonzero-prefix mixed attention. It
 incrementally mirrors raw and compressed KV on the NVLink partner, copies the latter half of
 Q to that partner, executes 50/50 row launches concurrently, and gathers the
 partner's full-head result before the unchanged inverse-RoPE/output projection.

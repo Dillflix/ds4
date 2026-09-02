@@ -43,6 +43,8 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier);
 int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier);
@@ -881,6 +883,12 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     char *old_pairs = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
+    char *old_indexer = save_env_value(
+        "DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
+    char *old_indexer_pairs = save_env_value(
+        "DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    char *old_no_indexer_pairs = save_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
     char *old_query_dst = save_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
     char *old_gather_dst = save_env_value(
@@ -917,6 +925,9 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
+    unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_GATHER_DST_STREAM_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
@@ -924,9 +935,37 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
+          "stable default suppresses pair 0 and keeps pair 1 row splitting");
+
+    CHECK(ds4_test_cuda_tp_prefill_indexer_rows_requested() &&
+          !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
+          "prefill indexer has an independent stable pair policy");
+    setenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
+          "prefill indexer row splitting accepts an independent rollback");
+    unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "0", 1);
+    setenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS", "0,1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1) &&
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
+          "prefill indexer pairs can be enabled with attention rows disabled");
+    setenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(1),
+          "prefill indexer negative pair selector overrides its allow list");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS");
+    unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
+
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "1", 1);
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
           ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
-          "both prefill attention row-split pairs are enabled by default");
+          "explicit row-split opt-in restores both qualified pairs");
 
     setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", "0", 1);
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -1112,6 +1151,11 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
     restore_env_value("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", old_pairs);
+    restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", old_indexer);
+    restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS",
+                      old_indexer_pairs);
+    restore_env_value("DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS",
+                      old_no_indexer_pairs);
     restore_env_value(
         "DS4_CUDA_TP_PREFILL_ATTN_QUERY_DST_STREAM_PAIRS", old_query_dst);
     restore_env_value(

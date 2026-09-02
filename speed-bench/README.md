@@ -1249,8 +1249,14 @@ partner-fused and FP16-result counts with zero local fused calls. It rejects a
 plan change, missing production path, power-limit change, within-arm
 nondeterminism, or any frontier top-1 change. A passing performance/numerical
 screen requires a median win at 32K on both models and permits no measured
-frontier below 0.995x. It still requires a subsequent multi-prompt quality A/B
-on both models before `DS4_CUDA_T32_F16_FUSED` may become the engine default.
+frontier below 0.995x. The engine now enables the fused path by default when
+its production eligibility checks pass; `DS4_CUDA_T32_F16_FUSED=0` and
+`DS4_CUDA_NO_T32_F16_FUSED=1` remain rollback controls. The first
+stable-topology mixed15 pair measured +9.05%, +2.04%, and +0.76% at 512, 4096,
+and 32768 tokens respectively, and reduced partner result traffic from 212.27
+to 124.92 GiB. The dual-model repeated matrix remains the qualification
+harness for tracking the mixed15 and all43 production shapes, not an opt-in
+gate.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1272,15 +1278,45 @@ Return `sm75-t32-f16-production-ab-<timestamp>.tar.gz`. The runner is
 deliberately one-shot; after a GPU loss, retain the partial archive and start a
 new matrix after reboot rather than combining process histories with resume.
 
-Before expanding that stable-topology A/B, use
-`cuda-sm75-t32-f16-rowsplit-probe.sh` to answer the narrower stability
-question created by the candidate's approximately 41% reduction in Q8 partner
-result traffic. The probe fixes fused T32 output on, restores attention and
+`cuda-sm75-t32-f16-rowsplit-probe.sh` is retained only as a fault-reproduction
+harness. It fixes fused T32 output on, explicitly restores attention and
 indexer row splitting on pair 0, and executes exactly one mixed15 32K prefill
-process. Pair 1, the 344/344 placement, all-partner T32 ownership, direct peer
-routes, power limits, and every other production selector remain fixed. There
-is no control arm and no resume path because a GPU-loss result requires a
-reboot and must not be combined with a later process history.
+process. That experiment still lost the GPU1 PCIe endpoint after 19 pair-0
+attention splits even though partner result traffic was reduced. It therefore
+rejects the hypothesis that T32 traffic reduction makes the all-pairs row-split
+topology stable. Pair 1, the 344/344 placement, all-partner T32 ownership,
+direct peer routes, power limits, and every other production selector remain
+fixed. There is no control arm and no resume path because a GPU-loss result
+requires a reboot and must not be combined with a later process history.
+
+`cuda-sm75-prefill-indexer-pair0-probe.sh` removes the earlier diagnostic
+confound between pair-0 prefill attention and pair-0 prefill indexer splitting.
+Both one-shot arms keep pair-0 attention disabled, retain pair-1 attention and
+indexer splitting, use the default fused T32 path, and run the same 32K
+production-shaped prefill. `VARIANT=indexer-on` alone runs pair-0 indexer
+score/top-k 50/50 and gathers the partner's integer top-k rows home before
+unsplit attention; `VARIANT=control` keeps that pair's indexer work home. Run
+the candidate first. If it leaves all GPUs healthy, run the control separately
+with `REFERENCE_DIR` pointing at the candidate directory; the control then
+requires every dumped frontier-logit file to be byte-identical. Separate
+processes are mandatory because a GPU-loss arm requires a reboot.
+
+```bash
+VARIANT=indexer-on \
+MODEL_LAYOUT=mixed15 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+bash ./speed-bench/cuda-sm75-prefill-indexer-pair0-probe.sh
+
+VARIANT=control \
+MODEL_LAYOUT=mixed15 \
+REFERENCE_DIR="$PWD/sm75-prefill-indexer-pair0-indexer-on-<timestamp>" \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+bash ./speed-bench/cuda-sm75-prefill-indexer-pair0-probe.sh
+```
+
+Repeat the same pair with `MODEL_LAYOUT=all43` only after mixed15 establishes
+stability and exactness. This is a prefill-indexer qualification; it does not
+alter or retest the independently promoted one-token decode-indexer split.
 
 Set physical GPU power limits before launching. The default requirement is
 250 W on passive GPUs 0, 2, and 3 and the workstation board's full 260 W on
