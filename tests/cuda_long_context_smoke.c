@@ -24,6 +24,8 @@ extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_mapping(void);
 extern void ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(
     uint32_t depth);
 extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth(void);
+extern void ds4_gpu_test_set_moe_direct_native_q8(int enabled);
+extern int ds4_gpu_test_get_moe_direct_native_q8(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
@@ -1481,15 +1483,41 @@ static int check_sm75_q4_32_mapping_env(void) {
     if (ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u) rc = 1;
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_PREFETCH_DEPTH");
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DOWN_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8");
+    (void)unsetenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8");
     ds4_gpu_test_refresh_decode_dispatch_env();
     if (ds4_gpu_test_get_moe_q4_32_decode_mapping() != 3u ||
         ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != 0u ||
         ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u ||
-        ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u)
+        ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u ||
+        ds4_gpu_test_get_moe_direct_native_q8() != 0)
         rc = 1;
+    if (rc == 0 &&
+        setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
+        return 1;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 1) rc = 1;
+    if (rc == 0 &&
+        setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "0", 1) != 0)
+        return 1;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
+    if (rc == 0 &&
+        setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
+        return 1;
+    if (rc == 0 &&
+        setenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
+        return 1;
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
+    (void)unsetenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8");
+    (void)unsetenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8");
+    ds4_gpu_test_refresh_decode_dispatch_env();
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
     fputs(rc == 0
               ? "cuda-regression: SM75 Q4-32 production mapping selectors exact\n"
-              : "cuda-regression: SM75 Q4-32 production mapping selectors failed\n",
+                "cuda-regression: SM75 direct native Q8 opt-in selector exact\n"
+              : "cuda-regression: SM75 Q4-32/direct-native selectors failed\n",
           stderr);
     return rc;
 }
@@ -1529,6 +1557,10 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
     float *mid_splith = (float *)malloc((size_t)mid_bytes);
     float *home_refh = (float *)malloc((size_t)slot_bytes);
     float *home_splith = (float *)malloc((size_t)slot_bytes);
+    unsigned char *shared_refh =
+        (unsigned char *)malloc((size_t)shared_prequant_bytes);
+    unsigned char *shared_directh =
+        (unsigned char *)malloc((size_t)shared_prequant_bytes);
     const int32_t selh[6] = {0, 4, 1, 5, 2, 6};
     const float wh[6] = {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f};
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
@@ -1547,7 +1579,7 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
         ds4_gpu_tensor_alloc(shared_prequant_bytes);
     int rc = 1;
     if (!model || !xh || !refh || !goth || !mid_refh || !mid_splith ||
-        !home_refh || !home_splith ||
+        !home_refh || !home_splith || !shared_refh || !shared_directh ||
         !x || !selected || !weights ||
         !ref || !got || !tmp_out || !gate || !up || !mid || !down ||
         !home_slots || !peer_packed || !shared_prequant) goto cleanup;
@@ -1593,6 +1625,7 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
         ds4_gpu_test_set_moe_q32_decode_fused_lowreg(0u);
         ds4_gpu_test_set_moe_q4_32_decode_mapping(0u);
         ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
+        ds4_gpu_test_set_moe_direct_native_q8(0);
         if (!ds4_gpu_routed_moe_one_owned_tensor(
                 tmp_out, gate, up, mid, down, model, model_bytes,
                 gate_off, up_off, down_off, gate_type, 42u,
@@ -1603,6 +1636,8 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
             !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(mid, 0, mid_refh, mid_bytes) ||
             !ds4_gpu_tensor_read(home_slots, 0, home_refh, slot_bytes) ||
+            !ds4_gpu_tensor_read(shared_prequant, 0, shared_refh,
+                                 shared_prequant_bytes) ||
             !require_nonzero_f32("SM75 Q32 native reference intermediate",
                                  mid_refh,
                                  (uint64_t)n_expert * mid_dim) ||
@@ -1611,9 +1646,41 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                                  (uint64_t)n_expert * out_dim) ||
             (gate_type == 42u &&
              !require_sm75_q32_f32_bits(
-                 "SM75 Q4-32 signed-zero reference mid[0]",
-                 mid_refh[0], 0x00000000u)))
+                  "SM75 Q4-32 signed-zero reference mid[0]",
+                  mid_refh[0], 0x00000000u)))
             goto cleanup;
+
+        /* Exercise the integrated direct-native producer through the actual
+         * Q4-32 down consumer.  Gate type 42 covers mixed Q4/Q3A4 models and
+         * type 43 covers the all-Q3A4 gate/up model; down remains identical. */
+        ds4_gpu_test_set_moe_direct_native_q8(1);
+        if (!ds4_gpu_routed_moe_one_owned_tensor(
+                tmp_out, gate, up, mid, down, model, model_bytes,
+                gate_off, up_off, down_off, gate_type, 42u,
+                gate_expert, gate_row, down_expert, down_row,
+                in_dim, mid_dim, out_dim, selected, weights,
+                n_total, n_expert, 0u, 4u, 10.0f, x,
+                home_slots, false, shared_prequant) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(mid, 0, mid_splith, mid_bytes) ||
+            !ds4_gpu_tensor_read(home_slots, 0, home_splith, slot_bytes) ||
+            !ds4_gpu_tensor_read(shared_prequant, 0, shared_directh,
+                                 shared_prequant_bytes) ||
+            !compare_exact_f32("SM75 direct native Q8 gate/up intermediate",
+                               mid_refh, mid_splith,
+                               (size_t)n_expert * mid_dim) ||
+            !compare_exact_f32("SM75 direct native Q8 owned down output",
+                               home_refh, home_splith,
+                               (size_t)n_expert * out_dim))
+            goto cleanup;
+        if (memcmp(shared_refh, shared_directh,
+                   (size_t)shared_prequant_bytes) != 0) {
+            fprintf(stderr,
+                    "SM75 direct native Q8 dual quantizer changed shared "
+                    "Q8_0 bytes\n");
+            goto cleanup;
+        }
+        ds4_gpu_test_set_moe_direct_native_q8(0);
         ds4_gpu_test_set_moe_q32_decode_split(1);
         if (!ds4_gpu_routed_moe_one_owned_tensor(
                 tmp_out, gate, up, mid, down, model, model_bytes,
@@ -1869,6 +1936,10 @@ static int check_sm75_q32_owned_graph_case(uint32_t gate_type,
                   "cuda-regression: SM75 Q4-32 tile32-mma prefetch-depth "
                   "1/2 nonzero exact\n"
                   "cuda-regression: SM75 Q4-32 signed-zero gate probe exact\n");
+    fprintf(stderr,
+            "cuda-regression: SM75 %s direct native Q8 producer + Q4-32 "
+            "down consumer exact/reuse\n",
+            label);
     rc = 0;
 
 cleanup:
@@ -1879,6 +1950,7 @@ cleanup:
     ds4_gpu_test_set_moe_q3a4_decode_mapping(0u);
     ds4_gpu_test_set_moe_q3a4_decode_ksplit(1u);
     ds4_gpu_test_set_moe_q3a4_decode_prefetch_depth(0u);
+    ds4_gpu_test_set_moe_direct_native_q8(0);
     ds4_gpu_test_set_moe_q32_decode_graph(1);
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
@@ -1890,6 +1962,7 @@ cleanup:
     ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
     free(home_splith); free(home_refh); free(mid_splith); free(mid_refh);
+    free(shared_directh); free(shared_refh);
     free(goth); free(refh);
     free(xh); free(model);
     return rc;

@@ -1805,13 +1805,13 @@ both recorded shapes. This is not a claim of bit-exact agreement with the
 production kernel, which is built under a different compiler mode.
 
 The same benchmark logs contain a separate bounded producer comparison for a
-candidate direct-native Q8_K quantizer. It preserves the canonical signed
+direct-native Q8_K quantizer. It preserves the canonical signed
 scale, all 16 `bsums`, and every low/high nibble-plane byte, but writes the
 native 292-byte record directly. Its timing compares one direct launch against
 the complete canonical quantize-plus-pack operation (two launches), including
-the canonical record's 292-byte write and 292-byte reread. This candidate is
-harness-only; even a bounded win does not alter production dispatch without a
-subsequent production acceptance test.
+the canonical record's 292-byte write and 292-byte reread. The bounded result
+motivates an explicitly opt-in production candidate; it does not by itself
+change the canonical production default.
 
 The script builds only an `sm_75` cubin, rejects any GPU other than compute
 capability 7.5, runs Compute Sanitizer when available, and checks the emitted
@@ -1857,6 +1857,60 @@ and telemetry evidence before skipping it. It never overwrites the original
 evidence or failure archive: new provenance, status, and Nsight files go under
 `resume-<timestamp>/`, and the resulting archive is named
 `sm75-q4-down-native-<original-timestamp>.resume-<timestamp>.tar.gz`.
+
+### SM75 direct native-Q8 production A/B
+
+`DS4_CUDA_MOE_DIRECT_NATIVE_Q8=1` selects the direct native-Q8 producer at
+both activation boundaries consumed by the tagged SM75 routed-MoE kernels:
+the model input feeding Q4-32 or Q3A4 gate/up and the intermediate activation
+feeding Q4-32 down. Decode's shared prequantization remains one launch: the
+candidate preserves the indexer's Q8_0 bytes while emitting the Q8_K half in
+native form. `DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8=1` is the explicit rollback.
+The selector is opt-in; absence of both variables retains canonical
+Q8_K-plus-pack production behavior.
+
+`cuda-sm75-direct-native-q8-production-ab.sh` is the acceptance test. It runs
+the mixed15 and all43 models under the same stable 22/21 four-GPU topology,
+alternates canonical/direct arms for at least three repeats, and measures both
+prefill and 256-token decode at PP512, PP4096, and PP32768. Each process must
+report exclusive canonical or direct dispatch at both boundaries for both
+prefill and decode. The runner also requires identical dense-Q8 placement,
+healthy fixed GPU identities and power limits, and byte-identical logits for
+16 decode tokens at every frontier for each model. It is deliberately
+one-shot: an interrupted or GPU-loss run is archived rather than resumed.
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-direct-native-q8
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+sudo nvidia-smi -i 0 -pl 250
+sudo nvidia-smi -i 1 -pl 260
+sudo nvidia-smi -i 2 -pl 250
+sudo nvidia-smi -i 3 -pl 250
+
+unset CUDA_VISIBLE_DEVICES
+unset DIRECT_NATIVE_Q8_PRODUCTION_AB_DIR
+
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+REPEATS=3 \
+TG_TOKENS=256 \
+EXACT_TOKENS=16 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-direct-native-q8-production-ab.sh
+```
+
+Return `sm75-direct-native-q8-production-ab-<timestamp>.tar.gz`. Promotion
+requires a complete archive; the earlier one-GPU synthetic audit remains
+supporting resource and microbenchmark evidence only.
 
 ### SM75 production-shaped Q4 gate/up native-packing audit
 

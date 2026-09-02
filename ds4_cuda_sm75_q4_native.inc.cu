@@ -48,6 +48,156 @@ static int sm75_q4_pack_activations_inplace(
     return cuda_ok(cudaGetLastError(), what);
 }
 
+/* Direct form of q8_K_quantize_kernel for native SM75 Q4 consumers.  Its
+ * extrema reduction, signed scale, lrintf expression and clamps intentionally
+ * match the canonical producer exactly.  Only the destination encoding
+ * differs: each warp transposes the values still held by its 32 producing
+ * lanes into the native nibble planes, avoiding a canonical Q8_K global
+ * write/read and the separate pack launch. */
+__device__ __forceinline__ static void sm75_q4_store_native_q8_K(
+        cuda_sm75_native_q8_K *yb, int qv, uint32_t tid, float d) {
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane4 = lane & 3u;
+    uint32_t low = 0u;
+    uint32_t high = 0u;
+    int word_sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const int qi = __shfl_sync(0xffffffffu, qv, lane4 * 8u + i);
+        const uint32_t raw = (uint32_t)(uint8_t)(int8_t)qi;
+        low |= (raw & 0x0fu) << (4u * i);
+        high |= ((raw >> 4u) & 0x0fu) << (4u * i);
+        word_sum += (int)(int8_t)qi;
+    }
+    const int pair_sum = word_sum +
+        __shfl_xor_sync(0xffffffffu, word_sum, 1u);
+    if (lane < 4u) {
+        yb->low[warp][lane] = low;
+        yb->high_signed[warp][lane] = high;
+    }
+    if (lane == 0u) yb->bsums[2u * warp] = (int16_t)pair_sum;
+    if (lane == 2u) yb->bsums[2u * warp + 1u] = (int16_t)pair_sum;
+    if (tid == 0u) yb->d = d;
+}
+
+__global__ __launch_bounds__(256) static void q8_K_quantize_sm75_native_kernel(
+        cuda_sm75_native_q8_K *out, const float *x,
+        uint32_t in_dim, uint32_t n_rows) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
+    const float *xr = x + (uint64_t)row * in_dim +
+                      (uint64_t)b * CUDA_QK_K;
+    cuda_sm75_native_q8_K *yb =
+        out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
+    __shared__ float abs_part[CUDA_QK_K];
+    __shared__ float val_part[CUDA_QK_K];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float amax = abs_part[0];
+    if (amax == 0.0f) {
+        sm75_q4_store_native_q8_K(yb, 0, tid, 0.0f);
+        return;
+    }
+    if (tid == 0u) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    int qv = (int)lrintf(iscale_s * xr[tid]);
+    if (qv > 127) qv = 127;
+    if (qv < -128) qv = -128;
+    const float d = tid == 0u ? 1.0f / iscale_s : 0.0f;
+    sm75_q4_store_native_q8_K(yb, qv, tid, d);
+}
+
+/* Decode can share one input quantization launch with the 32-value Q8_0
+ * indexer representation.  Preserve that half's exact reduction and write
+ * order while changing only the Q8_K half to the direct native encoding. */
+__global__ __launch_bounds__(256) static void q8_K_q8_0_quantize_sm75_native_kernel(
+        cuda_sm75_native_q8_K *out,
+        int8_t *q8_0,
+        float *q8_0_scale,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t n_rows) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
+    const float *xr = x + (uint64_t)row * in_dim +
+                      (uint64_t)b * CUDA_QK_K;
+    cuda_sm75_native_q8_K *yb =
+        out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
+    __shared__ float abs_part[CUDA_QK_K];
+    __shared__ float val_part[CUDA_QK_K];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
+
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    __syncthreads();
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            abs_part[tid] = fmaxf(abs_part[tid], abs_part[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const uint32_t q8_blocks = in_dim / 32u;
+    const uint32_t q8_block = b * 8u + warp;
+    const float d8 = abs_part[warp * 32u] / 127.0f;
+    const float id8 = d8 != 0.0f ? 1.0f / d8 : 0.0f;
+    if (lane == 0u) {
+        q8_0_scale[(uint64_t)row * q8_blocks + q8_block] = d8;
+    }
+    int qv = (int)lrintf(v * id8);
+    qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
+    q8_0[((uint64_t)row * q8_blocks + q8_block) * 32u + lane] =
+        (int8_t)qv;
+    __syncthreads();
+
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float amax = abs_part[0];
+    if (amax == 0.0f) {
+        sm75_q4_store_native_q8_K(yb, 0, tid, 0.0f);
+        return;
+    }
+    if (tid == 0u) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    int kv = (int)lrintf(iscale_s * xr[tid]);
+    if (kv > 127) kv = 127;
+    if (kv < -128) kv = -128;
+    const float dk = tid == 0u ? 1.0f / iscale_s : 0.0f;
+    sm75_q4_store_native_q8_K(yb, kv, tid, dk);
+}
+
 /* Scalar reference for decode.  The packed weight word is the exact B
  * fragment owned by one MMA lane; the packed high activation nibble is
  * interpreted as signed s4, hence q8 = low + 16 * signed(high). */
