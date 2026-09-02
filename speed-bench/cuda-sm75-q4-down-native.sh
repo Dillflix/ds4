@@ -55,13 +55,16 @@ profile_kernels=(
     sm75_q4_down_native_aw_kernel
     sm75_q4_down_pack_a_kernel
 )
-sass_labels=(standard native-w native-aw pack-a pack-w)
+sass_labels=(standard native-w native-aw pack-a pack-a-inplace pack-w quantize-q8k quantize-native-q8k)
 sass_kernels=(
     sm75_q4_down_standard_kernel
     sm75_q4_down_native_w_kernel
     sm75_q4_down_native_aw_kernel
     sm75_q4_down_pack_a_kernel
+    sm75_q4_down_pack_a_inplace_kernel
     sm75_q4_down_pack_w_kernel
+    sm75_q4_down_quantize_q8k_kernel
+    sm75_q4_down_quantize_native_q8k_kernel
 )
 
 PROFILE_GPU=${PROFILE_GPU:-0}
@@ -391,7 +394,10 @@ import sys
 path = sys.argv[1]
 with open(path, newline="", encoding="utf-8-sig") as handle:
     rows = {row["label"]: row for row in csv.DictReader(handle)}
-required = {"standard", "native-w", "native-aw", "pack-a", "pack-w"}
+required = {
+    "standard", "native-w", "native-aw", "pack-a", "pack-a-inplace",
+    "pack-w", "quantize-q8k", "quantize-native-q8k",
+}
 if set(rows) != required:
     raise SystemExit(f"unexpected SASS summary labels: {sorted(rows)}")
 
@@ -408,7 +414,10 @@ for label in ("native-w", "native-aw"):
         raise SystemExit(f"{label} has no recorded m8n8k32 IMMA")
     if count(label, "s4_u4") <= 0 or count(label, "u4_u4") <= 0:
         raise SystemExit(f"{label} is missing a packed INT4 operand form")
-for label in ("standard", "native-w", "native-aw"):
+for label in (
+    "standard", "native-w", "native-aw", "pack-a-inplace",
+    "quantize-q8k", "quantize-native-q8k",
+):
     if count(label, "ldl") != 0 or count(label, "stl") != 0:
         raise SystemExit(f"{label} has recorded local-memory traffic")
 PY
@@ -470,7 +479,9 @@ else
         (( s4_u4 > 0 )) || die "$kernel contains no S4 x U4 IMMA instruction"
         (( u4_u4 > 0 )) || die "$kernel contains no U4 x U4 IMMA instruction"
     fi
-    if [[ $label == standard || $label == native-w || $label == native-aw ]]; then
+    if [[ $label == standard || $label == native-w || $label == native-aw ||
+          $label == pack-a-inplace || $label == quantize-q8k ||
+          $label == quantize-native-q8k ]]; then
         (( ldl == 0 && stl == 0 )) ||
             die "$kernel contains local-memory load/store spill indicators"
         fi
@@ -488,7 +499,9 @@ if [[ $RESUME_NCU == 0 ]]; then
             }
 fi
 [[ -s $OUTPUT_DIR/correctness.log ]] || die "correctness evidence is missing"
-for marker in activation_pack_validation=exact output_validation=bit_exact \
+for marker in activation_pack_validation=exact \
+        direct_native_quantizer_validation=byte_exact \
+        output_validation=bit_exact \
         unowned_output_poison_validation=exact correctness_status=ok \
         harness_status=ok; do
     grep -Fxq "$marker" "$OUTPUT_DIR/correctness.log" ||
@@ -538,6 +551,81 @@ validate_benchmark() {
         die "$scenario benchmark omitted benchmark_status=ok"
     grep -Fxq 'harness_status=ok' "$log" ||
         die "$scenario benchmark omitted harness_status=ok"
+    for marker in direct_native_quantizer_benchmark_begin=1 \
+            direct_native_quantizer_post_timing_exactness=byte-exact \
+            direct_native_quantizer_post_timing_canaries=ok \
+            direct_native_quantizer_benchmark_end=1; do
+        grep -Fxq "$marker" "$log" ||
+            die "$scenario benchmark omitted required marker: $marker"
+    done
+    if ! python3 - "$log" "$BENCH_ROUNDS" "$BENCH_LAUNCHES" <<'PY'
+import math
+import re
+import sys
+
+path, rounds_text, iterations_text = sys.argv[1:]
+with open(path, encoding="utf-8-sig") as handle:
+    lines = [line.rstrip("\n") for line in handle]
+values = {}
+for line in lines:
+    if "=" in line:
+        key, value = line.split("=", 1)
+        values[key] = value
+
+expected_ints = {
+    "direct_native_quantizer_rounds": int(rounds_text),
+    "direct_native_quantizer_iterations_per_sample": int(iterations_text),
+    "quantizer_rows_per_iteration": 3072,
+    "quantizer_blocks_per_row": 8,
+    "quantizer_blocks_per_iteration": 24576,
+    "canonical_quantize_pack_launches_per_iteration": 2,
+    "direct_native_quantize_launches_per_iteration": 1,
+    "quantizer_input_bytes_per_iteration": 25165824,
+    "native_q8_record_bytes": 292,
+    "canonical_intermediate_global_bytes_per_block": 584,
+    "canonical_intermediate_global_bytes_per_iteration": 14352384,
+    "native_q8_output_bytes_per_iteration": 7176192,
+    "canonical_nominal_global_bytes_per_iteration": 46694400,
+    "direct_native_nominal_global_bytes_per_iteration": 32342016,
+    "direct_native_intermediate_global_bytes_per_block": 0,
+}
+for key, expected in expected_ints.items():
+    try:
+        actual = int(values[key])
+    except (KeyError, ValueError) as error:
+        raise SystemExit(f"invalid direct-quantizer field {key}: {error}")
+    if actual != expected:
+        raise SystemExit(f"unexpected {key}: {actual}, expected {expected}")
+if values.get("direct_native_quantizer_scope") != \
+        "one-production-shaped-activation-surface":
+    raise SystemExit("direct quantizer reported an unexpected benchmark scope")
+if values.get("direct_native_quantizer_consumer_excluded") != "1":
+    raise SystemExit("direct quantizer benchmark did not exclude the consumer")
+
+def positive(key):
+    try:
+        value = float(values[key])
+    except (KeyError, ValueError) as error:
+        raise SystemExit(f"invalid direct-quantizer field {key}: {error}")
+    if not math.isfinite(value) or value <= 0.0:
+        raise SystemExit(f"non-positive/non-finite {key}: {value}")
+    return value
+
+canonical = positive("canonical_quantize_pack_median_total_ms")
+direct = positive("direct_native_quantize_median_total_ms")
+speedup = positive("direct_native_quantize_speedup")
+if not math.isclose(speedup, canonical / direct,
+                    rel_tol=2e-6, abs_tol=2e-6):
+    raise SystemExit("direct-native quantizer speedup is inconsistent")
+sample_paths = [line for line in lines if re.fullmatch(
+    r"direct_native_quantizer_round_\d+_slot_\d+_path="
+    r"(?:canonical-quantize-pack|direct-native-quantize)", line)]
+if len(sample_paths) != 2 * int(rounds_text):
+    raise SystemExit("direct-native quantizer sample count is incomplete")
+PY
+    then
+        die "$scenario direct-native quantizer benchmark validation failed"
+    fi
     grep -Fxq 'scenario,round,sample_slot,variant,total_ms,us_per_launch,relative_speed' \
         "$log" || die "$scenario benchmark omitted the sample CSV header"
     grep -Fxq 'scenario,variant,median_total_ms,median_us_per_launch,relative_speed' \

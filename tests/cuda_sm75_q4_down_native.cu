@@ -11,6 +11,12 @@
  *   native-aw-combined   Q8_K pack plus native-aw consumer per launch
  *   pack-a               Q8_K pack only
  *
+ * The harness also times the activation producer independently.  That bounded
+ * comparison is canonical Q8_K quantize + native pack (two launches) versus a
+ * direct native-Q8_K quantizer (one launch).  The direct path is not wired into
+ * production unless it first wins this inclusive comparison and remains byte
+ * identical to the canonical quantize-then-pack result.
+ *
  * The Q4_K headers, packed scale/min metadata, signed Q8_K scale, bsums min
  * correction, b-slot accumulation, and final float reduction tree match the
  * production source.  This file is built without --use_fast_math, so an
@@ -259,6 +265,77 @@ extern "C" __global__ void sm75_q4_down_quantize_q8k_kernel(
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
+/* Direct form of the production quantizer for native SM75 consumers.  The
+ * extrema reduction, signed scale, lrintf expression, and clamps above are
+ * intentionally repeated verbatim.  Only the destination encoding changes:
+ * the 256 quantized bytes remain in their producing lanes and are transposed
+ * into the size-neutral nibble planes with warp shuffles, so no canonical
+ * Q8_K record ever reaches global memory. */
+__device__ __forceinline__ static void store_native_q8k_block(
+        NativeQ8K *yb, int qv, uint32_t tid, float d) {
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane4 = lane & 3u;
+    uint32_t low = 0u;
+    uint32_t high = 0u;
+    int word_sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const int qi = __shfl_sync(0xffffffffu, qv, lane4 * 8u + i);
+        const uint32_t raw = (uint32_t)(uint8_t)(int8_t)qi;
+        low |= (raw & 0x0fu) << (4u * i);
+        high |= ((raw >> 4u) & 0x0fu) << (4u * i);
+        word_sum += (int)(int8_t)qi;
+    }
+    const int pair_sum = word_sum +
+        __shfl_xor_sync(0xffffffffu, word_sum, 1u);
+    if (lane < 4u) {
+        yb->low[warp][lane] = low;
+        yb->high_signed[warp][lane] = high;
+    }
+    if (lane == 0u) yb->bsums[2u * warp] = (int16_t)pair_sum;
+    if (lane == 2u) yb->bsums[2u * warp + 1u] = (int16_t)pair_sum;
+    if (tid == 0u) yb->d = d;
+}
+
+extern "C" __global__ void sm75_q4_down_quantize_native_q8k_kernel(
+        NativeQ8K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / QK_K) return;
+    const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * QK_K;
+    NativeQ8K *yb = out + (uint64_t)row * (in_dim / QK_K) + b;
+    __shared__ float abs_part[QK_K];
+    __shared__ float val_part[QK_K];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const float v = xr[tid];
+    abs_part[tid] = fabsf(v);
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (abs_part[0] == 0.0f) {
+        store_native_q8k_block(yb, 0, tid, 0.0f);
+        return;
+    }
+    if (tid == 0) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    int qv = (int)lrintf(iscale_s * xr[tid]);
+    qv = qv > 127 ? 127 : (qv < -128 ? -128 : qv);
+    const float d = tid == 0u ? 1.0f / iscale_s : 0.0f;
+    store_native_q8k_block(yb, qv, tid, d);
+}
+
 /* Eight warps convert eight Q8_K blocks per CTA. No standard and native A
  * copies are staged together in shared memory; this is a pure global layout
  * transform and is timed separately and in the combined variant. */
@@ -279,6 +356,33 @@ extern "C" __global__ void sm75_q4_down_pack_a_kernel(
     dst->high_signed[j][lane4] = pack_nibbles_8(x0, x1, 4u);
     if (lane == 0) dst->d = src->d;
     if (lane < QK_K / 16) dst->bsums[lane] = src->bsums[lane];
+}
+
+/* Production's canonical control performs the same transform in place. Every
+ * source byte owned by the warp is captured before any lane overwrites the
+ * record. Keep this separate from pack-a so the established consumer matrix
+ * remains an out-of-place transform while the direct-quantizer comparison
+ * mirrors production's exact two-launch operation. */
+extern "C" __global__ void sm75_q4_down_pack_a_inplace_kernel(
+        BlockQ8K *io, uint64_t n_blocks) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t block = (uint64_t)blockIdx.x * WARPS_PER_CTA + warp;
+    if (block >= n_blocks) return;
+    const BlockQ8K *src = io + block;
+    const uint32_t j = lane >> 2u;
+    const uint32_t lane4 = lane & 3u;
+    const uint32_t off = j * 32u + lane4 * 8u;
+    const uint32_t x0 = load_u32_unaligned(src->qs + off);
+    const uint32_t x1 = load_u32_unaligned(src->qs + off + 4u);
+    const float d = src->d;
+    const int16_t bsum = lane < QK_K / 16 ? src->bsums[lane] : 0;
+    __syncwarp();
+    NativeQ8K *dst = (NativeQ8K *)io + block;
+    dst->low[j][lane4] = pack_nibbles_8(x0, x1, 0u);
+    dst->high_signed[j][lane4] = pack_nibbles_8(x0, x1, 4u);
+    if (lane == 0u) dst->d = d;
+    if (lane < QK_K / 16) dst->bsums[lane] = bsum;
 }
 
 /* Offline, size-neutral weight-layout builder. Its cost is deliberately not
@@ -743,8 +847,10 @@ struct ScenarioData {
     HostMetadata host_meta;
     DeviceBuffer standard_w;
     DeviceBuffer native_w;
+    DeviceBuffer input;
     DeviceBuffer standard_a;
     DeviceBuffer native_a;
+    DeviceBuffer direct_native_a;
     DeviceBuffer output;
     uint32_t *d_sorted_pairs;
     uint32_t *d_offsets;
@@ -1003,6 +1109,19 @@ static void fill_activations(float *values, const ScenarioSpec *spec) {
             row[3] = 127.0f / 64.0f;
         }
     }
+    /* Quantizer-specific exactness gates which are otherwise rare in the
+     * production-shaped random corpus.  The strict `>` extrema reduction must
+     * preserve the first member of equal-absolute-value ties, including its
+     * sign, and the all-zero fast path must produce an entirely zero record. */
+    memset(values, 0, QK_K * sizeof(float));
+    values[(uint64_t)1u * MID_DIM + 0u] = -2.0f;
+    values[(uint64_t)1u * MID_DIM + 1u] = 2.0f;
+    values[(uint64_t)1u * MID_DIM + 2u] = -1.0f;
+    values[(uint64_t)1u * MID_DIM + 3u] = 1.0f;
+    values[(uint64_t)2u * MID_DIM + 0u] = 2.0f;
+    values[(uint64_t)2u * MID_DIM + 1u] = -2.0f;
+    values[(uint64_t)2u * MID_DIM + 2u] = 1.0f;
+    values[(uint64_t)2u * MID_DIM + 3u] = -1.0f;
 }
 
 static int validate_weight_pack_samples(
@@ -1067,9 +1186,10 @@ static int validate_activation_pack(const ScenarioData *d) {
     const size_t bytes = (size_t)d->activation_blocks * sizeof(BlockQ8K);
     BlockQ8K *standard = (BlockQ8K *)malloc(bytes);
     NativeQ8K *native = (NativeQ8K *)malloc(bytes);
-    if (!standard || !native) {
+    NativeQ8K *direct = (NativeQ8K *)malloc(bytes);
+    if (!standard || !native || !direct) {
         fprintf(stderr, "error: activation validation allocation failed\n");
-        free(native); free(standard);
+        free(direct); free(native); free(standard);
         return 0;
     }
     cuda_die(cudaMemcpy(standard, d->standard_a.ptr, bytes,
@@ -1078,18 +1198,37 @@ static int validate_activation_pack(const ScenarioData *d) {
     cuda_die(cudaMemcpy(native, d->native_a.ptr, bytes,
                         cudaMemcpyDeviceToHost),
              "copy native Q8_K activations");
-    uint64_t negative_d = 0, positive_d = 0;
+    cuda_die(cudaMemcpy(direct, d->direct_native_a.ptr, bytes,
+                        cudaMemcpyDeviceToHost),
+             "copy direct-native Q8_K activations");
+    uint64_t negative_d = 0, positive_d = 0, zero_d = 0;
     for (uint64_t block = 0; block < d->activation_blocks; block++) {
+        if (memcmp(native + block, direct + block, sizeof(NativeQ8K)) != 0) {
+            const uint8_t *expected = (const uint8_t *)(native + block);
+            const uint8_t *actual = (const uint8_t *)(direct + block);
+            uint32_t byte = 0u;
+            while (byte < sizeof(NativeQ8K) &&
+                   expected[byte] == actual[byte]) byte++;
+            fprintf(stderr,
+                    "error: direct-native Q8_K mismatch block=%llu byte=%u "
+                    "expected=%02x actual=%02x\n",
+                    (unsigned long long)block, byte,
+                    byte < sizeof(NativeQ8K) ? expected[byte] : 0u,
+                    byte < sizeof(NativeQ8K) ? actual[byte] : 0u);
+            free(direct); free(native); free(standard);
+            return 0;
+        }
         if (memcmp(&standard[block].d, &native[block].d, sizeof(float)) != 0 ||
             memcmp(standard[block].bsums, native[block].bsums,
                    sizeof(standard[block].bsums)) != 0) {
             fprintf(stderr, "error: native-A metadata mismatch block=%llu\n",
                     (unsigned long long)block);
-            free(native); free(standard);
+            free(direct); free(native); free(standard);
             return 0;
         }
         negative_d += standard[block].d < 0.0f;
         positive_d += standard[block].d > 0.0f;
+        zero_d += standard[block].d == 0.0f;
         for (uint32_t j = 0; j < Q4_GROUPS; j++) {
             for (uint32_t lane4 = 0; lane4 < 4u; lane4++) {
                 const uint32_t off = j * 32u + lane4 * 8u;
@@ -1105,7 +1244,7 @@ static int validate_activation_pack(const ScenarioData *d) {
                             "error: native-A plane mismatch block=%llu "
                             "j=%u lane4=%u\n",
                             (unsigned long long)block, j, lane4);
-                    free(native); free(standard);
+                    free(direct); free(native); free(standard);
                     return 0;
                 }
             }
@@ -1118,23 +1257,28 @@ static int validate_activation_pack(const ScenarioData *d) {
                 fprintf(stderr,
                         "error: Q8_K bsum mismatch block=%llu group=%u\n",
                         (unsigned long long)block, g);
-                free(native); free(standard);
+                free(direct); free(native); free(standard);
                 return 0;
             }
         }
     }
-    if (!negative_d || !positive_d) {
+    if (!negative_d || !positive_d || !zero_d) {
         fprintf(stderr,
-                "error: activation corpus did not exercise both signs of d\n");
-        free(native); free(standard);
+                "error: activation corpus did not exercise negative, positive, "
+                "and zero d\n");
+        free(direct); free(native); free(standard);
         return 0;
     }
     printf("activation_blocks_byte_validated=%llu\n"
            "q8_negative_d_blocks=%llu\nq8_positive_d_blocks=%llu\n"
-           "activation_pack_validation=exact\n",
+           "q8_zero_d_blocks=%llu\n"
+           "activation_pack_validation=exact\n"
+           "direct_native_quantizer_validation=byte_exact\n",
            (unsigned long long)d->activation_blocks,
            (unsigned long long)negative_d,
-           (unsigned long long)positive_d);
+           (unsigned long long)positive_d,
+           (unsigned long long)zero_d);
+    free(direct);
     free(native);
     free(standard);
     return 1;
@@ -1149,7 +1293,9 @@ static void cleanup_scenario(ScenarioData *d) {
     if (d->d_sorted_pairs) cudaFree(d->d_sorted_pairs);
     free_guarded(&d->output);
     free_guarded(&d->native_a);
+    free_guarded(&d->direct_native_a);
     free_guarded(&d->standard_a);
+    free_guarded(&d->input);
     free_guarded(&d->native_w);
     free_guarded(&d->standard_w);
     free_host_metadata(&d->host_meta);
@@ -1189,7 +1335,6 @@ static int setup_scenario(ScenarioData *d, const ScenarioSpec *spec) {
         (BlockQ4K *)malloc((size_t)d->weight_bytes);
     float *host_activations = (float *)malloc(
         (size_t)TOTAL_PAIR_SLOTS * MID_DIM * sizeof(float));
-    float *device_activations = NULL;
     int ok = 0;
     if (!host_weights || !host_activations) {
         fprintf(stderr, "error: scenario host allocation failed\n");
@@ -1199,8 +1344,10 @@ static int setup_scenario(ScenarioData *d, const ScenarioSpec *spec) {
     fill_activations(host_activations, spec);
     if (!alloc_guarded(&d->standard_w, d->weight_bytes) ||
         !alloc_guarded(&d->native_w, d->weight_bytes) ||
+        !alloc_guarded(&d->input, input_bytes) ||
         !alloc_guarded(&d->standard_a, activation_bytes) ||
         !alloc_guarded(&d->native_a, activation_bytes) ||
+        !alloc_guarded(&d->direct_native_a, activation_bytes) ||
         !alloc_guarded(&d->output, output_bytes)) {
         goto done;
     }
@@ -1219,14 +1366,12 @@ static int setup_scenario(ScenarioData *d, const ScenarioSpec *spec) {
             host_weights, spec,
             (const NativeWeightTileBlock *)d->native_w.ptr)) goto done;
 
-    cuda_die(cudaMalloc((void **)&device_activations, input_bytes),
-             "allocate activation floats");
-    cuda_die(cudaMemcpy(device_activations, host_activations, input_bytes,
+    cuda_die(cudaMemcpy(d->input.ptr, host_activations, input_bytes,
                         cudaMemcpyHostToDevice),
              "copy activation floats");
     sm75_q4_down_quantize_q8k_kernel<<<
         dim3(MIDQ_BLOCKS_MAX, TOTAL_PAIR_SLOTS), THREADS_PER_CTA>>>(
-        (BlockQ8K *)d->standard_a.ptr, device_activations,
+        (BlockQ8K *)d->standard_a.ptr, (const float *)d->input.ptr,
         MID_DIM, TOTAL_PAIR_SLOTS);
     cuda_die(cudaGetLastError(), "launch Q8_K quantizer");
     sm75_q4_down_pack_a_kernel<<<
@@ -1236,6 +1381,11 @@ static int setup_scenario(ScenarioData *d, const ScenarioSpec *spec) {
         (const BlockQ8K *)d->standard_a.ptr,
         d->activation_blocks);
     cuda_die(cudaGetLastError(), "launch native-A pack");
+    sm75_q4_down_quantize_native_q8k_kernel<<<
+        dim3(MIDQ_BLOCKS_MAX, TOTAL_PAIR_SLOTS), THREADS_PER_CTA>>>(
+        (NativeQ8K *)d->direct_native_a.ptr, (const float *)d->input.ptr,
+        MID_DIM, TOTAL_PAIR_SLOTS);
+    cuda_die(cudaGetLastError(), "launch direct-native Q8_K quantizer");
     cuda_die(cudaDeviceSynchronize(), "synchronize activation setup");
     if (!validate_activation_pack(d)) goto done;
 
@@ -1260,13 +1410,14 @@ static int setup_scenario(ScenarioData *d, const ScenarioSpec *spec) {
                         cudaMemcpyHostToDevice), "copy tile total");
     ok = validate_canary(&d->standard_w, "standard-W") &&
          validate_canary(&d->native_w, "native-W") &&
+         validate_canary(&d->input, "activation-input") &&
          validate_canary(&d->standard_a, "standard-A") &&
          validate_canary(&d->native_a, "native-A") &&
+         validate_canary(&d->direct_native_a, "direct-native-A") &&
          validate_canary(&d->output, "output");
     if (ok) printf("setup_canaries=ok\n");
 
 done:
-    if (device_activations) cudaFree(device_activations);
     free(host_activations);
     free(host_weights);
     if (!ok) cleanup_scenario(d);
@@ -1434,8 +1585,10 @@ static int run_correctness(ScenarioData *d) {
     const int canaries_ok =
         validate_canary(&d->standard_w, "standard-W") &&
         validate_canary(&d->native_w, "native-W") &&
+        validate_canary(&d->input, "activation-input") &&
         validate_canary(&d->standard_a, "standard-A") &&
         validate_canary(&d->native_a, "native-A") &&
+        validate_canary(&d->direct_native_a, "direct-native-A") &&
         validate_canary(&d->output, "output");
     printf("output_values_compared=%llu\n"
            "output_allocation_values=%llu\n"
@@ -1459,8 +1612,165 @@ static int compare_double(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
+enum QuantizerPath {
+    QUANT_CANONICAL_PACK = 0,
+    QUANT_DIRECT_NATIVE,
+    QUANT_PATH_COUNT,
+};
+
+static const char *const kQuantizerPathNames[QUANT_PATH_COUNT] = {
+    "canonical-quantize-pack",
+    "direct-native-quantize",
+};
+
+static void launch_quantizer_path(const ScenarioData *d,
+                                  QuantizerPath path,
+                                  cudaStream_t stream) {
+    const dim3 quant_grid(MIDQ_BLOCKS_MAX, TOTAL_PAIR_SLOTS, 1u);
+    if (path == QUANT_CANONICAL_PACK) {
+        sm75_q4_down_quantize_q8k_kernel<<<
+            quant_grid, THREADS_PER_CTA, 0, stream>>>(
+            (BlockQ8K *)d->native_a.ptr,
+            (const float *)d->input.ptr, MID_DIM, TOTAL_PAIR_SLOTS);
+        cuda_die(cudaGetLastError(), "launch timed Q8_K quantizer");
+        sm75_q4_down_pack_a_inplace_kernel<<<
+            (unsigned int)((d->activation_blocks + WARPS_PER_CTA - 1u) /
+                           WARPS_PER_CTA), THREADS_PER_CTA, 0, stream>>>(
+            (BlockQ8K *)d->native_a.ptr, d->activation_blocks);
+        cuda_die(cudaGetLastError(), "launch timed in-place native-A pack");
+        return;
+    }
+    sm75_q4_down_quantize_native_q8k_kernel<<<
+        quant_grid, THREADS_PER_CTA, 0, stream>>>(
+        (NativeQ8K *)d->direct_native_a.ptr,
+        (const float *)d->input.ptr, MID_DIM, TOTAL_PAIR_SLOTS);
+    cuda_die(cudaGetLastError(), "launch timed direct-native Q8_K quantizer");
+}
+
+/* This timing is intentionally isolated from the existing consumer matrix.
+ * It measures the complete activation-production operation needed by a native
+ * consumer, including both canonical launches and their intermediate global
+ * traffic.  Key/value output keeps the established consumer CSV contract
+ * unchanged for the archive parser. */
+static int run_quantizer_benchmark(ScenarioData *d, uint32_t rounds,
+                                   uint32_t iterations) {
+    double *samples = (double *)calloc(
+        (size_t)QUANT_PATH_COUNT * rounds, sizeof(double));
+    double *sorted = (double *)malloc((size_t)rounds * sizeof(double));
+    if (!samples || !sorted) {
+        fprintf(stderr, "error: quantizer benchmark allocation failed\n");
+        free(sorted); free(samples);
+        return 0;
+    }
+    cudaEvent_t start, stop;
+    cuda_die(cudaEventCreate(&start), "create quantizer benchmark start");
+    cuda_die(cudaEventCreate(&stop), "create quantizer benchmark stop");
+    launch_quantizer_path(d, QUANT_CANONICAL_PACK, 0);
+    launch_quantizer_path(d, QUANT_DIRECT_NATIVE, 0);
+    cuda_die(cudaDeviceSynchronize(), "synchronize quantizer warmup");
+
+    const uint64_t input_bytes =
+        (uint64_t)TOTAL_PAIR_SLOTS * MID_DIM * sizeof(float);
+    const uint64_t native_output_bytes =
+        d->activation_blocks * sizeof(NativeQ8K);
+    const uint64_t canonical_intermediate_bytes =
+        d->activation_blocks * 2u * sizeof(BlockQ8K);
+
+    printf("direct_native_quantizer_benchmark_begin=1\n"
+           "direct_native_quantizer_scope=one-production-shaped-activation-surface\n"
+           "direct_native_quantizer_consumer_excluded=1\n"
+           "direct_native_quantizer_rounds=%u\n"
+           "direct_native_quantizer_iterations_per_sample=%u\n"
+           "quantizer_rows_per_iteration=%u\n"
+           "quantizer_blocks_per_row=%u\n"
+           "quantizer_blocks_per_iteration=%llu\n"
+           "canonical_quantize_pack_launches_per_iteration=2\n"
+           "direct_native_quantize_launches_per_iteration=1\n"
+           "quantizer_input_bytes_per_iteration=%llu\n"
+           "native_q8_record_bytes=%zu\n"
+           "canonical_intermediate_global_bytes_per_block=%zu\n"
+           "canonical_intermediate_global_bytes_per_iteration=%llu\n"
+           "native_q8_output_bytes_per_iteration=%llu\n"
+           "canonical_nominal_global_bytes_per_iteration=%llu\n"
+           "direct_native_nominal_global_bytes_per_iteration=%llu\n"
+           "direct_native_intermediate_global_bytes_per_block=0\n",
+           rounds, iterations, TOTAL_PAIR_SLOTS, MIDQ_BLOCKS_MAX,
+           (unsigned long long)d->activation_blocks,
+           (unsigned long long)input_bytes, sizeof(NativeQ8K),
+           2u * sizeof(BlockQ8K),
+           (unsigned long long)canonical_intermediate_bytes,
+           (unsigned long long)native_output_bytes,
+           (unsigned long long)(input_bytes + canonical_intermediate_bytes +
+                                native_output_bytes),
+           (unsigned long long)(input_bytes + native_output_bytes));
+    for (uint32_t round = 0; round < rounds; round++) {
+        for (uint32_t slot = 0; slot < QUANT_PATH_COUNT; slot++) {
+            const QuantizerPath path = (QuantizerPath)(
+                (slot + (round & 1u)) % QUANT_PATH_COUNT);
+            cuda_die(cudaEventRecord(start),
+                     "record quantizer benchmark start");
+            for (uint32_t i = 0; i < iterations; i++)
+                launch_quantizer_path(d, path, 0);
+            cuda_die(cudaEventRecord(stop),
+                     "record quantizer benchmark stop");
+            cuda_die(cudaEventSynchronize(stop),
+                     "synchronize quantizer benchmark sample");
+            float ms = 0.0f;
+            cuda_die(cudaEventElapsedTime(&ms, start, stop),
+                     "measure quantizer benchmark sample");
+            samples[(size_t)path * rounds + round] = ms;
+            printf("direct_native_quantizer_round_%u_slot_%u_path=%s\n"
+                   "direct_native_quantizer_round_%u_slot_%u_total_ms=%.6f\n"
+                   "direct_native_quantizer_round_%u_slot_%u_us_per_iteration=%.6f\n",
+                   round + 1u, slot + 1u, kQuantizerPathNames[path],
+                   round + 1u, slot + 1u, (double)ms,
+                   round + 1u, slot + 1u,
+                   1000.0 * (double)ms / iterations);
+        }
+    }
+    double medians[QUANT_PATH_COUNT];
+    for (int path = 0; path < QUANT_PATH_COUNT; path++) {
+        memcpy(sorted, samples + (size_t)path * rounds,
+               (size_t)rounds * sizeof(double));
+        qsort(sorted, rounds, sizeof(double), compare_double);
+        medians[path] = (rounds & 1u)
+            ? sorted[rounds / 2u]
+            : 0.5 * (sorted[rounds / 2u - 1u] + sorted[rounds / 2u]);
+    }
+    printf("canonical_quantize_pack_median_total_ms=%.6f\n"
+           "canonical_quantize_pack_median_us_per_iteration=%.6f\n"
+           "direct_native_quantize_median_total_ms=%.6f\n"
+           "direct_native_quantize_median_us_per_iteration=%.6f\n"
+           "direct_native_quantize_speedup=%.6f\n",
+           medians[QUANT_CANONICAL_PACK],
+           1000.0 * medians[QUANT_CANONICAL_PACK] / iterations,
+           medians[QUANT_DIRECT_NATIVE],
+           1000.0 * medians[QUANT_DIRECT_NATIVE] / iterations,
+           medians[QUANT_CANONICAL_PACK] / medians[QUANT_DIRECT_NATIVE]);
+
+    /* Both paths' most recent outputs must still match after all timed work;
+     * this also makes every timing sample conditional on exact native bytes. */
+    const int exact = validate_activation_pack(d);
+    const int canaries_ok =
+        validate_canary(&d->input, "activation-input") &&
+        validate_canary(&d->standard_a, "standard-A") &&
+        validate_canary(&d->native_a, "native-A") &&
+        validate_canary(&d->direct_native_a, "direct-native-A");
+    printf("direct_native_quantizer_post_timing_exactness=%s\n"
+           "direct_native_quantizer_post_timing_canaries=%s\n"
+           "direct_native_quantizer_benchmark_end=1\n",
+           exact ? "byte-exact" : "failed",
+           canaries_ok ? "ok" : "failed");
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    free(sorted);
+    free(samples);
+    return exact && canaries_ok;
+}
+
 static int run_benchmark(ScenarioData *d, uint32_t rounds,
                          uint32_t launches) {
+    if (!run_quantizer_benchmark(d, rounds, launches)) return 0;
     double *samples = (double *)calloc(
         (size_t)VARIANT_COUNT * rounds, sizeof(double));
     double *sorted = (double *)malloc((size_t)rounds * sizeof(double));
@@ -1569,6 +1879,11 @@ static void print_one_resource(const char *name, Kernel kernel,
 }
 
 static void print_resources(void) {
+    print_one_resource("quantize_q8k", sm75_q4_down_quantize_q8k_kernel);
+    print_one_resource("quantize_native_q8k",
+        sm75_q4_down_quantize_native_q8k_kernel);
+    print_one_resource("pack_a_inplace",
+        sm75_q4_down_pack_a_inplace_kernel);
     print_one_resource("standard", sm75_q4_down_standard_kernel);
     print_one_resource("native_w", sm75_q4_down_native_w_kernel);
     print_one_resource("native_aw", sm75_q4_down_native_aw_kernel);
@@ -1968,7 +2283,9 @@ static void usage(const char *argv0) {
         "\n"
         "Without --scenario, correctness runs early and late; benchmark and\n"
         "profile default to early. Without a mode, correctness and benchmark\n"
-        "run for the selected scenarios.\n", argv0);
+        "run for the selected scenarios. Every benchmark first reports the\n"
+        "inclusive canonical quantize+pack versus direct-native quantizer.\n",
+        argv0);
 }
 
 static uint32_t parse_u32(const char *text, const char *name) {

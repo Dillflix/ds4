@@ -1803,6 +1803,15 @@ poisoned before running the randomized, position-rotated benchmark rounds for
 both recorded shapes. This is not a claim of bit-exact agreement with the
 production kernel, which is built under a different compiler mode.
 
+The same benchmark logs contain a separate bounded producer comparison for a
+candidate direct-native Q8_K quantizer. It preserves the canonical signed
+scale, all 16 `bsums`, and every low/high nibble-plane byte, but writes the
+native 292-byte record directly. Its timing compares one direct launch against
+the complete canonical quantize-plus-pack operation (two launches), including
+the canonical record's 292-byte write and 292-byte reread. This candidate is
+harness-only; even a bounded win does not alter production dispatch without a
+subsequent production acceptance test.
+
 The script builds only an `sm_75` cubin, rejects any GPU other than compute
 capability 7.5, runs Compute Sanitizer when available, and checks the emitted
 standard/native kernels with `cuobjdump`. Focused Nsight Compute captures cover
