@@ -226,7 +226,10 @@ cache policy or any unexpected pair-0 attention dispatch. It also requires the
 physical GPU 0/1/2/3 power limits to match `250,260,250,250` W by default and
 requires the default fused T32 FP16-output path to dispatch. Thus a decode
 result cannot silently regain the unstable prefill topology or lose an
-accepted production optimization.
+accepted production optimization. Pair-1 attention and both indexer dispatches
+are required in the eligible multi-frontier throughput workload; PP512-only
+exact runs validate the policy masks without incorrectly requiring a split
+below the production dispatch threshold.
 
 `Q3A4_LAYOUT=mixed15` requires the current exact 15-layer allocation.
 `Q3A4_LAYOUT=all43` requires Q3A4 gate/up and Q4-32 down on every routed

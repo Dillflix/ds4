@@ -363,12 +363,6 @@ validate_common_log() {
         "$log" || return 1
     ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
         return 1
-    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
-        return 1
-    grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 .*selected_mode=gather-home' \
-        "$log" || return 1
-    grep -Eq 'prefill indexer row audit event=complete .*home_tier=1 .*selected_mode=partner-local' \
-        "$log" || return 1
     grep -Eq 'CUDA T32 f16-output fused summary: local=0 partner=[1-9][0-9]*' \
         "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
@@ -409,6 +403,16 @@ validate_common_log() {
                    layers==expected_layers && !bad)
         }
     ' "$log"
+}
+
+validate_eligible_prefill_dispatch() {
+    local log=$1
+    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+        return 1
+    grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 .*selected_mode=gather-home' \
+        "$log" || return 1
+    grep -Eq 'prefill indexer row audit event=complete .*home_tier=1 .*selected_mode=partner-local' \
+        "$log" || return 1
 }
 
 q4_gate_active_count() {
@@ -642,7 +646,8 @@ validate_throughput_run() {
     local variant=$1 base=$2
     validate_gpu_health_pair "$base" && validate_q8_state_files "$base" &&
         validate_throughput_csv "$base.csv" && validate_common_log "$base.log" &&
-        validate_mapping_audit "$variant" "$base.log"
+        validate_mapping_audit "$variant" "$base.log" &&
+        validate_eligible_prefill_dispatch "$base.log"
 }
 
 validate_exact_run() {
