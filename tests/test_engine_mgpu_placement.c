@@ -1128,6 +1128,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROW_SHADOW_PHASE");
 
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     g_n_gpus = 2;
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "automatic query-row splitting stays scoped to measured four-GPU layout");
