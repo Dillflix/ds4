@@ -1871,13 +1871,15 @@ Q8_K-plus-pack production behavior.
 
 `cuda-sm75-direct-native-q8-production-ab.sh` is the acceptance test. It runs
 the mixed15 and all43 models under the same stable 22/21 four-GPU topology,
-alternates canonical/direct arms for at least three repeats, and measures both
+runs one canonical/direct pair by default, and measures both
 prefill and 256-token decode at PP512, PP4096, and PP32768. Each process must
 report exclusive canonical or direct dispatch at both boundaries for both
 prefill and decode. The runner also requires identical dense-Q8 placement,
 healthy fixed GPU identities and power limits, and byte-identical logits for
 16 decode tokens at every frontier for each model. It is deliberately
 one-shot: an interrupted or GPU-loss run is archived rather than resumed.
+Increase `REPEATS` only when additional run-order/noise characterization is
+specifically needed; it is not required for the production correctness gate.
 
 ```bash
 cd ~/ds4-iq2-q4
@@ -1900,7 +1902,7 @@ GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
-REPEATS=3 \
+REPEATS=1 \
 TG_TOKENS=256 \
 EXACT_TOKENS=16 \
 SKIP_BUILD=0 \

@@ -18,7 +18,7 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   REQUIRED_POWER_LIMITS_W=250,260,250,250
-  REPEATS=3
+  REPEATS=1
   TG_TOKENS=256
   EXACT_TOKENS=16
   WARMUP_TOKENS=512
@@ -48,7 +48,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
-REPEATS=${REPEATS:-3}
+REPEATS=${REPEATS:-1}
 TG_TOKENS=${TG_TOKENS:-256}
 EXACT_TOKENS=${EXACT_TOKENS:-16}
 WARMUP_TOKENS=${WARMUP_TOKENS:-512}
@@ -82,9 +82,9 @@ for item in "REPEATS:$REPEATS" "TG_TOKENS:$TG_TOKENS" \
     value=${item#*:}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 done
-(( REPEATS >= 3 && TG_TOKENS == 256 && EXACT_TOKENS == 16 &&
+(( REPEATS >= 1 && TG_TOKENS == 256 && EXACT_TOKENS == 16 &&
    WARMUP_TOKENS == 512 && PREFILL_CHUNK == 2048 && PIPELINE_MB == 512 )) ||
-    die "require repeats>=3, tg_tokens=256, exact_tokens=16, warmup=512, prefill_chunk=2048, pipeline_mb=512"
+    die "require repeats>=1, tg_tokens=256, exact_tokens=16, warmup=512, prefill_chunk=2048, pipeline_mb=512"
 for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"

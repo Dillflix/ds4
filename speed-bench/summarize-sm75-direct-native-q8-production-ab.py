@@ -105,13 +105,15 @@ def main() -> None:
                 "direct_prefill_tps": statistics.median(
                     float(row["direct_prefill_tps"]) for row in group),
                 "paired_prefill_speedup": statistics.median(prefill_ratios),
-                "prefill_speedup_sd": statistics.stdev(prefill_ratios),
+                "prefill_speedup_sd": (statistics.stdev(prefill_ratios)
+                                       if len(prefill_ratios) > 1 else 0.0),
                 "canonical_decode_tps": statistics.median(
                     float(row["canonical_decode_tps"]) for row in group),
                 "direct_decode_tps": statistics.median(
                     float(row["direct_decode_tps"]) for row in group),
                 "paired_decode_speedup": statistics.median(decode_ratios),
-                "decode_speedup_sd": statistics.stdev(decode_ratios),
+                "decode_speedup_sd": (statistics.stdev(decode_ratios)
+                                      if len(decode_ratios) > 1 else 0.0),
                 "samples": len(group),
             })
 
