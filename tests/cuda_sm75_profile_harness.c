@@ -18,6 +18,11 @@
 #define PROFILE_TYPE_SM75_Q4_32 42u
 #define PROFILE_TYPE_SM75_Q3A4 43u
 
+extern void ds4_gpu_test_set_indexed_decode_exact_group(uint32_t heads);
+extern int ds4_gpu_test_indexed_decode_exact_resources(
+    uint32_t heads, int *registers, uint64_t *shared_bytes,
+    uint64_t *local_bytes, int *max_threads, int *active_blocks_per_sm);
+
 typedef enum {
     SCENARIO_MOE_Q4_EARLY,
     SCENARIO_MOE_Q4_LATE,
@@ -35,6 +40,7 @@ typedef enum {
     SCENARIO_Q8_OUT_B,
     SCENARIO_ATTN_INDEXED_32K,
     SCENARIO_ATTN_MIXED_32K,
+    SCENARIO_ATTN_INDEXED_DECODE_GROUPED,
     SCENARIO_INDEXER_32K,
 } scenario_kind;
 
@@ -207,6 +213,11 @@ static const scenario_spec scenarios[] = {
         0u, 0u, 0u, 512u, 64u, NULL,
     },
     {
+        "attn-indexed-decode-grouped",
+        SCENARIO_ATTN_INDEXED_DECODE_GROUPED, 27u,
+        0u, 0u, 0u, 1u, 64u, NULL,
+    },
+    {
         "indexer-32k", SCENARIO_INDEXER_32K, 27u,
         0u, 0u, 0u, 128u, 8192u, NULL,
     },
@@ -222,7 +233,8 @@ static void usage(const char *argv0) {
             "q2-early|q2-late|hybrid-iq2-q4-early|"
             "hybrid-iq2-q4-late|sm75-q4-32|sm75-q3a4|"
             "q8-q-b|q8-attn|q8-shared|q8-out-b|"
-            "attn-indexed-32k|attn-mixed-32k|indexer-32k\n"
+            "attn-indexed-32k|attn-mixed-32k|"
+            "attn-indexed-decode-grouped|indexer-32k\n"
             "\n"
             "A one-process, one-GPU SM75 profiling harness. It never opens a\n"
             "GGUF and caps predicted device state at 3 GiB. Set\n"
@@ -329,6 +341,42 @@ static int verify_zero_f32(const float *values, uint64_t count,
             return 0;
         }
     }
+    return 1;
+}
+
+static int verify_exact_nonzero_f32(const float *reference,
+                                    const float *candidate,
+                                    uint64_t count,
+                                    const char *label) {
+    uint64_t nonzero = 0u;
+    for (uint64_t i = 0u; i < count; i++) {
+        uint32_t ref_bits = 0u, got_bits = 0u;
+        memcpy(&ref_bits, reference + i, sizeof(ref_bits));
+        memcpy(&got_bits, candidate + i, sizeof(got_bits));
+        if (ref_bits != got_bits) {
+            fprintf(stderr,
+                    "error: %s mismatch at %llu: "
+                    "reference=%g (0x%08x) candidate=%g (0x%08x)\n",
+                    label, (unsigned long long)i,
+                    reference[i], ref_bits, candidate[i], got_bits);
+            return 0;
+        }
+        if (!isfinite(candidate[i])) {
+            fprintf(stderr, "error: %s non-finite value at %llu: %g\n",
+                    label, (unsigned long long)i, candidate[i]);
+            return 0;
+        }
+        nonzero += candidate[i] != 0.0f;
+    }
+    if (nonzero == 0u) {
+        fprintf(stderr, "error: %s fixture produced only zeros\n", label);
+        return 0;
+    }
+    printf("%s_values_checked=%llu\n%s_nonzero=%llu\n"
+           "%s_validation=byte-exact\n",
+           label, (unsigned long long)count,
+           label, (unsigned long long)nonzero,
+           label);
     return 1;
 }
 
@@ -1657,6 +1705,198 @@ cleanup:
     return ok;
 }
 
+static int run_indexed_decode_grouped(uint32_t timed_repeats) {
+    const uint32_t n_tokens = 1u, pos0 = 32767u;
+    const uint32_t n_raw = 128u, raw_cap = 2048u, raw_start = 1920u;
+    /* 7936 is the compressed-row count before a batch beginning at 31744.
+     * A decode token at the completed 32K frontier sees 32768 / 4 rows. */
+    const uint32_t n_comp = 8192u, top_k = 512u;
+    const uint32_t window = 128u, ratio = 4u;
+    const uint32_t n_head = 64u, head_dim = 512u;
+    const uint64_t q_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_value_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_value_count = (uint64_t)n_comp * head_dim;
+    const uint64_t model_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t tensor_bytes =
+        (q_count * 2u + raw_value_count + comp_value_count) * sizeof(float) +
+        (uint64_t)top_k * sizeof(int32_t);
+
+    float *model = (float *)malloc((size_t)model_bytes);
+    float *q_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *raw_host =
+        (float *)malloc((size_t)raw_value_count * sizeof(float));
+    float *comp_host =
+        (float *)malloc((size_t)comp_value_count * sizeof(float));
+    int32_t *topk_host = (int32_t *)malloc(top_k * sizeof(int32_t));
+    float *reference = (float *)malloc((size_t)q_count * sizeof(float));
+    float *candidate = (float *)malloc((size_t)q_count * sizeof(float));
+    ds4_gpu_tensor *q = NULL, *raw = NULL, *comp = NULL, *topk = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    int ok = 0;
+    model_storage = (unsigned char *)model;
+
+    printf("scenario=attn-indexed-decode-grouped\n"
+           "profile_kind=attention_sm75_indexed_decode_grouped\n"
+           "n_tokens=%u\npos0=%u\nn_raw=%u\nraw_cap=%u\n"
+           "raw_start=%u\nn_comp=%u\ntop_k=%u\nwindow=%u\nratio=%u\n"
+           "n_head=%u\nhead_dim=%u\nmodel_bytes=%llu\n"
+           "tensor_bytes=%llu\n",
+           n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+           window, ratio, n_head, head_dim,
+           (unsigned long long)model_bytes,
+           (unsigned long long)tensor_bytes);
+    for (uint32_t group = 2u; group <= 8u; group += 6u) {
+        int registers = 0, max_threads = 0, active_blocks = 0;
+        uint64_t shared_bytes = 0u, local_bytes = 0u;
+        if (!ds4_gpu_test_indexed_decode_exact_resources(
+                group, &registers, &shared_bytes, &local_bytes,
+                &max_threads, &active_blocks) ||
+            max_threads < 256 || active_blocks < 1) {
+            fprintf(stderr,
+                    "error: grouped indexed-decode resource query failed "
+                    "for %u heads\n", group);
+            goto cleanup;
+        }
+        printf("group%u_registers=%d\ngroup%u_shared_bytes=%llu\n"
+               "group%u_local_bytes=%llu\ngroup%u_max_threads=%d\n"
+               "group%u_active_blocks_per_sm=%d\n",
+               group, registers,
+               group, (unsigned long long)shared_bytes,
+               group, (unsigned long long)local_bytes,
+               group, max_threads,
+               group, active_blocks);
+    }
+    if (!model || !q_host || !raw_host || !comp_host || !topk_host ||
+        !reference || !candidate) {
+        fprintf(stderr, "error: grouped indexed-decode host allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t h = 0u; h < n_head; h++) {
+        model[h] = ((int32_t)(h % 17u) - 8) * (1.0f / 128.0f);
+    }
+    for (uint64_t i = 0u; i < q_count; i++) {
+        q_host[i] = ((int32_t)((i * 37u + 11u) % 251u) - 125) *
+                    (1.0f / 2048.0f);
+    }
+    for (uint64_t i = 0u; i < raw_value_count; i++) {
+        raw_host[i] = ((int32_t)((i * 29u + 7u) % 241u) - 120) *
+                      (1.0f / 4096.0f);
+    }
+    for (uint64_t i = 0u; i < comp_value_count; i++) {
+        comp_host[i] = ((int32_t)((i * 43u + 19u) % 239u) - 119) *
+                       (1.0f / 4096.0f);
+    }
+    for (uint32_t k = 0u; k < top_k; k++) {
+        topk_host[k] = (int32_t)((k * 1543u + 29u) % n_comp);
+    }
+
+    q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    raw = ds4_gpu_tensor_alloc(raw_value_count * sizeof(float));
+    comp = ds4_gpu_tensor_alloc(comp_value_count * sizeof(float));
+    topk = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(int32_t));
+    heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    if (!q || !raw || !comp || !topk || !heads ||
+        !ds4_gpu_tensor_write(q, 0u, q_host, q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            raw, 0u, raw_host, raw_value_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            comp, 0u, comp_host, comp_value_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            topk, 0u, topk_host, (uint64_t)top_k * sizeof(int32_t)) ||
+        !ds4_gpu_set_model_map(model, model_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "error: grouped indexed-decode device setup failed\n");
+        goto cleanup;
+    }
+
+#define DS4_RUN_INDEXED_DECODE() \
+    ds4_gpu_attention_indexed_mixed_batch_heads_tensor( \
+        heads, model, model_bytes, 0u, q, raw, comp, 0u, topk, \
+        n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, \
+        ratio, n_head, head_dim)
+#define DS4_SET_INDEXED_DECODE_GROUP(GROUP) \
+    ds4_gpu_test_set_indexed_decode_exact_group((GROUP))
+
+    DS4_SET_INDEXED_DECODE_GROUP(0u);
+    if (!DS4_RUN_INDEXED_DECODE() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            heads, 0u, reference, q_count * sizeof(float))) {
+        fprintf(stderr, "error: indexed-decode control failed\n");
+        goto cleanup;
+    }
+    DS4_SET_INDEXED_DECODE_GROUP(2u);
+    if (!DS4_RUN_INDEXED_DECODE() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads, 0u, candidate, q_count * sizeof(float)) ||
+        !verify_exact_nonzero_f32(
+            reference, candidate, q_count, "indexed_decode_group2")) {
+        goto cleanup;
+    }
+    DS4_SET_INDEXED_DECODE_GROUP(8u);
+    if (!DS4_RUN_INDEXED_DECODE() || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads, 0u, candidate, q_count * sizeof(float)) ||
+        !verify_exact_nonzero_f32(
+            reference, candidate, q_count, "indexed_decode_heads8")) {
+        goto cleanup;
+    }
+
+    if (timed_repeats > 0u) {
+        double elapsed_ms[3] = {0.0, 0.0, 0.0};
+        for (uint32_t variant = 0u; variant < 3u; variant++) {
+            DS4_SET_INDEXED_DECODE_GROUP(
+                variant == 1u ? 2u : (variant == 2u ? 8u : 0u));
+            if (!DS4_RUN_INDEXED_DECODE() || !ds4_gpu_synchronize()) {
+                fprintf(stderr,
+                        "error: indexed-decode timing warmup failed for %u\n",
+                        variant);
+                goto cleanup;
+            }
+            const double start = monotonic_seconds();
+            for (uint32_t repeat = 0u; repeat < timed_repeats; repeat++) {
+                if (!DS4_RUN_INDEXED_DECODE()) {
+                    fprintf(stderr,
+                            "error: indexed-decode timed launch failed for %u\n",
+                            variant);
+                    goto cleanup;
+                }
+            }
+            if (!ds4_gpu_synchronize()) {
+                fprintf(stderr,
+                        "error: indexed-decode timed sync failed for %u\n",
+                        variant);
+                goto cleanup;
+            }
+            elapsed_ms[variant] =
+                (monotonic_seconds() - start) * 1000.0 /
+                (double)timed_repeats;
+        }
+        printf("timed_repeats=%u\ncontrol_ms=%.9f\n"
+               "group2_ms=%.9f\nheads8_ms=%.9f\n"
+               "group2_speedup=%.9f\nheads8_speedup=%.9f\n",
+               timed_repeats, elapsed_ms[0], elapsed_ms[1], elapsed_ms[2],
+               elapsed_ms[0] / elapsed_ms[1],
+               elapsed_ms[0] / elapsed_ms[2]);
+    }
+    ok = 1;
+
+cleanup:
+    DS4_SET_INDEXED_DECODE_GROUP(0u);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    free(candidate);
+    free(reference);
+    free(topk_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+#undef DS4_SET_INDEXED_DECODE_GROUP
+#undef DS4_RUN_INDEXED_DECODE
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         usage(argv[0]);
@@ -1828,6 +2068,8 @@ int main(int argc, char **argv) {
     const int attention_32k =
         spec->kind == SCENARIO_ATTN_INDEXED_32K ||
         spec->kind == SCENARIO_ATTN_MIXED_32K;
+    const int indexed_decode_grouped =
+        spec->kind == SCENARIO_ATTN_INDEXED_DECODE_GROUPED;
     const int indexer_32k = spec->kind == SCENARIO_INDEXER_32K;
     const uint32_t private_q32_layout = DS4_TENSOR_LAYOUT_SM75_Q4_32 |
                                         DS4_TENSOR_LAYOUT_SM75_Q3A4;
@@ -1852,6 +2094,8 @@ int main(int argc, char **argv) {
                      timed_repeats);
     } else if (attention_32k) {
         ok = run_attention_32k(spec, timed_repeats);
+    } else if (indexed_decode_grouped) {
+        ok = run_indexed_decode_grouped(timed_repeats);
     } else if (indexer_32k) {
         ok = run_indexer_32k(spec, timed_repeats);
     } else {

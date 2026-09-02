@@ -7,6 +7,7 @@
 #include <time.h>
 
 extern void ds4_gpu_test_set_moe_q32_decode_graph(int enabled);
+extern void ds4_gpu_test_set_indexed_decode_exact_group(uint32_t heads);
 extern void ds4_gpu_test_set_moe_q32_decode_split(int enabled);
 extern void ds4_gpu_test_set_moe_q32_decode_fused_lowreg(uint32_t unroll);
 extern void ds4_gpu_test_set_moe_q4_32_decode_mapping(uint32_t mapping);
@@ -2714,12 +2715,14 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
     ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
     ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *decode_comp = ds4_gpu_tensor_alloc(
+        (uint64_t)8192u * head_dim * sizeof(float));
     ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(
         topk_count * sizeof(int32_t));
     ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_count * sizeof(float));
     int rc = 1;
     if (!sinks || !topk_host || !reference || !candidate ||
-        !q || !raw || !comp || !topk || !heads) goto cleanup;
+        !q || !raw || !comp || !decode_comp || !topk || !heads) goto cleanup;
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t k = 0; k < top_k; k++) {
             topk_host[(uint64_t)t * top_k + k] =
@@ -2729,6 +2732,8 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
     if (!ds4_gpu_tensor_fill_f32(q, 0.03125f, q_count) ||
         !ds4_gpu_tensor_fill_f32(raw, 0.015625f, raw_count) ||
         !ds4_gpu_tensor_fill_f32(comp, -0.0078125f, comp_count) ||
+        !ds4_gpu_tensor_fill_f32(
+            decode_comp, -0.0078125f, (uint64_t)8192u * head_dim) ||
         !ds4_gpu_tensor_write(topk, 0, topk_host,
                               topk_count * sizeof(int32_t)) ||
         !ds4_gpu_set_model_map(sinks, n_head * sizeof(float))) goto cleanup;
@@ -2758,6 +2763,53 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
         !compare_exact_f32("SM75 indexed attention heads8 shards",
                            reference, candidate, q_count)) goto cleanup;
     {
+        /* Completed 32K decode state: the position-32767 compressor row is
+         * committed before attention, so 32768 / 4 rows are visible. */
+        const uint32_t decode_n_raw = 128u;
+        const uint32_t decode_raw_cap = 2048u;
+        const uint32_t decode_raw_start = 1920u;
+        const uint32_t decode_n_comp = 8192u;
+        const uint32_t decode_window = 128u;
+        const uint64_t decode_count = (uint64_t)n_head * head_dim;
+        for (uint32_t k = 0u; k < top_k; k++) {
+            topk_host[k] =
+                (int32_t)((k * 1543u + 29u) % decode_n_comp);
+        }
+        if (!ds4_gpu_tensor_write(topk, 0u, topk_host,
+                                  (uint64_t)top_k * sizeof(int32_t))) {
+            goto cleanup;
+        }
+#define RUN_INDEXED_DECODE_EXACT(DST) \
+        (ds4_gpu_attention_indexed_mixed_batch_heads_tensor( \
+             heads, sinks, n_head * sizeof(float), 0u, q, raw, decode_comp, \
+             0u, topk, 1u, 32767u, decode_n_raw, decode_raw_cap, \
+             decode_raw_start, decode_n_comp, top_k, decode_window, ratio, \
+             n_head, head_dim) && \
+         ds4_gpu_synchronize() && \
+         ds4_gpu_tensor_read( \
+             heads, 0u, (DST), decode_count * sizeof(float)))
+        ds4_gpu_test_set_indexed_decode_exact_group(0u);
+        if (!RUN_INDEXED_DECODE_EXACT(reference)) goto cleanup;
+        ds4_gpu_test_set_indexed_decode_exact_group(2u);
+        if (!RUN_INDEXED_DECODE_EXACT(candidate) ||
+            !compare_exact_f32("SM75 indexed decode exact group2",
+                               reference, candidate, decode_count)) {
+            goto cleanup;
+        }
+        ds4_gpu_test_set_indexed_decode_exact_group(8u);
+        if (!RUN_INDEXED_DECODE_EXACT(candidate) ||
+            !compare_exact_f32("SM75 indexed decode exact heads8",
+                               reference, candidate, decode_count)) {
+            goto cleanup;
+        }
+        ds4_gpu_test_set_indexed_decode_exact_group(0u);
+#undef RUN_INDEXED_DECODE_EXACT
+        fprintf(stderr,
+                "cuda-regression: SM75 indexed decode group2/heads8 exact "
+                "at 32K (%llu values)\n",
+                (unsigned long long)decode_count);
+    }
+    {
         uint64_t nonzero = 0u;
         for (uint64_t i = 0; i < q_count; i++)
             nonzero += candidate[i] != 0.0f;
@@ -2776,9 +2828,11 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
 
 cleanup:
     (void)unsetenv("DS4_CUDA_INDEXED_HEADS8_SM75");
+    ds4_gpu_test_set_indexed_decode_exact_group(0u);
     if (sinks && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(heads);
     ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(decode_comp);
     ds4_gpu_tensor_free(comp);
     ds4_gpu_tensor_free(raw);
     ds4_gpu_tensor_free(q);
