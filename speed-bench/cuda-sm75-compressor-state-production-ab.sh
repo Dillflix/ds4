@@ -15,6 +15,8 @@ STAGE_SPLIT=${STAGE_SPLIT:-22}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+TG_TOKENS=${TG_TOKENS:-256}
+EXACT_TOKENS=${EXACT_TOKENS:-16}
 PREFILL_CHUNK=2048
 PIPELINE_MB=512
 CTX_ALLOC=33025
@@ -36,6 +38,8 @@ for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+[[ $TG_TOKENS =~ ^[1-9][0-9]*$ && $EXACT_TOKENS =~ ^[1-9][0-9]*$ ]] ||
+    die "TG_TOKENS and EXACT_TOKENS must be positive integers"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
 for tool in awk basename cmp date dirname env find git grep make mkdir mv nproc \
@@ -126,6 +130,7 @@ phase=manifest
     printf 'gpu_devices=%s\npower_limits_w=%s\nstage_split=22/21\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
     printf 'contexts=512,4096,32768\nrepeats=1\ncomparison=reference-vs-fused-pair-state-store\n'
+    printf 'tg_tokens=%s\nexact_tokens=%s\n' "$TG_TOKENS" "$EXACT_TOKENS"
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'
@@ -155,19 +160,31 @@ validate_health() {
         cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv"
 }
 
-validate_frontiers() {
-    local base=$1 context
+validate_throughput() {
+    local base=$1
     awk -F, '
-        NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps"); next}
-        NR==2 {rows++; a=($1==512 && ($3+0)>0); next}
-        NR==3 {rows++; b=($1==4096 && ($3+0)>0); next}
-        NR==4 {rows++; c=($1==32768 && ($3+0)>0); next}
+        NR==1 {header=($1=="ctx_tokens" && $4=="gen_tokens" &&
+                       $8=="gen_steady_tps"); next}
+        NR==2 {rows++; a=($1==512 && ($4+0)==tg && ($8+0)>0); next}
+        NR==3 {rows++; b=($1==4096 && ($4+0)==tg && ($8+0)>0); next}
+        NR==4 {rows++; c=($1==32768 && ($4+0)==tg && ($8+0)>0); next}
         NR>4 {rows++}
         END {exit !(header && rows==3 && a && b && c)}
+    ' tg="$TG_TOKENS" "$base.csv"
+}
+
+validate_exact() {
+    local base=$1 context=$2 logits=$3 token file
+    awk -F, -v ctx="$context" -v tg="$EXACT_TOKENS" '
+        NR==1 {header=($1=="ctx_tokens" && $4=="gen_tokens" &&
+                       $8=="gen_steady_tps"); next}
+        NR==2 {rows++; ok=($1==ctx && ($4+0)==tg && ($8+0)>0); next}
+        NR>2 {rows++}
+        END {exit !(header && rows==1 && ok)}
     ' "$base.csv" || return 1
-    for context in 512 4096 32768; do
-        printf -v file '%s-logits/frontier_%06d.logits.f32' "$base" "$context"
-        [[ -s $file ]] || return 1
+    for ((token=1; token<=EXACT_TOKENS; token++)); do
+        printf -v file 'frontier_%06d.decode_%06d.logits.f32' "$context" "$token"
+        [[ -s $logits/$file ]] || return 1
     done
 }
 
@@ -203,23 +220,23 @@ validate_selector() {
 }
 
 run_arm() {
-    local model=$1 variant=$2 base=$3 rc=0
-    local -a selector
+    local model=$1 variant=$2 tokens=$3 start=$4 max=$5 base=$6 logits=${7:-} rc=0
+    local -a selector cmd
     if [[ $variant == control ]]; then
         selector=(DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE=1)
     else
         selector=(DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE=1)
     fi
-    mkdir -p "$base-logits"
     capture_gpu_health "$base.pre-gpu.csv" || return 1
-    "${production_env[@]}" "${selector[@]}" ./ds4-bench \
+    cmd=("${production_env[@]}" "${selector[@]}" ./ds4-bench \
         --cuda --cuda-tensor-parallel \
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
         --model "$model" --prompt-file "$PROMPT" \
-        --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC" \
-        --step-mul 8 --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 \
-        --csv "$base.csv" --dump-frontier-logits-dir "$base-logits" \
-        >"$base.log" 2>&1 || rc=$?
+        --ctx-start "$start" --ctx-max "$max" --ctx-alloc "$CTX_ALLOC" \
+        --step-mul 8 --prefill-chunk "$PREFILL_CHUNK" --gen-tokens "$tokens")
+    [[ -z $logits ]] || cmd+=(--dump-decode-logits-dir "$logits")
+    cmd+=(--csv "$base.csv")
+    "${cmd[@]}" >"$base.log" 2>&1 || rc=$?
     capture_gpu_health "$base.post-gpu.csv" || return 1
     return "$rc"
 }
@@ -229,40 +246,66 @@ capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" || die "could not capture initi
 printf 'layout\tvariant\tcsv\tlog\tlogits\n' >"$OUTPUT_DIR/runs.tsv"
 for index in 0 1; do
     layout=${layouts[$index]}; model=${models[$index]}
-    for variant in control fused; do
+    if (( index % 2 == 0 )); then
+        variants=(control fused)
+    else
+        variants=(fused control)
+    fi
+    for variant in "${variants[@]}"; do
         base="$OUTPUT_DIR/runs/$layout-$variant"
         printf 'Compressor/state production A/B model=%s variant=%s...\n' "$layout" "$variant"
-        run_arm "$model" "$variant" "$base" || {
+        run_arm "$model" "$variant" "$TG_TOKENS" 512 32768 "$base" || {
             tail -n 200 "$base.log" >&2 || true
             die "$layout $variant production run failed"
         }
         validate_health "$base" || die "$layout $variant GPU health changed"
-        validate_frontiers "$base" || die "$layout $variant frontier output is incomplete"
+        validate_throughput "$base" || die "$layout $variant decode throughput output is incomplete"
         validate_topology "$base.log" || die "$layout $variant production topology validation failed"
         validate_selector "$variant" "$base.log" || die "$layout $variant fusion dispatch validation failed"
         printf '%s\t%s\t%s\t%s\t%s\n' "$layout" "$variant" \
-            "$base.csv" "$base.log" "$base-logits" >>"$OUTPUT_DIR/runs.tsv"
+            "$base.csv" "$base.log" "-" >>"$OUTPUT_DIR/runs.tsv"
     done
     for context in 512 4096 32768; do
-        printf -v name 'frontier_%06d.logits.f32' "$context"
-        cmp -s "$OUTPUT_DIR/runs/$layout-control-logits/$name" \
-               "$OUTPUT_DIR/runs/$layout-fused-logits/$name" ||
-            die "$layout fused output is not byte-exact at context $context"
+        for variant in control fused; do
+            base="$OUTPUT_DIR/runs/$layout-$variant-exact-pp$context"
+            logits="$base-logits"
+            mkdir -p "$logits"
+            printf 'Exact compressor/state decode logits model=%s variant=%s PP=%s...\n' \
+                "$layout" "$variant" "$context"
+            run_arm "$model" "$variant" "$EXACT_TOKENS" "$context" "$context" \
+                "$base" "$logits" || {
+                tail -n 200 "$base.log" >&2 || true
+                die "$layout $variant PP=$context exact run failed"
+            }
+            validate_health "$base" || die "$layout $variant PP=$context GPU health changed"
+            validate_exact "$base" "$context" "$logits" ||
+                die "$layout $variant PP=$context exact output is incomplete"
+            validate_topology "$base.log" ||
+                die "$layout $variant PP=$context topology validation failed"
+            validate_selector "$variant" "$base.log" ||
+                die "$layout $variant PP=$context fusion dispatch validation failed"
+        done
+        for ((token=1; token<=EXACT_TOKENS; token++)); do
+            printf -v name 'frontier_%06d.decode_%06d.logits.f32' "$context" "$token"
+            cmp -s "$OUTPUT_DIR/runs/$layout-control-exact-pp$context-logits/$name" \
+                   "$OUTPUT_DIR/runs/$layout-fused-exact-pp$context-logits/$name" ||
+                die "$layout fused output diverged at PP=$context decode token $token"
+        done
     done
 done
 
 phase=summarize
 {
     printf '# SM75 four-GPU compressor projection/state-store A/B\n\n'
-    printf '| Model | Context | Control prefill tok/s | Fused prefill tok/s | Speedup |\n'
+    printf '| Model | Context | Control decode tok/s | Fused decode tok/s | Speedup |\n'
     printf '| --- | ---: | ---: | ---: | ---: |\n'
     for layout in "${layouts[@]}"; do
         awk -F, -v layout="$layout" '
-            NR==FNR {if (FNR>1) control[$1]=$3; next}
-            FNR>1 {printf "| %s | %s | %.3f | %.3f | %.6fx |\n", layout,$1,control[$1],$3,$3/control[$1]}
+            NR==FNR {if (FNR>1) control[$1]=$8; next}
+            FNR>1 {printf "| %s | %s | %.3f | %.3f | %.6fx |\n", layout,$1,control[$1],$8,$8/control[$1]}
         ' "$OUTPUT_DIR/runs/$layout-control.csv" "$OUTPUT_DIR/runs/$layout-fused.csv"
     done
-    printf '\nExact frontier logits were byte-identical for both models.\n'
+    printf '\nAll %s decode logits at all three frontiers were byte-identical for both models.\n' "$EXACT_TOKENS"
 } | tee "$OUTPUT_DIR/summary/report.md"
 
 phase=complete
