@@ -4743,3 +4743,26 @@ REPEAT_LEVELS=1,64,256,512,1536 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 ```
+
+### Bounded exact compact-attention KV codec
+
+`cuda-sm75-compact-attention-kv.sh` does not alter production dispatch. It
+packs the existing 512-float compressed-attention row into a 736-byte exact
+representation: seven F32 power-of-two scales, 448 E4M3 sign/index bytes, and
+64 untouched F32 RoPE values. The harness requires bit-identical unpack and
+consumer output, rejects non-finite or non-representable rows, checks guarded
+allocations under Compute Sanitizer, records PTXAS/SASS resources, and times a
+full-row F32 consumer against compact decode plus consume. The reported SASS
+LDL/STL counts are explicitly whole-binary diagnostics, not a per-kernel
+acceptance gate.
+
+```bash
+PROFILE_GPU=0 \
+ROWS=8192 \
+TIMING_ROUNDS=7 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
+```
