@@ -1242,7 +1242,10 @@ The runner executes an alternating control/fused A/B at 512, 4096, and 32768
 tokens for both the existing mixed15 model and the new all43-Q3A4 gate/up
 model. Each process records the exact 344-entry plan and canonical binding
 state, pre/post GPU identity and power limits, routed quantization for all 43
-layers, FP16-result call counts, and full-vocabulary raw logits. It rejects a
+layers, FP16-result call counts, and full-vocabulary raw logits. The current
+stage-aware plan places all 43 T32 projections on partners (22 for the 22-layer
+stage and 21 for the 21-layer stage), so the candidate must report matching
+partner-fused and FP16-result counts with zero local fused calls. It rejects a
 plan change, missing production path, power-limit change, within-arm
 nondeterminism, or any frontier top-1 change. A passing performance/numerical
 screen requires a median win at 32K on both models and permits no measured

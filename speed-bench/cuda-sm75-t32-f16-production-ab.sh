@@ -283,13 +283,31 @@ validate_q8_state_files() {
     [[ $(wc -l <"$plan") == 345 && $(wc -l <"$bindings") == 345 ]] || return 1
     awk -F, '
         NR==1 {header=($1=="sequence" && $2=="label" && $3=="consumer_device" && $7=="resident_device" && $13=="status"); next}
-        {rows++; if (($7+0)<0 || ($13!="home" && $13!="partner")) bad=1}
-        END {exit !(header && rows==344 && !bad)}
+        {
+            rows++
+            if (($7+0)<0 || ($13!="home" && $13!="partner")) bad=1
+            if ($2 ~ /\.attn_q_b\.weight$/) {
+                t32++
+                if ($13!="partner") bad=1
+                if ($3==0 && $7==1) t32_pair0++
+                else if ($3==3 && $7==2) t32_pair1++
+                else bad=1
+            }
+        }
+        END {exit !(header && rows==344 && t32==43 &&
+                    t32_pair0==22 && t32_pair1==21 && !bad)}
     ' "$plan" || return 1
     awk -F, '
         NR==1 {header=($1=="consumer_device" && $2=="resident_device" && $3=="partner_offload" && $12=="label" && $15=="live"); next}
-        {rows++; if (($13+0)<=0 || ($14+0)<=0 || $15!=1) bad=1}
-        END {exit !(header && rows==344 && !bad)}
+        {
+            rows++
+            if (($13+0)<=0 || ($14+0)<=0 || $15!=1) bad=1
+            if ($12 ~ /\.attn_q_b\.weight$/) {
+                t32++
+                if ($3!=1) bad=1
+            }
+        }
+        END {exit !(header && rows==344 && t32==43 && !bad)}
     ' "$bindings"
 }
 
@@ -341,11 +359,18 @@ validate_variant() {
         total_partner=${BASH_REMATCH[1]}; f16_calls=${BASH_REMATCH[2]}
     fi
     if [[ $variant == control ]]; then
-        (( local_calls == 0 && partner_calls == 0 && f16_calls == 0 ))
+        if (( local_calls == 0 && partner_calls == 0 && f16_calls == 0 )); then
+            return 0
+        fi
     else
-        (( local_calls > 0 && partner_calls > 0 && total_partner >= partner_calls &&
-           f16_calls == partner_calls ))
+        if (( local_calls == 0 && partner_calls > 0 &&
+              total_partner >= partner_calls && f16_calls == partner_calls )); then
+            return 0
+        fi
     fi
+    printf 'validation: %s T32 counters local=%s partner=%s total-partner=%s f16-results=%s\n' \
+        "$variant" "$local_calls" "$partner_calls" "$total_partner" "$f16_calls" >&2
+    return 1
 }
 
 run_engine() {
@@ -387,10 +412,7 @@ validate_run() {
         return 1
     }
     validate_common_log "$layout" "$base.log" || return 1
-    validate_variant "$variant" "$base.log" || {
-        printf 'validation: %s T32 FP16 dispatch counters are invalid\n' "$variant" >&2
-        return 1
-    }
+    validate_variant "$variant" "$base.log"
 }
 
 phase=production-ab
