@@ -228,8 +228,9 @@ static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_ksplit_calls[3] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_prefetch_calls[3] = {};
 static std::atomic<bool> g_cuda_moe_q3a4_decode_mapping_logged = false;
-/* Diagnostic-only compressor projection/state-store fusion. Environment
- * selectors are sampled once during CUDA initialization, never per token. */
+/* SM75 compressor projection/state-store fusion. Enabled by default after
+ * exact four-GPU mixed15/all43 qualification. Environment selectors are
+ * sampled once during CUDA initialization, never per token. */
 static int g_cuda_compressor_pair_state_store;
 static int g_cuda_compressor_pair_state_store_disabled;
 static int g_cuda_compressor_pair_state_store_incompatible;
@@ -663,10 +664,10 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
-    g_cuda_compressor_pair_state_store =
-        getenv("DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE") != NULL;
     g_cuda_compressor_pair_state_store_disabled =
         getenv("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE") != NULL;
+    g_cuda_compressor_pair_state_store =
+        !g_cuda_compressor_pair_state_store_disabled;
     g_cuda_compressor_pair_state_store_audit =
         getenv("DS4_CUDA_COMPRESSOR_PAIR_STATE_STORE_AUDIT") != NULL;
     for (unsigned i = 0; i < 3u; ++i) {

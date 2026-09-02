@@ -4762,9 +4762,10 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-state-fusion.sh
 ```
 
-This is deliberately synthetic evidence. The fusion remains disabled by
-default and must not be promoted until a real-model engine A/B proves exact
-outputs, dispatch selection, and an end-to-end win on the production topology.
+This remains useful as bounded kernel evidence. The fusion is now enabled by
+default after exact four-GPU mixed15/all43 qualification. Set
+`DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE=1` for the retained reference
+rollback path.
 
 ### SM75 compressor projection/state-store production A/B
 
@@ -4787,3 +4788,7 @@ TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-state-production-ab.sh
 ```
+
+The accepted production run was byte-exact for 16 decode tokens at PP512,
+PP4096, and PP32768 on both models. All43 improved by 0.410% to 0.743%; mixed15
+was effectively neutral (-0.312% to +0.058%) at the longer prompt frontiers.
