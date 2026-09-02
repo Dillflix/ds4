@@ -13658,93 +13658,78 @@ attention_indexed_mixed_decode_streaming_exact_kernel(
     }
     __syncthreads();
 
-    /* Pass A: recompute scores tilewise and preserve each logical thread's
-     * row, row+256, ... max sequence without retaining the score surface.
-     * Score directly from the source row, as the shipping kernel does.  The
-     * production 32K stage probe localizes the first one-ULP divergence to
-     * this score/max phase, so shared-row score loads are an avoidable codegen
-     * difference.  Pass B still stages each row once for multi-head PV reuse. */
-    for (uint32_t row0 = 0u; row0 < n_score; row0 += ROWS_PER_STAGE) {
-        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE
-            ? n_score - row0 : ROWS_PER_STAGE;
-        uint32_t score_row = UINT32_MAX;
-        if (comp_count == 0u) {
-            score_row = (threadIdx.x + 256u - (row0 & 255u)) & 255u;
-            if (score_row < nr) {
-#pragma unroll
-                for (uint32_t local_head = 0u;
-                     local_head < HEADS_PER_GROUP; local_head++) {
-                    const uint32_t head = head_base + local_head;
-                    if (head >= n_head) continue;
-                    const float *qh = q + (uint64_t)head * head_dim;
-                    const uint32_t row = row0 + score_row;
-                    const float *kvrow = row < raw_count
-                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                        : comp_kv +
-                            (uint64_t)comp_rows[row - raw_count] * head_dim;
-                    float dot = 0.0f;
-                    for (uint32_t d = 0u; d < head_dim; d++) {
-                        dot += qh[d] * kvrow[d];
-                    }
-                    score_tile[local_head][score_row] = dot * scale;
-                }
-            }
-        } else {
-            /* Shipping assigns score row r to physical 8-lane subgroup
-             * r&31.  Retain that subgroup/lane identity while a subgroup
-             * evaluates the grouped heads sequentially. */
-            score_row = (score_group + 32u - (row0 & 31u)) & 31u;
-            if (score_row < nr) {
-                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
-#pragma unroll
-                for (uint32_t local_head = 0u;
-                     local_head < HEADS_PER_GROUP; local_head++) {
-                    const uint32_t head = head_base + local_head;
-                    if (head >= n_head) continue;
-                    const float *qh = q + (uint64_t)head * head_dim;
-                    const uint32_t row = row0 + score_row;
-                    const float *kvrow = row < raw_count
-                        ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                        : comp_kv +
-                            (uint64_t)comp_rows[row - raw_count] * head_dim;
-                    float dot = 0.0f;
-                    for (uint32_t d = score_lane; d < head_dim; d += 8u) {
-                        dot += qh[d] * kvrow[d];
-                    }
-                    for (uint32_t off = 4u; off > 0u; off >>= 1u) {
-                        dot += __shfl_down_sync(mask, dot, off, 8);
-                    }
-                    if (score_lane == 0u) {
-                        score_tile[local_head][score_row] = dot * scale;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-        if (score_row < nr &&
-            (comp_count == 0u || score_lane == 0u)) {
-            const uint32_t row = row0 + score_row;
+    /* Pass A mirrors shipping's score-worker mapping and loop shape.  Earlier
+     * ROWS_PER_STAGE-sized score loops changed the generated FP32 dot schedule
+     * even for H1 and diverged on the first raw row.  KV staging remains a
+     * pass-B concern; pass A has no reason to inherit its 4/8-row cadence. */
+    if (comp_count == 0u) {
+        for (uint32_t row = threadIdx.x; row < raw_count;
+             row += blockDim.x) {
 #pragma unroll
             for (uint32_t local_head = 0u;
                  local_head < HEADS_PER_GROUP; local_head++) {
-                if (head_base + local_head >= n_head) continue;
-                float *dst = &partial[local_head][row & 255u];
-                *dst = fmaxf(*dst,
-                             score_tile[local_head][score_row]);
+                const uint32_t head = head_base + local_head;
+                if (head >= n_head) continue;
+                const float *qh = q + (uint64_t)head * head_dim;
+                const float *kvrow =
+                    raw_kv + (uint64_t)raw_rows[row] * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0u; d < head_dim; d++) {
+                    dot += qh[d] * kvrow[d];
+                }
+                const float score = dot * scale;
+                partial[local_head][threadIdx.x] = fmaxf(
+                    partial[local_head][threadIdx.x], score);
                 if (exact_audit_mode == 4u || exact_audit_mode == 5u) {
                     const uint32_t score_base =
                         exact_audit_mode == 4u ? 0u : 512u;
                     if (row >= score_base && row < score_base + head_dim) {
-                        float *out = heads +
-                            (uint64_t)(head_base + local_head) * head_dim;
-                        out[row - score_base] =
-                            score_tile[local_head][score_row];
+                        float *out = heads + (uint64_t)head * head_dim;
+                        out[row - score_base] = score;
                     }
                 }
             }
         }
-        __syncthreads();
+    } else {
+        const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+        for (uint32_t row0 = 0u; row0 < n_score; row0 += 32u) {
+            const uint32_t row = row0 + score_group;
+            if (row >= n_score) continue;
+#pragma unroll
+            for (uint32_t local_head = 0u;
+                 local_head < HEADS_PER_GROUP; local_head++) {
+                const uint32_t head = head_base + local_head;
+                if (head >= n_head) continue;
+                const float *qh = q + (uint64_t)head * head_dim;
+                const float *kvrow = row < raw_count
+                    ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+                    : comp_kv +
+                        (uint64_t)comp_rows[row - raw_count] * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = score_lane; d < head_dim; d += 8u) {
+                    dot += qh[d] * kvrow[d];
+                }
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (score_lane == 0u) {
+                    const float score = dot * scale;
+                    float *dst = &partial[local_head][row & 255u];
+                    *dst = fmaxf(*dst, score);
+                    if (exact_audit_mode == 4u || exact_audit_mode == 5u) {
+                        const uint32_t score_base =
+                            exact_audit_mode == 4u ? 0u : 512u;
+                        if (row >= score_base &&
+                            row < score_base + head_dim) {
+                            float *out = heads + (uint64_t)head * head_dim;
+                            out[row - score_base] = score;
+                        }
+                    }
+                }
+            }
+        }
     }
+    __syncthreads();
 
     /* Modes 4/5 expose the raw score surface before max reduction.  They are
      * diagnostic-only and intentionally avoid the recompute/PV pass. */
