@@ -4743,3 +4743,25 @@ REPEAT_LEVELS=1,64,256,512,1536 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 ```
+
+# SM75 compressor projection/state-store fusion (synthetic qualification)
+
+`cuda-sm75-compressor-state-fusion.sh` compares the diagnostic one-token
+paired-F16 projection/state-store kernel with the shipping ordered paired-F16
+projection followed by `compressor_store`.  It covers attention and indexer
+widths, ratio-4 and ratio-128 intermediate/emit/wrap phases, F16 and F32 APE,
+destination canaries, runtime occupancy/resources, per-symbol PTXAS/SASS, and
+selected Compute Sanitizer cases.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-state-fusion.sh
+```
+
+This is deliberately synthetic evidence. The fusion remains disabled by
+default and must not be promoted until a real-model engine A/B proves exact
+outputs, dispatch selection, and an end-to-end win on the production topology.

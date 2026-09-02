@@ -223,6 +223,9 @@ tests/cuda_sm75_profile_harness.o: tests/cuda_sm75_profile_harness.c ds4_gpu.h
 tests/cuda_sm75_decode_weight_profile.o: tests/cuda_sm75_decode_weight_profile.c ds4_gpu.h ds4_tensor_layout.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sm75_decode_weight_profile.c
 
+tests/cuda_sm75_compressor_state_fusion.o: tests/cuda_sm75_compressor_state_fusion.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sm75_compressor_state_fusion.c
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -272,6 +275,9 @@ tests/cuda_sm75_profile_harness: tests/cuda_sm75_profile_harness.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/cuda_sm75_decode_weight_profile: tests/cuda_sm75_decode_weight_profile.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/cuda_sm75_compressor_state_fusion: tests/cuda_sm75_compressor_state_fusion.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/cuda_sm75_int4_mma: tests/cuda_sm75_int4_mma.cu
@@ -444,4 +450,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/cuda_sm75_pair_stability tests/cuda_device_identity tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_decode_weight_profile tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official $(QUALITY_SCORE_OBJ) tests/test_q4k_dot tests/test_metal_session_batch tests/test_gpu_xdev tests/cuda_attention_rowsplit_xdev tests/cuda_sm75_pair_stability tests/cuda_device_identity tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/cuda_sm75_profile_harness tests/cuda_sm75_decode_weight_profile tests/cuda_sm75_compressor_state_fusion tests/cuda_sm75_int4_mma tests/cuda_sm75_q3_q4_32 tests/cuda_sm75_q4_down_native tests/cuda_sm75_q4_gate_up_native
