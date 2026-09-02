@@ -218,6 +218,16 @@ logits at each frontier. Dispatch counters must show K4 exclusively in both
 arms and prefetch depth 0 versus 2 exclusively; dense-Q8 placement plans and
 canonical binding identities must also match between arms.
 
+The A/B also fixes the accepted stable prefill policy in every process:
+pair 0 retains prefill indexer row splitting but not attention row splitting,
+pair 1 retains both, attention-cache mirrors exist only for pair 1, and native
+index-cache mirrors exist for both pairs. The runner rejects the old coupled
+cache policy or any unexpected pair-0 attention dispatch. It also requires the
+physical GPU 0/1/2/3 power limits to match `250,260,250,250` W by default and
+requires the default fused T32 FP16-output path to dispatch. Thus a decode
+result cannot silently regain the unstable prefill topology or lose an
+accepted production optimization.
+
 `Q3A4_LAYOUT=mixed15` requires the current exact 15-layer allocation.
 `Q3A4_LAYOUT=all43` requires Q3A4 gate/up and Q4-32 down on every routed
 layer, so the same runner can validate the forthcoming all-Q3A4 gate/up model
@@ -237,6 +247,7 @@ export PROMPT="$PWD/speed-bench/promessi_sposi.txt"
 GPU_DEVICES=0,3,1,2 \
 GPU_VRAM=auto \
 STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 Q3A4_LAYOUT=mixed15 \
 REPEATS=3 \
 TG_TOKENS=256 \
@@ -245,6 +256,11 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 ./speed-bench/cuda-sm75-decode-q3a4-prefetch2-production-ab.sh
 ```
+
+Run the all-Q3A4 model as an independent invocation by changing `MODEL` to
+`DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf` and setting
+`Q3A4_LAYOUT=all43`. Separate output directories keep a reboot or failed arm
+for one model from contaminating the other model's evidence.
 
 ### SM75 Q4-32 software-prefetch depth
 

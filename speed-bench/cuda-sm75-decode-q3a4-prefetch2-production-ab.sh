@@ -17,6 +17,7 @@ Optional environment:
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
   STAGE_SPLIT=22
+  REQUIRED_POWER_LIMITS_W=250,260,250,250
   Q3A4_LAYOUT=mixed15          mixed15 or all43
   REPEATS=3
   TG_TOKENS=256
@@ -48,6 +49,7 @@ PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
+REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
 Q3A4_LAYOUT=${Q3A4_LAYOUT:-mixed15}
 REPEATS=${REPEATS:-3}
 TG_TOKENS=${TG_TOKENS:-256}
@@ -91,6 +93,19 @@ done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical IDs remain stable"
 
+IFS=, read -r -a required_power <<<"$REQUIRED_POWER_LIMITS_W"
+(( ${#required_power[@]} == 4 )) ||
+    die "REQUIRED_POWER_LIMITS_W must contain physical GPU 0,1,2,3 limits"
+for gpu in 0 1 2 3; do
+    [[ ${required_power[$gpu]} =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        die "invalid required power limit for physical GPU $gpu"
+    limit=$(nvidia-smi -i "$gpu" --query-gpu=power.limit \
+        --format=csv,noheader,nounits | tr -d '[:space:]')
+    awk -v actual="$limit" -v expected="${required_power[$gpu]}" \
+        'BEGIN {exit !((actual+0)==(expected+0))}' ||
+        die "physical GPU $gpu power limit is ${limit:-unknown} W, expected ${required_power[$gpu]} W"
+done
+
 case "$Q3A4_LAYOUT" in
     mixed15)
         Q3A4_LAYER_COUNT=15
@@ -131,6 +146,9 @@ emit_configuration() {
     printf 'tg_tokens=%s\nexact_tokens=%s\nwarmup_tokens=%s\n' \
         "$TG_TOKENS" "$EXACT_TOKENS" "$WARMUP_TOKENS"
     printf 'prefill_chunk=%s\npipeline_mb=%s\n' "$PREFILL_CHUNK" "$PIPELINE_MB"
+    printf 'required_power_limits_w=%s\n' "$REQUIRED_POWER_LIMITS_W"
+    printf 'prefill_attention_rows_pairs=1\nprefill_indexer_rows_pairs=0,1\n'
+    printf 'attention_cache_mirror_pairs=1\nindex_cache_mirror_pairs=0,1\n'
     printf 'comparison=q3a4-k4-prefetch0-vs-prefetch2\n'
     printf 'production_ctx_max=%s\nproduction_ctx_alloc=%s\nvocab_size=%s\nlogits_bytes=%s\n' \
         "$PRODUCTION_CTX_MAX" "$PRODUCTION_CTX_ALLOC" "$VOCAB_SIZE" "$LOGITS_BYTES"
@@ -191,6 +209,9 @@ production_env=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
     "DS4_BENCH_UNTIMED_WARMUP_TOKENS=$WARMUP_TOKENS"
+    DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0
+    DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS=0,1
+    DS4_CUDA_TP_PREFILL_INDEXER_ROWS_AUDIT=1
     DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH=1
     DS4_CUDA_NO_MOE_Q32_DECODE_SPLIT=1
     DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG=1
@@ -261,7 +282,7 @@ if [[ $RESUME == 0 ]]; then
             "$MODEL" "$(stat -c %s "$MODEL")"
         emit_configuration
         printf '\n[gpu inventory]\n'
-        nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,memory.free,compute_cap \
+        nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,memory.free,compute_cap \
             --format=csv
         printf '\n[topology]\n'
         nvidia-smi topo -m
@@ -334,6 +355,22 @@ validate_common_log() {
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
         grep -Fq "$route" "$log" || return 1
     done
+    grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
+        "$log" || return 1
+    grep -Fq 'prefill indexer row split pair policy: enabled-pairs=0,1 disabled-pairs=none' \
+        "$log" || return 1
+    grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' \
+        "$log" || return 1
+    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" ||
+        return 1
+    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" ||
+        return 1
+    grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 .*selected_mode=gather-home' \
+        "$log" || return 1
+    grep -Eq 'prefill indexer row audit event=complete .*home_tier=1 .*selected_mode=partner-local' \
+        "$log" || return 1
+    grep -Eq 'CUDA T32 f16-output fused summary: local=0 partner=[1-9][0-9]*' \
+        "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
     ! grep -Fq 'SM75 Q32 owned decode CUDA Graph enabled' "$log" || return 1
     ! grep -Fq 'SM75 Q32 decode graph audit' "$log" || return 1
