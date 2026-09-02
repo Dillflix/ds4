@@ -13700,16 +13700,22 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
         __syncthreads();
     }
 
-    const uint32_t threads_per_head = 256u / HEADS_PER_GROUP;
-    const uint32_t values_per_thread = HEADS_PER_GROUP * 2u;
-    const uint32_t local_head = threadIdx.x / threads_per_head;
-    const uint32_t worker = threadIdx.x % threads_per_head;
-    const uint32_t head = head_base + local_head;
-    const bool valid_head = head < n_head;
-    float acc[HEADS_PER_GROUP * 2u];
+    /* Preserve the reference PV expression shape as well as its row order.
+     * Every physical thread owns d and d+256 for every grouped head, just as
+     * that thread does in each independent reference block.  This removes the
+     * prior split-thread accumulator shape after the grouped kernel drifted on
+     * a nonconstant SM75 fixture; the strengthened test below decides whether
+     * this was the relevant divergence. */
+    const uint32_t d0 = threadIdx.x;
+    const uint32_t d1 = d0 + 256u;
+    float acc0[HEADS_PER_GROUP];
+    float acc1[HEADS_PER_GROUP];
 #pragma unroll
-    for (uint32_t slot = 0u; slot < values_per_thread; slot++) {
-        acc[slot] = 0.0f;
+    for (uint32_t local_head = 0u;
+         local_head < HEADS_PER_GROUP;
+         local_head++) {
+        acc0[local_head] = 0.0f;
+        acc1[local_head] = 0.0f;
     }
     const uint32_t value_rows_per_stage =
         HEADS_PER_GROUP == 2u ? 8u : 4u;
@@ -13730,24 +13736,31 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
             kv_shared[off] = src[d];
         }
         __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0u; rr < nr; rr++) {
-                const float p = scores[local_head][row0 + rr];
+        for (uint32_t rr = 0u; rr < nr; rr++) {
+            const float v0 = kv_shared[rr * head_dim + d0];
+            const float v1 = kv_shared[rr * head_dim + d1];
 #pragma unroll
-                for (uint32_t slot = 0u; slot < values_per_thread; slot++) {
-                    const uint32_t d = worker + slot * threads_per_head;
-                    acc[slot] += kv_shared[rr * head_dim + d] * p;
+            for (uint32_t local_head = 0u;
+                 local_head < HEADS_PER_GROUP;
+                 local_head++) {
+                if (head_base + local_head < n_head) {
+                    const float p = scores[local_head][row0 + rr];
+                    acc0[local_head] += v0 * p;
+                    acc1[local_head] += v1 * p;
                 }
             }
         }
         __syncthreads();
     }
-    if (valid_head) {
-        float *out = heads + (uint64_t)head * head_dim;
-        const float den = denom[local_head];
-#pragma unroll
-        for (uint32_t slot = 0u; slot < values_per_thread; slot++) {
-            out[worker + slot * threads_per_head] = acc[slot] / den;
+    for (uint32_t local_head = 0u;
+         local_head < HEADS_PER_GROUP;
+         local_head++) {
+        const uint32_t head = head_base + local_head;
+        if (head < n_head) {
+            float *out = heads + (uint64_t)head * head_dim;
+            const float den = denom[local_head];
+            out[d0] = acc0[local_head] / den;
+            out[d1] = acc1[local_head] / den;
         }
     }
 }
