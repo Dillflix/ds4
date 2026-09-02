@@ -239,17 +239,42 @@ validate_common_log() {
                   'materialized 344/344 candidates' \
                   'SM75 routed Q32 layout enabled' \
                   'SM75 native F16 indexer cache and streaming WMMA64 enabled'; do
-        grep -Fq "$marker" "$log" || return 1
+        grep -Fq "$marker" "$log" || {
+            printf 'validation: missing production marker: %s\n' "$marker" >&2
+            return 1
+        }
     done
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
-        grep -Fq "$route" "$log" || return 1
+        grep -Fq "$route" "$log" || {
+            printf 'validation: missing direct route: %s\n' "$route" >&2
+            return 1
+        }
     done
-    ! grep -Fq 'required but unavailable' "$log" || return 1
-    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
-    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
-    [[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' "$log") == 2 ]] ||
+    ! grep -Fq 'required but unavailable' "$log" || {
+        printf 'validation: a required production path was unavailable\n' >&2
         return 1
-    validate_layout "$layout" "$log"
+    }
+    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || {
+        printf 'validation: pair 0 prefill attention row split was not suppressed\n' >&2
+        return 1
+    }
+    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || {
+        printf 'validation: pair 1 prefill attention row split was not active\n' >&2
+        return 1
+    }
+    ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || {
+        printf 'validation: pair 0 prefill indexer row split was not suppressed\n' >&2
+        return 1
+    }
+    if [[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' "$log") != 1 ]] ||
+       ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log"; then
+        printf 'validation: expected exactly the pair 1 prefill indexer row split\n' >&2
+        return 1
+    fi
+    validate_layout "$layout" "$log" || {
+        printf 'validation: %s routed-quant inventory mismatch\n' "$layout" >&2
+        return 1
+    }
 }
 
 validate_q8_state_files() {
@@ -349,9 +374,23 @@ run_engine() {
 
 validate_run() {
     local layout=$1 variant=$2 base=$3
-    validate_gpu_health_pair "$base" && validate_q8_state_files "$base" &&
-        validate_frontiers "$base" && validate_common_log "$layout" "$base.log" &&
-        validate_variant "$variant" "$base.log"
+    validate_gpu_health_pair "$base" || {
+        printf 'validation: GPU identity, health, or power limit changed\n' >&2
+        return 1
+    }
+    validate_q8_state_files "$base" || {
+        printf 'validation: dense-Q8 plan or binding state is incomplete\n' >&2
+        return 1
+    }
+    validate_frontiers "$base" || {
+        printf 'validation: benchmark CSV or frontier logits are incomplete\n' >&2
+        return 1
+    }
+    validate_common_log "$layout" "$base.log" || return 1
+    validate_variant "$variant" "$base.log" || {
+        printf 'validation: %s T32 FP16 dispatch counters are invalid\n' "$variant" >&2
+        return 1
+    }
 }
 
 phase=production-ab

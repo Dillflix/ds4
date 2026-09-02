@@ -1234,8 +1234,9 @@ decision boundary. It leaves the stage-aware 344/344 Q8 plan, automatic
 T32/T256/shared-down placement, prefill pipeline, and native indexer defaults
 unchanged in both arms. On the qualified machine it also keeps the known-stable
 prefill attention topology fixed: query-row splitting is disabled only for
-pair 0 and remains enabled for pair 1, while indexer row splitting remains
-enabled on both pairs.
+pair 0 and remains enabled for pair 1. The corresponding prefill indexer
+row split is therefore also active only for pair 1; the independent decode
+indexer row split remains unchanged.
 
 The runner executes an alternating control/fused A/B at 512, 4096, and 32768
 tokens for both the existing mixed15 model and the new all43-Q3A4 gate/up
