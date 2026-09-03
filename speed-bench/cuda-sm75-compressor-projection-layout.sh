@@ -135,6 +135,7 @@ for marker in \
     'weight_layout_size_neutral=yes' \
     'weight_repack_roundtrip=byte-exact' \
     'activation_repack_roundtrip=byte-exact' \
+    'canonical_staged_activation=coalesced-shared-tile' \
     'control_required_regions=overwritten' \
     'correctness_full_output_state=bit-exact' \
     'correctness_canaries=ok' \

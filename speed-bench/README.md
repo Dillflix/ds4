@@ -5080,6 +5080,15 @@ canonical shared-staging arm added here determines whether most of that gain
 can be retained without a second weight representation; this remains bounded
 diagnostic evidence rather than a production promotion.
 
+The first canonical-staging run (`20260903T210550Z`) was bit-exact and
+sanitizer-clean, improving 0.29952 ms to 0.13102 ms (2.29x), but it did not
+fully test the no-cache design: only weights were staged while activation loads
+remained in the original scattered lane pattern. Nsight consequently reported
+22.22% load efficiency, 11.97 sectors per request, and a 9.41 MIO-throttle
+stall ratio. The current arm stages the activation in
+the same coalesced padded tile, eliminating that identified residual global-
+load pattern without changing model storage or arithmetic order.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 \
 BENCH_ROUNDS=9 BENCH_LAUNCHES=25 \

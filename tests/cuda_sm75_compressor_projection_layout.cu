@@ -113,11 +113,12 @@ __global__ void sm75_compressor_pair_control_kernel(
     }
 }
 
-/* Keep the canonical row-major model representation.  Each CTA cooperatively
- * loads a 32x32 slice from every lane's original 128-element K interval, so
- * global reads are contiguous.  Padding the shared rows keeps the subsequent
- * per-lane reads from collapsing onto the same banks.  Tiles and elements are
- * consumed in the original order, preserving the production accumulation. */
+/* Keep the canonical row-major model and activation representations.  Each CTA
+ * cooperatively loads a 32x32 slice from every lane's original 128-element K
+ * interval, so all global reads are contiguous.  Padding the shared rows keeps
+ * the subsequent per-lane reads from collapsing onto the same banks.  Tiles
+ * and elements are consumed in the original order, preserving the production
+ * accumulation. */
 __global__ void sm75_compressor_pair_canonical_staged_kernel(
         float *out_kv, float *out_score,
         float *state_kv, float *state_score,
@@ -127,6 +128,7 @@ __global__ void sm75_compressor_pair_canonical_staged_kernel(
     if (row >= kWidth) return;
     __shared__ __half staged_kv[kLanes][kStagePad];
     __shared__ __half staged_score[kLanes][kStagePad];
+    __shared__ float staged_x[kLanes][kStagePad];
     __shared__ float partial_kv[kLanes];
     __shared__ float partial_score[kLanes];
     const uint32_t lane = threadIdx.x;
@@ -141,11 +143,11 @@ __global__ void sm75_compressor_pair_canonical_staged_kernel(
                                tile * kStageTile + lane;
             staged_kv[source_lane][lane] = wkv[k];
             staged_score[source_lane][lane] = wscore[k];
+            staged_x[source_lane][lane] = x[k];
         }
         __syncthreads();
         for (uint32_t step = 0; step < kStageTile; ++step) {
-            const uint32_t k = lane * kChunk + tile * kStageTile + step;
-            const float xv = x[k];
+            const float xv = staged_x[lane][step];
             sum_kv += __half2float(staged_kv[lane][step]) * xv;
             sum_score += __half2float(staged_score[lane][step]) * xv;
         }
@@ -513,6 +515,7 @@ bool run_correctness(Fixture *f) {
     std::printf("weight_layout_size_neutral=yes\n"
                 "weight_repack_roundtrip=byte-exact\n"
                 "activation_repack_roundtrip=byte-exact\n"
+                "canonical_staged_activation=coalesced-shared-tile\n"
                 "control_required_regions=overwritten\n"
                 "correctness_full_output_state=bit-exact\n"
                 "correctness_canaries=ok\n");
