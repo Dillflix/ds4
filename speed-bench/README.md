@@ -5138,3 +5138,27 @@ TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-production-ab.sh
 ```
+
+### SM75 small-width canonical-staged compressor projection A/B
+
+`cuda-sm75-compressor-projection-small-production-ab.sh` extends the same
+exact canonical shared-staging implementation to the two compressor shapes
+that were deliberately excluded from the width-1024 promotion: the ratio-128
+attention projection (`4096 x 512` twice) and the ratio-4 indexer projection
+(`4096 x 256` twice).  The control arm retains the accepted width-1024 staged
+default in both variants, so this isolates only the incremental width-256/512
+change.  The candidate is opt-in with
+`DS4_CUDA_COMPRESSOR_PROJECTION_STAGED_SMALL=1`; the global staged rollback
+continues to override it.  No repacked model or persistent auxiliary cache is
+allocated.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
+```

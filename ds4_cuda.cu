@@ -239,11 +239,14 @@ static std::atomic<uint64_t> g_cuda_compressor_pair_state_store_calls[3] = {};
 static std::atomic<bool> g_cuda_compressor_pair_state_store_logged[3] = {};
 /* Width-1024 decode projection using the canonical F16 model layout.  Exact
  * four-GPU mixed15/all43 qualification made this the SM75 production default.
- * The kernel stages weights and the normalized activation cooperatively so it
- * needs no auxiliary model representation or persistent cache. */
+ * The same kernel shape for the remaining width-256/512 projections is kept
+ * behind a separate qualification selector.  All variants stage weights and
+ * the normalized activation cooperatively, so they need no auxiliary model
+ * representation or persistent cache. */
 static int g_cuda_compressor_projection_staged;
-static std::atomic<uint64_t> g_cuda_compressor_projection_staged_calls = 0;
-static std::atomic<bool> g_cuda_compressor_projection_staged_logged = false;
+static int g_cuda_compressor_projection_staged_small;
+static std::atomic<uint64_t> g_cuda_compressor_projection_staged_calls[3] = {};
+static std::atomic<bool> g_cuda_compressor_projection_staged_logged[3] = {};
 /* Q4-32 down tile32 packed-INT4 is the SM75 tagged-layout production default.
  * The former quarter-warp scalar kernel remains an explicit fallback. */
 enum cuda_moe_q4_32_down_decode_mapping {
@@ -478,6 +481,11 @@ extern "C" void ds4_gpu_test_set_compressor_pair_state_store_reference(
 
 extern "C" void ds4_gpu_test_set_compressor_projection_staged(int enabled) {
     g_cuda_compressor_projection_staged = enabled != 0;
+}
+
+extern "C" void ds4_gpu_test_set_compressor_projection_staged_small(
+        int enabled) {
+    g_cuda_compressor_projection_staged_small = enabled != 0;
 }
 
 extern "C" void ds4_gpu_test_set_moe_q32_decode_split(int enabled) {
@@ -726,10 +734,15 @@ static void cuda_decode_dispatch_env_refresh(void) {
         "DS4_CUDA_COMPRESSOR_PROJECTION_STAGED", 1) &&
         !cuda_env_flag_enabled(
             "DS4_CUDA_NO_COMPRESSOR_PROJECTION_STAGED", 0);
-    g_cuda_compressor_projection_staged_calls.store(
-        0u, std::memory_order_relaxed);
-    g_cuda_compressor_projection_staged_logged.store(
-        false, std::memory_order_relaxed);
+    g_cuda_compressor_projection_staged_small =
+        g_cuda_compressor_projection_staged && cuda_env_flag_enabled(
+            "DS4_CUDA_COMPRESSOR_PROJECTION_STAGED_SMALL", 0);
+    for (unsigned i = 0; i < 3u; ++i) {
+        g_cuda_compressor_projection_staged_calls[i].store(
+            0u, std::memory_order_relaxed);
+        g_cuda_compressor_projection_staged_logged[i].store(
+            false, std::memory_order_relaxed);
+    }
     g_cuda_compressor_pair_state_store_incompatible =
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
@@ -5467,14 +5480,24 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)t32_fused_local,
                 (unsigned long long)t32_fused_partner);
     }
-    const uint64_t compressor_staged_calls =
-        g_cuda_compressor_projection_staged_calls.load(
+    const uint64_t compressor_staged_256 =
+        g_cuda_compressor_projection_staged_calls[0].load(
             std::memory_order_relaxed);
-    if (compressor_staged_calls != 0u) {
+    const uint64_t compressor_staged_512 =
+        g_cuda_compressor_projection_staged_calls[1].load(
+            std::memory_order_relaxed);
+    const uint64_t compressor_staged_1024 =
+        g_cuda_compressor_projection_staged_calls[2].load(
+            std::memory_order_relaxed);
+    if (compressor_staged_256 != 0u || compressor_staged_512 != 0u ||
+        compressor_staged_1024 != 0u) {
         fprintf(stderr,
                 "ds4: SM75 compressor canonical-staged summary: "
+                "width256-calls=%llu width512-calls=%llu "
                 "width1024-calls=%llu auxiliary-model-bytes=0\n",
-                (unsigned long long)compressor_staged_calls);
+                (unsigned long long)compressor_staged_256,
+                (unsigned long long)compressor_staged_512,
+                (unsigned long long)compressor_staged_1024);
     }
 
     if (g_cuda_moe_q32_decode_graph &&
@@ -8764,14 +8787,15 @@ __global__ static void q8_0_warp_interleaved_pack_kernel(
     }
 }
 
-/* Exact SM75 width-1024 compressor projection from canonical row-major F16
- * weights.  Each CTA cooperatively loads a 32x32 slice from every lane's
- * original 128-element K interval, converting the pathological 32-sector
- * warp requests into contiguous transactions.  Shared rows are padded to
- * avoid bank aliasing.  Tiles, elements, accumulators, and the final lane-0
- * reduction retain the reference order exactly. */
+/* Exact SM75 compressor projection from canonical row-major F16 weights.
+ * Each CTA cooperatively loads a 32x32 slice from every lane's original
+ * 128-element K interval, converting the pathological 32-sector warp requests
+ * into contiguous transactions.  Shared rows are padded to avoid bank
+ * aliasing.  Tiles, elements, accumulators, and the final lane-0 reduction
+ * retain the reference order exactly. */
+template <uint32_t kWidth, uint32_t kRatio>
 __global__ static void
-matmul_f16_pair_compressor_store_canonical_staged_4096x1024_kernel(
+matmul_f16_pair_compressor_store_canonical_staged_4096_kernel(
         float *out_kv,
         float *out_score,
         float *state_kv,
@@ -8788,8 +8812,6 @@ matmul_f16_pair_compressor_store_canonical_staged_4096x1024_kernel(
         kTile = 32u,
         kPad = 33u,
         kTiles = 4u,
-        kWidth = 1024u,
-        kRatio = 4u,
     };
     const uint32_t row = blockIdx.x;
     if (row >= kWidth) return;
@@ -8839,7 +8861,7 @@ matmul_f16_pair_compressor_store_canonical_staged_4096x1024_kernel(
         out_kv[row] = total_kv;
         out_score[row] = total_score;
         const uint32_t pos_mod = pos % kRatio;
-        const uint32_t dst_row = kRatio + pos_mod;
+        const uint32_t dst_row = kRatio == 4u ? kRatio + pos_mod : pos_mod;
         const uint64_t dst = (uint64_t)dst_row * kWidth + row;
         const uint64_t ape_i = (uint64_t)pos_mod * kWidth + row;
         const float ape_v = ape_type == 1u
@@ -21639,24 +21661,57 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             model_map, ape_offset, ape_bytes, logical_tier, "compressor ape");
     if (!weight_kv || !weight_score || !ape) return -1;
 
-    const bool staged = g_cuda_compressor_projection_staged &&
+    const unsigned shape = width == 256u ? 0u : (width == 512u ? 1u : 2u);
+    const bool staged_shape =
+        (width == 1024u && ratio == 4u &&
+         g_cuda_compressor_projection_staged) ||
+        ((width == 256u || width == 512u) &&
+         g_cuda_compressor_projection_staged_small);
+    const bool staged = staged_shape &&
                         logical_tier >= 0 && logical_tier < g_n_gpus &&
                         g_gpu[logical_tier].compute_major == 7 &&
-                        g_gpu[logical_tier].compute_minor == 5 &&
-                        width == 1024u && ratio == 4u;
+                        g_gpu[logical_tier].compute_minor == 5;
     if (staged) {
-        matmul_f16_pair_compressor_store_canonical_staged_4096x1024_kernel
-            <<<width, 32>>>(
-                (float *)out_kv->ptr,
-                (float *)out_score->ptr,
-                (float *)state_kv->ptr,
-                (float *)state_score->ptr,
-                weight_kv,
-                weight_score,
-                (const float *)x->ptr,
-                ape,
-                ape_type,
-                pos);
+        if (width == 256u) {
+            matmul_f16_pair_compressor_store_canonical_staged_4096_kernel
+                <256u, 4u><<<width, 32>>>(
+                    (float *)out_kv->ptr,
+                    (float *)out_score->ptr,
+                    (float *)state_kv->ptr,
+                    (float *)state_score->ptr,
+                    weight_kv,
+                    weight_score,
+                    (const float *)x->ptr,
+                    ape,
+                    ape_type,
+                    pos);
+        } else if (width == 512u) {
+            matmul_f16_pair_compressor_store_canonical_staged_4096_kernel
+                <512u, 128u><<<width, 32>>>(
+                    (float *)out_kv->ptr,
+                    (float *)out_score->ptr,
+                    (float *)state_kv->ptr,
+                    (float *)state_score->ptr,
+                    weight_kv,
+                    weight_score,
+                    (const float *)x->ptr,
+                    ape,
+                    ape_type,
+                    pos);
+        } else {
+            matmul_f16_pair_compressor_store_canonical_staged_4096_kernel
+                <1024u, 4u><<<width, 32>>>(
+                    (float *)out_kv->ptr,
+                    (float *)out_score->ptr,
+                    (float *)state_kv->ptr,
+                    (float *)state_score->ptr,
+                    weight_kv,
+                    weight_score,
+                    (const float *)x->ptr,
+                    ape,
+                    ape_type,
+                    pos);
+        }
     } else {
         matmul_f16_pair_compressor_store_ordered_chunks_kernel<<<width, 32>>>(
                 (float *)out_kv->ptr,
@@ -21677,7 +21732,6 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                  "f16 compressor pair projection/state-store launch")) {
         return -1;
     }
-    const unsigned shape = width == 256u ? 0u : (width == 512u ? 1u : 2u);
     const uint64_t call =
         g_cuda_compressor_pair_state_store_calls[shape].fetch_add(1u) + 1u;
     if (g_cuda_compressor_pair_state_store_audit &&
@@ -21689,15 +21743,16 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
     }
     if (staged) {
         const uint64_t staged_call =
-            g_cuda_compressor_projection_staged_calls.fetch_add(
+            g_cuda_compressor_projection_staged_calls[shape].fetch_add(
                 1u, std::memory_order_relaxed) + 1u;
         if (g_cuda_compressor_pair_state_store_audit &&
-            !g_cuda_compressor_projection_staged_logged.exchange(
+            !g_cuda_compressor_projection_staged_logged[shape].exchange(
                 true, std::memory_order_relaxed)) {
             fprintf(stderr,
                     "ds4: SM75 compressor canonical-staged selected "
-                    "width=1024 ratio=4 first_call=%llu "
+                    "width=%u ratio=%u first_call=%llu "
                     "auxiliary-model-bytes=0\n",
+                    width, ratio,
                     (unsigned long long)staged_call);
         }
     }

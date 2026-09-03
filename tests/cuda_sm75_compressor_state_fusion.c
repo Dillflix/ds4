@@ -11,6 +11,7 @@
 extern void ds4_gpu_test_set_compressor_pair_state_store(int enabled);
 extern void ds4_gpu_test_set_compressor_pair_state_store_disabled(int disabled);
 extern void ds4_gpu_test_set_compressor_pair_state_store_reference(int reference);
+extern void ds4_gpu_test_set_compressor_projection_staged_small(int enabled);
 extern int ds4_gpu_test_compressor_pair_state_store_resources(
         int *registers, int *static_shared_bytes, int *local_bytes,
         int *max_threads_per_block, int *active_blocks_per_sm);
@@ -446,6 +447,10 @@ int main(int argc, char **argv) {
          payload_unchanged(&cand_state_kv, "reference-state-kv") &&
          payload_unchanged(&cand_state_score, "reference-state-score");
     ds4_gpu_test_set_compressor_pair_state_store_reference(0);
+    /* Exercise the candidate canonical-staged implementation for both smaller
+     * production shapes.  Width 1024 is already the default and is unaffected
+     * by this diagnostic-only setter. */
+    ds4_gpu_test_set_compressor_projection_staged_small(1);
     if (!ok) goto cleanup;
 
     ok = run_control(ref_out_kv.view, ref_out_score.view,

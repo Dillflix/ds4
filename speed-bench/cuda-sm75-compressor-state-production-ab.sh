@@ -35,7 +35,13 @@ case $COMPRESSOR_STATE_AB_AXIS in
         candidate_variant=staged
         comparison_name=canonical-reference-vs-canonical-shared-staging
         ;;
-    *) die "COMPRESSOR_STATE_AB_AXIS must be fusion or projection-layout" ;;
+    projection-small-widths)
+        OUTPUT_DIR=${COMPRESSOR_PROJECTION_SMALL_PRODUCTION_AB_DIR:-$repo_dir/sm75-compressor-projection-small-production-ab-$stamp}
+        variants_forward=(control staged-small)
+        candidate_variant=staged-small
+        comparison_name=width1024-production-default-vs-width256-512-shared-staging
+        ;;
+    *) die "COMPRESSOR_STATE_AB_AXIS must be fusion, projection-layout, or projection-small-widths" ;;
 esac
 layouts=(mixed15 all43)
 models=("$MIXED_MODEL" "$ALL43_MODEL")
@@ -237,7 +243,7 @@ validate_selector() {
                 [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
             fi
         done
-    else
+    elif [[ $COMPRESSOR_STATE_AB_AXIS == projection-layout ]]; then
         for spec in 256:4 512:128 1024:4; do
             width=${spec%%:*}; ratio=${spec#*:}
             marker="SM75 compressor pair/state fusion selected width=$width ratio=$ratio"
@@ -249,7 +255,26 @@ validate_selector() {
             ! grep -Fq 'SM75 compressor canonical-staged summary:' "$log" || return 1
         else
             [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
-            grep -Eq 'SM75 compressor canonical-staged summary: width1024-calls=[1-9][0-9]* auxiliary-model-bytes=0' \
+            grep -Eq 'SM75 compressor canonical-staged summary: width256-calls=0 width512-calls=0 width1024-calls=[1-9][0-9]* auxiliary-model-bytes=0' \
+                "$log" || return 1
+        fi
+    else
+        for spec in 256:4 512:128 1024:4; do
+            width=${spec%%:*}; ratio=${spec#*:}
+            marker="SM75 compressor pair/state fusion selected width=$width ratio=$ratio"
+            [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
+        done
+        marker='SM75 compressor canonical-staged selected width=1024 ratio=4'
+        [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
+        if [[ $variant == control ]]; then
+            ! grep -Fq 'SM75 compressor canonical-staged selected width=256 ratio=4' "$log" || return 1
+            ! grep -Fq 'SM75 compressor canonical-staged selected width=512 ratio=128' "$log" || return 1
+            grep -Eq 'SM75 compressor canonical-staged summary: width256-calls=0 width512-calls=0 width1024-calls=[1-9][0-9]* auxiliary-model-bytes=0' \
+                "$log" || return 1
+        else
+            [[ $(grep -Fc 'SM75 compressor canonical-staged selected width=256 ratio=4' "$log") == 1 ]] || return 1
+            [[ $(grep -Fc 'SM75 compressor canonical-staged selected width=512 ratio=128' "$log") == 1 ]] || return 1
+            grep -Eq 'SM75 compressor canonical-staged summary: width256-calls=[1-9][0-9]* width512-calls=[1-9][0-9]* width1024-calls=[1-9][0-9]* auxiliary-model-bytes=0' \
                 "$log" || return 1
         fi
     fi
@@ -264,8 +289,13 @@ run_arm() {
         else
             selector=(DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE=1)
         fi
-    else
+    elif [[ $COMPRESSOR_STATE_AB_AXIS == projection-layout ]]; then
         selector=("DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=$([[ $variant == staged ]] && printf 1 || printf 0)")
+    else
+        selector=(
+            DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=1
+            "DS4_CUDA_COMPRESSOR_PROJECTION_STAGED_SMALL=$([[ $variant == staged-small ]] && printf 1 || printf 0)"
+        )
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     cmd=("${production_env[@]}" "${selector[@]}" ./ds4-bench \
@@ -344,9 +374,12 @@ phase=summarize
     if [[ $COMPRESSOR_STATE_AB_AXIS == fusion ]]; then
         printf '# SM75 four-GPU compressor projection/state-store A/B\n\n'
         candidate_label=Fused
-    else
+    elif [[ $COMPRESSOR_STATE_AB_AXIS == projection-layout ]]; then
         printf '# SM75 four-GPU canonical-staged compressor projection A/B\n\n'
         candidate_label=Staged
+    else
+        printf '# SM75 four-GPU small-width canonical-staged compressor projection A/B\n\n'
+        candidate_label=Staged-small
     fi
     printf '| Model | Context | Control decode tok/s | %s decode tok/s | Speedup |\n' "$candidate_label"
     printf '| --- | ---: | ---: | ---: | ---: |\n'

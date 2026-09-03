@@ -140,7 +140,7 @@ class Phase2SummaryTest(unittest.TestCase):
                         "device": 0, "bytes": 0,
                         "name": (
                             "matmul_f16_pair_compressor_store_"
-                            "canonical_staged_4096x1024_kernel"
+                            "canonical_staged_4096_kernel<512u, 128u>"
                         ),
                         "category": "attention", "layer": 0,
                         "stage_range": "", "layer_range": "",
