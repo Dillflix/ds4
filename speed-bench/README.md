@@ -4865,3 +4865,52 @@ bash ./speed-bench/cuda-sm75-compressor-state-production-ab.sh
 The accepted production run was byte-exact for 16 decode tokens at PP512,
 PP4096, and PP32768 on both models. All43 improved by 0.410% to 0.743%; mixed15
 was effectively neutral (-0.312% to +0.058%) at the longer prompt frontiers.
+
+### SM75 four-GPU MTP production A/B
+
+`cuda-sm75-mtp-production-ab.sh` is the one-shot production qualification for
+the optional legacy DeepSeek Flash MTP support model. For each selected main
+model it runs the fixed PP512/4096/32768 greedy-decode matrix three ways:
+ordinary decode with no support model, support-model residency at draft depth
+1, and strict-exact MTP at draft depth 2. Clean timing defaults to three
+Latin-rotated repeats so every variant occupies every run position once. One
+separate MTP diagnostic arm records detailed timing and acceptance events but
+is excluded from the speed table; per-dispatch indexer and decode-mapping audit
+instrumentation is enabled only in that diagnostic arm. The harness requires
+the accepted 22/21 four-GPU prefill topology and fixed physical power limits,
+rebuilds and runs the byte-exact CUDA regression with no tracked or staged
+source changes, validates CUDA ordinal-to-bus/UUID identity, main-model Q8
+placement, and decode-kernel dispatch, and accepts a result only when all 256
+generated tokens plus one untimed next-token sentinel are byte-identical to
+ordinary decode. CUDA runtime modifiers inherited from the caller are cleared
+and the runtime is pinned to `CUDA_DEVICE_ORDER=PCI_BUS_ID`. There is
+deliberately no resume mode; restart a failed or GPU-loss run from a clean host
+state and a fresh directory.
+Legacy MTP support weights must fit on their executor tier: this initial
+qualification deliberately rejects peer-spilled support weights because the
+existing peer probe does not qualify remote kernel reads in that direction.
+Its private support-layer attention history starts cold instead of replaying
+the prompt, making this the zero-prefill-compute baseline. That can reduce early
+proposal acceptance but cannot change target output; prompt-tail capture and
+support-cache warmup are a separate follow-up if the acceptance evidence
+justifies their prefill cost.
+
+```bash
+MTP_MODEL="$PWD/gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf" \
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+MODEL_LAYOUT=both \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TG_TOKENS=256 MTP_MARGIN=3 REPEATS=3 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-mtp-production-ab.sh
+```
+
+Use `MODEL_LAYOUT=mixed15` or `MODEL_LAYOUT=all43` for a single-model run.
+`MTP_MODEL` may instead point at the same support GGUF under `gguf/ds4/`.
+`REPEATS=1` is useful only for a preliminary smoke; production qualification
+uses the default three-repeat rotation, and any larger qualification count must
+be a multiple of three. `TG_TOKENS` is fixed at 256. `SKIP_BUILD=1` is
+intentionally rejected.

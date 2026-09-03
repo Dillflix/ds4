@@ -175,12 +175,17 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
+        if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--mtp FILE", "Optional legacy MTP support GGUF used for speculative decode benchmarking.");
+        } else {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens, 1..16. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+        }
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
@@ -378,6 +383,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write JSON and exact raw FP32 logits per frontier.");
     opt(fp, c, "--dump-decode-logits-dir DIR", "Correctness only: write raw FP32 logits after each generated token.");
+    opt(fp, c, "--dump-generated-tokens-dir DIR", "Write emitted int32 token IDs plus an untimed next-token sentinel per frontier for exact A/B comparison.");
     fputc('\n', fp);
 }
 

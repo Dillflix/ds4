@@ -15959,6 +15959,10 @@ typedef struct {
     bool dspark_capture_valid;
     bool dspark_capture_batch_valid;
     int dspark_exec_tier;
+    /* Legacy MTP is intentionally pinned to the output-head tier.  Its
+     * private support block, scratch, raw cache, and unsharded output-head
+     * staging buffers must all be addressable from one CUDA device. */
+    int mtp_exec_tier;
     bool dspark_capture_enabled;
     bool verify_small_batch_tp;
     uint32_t pipeline_capture_chunk_start;
@@ -15979,6 +15983,10 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+    /* A failed physical-device restore is not an ordinary rejected draft: the
+     * graph can no longer prove that CUDA and active_tier name the same device.
+     * Keep this sticky until the graph is rebuilt and make callers fail closed. */
+    bool mtp_device_poisoned;
     uint32_t prefill_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
@@ -17797,9 +17805,11 @@ static bool metal_graph_alloc_raw_cap(
         const int              *placement,
         bool                    cuda_tensor_parallel,
         const ds4_gpu_graph    *shared_prefill_workspace) {
-    const int saved_dspark_exec_tier = g->dspark_exec_tier;
+    const int saved_dspark_exec_tier = placement ? g->dspark_exec_tier : 0;
+    const int saved_mtp_exec_tier = placement ? g->mtp_exec_tier : 0;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->mtp_exec_tier = saved_mtp_exec_tier;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -18360,27 +18370,44 @@ static bool metal_graph_alloc_raw_cap(
      * and no MTP scratch hidden behind otherwise unused tensors.
      */
     if (enable_mtp) {
-        g->mtp_embed = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_enorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hnorm_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
+        const int mtp_tier =
+            g->mtp_exec_tier >= 0 && g->mtp_exec_tier < DS4_MAX_GPUS
+                ? g->mtp_exec_tier : 0;
+        g->mtp_embed = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_enorm = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_hnorm_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_hproj_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_input_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_state_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_next_hc = ds4_gpu_tensor_alloc_ptr_on(
+                mtp_tier, hc_dim * sizeof(float));
+        g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor_on(
                 managed_kv_cache,
+                mtp_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         g->mtp_n_raw = 0;
     }
     if (enable_spec_logits) {
-        const int spec_tier =
-            g->dspark_exec_tier > 0 && g->dspark_exec_tier < DS4_MAX_GPUS
-                ? g->dspark_exec_tier : 0;
-        g->spec_logits = spec_tier
-            ? ds4_gpu_tensor_alloc_ptr_on(spec_tier, (uint64_t)16 * DS4_N_VOCAB * sizeof(float))
-            : ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+        int spec_tier = 0;
+        if (g->dspark_exec_tier > 0 &&
+            g->dspark_exec_tier < DS4_MAX_GPUS) {
+            spec_tier = g->dspark_exec_tier;
+        } else if (g->mtp_exec_tier >= 0 &&
+                   g->mtp_exec_tier < DS4_MAX_GPUS) {
+            spec_tier = g->mtp_exec_tier;
+        }
+        g->spec_logits = ds4_gpu_tensor_alloc_ptr_on(
+                spec_tier, (uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }
 
     /* Class E — emb_tier captured from placement[0] (or 0 in
@@ -36030,7 +36057,13 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         uint32_t               pos,
         float                 *logits,
         int                   *top_id) {
-    if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
+    if (!g || g->mtp_device_poisoned ||
+        !base_model || !base_weights || !base_weights->token_embd ||
+        !base_weights->output || !mtp_model || !mtp ||
+        !mtp->block.attn_q_a || !g->mtp_raw_cache || g->raw_cap == 0 ||
+        !prev_hc || !out_hc) {
+        return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -36038,17 +36071,112 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (n_raw > g->raw_window) n_raw = g->raw_window;
     if (n_raw > g->raw_cap) n_raw = g->raw_cap;
 
-    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
-    ds4_gpu_tensor *saved_after = metal_graph_after_ffn_hc(g);
-    const uint32_t saved_tp_world = g->tp_world;
-    const uint32_t saved_tp_batch_rows = g->tp_batch_rows;
+    const bool multi_tier = g->placement != NULL;
+    const int saved_active_tier = g->active_tier;
+    const int exec_tier = multi_tier ? g->mtp_exec_tier : 0;
+    if (multi_tier &&
+        (saved_active_tier < 0 || saved_active_tier >= g_n_gpus ||
+         exec_tier < 0 || exec_tier >= g_n_gpus ||
+         exec_tier != g->head_tier)) {
+        fprintf(stderr,
+                "ds4: legacy MTP executor/head placement is invalid "
+                "(active=%d executor=%d head=%d)\n",
+                saved_active_tier, exec_tier, g->head_tier);
+        return false;
+    }
+
+    ds4_gpu_tensor *saved_active_cur = metal_graph_cur_hc(g);
+    ds4_gpu_tensor *saved_exec_cur = g->cur_hc_by_tier[exec_tier];
+    ds4_gpu_tensor *saved_exec_after = g->after_ffn_hc_by_tier[exec_tier];
+    const bool prev_is_active_cur = prev_hc == saved_active_cur;
+    struct {
+        const int *placement;
+        uint32_t tp_world;
+        uint32_t tp_batch_rows;
+        bool cuda_tp_decode;
+        bool cuda_tp_attn;
+        bool cuda_tp_moe;
+        bool cuda_tp_ep;
+        bool cuda_tp_shared;
+        bool cuda_tp_q;
+        bool cuda_tp_output;
+        bool cuda_tp_prefill_indexer_rows;
+        bool cuda_tp_decode_indexer_rows;
+    } saved = {
+        .placement = g->placement,
+        .tp_world = g->tp_world,
+        .tp_batch_rows = g->tp_batch_rows,
+        .cuda_tp_decode = g->cuda_tp_decode,
+        .cuda_tp_attn = g->cuda_tp_attn,
+        .cuda_tp_moe = g->cuda_tp_moe,
+        .cuda_tp_ep = g->cuda_tp_ep,
+        .cuda_tp_shared = g->cuda_tp_shared,
+        .cuda_tp_q = g->cuda_tp_q,
+        .cuda_tp_output = g->cuda_tp_output,
+        .cuda_tp_prefill_indexer_rows = g->cuda_tp_prefill_indexer_rows,
+        .cuda_tp_decode_indexer_rows = g->cuda_tp_decode_indexer_rows,
+    };
+
+    bool ok = true;
+    if (multi_tier) {
+        /* Resolve and fence the ACTUAL CUDA device before consulting the
+         * graph's cached logical tier.  TP/output helpers can leave those two
+         * notions out of sync, in which case the ordinary cached setter is
+         * allowed to no-op. */
+        ok = ds4_gpu_set_current_device_fenced(exec_tier) == 0;
+        if (ok) ok = metal_graph_set_active_tier_decode(g, exec_tier);
+        if (ok && prev_is_active_cur) prev_hc = metal_graph_cur_hc(g);
+    }
+
+    /* The legacy support layer is a single-device graph.  Reject a partial
+     * residency setup before opening a command scope instead of allowing a
+     * kernel to consume a tensor owned by an unrelated CUDA device. */
+    if (ok && multi_tier) {
+        const ds4_gpu_tensor *resident[] = {
+            prev_hc, out_hc, g->mtp_embed, g->mtp_enorm, g->mtp_eproj,
+            g->mtp_eproj_hc, g->mtp_hnorm_hc, g->mtp_hproj_hc,
+            g->mtp_input_hc, g->mtp_state_hc, g->mtp_next_hc,
+            g->mtp_raw_cache, metal_graph_flat_hc(g),
+            metal_graph_output_pre(g), metal_graph_output_weights(g),
+            metal_graph_output_embd(g), metal_graph_output_norm(g),
+            metal_graph_logits(g), metal_graph_comp_selected(g),
+        };
+        for (size_t i = 0; i < sizeof(resident) / sizeof(resident[0]); i++) {
+            if (!resident[i] ||
+                ds4_gpu_tensor_device(resident[i]) != exec_tier) {
+                fprintf(stderr,
+                        "ds4: legacy MTP tensor %zu is not resident on "
+                        "executor tier %d\n",
+                        i, exec_tier);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    /* placement[il + 1] describes a base-model layer and must not redirect
+     * the support block.  Likewise, none of the local CUDA-TP policies may
+     * enlist a partner for this private one-layer graph. */
+    if (ok) {
+        g->placement = NULL;
+        g->cuda_tp_decode = false;
+        g->cuda_tp_attn = false;
+        g->cuda_tp_moe = false;
+        g->cuda_tp_ep = false;
+        g->cuda_tp_shared = false;
+        g->cuda_tp_q = false;
+        g->cuda_tp_output = false;
+        g->cuda_tp_prefill_indexer_rows = false;
+        g->cuda_tp_decode_indexer_rows = false;
+    }
     g->tp_world = 0;
     g->tp_batch_rows = 0;
-    const bool suspended_expert_sharding = saved_tp_world == 2;
+    const bool suspended_expert_sharding = ok && saved.tp_world == 2;
     if (suspended_expert_sharding) {
         ds4_gpu_tp_suspend_expert_sharding(1);
     }
-    bool ok = ds4_gpu_begin_commands() != 0;
+    const bool commands_begun = ok && ds4_gpu_begin_commands() != 0;
+    ok = ok && commands_begun;
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
                                                   base_model->map,
                                                   base_model->size,
@@ -36111,23 +36239,27 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              token);
     }
     if (ok) g->cur_hc_by_tier[g->active_tier] = out_hc;
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
+    /* A verified full-accept suffix needs one final support-layer pass to
+     * append the otherwise missing raw-cache row, but it does not need another
+     * vocabulary projection.  Both NULL outputs explicitly select that
+     * cache-only catch-up path. */
+    if (ok && (logits || top_id)) {
+        ok = metal_graph_encode_output_head_mtp(g,
+                                                base_model,
+                                                base_weights,
+                                                mtp_model,
+                                                mtp,
+                                                base_weights->output->dim[1]);
+    }
     if (ok && top_id) {
         ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
                                    metal_graph_logits(g),
                                    DS4_N_VOCAB) != 0;
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (suspended_expert_sharding) {
-        ds4_gpu_tp_suspend_expert_sharding(0);
+    if (commands_begun) {
+        const bool ended = ds4_gpu_end_commands() != 0;
+        ok = ok && ended;
     }
-    g->cur_hc_by_tier[g->active_tier] = saved_cur;
-    g->after_ffn_hc_by_tier[g->active_tier] = saved_after;
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -36136,12 +36268,40 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0, top_id, sizeof(*top_id)) != 0;
     }
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
-    g->tp_world = saved_tp_world;
-    g->tp_batch_rows = saved_tp_batch_rows;
     if (!ok) {
         (void)ds4_gpu_synchronize();
-        g->cur_hc_by_tier[g->active_tier] = saved_cur;
-        g->after_ffn_hc_by_tier[g->active_tier] = saved_after;
+    }
+
+    if (suspended_expert_sharding) {
+        ds4_gpu_tp_suspend_expert_sharding(0);
+    }
+    g->cur_hc_by_tier[exec_tier] = saved_exec_cur;
+    g->after_ffn_hc_by_tier[exec_tier] = saved_exec_after;
+    g->tp_world = saved.tp_world;
+    g->tp_batch_rows = saved.tp_batch_rows;
+    g->cuda_tp_decode = saved.cuda_tp_decode;
+    g->cuda_tp_attn = saved.cuda_tp_attn;
+    g->cuda_tp_moe = saved.cuda_tp_moe;
+    g->cuda_tp_ep = saved.cuda_tp_ep;
+    g->cuda_tp_shared = saved.cuda_tp_shared;
+    g->cuda_tp_q = saved.cuda_tp_q;
+    g->cuda_tp_output = saved.cuda_tp_output;
+    g->cuda_tp_prefill_indexer_rows = saved.cuda_tp_prefill_indexer_rows;
+    g->cuda_tp_decode_indexer_rows = saved.cuda_tp_decode_indexer_rows;
+    g->placement = saved.placement;
+    if (multi_tier) {
+        /* The original active-tier buffer was never rebound or overwritten;
+         * restoring the logical/physical device directly avoids copying the
+         * private draft result back into the committed main-model state. */
+        if (ds4_gpu_set_current_device_fenced(saved_active_tier) != 0) {
+            /* Do not publish a logical tier that the physical CUDA context did
+             * not reach.  Ordinary MTP rejection is recoverable; this is not. */
+            g->active_tier = -1;
+            g->mtp_device_poisoned = true;
+            ok = false;
+        } else {
+            g->active_tier = saved_active_tier;
+        }
     }
     return ok;
 }
@@ -37914,11 +38074,15 @@ static bool metal_graph_verify_suffix_tops_impl(
         bool                   capture_dspark_hidden,
         int                   *row_tops,
         float                 *row_logits,
-        ds4_verify_suffix_timing *timing) {
+        ds4_verify_suffix_timing *timing,
+        ds4_gpu_tensor       *verified_hc_dst) {
     if (timing) memset(timing, 0, sizeof(*timing));
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    ds4_gpu_tensor *verified_hc_src = NULL;
     if (top_rows && !row_tops) return false;
 
     const double upload_t0 = timing ? now_sec() : 0.0;
@@ -38001,6 +38165,14 @@ static bool metal_graph_verify_suffix_tops_impl(
         }
     }
     g->tp_batch_rows = 0;
+    if (ok && verified_hc_dst) {
+        /* Retain an explicit view of the last target-model hidden row before
+         * the output head is allowed to move the graph to its resident tier.
+         * The view remains valid until the verifier batch workspace is reused. */
+        verified_hc_src = metal_graph_tensor_row_view(
+                metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
+        ok = verified_hc_src != NULL;
+    }
     if (ok && fuse_head) {
         ok = metal_graph_encode_output_head_batch(g,
                                                   model,
@@ -38023,6 +38195,12 @@ static bool metal_graph_verify_suffix_tops_impl(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    if (ok && verified_hc_dst) {
+        ok = ds4_gpu_tensor_copy_xdev(verified_hc_dst,
+                                      verified_hc_src,
+                                      hc_bytes) != 0;
+    }
+    ds4_gpu_tensor_free(verified_hc_src);
     g->spec_capture_prefix1 = saved_capture;
     if (!ok && dspark_capture_active) {
         metal_graph_dspark_capture_invalidate(g);
@@ -38116,15 +38294,17 @@ static bool metal_graph_verify_suffix_tops(
         bool                   capture_dspark_hidden,
         int                   *row_tops,
         float                 *row_logits,
-        ds4_verify_suffix_timing *timing) {
+        ds4_verify_suffix_timing *timing,
+        ds4_gpu_tensor       *verified_hc_dst) {
     ds4_gpu_tp_keepalive_pause(1);
     const bool ok = metal_graph_verify_suffix_tops_impl(g, model, weights,
                                                         prompt, start,
                                                         n_tokens,
                                                         capture_prefix1,
-                                                        capture_dspark_hidden,
-                                                        row_tops, row_logits,
-                                                        timing);
+                                                         capture_dspark_hidden,
+                                                         row_tops, row_logits,
+                                                         timing,
+                                                         verified_hc_dst);
     ds4_gpu_tp_keepalive_pause(0);
     return ok;
 }
@@ -38156,7 +38336,8 @@ static bool metal_graph_verify_decode2_exact(
         int                   *top0,
         int                   *top1,
         float                 *logits0,
-        float                 *logits1) {
+        float                 *logits1,
+        ds4_gpu_tensor        *verified_hc_dst) {
     if (!g || !top0 || (!top1 && !logits1) || g->raw_cap == 0) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -38287,13 +38468,28 @@ static bool metal_graph_verify_decode2_exact(
             logits0 == NULL &&
             g->cuda_tp_output &&
             metal_graph_cuda_verify_decode2_split_top1_requested();
+        int output_tiers[DS4_MAX_GPUS] = {0};
         uint32_t output_ways = 0;
         g->cur_hc_by_tier[cur_tier] = cur0_by_tier[cur_tier];
         ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
+        if (ok && split_top1) {
+            ok = metal_graph_encode_output_head_split_top1(g,
+                                                           model,
+                                                           weights,
+                                                           weights->output->dim[1],
+                                                           output_tiers,
+                                                           &output_ways);
+        } else if (ok) {
+            ok = metal_graph_encode_output_head(g,
+                                                model,
+                                                weights,
+                                                weights->output->dim[1]);
+            if (ok) {
+                ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
                                            metal_graph_logits(g),
                                            DS4_N_VOCAB) != 0;
+            }
+        }
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
         if (ok && split_top1) {
@@ -38355,6 +38551,14 @@ static bool metal_graph_verify_decode2_exact(
             }
         }
     }
+    if (ok && verified_hc_dst) {
+        /* cur1_by_tier[cur_tier] is the exact target-model HC after token1.
+         * Capture it before restoring the ordinary decode pointers and freeing
+         * the verifier row views; metal_graph_cur_hc() is stale after restore. */
+        ok = ds4_gpu_tensor_copy_xdev(verified_hc_dst,
+                                      cur1_by_tier[cur_tier],
+                                      hc_bytes) != 0;
+    }
     g->spec_capture_prefix1 = saved_capture;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         g->cur_hc_by_tier[t] = saved_cur_by_tier[t];
@@ -38362,7 +38566,16 @@ static bool metal_graph_verify_decode2_exact(
     }
     if (g->placement) {
         if (saved_active_tier >= 0) {
-            (void)metal_graph_set_active_tier_no_copy(g, saved_active_tier);
+            /* The verifier may finish on the output-head tier.  Verify the
+             * actual CUDA device while restoring the caller's logical tier;
+             * the cached setter alone may no-op on stale bookkeeping. */
+            if (ds4_gpu_set_current_device_fenced(saved_active_tier) != 0) {
+                g->active_tier = -1;
+                g->mtp_device_poisoned = true;
+                ok = false;
+            } else {
+                g->active_tier = saved_active_tier;
+            }
         } else {
             g->active_tier = saved_active_tier;
         }
@@ -39401,6 +39614,7 @@ struct ds4_engine {
     ds4_backend backend;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
+    int mtp_exec_tier;
     uint32_t support_stages;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -54981,6 +55195,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
                                                            &top0,
                                                            &top1,
                                                            NULL,
+                                                           NULL,
                                                            NULL);
                 if (!ok) {
                     snprintf(err, errlen, "%s split-kv paired exact replay failed",
@@ -55131,6 +55346,12 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
     return -1;
 #else
     ds4_engine *e = s->engine;
+    if (s->graph.mtp_device_poisoned) {
+        snprintf(err, errlen,
+                 "CUDA device state is poisoned; rebuild the session");
+        s->checkpoint_valid = false;
+        return -1;
+    }
     int top = -1;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
     const bool splitkv_may_engage =
@@ -55396,6 +55617,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
                                                  false,
                                                  &row0_top,
                                                  row_logits,
+                                                 NULL,
                                                  NULL);
         const double t_verify = timing ? now_sec() : 0.0;
         if (!ok) {
@@ -55481,7 +55703,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
                                                &row0_top,
                                                NULL,
                                                row0_logits,
-                                               row1_logits);
+                                               row1_logits,
+                                               NULL);
     const double t_verify = timing ? now_sec() : 0.0;
     if (!ok) {
         (void)spec_frontier_restore(&frontier, s);
@@ -59530,68 +59753,131 @@ static void engine_print_layout(const ds4_engine *e) {
  *      caches.
  *
  * Returns 0 on success. */
-/* Install the DSpark support model's tensors on one executor tier: the
- * TP partner of the output-head tier when decode TP is active (it has the
- * output-head copy from output TP and plenty of free VRAM), otherwise the
- * head tier itself. The strict multi-tier weight cache is offset-keyed, so
- * support tensors are registered with a disjoint offset bias. */
-static int engine_install_dspark_support_cache(ds4_engine *e) {
-    if (!e->multi_tier || e->support_kind != DS4_SUPPORT_DSPARK) return 0;
-    if (!e->dspark) return 0;
-    if (!e->mtp_model.map || e->mtp_model.n_tensors == 0) return 0;
-
-    int exec_tier = e->placement[DS4_N_LAYER + 1];
-    if (exec_tier < 0 || exec_tier >= e->gpu_cfg.n_gpus) exec_tier = 0;
-    const bool tp_decode = e->cuda_tensor_parallel;
-    const int tp_half = e->gpu_cfg.n_gpus / 2;
-    if (tp_decode && e->gpu_cfg.n_gpus >= 2 && exec_tier < tp_half) {
-        exec_tier += tp_half;
-    }
-    if (tp_decode && e->gpu_cfg.n_gpus >= 2) {
-        /* Prefer the partner tier with the most free VRAM so the support
-         * weights stay local to the executor. */
-        uint64_t best_free = ds4_gpu_tier_free_vram(exec_tier);
-        for (int t = tp_half; t < e->gpu_cfg.n_gpus; t++) {
-            const uint64_t f = ds4_gpu_tier_free_vram(t);
-            if (f > best_free) { best_free = f; exec_tier = t; }
-        }
-    }
-    const char *tier_env = getenv("DS4_DSPARK_EXEC_TIER");
-    if (tier_env && tier_env[0]) {
-        const int v = atoi(tier_env);
-        if (v >= 0 && v < e->gpu_cfg.n_gpus) exec_tier = v;
-    }
-    e->dspark_exec_tier = exec_tier;
-
-    const uint64_t bias = (e->model.size + 4095ull) & ~4095ull;
-    if (!ds4_gpu_register_support_map(e->mtp_model.map, e->mtp_model.size, bias)) {
-        fprintf(stderr, "ds4: failed to register DSpark support model map\n");
+/* Install a speculative support model into the strict multi-tier cache.
+ *
+ * Cache keys are source offsets, so a support model must occupy a disjoint
+ * key range from the base GGUF. DSpark may retain its existing direct-peer
+ * spill policy; legacy MTP is executor-local-only until remote kernel reads
+ * have a dedicated qualifier.
+ *
+ * DSpark retains its existing partner-tier executor policy.  Legacy MTP is
+ * stricter: its HC-collapse and full-vocabulary staging buffers are Class-H
+ * allocations that exist only on the main output-head tier, so its executor
+ * is exactly that tier.  An environment override may restate that tier but
+ * may not redirect execution to a device without those buffers. */
+static int engine_install_support_cache(ds4_engine *e) {
+    if (!e->multi_tier || e->support_kind == DS4_SUPPORT_NONE) return 0;
+    const bool legacy = e->support_kind == DS4_SUPPORT_MTP_LEGACY;
+    const bool dspark = e->support_kind == DS4_SUPPORT_DSPARK;
+    if ((legacy && !e->mtp_ready) || (dspark && !e->dspark)) return 0;
+    if (!e->mtp_model.map || e->mtp_model.n_tensors == 0) {
+        fprintf(stderr, "ds4: %s support model has no mapped tensors\n",
+                support_kind_name(e->support_kind));
         return -1;
     }
 
-    /* Greedy pack: exec tier first, then the other TP-partner tiers.
-     * Entries always claim the executor device; spilled tensors are read
-     * through peer access. Per-tier budget leaves room for the graph
-     * scratch and allocator slack that session_create allocates later. */
+    const char *support_name = legacy ? "legacy MTP" : "DSpark";
+    const bool tp_decode = e->cuda_tensor_parallel;
+    const int tp_half = e->gpu_cfg.n_gpus / 2;
+    int exec_tier = e->placement[DS4_N_LAYER + 1];
+    if (exec_tier < 0 || exec_tier >= e->gpu_cfg.n_gpus) {
+        fprintf(stderr,
+                "ds4: %s output-head executor tier %d is invalid\n",
+                support_name, exec_tier);
+        return -1;
+    }
+
+    if (legacy) {
+        const char *tier_env = getenv("DS4_MTP_EXEC_TIER");
+        if (tier_env && tier_env[0]) {
+            char *end = NULL;
+            const long requested = strtol(tier_env, &end, 10);
+            if (end == tier_env || *end != '\0' || requested < 0 ||
+                requested >= e->gpu_cfg.n_gpus || requested != exec_tier) {
+                fprintf(stderr,
+                        "ds4: DS4_MTP_EXEC_TIER=%s is incompatible with "
+                        "legacy MTP output buffers on head tier %d\n",
+                        tier_env, exec_tier);
+                return -1;
+            }
+        }
+        e->mtp_exec_tier = exec_tier;
+    } else {
+        if (tp_decode && e->gpu_cfg.n_gpus >= 2 && exec_tier < tp_half) {
+            exec_tier += tp_half;
+        }
+        if (tp_decode && e->gpu_cfg.n_gpus >= 2) {
+            /* Prefer the directly usable partner tier with the most free
+             * VRAM so the support weights stay local to the executor. */
+            uint64_t best_free = ds4_gpu_tier_free_vram(exec_tier);
+            for (int t = tp_half; t < e->gpu_cfg.n_gpus; t++) {
+                const uint64_t f = ds4_gpu_tier_free_vram(t);
+                if (f > best_free) { best_free = f; exec_tier = t; }
+            }
+        }
+        const char *tier_env = getenv("DS4_DSPARK_EXEC_TIER");
+        if (tier_env && tier_env[0]) {
+            const int v = atoi(tier_env);
+            if (v >= 0 && v < e->gpu_cfg.n_gpus) exec_tier = v;
+        }
+        e->dspark_exec_tier = exec_tier;
+    }
+
+    if (e->model.size > UINT64_MAX - 4095ull) {
+        fprintf(stderr, "ds4: %s support-map bias overflow\n", support_name);
+        return -1;
+    }
+    const uint64_t bias = (e->model.size + 4095ull) & ~4095ull;
+    if (bias == 0 || e->mtp_model.size > UINT64_MAX - bias ||
+        !ds4_gpu_register_support_map(e->mtp_model.map,
+                                      e->mtp_model.size,
+                                      bias)) {
+        fprintf(stderr, "ds4: failed to register %s support model map\n",
+                support_name);
+        return -1;
+    }
+
+    /* Greedy pack: executor first, then eligible spill tiers for DSpark only.
+     * A successful peer-copy probe does not prove that an executor kernel may
+     * directly dereference an allocation owned by that peer.  Until legacy
+     * MTP has a dedicated remote-read qualifier, every support tensor must be
+     * physically local to its executor; insufficient local capacity fails
+     * engine creation closed. */
     int order[DS4_MAX_GPUS];
     int n_order = 0;
     order[n_order++] = exec_tier;
     for (int t = e->gpu_cfg.n_gpus - 1; t >= 0; t--) {
+        if (legacy) break;
         if (t == exec_tier) continue;
-        if (tp_decode && t < tp_half) continue; /* home tiers are packed full */
+        if (dspark && tp_decode && t < tp_half) continue;
+        if (!g_gpu_peer_ok[exec_tier][t]) {
+            fprintf(stderr,
+                    "ds4: %s support pack skipping tier %d: executor tier %d "
+                    "cannot directly read it\n",
+                    support_name, t, exec_tier);
+            continue;
+        }
         order[n_order++] = t;
     }
     uint64_t reserve = 4ull * 1024ull * 1024ull * 1024ull + (1ull << 29);
     {
-        const char *renv = getenv("DS4_DSPARK_CACHE_RESERVE_GB");
+        const char *renv = getenv(legacy ? "DS4_MTP_CACHE_RESERVE_GB"
+                                         : "DS4_DSPARK_CACHE_RESERVE_GB");
         if (renv && renv[0]) {
             const int gv = atoi(renv);
             if (gv >= 1 && gv <= 32) reserve = (uint64_t)gv << 30;
         }
     }
-    const uint64_t range_cap =
+    const uint64_t base_range_cap =
         e->mtp_model.n_tensors > e->model.n_tensors
             ? e->mtp_model.n_tensors : e->model.n_tensors;
+    if (base_range_cap == UINT64_MAX ||
+        base_range_cap + 1u > SIZE_MAX / sizeof(ds4_tensor_range)) {
+        fprintf(stderr, "ds4: %s support cache range count is too large\n",
+                support_name);
+        return -1;
+    }
+    const uint64_t range_cap = base_range_cap + 1u;
     ds4_tensor_range *ranges =
         xmalloc((size_t)range_cap * sizeof(ranges[0]));
     bool *placed = xmalloc((size_t)e->mtp_model.n_tensors * sizeof(placed[0]));
@@ -59611,7 +59897,8 @@ static int engine_install_dspark_support_cache(ds4_engine *e) {
                                                ? reserve - (1ull << 30) : reserve);
         uint64_t budget = free_b > tier_reserve ? free_b - tier_reserve : 0;
         fprintf(stderr,
-                "ds4: DSpark support pack tier=%d free=%.2f GiB budget=%.2f GiB\n",
+                "ds4: %s support pack tier=%d free=%.2f GiB budget=%.2f GiB\n",
+                support_name,
                 tier,
                 (double)free_b / 1073741824.0,
                 (double)budget / 1073741824.0);
@@ -59636,60 +59923,108 @@ static int engine_install_dspark_support_cache(ds4_engine *e) {
                 ranges, n, 0);
         if (rc != 0) {
             fprintf(stderr,
-                    "ds4: DSpark support cache install failed on tier %d (rc=%d)\n",
-                    tier, rc);
+                    "ds4: %s support cache install failed on tier %d (rc=%d)\n",
+                    support_name, tier, rc);
             free(placed);
             free(ranges);
             return -1;
         }
         fprintf(stderr,
-                "ds4: DSpark support tensors cached on tier %d (%d tensors%s)\n",
-                tier, n, tier == exec_tier ? ", executor tier" : ", peer spill");
+                "ds4: %s support tensors cached on tier %d (%d tensors%s)\n",
+                support_name, tier, n,
+                tier == exec_tier ? ", executor tier" : ", direct-peer spill");
     }
-    /* The DSpark draft block embeds tokens through the BASE model's
-     * embedding tensors, which normally live only on the embedding tier.
-     * Install the embedding bucket (placement entry 0) on the executor
-     * tier as well, through the normal main-model cache API. */
+    if (remaining != 0) {
+        fprintf(stderr,
+                "ds4: %s support cache could not place %llu tensors %s\n",
+                support_name, (unsigned long long)remaining,
+                legacy ? "on its executor tier"
+                       : "locally or on a validated direct peer");
+        free(placed);
+        free(ranges);
+        return -1;
+    }
+
+    /* Both support runtimes embed through the BASE model.  Cache every
+     * missing embedding-bucket range on the executor.  Legacy MTP also uses
+     * the ordinary, unsharded base vocabulary projection; output TP may have
+     * cached only a shard, so install the full output tensor when necessary. */
     {
         int n = 0;
+        int embedding_n = 0;
+        bool added_full_output = false;
+        const int exec_device = g_gpu[exec_tier].device_id;
         for (uint64_t ti = 0; ti < e->model.n_tensors; ti++) {
             const ds4_tensor *t = &e->model.tensors[ti];
             if (t->bytes == 0) continue;
             if (tensor_to_entry(t, DS4_N_LAYER) != 0) continue;
+            void *cached = NULL;
+            if (ds4_gpu_lookup_cache_strict(t->abs_offset, t->bytes,
+                                            exec_device, &cached) && cached) {
+                continue;
+            }
             ranges[n].source_offset = t->abs_offset;
             ranges[n].bytes = t->bytes;
-            ranges[n].target_device = g_gpu[exec_tier].device_id;
+            ranges[n].target_device = exec_device;
             n++;
+            embedding_n++;
         }
-        if (n != 0) {
-            const int rc = ds4_gpu_device_cache_support_tensors(
-                    g_gpu[exec_tier].device_id,
-                    g_gpu[exec_tier].device_id,
-                    ranges, n, 1);
-            if (rc != 0) {
+        if (legacy) {
+            const ds4_tensor *output = e->weights.output;
+            if (!output || output->bytes == 0) {
                 fprintf(stderr,
-                        "ds4: DSpark base embedding cache install failed on "
-                        "tier %d (rc=%d)\n",
-                        exec_tier, rc);
+                        "ds4: legacy MTP requires the base output tensor\n");
                 free(placed);
                 free(ranges);
                 return -1;
             }
-            fprintf(stderr,
-                    "ds4: DSpark base embedding bucket cached on tier %d "
-                    "(%d tensors)\n",
-                    exec_tier, n);
+            void *cached = NULL;
+            if (!ds4_gpu_lookup_cache_strict(output->abs_offset, output->bytes,
+                                             exec_device, &cached) || !cached) {
+                ranges[n].source_offset = output->abs_offset;
+                ranges[n].bytes = output->bytes;
+                ranges[n].target_device = exec_device;
+                n++;
+                added_full_output = true;
+            }
+        }
+        if (n != 0) {
+            const int rc = ds4_gpu_device_cache_support_tensors(
+                    exec_device,
+                    exec_device,
+                    ranges, n, 1);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "ds4: %s auxiliary base cache install failed on "
+                        "tier %d (rc=%d)\n",
+                        support_name, exec_tier, rc);
+                free(placed);
+                free(ranges);
+                return -1;
+            }
+        }
+        fprintf(stderr,
+                "ds4: %s base embedding bucket ready on tier %d "
+                "(%d newly cached tensors%s)\n",
+                support_name, exec_tier, embedding_n,
+                added_full_output ? "; full output tensor cached" : "");
+        if (legacy) {
+            void *cached = NULL;
+            const ds4_tensor *output = e->weights.output;
+            if (!ds4_gpu_lookup_cache_strict(output->abs_offset, output->bytes,
+                                             exec_device, &cached) || !cached) {
+                fprintf(stderr,
+                        "ds4: legacy MTP full output tensor is unavailable on "
+                        "executor tier %d\n",
+                        exec_tier);
+                free(placed);
+                free(ranges);
+                return -1;
+            }
         }
     }
     free(placed);
     free(ranges);
-    if (remaining != 0) {
-        fprintf(stderr,
-                "ds4: DSpark support cache could not place %llu tensors "
-                "(insufficient free VRAM); disabling DSpark runtime\n",
-                (unsigned long long)remaining);
-        return -1;
-    }
     return 0;
 }
 
@@ -60171,7 +60506,7 @@ const int *ds4_test_engine_placement(const ds4_engine *e) {
 }
 #endif /* DS4_TEST_HOOKS */
 
-static int engine_install_dspark_support_cache(ds4_engine *e);
+static int engine_install_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
@@ -60609,8 +60944,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
             if (opt->tp.role != DS4_TP_NONE) {
                 fprintf(stderr,
-                        "ds4: legacy MTP support is ignored under tensor parallelism; "
-                        "using the normal TP decode path\n");
+                        "ds4: legacy MTP support is ignored under process/network "
+                        "tensor parallelism; using the normal TP decode path "
+                        "(local CUDA multi-tier execution remains supported)\n");
                 model_close(&e->mtp_model);
                 e->support_kind = DS4_SUPPORT_NONE;
                 e->support_stages = 0;
@@ -60707,7 +61043,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            if (engine_install_dspark_support_cache(e) != 0) {
+            if (engine_install_support_cache(e) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -61665,6 +62001,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ? &e->shared_prefill_workspace
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
+    s->graph.mtp_exec_tier =
+        e->multi_tier && e->support_kind == DS4_SUPPORT_MTP_LEGACY
+            ? e->mtp_exec_tier : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,
@@ -61775,6 +62114,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
+        fprintf(stderr,
+                "ds4: legacy MTP private raw cache starts cold; prompt prefill "
+                "is not replayed into the support model (zero-prefill-overhead "
+                "baseline)\n");
     }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
         char err[256];
@@ -61933,6 +62276,11 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (s->graph.mtp_device_poisoned) {
+        if (errlen) snprintf(err, errlen,
+                             "CUDA device state is poisoned; rebuild the session");
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
@@ -61978,6 +62326,12 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    if (s->graph.mtp_device_poisoned) {
+        if (errlen) snprintf(err, errlen,
+                             "CUDA device state is poisoned; rebuild the session");
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         ds4_glm_gpu_graph *gg = &s->glm_graph;
         bool ok = ds4_gpu_tensor_write(gg->cur,
@@ -62303,6 +62657,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     s->checkpoint_valid = false;
     return 1;
 #else
+    if (s->graph.mtp_device_poisoned) {
+        if (errlen) snprintf(err, errlen,
+                             "CUDA device state is poisoned; rebuild the session");
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         ds4_engine *e = s->engine;
         ds4_glm_gpu_graph *g = &s->glm_graph;
@@ -62921,6 +63281,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+    if (s->graph.mtp_device_poisoned) {
+        snprintf(err, errlen,
+                 "CUDA device state is poisoned; rebuild the session");
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -63518,6 +63884,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     {
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
+        /* Legacy MTP cache rows are produced only by the private drafter; an
+         * externally supplied prompt suffix advances the target frontier
+         * without advancing that cache.  Reusing its old row count would make
+         * the next draft attend to stale pre-extension history. */
+        if (suffix > 0 && e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
+            s->graph.mtp_n_raw = 0;
+        }
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
             bool cancelled = false;
@@ -64504,6 +64877,12 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (s->graph.mtp_device_poisoned) {
+        snprintf(err, errlen,
+                 "CUDA device state is poisoned; rebuild the session");
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         /* TP worker under GLM MTP: run the full speculative cycle off the
          * mirrored EVAL frame so drafts, verify batches, and gate traffic
@@ -64618,6 +64997,20 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                       (uint32_t)(s->checkpoint.len - 1),
                                       probe_mtp,
                                       mtp_probe_log);
+    if (s->graph.mtp_device_poisoned) {
+        snprintf(err, errlen,
+                 "CUDA device restore failed; session is unusable");
+        s->checkpoint_valid = false;
+        s->graph.mtp_n_raw = 0;
+        return 1;
+    }
+    if (e->support_kind == DS4_SUPPORT_MTP_LEGACY &&
+        (!probe_mtp || !s->mtp_draft_valid)) {
+        /* This committed token was not appended successfully to the private
+         * support cache.  Never let a later speculative call interpret the old
+         * visible count as contiguous across the gap. */
+        s->graph.mtp_n_raw = 0;
+    }
     return 0;
 #endif
 }
@@ -64668,11 +65061,15 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
-    bool probe_mtp = true;
+    bool probe_mtp = false;
 #ifndef DS4_NO_GPU
-    if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
-        probe_mtp = false;
-    }
+    /* Ordinary sampled/non-speculative decode must not pay for a draft that
+     * no caller will consume.  The speculative API opts in explicitly through
+     * ds4_session_eval_probe_tp(..., true); ordinary eval only runs the legacy
+     * drafter when the diagnostic probe was explicitly requested. */
+    probe_mtp = s && s->engine &&
+                s->engine->support_kind == DS4_SUPPORT_MTP_LEGACY &&
+                getenv("DS4_MTP_PROBE") != NULL;
 #endif
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
 }
@@ -65737,7 +66134,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             true,
                                             row_tops,
                                             NULL,
-                                            stats_enabled ? &verify_timing : NULL);
+                                            stats_enabled ? &verify_timing : NULL,
+                                            NULL);
         if (stats_enabled) {
             s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
@@ -65994,6 +66392,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                              false,
                                              false,
                                              draft_n > 1 ? row_tops : NULL,
+                                             NULL,
                                              NULL,
                                              NULL);
     int32_t full_accept = 0, replay_n = 0;
@@ -68866,6 +69265,126 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+static uint32_t ds4_legacy_mtp_raw_count_after(
+        const ds4_gpu_graph *g,
+        uint32_t             base,
+        uint32_t             added) {
+    uint64_t keep = (uint64_t)base + added;
+    uint32_t cap = g ? g->raw_window : 0;
+    if (g && cap > g->raw_cap) cap = g->raw_cap;
+    if (keep > cap) keep = cap;
+    return (uint32_t)keep;
+}
+
+/* Preserve an exact target-model hidden row for the support-cache catch-up.
+ * Callers must pass an explicitly known final accepted row; never infer it
+ * from metal_graph_cur_hc() after a verifier has restored graph pointers. */
+static bool metal_graph_capture_legacy_mtp_verified_hc(
+        ds4_gpu_graph  *g,
+        ds4_gpu_tensor *src) {
+    if (!g || !src || !g->mtp_next_hc ||
+        g->mtp_exec_tier < 0 || g->mtp_exec_tier >= DS4_MAX_GPUS ||
+        ds4_gpu_tensor_device(g->mtp_next_hc) != g->mtp_exec_tier) {
+        return false;
+    }
+    const uint64_t hc_bytes =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    return ds4_gpu_tensor_copy_xdev(g->mtp_next_hc, src, hc_bytes) != 0;
+}
+
+/* Recursive legacy MTP drafting materializes a raw-cache row for every draft
+ * except the final proposal.  A partial accept can hide unaccepted rows by
+ * rolling the visible count back.  A full accept must actually run the final
+ * accepted token through the support layer from that token's exact target HC,
+ * or the next cycle would expose an unwritten/stale row. The verifier must
+ * retain that HC explicitly before restoring its temporary graph pointers.
+ * The catch-up pass skips the unused vocabulary projection (both result
+ * outputs are NULL). */
+static bool ds4_session_commit_legacy_mtp_raw(
+        ds4_session *s,
+        const int   *drafts,
+        int          drafted,
+        int          accepted,
+        uint32_t     base_raw,
+        uint32_t     draft_start,
+        ds4_gpu_tensor *verified_hc) {
+    if (!s || !s->engine || !drafts || drafted <= 0 || accepted < 0 ||
+        accepted > drafted) {
+        if (s) s->graph.mtp_n_raw = 0;
+        return s && !s->graph.mtp_device_poisoned;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t accepted_u = (uint32_t)accepted;
+    const uint32_t desired =
+        ds4_legacy_mtp_raw_count_after(g, base_raw, accepted_u);
+    if (accepted < drafted) {
+        const uint32_t generated_u = (uint32_t)(drafted - 1);
+        uint32_t cap = g->raw_window;
+        if (cap > g->raw_cap) cap = g->raw_cap;
+        if (generated_u > accepted_u &&
+            (uint64_t)base_raw + generated_u > cap) {
+            /* An unaccepted future row wrapped onto still-visible history.
+             * Counter rollback cannot reconstruct the overwritten oldest row;
+             * invalidate the private history rather than consume stale data. */
+            g->mtp_n_raw = 0;
+            return !g->mtp_device_poisoned;
+        }
+        /* Speculative rows past the accepted prefix remain in the allocation,
+         * but are invisible and will be overwritten by absolute-position ring
+         * indexing on a later proposal. */
+        g->mtp_n_raw = desired;
+        return !g->mtp_device_poisoned;
+    }
+
+    const uint32_t generated_u = (uint32_t)(drafted - 1);
+    const uint32_t expected_before =
+        ds4_legacy_mtp_raw_count_after(g, base_raw, generated_u);
+    if (g->mtp_n_raw != expected_before ||
+        draft_start > UINT32_MAX - generated_u ||
+        !e->mtp_ready ||
+        !verified_hc ||
+        verified_hc != g->mtp_next_hc) {
+        fprintf(stderr,
+                "ds4: legacy MTP raw-cache catch-up precondition failed; "
+                "resetting private history (base=%u generated=%u visible=%u)\n",
+                base_raw, generated_u, g->mtp_n_raw);
+        g->mtp_n_raw = 0;
+        s->mtp_draft_valid = false;
+        return !g->mtp_device_poisoned;
+    }
+
+    ds4_gpu_tensor *out_hc = g->mtp_state_hc;
+    if (!out_hc || out_hc == verified_hc ||
+        !metal_graph_eval_mtp_draft_from_hc(g,
+                                             &e->model,
+                                             &e->weights,
+                                             &e->mtp_model,
+                                             &e->mtp_weights,
+                                             verified_hc,
+                                             out_hc,
+                                             drafts[drafted - 1],
+                                             draft_start + generated_u,
+                                             NULL,
+                                             NULL) ||
+        g->mtp_n_raw != desired) {
+        fprintf(stderr,
+                "ds4: legacy MTP raw-cache catch-up failed; resetting private "
+                "history (drafted=%d accepted=%d position=%u)\n",
+                drafted, accepted, draft_start + generated_u);
+        g->mtp_n_raw = 0;
+        s->mtp_draft_valid = false;
+    }
+    if (g->mtp_device_poisoned) {
+        s->checkpoint_valid = false;
+        return false;
+    }
+    return true;
+}
+#endif
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -69001,7 +69520,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         return n_accept + extra;
     }
 
-    /* Legacy MTP verify is not TP-mirrored; fall back to per-token decode. */
+    /* Process/network TP verification is not mirrored.  This does not reject
+     * local CUDA multi-tier execution, whose state is e->cuda_tensor_parallel
+     * rather than e->tp.active. */
     if (e->tp.active) return n_accept;
 
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
@@ -69049,17 +69570,19 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
     if (drafts[0] == eos_token) draft_cap = 1;
     const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    const uint32_t mtp_draft_start = (uint32_t)s->checkpoint.len;
+    bool mtp_verified_hc_valid = false;
     /*
      * MTP has its own raw SWA cache. Recursive drafting writes speculative
      * future rows into it; after verification, rows beyond the accepted prefix
-     * must become invisible.  We do not copy/rollback the cache body because the
-     * next draft attempt will overwrite future slots.  A counter is enough.
+     * must become invisible. A full accept additionally materializes the final
+     * proposal's missing row before the next cycle.
      */
-#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
-    } while (0)
+#define DS4_MTP_KEEP_ACCEPTED(n_) \
+        ds4_session_commit_legacy_mtp_raw(s, drafts, draft_n, (n_), \
+                                          mtp_base_raw, mtp_draft_start, \
+                                          mtp_verified_hc_valid \
+                                              ? s->graph.mtp_next_hc : NULL)
 
     for (; draft_n < draft_cap; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
@@ -69077,6 +69600,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 mtp_need_logits ? s->mtp_logits : NULL,
                                                 &mtp_top))
         {
+            /* The failed step may have written its raw row before a later
+             * stage failed, and older successful steps may have wrapped the
+             * ring. Invalidate private history; counter rollback alone cannot
+             * prove the old visible rows are intact. */
+            s->graph.mtp_n_raw = 0;
+            if (s->graph.mtp_device_poisoned) {
+                snprintf(err, errlen,
+                         "legacy MTP CUDA device restore failed; session is unusable");
+                s->checkpoint_valid = false;
+                return -1;
+            }
             return n_accept;
         }
         drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
@@ -69112,6 +69646,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 free(row_logits);
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
+                s->graph.mtp_n_raw = 0;
                 return -1;
             }
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -69120,7 +69655,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            if (!DS4_MTP_KEEP_ACCEPTED(1)) {
+                snprintf(err, errlen,
+                         "legacy MTP CUDA device restore failed; session is unusable");
+                return -1;
+            }
             ds4_session_dspark_capture_note_checkpoint(s);
             if (mtp_timing) {
                 const double done = now_sec();
@@ -69164,10 +69703,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   drafts[0],
                                                   drafts[1],
                                                   (uint32_t)start,
-                                                  &row0_top,
-                                                  NULL,
-                                                  row0_logits,
-                                                  row_logits);
+                                                   &row0_top,
+                                                   NULL,
+                                                   row0_logits,
+                                                   row_logits,
+                                                   s->graph.mtp_next_hc);
+            mtp_verified_hc_valid = ok;
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok && row0_top == drafts[1]) {
@@ -69178,7 +69719,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(2);
+            if (!DS4_MTP_KEEP_ACCEPTED(2)) {
+                snprintf(err, errlen,
+                         "legacy MTP CUDA device restore failed; session is unusable");
+                spec_frontier_free(&frontier);
+                free(row0_logits);
+                free(row_logits);
+                return -1;
+            }
             ds4_session_dspark_capture_note_checkpoint(s);
             if (mtp_timing) {
                 fprintf(stderr,
@@ -69205,7 +69753,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
+            if (!DS4_MTP_KEEP_ACCEPTED(1)) {
+                snprintf(err, errlen,
+                         "legacy MTP CUDA device restore failed; session is unusable");
+                spec_frontier_free(&frontier);
+                free(row0_logits);
+                free(row_logits);
+                return -1;
+            }
             ds4_session_dspark_capture_note_checkpoint(s);
             if (mtp_timing) {
                 const double replay_done = now_sec();
@@ -69225,7 +69780,26 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (have_frontier) {
             s->checkpoint.len = start;
             ds4_session_dspark_capture_invalidate(s);
-            (void)spec_frontier_restore(&frontier, s);
+            if (!spec_frontier_restore(&frontier, s)) {
+                snprintf(err, errlen,
+                         "MTP decode2 frontier restore failed");
+                s->checkpoint_valid = false;
+                s->graph.mtp_n_raw = 0;
+                spec_frontier_free(&frontier);
+                free(row0_logits);
+                free(row_logits);
+                return -1;
+            }
+        }
+        if (s->graph.mtp_device_poisoned) {
+            snprintf(err, errlen,
+                     "legacy MTP CUDA device restore failed; session is unusable");
+            s->checkpoint_valid = false;
+            s->graph.mtp_n_raw = 0;
+            spec_frontier_free(&frontier);
+            free(row0_logits);
+            free(row_logits);
+            return -1;
         }
         spec_frontier_free(&frontier);
         free(row0_logits);
@@ -69277,9 +69851,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)draft_n,
                                                 capture_prefix1,
                                                 false,
-                                                row_tops,
-                                                NULL,
-                                                NULL);
+                                                 row_tops,
+                                                 NULL,
+                                                 NULL,
+                                                 s->graph.mtp_next_hc);
+            mtp_verified_hc_valid = ok;
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok) {
@@ -69300,6 +69876,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         draft_n > 1 ? drafts[1] : -1);
             }
             if (exact_replay_debug && have_frontier) {
+                /* The batch verifier HC is invalid once its frontier is
+                 * restored. A full exact replay captures its own final HC. */
+                mtp_verified_hc_valid = false;
                 s->checkpoint.len = start;
                 ds4_session_dspark_capture_invalidate(s);
                 ok = spec_frontier_restore(&frontier, s);
@@ -69315,6 +69894,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         if (ok) token_vec_push(&s->checkpoint, drafts[replayed]);
                     }
                     if (ok) {
+                        if (replayed == draft_n) {
+                            mtp_verified_hc_valid =
+                                metal_graph_capture_legacy_mtp_verified_hc(
+                                        &s->graph,
+                                        metal_graph_cur_hc(&s->graph));
+                        }
                         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                         for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
                             accepted[n_accept++] = drafts[i];
@@ -69322,7 +69907,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         }
                         s->checkpoint_valid = true;
                         s->mtp_draft_valid = false;
-                        DS4_MTP_KEEP_ACCEPTED(replayed);
+                        if (!DS4_MTP_KEEP_ACCEPTED(replayed)) {
+                            snprintf(err, errlen,
+                                     "legacy MTP CUDA device restore failed; session is unusable");
+                            spec_frontier_free(&frontier);
+                            free(row_logits);
+                            free(row_tops);
+                            return -1;
+                        }
                         ds4_session_dspark_capture_note_checkpoint(s);
                         spec_frontier_free(&frontier);
                         free(row_logits);
@@ -69344,7 +69936,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(draft_n);
+                    if (!DS4_MTP_KEEP_ACCEPTED(draft_n)) {
+                        snprintf(err, errlen,
+                                 "legacy MTP CUDA device restore failed; session is unusable");
+                        spec_frontier_free(&frontier);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
                     ds4_session_dspark_capture_note_checkpoint(s);
                     if (mtp_timing) {
                         fprintf(stderr,
@@ -69375,7 +69974,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    if (!DS4_MTP_KEEP_ACCEPTED(1)) {
+                        snprintf(err, errlen,
+                                 "legacy MTP CUDA device restore failed; session is unusable");
+                        spec_frontier_free(&frontier);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
                     token_vec_push(&s->checkpoint, drafts[0]);
                     ds4_session_dspark_capture_note_checkpoint(s);
                     if (mtp_timing) {
@@ -69411,7 +70017,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
+                    if (!DS4_MTP_KEEP_ACCEPTED(1)) {
+                        snprintf(err, errlen,
+                                 "legacy MTP CUDA device restore failed; session is unusable");
+                        spec_frontier_free(&frontier);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
                     token_vec_push(&s->checkpoint, drafts[0]);
                     ds4_session_dspark_capture_note_checkpoint(s);
                     if (mtp_timing) {
@@ -69442,9 +70055,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     (uint32_t)commit_drafts,
                                                     false,
                                                     false,
-                                                    row_tops,
-                                                    NULL,
-                                                    NULL);
+                                                     row_tops,
+                                                     NULL,
+                                                     NULL,
+                                                     s->graph.mtp_next_hc);
+                mtp_verified_hc_valid = ok;
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
                                                               (uint32_t)(commit_drafts - 1),
                                                               row_logits);
@@ -69456,7 +70071,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+                    if (!DS4_MTP_KEEP_ACCEPTED(commit_drafts)) {
+                        snprintf(err, errlen,
+                                 "legacy MTP CUDA device restore failed; session is unusable");
+                        spec_frontier_free(&frontier);
+                        free(row_logits);
+                        free(row_tops);
+                        return -1;
+                    }
                     ds4_session_dspark_capture_note_checkpoint(s);
                     if (mtp_timing) {
                         const double replay_done = now_sec();
@@ -69480,14 +70102,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         s->checkpoint.len = start;
         ds4_session_dspark_capture_invalidate(s);
         if (have_frontier) {
-            (void)spec_frontier_restore(&frontier, s);
+            if (!spec_frontier_restore(&frontier, s)) {
+                snprintf(err, errlen, "MTP verifier frontier restore failed");
+                s->checkpoint_valid = false;
+                s->graph.mtp_n_raw = 0;
+                spec_frontier_free(&frontier);
+                free(row_logits);
+                free(row_tops);
+                return -1;
+            }
         } else if (!verifier_may_have_mutated) {
             /* Snapshot setup failed before the verifier touched Metal state.
              * Fall through to the exact sequential verifier below. */
         } else {
             snprintf(err, errlen, "MTP verifier failed");
             s->checkpoint_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(0);
+            (void)DS4_MTP_KEEP_ACCEPTED(0);
             spec_frontier_free(&frontier);
             free(row_logits);
             free(row_tops);
@@ -69507,6 +70137,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * wrong state.  This path is deliberately slow and should not be selected
      * during normal --mtp operation.
      */
+    mtp_verified_hc_valid = false;
     int verified = 0;
     int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
     bool logits_on_host = true;
@@ -69537,6 +70168,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
+            s->graph.mtp_n_raw = 0;
             return -1;
         }
         token_vec_push(&s->checkpoint, drafts[i]);
@@ -69553,12 +70185,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         {
             snprintf(err, errlen, "%s logits readback failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
+            s->graph.mtp_n_raw = 0;
             return -1;
         }
         logits_on_host = true;
     }
     (void)logits_on_host;
-    DS4_MTP_KEEP_ACCEPTED(verified);
+    if (verified == draft_n && verified > 0) {
+        mtp_verified_hc_valid =
+            metal_graph_capture_legacy_mtp_verified_hc(
+                    &s->graph,
+                    metal_graph_cur_hc(&s->graph));
+    }
+    if (!DS4_MTP_KEEP_ACCEPTED(verified)) {
+        snprintf(err, errlen,
+                 "legacy MTP CUDA device restore failed; session is unusable");
+        return -1;
+    }
     if (verified > 0) ds4_session_dspark_capture_note_checkpoint(s);
 #undef DS4_MTP_KEEP_ACCEPTED
     if (mtp_timing) {
@@ -69597,6 +70240,14 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (s->engine &&
+        s->engine->support_kind == DS4_SUPPORT_MTP_LEGACY) {
+        /* The private support cache is position-indexed.  An invalidated
+         * target frontier cannot retain a meaningful visible-row count. */
+        s->graph.mtp_n_raw = 0;
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
@@ -69612,6 +70263,15 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (s->engine &&
+        s->engine->support_kind == DS4_SUPPORT_MTP_LEGACY) {
+        /* Rewind changes the target position without reconstructing the
+         * private legacy-MTP ring.  Rebuild it from the next committed token
+         * instead of exposing rows from the abandoned suffix. */
+        s->graph.mtp_n_raw = 0;
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_cap_dense_cache(s);

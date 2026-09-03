@@ -202,6 +202,67 @@ if [ -x ./ds4 ]; then
     fi
 fi
 
+# 8: ds4-bench exposes and validates the legacy MTP evidence options before
+# model loading. The real model-backed speculative invariant remains covered
+# by `make mtp-verify-depth`.
+if [ -x ./ds4-bench ]; then
+    ./ds4-bench --help all > "$LOG" 2>&1 || true
+    assert_grep "ds4-bench help mentions --mtp" "--mtp FILE" "$LOG"
+    assert_grep "ds4-bench help mentions --mtp-draft" "--mtp-draft N" "$LOG"
+    assert_grep "ds4-bench help mentions --mtp-margin" "--mtp-margin F" "$LOG"
+    assert_grep "ds4-bench help mentions exact token dump" \
+        "--dump-generated-tokens-dir DIR" "$LOG"
+
+    ./ds4-bench --prompt-file /dev/null --mtp-draft 0 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--mtp-draft must be between 1 and 16" "$LOG"; then
+        ok "ds4-bench rejects a zero MTP draft depth"
+    else
+        fail "ds4-bench returned the wrong zero MTP draft error"
+    fi
+
+    ./ds4-bench --prompt-file /dev/null --mtp-draft 17 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--mtp-draft must be between 1 and 16" "$LOG"; then
+        ok "ds4-bench rejects an oversized MTP draft depth"
+    else
+        fail "ds4-bench returned the wrong oversized MTP draft error"
+    fi
+
+    ./ds4-bench --prompt-file /dev/null --mtp-margin -0.5 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--mtp-margin must be between 0 and 1000" "$LOG"; then
+        ok "ds4-bench rejects a negative MTP margin"
+    else
+        fail "ds4-bench returned the wrong negative MTP margin error"
+    fi
+
+    ./ds4-bench --prompt-file /dev/null --mtp-margin nan > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "invalid value for --mtp-margin: nan" "$LOG"; then
+        ok "ds4-bench rejects a non-finite MTP margin"
+    else
+        fail "ds4-bench accepted a non-finite MTP margin"
+    fi
+
+    ./ds4-bench --prompt-file /dev/null --mtp-draft 2 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--mtp-draft greater than 1 requires --mtp FILE" "$LOG"; then
+        ok "ds4-bench rejects speculative depth without a support model"
+    else
+        fail "ds4-bench accepted speculative depth without a support model"
+    fi
+
+    ./ds4-bench --prompt-file /dev/null --mtp /dev/null --mtp-draft 2 \
+        --dump-decode-logits-dir /tmp > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "cannot capture intermediate states" "$LOG"; then
+        ok "ds4-bench rejects per-token logit dumps across MTP cycles"
+    else
+        fail "ds4-bench accepted ambiguous per-token MTP logit dumping"
+    fi
+fi
+
 rm -f "$LOG"
 
 echo ""

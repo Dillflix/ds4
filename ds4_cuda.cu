@@ -1014,6 +1014,15 @@ struct cache_range_entry {
 };
 static std::vector<cache_range_entry> g_cache_ranges;
 
+/* Support and auxiliary base-model ranges use standalone allocations rather
+ * than growing g_dev_cache[].  Track those slabs explicitly so engine-open
+ * failures and ordinary backend teardown release every successful install. */
+struct cuda_support_cache_slab {
+    void *base;
+    int   device_id; /* physical CUDA ordinal */
+};
+static std::vector<cuda_support_cache_slab> g_support_cache_slabs;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -5562,7 +5571,22 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_dev_cache[d].present = 0;
         if (prev >= 0) (void)cudaSetDevice(prev);
     }
+    {
+        int prev = -1;
+        (void)cudaGetDevice(&prev);
+        for (const cuda_support_cache_slab &slab : g_support_cache_slabs) {
+            if (!slab.base) continue;
+            if (cudaSetDevice(slab.device_id) == cudaSuccess) {
+                (void)cudaFree(slab.base);
+            }
+        }
+        g_support_cache_slabs.clear();
+        if (prev >= 0) (void)cudaSetDevice(prev);
+    }
     g_cache_ranges.clear();
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_offset_bias = 0;
 
     /* Continue with legacy global teardown below. */
 
@@ -6000,8 +6024,12 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
         if (!ok) return 0;
         WITH_DEVICE(g_gpu[dd].device_id) {
             cudaStream_t s2 = (cudaStream_t)g_gpu[dd].stream;
-            (void)cudaStreamWaitEvent(s2, (cudaEvent_t)g_gpu[sd].boundary_event, 0);
-            if (g_xdev_sync_debug) {
+            ok = cuda_ok(cudaStreamWaitEvent(
+                             s2,
+                             (cudaEvent_t)g_gpu[sd].boundary_event,
+                             0),
+                         "peer destination wait");
+            if (ok && g_xdev_sync_debug) {
                 ok = cuda_ok(cudaStreamSynchronize(s2), "peer dst sync");
             }
         }
@@ -6027,10 +6055,19 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
     if (!ok) return 0;
     WITH_DEVICE(g_gpu[dd].device_id) {
         cudaStream_t s2 = (cudaStream_t)g_gpu[dd].stream;
-        (void)cudaStreamWaitEvent(s2, (cudaEvent_t)g_gpu[sd].boundary_event, 0);
-        ok = cuda_ok(cudaMemcpyAsync(dst->ptr, g_xdev_bounce[sd][dd], bytes,
-                                     cudaMemcpyHostToDevice, s2),
-                      "bounce h2d");
+        ok = cuda_ok(cudaStreamWaitEvent(
+                         s2,
+                         (cudaEvent_t)g_gpu[sd].boundary_event,
+                         0),
+                     "bounce destination wait");
+        if (ok) {
+            ok = cuda_ok(cudaMemcpyAsync(dst->ptr,
+                                         g_xdev_bounce[sd][dd],
+                                         bytes,
+                                         cudaMemcpyHostToDevice,
+                                         s2),
+                          "bounce h2d");
+        }
         if (ok) ok = cuda_ok(cudaStreamSynchronize(s2), "bounce dst sync");
     }
     return ok;
@@ -7365,7 +7402,10 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
      * cudaSetDevice calls can leave g_current_logical_tier stale, and a
      * false "already there" here strands work on the wrong device. */
     int cur_dev = -1;
-    (void)cudaGetDevice(&cur_dev);
+    if (cudaGetDevice(&cur_dev) != cudaSuccess) {
+        g_current_logical_tier = -1;
+        return -1;
+    }
     int prev = -1;
     for (int t = 0; t < g_n_gpus; t++) {
         if (g_gpu[t].device_id == cur_dev) { prev = t; break; }
@@ -7378,26 +7418,43 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
         return 0;
     }
     if (prev >= 0 && prev < g_n_gpus && prev != logical_tier) {
-        if (cudaSetDevice(g_gpu[prev].device_id) != cudaSuccess) return -1;
+        if (cudaSetDevice(g_gpu[prev].device_id) != cudaSuccess) {
+            g_current_logical_tier = -1;
+            return -1;
+        }
         if (!fence_ev[prev] &&
             cudaEventCreateWithFlags(&fence_ev[prev],
                                      cudaEventDisableTiming) != cudaSuccess) {
             fence_ev[prev] = NULL;
+            g_current_logical_tier = -1;
+            return -1;
         }
-        if (fence_ev[prev]) {
-            (void)cudaEventRecord(fence_ev[prev], 0);
+        if (cudaEventRecord(fence_ev[prev], 0) != cudaSuccess) {
+            g_current_logical_tier = -1;
+            return -1;
         }
         if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) {
             g_current_logical_tier = -1;
             return -1;
         }
-        g_current_logical_tier = logical_tier;
-        if (fence_ev[prev]) {
-            (void)cudaStreamWaitEvent(0, fence_ev[prev], 0);
+        if (cudaStreamWaitEvent(0, fence_ev[prev], 0) != cudaSuccess) {
+            g_current_logical_tier = -1;
+            return -1;
         }
+        g_current_logical_tier = logical_tier;
         return 0;
     }
-    return ds4_gpu_set_current_device(logical_tier);
+    /* The current physical device is outside the selected logical inventory.
+     * Do not delegate to the cached setter: its logical cache may be stale and
+     * incorrectly turn this into a no-op.  Synchronize the unknown device once
+     * before switching so subsequent work is still ordered. */
+    if (cudaDeviceSynchronize() != cudaSuccess ||
+        cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) {
+        g_current_logical_tier = -1;
+        return -1;
+    }
+    g_current_logical_tier = logical_tier;
+    return 0;
 }
 
 /* =========================================================================
@@ -7612,6 +7669,8 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
     }
     const char *host_base = src_base;
     size_t write_off = 0;
+    std::vector<cache_range_entry> pending_entries;
+    pending_entries.reserve((size_t)n_ranges);
     for (int i = 0; i < n_ranges; i++) {
         if (ranges[i].bytes == 0) continue;
         char *dev_ptr = (char *)base + write_off;
@@ -7634,9 +7693,14 @@ extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
          * spilled pointer directly. */
         ent.device_id = entry_device_id;
         ent.device_ptr = dev_ptr;
-        g_cache_ranges.push_back(ent);
+        pending_entries.push_back(ent);
         write_off += ranges[i].bytes;
     }
+    /* Publish pointers only after every copy has succeeded.  Before this
+     * point an error can free base without leaving a dangling cache entry. */
+    g_support_cache_slabs.push_back({base, device_id});
+    g_cache_ranges.insert(g_cache_ranges.end(),
+                          pending_entries.begin(), pending_entries.end());
     std::sort(g_cache_ranges.begin(), g_cache_ranges.end(),
               [](const cache_range_entry &a, const cache_range_entry &b) {
                   if (a.source_offset != b.source_offset)

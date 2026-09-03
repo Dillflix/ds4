@@ -33,6 +33,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -57,6 +58,9 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     const char *dump_decode_logits_dir;
+    const char *dump_generated_tokens_dir;
+    int mtp_draft_tokens;
+    float mtp_margin;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
@@ -297,6 +301,8 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -326,6 +332,23 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.mtp_draft_tokens < 1 || c.mtp_draft_tokens > 16) {
+                fprintf(stderr, "ds4-bench: --mtp-draft must be between 1 and 16\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            const double value =
+                parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (!isfinite(value) || value < 0.0 || value > 1000.0) {
+                fprintf(stderr, "ds4-bench: --mtp-margin must be between 0 and 1000\n");
+                exit(2);
+            }
+            c.mtp_margin = (float)value;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -350,6 +373,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-decode-logits-dir")) {
             c.dump_decode_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-generated-tokens-dir")) {
+            c.dump_generated_tokens_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -450,6 +475,17 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+        exit(2);
+    }
+    if (c.mtp_draft_tokens > 1 && !c.mtp_path) {
+        fprintf(stderr, "ds4-bench: --mtp-draft greater than 1 requires --mtp FILE\n");
+        exit(2);
+    }
+    if (c.mtp_path && c.mtp_draft_tokens > 1 && c.dump_decode_logits_dir) {
+        fprintf(stderr,
+                "ds4-bench: --dump-decode-logits-dir cannot capture intermediate "
+                "states from multi-token MTP cycles; use "
+                "--dump-generated-tokens-dir for exact output comparison\n");
         exit(2);
     }
     char dist_err[256];
@@ -660,6 +696,61 @@ static int write_decode_logits_raw(
     const int close_rc = fclose(fp);
     free(logits);
     if (written != (size_t)vocab || close_rc != 0) {
+        fprintf(stderr, "ds4-bench: failed to write %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Exact generated-token evidence for control/candidate comparison. Each
+ * frontier gets a headerless little-endian int32 stream containing the emitted
+ * tokens followed by one untimed next-token sentinel from the final target
+ * logits. Matching runs can therefore compare both output and continuation
+ * state directly with cmp. */
+static int write_generated_tokens_i32le(
+        const bench_config *cfg,
+        int                 frontier,
+        const int          *tokens,
+        int                 count) {
+    if (!cfg->dump_generated_tokens_dir) return 0;
+    if (count < 0 || (count > 0 && !tokens)) {
+        fprintf(stderr, "ds4-bench: invalid generated-token buffer\n");
+        return 1;
+    }
+
+    char path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%06d.tokens.i32le",
+                           cfg->dump_generated_tokens_dir,
+                           frontier);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: generated-token dump path is too long\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                path, strerror(errno));
+        return 1;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < count; i++) {
+        const uint32_t value = (uint32_t)(int32_t)tokens[i];
+        const unsigned char encoded[4] = {
+            (unsigned char)(value & 0xffu),
+            (unsigned char)((value >> 8) & 0xffu),
+            (unsigned char)((value >> 16) & 0xffu),
+            (unsigned char)((value >> 24) & 0xffu),
+        };
+        if (fwrite(encoded, 1, sizeof(encoded), fp) != sizeof(encoded)) {
+            ok = false;
+            break;
+        }
+    }
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) {
         fprintf(stderr, "ds4-bench: failed to write %s\n", path);
         return 1;
     }
@@ -884,6 +975,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -894,6 +986,8 @@ int main(int argc, char **argv) {
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
@@ -924,6 +1018,18 @@ int main(int argc, char **argv) {
         if (ds4_engine_create_with_gpu_config(
                 &engine, &opt, &gpu_cfg) != 0) return 1;
     } else if (ds4_engine_open(&engine, &opt) != 0) {
+        return 1;
+    }
+    const bool speculative_decode =
+        cfg.mtp_path && cfg.mtp_draft_tokens > 1;
+    if (cfg.mtp_path &&
+        (!ds4_engine_has_mtp(engine) ||
+         ds4_engine_mtp_draft_tokens(engine) != cfg.mtp_draft_tokens)) {
+        fprintf(stderr,
+                "ds4-bench: requested legacy MTP decode is not active "
+                "at draft depth %d\n",
+                cfg.mtp_draft_tokens);
+        ds4_engine_close(engine);
         return 1;
     }
     bench_progress_journal_mark(
@@ -1271,16 +1377,27 @@ int main(int argc, char **argv) {
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
         int gen_done = 0;
-        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
-            ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
+        int gen_steady_tokens = 0;
+        int decode_cycles = 0;
+        int multi_token_cycles = 0;
+        int max_cycle_tokens = 0;
+        const bool capture_generated_tokens =
+            cfg.show_output || cfg.dump_generated_tokens_dir;
+        int *gen_token_buf = capture_generated_tokens && cfg.gen_tokens > 0
+            ? malloc(((size_t)cfg.gen_tokens + 1u) * sizeof(gen_token_buf[0]))
             : NULL;
+        if (capture_generated_tokens && cfg.gen_tokens > 0 && !gen_token_buf) {
+            fprintf(stderr, "ds4-bench: out of memory capturing generated tokens\n");
+            rc = 1;
+            break;
+        }
         int gen_token_count = 0;
         if (cfg.gen_tokens > 0) {
             bench_progress_journal_mark(
                 &progress_journal, "decode", "frontier-start",
                 0, cfg.gen_tokens);
         }
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -1292,15 +1409,28 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            int cycle_limit = cfg.gen_tokens - gen_done;
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (nsys_decode_tokens > 0 && !nsys_decode_capture_done) {
+                const int capture_end =
+                    nsys_decode_skip + nsys_decode_tokens;
+                if (!nsys_decode_capture_active &&
+                    gen_done < nsys_decode_skip &&
+                    cycle_limit > nsys_decode_skip - gen_done) {
+                    cycle_limit = nsys_decode_skip - gen_done;
+                } else if (nsys_decode_capture_active &&
+                           cycle_limit > capture_end - gen_done) {
+                    cycle_limit = capture_end - gen_done;
+                }
+            }
             if (nsys_decode_tokens > 0 && !nsys_decode_capture_done &&
-                i == nsys_decode_skip) {
+                gen_done == nsys_decode_skip) {
                 fprintf(stderr,
                         "ds4-bench: starting Nsight CUDA capture for decode "
                         "frontier %d steps %d..%d\n",
                         frontier,
-                        i + 1,
-                        i + nsys_decode_tokens);
+                        gen_done + 1,
+                        gen_done + nsys_decode_tokens);
                 if (!ds4_gpu_profiler_start()) {
                     fprintf(stderr,
                             "ds4-bench: failed to start bounded decode capture\n");
@@ -1309,15 +1439,51 @@ int main(int argc, char **argv) {
                 }
                 nsys_decode_capture_active = true;
             }
+            if (nsys_decode_capture_active) {
+                const int capture_end =
+                    nsys_decode_skip + nsys_decode_tokens;
+                if (cycle_limit > capture_end - gen_done) {
+                    cycle_limit = capture_end - gen_done;
+                }
+            }
 #endif
-            if (i == 0 || ((i + 1) % 16) == 0) {
+            const int cycle_start = gen_done;
+            if (cycle_start == 0 || ((cycle_start + 1) % 16) == 0) {
                 bench_progress_journal_mark(
                     &progress_journal, "decode", "token-start",
-                    i + 1, cfg.gen_tokens);
+                    cycle_start + 1, cfg.gen_tokens);
             }
+            int accepted[17]; /* base token plus the engine's max draft depth */
+            int accepted_count = 1;
+            err[0] = '\0';
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+            if (speculative_decode) {
+                int accepted_cap = cycle_limit;
+                if (accepted_cap > (int)(sizeof(accepted) / sizeof(accepted[0]))) {
+                    accepted_cap = (int)(sizeof(accepted) / sizeof(accepted[0]));
+                }
+                accepted_count = ds4_session_eval_speculative_argmax(
+                    session,
+                    token,
+                    cycle_limit,
+                    eos,
+                    accepted,
+                    accepted_cap,
+                    err,
+                    sizeof(err));
+            } else {
+                accepted[0] = token;
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    accepted_count = -1;
+                }
+            }
+            if (accepted_count <= 0 || accepted_count > cycle_limit ||
+                accepted_count > (int)(sizeof(accepted) / sizeof(accepted[0])) ||
+                (accepted_count > 0 && accepted[0] != token)) {
+                fprintf(stderr,
+                        "ds4-bench: decode at frontier %d failed: %s\n",
+                        frontier,
+                        err[0] ? err : "invalid speculative decode result");
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
                 if (nsys_decode_capture_active) {
                     (void)ds4_gpu_profiler_stop();
@@ -1328,9 +1494,49 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t1 = bench_now_sec();
+            bool accepted_eos = false;
+            for (int j = 0; j < accepted_count; j++) {
+                if (accepted[j] == eos) {
+                    accepted_eos = true;
+                    break;
+                }
+            }
+            if (accepted_eos) {
+                fprintf(stderr,
+                        "ds4-bench: MTP cycle accepted EOS at frontier %d; "
+                        "cannot preserve this benchmark's fixed non-EOS token count\n",
+                        frontier);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                if (nsys_decode_capture_active) {
+                    (void)ds4_gpu_profiler_stop();
+                    nsys_decode_capture_active = false;
+                }
+#endif
+                rc = 1;
+                break;
+            }
+
+            decode_cycles++;
+            if (accepted_count > 1) multi_token_cycles++;
+            if (accepted_count > max_cycle_tokens) {
+                max_cycle_tokens = accepted_count;
+            }
+            if (cycle_start == 0) {
+                gen_first_sec = token_t1 - token_t0;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+                gen_steady_tokens += accepted_count;
+            }
+            if (gen_token_buf) {
+                memcpy(gen_token_buf + gen_token_count,
+                       accepted,
+                       (size_t)accepted_count * sizeof(accepted[0]));
+                gen_token_count += accepted_count;
+            }
+            gen_done += accepted_count;
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             if (nsys_decode_capture_active &&
-                i + 1 == nsys_decode_skip + nsys_decode_tokens) {
+                gen_done == nsys_decode_skip + nsys_decode_tokens) {
                 if (!ds4_gpu_profiler_stop()) {
                     fprintf(stderr,
                             "ds4-bench: failed to stop bounded decode capture\n");
@@ -1347,21 +1553,18 @@ int main(int argc, char **argv) {
                         nsys_decode_tokens);
             }
 #endif
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
-            if (i == 0 || ((i + 1) % 16) == 0 ||
-                i + 1 == cfg.gen_tokens) {
+            if (cycle_start == 0 ||
+                (gen_done / 16) != (cycle_start / 16) ||
+                gen_done == cfg.gen_tokens) {
                 bench_progress_journal_mark(
                     &progress_journal, "decode", "token-complete",
-                    i + 1, cfg.gen_tokens);
+                    gen_done, cfg.gen_tokens);
             }
             if (write_decode_logits_raw(&cfg,
                                         engine,
                                         session,
                                         frontier,
-                                        i + 1) != 0) {
+                                        gen_done) != 0) {
                 rc = 1;
                 break;
             }
@@ -1371,6 +1574,49 @@ int main(int argc, char **argv) {
             bench_progress_journal_mark(
                 &progress_journal, "decode", "frontier-complete",
                 gen_done, cfg.gen_tokens);
+        }
+        int generated_dump_count = gen_token_count;
+        if (rc == 0 && cfg.dump_generated_tokens_dir && cfg.gen_tokens > 0) {
+            if (ds4_session_pos(session) != frontier + gen_done) {
+                fprintf(stderr,
+                        "ds4-bench: final decode position mismatch at frontier %d: "
+                        "got %d, expected %d\n",
+                        frontier,
+                        ds4_session_pos(session),
+                        frontier + gen_done);
+                rc = 1;
+            } else {
+                const int sentinel = ds4_session_argmax_excluding(session, eos);
+                if (sentinel < 0) {
+                    fprintf(stderr,
+                            "ds4-bench: failed to capture final next-token sentinel "
+                            "at frontier %d\n",
+                            frontier);
+                    rc = 1;
+                } else {
+                    gen_token_buf[generated_dump_count++] = sentinel;
+                }
+            }
+        }
+        if (rc == 0 &&
+            write_generated_tokens_i32le(&cfg,
+                                         frontier,
+                                         gen_token_buf,
+                                         generated_dump_count) != 0) {
+            rc = 1;
+        }
+        if (rc == 0 && speculative_decode && cfg.gen_tokens > 0) {
+            fprintf(stderr,
+                    "ds4-bench: MTP decode frontier=%d tokens=%d cycles=%d "
+                    "multi_token_cycles=%d max_cycle_tokens=%d "
+                    "mean_tokens_per_cycle=%.6f\n",
+                    frontier,
+                    gen_done,
+                    decode_cycles,
+                    multi_token_cycles,
+                    max_cycle_tokens,
+                    decode_cycles > 0
+                        ? (double)gen_done / (double)decode_cycles : 0.0);
         }
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
@@ -1414,7 +1660,6 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,
