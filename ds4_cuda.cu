@@ -13522,7 +13522,10 @@ __global__ static void attention_indexed_mixed_decode_grouped_exact_kernel(
     static_assert(HEADS_PER_GROUP == 2u || HEADS_PER_GROUP == 8u,
                   "bounded exact indexed-decode group size");
     const uint32_t head_base = blockIdx.x * HEADS_PER_GROUP;
-    if (head_base >= n_head || head_dim != 512u) return;
+    if (head_base >= n_head) return;
+    /* The host admits this diagnostic only for head_dim=512.  Keep the device
+     * loop bound and rsqrt operand runtime-valued, matching the shipping
+     * kernel's arithmetic formation and the exact streaming fix. */
 
     __shared__ uint32_t raw_rows[128];
     __shared__ uint32_t comp_rows[512];
