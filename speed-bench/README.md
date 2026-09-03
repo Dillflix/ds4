@@ -5089,10 +5089,50 @@ stall ratio. The current arm stages the activation in
 the same coalesced padded tile, eliminating that identified residual global-
 load pattern without changing model storage or arithmetic order.
 
+The corrected `20260903T211314Z` run was also bit-exact and sanitizer-clean.
+Coalescing both canonical weights and activation reduced 0.27846 ms to
+0.04277 ms (6.51x). Nsight measured 99.91% global-load efficiency, 2.66
+sectors/request, and 360.68 GB/s versus 8.33%, 31.80, and 93.08 GB/s for the
+control. The lane-major arm remained faster at 0.03523 ms including its
+per-token activation transform (7.90x), but its remaining advantage projects
+to only about 0.2 percentage points of aggregate decode GPU work while an
+auxiliary copy of both width-1024 matrices would consume 336 MiB across the 21
+ratio-4 layers. The no-cache canonical path is therefore the production
+candidate; lane-major remains architecture evidence rather than a proposed
+model-format change.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 \
 BENCH_ROUNDS=9 BENCH_LAUNCHES=25 \
 RUN_SANITIZER=1 RUN_NCU=1 NCU_USE_SUDO=1 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-layout.sh
+```
+
+### SM75 canonical-staged compressor projection production A/B
+
+`cuda-sm75-compressor-projection-production-ab.sh` compares the existing
+exact fused projection/state-store kernel with the opt-in canonical shared-
+staging implementation for the production `4096 x 1024` ratio-4 compressor
+pair. Both arms retain the already accepted state-store fusion. The candidate
+reads the original row-major F16 model directly and reports zero auxiliary
+model bytes; it does not create a repacked weight cache.
+
+The one-shot four-GPU test covers mixed15 and all43 at PP512, PP4096, and
+PP32768. It runs one 256-token throughput pass and a separate 16-token exact-
+logit pass per arm, requires the stable 22/21 topology, validates all three
+compressor widths, proves nonzero width-1024 staged dispatch, checks GPU
+identity and power limits before and after every process, and rejects any
+non-byte-identical logit. The staged selector is opt-in until this evidence is
+accepted: `DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=1`.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-projection-production-ab.sh
 ```

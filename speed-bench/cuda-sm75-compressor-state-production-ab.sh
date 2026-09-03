@@ -17,11 +17,26 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 TG_TOKENS=${TG_TOKENS:-256}
 EXACT_TOKENS=${EXACT_TOKENS:-16}
+COMPRESSOR_STATE_AB_AXIS=${COMPRESSOR_STATE_AB_AXIS:-fusion}
 PREFILL_CHUNK=2048
 PIPELINE_MB=512
 CTX_ALLOC=33025
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-OUTPUT_DIR=${COMPRESSOR_STATE_PRODUCTION_AB_DIR:-$repo_dir/sm75-compressor-state-production-ab-$stamp}
+case $COMPRESSOR_STATE_AB_AXIS in
+    fusion)
+        OUTPUT_DIR=${COMPRESSOR_STATE_PRODUCTION_AB_DIR:-$repo_dir/sm75-compressor-state-production-ab-$stamp}
+        variants_forward=(control fused)
+        candidate_variant=fused
+        comparison_name=reference-vs-fused-pair-state-store
+        ;;
+    projection-layout)
+        OUTPUT_DIR=${COMPRESSOR_PROJECTION_PRODUCTION_AB_DIR:-$repo_dir/sm75-compressor-projection-production-ab-$stamp}
+        variants_forward=(control staged)
+        candidate_variant=staged
+        comparison_name=canonical-reference-vs-canonical-shared-staging
+        ;;
+    *) die "COMPRESSOR_STATE_AB_AXIS must be fusion or projection-layout" ;;
+esac
 layouts=(mixed15 all43)
 models=("$MIXED_MODEL" "$ALL43_MODEL")
 
@@ -129,7 +144,9 @@ phase=manifest
         "$MIXED_MODEL" "$ALL43_MODEL" "$PROMPT"
     printf 'gpu_devices=%s\npower_limits_w=%s\nstage_split=22/21\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
-    printf 'contexts=512,4096,32768\nrepeats=1\ncomparison=reference-vs-fused-pair-state-store\n'
+    printf 'contexts=512,4096,32768\nrepeats=1\ncomparison=%s\n' \
+        "$comparison_name"
+    printf 'compressor_state_ab_axis=%s\n' "$COMPRESSOR_STATE_AB_AXIS"
     printf 'tg_tokens=%s\nexact_tokens=%s\n' "$TG_TOKENS" "$EXACT_TOKENS"
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
@@ -210,24 +227,45 @@ validate_topology() {
 
 validate_selector() {
     local variant=$1 log=$2 width ratio marker
-    for spec in 256:4 512:128 1024:4; do
-        width=${spec%%:*}; ratio=${spec#*:}
-        marker="SM75 compressor pair/state fusion selected width=$width ratio=$ratio"
+    if [[ $COMPRESSOR_STATE_AB_AXIS == fusion ]]; then
+        for spec in 256:4 512:128 1024:4; do
+            width=${spec%%:*}; ratio=${spec#*:}
+            marker="SM75 compressor pair/state fusion selected width=$width ratio=$ratio"
+            if [[ $variant == control ]]; then
+                ! grep -Fq "$marker" "$log" || return 1
+            else
+                [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
+            fi
+        done
+    else
+        for spec in 256:4 512:128 1024:4; do
+            width=${spec%%:*}; ratio=${spec#*:}
+            marker="SM75 compressor pair/state fusion selected width=$width ratio=$ratio"
+            [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
+        done
+        marker='SM75 compressor canonical-staged selected width=1024 ratio=4'
         if [[ $variant == control ]]; then
             ! grep -Fq "$marker" "$log" || return 1
+            ! grep -Fq 'SM75 compressor canonical-staged summary:' "$log" || return 1
         else
             [[ $(grep -Fc "$marker" "$log") == 1 ]] || return 1
+            grep -Eq 'SM75 compressor canonical-staged summary: width1024-calls=[1-9][0-9]* auxiliary-model-bytes=0' \
+                "$log" || return 1
         fi
-    done
+    fi
 }
 
 run_arm() {
     local model=$1 variant=$2 tokens=$3 start=$4 max=$5 base=$6 logits=${7:-} rc=0
     local -a selector cmd
-    if [[ $variant == control ]]; then
-        selector=(DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE=1)
+    if [[ $COMPRESSOR_STATE_AB_AXIS == fusion ]]; then
+        if [[ $variant == control ]]; then
+            selector=(DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE=1)
+        else
+            selector=(DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE=1)
+        fi
     else
-        selector=(DS4_CUDA_ENABLE_COMPRESSOR_PAIR_STATE_STORE=1)
+        selector=("DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=$([[ $variant == staged ]] && printf 1 || printf 0)")
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     cmd=("${production_env[@]}" "${selector[@]}" ./ds4-bench \
@@ -249,13 +287,14 @@ printf 'layout\tvariant\tcsv\tlog\tlogits\n' >"$OUTPUT_DIR/runs.tsv"
 for index in 0 1; do
     layout=${layouts[$index]}; model=${models[$index]}
     if (( index % 2 == 0 )); then
-        variants=(control fused)
+        variants=("${variants_forward[@]}")
     else
-        variants=(fused control)
+        variants=("${variants_forward[1]}" "${variants_forward[0]}")
     fi
     for variant in "${variants[@]}"; do
         base="$OUTPUT_DIR/runs/$layout-$variant"
-        printf 'Compressor/state production A/B model=%s variant=%s...\n' "$layout" "$variant"
+        printf 'Compressor %s production A/B model=%s variant=%s...\n' \
+            "$COMPRESSOR_STATE_AB_AXIS" "$layout" "$variant"
         run_arm "$model" "$variant" "$TG_TOKENS" 512 32768 "$base" || {
             tail -n 200 "$base.log" >&2 || true
             die "$layout $variant production run failed"
@@ -263,12 +302,13 @@ for index in 0 1; do
         validate_health "$base" || die "$layout $variant GPU health changed"
         validate_throughput "$base" || die "$layout $variant decode throughput output is incomplete"
         validate_topology "$base.log" || die "$layout $variant production topology validation failed"
-        validate_selector "$variant" "$base.log" || die "$layout $variant fusion dispatch validation failed"
+        validate_selector "$variant" "$base.log" ||
+            die "$layout $variant $COMPRESSOR_STATE_AB_AXIS dispatch validation failed"
         printf '%s\t%s\t%s\t%s\t%s\n' "$layout" "$variant" \
             "$base.csv" "$base.log" "-" >>"$OUTPUT_DIR/runs.tsv"
     done
     for context in 512 4096 32768; do
-        for variant in control fused; do
+        for variant in "${variants_forward[@]}"; do
             base="$OUTPUT_DIR/runs/$layout-$variant-exact-pp$context"
             logits="$base-logits"
             mkdir -p "$logits"
@@ -288,30 +328,37 @@ for index in 0 1; do
             validate_topology "$base.log" 0 ||
                 die "$layout $variant PP=$context topology validation failed"
             validate_selector "$variant" "$base.log" ||
-                die "$layout $variant PP=$context fusion dispatch validation failed"
+                die "$layout $variant PP=$context $COMPRESSOR_STATE_AB_AXIS dispatch validation failed"
         done
         for ((token=1; token<=EXACT_TOKENS; token++)); do
             printf -v name 'frontier_%06d.decode_%06d.logits.f32' "$context" "$token"
             cmp -s "$OUTPUT_DIR/runs/$layout-control-exact-pp$context-logits/$name" \
-                   "$OUTPUT_DIR/runs/$layout-fused-exact-pp$context-logits/$name" ||
-                die "$layout fused output diverged at PP=$context decode token $token"
+                   "$OUTPUT_DIR/runs/$layout-$candidate_variant-exact-pp$context-logits/$name" ||
+                die "$layout $candidate_variant output diverged at PP=$context decode token $token"
         done
     done
 done
 
 phase=summarize
 {
-    printf '# SM75 four-GPU compressor projection/state-store A/B\n\n'
-    printf '| Model | Context | Control decode tok/s | Fused decode tok/s | Speedup |\n'
+    if [[ $COMPRESSOR_STATE_AB_AXIS == fusion ]]; then
+        printf '# SM75 four-GPU compressor projection/state-store A/B\n\n'
+        candidate_label=Fused
+    else
+        printf '# SM75 four-GPU canonical-staged compressor projection A/B\n\n'
+        candidate_label=Staged
+    fi
+    printf '| Model | Context | Control decode tok/s | %s decode tok/s | Speedup |\n' "$candidate_label"
     printf '| --- | ---: | ---: | ---: | ---: |\n'
     for layout in "${layouts[@]}"; do
         awk -F, -v layout="$layout" '
             NR==FNR {if (FNR>1) control[$1]=$8; next}
             FNR>1 {printf "| %s | %s | %.3f | %.3f | %.6fx |\n", layout,$1,control[$1],$8,$8/control[$1]}
-        ' "$OUTPUT_DIR/runs/$layout-control.csv" "$OUTPUT_DIR/runs/$layout-fused.csv"
+        ' "$OUTPUT_DIR/runs/$layout-control.csv" "$OUTPUT_DIR/runs/$layout-$candidate_variant.csv"
     done
     printf '\nAll %s decode logits at all three frontiers were byte-identical for both models.\n' "$EXACT_TOKENS"
 } | tee "$OUTPUT_DIR/summary/report.md"
 
 phase=complete
-printf 'SM75 compressor projection/state-store production A/B complete: %s\n' "$OUTPUT_DIR"
+printf 'SM75 compressor %s production A/B complete: %s\n' \
+    "$COMPRESSOR_STATE_AB_AXIS" "$OUTPUT_DIR"
