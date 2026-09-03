@@ -38928,10 +38928,21 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
     const char *fused_env = getenv("DS4_CUDA_T32_F16_FUSED");
+    const char *decode_probe_env =
+        getenv("DS4_CUDA_T32_F16_DECODE_PROBE");
+    /* Decode remains ineligible by default.  This narrow admission exists
+     * only so the standalone one-token T32 diagnostic can measure the same
+     * cached-F16 projection/output path without wiring it into the engine. */
+    const bool decode_probe =
+        n_tok == 1u && in_dim == 1024u && out_dim == 16384u &&
+        n_head == 32u && head_dim == 512u && n_rot == 64u &&
+        decode_probe_env && decode_probe_env[0] &&
+        strcmp(decode_probe_env, "0") != 0;
     if ((fused_env && fused_env[0] && strcmp(fused_env, "0") == 0) ||
         getenv("DS4_CUDA_NO_T32_F16_FUSED") != NULL ||
         !g_cublas_ready || !out || !x || !model_map ||
-        n_tok <= 1u || n_head == 0u || head_dim == 0u ||
+        n_tok == 0u || (n_tok == 1u && !decode_probe) ||
+        n_head == 0u || head_dim == 0u ||
         in_dim == 0u || out_dim == 0u ||
         in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
         n_rot > head_dim || (n_rot & 1u) != 0u ||

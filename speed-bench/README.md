@@ -4947,3 +4947,60 @@ bash ./speed-bench/cuda-sm75-compressor-state-production-ab.sh
 The accepted production run was byte-exact for 16 decode tokens at PP512,
 PP4096, and PP32768 on both models. All43 improved by 0.410% to 0.743%; mixed15
 was effectively neutral (-0.312% to +0.058%) at the longer prompt frontiers.
+
+### SM75 single-token T32 FP16-output diagnostic
+
+`cuda-sm75-t32-decode-f16-ab.sh` is a bounded, one-GPU, production-shape
+diagnostic for a single decode token. Here T32 means 32 native Q8 blocks per
+1024-element input row; it does not mean a 32-token batch. The three arms
+separate native-Q8/F32 projection, cached-F16/F32 projection, and the opt-in
+cached-F16/FP16-output helper. Single-token admission is enabled only inside
+this diagnostic; the production decode default remains unchanged.
+
+```bash
+PROFILE_GPU=0 \
+CUDA_ARCH=sm_75 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=100 \
+WARMUPS=5 \
+RUN_SANITIZER=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-decode-f16-ab.sh
+```
+
+The native-Q8/F32 to cached-F16/F32 comparison measures the compute/cache
+change. The cached-F16/F32 to cached-F16/FP16 comparison isolates output
+storage only when the report says `storage_axis_isolated=1`; otherwise changing
+the cuBLAS output type also changed numerical compute behavior, so that ratio is
+a combined candidate result. This bounded test cannot promote the path: any
+default change still requires exact four-GPU logits and production decode A/B
+evidence.
+
+### Size-neutral SM75 Q8_0 warp-interleaved prototype
+
+`cuda-sm75-q8-warp-interleaved.sh` compares the shipping one-token prequantized
+Q8_0 consumer with a standalone SM75 prototype that stores each 32-block group
+as a contiguous half-scale plane plus eight interleaved `int32` word planes.
+It applies the matching word-plane layout to the quantized activation. Both
+representations retain exactly the canonical byte count, lane ownership, eight
+DP4A operations per block, accumulation order, and warp reduction order.
+
+```bash
+PROFILE_GPU=0 \
+CUDA_ARCH=sm_75 \
+BENCH_ROUNDS=14 \
+BENCH_LAUNCHES=100 \
+RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-warp-interleaved.sh
+```
+
+The report separates the steady consumer, per-token activation repack, and
+one-time weight repack costs, under both warm and cache-scrubbed timing. The
+candidate must remain bit-exact across the production T32 shape, a two-group
+shape, and an unaligned partial-group/tail shape. This prototype does not alter
+the production model format, cache, quantizer, or dispatch.

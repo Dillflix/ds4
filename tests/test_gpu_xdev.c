@@ -2127,6 +2127,7 @@ static int run_q8_partner_projection_case(
     (void)setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "f16", 1);
     (void)setenv("DS4_CUDA_NO_TF32", "1", 1);
     (void)unsetenv("DS4_CUDA_NO_Q8_F16_PARTNER_OFFLOAD");
+    (void)unsetenv("DS4_CUDA_T32_F16_DECODE_PROBE");
     if (t32_fused) {
         (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
         if (t32_fused == 1) {
@@ -2471,6 +2472,7 @@ static int run_q8_partner_projection_case(
     (void)unsetenv("DS4_CUDA_NO_TF32");
     (void)unsetenv("DS4_CUDA_NO_T32_F16_FUSED");
     (void)unsetenv("DS4_CUDA_T32_F16_FUSED");
+    (void)unsetenv("DS4_CUDA_T32_F16_DECODE_PROBE");
     (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
     fprintf(stderr, "  q8 partner projection exactness %s OK\n", case_name);
     return 0;
