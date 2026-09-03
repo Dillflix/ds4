@@ -108,6 +108,27 @@ class Phase2SummaryTest(unittest.TestCase):
                         "layer": 0, "stage_range": "", "layer_range": "",
                     },
                     {
+                        "trace": dlabel, "kind": "kernel", "duration_ns": 7000000,
+                        "device": 0, "bytes": 0,
+                        "name": "q8_K_q8_0_quantize_sm75_native_kernel",
+                        "category": "ffn", "layer": 0,
+                        "stage_range": "", "layer_range": "",
+                    },
+                    {
+                        "trace": dlabel, "kind": "kernel", "duration_ns": 5000000,
+                        "device": 0, "bytes": 0,
+                        "name": "grouped_q8_0_a_preq_warp8_kernel",
+                        "category": "ffn", "layer": 0,
+                        "stage_range": "", "layer_range": "",
+                    },
+                    {
+                        "trace": dlabel, "kind": "kernel", "duration_ns": 6000000,
+                        "device": 0, "bytes": 0,
+                        "name": "shared_mid_q8_0_preq_warp8_exact_kernel",
+                        "category": "ffn", "layer": 0,
+                        "stage_range": "", "layer_range": "",
+                    },
+                    {
                         "trace": dlabel, "kind": "kernel", "duration_ns": 3000000,
                         "device": 0, "bytes": 0,
                         "name": "matmul_f16_pair_compressor_store_ordered_chunks_kernel",
@@ -183,7 +204,23 @@ class Phase2SummaryTest(unittest.TestCase):
                 decode_rows = list(csv.DictReader(handle))
             decode_families = {row["family"] for row in decode_rows}
             self.assertIn("direct_native_q8_quantize", decode_families)
+            self.assertIn("dense_q8", decode_families)
             self.assertIn("compressor_projection_state_fused", decode_families)
+            for layout in ("mixed15", "all43"):
+                trace = f"{layout}-decode-32k"
+                dense_q8 = next(
+                    row for row in decode_rows
+                    if row["trace"] == trace and row["family"] == "dense_q8"
+                )
+                self.assertEqual(dense_q8["calls"], "2")
+                self.assertEqual(float(dense_q8["duration_ms"]), 11.0)
+                native_quantize = next(
+                    row for row in decode_rows
+                    if row["trace"] == trace
+                    and row["family"] == "direct_native_q8_quantize"
+                )
+                self.assertEqual(native_quantize["calls"], "2")
+                self.assertEqual(float(native_quantize["duration_ms"]), 9.0)
             decode_by_trace = {
                 (row["trace"], row["family"]) for row in decode_rows
             }

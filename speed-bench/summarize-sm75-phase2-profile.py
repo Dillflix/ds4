@@ -99,9 +99,12 @@ def family_of(row: dict[str, str], layout: str) -> str:
         if "f32_to_f16" in lower:
             return f"{partner_family(row)}_conversion"
         return f"{partner_family(row)}_compute"
-    if "q8_k_quantize_sm75_native_kernel" in lower:
-        return "direct_native_q8_quantize"
-    if "q8_k_quantize" in lower or "quantize_q8" in lower:
+    if "q8_k" in lower and "quantize" in lower:
+        return (
+            "direct_native_q8_quantize"
+            if "sm75_native" in lower else "canonical_q8_quantize"
+        )
+    if "quantize_q8" in lower:
         return "canonical_q8_quantize"
     if "matmul_f16_pair_compressor_store_ordered_chunks_kernel" in lower:
         return "compressor_projection_state_fused"
@@ -124,7 +127,10 @@ def family_of(row: dict[str, str], layout: str) -> str:
         return "indexer_topk"
     if "indexer" in lower:
         return "indexer_score"
-    if "matmul_q8" in lower or ("q8_0" in lower and "matmul" in lower):
+    if "matmul_q8" in lower or any(marker in lower for marker in (
+        "grouped_q8_0", "shared_mid_q8_0", "qk_lowrank_q8_0",
+        "value_project_q8_0",
+    )):
         return "dense_q8"
     if any(marker in lower for marker in (
         "cutlass::", "cublas", "gemm", "gemvx::", "turing_s",
