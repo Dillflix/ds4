@@ -4743,3 +4743,27 @@ REPEAT_LEVELS=1,64,256,512,1536 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 ```
+
+### SM75 grouped indexed-decode attention experiment
+
+The exact shared-row Group2 and Group8 kernels are retained as diagnostic
+implementations, not production candidates. The strengthened 32K regression
+uses nonzero Q/K/V data and requires all 32,768 output values to match the
+shipping one-head-per-block kernel byte for byte. Both grouped kernels pass,
+with no local-memory traffic and two active blocks per SM at the production
+shape.
+
+The accepted 100-repeat timing at one token, position 32767, 8,192 compressed
+rows, top-k 512, 128 raw rows, 64 heads, and head dimension 512 measured:
+
+| Mapping | Median ms | Speedup vs shipping |
+| --- | ---: | ---: |
+| shipping | 0.144951 | 1.000000x |
+| Group2 shared-row | 0.908138 | 0.159613x |
+| Group8 shared-row | 1.254310 | 0.115562x |
+
+Grouping is therefore rejected: Group2 is 6.27x slower and Group8 is 8.65x
+slower. Reusing each indexed row across heads does not compensate for reduced
+head-level block parallelism, shared staging, and synchronization on SM75.
+Do not advance either mapping to a four-GPU production A/B or enable it by
+default.
