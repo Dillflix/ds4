@@ -4782,6 +4782,13 @@ gates, and runs Compute Sanitizer by default. Timing uses the live H32 fixture,
 alternates control/candidate order over paired rounds, and reports medians,
 paired-speedup standard deviation, and range.
 
+The accepted exact run on 2026-09-02 rejected this algorithm for performance.
+H1, H4, and H8 were byte-exact and sanitizer-clean, but achieved only
+`0.234109x`, `0.073786x`, and `0.025663x` of shipping throughput respectively.
+Shipping retains its small score surface in CTA shared memory; recomputing all
+score dots twice therefore removes no global score traffic and cannot repay the
+extra arithmetic and synchronization. The experiment remains diagnostic-only.
+
 ```bash
 cd ~/ds4-iq2-q4
 
