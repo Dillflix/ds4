@@ -17,7 +17,7 @@ TG_TOKENS=${TG_TOKENS:-256}
 EXACT_TOKENS=${EXACT_TOKENS:-16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
-INTERLEAVED_CACHE_MB=${INTERLEAVED_CACHE_MB:-512}
+INTERLEAVED_CACHE_MB=${INTERLEAVED_CACHE_MB:-1024}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CTX_ALLOC=33025
@@ -45,8 +45,8 @@ for item in "TG_TOKENS:$TG_TOKENS" "EXACT_TOKENS:$EXACT_TOKENS" \
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 done
 (( TG_TOKENS == 256 && EXACT_TOKENS == 16 && PREFILL_CHUNK == 2048 &&
-   PIPELINE_MB == 512 && INTERLEAVED_CACHE_MB >= 256 )) ||
-    die "require TG=256 EXACT=16 PREFILL_CHUNK=2048 PIPELINE_MB=512 cache>=256 MiB"
+   PIPELINE_MB == 512 && INTERLEAVED_CACHE_MB >= 768 )) ||
+    die "require TG=256 EXACT=16 PREFILL_CHUNK=2048 PIPELINE_MB=512 cache>=768 MiB"
 for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
@@ -166,7 +166,7 @@ phase=manifest
         "$(sha256sum "$PROMPT" | awk '{print $1}')"
     printf 'gpu_devices=%s\nrequired_power_limits_w=%s\nstage_split=22/21\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
-    printf 'candidate_scope=single-token-q8-t32-1024x16384\n'
+    printf 'candidate_scope=single-token-q8-t32-1024x32768\n'
     printf 'candidate_cache_mib_per_device=%s\n' "$INTERLEAVED_CACHE_MB"
     printf 'throughput_repeats=1\nfrontiers=512,4096,32768\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
@@ -227,7 +227,7 @@ validate_dispatch() {
             }
             END {exit !(seen==1 && !bad)}
         ' "$log"
-        [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=1024 out=16384$' \
+        [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=1024 out=32768$' \
               "$log") -ge 43 ]]
     fi
 }

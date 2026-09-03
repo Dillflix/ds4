@@ -5008,8 +5008,8 @@ the production model format, cache, quantizer, or dispatch.
 ### SM75 warp-interleaved Q8_0 production decode A/B
 
 `cuda-sm75-q8-warp-interleaved-production-ab.sh` integrates the same exact
-mapping behind an opt-in engine selector for the per-rank single-token T32
-query projection (`1024 x 16384`). The control retains canonical Q8_0. The
+mapping behind an opt-in engine selector for the full single-token T32 query
+projection (`1024 x 32768`). The control retains canonical Q8_0. The
 candidate lazily creates one equal-size interleaved copy per layer/device and
 reuses it across decode tokens; canonical storage remains available for
 prefill, so this first production experiment reports the additional resident
@@ -5022,13 +5022,19 @@ fallback, verifies GPU
 identity and power limits before and after every process, and rejects any
 non-byte-identical logit.
 
+The `20260903T040314Z` archive is not candidate performance evidence. Its
+opt-in gate incorrectly named the diagnostic half-width `1024 x 16384` shape,
+while production decode executes the full `1024 x 32768` query projection.
+Consequently the candidate recorded zero fills and zero calls; the small CSV
+differences between those two runs are an unchanged-control noise sample.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
-INTERLEAVED_CACHE_MB=512 TG_TOKENS=256 EXACT_TOKENS=16 \
+INTERLEAVED_CACHE_MB=1024 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
 ```

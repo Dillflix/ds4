@@ -8827,7 +8827,7 @@ static uint64_t cuda_q8_warp_interleaved_cache_limit_bytes(void) {
 
 static int cuda_q8_warp_interleaved_target(
         uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
-    return n_tok == 1u && in_dim == 1024u && out_dim == 16384u &&
+    return n_tok == 1u && in_dim == 1024u && out_dim == 32768u &&
            cuda_env_flag_enabled(
                "DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE", 0) &&
            cuda_sm75_mma_ok();

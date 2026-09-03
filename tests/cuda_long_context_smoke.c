@@ -145,7 +145,7 @@ static int check_sm75_q8_mma_exact(void) {
 
 static int check_sm75_q8_warp_interleaved_engine_exact(void) {
     const uint32_t in_dim = 1024u;
-    const uint32_t out_dim = 16384u;
+    const uint32_t out_dim = 32768u;
     const uint32_t blocks = in_dim / 32u;
     const size_t weight_bytes = (size_t)out_dim * blocks * 34u;
     unsigned char *model = (unsigned char *)malloc(weight_bytes);
