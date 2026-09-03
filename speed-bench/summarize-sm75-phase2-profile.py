@@ -106,7 +106,10 @@ def family_of(row: dict[str, str], layout: str) -> str:
         )
     if "quantize_q8" in lower:
         return "canonical_q8_quantize"
-    if "matmul_f16_pair_compressor_store_ordered_chunks_kernel" in lower:
+    if any(marker in lower for marker in (
+        "matmul_f16_pair_compressor_store_ordered_chunks_kernel",
+        "matmul_f16_pair_compressor_store_canonical_staged_4096x1024_kernel",
+    )):
         return "compressor_projection_state_fused"
     if "moe_gate_up_mid_decode_sm75_q3a4" in lower:
         return "q3a4_gate_up"

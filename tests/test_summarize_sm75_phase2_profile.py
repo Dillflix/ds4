@@ -136,6 +136,16 @@ class Phase2SummaryTest(unittest.TestCase):
                         "stage_range": "", "layer_range": "",
                     },
                     {
+                        "trace": dlabel, "kind": "kernel", "duration_ns": 3500000,
+                        "device": 0, "bytes": 0,
+                        "name": (
+                            "matmul_f16_pair_compressor_store_"
+                            "canonical_staged_4096x1024_kernel"
+                        ),
+                        "category": "attention", "layer": 0,
+                        "stage_range": "", "layer_range": "",
+                    },
+                    {
                         "trace": dlabel, "kind": "kernel", "duration_ns": 4000000,
                         "device": 0, "bytes": 0,
                         "name": (
@@ -221,6 +231,13 @@ class Phase2SummaryTest(unittest.TestCase):
                 )
                 self.assertEqual(native_quantize["calls"], "2")
                 self.assertEqual(float(native_quantize["duration_ms"]), 9.0)
+                compressor = next(
+                    row for row in decode_rows
+                    if row["trace"] == trace
+                    and row["family"] == "compressor_projection_state_fused"
+                )
+                self.assertEqual(compressor["calls"], "2")
+                self.assertEqual(float(compressor["duration_ms"]), 6.5)
             decode_by_trace = {
                 (row["trace"], row["family"]) for row in decode_rows
             }

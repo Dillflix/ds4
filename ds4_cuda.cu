@@ -237,10 +237,10 @@ static int g_cuda_compressor_pair_state_store_incompatible;
 static int g_cuda_compressor_pair_state_store_audit;
 static std::atomic<uint64_t> g_cuda_compressor_pair_state_store_calls[3] = {};
 static std::atomic<bool> g_cuda_compressor_pair_state_store_logged[3] = {};
-/* Width-1024 decode projection using the canonical F16 model layout.  This is
- * opt-in until exact four-GPU mixed15/all43 evidence accepts it.  The kernel
- * stages weights and the normalized activation cooperatively so it needs no
- * auxiliary model representation or persistent cache. */
+/* Width-1024 decode projection using the canonical F16 model layout.  Exact
+ * four-GPU mixed15/all43 qualification made this the SM75 production default.
+ * The kernel stages weights and the normalized activation cooperatively so it
+ * needs no auxiliary model representation or persistent cache. */
 static int g_cuda_compressor_projection_staged;
 static std::atomic<uint64_t> g_cuda_compressor_projection_staged_calls = 0;
 static std::atomic<bool> g_cuda_compressor_projection_staged_logged = false;
@@ -723,7 +723,9 @@ static void cuda_decode_dispatch_env_refresh(void) {
         g_cuda_compressor_pair_state_store_logged[i].store(false);
     }
     g_cuda_compressor_projection_staged = cuda_env_flag_enabled(
-        "DS4_CUDA_COMPRESSOR_PROJECTION_STAGED", 0);
+        "DS4_CUDA_COMPRESSOR_PROJECTION_STAGED", 1) &&
+        !cuda_env_flag_enabled(
+            "DS4_CUDA_NO_COMPRESSOR_PROJECTION_STAGED", 0);
     g_cuda_compressor_projection_staged_calls.store(
         0u, std::memory_order_relaxed);
     g_cuda_compressor_projection_staged_logged.store(

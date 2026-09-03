@@ -5118,13 +5118,15 @@ pair. Both arms retain the already accepted state-store fusion. The candidate
 reads the original row-major F16 model directly and reports zero auxiliary
 model bytes; it does not create a repacked weight cache.
 
-The one-shot four-GPU test covers mixed15 and all43 at PP512, PP4096, and
-PP32768. It runs one 256-token throughput pass and a separate 16-token exact-
-logit pass per arm, requires the stable 22/21 topology, validates all three
-compressor widths, proves nonzero width-1024 staged dispatch, checks GPU
-identity and power limits before and after every process, and rejects any
-non-byte-identical logit. The staged selector is opt-in until this evidence is
-accepted: `DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=1`.
+The accepted `20260903T213736Z` one-shot four-GPU test covered mixed15 and
+all43 at PP512, PP4096, and PP32768. All 96 control/candidate logit pairs were
+byte-identical; all 32 pre/post GPU snapshots matched; and each throughput arm
+recorded 16,128 staged calls with zero auxiliary model bytes. Decode improved
+by 9.16%, 8.50%, and 7.20% for mixed15 and by 10.33%, 9.05%, and 8.36% for
+all43 at those frontiers. This promotes canonical staging to the SM75
+width-1024 production default. Set
+`DS4_CUDA_COMPRESSOR_PROJECTION_STAGED=0` or
+`DS4_CUDA_NO_COMPRESSOR_PROJECTION_STAGED=1` for the exact retained rollback.
 
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
