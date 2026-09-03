@@ -143,6 +143,86 @@ static int check_sm75_q8_mma_exact(void) {
     return check_sm75_q8_mma_exact_case(8192u, 128u, 17u, "T256");
 }
 
+static int check_sm75_q8_warp_interleaved_engine_exact(void) {
+    const uint32_t in_dim = 1024u;
+    const uint32_t out_dim = 16384u;
+    const uint32_t blocks = in_dim / 32u;
+    const size_t weight_bytes = (size_t)out_dim * blocks * 34u;
+    unsigned char *model = (unsigned char *)malloc(weight_bytes);
+    float *x_host = (float *)malloc((size_t)in_dim * sizeof(float));
+    float *reference = (float *)malloc((size_t)out_dim * sizeof(float));
+    float *candidate = (float *)malloc((size_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((size_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *out =
+        ds4_gpu_tensor_alloc((size_t)out_dim * sizeof(float));
+    int rc = 1;
+    if (!model || !x_host || !reference || !candidate || !x || !out)
+        goto cleanup;
+
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t b = 0; b < blocks; b++) {
+            unsigned char *blk =
+                model + ((size_t)row * blocks + b) * 34u;
+            const uint16_t d = (uint16_t)(0x2000u +
+                ((row * 5u + b * 3u) & 31u));
+            memcpy(blk, &d, sizeof(d));
+            for (uint32_t i = 0; i < 32u; i++) {
+                const int q =
+                    (int)((row * 17u + b * 13u + i * 7u) % 255u) - 127;
+                blk[2u + i] = (unsigned char)(int8_t)q;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < in_dim; i++) {
+        const int v = (int)((i * 29u + (i >> 3u) * 11u) % 193u) - 96;
+        x_host[i] = (float)v / 101.0f;
+    }
+    if (!ds4_gpu_tensor_write(x, 0, x_host,
+                              (size_t)in_dim * sizeof(float)) ||
+        !ds4_gpu_set_model_map(model, weight_bytes)) goto cleanup;
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB");
+    if (!ds4_gpu_matmul_q8_0_tensor(out, model, weight_bytes, 0,
+                                    in_dim, out_dim, x, 1u) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, reference,
+                             (size_t)out_dim * sizeof(float))) goto cleanup;
+
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB", "64", 1);
+    if (!ds4_gpu_matmul_q8_0_tensor(out, model, weight_bytes, 0,
+                                    in_dim, out_dim, x, 1u) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, candidate,
+                             (size_t)out_dim * sizeof(float))) goto cleanup;
+    if (memcmp(reference, candidate, (size_t)out_dim * sizeof(float)) != 0) {
+        uint32_t first = 0u;
+        while (first < out_dim &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) first++;
+        fprintf(stderr,
+                "SM75 warp-interleaved engine mismatch at %u: reference=%a candidate=%a\n",
+                first, (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 warp-interleaved Q8 engine T32 exact (%u values)\n",
+            out_dim);
+    rc = 0;
+
+cleanup:
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB");
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    free(candidate);
+    free(reference);
+    free(x_host);
+    free(model);
+    return rc;
+}
+
 static int check_sm75_iq2_moe_mma_exact(void) {
     const uint32_t n_total_expert = 8;
     /* One selected expert per token isolates every final-output write.  The
@@ -3004,6 +3084,7 @@ int main(void) {
         return 1;
     }
     int rc = check_sm75_q8_mma_exact();
+    if (check_sm75_q8_warp_interleaved_engine_exact() != 0) rc = 1;
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
     if (check_sm75_q32_production_exact() != 0) rc = 1;

@@ -5004,3 +5004,31 @@ one-time weight repack costs, under both warm and cache-scrubbed timing. The
 candidate must remain bit-exact across the production T32 shape, a two-group
 shape, and an unaligned partial-group/tail shape. This prototype does not alter
 the production model format, cache, quantizer, or dispatch.
+
+### SM75 warp-interleaved Q8_0 production decode A/B
+
+`cuda-sm75-q8-warp-interleaved-production-ab.sh` integrates the same exact
+mapping behind an opt-in engine selector for the per-rank single-token T32
+query projection (`1024 x 16384`). The control retains canonical Q8_0. The
+candidate lazily creates one equal-size interleaved copy per layer/device and
+reuses it across decode tokens; canonical storage remains available for
+prefill, so this first production experiment reports the additional resident
+cache explicitly. It does not modify any default.
+
+The one-shot test covers mixed15 and all43 at PP512, PP4096, and PP32768. It
+runs one 256-token throughput pass and a separate 16-token exact-logit pass per
+arm, requires at least one complete 43-layer set of cache fills with zero
+fallback, verifies GPU
+identity and power limits before and after every process, and rejects any
+non-byte-identical logit.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+INTERLEAVED_CACHE_MB=512 TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
+```
