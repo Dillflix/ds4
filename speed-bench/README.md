@@ -5147,10 +5147,17 @@ that were deliberately excluded from the width-1024 promotion: the ratio-128
 attention projection (`4096 x 512` twice) and the ratio-4 indexer projection
 (`4096 x 256` twice).  The control arm retains the accepted width-1024 staged
 default in both variants, so this isolates only the incremental width-256/512
-change.  The candidate is opt-in with
-`DS4_CUDA_COMPRESSOR_PROJECTION_STAGED_SMALL=1`; the global staged rollback
-continues to override it.  No repacked model or persistent auxiliary cache is
-allocated.
+change.  The accepted `20260903T230735Z` run improved mixed15 decode by 7.13%,
+6.07%, and 5.37% at PP512, PP4096, and PP32768; all43 improved by 8.18%,
+7.05%, and 6.10%.  All 96 control/candidate logit pairs were byte-identical,
+all 32 GPU-health snapshots matched, and both candidate throughput arms
+recorded 16,128 width-256, 15,360 width-512, and 16,128 width-1024 staged
+calls with zero auxiliary model bytes.  Small-width canonical staging is now
+the SM75 production default.  Set
+`DS4_CUDA_COMPRESSOR_PROJECTION_STAGED_SMALL=0` or
+`DS4_CUDA_NO_COMPRESSOR_PROJECTION_STAGED_SMALL=1` for the small-width-only
+rollback; the global staged rollback continues to override every width.  No
+repacked model or persistent auxiliary cache is allocated.
 
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
