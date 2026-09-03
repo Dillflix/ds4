@@ -576,8 +576,13 @@ def main() -> int:
             values[(int(row["stage"]), int(row["device"]))] = float(
                 row["kernel_ms_per_layer"]
             )
+    complete_2x2 = all(
+        (stage, device) in values
+        for stage in (0, 1)
+        for device in (0, 3)
+    )
     gpu_factor = stage_factor = 0.0
-    if all((stage, device) in values for stage in (0, 1) for device in (0, 3)):
+    if complete_2x2:
         gpu_factor = math.sqrt(
             (values[(0, 3)] / values[(0, 0)])
             * (values[(1, 3)] / values[(1, 0)])
@@ -595,7 +600,7 @@ def main() -> int:
                 f"pipeline_gpu_span={row['pipeline_gpu_span_ms']:.3f} ms "
                 f"annotated_kernel={row['annotated_kernel_ms']:.3f} ms\n"
             )
-        if len(traces) == 2:
+        if complete_2x2:
             handle.write("\nPer-layer home-kernel 2x2 cells (ms):\n")
             for stage in (0, 1):
                 handle.write(
@@ -606,9 +611,15 @@ def main() -> int:
                 f"\nphysical_gpu3_over_gpu0_factor={gpu_factor:.6f}\n"
                 f"late_stage_over_early_stage_factor={stage_factor:.6f}\n"
             )
-        else:
+        elif len(traces) == 1:
             handle.write(
                 "\nsingle_trace=true\n"
+                "pair_attribution=not_requested\n"
+            )
+        else:
+            handle.write(
+                "\npaired_trace_count=" + str(len(traces)) + "\n"
+                "complete_2x2=false\n"
                 "pair_attribution=not_requested\n"
             )
         if harness_rows:
@@ -619,18 +630,24 @@ def main() -> int:
                     f"gpu3={row['gpu3_median_ms']:.6f} ms "
                     f"ratio={row['gpu3_over_gpu0']:.6f}\n"
                 )
-        if len(traces) == 2:
+        if complete_2x2:
             handle.write(
                 "\nInterpretation boundary: the 2x2 factors describe attributed "
                 "GPU work, not end-to-end speedup. Use trace-summary.csv for "
                 "pipeline span and same-work-gpu-summary.csv to confirm or "
                 "reject a physical GPU/clock explanation.\n"
             )
-        else:
+        elif len(traces) == 1:
             handle.write(
                 "\nInterpretation boundary: this is one bounded production "
                 "trace. It attributes the captured critical path but does not "
                 "separate physical-GPU and layer-range effects.\n"
+            )
+        else:
+            handle.write(
+                "\nInterpretation boundary: these bounded production traces "
+                "share one placement. They compare workloads but do not form "
+                "a physical-GPU-versus-layer-range 2x2 experiment.\n"
             )
     print((output_dir / "analysis.txt").read_text(encoding="utf-8"), end="")
     return 0

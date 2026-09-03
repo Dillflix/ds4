@@ -2916,6 +2916,26 @@ CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-phase2-consolidated-profile.sh
 ```
 
+If a late model-free Nsight Compute capture fails after all four production
+traces completed, retain the output directory and resume it without reopening
+either GGUF. Resume revalidates the saved topology, GPU identity/power, engine
+logs, benchmark rows, reports, and SQLite exports before reuse. Each saved NCU
+report is also revalidated against the current kernel symbol and launch shape;
+an invalid or incomplete report is recaptured while valid reports are reused.
+
+```bash
+export PHASE2_PROFILE_DIR="$PWD/sm75-phase2-consolidated-profile-<timestamp>"
+
+RESUME=1 \
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+RUN_NCU=1 NCU_USE_SUDO=1 SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-phase2-consolidated-profile.sh
+```
+
 Return `sm75-phase2-consolidated-profile-<timestamp>.tar.gz`. The primary
 decision artifacts are `summary/summary.md`, `summary/throughput.csv`,
 `summary/prefill-stage-balance.csv`, `summary/prefill-family-summary.csv`,

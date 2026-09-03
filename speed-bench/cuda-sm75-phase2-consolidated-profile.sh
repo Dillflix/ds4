@@ -31,8 +31,9 @@ Optional environment:
   RUN_NCU=1
   NCU_USE_SUDO=1
   SKIP_BUILD=0
+  RESUME=0
   CREATE_ARCHIVE=1
-  PHASE2_PROFILE_DIR=...            new output directory
+  PHASE2_PROFILE_DIR=...            new output directory, or existing with RESUME=1
 EOF
 }
 
@@ -59,6 +60,7 @@ PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_NCU=${RUN_NCU:-1}
 NCU_USE_SUDO=${NCU_USE_SUDO:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
+RESUME=${RESUME:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${PHASE2_PROFILE_DIR:-$repo_dir/sm75-phase2-consolidated-profile-$stamp}
@@ -80,14 +82,20 @@ done
     die "current stage-aware T256 production placement requires STAGE_SPLIT=22"
 (( PROFILE_TOKENS == 32768 && PREFILL_CHUNK > 0 && PIPELINE_MB > 0 &&
    DECODE_SKIP > 0 && DECODE_TOKENS > 0 )) || die "invalid profiling shape"
-for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_NCU NCU_USE_SUDO SKIP_BUILD RESUME CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical IDs remain stable"
-[[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
-    die "output path already exists: $OUTPUT_DIR"
+if [[ $RESUME == 1 ]]; then
+    [[ -n ${PHASE2_PROFILE_DIR:-} && $PHASE2_PROFILE_DIR == /* ]] ||
+        die "RESUME=1 requires an absolute PHASE2_PROFILE_DIR"
+    [[ -d $OUTPUT_DIR ]] || die "resume directory not found: $OUTPUT_DIR"
+else
+    [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
+        die "output path already exists: $OUTPUT_DIR"
+fi
 
 tools=(awk cat cmp date env git grep make mkdir mv nproc nsys nvidia-smi
        python3 sha256sum sort stat tail tar tee tr)
@@ -125,7 +133,14 @@ done
 mkdir -p "$OUTPUT_DIR"/{prefill/nsys,decode/nsys,telemetry,validation,provenance,summary}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 topology_file="$OUTPUT_DIR/provenance/topology.txt"
-nvidia-smi topo -m >"$topology_file"
+if [[ $RESUME == 1 ]]; then
+    [[ -s $topology_file ]] || die "resume directory is missing saved topology"
+    nvidia-smi topo -m >"$OUTPUT_DIR/provenance/resume-topology.txt"
+    cmp -s "$topology_file" "$OUTPUT_DIR/provenance/resume-topology.txt" ||
+        die "current topology differs from the saved production trace topology"
+else
+    nvidia-smi topo -m >"$topology_file"
+fi
 topology_link() {
     local from=$1 to=$2
     awk -v from="GPU$from" -v to="GPU$to" '
@@ -252,34 +267,42 @@ for marker in \
 done
 
 phase=manifest
-{
+if [[ $RESUME == 0 ]]; then
+    {
+        printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
+            "$(git branch --show-current)"
+        printf 'mixed_model=%s\nmixed_model_bytes=%s\n' \
+            "$MIXED_MODEL" "$(stat -c %s "$MIXED_MODEL")"
+        printf 'all43_model=%s\nall43_model_bytes=%s\n' \
+            "$ALL43_MODEL" "$(stat -c %s "$ALL43_MODEL")"
+        printf 'prompt=%s\nprompt_sha256=%s\n' "$PROMPT" \
+            "$(sha256sum "$PROMPT" | awk '{print $1}')"
+        printf 'gpu_devices=%s\ngpu_vram=%s\nrequired_power_limits_w=%s\n' \
+            "$GPU_DEVICES" "$GPU_VRAM" "$REQUIRED_POWER_LIMITS_W"
+        printf 'stage_split=22/21\nprofile_tokens=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
+            "$PROFILE_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
+        printf 'decode_skip=%s\ndecode_tokens=%s\n' "$DECODE_SKIP" "$DECODE_TOKENS"
+        printf 'pair0_attention_rows=disabled\npair0_indexer_rows=enabled\n'
+        printf 'pair1_attention_rows=enabled\npair1_indexer_rows=enabled\n'
+        printf 't32_output=fused-fp16-default\ndirect_native_q8=decode-default\n'
+        printf 'compressor_state_append=fused-default\nrun_ncu=%s\n' "$RUN_NCU"
+        printf '\n[gpu inventory]\n'
+        nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
+            --format=csv
+        printf '\n[topology]\n'; cat "$topology_file"
+        printf '\n[nsight systems]\n'; nsys --version
+        if [[ $RUN_NCU == 1 ]]; then printf '\n[nsight compute]\n'; ncu --version; fi
+    } >"$OUTPUT_DIR/manifest.txt"
+    git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
+    git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+else
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
-        "$(git branch --show-current)"
-    printf 'mixed_model=%s\nmixed_model_bytes=%s\n' \
-        "$MIXED_MODEL" "$(stat -c %s "$MIXED_MODEL")"
-    printf 'all43_model=%s\nall43_model_bytes=%s\n' \
-        "$ALL43_MODEL" "$(stat -c %s "$ALL43_MODEL")"
-    printf 'prompt=%s\nprompt_sha256=%s\n' "$PROMPT" \
-        "$(sha256sum "$PROMPT" | awk '{print $1}')"
-    printf 'gpu_devices=%s\ngpu_vram=%s\nrequired_power_limits_w=%s\n' \
-        "$GPU_DEVICES" "$GPU_VRAM" "$REQUIRED_POWER_LIMITS_W"
-    printf 'stage_split=22/21\nprofile_tokens=%s\nprefill_chunk=%s\npipeline_mb=%s\n' \
-        "$PROFILE_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 'decode_skip=%s\ndecode_tokens=%s\n' "$DECODE_SKIP" "$DECODE_TOKENS"
-    printf 'pair0_attention_rows=disabled\npair0_indexer_rows=enabled\n'
-    printf 'pair1_attention_rows=enabled\npair1_indexer_rows=enabled\n'
-    printf 't32_output=fused-fp16-default\ndirect_native_q8=decode-default\n'
-    printf 'compressor_state_append=fused-default\nrun_ncu=%s\n' "$RUN_NCU"
-    printf '\n[gpu inventory]\n'
-    nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
-        --format=csv
-    printf '\n[topology]\n'; cat "$topology_file"
-    printf '\n[nsight systems]\n'; nsys --version
-    if [[ $RUN_NCU == 1 ]]; then printf '\n[nsight compute]\n'; ncu --version; fi
-} >"$OUTPUT_DIR/manifest.txt"
-git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
-git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
+        "$(git branch --show-current)" >"$OUTPUT_DIR/provenance/resume-manifest.txt"
+    git status --short >"$OUTPUT_DIR/provenance/resume-git-status.txt"
+    git diff --stat >"$OUTPUT_DIR/provenance/resume-git-diff-stat.txt"
+fi
 
 capture_health() {
     local output=$1 partial="$1.partial.$$" gpu
@@ -293,8 +316,18 @@ capture_health() {
     done
     mv -- "$partial" "$output"
 }
-capture_health "$OUTPUT_DIR/validation/initial-gpu.csv" ||
-    die "could not capture initial GPU health"
+if [[ $RESUME == 0 ]]; then
+    capture_health "$OUTPUT_DIR/validation/initial-gpu.csv" ||
+        die "could not capture initial GPU health"
+else
+    [[ -s $OUTPUT_DIR/validation/initial-gpu.csv ]] ||
+        die "resume directory is missing initial GPU identity"
+    capture_health "$OUTPUT_DIR/validation/resume-gpu.csv" ||
+        die "could not capture resume GPU health"
+    cmp -s "$OUTPUT_DIR/validation/initial-gpu.csv" \
+        "$OUTPUT_DIR/validation/resume-gpu.csv" ||
+        die "current GPU identity or power differs from the saved production traces"
+fi
 validate_health() {
     local stem=$1
     [[ -s $stem.pre-gpu.csv && -s $stem.post-gpu.csv ]] &&
@@ -416,6 +449,38 @@ stats_reports() {
     done
 }
 
+validate_prefill_artifacts() {
+    local layout=$1 base=$2 label="${1}-prefill-32k"
+    validate_health "$base" || return 1
+    validate_topology_log "$layout" "$base.log" || return 1
+    awk -F, -v pp="$PROFILE_TOKENS" '
+        NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" && $4=="gen_tokens"); next}
+        NR==2 {rows++; ok=($1==pp && ($3+0)>0 && ($4+0)==0); next}
+        NR>2 {rows++}
+        END {exit !(header && rows==1 && ok)}
+    ' "$base-benchmark.csv" || return 1
+    [[ -s $base.nsys-rep && -s $base.sqlite ]] || return 1
+}
+
+validate_decode_artifacts() {
+    local layout=$1 base=$2 label="${1}-decode-32k"
+    local gen_tokens=$((DECODE_SKIP + DECODE_TOKENS))
+    validate_health "$base" || return 1
+    validate_topology_log "$layout" "$base.log" || return 1
+    validate_decode_defaults "$layout" "$base.log" || return 1
+    grep -Fq "starting Nsight CUDA capture for decode frontier $PROFILE_TOKENS" \
+        "$base.log" || return 1
+    grep -Fq "stopped Nsight CUDA capture for decode frontier $PROFILE_TOKENS after $DECODE_TOKENS tokens" \
+        "$base.log" || return 1
+    awk -F, -v pp="$PROFILE_TOKENS" -v tg="$gen_tokens" '
+        NR==1 {header=($1=="ctx_tokens" && $4=="gen_tokens" && $8=="gen_steady_tps"); next}
+        NR==2 {rows++; ok=($1==pp && ($4+0)==tg && ($8+0)>0); next}
+        NR>2 {rows++}
+        END {exit !(header && rows==1 && ok)}
+    ' "$base-benchmark.csv" || return 1
+    [[ -s $base.nsys-rep && -s $base.sqlite ]] || return 1
+}
+
 declare -A models=(
     [mixed15]="$MIXED_MODEL"
     [all43]="$ALL43_MODEL"
@@ -431,6 +496,16 @@ capture_prefill() {
     local layout=$1 model=${models[$1]} label="${1}-prefill-32k"
     local base="$OUTPUT_DIR/prefill/nsys/$label" rc=0
     phase="prefill-$layout"
+    if [[ $RESUME == 1 ]]; then
+        validate_prefill_artifacts "$layout" "$base" ||
+            die "$label saved production artifacts failed resume validation"
+        printf 'Reusing validated Phase 2 profile: model=%s phase=prefill frontier=%s\n' \
+            "$layout" "$PROFILE_TOKENS"
+        printf '%s\t%s\t%s\t%s\t22/21\t%s\t%s\n' \
+            "$label" "$GPU_DEVICES" "$base.sqlite" "$layout" \
+            "$base-benchmark.csv" "$base.log" >>"$OUTPUT_DIR/prefill/trace-map.tsv"
+        return
+    fi
     printf 'Phase 2 profile: model=%s phase=prefill frontier=%s...\n' \
         "$layout" "$PROFILE_TOKENS"
     capture_health "$base.pre-gpu.csv" || die "$label pre-run GPU health failed"
@@ -452,18 +527,10 @@ capture_prefill() {
     cleanup_sampler
     (( rc == 0 )) || { tail -n 220 "$base.log" >&2 || true; die "$label failed (exit $rc)"; }
     capture_health "$base.post-gpu.csv" || die "$label post-run GPU health failed"
-    validate_health "$base" || die "$label changed GPU identity, power, or health"
-    validate_topology_log "$layout" "$base.log" || die "$label production topology validation failed"
-    awk -F, -v pp="$PROFILE_TOKENS" '
-        NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" && $4=="gen_tokens"); next}
-        NR==2 {rows++; ok=($1==pp && ($3+0)>0 && ($4+0)==0); next}
-        NR>2 {rows++}
-        END {exit !(header && rows==1 && ok)}
-    ' "$base-benchmark.csv" || die "$label benchmark CSV is invalid"
-    [[ -s $base.nsys-rep ]] || die "$label omitted its Nsight report"
     nsys export --type sqlite --force-overwrite=true --output "$base.sqlite" \
         "$base.nsys-rep" >"$base-export.log" 2>&1 || die "$label SQLite export failed"
-    [[ -s $base.sqlite ]] || die "$label SQLite export is empty"
+    validate_prefill_artifacts "$layout" "$base" ||
+        die "$label production artifact validation failed"
     stats_reports "$base"
     printf '%s\t%s\t%s\t%s\t22/21\t%s\t%s\n' \
         "$label" "$GPU_DEVICES" "$base.sqlite" "$layout" \
@@ -475,6 +542,17 @@ capture_decode() {
     local base="$OUTPUT_DIR/decode/nsys/$label" rc=0
     local gen_tokens=$((DECODE_SKIP + DECODE_TOKENS))
     phase="decode-$layout"
+    if [[ $RESUME == 1 ]]; then
+        validate_decode_artifacts "$layout" "$base" ||
+            die "$label saved production artifacts failed resume validation"
+        printf 'Reusing validated Phase 2 profile: model=%s phase=steady-decode frontier=%s tokens=%s\n' \
+            "$layout" "$PROFILE_TOKENS" "$DECODE_TOKENS"
+        printf '%s\t%s\t1024\t%s\t%s\t%s\t%s\t22/21\t%s\t%s\n' \
+            "$label" "$PROFILE_TOKENS" "$DECODE_TOKENS" "$GPU_DEVICES" \
+            "$base.sqlite" "$layout" "$base-benchmark.csv" "$base.log" \
+            >>"$OUTPUT_DIR/decode/trace-map.tsv"
+        return
+    fi
     printf 'Phase 2 profile: model=%s phase=steady-decode frontier=%s tokens=%s...\n' \
         "$layout" "$PROFILE_TOKENS" "$DECODE_TOKENS"
     capture_health "$base.pre-gpu.csv" || die "$label pre-run GPU health failed"
@@ -499,23 +577,10 @@ capture_decode() {
     cleanup_sampler
     (( rc == 0 )) || { tail -n 220 "$base.log" >&2 || true; die "$label failed (exit $rc)"; }
     capture_health "$base.post-gpu.csv" || die "$label post-run GPU health failed"
-    validate_health "$base" || die "$label changed GPU identity, power, or health"
-    validate_topology_log "$layout" "$base.log" || die "$label production topology validation failed"
-    validate_decode_defaults "$layout" "$base.log" || die "$label Phase 2 default validation failed"
-    grep -Fq "starting Nsight CUDA capture for decode frontier $PROFILE_TOKENS" "$base.log" ||
-        die "$label did not start bounded decode capture"
-    grep -Fq "stopped Nsight CUDA capture for decode frontier $PROFILE_TOKENS after $DECODE_TOKENS tokens" \
-        "$base.log" || die "$label did not stop bounded decode capture"
-    awk -F, -v pp="$PROFILE_TOKENS" -v tg="$gen_tokens" '
-        NR==1 {header=($1=="ctx_tokens" && $4=="gen_tokens" && $8=="gen_steady_tps"); next}
-        NR==2 {rows++; ok=($1==pp && ($4+0)==tg && ($8+0)>0); next}
-        NR>2 {rows++}
-        END {exit !(header && rows==1 && ok)}
-    ' "$base-benchmark.csv" || die "$label benchmark CSV is invalid"
-    [[ -s $base.nsys-rep ]] || die "$label omitted its Nsight report"
     nsys export --type sqlite --force-overwrite=true --output "$base.sqlite" \
         "$base.nsys-rep" >"$base-export.log" 2>&1 || die "$label SQLite export failed"
-    [[ -s $base.sqlite ]] || die "$label SQLite export is empty"
+    validate_decode_artifacts "$layout" "$base" ||
+        die "$label production artifact validation failed"
     stats_reports "$base"
     printf '%s\t%s\t1024\t%s\t%s\t%s\t%s\t22/21\t%s\t%s\n' \
         "$label" "$PROFILE_TOKENS" "$DECODE_TOKENS" "$GPU_DEVICES" \
@@ -538,7 +603,7 @@ if [[ $RUN_NCU == 1 ]]; then
     phase=bounded-nsight-compute
     PROFILE_GPU="$PROFILE_GPU" CUDA_ARCH=sm_75 PROFILE_SET=all \
     NCU_SET=focused NCU_CACHE_CONTROL=all NCU_USE_SUDO="$NCU_USE_SUDO" \
-    SKIP_BUILD=1 RESUME=0 CREATE_ARCHIVE=0 \
+    SKIP_BUILD=1 RESUME="$RESUME" CREATE_ARCHIVE=0 \
     DECODE_WEIGHT_PROFILE_DIR="$OUTPUT_DIR/ncu-decode-weight" \
         bash ./speed-bench/cuda-sm75-decode-weight-profile.sh \
         | tee "$OUTPUT_DIR/ncu-decode-weight.stdout.txt"

@@ -265,7 +265,11 @@ kernel_regex() {
 }
 
 block_size() {
-    case "$1" in f16-pair-*) printf '32' ;; *) printf '256' ;; esac
+    case "$1" in
+        q4-32-down-slots-tile32|q4-32-down-packed-tile32) printf '128' ;;
+        f16-pair-*) printf '32' ;;
+        *) printf '256' ;;
+    esac
 }
 
 profile_one() {
@@ -274,8 +278,16 @@ profile_one() {
     block=$(block_size "$scenario")
     base="$OUTPUT_DIR/ncu/$scenario"
     if [[ $RESUME == 1 && -s $base.csv && -s $base.ncu-rep ]]; then
-        printf 'Reusing Nsight capture: %s\n' "$scenario"
-        return
+        if python3 speed-bench/validate-ncu-capture.py \
+                "$base.csv" "$regex" 0 \
+                --process cuda_sm75_decode_weight_profile \
+                --block-size "$block" >"$base-validation.txt" 2>&1; then
+            printf 'Reusing validated Nsight capture: %s\n' "$scenario"
+            cat "$base-validation.txt"
+            return
+        fi
+        printf 'Saved Nsight capture failed current validation; recapturing: %s\n' \
+            "$scenario"
     fi
     local -a collection
     if [[ $NCU_SET == full ]]; then

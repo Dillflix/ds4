@@ -165,6 +165,25 @@ def main() -> int:
         assert "single_trace=true" in single
         assert "pair_attribution=not_requested" in single
         assert "physical_gpu3_over_gpu0_factor=" not in single
+
+        # Two traces are not necessarily the swapped-placement 2x2.  The
+        # consolidated Phase 2 profile compares two model layouts using the
+        # same placement and must not report zero-valued 2x2 factors.
+        same_placement = out / "same-placement.sqlite"
+        create_trace(same_placement, (0, 3), (55, 95))
+        (out / "trace-map.tsv").write_text(
+            "label\tdevices\tsqlite\n"
+            f"current\t0,3,1,2\t{current}\n"
+            f"same-placement\t0,3,1,2\t{same_placement}\n",
+            encoding="utf-8",
+        )
+        subprocess.run([sys.executable, str(SUMMARIZER), str(out)], check=True)
+        paired = (out / "analysis.txt").read_text(encoding="utf-8")
+        assert "paired_trace_count=2" in paired
+        assert "complete_2x2=false" in paired
+        assert "pair_attribution=not_requested" in paired
+        assert "physical_gpu3_over_gpu0_factor=" not in paired
+        assert "share one placement" in paired
     print("critical-path summarizer synthetic 2x2 test: OK")
     return 0
 
