@@ -180,7 +180,7 @@ static int check_sm75_q8_warp_interleaved_engine_exact(void) {
     if (!ds4_gpu_tensor_write(x, 0, x_host,
                               (size_t)in_dim * sizeof(float)) ||
         !ds4_gpu_set_model_map(model, weight_bytes)) goto cleanup;
-    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE");
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE", "0", 1);
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB");
     if (!ds4_gpu_matmul_q8_0_tensor(out, model, weight_bytes, 0,
                                     in_dim, out_dim, x, 1u) ||
@@ -188,8 +188,8 @@ static int check_sm75_q8_warp_interleaved_engine_exact(void) {
         !ds4_gpu_tensor_read(out, 0, reference,
                              (size_t)out_dim * sizeof(float))) goto cleanup;
 
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB", "64", 1);
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB");
     if (!ds4_gpu_matmul_q8_0_tensor(out, model, weight_bytes, 0,
                                     in_dim, out_dim, x, 1u) ||
         !ds4_gpu_synchronize() ||
@@ -206,7 +206,7 @@ static int check_sm75_q8_warp_interleaved_engine_exact(void) {
         goto cleanup;
     }
     fprintf(stderr,
-            "cuda-regression: SM75 warp-interleaved Q8 engine T32 exact (%u values)\n",
+            "cuda-regression: SM75 warp-interleaved Q8 engine T32 production default exact (%u values)\n",
             out_dim);
     rc = 0;
 

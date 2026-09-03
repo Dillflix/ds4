@@ -5007,13 +5007,15 @@ the production model format, cache, quantizer, or dispatch.
 
 ### SM75 warp-interleaved Q8_0 production decode A/B
 
-`cuda-sm75-q8-warp-interleaved-production-ab.sh` integrates the same exact
-mapping behind an opt-in engine selector for the full single-token T32 query
-projection (`1024 x 32768`). The control retains canonical Q8_0. The
-candidate lazily creates one equal-size interleaved copy per layer/device and
-reuses it across decode tokens; canonical storage remains available for
-prefill, so this first production experiment reports the additional resident
-cache explicitly. It does not modify any default.
+`cuda-sm75-q8-warp-interleaved-production-ab.sh` validates the production
+default for the full single-token T32 query projection (`1024 x 32768`). The
+control sets `DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=0` and retains canonical
+Q8_0. The candidate uses the default selector and lazily creates one equal-size
+interleaved copy per layer/device. Canonical storage remains available for
+prefill, and the default per-device interleaved-cache cap is 1024 MiB. Set
+`DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB` to override that cap; setting either
+the cache cap or `DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE` to zero is an
+explicit rollback.
 
 The one-shot test covers mixed15 and all43 at PP512, PP4096, and PP32768. It
 runs one 256-token throughput pass and a separate 16-token exact-logit pass per
@@ -5027,6 +5029,14 @@ opt-in gate incorrectly named the diagnostic half-width `1024 x 16384` shape,
 while production decode executes the full `1024 x 32768` query projection.
 Consequently the candidate recorded zero fills and zero calls; the small CSV
 differences between those two runs are an unchanged-control noise sample.
+
+The corrected `20260903T043348Z` four-GPU run exercised 33,024 interleaved
+calls per throughput arm and 2,064 per exact-logit arm, with 43 cache fills and
+zero fallbacks. All 16 decode logits at PP512, PP4096, and PP32768 were
+byte-identical for mixed15 and all43. The interleaved path improved steady
+decode by 5.97%, 5.03%, and 4.55% for mixed15 and by 5.79%, 5.04%, and 4.54%
+for all43 at those frontiers, respectively. That evidence promotes the path to
+the SM75 production default for this exact shape.
 
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \

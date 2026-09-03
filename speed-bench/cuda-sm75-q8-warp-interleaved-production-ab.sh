@@ -143,7 +143,7 @@ fi
         tail -n 220 "$OUTPUT_DIR/smoke.log" >&2
         die "CUDA regression failed"
     }
-grep -Fq 'SM75 warp-interleaved Q8 engine T32 exact' "$OUTPUT_DIR/smoke.log" ||
+grep -Fq 'SM75 warp-interleaved Q8 engine T32 production default exact' "$OUTPUT_DIR/smoke.log" ||
     die "interleaved engine regression marker missing"
 "${clean[@]}" ./tests/cuda_sm75_q8_warp_interleaved --correctness-only \
     >"$OUTPUT_DIR/interleaved-correctness.log" 2>&1 || {
@@ -273,9 +273,10 @@ PY
 run_engine() {
     local model=$1 variant=$2 tokens=$3 base=$4 logits=${5:-} rc=0
     local -a candidate=() cmd
-    if [[ $variant == interleaved ]]; then
+    if [[ $variant == control ]]; then
+        candidate=(DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=0)
+    else
         candidate=(
-            DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=1
             "DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=$INTERLEAVED_CACHE_MB"
             DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
         )
