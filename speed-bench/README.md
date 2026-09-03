@@ -5048,3 +5048,29 @@ INTERLEAVED_CACHE_MB=1024 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
 ```
+
+### SM75 width-1024 compressor projection layout diagnostic
+
+`cuda-sm75-compressor-projection-layout.sh` targets the expensive one-token
+paired F16 attention-compressor projection (`4096 x 1024` twice) without
+changing production dispatch. Its control reproduces the production ordered
+32-thread kernel, including recurrent-state stores. Two size-neutral candidates
+transpose each row into lane-major order so a warp loads adjacent F16 values
+while preserving each lane's original 128-element accumulation sequence and
+the final lane-order reduction. The first candidate retains one warp per output
+row; the second assigns the independent KV and score accumulators to separate
+warps in the same CTA.
+
+The one-time weight transpose is excluded. The 16 KiB activation transpose is
+measured both outside and inside each candidate launch. The harness requires
+bit-identical projection outputs and recurrent state, intact canaries, SM75
+resource evidence, Compute Sanitizer, and validated Nsight captures for all
+three kernels.
+
+```bash
+PROFILE_GPU=0 CUDA_ARCH=sm_75 \
+BENCH_ROUNDS=9 BENCH_LAUNCHES=25 \
+RUN_SANITIZER=1 RUN_NCU=1 NCU_USE_SUDO=1 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-projection-layout.sh
+```
