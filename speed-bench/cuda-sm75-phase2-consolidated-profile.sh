@@ -337,6 +337,23 @@ validate_layout() {
     ' "$log"
 }
 
+validate_t32_f16_summary() {
+    local log=$1 line
+    local local_calls=0 partner_calls=0 total_partner=0 f16_calls=0
+    line=$(grep -F 'CUDA T32 f16-output fused summary:' "$log" | tail -n 1 || true)
+    if [[ $line =~ local=([0-9]+)[[:space:]]partner=([0-9]+) ]]; then
+        local_calls=${BASH_REMATCH[1]}
+        partner_calls=${BASH_REMATCH[2]}
+    fi
+    line=$(grep -F 'CUDA q8 fp16 partner summary:' "$log" | tail -n 1 || true)
+    if [[ $line =~ calls=([0-9]+).*f16-result-calls=([0-9]+) ]]; then
+        total_partner=${BASH_REMATCH[1]}
+        f16_calls=${BASH_REMATCH[2]}
+    fi
+    (( local_calls + partner_calls > 0 && partner_calls > 0 &&
+       total_partner >= partner_calls && f16_calls == partner_calls ))
+}
+
 validate_topology_log() {
     local layout=$1 log=$2 marker route
     for marker in 'CUDA EP forced pipeline split 22/21' \
@@ -358,8 +375,7 @@ validate_topology_log() {
     grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
     grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || return 1
     grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" || return 1
-    grep -Eq 'CUDA T32 f16-output fused summary: local=0 partner=[1-9][0-9]*' "$log" ||
-        return 1
+    validate_t32_f16_summary "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
     validate_layout "$layout" "$log"
 }
