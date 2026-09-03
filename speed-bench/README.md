@@ -5054,18 +5054,31 @@ bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
 `cuda-sm75-compressor-projection-layout.sh` targets the expensive one-token
 paired F16 attention-compressor projection (`4096 x 1024` twice) without
 changing production dispatch. Its control reproduces the production ordered
-32-thread kernel, including recurrent-state stores. Two size-neutral candidates
-transpose each row into lane-major order so a warp loads adjacent F16 values
-while preserving each lane's original 128-element accumulation sequence and
-the final lane-order reduction. The first candidate retains one warp per output
-row; the second assigns the independent KV and score accumulators to separate
-warps in the same CTA.
+32-thread kernel, including recurrent-state stores. A no-cache candidate keeps
+the canonical model layout and cooperatively stages four padded 32x32 tiles in
+shared memory using coalesced global loads. Two size-neutral candidates instead
+transpose each row into lane-major order so a warp loads adjacent F16 values.
+All candidates preserve each lane's original 128-element accumulation sequence
+and the final lane-order reduction. The first lane-major candidate retains one
+warp per output row; the second assigns the independent KV and score
+accumulators to separate warps in the same CTA.
 
 The one-time weight transpose is excluded. The 16 KiB activation transpose is
 measured both outside and inside each candidate launch. The harness requires
 bit-identical projection outputs and recurrent state, intact canaries, SM75
 resource evidence, Compute Sanitizer, and validated Nsight captures for all
-three kernels.
+four kernels.
+
+The `20260903T204338Z` three-arm run accepted both packed candidates as
+bit-exact and sanitizer-clean. The control took 0.29959 ms; the one-warp
+lane-major consumer took 0.03293 ms (9.10x), or 0.03580 ms including the
+per-token activation transpose (8.36x). Two warps took 0.03285 ms, providing
+no material benefit while increasing registers from 44 to 60. Nsight measured
+global-load efficiency rising from 8.33% to 99.91%, sectors per request falling
+from 31.83 to 2.66, and DRAM utilization rising from 13.10% to 73.64%. The
+canonical shared-staging arm added here determines whether most of that gain
+can be retained without a second weight representation; this remains bounded
+diagnostic evidence rather than a production promotion.
 
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 \

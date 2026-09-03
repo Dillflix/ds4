@@ -18,14 +18,18 @@ constexpr uint32_t kRatio = 4u;
 constexpr uint32_t kStateRows = 8u;
 constexpr uint32_t kLanes = 32u;
 constexpr uint32_t kChunk = kIn / kLanes;
+constexpr uint32_t kStageTile = 32u;
+constexpr uint32_t kStagePad = kStageTile + 1u;
+constexpr uint32_t kStageTiles = kChunk / kStageTile;
 constexpr uint32_t kGuard = 32u;
 constexpr uint32_t kPos = 32767u;
 
-enum class Arm { Control, LaneMajor, TwoWarp };
+enum class Arm { Control, CanonicalStaged, LaneMajor, TwoWarp };
 
 const char *arm_name(Arm arm) {
     switch (arm) {
         case Arm::Control: return "control";
+        case Arm::CanonicalStaged: return "canonical-staged";
         case Arm::LaneMajor: return "lane-major";
         case Arm::TwoWarp: return "lane-major-two-warp";
     }
@@ -91,6 +95,61 @@ __global__ void sm75_compressor_pair_control_kernel(
         const float xv = x[k];
         sum_kv += __half2float(wkv[k]) * xv;
         sum_score += __half2float(wscore[k]) * xv;
+    }
+    partial_kv[lane] = sum_kv;
+    partial_score[lane] = sum_score;
+    __syncthreads();
+    if (lane == 0u) {
+        float total_kv = 0.0f;
+        float total_score = 0.0f;
+        for (uint32_t i = 0; i < kLanes; ++i) {
+            total_kv += partial_kv[i];
+            total_score += partial_score[i];
+        }
+        store_projection_state(out_kv, state_kv, ape, row, pos,
+                               total_kv, false);
+        store_projection_state(out_score, state_score, ape, row, pos,
+                               total_score, true);
+    }
+}
+
+/* Keep the canonical row-major model representation.  Each CTA cooperatively
+ * loads a 32x32 slice from every lane's original 128-element K interval, so
+ * global reads are contiguous.  Padding the shared rows keeps the subsequent
+ * per-lane reads from collapsing onto the same banks.  Tiles and elements are
+ * consumed in the original order, preserving the production accumulation. */
+__global__ void sm75_compressor_pair_canonical_staged_kernel(
+        float *out_kv, float *out_score,
+        float *state_kv, float *state_score,
+        const __half *weight_kv, const __half *weight_score,
+        const float *x, const __half *ape, uint32_t pos) {
+    const uint32_t row = blockIdx.x;
+    if (row >= kWidth) return;
+    __shared__ __half staged_kv[kLanes][kStagePad];
+    __shared__ __half staged_score[kLanes][kStagePad];
+    __shared__ float partial_kv[kLanes];
+    __shared__ float partial_score[kLanes];
+    const uint32_t lane = threadIdx.x;
+    const __half *wkv = weight_kv + (uint64_t)row * kIn;
+    const __half *wscore = weight_score + (uint64_t)row * kIn;
+    float sum_kv = 0.0f;
+    float sum_score = 0.0f;
+    for (uint32_t tile = 0; tile < kStageTiles; ++tile) {
+        for (uint32_t source_lane = 0; source_lane < kLanes;
+             ++source_lane) {
+            const uint32_t k = source_lane * kChunk +
+                               tile * kStageTile + lane;
+            staged_kv[source_lane][lane] = wkv[k];
+            staged_score[source_lane][lane] = wscore[k];
+        }
+        __syncthreads();
+        for (uint32_t step = 0; step < kStageTile; ++step) {
+            const uint32_t k = lane * kChunk + tile * kStageTile + step;
+            const float xv = x[k];
+            sum_kv += __half2float(staged_kv[lane][step]) * xv;
+            sum_score += __half2float(staged_score[lane][step]) * xv;
+        }
+        __syncthreads();
     }
     partial_kv[lane] = sum_kv;
     partial_score[lane] = sum_score;
@@ -312,6 +371,10 @@ bool launch_arm(Fixture *f, Arm arm) {
         sm75_compressor_pair_control_kernel<<<kWidth, 32>>>(
             out_kv, out_score, state_kv, state_score,
             f->weight_kv, f->weight_score, f->x, f->ape, f->pos);
+    } else if (arm == Arm::CanonicalStaged) {
+        sm75_compressor_pair_canonical_staged_kernel<<<kWidth, 32>>>(
+            out_kv, out_score, state_kv, state_score,
+            f->weight_kv, f->weight_score, f->x, f->ape, f->pos);
     } else if (arm == Arm::LaneMajor) {
         sm75_compressor_pair_lane_major_kernel<<<kWidth, 32>>>(
             out_kv, out_score, state_kv, state_score,
@@ -436,7 +499,7 @@ bool run_correctness(Fixture *f) {
                      "error: control did not overwrite every required region\n");
         return false;
     }
-    for (Arm arm : {Arm::LaneMajor, Arm::TwoWarp}) {
+    for (Arm arm : {Arm::CanonicalStaged, Arm::LaneMajor, Arm::TwoWarp}) {
         if (!outputs_reset(&f->output) || !pack_activation(f) ||
             !launch_arm(f, arm) ||
             !cuda_ok(cudaDeviceSynchronize(), "candidate correctness sync")) return false;
@@ -483,10 +546,13 @@ float median(std::vector<float> values) {
 }
 
 bool run_benchmark(Fixture *f, uint32_t rounds, uint32_t launches) {
-    std::vector<float> control(rounds), lane(rounds), lane_inclusive(rounds);
+    std::vector<float> control(rounds), staged(rounds);
+    std::vector<float> lane(rounds), lane_inclusive(rounds);
     std::vector<float> two(rounds), two_inclusive(rounds);
     for (uint32_t warm = 0; warm < 5u; ++warm) {
-        if (!launch_arm(f, Arm::Control) || !launch_arm(f, Arm::LaneMajor) ||
+        if (!launch_arm(f, Arm::Control) ||
+            !launch_arm(f, Arm::CanonicalStaged) ||
+            !launch_arm(f, Arm::LaneMajor) ||
             !launch_arm(f, Arm::TwoWarp)) return false;
     }
     if (!cuda_ok(cudaDeviceSynchronize(), "benchmark warmup")) return false;
@@ -494,6 +560,8 @@ bool run_benchmark(Fixture *f, uint32_t rounds, uint32_t launches) {
         const bool reverse = (round & 1u) != 0u;
         if (!reverse) {
             if (!time_sequence(f, Arm::Control, false, launches, &control[round]) ||
+                !time_sequence(f, Arm::CanonicalStaged, false, launches,
+                               &staged[round]) ||
                 !time_sequence(f, Arm::LaneMajor, false, launches, &lane[round]) ||
                 !time_sequence(f, Arm::TwoWarp, false, launches, &two[round]) ||
                 !time_sequence(f, Arm::LaneMajor, true, launches, &lane_inclusive[round]) ||
@@ -503,12 +571,16 @@ bool run_benchmark(Fixture *f, uint32_t rounds, uint32_t launches) {
                 !time_sequence(f, Arm::LaneMajor, true, launches, &lane_inclusive[round]) ||
                 !time_sequence(f, Arm::TwoWarp, false, launches, &two[round]) ||
                 !time_sequence(f, Arm::LaneMajor, false, launches, &lane[round]) ||
+                !time_sequence(f, Arm::CanonicalStaged, false, launches,
+                               &staged[round]) ||
                 !time_sequence(f, Arm::Control, false, launches, &control[round])) return false;
         }
     }
-    std::vector<float> lane_ratio(rounds), lane_inc_ratio(rounds);
+    std::vector<float> staged_ratio(rounds), lane_ratio(rounds);
+    std::vector<float> lane_inc_ratio(rounds);
     std::vector<float> two_ratio(rounds), two_inc_ratio(rounds);
     for (uint32_t i = 0; i < rounds; ++i) {
+        staged_ratio[i] = control[i] / staged[i];
         lane_ratio[i] = control[i] / lane[i];
         lane_inc_ratio[i] = control[i] / lane_inclusive[i];
         two_ratio[i] = control[i] / two[i];
@@ -519,6 +591,8 @@ bool run_benchmark(Fixture *f, uint32_t rounds, uint32_t launches) {
                 "activation_pack_scope=per-token-included-separately\n"
                 "timing_rounds=%u\ntiming_launches=%u\n"
                 "control_median_ms=%.9g\n"
+                "canonical_staged_median_ms=%.9g\n"
+                "canonical_staged_speedup=%.9g\n"
                 "lane_major_consumer_median_ms=%.9g\n"
                 "lane_major_consumer_speedup=%.9g\n"
                 "lane_major_inclusive_median_ms=%.9g\n"
@@ -527,8 +601,9 @@ bool run_benchmark(Fixture *f, uint32_t rounds, uint32_t launches) {
                 "two_warp_consumer_speedup=%.9g\n"
                 "two_warp_inclusive_median_ms=%.9g\n"
                 "two_warp_inclusive_speedup=%.9g\n",
-                rounds, launches, median(control), median(lane),
-                median(lane_ratio), median(lane_inclusive),
+                rounds, launches, median(control), median(staged),
+                median(staged_ratio), median(lane), median(lane_ratio),
+                median(lane_inclusive),
                 median(lane_inc_ratio), median(two), median(two_ratio),
                 median(two_inclusive), median(two_inc_ratio));
     return run_correctness(f) &&
@@ -602,12 +677,15 @@ int main(int argc, char **argv) {
     Fixture fixture;
     if (!fixture_init(&fixture)) return 1;
     bool ok = print_resources("control", sm75_compressor_pair_control_kernel, 32) &&
+              print_resources("canonical-staged",
+                              sm75_compressor_pair_canonical_staged_kernel, 32) &&
               print_resources("lane-major", sm75_compressor_pair_lane_major_kernel, 32) &&
               print_resources("lane-major-two-warp",
                               sm75_compressor_pair_lane_major_two_warp_kernel, 64);
     if (ok && !profile.empty()) {
         Arm arm;
         if (profile == "control") arm = Arm::Control;
+        else if (profile == "canonical-staged") arm = Arm::CanonicalStaged;
         else if (profile == "lane-major") arm = Arm::LaneMajor;
         else if (profile == "two-warp") arm = Arm::TwoWarp;
         else {

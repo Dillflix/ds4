@@ -5,11 +5,11 @@ usage() {
     cat <<'EOF'
 Run the bounded SM75 width-1024 compressor-projection layout experiment.
 
-The production-ordered control is compared with a size-neutral lane-major
-weight layout using either one warp per output row or two independent warps
-(KV and score). One-time weight packing is excluded. Per-token activation
-packing is reported both excluded and included. Production dispatch is not
-modified.
+The production-ordered control is compared with a canonical-row-major shared-
+staging kernel and a size-neutral lane-major weight layout using either one
+warp per output row or two independent warps (KV and score). One-time weight
+packing is excluded. Per-token activation packing is reported both excluded
+and included. Production dispatch is not modified.
 
 Optional environment:
   PROFILE_GPU=0
@@ -129,6 +129,7 @@ if ! env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" ./$target --device 0 \
     die "correctness run failed"
 fi
 for marker in \
+    'correctness_result_canonical-staged=bit-exact' \
     'correctness_result_lane-major=bit-exact' \
     'correctness_result_lane-major-two-warp=bit-exact' \
     'weight_layout_size_neutral=yes' \
@@ -193,10 +194,12 @@ if [[ $RUN_NCU == 1 ]]; then
         launch__grid_size
     )
     metric_csv=$(IFS=,; printf '%s' "${metrics[*]}")
-    for variant in control lane-major two-warp; do
+    for variant in control canonical-staged lane-major two-warp; do
         case $variant in
             control)
                 regex='sm75_compressor_pair_control_kernel.*'; block=32 ;;
+            canonical-staged)
+                regex='sm75_compressor_pair_canonical_staged_kernel.*'; block=32 ;;
             lane-major)
                 regex='sm75_compressor_pair_lane_major_kernel.*'; block=32 ;;
             two-warp)
@@ -242,7 +245,7 @@ phase=summarization
     grep -E '^(resources|weight_layout|weight_repack|activation_repack|control_required|correctness_)' \
         "$OUTPUT_DIR/correctness.log"
     printf '\n'
-    grep -E '^(benchmark_scope|weight_repack_scope|activation_pack_scope|timing_|control_|lane_major_|two_warp_|post_timing_|benchmark_status)' \
+    grep -E '^(benchmark_scope|weight_repack_scope|activation_pack_scope|timing_|control_|canonical_staged_|lane_major_|two_warp_|post_timing_|benchmark_status)' \
         "$OUTPUT_DIR/benchmark.log"
     if [[ $RUN_NCU == 1 ]]; then
         printf '\n'; cat "$OUTPUT_DIR"/ncu/*-validation.txt
