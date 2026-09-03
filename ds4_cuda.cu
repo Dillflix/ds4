@@ -244,12 +244,13 @@ static int g_cuda_moe_q4_32_down_decode_mapping_audit;
  * tile32-slots, tile32-packed. */
 static std::atomic<uint64_t> g_moe_q4_32_down_decode_mapping_calls[4] = {};
 static std::atomic<uint64_t> g_moe_q4_32_down_decode_prefetch_calls[3] = {};
-/* Opt-in producer for the native activation ABI consumed by the SM75 Q4-32,
- * Q3A4 and native-Q4 gate/up and down paths.  The canonical Q8_K quantizer
- * followed by the in-place pack remains the default until a real four-GPU
- * A/B is accepted.  Audit indices are
+/* Producer for the native activation ABI consumed by the SM75 Q4-32, Q3A4
+ * and native-Q4 gate/up and down paths.  The accepted four-GPU A/B made it
+ * the decode default; prefill remains canonical because the direct producer
+ * was neutral-to-negative there.  Audit indices are
  * [input/mid][canonical/direct][prefill/decode]. */
-static int g_cuda_moe_direct_native_q8;
+static int g_cuda_moe_direct_native_q8_prefill;
+static int g_cuda_moe_direct_native_q8_decode = 1;
 static int g_cuda_moe_direct_native_q8_audit;
 static std::atomic<uint64_t> g_moe_direct_native_q8_calls[2][2][2] = {};
 static std::atomic<uint64_t> g_moe_direct_native_q8_blocks[2][2][2] = {};
@@ -528,11 +529,16 @@ ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth(void) {
 }
 
 extern "C" void ds4_gpu_test_set_moe_direct_native_q8(int enabled) {
-    g_cuda_moe_direct_native_q8 = enabled != 0;
+    g_cuda_moe_direct_native_q8_prefill = enabled != 0;
+    g_cuda_moe_direct_native_q8_decode = enabled != 0;
 }
 
 extern "C" int ds4_gpu_test_get_moe_direct_native_q8(void) {
-    return g_cuda_moe_direct_native_q8;
+    return g_cuda_moe_direct_native_q8_decode;
+}
+
+extern "C" int ds4_gpu_test_get_moe_direct_native_q8_prefill(void) {
+    return g_cuda_moe_direct_native_q8_prefill;
 }
 
 static inline void cuda_moe_direct_native_q8_audit_record(
@@ -883,9 +889,21 @@ static void cuda_decode_dispatch_env_refresh(void) {
                 CUDA_MOE_Q3A4_DECODE_PREFETCH_DEFAULT;
         }
     }
-    g_cuda_moe_direct_native_q8 =
-        cuda_env_flag_enabled("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", 0) &&
-        !cuda_env_flag_enabled("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8", 0);
+    const char *direct_native_q8 =
+        getenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8");
+    const int direct_native_q8_disabled =
+        cuda_env_flag_enabled("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8", 0);
+    if (direct_native_q8) {
+        const int enabled = cuda_env_flag_enabled(
+            "DS4_CUDA_MOE_DIRECT_NATIVE_Q8", 0) &&
+            !direct_native_q8_disabled;
+        g_cuda_moe_direct_native_q8_prefill = enabled;
+        g_cuda_moe_direct_native_q8_decode = enabled;
+    } else {
+        g_cuda_moe_direct_native_q8_prefill = 0;
+        g_cuda_moe_direct_native_q8_decode =
+            !direct_native_q8_disabled;
+    }
     g_cuda_moe_direct_native_q8_audit =
         cuda_env_flag_enabled("DS4_CUDA_MOE_DIRECT_NATIVE_Q8_AUDIT", 0);
     g_cuda_moe_direct_native_q8_logged.store(
@@ -5413,12 +5431,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         static const char *boundary_names[2] = {"input", "mid"};
         for (uint32_t boundary = 0u; boundary < 2u; boundary++) {
             fprintf(stderr,
-                    "ds4: SM75 direct native Q8 audit boundary=%s enabled=%d "
+                    "ds4: SM75 direct native Q8 audit boundary=%s "
+                    "enabled=%d prefill-enabled=%d decode-enabled=%d "
                     "canonical-prefill-calls=%llu direct-prefill-calls=%llu "
                     "canonical-prefill-blocks=%llu direct-prefill-blocks=%llu "
                     "canonical-decode-calls=%llu direct-decode-calls=%llu "
                     "canonical-decode-blocks=%llu direct-decode-blocks=%llu\n",
-                    boundary_names[boundary], g_cuda_moe_direct_native_q8,
+                    boundary_names[boundary],
+                    g_cuda_moe_direct_native_q8_prefill &&
+                        g_cuda_moe_direct_native_q8_decode,
+                    g_cuda_moe_direct_native_q8_prefill,
+                    g_cuda_moe_direct_native_q8_decode,
                     (unsigned long long)
                         g_moe_direct_native_q8_calls[boundary][0][0].load(
                             std::memory_order_relaxed),
@@ -30655,8 +30678,10 @@ static int routed_moe_launch(
         uint32_t iq2_tail8_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         const bool native_xq = native_gate_q4 || gate_q32;
-        const bool use_direct_native_xq =
-            g_cuda_moe_direct_native_q8 && native_xq;
+        const bool use_direct_native_q8 = n_tokens == 1u
+            ? g_cuda_moe_direct_native_q8_decode != 0
+            : g_cuda_moe_direct_native_q8_prefill != 0;
+        const bool use_direct_native_xq = use_direct_native_q8 && native_xq;
         if (use_direct_native_xq) {
             q8_K_quantize_sm75_native_kernel<<<xq_grid, 256>>>(
                 (cuda_sm75_native_q8_K *)xq,
@@ -30678,7 +30703,7 @@ static int routed_moe_launch(
                     true, std::memory_order_relaxed)) {
                 fprintf(stderr,
                         "ds4: SM75 direct native Q8 producer selected for "
-                        "routed MoE activations (audit candidate)\n");
+                        "routed MoE activations\n");
             }
         }
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
@@ -31640,7 +31665,7 @@ static int routed_moe_launch(
         if (ok && !use_direct_midq) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
             const bool use_direct_native_midq =
-                g_cuda_moe_direct_native_q8 &&
+                use_direct_native_q8 &&
                 (native_down_q4 || down_q4_32) &&
                 !use_q4_midq_sidecar && !use_owned_sparse_buffers;
             if (use_direct_native_midq) {
@@ -31658,7 +31683,7 @@ static int routed_moe_launch(
                             true, std::memory_order_relaxed)) {
                         fprintf(stderr,
                                 "ds4: SM75 direct native Q8 producer "
-                                "selected for Q4 down (audit candidate)\n");
+                                "selected for Q4 down\n");
                     }
                 }
             } else if (use_q4_midq_sidecar) {
@@ -32833,7 +32858,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         }
     }
 
-    if (g_cuda_moe_q32_decode_graph && !g_cuda_moe_direct_native_q8 &&
+    if (g_cuda_moe_q32_decode_graph && !g_cuda_moe_direct_native_q8_decode &&
         gate_q32 && down_q4_32 &&
         g_cuda_moe_q4_32_down_decode_mapping ==
             CUDA_MOE_Q4_32_DOWN_DECODE_CONTROL &&
@@ -32866,7 +32891,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         int8_t *shared_xq = (int8_t *)shared_prequant->ptr;
         float *shared_scale = (float *)((char *)shared_prequant->ptr +
                                         shared_scale_offset);
-        if (g_cuda_moe_direct_native_q8 && native_xq) {
+        if (g_cuda_moe_direct_native_q8_decode && native_xq) {
             q8_K_q8_0_quantize_sm75_native_kernel<<<xq_grid, 256>>>(
                     (cuda_sm75_native_q8_K *)xq,
                     shared_xq, shared_scale, (const float *)x->ptr,
@@ -32876,7 +32901,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
                     xq, shared_xq, shared_scale, (const float *)x->ptr,
                     expert_in_dim, 1u);
         }
-    } else if (g_cuda_moe_direct_native_q8 && native_xq) {
+    } else if (g_cuda_moe_direct_native_q8_decode && native_xq) {
         q8_K_quantize_sm75_native_kernel<<<xq_grid, 256>>>(
                 (cuda_sm75_native_q8_K *)xq,
                 (const float *)x->ptr, expert_in_dim, 1u);
@@ -32886,19 +32911,19 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe x quantize launch")) return 0;
     if (native_xq) {
-        if (!g_cuda_moe_direct_native_q8 &&
+        if (!g_cuda_moe_direct_native_q8_decode &&
             !sm75_q4_pack_activations_inplace(
                 xq, xq_blocks, "owned routed_moe native x pack launch")) {
             return 0;
         }
         cuda_moe_direct_native_q8_audit_record(
-            0u, g_cuda_moe_direct_native_q8, 1u, xq_blocks);
-        if (g_cuda_moe_direct_native_q8 &&
+            0u, g_cuda_moe_direct_native_q8_decode, 1u, xq_blocks);
+        if (g_cuda_moe_direct_native_q8_decode &&
             !g_cuda_moe_direct_native_q8_logged.exchange(
                 true, std::memory_order_relaxed)) {
             fprintf(stderr,
                     "ds4: SM75 direct native Q8 producer selected for "
-                    "routed MoE activations (audit candidate)\n");
+                    "routed MoE activations (production decode default)\n");
         }
     }
 
@@ -33158,7 +33183,7 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
 
     dim3 midq_grid(midq_blocks, 6u, 1u);
     if (native_down_q4 || down_q4_32) {
-        if (g_cuda_moe_direct_native_q8) {
+        if (g_cuda_moe_direct_native_q8_decode) {
             q8_K_quantize_sm75_native_kernel<<<midq_grid, 256>>>(
                     (cuda_sm75_native_q8_K *)midq,
                     (const float *)mid->ptr, expert_mid_dim, 6u);
@@ -33179,20 +33204,20 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe mid quantize launch")) return 0;
     if (native_down_q4 || down_q4_32) {
         const uint64_t native_blocks = 6ull * midq_blocks;
-        if (!g_cuda_moe_direct_native_q8 &&
+        if (!g_cuda_moe_direct_native_q8_decode &&
             !sm75_q4_pack_activations_inplace(
                 midq, native_blocks,
                 "owned routed_moe native mid pack launch")) {
             return 0;
         }
         cuda_moe_direct_native_q8_audit_record(
-            1u, g_cuda_moe_direct_native_q8, 1u, native_blocks);
-        if (g_cuda_moe_direct_native_q8 &&
+            1u, g_cuda_moe_direct_native_q8_decode, 1u, native_blocks);
+        if (g_cuda_moe_direct_native_q8_decode &&
             !g_cuda_moe_direct_native_q8_logged.exchange(
                 true, std::memory_order_relaxed)) {
             fprintf(stderr,
                     "ds4: SM75 direct native Q8 producer selected for "
-                    "Q4 down (audit candidate)\n");
+                    "Q4 down (production decode default)\n");
         }
     }
 

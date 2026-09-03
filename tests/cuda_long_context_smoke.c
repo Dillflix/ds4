@@ -26,6 +26,7 @@ extern void ds4_gpu_test_set_moe_q4_32_down_decode_prefetch_depth(
 extern uint32_t ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth(void);
 extern void ds4_gpu_test_set_moe_direct_native_q8(int enabled);
 extern int ds4_gpu_test_get_moe_direct_native_q8(void);
+extern int ds4_gpu_test_get_moe_direct_native_q8_prefill(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
 
 static unsigned char *idle_model_map;
@@ -1490,18 +1491,21 @@ static int check_sm75_q4_32_mapping_env(void) {
         ds4_gpu_test_get_moe_q4_32_decode_prefetch_depth() != 0u ||
         ds4_gpu_test_get_moe_q4_32_down_decode_mapping() != 1u ||
         ds4_gpu_test_get_moe_q4_32_down_decode_prefetch_depth() != 0u ||
-        ds4_gpu_test_get_moe_direct_native_q8() != 0)
+        ds4_gpu_test_get_moe_direct_native_q8() != 1 ||
+        ds4_gpu_test_get_moe_direct_native_q8_prefill() != 0)
         rc = 1;
     if (rc == 0 &&
         setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
         return 1;
     ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_direct_native_q8() != 1) rc = 1;
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 1 ||
+        ds4_gpu_test_get_moe_direct_native_q8_prefill() != 1) rc = 1;
     if (rc == 0 &&
         setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "0", 1) != 0)
         return 1;
     ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 0 ||
+        ds4_gpu_test_get_moe_direct_native_q8_prefill() != 0) rc = 1;
     if (rc == 0 &&
         setenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
         return 1;
@@ -1509,14 +1513,16 @@ static int check_sm75_q4_32_mapping_env(void) {
         setenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8", "1", 1) != 0)
         return 1;
     ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 0 ||
+        ds4_gpu_test_get_moe_direct_native_q8_prefill() != 0) rc = 1;
     (void)unsetenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8");
     (void)unsetenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8");
     ds4_gpu_test_refresh_decode_dispatch_env();
-    if (ds4_gpu_test_get_moe_direct_native_q8() != 0) rc = 1;
+    if (ds4_gpu_test_get_moe_direct_native_q8() != 1 ||
+        ds4_gpu_test_get_moe_direct_native_q8_prefill() != 0) rc = 1;
     fputs(rc == 0
               ? "cuda-regression: SM75 Q4-32 production mapping selectors exact\n"
-                "cuda-regression: SM75 direct native Q8 opt-in selector exact\n"
+                "cuda-regression: SM75 direct native Q8 decode default selector exact\n"
               : "cuda-regression: SM75 Q4-32/direct-native selectors failed\n",
           stderr);
     return rc;

@@ -1860,14 +1860,15 @@ evidence or failure archive: new provenance, status, and Nsight files go under
 
 ### SM75 direct native-Q8 production A/B
 
-`DS4_CUDA_MOE_DIRECT_NATIVE_Q8=1` selects the direct native-Q8 producer at
-both activation boundaries consumed by the tagged SM75 routed-MoE kernels:
-the model input feeding Q4-32 or Q3A4 gate/up and the intermediate activation
-feeding Q4-32 down. Decode's shared prequantization remains one launch: the
-candidate preserves the indexer's Q8_0 bytes while emitting the Q8_K half in
-native form. `DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8=1` is the explicit rollback.
-The selector is opt-in; absence of both variables retains canonical
-Q8_K-plus-pack production behavior.
+The direct native-Q8 producer is the production default for single-token
+decode at both activation boundaries consumed by the tagged SM75 routed-MoE
+kernels: the model input feeding Q4-32 or Q3A4 gate/up and the intermediate
+activation feeding Q4-32 down. Decode's shared prequantization remains one
+launch: the producer preserves the indexer's Q8_0 bytes while emitting the
+Q8_K half in native form. Prefill retains the canonical Q8_K-plus-pack path.
+`DS4_CUDA_MOE_DIRECT_NATIVE_Q8=1` explicitly selects direct production for
+both phases; `DS4_CUDA_MOE_DIRECT_NATIVE_Q8=0` or
+`DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8=1` is the full rollback.
 
 `cuda-sm75-direct-native-q8-production-ab.sh` is the acceptance test. It runs
 the mixed15 and all43 models under the same stable 22/21 four-GPU topology,
@@ -1913,6 +1914,12 @@ bash ./speed-bench/cuda-sm75-direct-native-q8-production-ab.sh
 Return `sm75-direct-native-q8-production-ab-<timestamp>.tar.gz`. Promotion
 requires a complete archive; the earlier one-GPU synthetic audit remains
 supporting resource and microbenchmark evidence only.
+
+The accepted `20260902T211111Z` archive passed byte-exact 16-token decode
+logits at PP512, PP4096, and PP32768 for both mixed15 and all43, with exclusive
+producer dispatch at both boundaries. Direct decode improved all six points by
+0.052% to 0.370%. Prefill was mixed (-0.752% to +0.349%) and regressed four of
+six points, so only decode was promoted.
 
 ### SM75 production-shaped Q4 gate/up native-packing audit
 
