@@ -144,8 +144,17 @@ for pair in 0:2 1:3; do
     home=${gpu_ids[${pair%%:*}]}; partner=${gpu_ids[${pair#*:}]}
     forward=$(topology_link "$home" "$partner")
     reverse=$(topology_link "$partner" "$home")
-    [[ $forward =~ ^NV[0-9]+$ && $reverse =~ ^NV[0-9]+$ ]] ||
-        die "logical pair $pair ($home/$partner) is not bidirectional NVLink: $forward/$reverse"
+    # NVLink is physically bidirectional, but some nvidia-smi releases omit
+    # one symmetric matrix row. Accept one unambiguous NV# report while still
+    # rejecting a contradictory reported value. The engine independently
+    # validates CUDA DIRECT peer access in both directions before admitting
+    # partner execution.
+    [[ $forward =~ ^NV[0-9]+$ || $reverse =~ ^NV[0-9]+$ ]] ||
+        die "logical pair $pair ($home/$partner) is not reported as NVLink: ${forward:-missing}/${reverse:-missing}"
+    [[ -z $forward || $forward =~ ^NV[0-9]+$ ]] ||
+        die "inconsistent NVLink topology for physical pair $home/$partner: $forward/${reverse:-missing}"
+    [[ -z $reverse || $reverse =~ ^NV[0-9]+$ ]] ||
+        die "inconsistent NVLink topology for physical pair $home/$partner: ${forward:-missing}/$reverse"
 done
 
 phase=initialization
