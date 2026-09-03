@@ -2862,6 +2862,67 @@ from the original invocation. Resume validates the saved production artifacts,
 reuses the SQLite export and Nsight Systems reports, regenerates attribution,
 then continues with the bounded Nsight Compute captures.
 
+# SM75 Phase 2 consolidated production profile
+
+`cuda-sm75-phase2-consolidated-profile.sh` is the closeout evidence pass before
+Phase 3 work begins. It profiles the current accepted engine—not the rejected
+Phase 2 experiments—using both `mixed15` and `all43` models at the genuine 32K
+frontier. For each model it captures one full-prefill Nsight Systems trace and
+one bounded 16-token steady-decode trace after 16 untraced decode tokens. The
+optional model-free Nsight Compute pass covers the active decode weight-kernel
+families without reopening either 127+ GB GGUF.
+
+The topology is intentionally fixed to the current stable production contract:
+22/21 layers, pair-0 attention row splitting off, pair-0 indexer row splitting
+on, and both pair-1 row splits on. The current stage-aware T256 placement is
+only valid for 22/21, so a 21/22 capture would measure a different placement
+policy rather than the shipping engine. The resulting per-stage imbalance is
+the evidence used to decide whether implementing and qualifying a 21/22 policy
+is the first Phase 3 pipeline task.
+
+The branch consolidates the accepted Phase 2 defaults: direct native packed
+Q8_K production for decode and fused compressor projection/recurrent-state
+append. The other three Phase 2 candidates remain rejected by their bounded
+evidence: grouped decode attention was exact but 6.27x/8.65x slower for group
+2/8, compact compressed-KV storage reduced bytes by 64.1% but made its consumer
+6.85x slower, and the exact two-score-pass online-softmax candidates were
+4.27x/13.55x/38.97x slower for H1/H4/H8.
+
+```bash
+cd ~/ds4-iq2-q4
+git switch agent/sm75-phase2-consolidated-profile
+git pull --ff-only
+
+sudo nvidia-smi -pm 1
+sudo nvidia-smi -i 0 -pl 250
+sudo nvidia-smi -i 1 -pl 260
+sudo nvidia-smi -i 2 -pl 250
+sudo nvidia-smi -i 3 -pl 250
+
+unset CUDA_VISIBLE_DEVICES
+unset PHASE2_PROFILE_DIR
+
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-phase2-consolidated-profile.sh
+```
+
+Return `sm75-phase2-consolidated-profile-<timestamp>.tar.gz`. The primary
+decision artifacts are `summary/summary.md`, `summary/throughput.csv`,
+`summary/prefill-stage-balance.csv`, `summary/prefill-family-summary.csv`,
+`summary/decode-family-summary.csv`, and `summary/phase3-target-evidence.csv`.
+The archive also retains all four Nsight Systems reports, their SQLite exports,
+telemetry, exact/default dispatch validation, and bounded Nsight Compute data.
+
 # SM75 routed-quant real-weight quality sweep
 
 After cuda-sm75-q3-q4-32.sh establishes bounded kernel correctness and
@@ -3203,9 +3264,10 @@ recorded in `exact/verification.txt`.
 # SM75 decode packed-weight profiling
 
 `cuda-sm75-decode-weight-profile.sh` profiles the actual one-token decode
-dispatch for routed Q4-32/Q3A4 gate/up, the distinct packed-Q8 projection
-shapes seen in the 32K production trace, and all observed ordered F16
-compressor-pair widths.  It opens no GGUF and validates exact-zero outputs from
+dispatch for routed Q4-32/Q3A4 gate/up, both Q4-32 down ownership modes, the
+direct native-Q8 producer, the distinct packed-Q8 projection
+shapes seen in the 32K production trace, and all observed fused F16
+compressor-pair/state widths. It opens no GGUF and validates exact-zero outputs from
 synthetic zero weights before collecting one precisely filtered kernel per
 scenario.  The default `NCU_CACHE_CONTROL=all` represents cold per-layer
 weight streams; use `none` only for an explicitly replay-warm L2 comparison.

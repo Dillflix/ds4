@@ -8,10 +8,11 @@ Nsight Compute. No GGUF is opened. Every scenario uses the shipping dispatch,
 a synthetic zero-weight model, and exact-zero output validation.
 
 Captured families:
-  * Q4-32 and Q3A4 routed gate/up;
+  * Q4-32 and Q3A4 routed gate/up plus Q4-32 owned-slots/packed down;
+  * the direct native-Q8 activation producer;
   * every materially distinct packed-Q8 decode access pattern observed in the
     32K production trace (single T32, pair, K-slice, grouped-A, shared-mid);
-  * the 256/512/1024-wide ordered F16 compressor-pair kernels.
+  * the 256/512/1024-wide fused F16 compressor-pair/state kernels.
 
 Optional environment:
   PROFILE_GPU=0
@@ -82,9 +83,9 @@ else
 fi
 [[ -x $target ]] || die "$target is missing; rerun with SKIP_BUILD=0"
 
-routed_scenarios=(q4-32-gate-up q3a4-gate-up)
-q8_scenarios=(q8-single-t32 q8-pair-2048 q8-pair-1024 q8-kslice-t256 q8-grouped-a-half q8-shared-mid)
-f16_scenarios=(f16-pair-256 f16-pair-512 f16-pair-1024)
+routed_scenarios=(q4-32-gate-up q3a4-gate-up q4-32-down-slots-tile32 q4-32-down-packed-tile32)
+q8_scenarios=(q8-native-quantize q8-single-t32 q8-pair-2048 q8-pair-1024 q8-kslice-t256 q8-grouped-a-half q8-shared-mid)
+f16_scenarios=(f16-pair-state-256 f16-pair-state-512 f16-pair-state-1024)
 case "$PROFILE_SET" in
     all) scenarios=("${routed_scenarios[@]}" "${q8_scenarios[@]}" "${f16_scenarios[@]}") ;;
     routed) scenarios=("${routed_scenarios[@]}") ;;
@@ -150,9 +151,11 @@ fi
 
 valid_scenario() {
     case "$1" in
-        q4-32-gate-up|q3a4-gate-up|q8-single-t32|q8-pair-2048|q8-pair-1024|\
+        q4-32-gate-up|q3a4-gate-up|q4-32-down-slots-tile32|\
+        q4-32-down-packed-tile32|q8-native-quantize|q8-single-t32|q8-pair-2048|q8-pair-1024|\
         q8-kslice-t256|q8-grouped-a-half|q8-shared-mid|f16-pair-256|\
-        f16-pair-512|f16-pair-1024) return 0 ;;
+        f16-pair-512|f16-pair-1024|f16-pair-state-256|\
+        f16-pair-state-512|f16-pair-state-1024) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -248,12 +251,16 @@ kernel_regex() {
         # from this symbol. Each scenario launches exactly one specialization,
         # so the harness scenario—not a missing suffix—provides separation.
         q4-32-gate-up|q3a4-gate-up) printf '%s' 'moe_gate_up_mid_decode_sm75_q32_owned_kernel.*' ;;
+        q4-32-down-slots-tile32) printf '%s' 'moe_down_sm75_q4_32_tile32_owned_slots_kernel.*' ;;
+        q4-32-down-packed-tile32) printf '%s' 'moe_down_sm75_q4_32_tile32_owned_packed_kernel.*' ;;
+        q8-native-quantize) printf '%s' 'q8_K_quantize_sm75_native_kernel.*' ;;
         q8-single-t32) printf '%s' 'matmul_q8_0_preq_warp8_kernel.*' ;;
         q8-pair-2048|q8-pair-1024) printf '%s' 'matmul_q8_0_pair_preq_warp8_kernel.*' ;;
         q8-kslice-t256) printf '%s' 'matmul_q8_0_kslice_preq_warp8_kernel.*' ;;
         q8-grouped-a-half) printf '%s' 'grouped_q8_0_a_preq_warp8_kernel.*' ;;
         q8-shared-mid) printf '%s' 'shared_mid_q8_0_preq_warp8_exact_kernel.*' ;;
         f16-pair-256|f16-pair-512|f16-pair-1024) printf '%s' 'matmul_f16_pair_ordered_chunks_kernel.*' ;;
+        f16-pair-state-256|f16-pair-state-512|f16-pair-state-1024) printf '%s' 'matmul_f16_pair_compressor_store_ordered_chunks_kernel.*' ;;
     esac
 }
 

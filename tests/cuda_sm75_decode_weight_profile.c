@@ -85,9 +85,13 @@ typedef enum {
     SCENARIO_Q8_KSLICE_T256,
     SCENARIO_Q8_GROUPED_A_HALF,
     SCENARIO_Q8_SHARED_MID,
+    SCENARIO_Q8_NATIVE_QUANTIZE,
     SCENARIO_F16_PAIR_256,
     SCENARIO_F16_PAIR_512,
     SCENARIO_F16_PAIR_1024,
+    SCENARIO_F16_PAIR_STATE_256,
+    SCENARIO_F16_PAIR_STATE_512,
+    SCENARIO_F16_PAIR_STATE_1024,
 } scenario_kind;
 
 typedef struct {
@@ -236,9 +240,17 @@ static const scenario_spec scenarios[] = {
     { "q8-kslice-t256", "dense-q8-kslice", SCENARIO_Q8_KSLICE_T256 },
     { "q8-grouped-a-half", "dense-q8-grouped-a", SCENARIO_Q8_GROUPED_A_HALF },
     { "q8-shared-mid", "dense-q8-shared", SCENARIO_Q8_SHARED_MID },
+    { "q8-native-quantize", "routed-native-q8-quantize",
+      SCENARIO_Q8_NATIVE_QUANTIZE },
     { "f16-pair-256", "dense-f16-pair", SCENARIO_F16_PAIR_256 },
     { "f16-pair-512", "dense-f16-pair", SCENARIO_F16_PAIR_512 },
     { "f16-pair-1024", "dense-f16-pair", SCENARIO_F16_PAIR_1024 },
+    { "f16-pair-state-256", "dense-f16-pair-state",
+      SCENARIO_F16_PAIR_STATE_256 },
+    { "f16-pair-state-512", "dense-f16-pair-state",
+      SCENARIO_F16_PAIR_STATE_512 },
+    { "f16-pair-state-1024", "dense-f16-pair-state",
+      SCENARIO_F16_PAIR_STATE_1024 },
 };
 
 /* CUDA may host-register the map if a forced device copy cannot be made.  Keep
@@ -964,6 +976,50 @@ cleanup:
     return ok;
 }
 
+static int run_f16_pair_state(uint32_t width) {
+    const uint64_t in_dim = 4096u;
+    const uint32_t ratio = width == 512u ? 128u : 4u;
+    const uint32_t state_rows = ratio == 4u ? 2u * ratio : ratio;
+    uint64_t one_bytes, weights_bytes, ape_bytes, model_bytes;
+    if (!checked_mul(in_dim * width, sizeof(uint16_t), &one_bytes) ||
+        !checked_mul(one_bytes, 2u, &weights_bytes) ||
+        !checked_mul((uint64_t)ratio * width, sizeof(float), &ape_bytes) ||
+        !checked_add(weights_bytes, ape_bytes, &model_bytes) ||
+        !install_zero_model(model_bytes)) return 0;
+    ds4_gpu_tensor *x = input_tensor(in_dim);
+    ds4_gpu_tensor *out0 = zero_tensor(width, sizeof(float));
+    ds4_gpu_tensor *out1 = zero_tensor(width, sizeof(float));
+    ds4_gpu_tensor *state0 = zero_tensor(
+        (uint64_t)state_rows * width, sizeof(float));
+    ds4_gpu_tensor *state1 = zero_tensor(
+        (uint64_t)state_rows * width, sizeof(float));
+    int ok = 0;
+    const int launched = x && out0 && out1 && state0 && state1
+        ? ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+              out0, out1, state0, state1,
+              model_storage, model_bytes, 0u, one_bytes, weights_bytes,
+              0u, in_dim, width, x, ratio, 7u)
+        : -1;
+    if (launched != 1 || !ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "error: fused F16 compressor-pair/state decode launch failed\n");
+        goto cleanup;
+    }
+    ok = verify_zero_tensor(out0, width, "f16-pair-state-out0") &&
+         verify_zero_tensor(out1, width, "f16-pair-state-out1") &&
+         verify_zero_tensor(state0, (uint64_t)state_rows * width,
+                            "f16-pair-state-state0") &&
+         verify_zero_tensor(state1, (uint64_t)state_rows * width,
+                            "f16-pair-state-state1");
+cleanup:
+    ds4_gpu_tensor_free(state1);
+    ds4_gpu_tensor_free(state0);
+    ds4_gpu_tensor_free(out1);
+    ds4_gpu_tensor_free(out0);
+    ds4_gpu_tensor_free(x);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || strcmp(argv[1], "-h") == 0 ||
         strcmp(argv[1], "--help") == 0) {
@@ -987,11 +1043,14 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_SERIAL_F16_MATMUL");
     (void)unsetenv("DS4_CUDA_SERIAL_ROUTER");
     (void)unsetenv("DS4_CUDA_NO_ORDERED_F16_MATMUL");
+    (void)unsetenv("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE");
     (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_GRAPH");
     (void)setenv("DS4_CUDA_NO_MOE_Q32_DECODE_GRAPH", "1", 1);
     (void)unsetenv("DS4_CUDA_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_NO_MOE_Q32_DECODE_FUSED_LOWREG");
     (void)unsetenv("DS4_CUDA_MOE_Q4_32_DECODE_MAPPING");
+    (void)unsetenv("DS4_CUDA_MOE_DIRECT_NATIVE_Q8");
+    (void)unsetenv("DS4_CUDA_NO_MOE_DIRECT_NATIVE_Q8");
     /* Preserve mapping-audit switches supplied by evidence runners.  They
      * only add teardown counters and cannot alter kernel selection. */
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_DECODE_MAPPING");
@@ -1140,9 +1199,17 @@ int main(int argc, char **argv) {
         case SCENARIO_Q8_KSLICE_T256: ok = run_q8_kslice(); break;
         case SCENARIO_Q8_GROUPED_A_HALF: ok = run_q8_grouped_a(); break;
         case SCENARIO_Q8_SHARED_MID: ok = run_q8_shared_mid(); break;
+        case SCENARIO_Q8_NATIVE_QUANTIZE:
+            ok = run_routed_gate_up(0, 0, 0u, 3u, 1u, 0); break;
         case SCENARIO_F16_PAIR_256: ok = run_f16_pair(256u); break;
         case SCENARIO_F16_PAIR_512: ok = run_f16_pair(512u); break;
         case SCENARIO_F16_PAIR_1024: ok = run_f16_pair(1024u); break;
+        case SCENARIO_F16_PAIR_STATE_256:
+            ok = run_f16_pair_state(256u); break;
+        case SCENARIO_F16_PAIR_STATE_512:
+            ok = run_f16_pair_state(512u); break;
+        case SCENARIO_F16_PAIR_STATE_1024:
+            ok = run_f16_pair_state(1024u); break;
     }
     ds4_gpu_cleanup();
     free(model_storage);

@@ -13,6 +13,9 @@ from typing import NoReturn
 SCENARIOS = [
     ("q4-32-gate-up", "routed Q4-32 gate/up", 25.5),
     ("q3a4-gate-up", "routed Q3A4 gate/up", 20.25),
+    ("q4-32-down-slots-tile32", "routed Q4-32 down owned slots", 12.75),
+    ("q4-32-down-packed-tile32", "routed Q4-32 down owned packed", 12.75),
+    ("q8-native-quantize", "routed direct native Q8 quantize", 0.0),
     ("q8-single-t32", "dense Q8 single T32", 34.0),
     ("q8-pair-2048", "dense Q8 pair 2048", 34.0),
     ("q8-pair-1024", "dense Q8 pair 1024", 17.0),
@@ -22,6 +25,9 @@ SCENARIOS = [
     ("f16-pair-256", "F16 compressor pair 256", 4.0),
     ("f16-pair-512", "F16 compressor pair 512", 8.0),
     ("f16-pair-1024", "F16 compressor pair 1024", 16.0),
+    ("f16-pair-state-256", "F16 compressor/state fused 256", 4.0),
+    ("f16-pair-state-512", "F16 compressor/state fused 512", 8.0),
+    ("f16-pair-state-1024", "F16 compressor/state fused 1024", 16.0),
 ]
 
 CORE_METRICS = [
