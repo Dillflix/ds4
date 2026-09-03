@@ -23,7 +23,7 @@ STAGE_SPLIT=${STAGE_SPLIT:-22}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
 TG_TOKENS=${TG_TOKENS:-256}
 MTP_MARGIN=${MTP_MARGIN:-3}
-REPEATS=${REPEATS:-3}
+REPEATS=${REPEATS:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 PREFILL_CHUNK=2048
@@ -561,31 +561,30 @@ validate_telemetry() {
         }
         NR==1 {next}
         {
-            ts=$1
             for (i=2; i<=NF; i++) {
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
             }
             idx=$2
+            sample=int(records/4)
             if (idx ~ /^[0-3]$/) {
                 per_gpu[idx]++
-                seen[ts,idx]=1
-                timestamps[ts]=1
+                sample_seen[sample,idx]++
                 if (tolower($3)!=expected_bus[idx] ||
                     ($6+0)!=(required_power[idx+1]+0)) bad=1
             } else {
                 bad=1
             }
+            records++
         }
         END {
-            complete=0
-            for (ts in timestamps) {
-                ok=1
-                for (i=0; i<4; i++) if (!seen[ts,i]) ok=0
-                if (ok) complete++
+            if (expected_count!=4 || bad || records<8 || (records%4)!=0) exit 1
+            samples=records/4
+            for (sample=0; sample<samples; sample++) {
+                for (i=0; i<4; i++) {
+                    if (sample_seen[sample,i]!=1) exit 1
+                }
             }
-            if (expected_count!=4 || bad) exit 1
-            for (i=0; i<4; i++) if (per_gpu[i]<2) exit 1
-            if (complete<2) exit 1
+            for (i=0; i<4; i++) if (per_gpu[i]!=samples) exit 1
         }
     ' "$csv"
 }

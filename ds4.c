@@ -17034,10 +17034,6 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
                    : ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
 }
 
-static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
-}
-
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================

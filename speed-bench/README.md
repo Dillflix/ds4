@@ -4872,8 +4872,10 @@ was effectively neutral (-0.312% to +0.058%) at the longer prompt frontiers.
 the optional legacy DeepSeek Flash MTP support model. For each selected main
 model it runs the fixed PP512/4096/32768 greedy-decode matrix three ways:
 ordinary decode with no support model, support-model residency at draft depth
-1, and strict-exact MTP at draft depth 2. Clean timing defaults to three
-Latin-rotated repeats so every variant occupies every run position once. One
+1, and strict-exact MTP at draft depth 2. The first invocation defaults to one
+preliminary pass. After that pass works end to end and reports useful acceptance
+at all three frontiers, set `REPEATS=3` for a Latin-rotated qualification in
+which every variant occupies every run position once. One
 separate MTP diagnostic arm records detailed timing and acceptance events but
 is excluded from the speed table; per-dispatch indexer and decode-mapping audit
 instrumentation is enabled only in that diagnostic arm. The harness requires
@@ -4903,14 +4905,15 @@ PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
 MODEL_LAYOUT=both \
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
-TG_TOKENS=256 MTP_MARGIN=3 REPEATS=3 \
+TG_TOKENS=256 MTP_MARGIN=3 REPEATS=1 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-mtp-production-ab.sh
 ```
 
 Use `MODEL_LAYOUT=mixed15` or `MODEL_LAYOUT=all43` for a single-model run.
 `MTP_MODEL` may instead point at the same support GGUF under `gguf/ds4/`.
-`REPEATS=1` is useful only for a preliminary smoke; production qualification
-uses the default three-repeat rotation, and any larger qualification count must
-be a multiple of three. `TG_TOKENS` is fixed at 256. `SKIP_BUILD=1` is
+`REPEATS=1` is the default preliminary smoke. After it passes and demonstrates
+useful end-to-end acceptance, production qualification uses `REPEATS=3`; any
+larger qualification count must be a multiple of three. `TG_TOKENS` is fixed at
+256. `SKIP_BUILD=1` is
 intentionally rejected.
