@@ -4816,3 +4816,52 @@ REPEAT_LEVELS=1,64,256,512,1536 \
 SKIP_BUILD=0 \
 bash ./speed-bench/cuda-sm75-p2p-direction-audit.sh
 ```
+
+# SM75 compressor projection/state-store fusion (synthetic qualification)
+
+`cuda-sm75-compressor-state-fusion.sh` compares the diagnostic one-token
+paired-F16 projection/state-store kernel with the shipping ordered paired-F16
+projection followed by `compressor_store`.  It covers attention and indexer
+widths, ratio-4 and ratio-128 intermediate/emit/wrap phases, F16 and F32 APE,
+destination canaries, runtime occupancy/resources, per-symbol PTXAS/SASS, and
+selected Compute Sanitizer cases.
+
+```bash
+PROFILE_GPU=0 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-state-fusion.sh
+```
+
+This remains useful as bounded kernel evidence. The fusion is now enabled by
+default after exact four-GPU mixed15/all43 qualification. Set
+`DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE=1` for the retained reference
+rollback path.
+
+### SM75 compressor projection/state-store production A/B
+
+`cuda-sm75-compressor-state-production-ab.sh` runs a one-repeat, one-shot
+four-GPU **decode** A/B for the exact fused compressor pair projection and
+recurrent-state append. It covers the mixed15 and all43 models at the 512, 4096,
+and 32768 prompt frontiers, requires the stable 22/21 topology, proves decode
+dispatch of all three production widths, and requires byte-identical logits for
+every checked decode token before accepting the result. A prefill-only run
+cannot exercise this one-token fusion. The script deliberately has no resume
+mode because a GPU-loss run must be restarted from a clean host state.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compressor-state-production-ab.sh
+```
+
+The accepted production run was byte-exact for 16 decode tokens at PP512,
+PP4096, and PP32768 on both models. All43 improved by 0.410% to 0.743%; mixed15
+was effectively neutral (-0.312% to +0.058%) at the longer prompt frontiers.

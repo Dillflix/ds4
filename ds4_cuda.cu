@@ -228,6 +228,15 @@ static std::atomic<uint64_t> g_moe_q3a4_decode_mapping_calls[4] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_ksplit_calls[3] = {};
 static std::atomic<uint64_t> g_moe_q3a4_decode_prefetch_calls[3] = {};
 static std::atomic<bool> g_cuda_moe_q3a4_decode_mapping_logged = false;
+/* SM75 compressor projection/state-store fusion. Enabled by default after
+ * exact four-GPU mixed15/all43 qualification. Environment selectors are
+ * sampled once during CUDA initialization, never per token. */
+static int g_cuda_compressor_pair_state_store;
+static int g_cuda_compressor_pair_state_store_disabled;
+static int g_cuda_compressor_pair_state_store_incompatible;
+static int g_cuda_compressor_pair_state_store_audit;
+static std::atomic<uint64_t> g_cuda_compressor_pair_state_store_calls[3] = {};
+static std::atomic<bool> g_cuda_compressor_pair_state_store_logged[3] = {};
 /* Q4-32 down tile32 packed-INT4 is the SM75 tagged-layout production default.
  * The former quarter-warp scalar kernel remains an explicit fallback. */
 enum cuda_moe_q4_32_down_decode_mapping {
@@ -444,6 +453,20 @@ static void routed_moe_decode_q32_graph_destroy_one(int logical_tier);
  * process. */
 extern "C" void ds4_gpu_test_set_moe_q32_decode_graph(int enabled) {
     g_cuda_moe_q32_decode_graph = enabled != 0;
+}
+
+extern "C" void ds4_gpu_test_set_compressor_pair_state_store(int enabled) {
+    g_cuda_compressor_pair_state_store = enabled != 0;
+}
+
+extern "C" void ds4_gpu_test_set_compressor_pair_state_store_disabled(
+        int disabled) {
+    g_cuda_compressor_pair_state_store_disabled = disabled != 0;
+}
+
+extern "C" void ds4_gpu_test_set_compressor_pair_state_store_reference(
+        int reference) {
+    g_cuda_compressor_pair_state_store_incompatible = reference != 0;
 }
 
 extern "C" void ds4_gpu_test_set_moe_q32_decode_split(int enabled) {
@@ -678,6 +701,21 @@ static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_no_top1 = getenv("DS4_CUDA_NO_TOP1") != NULL;
     g_cuda_end_stream_sync = getenv("DS4_CUDA_END_STREAM_SYNC") != NULL;
     g_cuda_no_setdevice_cache = getenv("DS4_CUDA_NO_SETDEVICE_CACHE") != NULL;
+    g_cuda_compressor_pair_state_store_disabled =
+        getenv("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_STATE_STORE") != NULL;
+    g_cuda_compressor_pair_state_store =
+        !g_cuda_compressor_pair_state_store_disabled;
+    g_cuda_compressor_pair_state_store_audit =
+        getenv("DS4_CUDA_COMPRESSOR_PAIR_STATE_STORE_AUDIT") != NULL;
+    for (unsigned i = 0; i < 3u; ++i) {
+        g_cuda_compressor_pair_state_store_calls[i].store(0u);
+        g_cuda_compressor_pair_state_store_logged[i].store(false);
+    }
+    g_cuda_compressor_pair_state_store_incompatible =
+        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
+        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL;
     g_cuda_exact_score_split_graph =
         getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL;
     g_cuda_exact_score_split_ldg =
@@ -8205,6 +8243,69 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         }
         if (row < out0_dim) out0[row] = total0;
         if (row < out1_dim) out1[row] = total1;
+    }
+}
+
+/* One-token compressor projection with the recurrent-state append performed
+ * by the same CTA.  The paired dot products and lane-0 reduction are kept
+ * byte-for-byte identical to matmul_f16_pair_ordered_chunks_kernel; only the
+ * otherwise separate compressor_store_kernel launch is removed. */
+__global__ static void matmul_f16_pair_compressor_store_ordered_chunks_kernel(
+        float *out_kv,
+        float *out_score,
+        float *state_kv,
+        float *state_score,
+        const __half *weight_kv,
+        const __half *weight_score,
+        const float *x,
+        const void *ape,
+        uint32_t ape_type,
+        uint64_t in_dim,
+        uint32_t width,
+        uint32_t ratio,
+        uint32_t pos) {
+    const uint32_t row = blockIdx.x;
+    if (row >= width) return;
+
+    __shared__ float partial_kv[32];
+    __shared__ float partial_score[32];
+    const uint32_t tid = threadIdx.x;
+    float sum_kv = 0.0f;
+    float sum_score = 0.0f;
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wkv = weight_kv + (uint64_t)row * in_dim;
+    const __half *wscore = weight_score + (uint64_t)row * in_dim;
+    for (uint64_t i = k0; i < k1; i++) {
+        const float xv = x[i];
+        sum_kv += __half2float(wkv[i]) * xv;
+        sum_score += __half2float(wscore[i]) * xv;
+    }
+    partial_kv[tid] = sum_kv;
+    partial_score[tid] = sum_score;
+    __syncthreads();
+
+    if (tid == 0u) {
+        float total_kv = 0.0f;
+        float total_score = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) {
+            total_kv += partial_kv[i];
+            total_score += partial_score[i];
+        }
+        out_kv[row] = total_kv;
+        out_score[row] = total_score;
+
+        const uint32_t pos_mod = pos % ratio;
+        const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+        const uint64_t dst = (uint64_t)dst_row * width + row;
+        const uint64_t ape_i = (uint64_t)pos_mod * width + row;
+        const float ape_v = ape_type == 1u
+            ? __half2float(((const __half *)ape)[ape_i])
+            : ((const float *)ape)[ape_i];
+        state_kv[dst] = total_kv;
+        state_score[dst] = total_score + ape_v;
     }
 }
 
@@ -21037,22 +21138,108 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         const ds4_gpu_tensor *x,
         uint32_t ratio,
         uint32_t pos) {
-    (void)out_kv;
-    (void)out_score;
-    (void)state_kv;
-    (void)state_score;
-    (void)model_map;
-    (void)model_size;
-    (void)weight_kv_offset;
-    (void)weight_score_offset;
-    (void)ape_offset;
-    (void)ape_type;
-    (void)in_dim;
-    (void)width;
-    (void)x;
-    (void)ratio;
-    (void)pos;
-    return 0;
+    if (!g_cuda_compressor_pair_state_store ||
+        g_cuda_compressor_pair_state_store_disabled ||
+        g_cuda_compressor_pair_state_store_incompatible) {
+        return 0;
+    }
+    if (!out_kv || !out_score || !state_kv || !state_score || !model_map || !x ||
+        in_dim == 0u || width == 0u || ratio == 0u ||
+        (ape_type != 0u && ape_type != 1u)) {
+        return -1;
+    }
+    if (in_dim != 4096u ||
+        !((width == 256u && ratio == 4u) ||
+          (width == 512u && ratio == 128u) ||
+          (width == 1024u && ratio == 4u))) {
+        return 0;
+    }
+    if (weight_kv_offset > model_size || weight_score_offset > model_size ||
+        width > UINT64_MAX / in_dim) {
+        return -1;
+    }
+    const uint64_t weight_bytes = (uint64_t)width * in_dim * sizeof(uint16_t);
+    const uint64_t ape_elem = ape_type == 1u ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)ratio * width * ape_elem;
+    const uint32_t state_rows = ratio == 4u ? 2u * ratio : ratio;
+    const uint64_t out_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    if (weight_bytes > model_size - weight_kv_offset ||
+        weight_bytes > model_size - weight_score_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        x->bytes < in_dim * sizeof(float) ||
+        out_kv->bytes < out_bytes || out_score->bytes < out_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        return -1;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out_kv);
+    if (ds4_tensor_device_idx(out_score) != logical_tier ||
+        ds4_tensor_device_idx(state_kv) != logical_tier ||
+        ds4_tensor_device_idx(state_score) != logical_tier ||
+        ds4_tensor_device_idx(x) != logical_tier) {
+        return 0;
+    }
+    const __half *weight_kv = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight_kv_offset, weight_bytes, logical_tier,
+            "f16 compressor kv");
+    const __half *weight_score = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight_score_offset, weight_bytes, logical_tier,
+            "f16 compressor score");
+    const char *ape = cuda_resolve_weight_ptr(
+            model_map, ape_offset, ape_bytes, logical_tier, "compressor ape");
+    if (!weight_kv || !weight_score || !ape) return -1;
+
+    matmul_f16_pair_compressor_store_ordered_chunks_kernel<<<width, 32>>>(
+            (float *)out_kv->ptr,
+            (float *)out_score->ptr,
+            (float *)state_kv->ptr,
+            (float *)state_score->ptr,
+            weight_kv,
+            weight_score,
+            (const float *)x->ptr,
+            ape,
+            ape_type,
+            in_dim,
+            width,
+            ratio,
+            pos);
+    if (!cuda_ok(cudaGetLastError(),
+                 "f16 compressor pair projection/state-store launch")) {
+        return -1;
+    }
+    const unsigned shape = width == 256u ? 0u : (width == 512u ? 1u : 2u);
+    const uint64_t call =
+        g_cuda_compressor_pair_state_store_calls[shape].fetch_add(1u) + 1u;
+    if (g_cuda_compressor_pair_state_store_audit &&
+        !g_cuda_compressor_pair_state_store_logged[shape].exchange(true)) {
+        fprintf(stderr,
+                "ds4: SM75 compressor pair/state fusion selected "
+                "width=%u ratio=%u first_call=%llu\n",
+                width, ratio, (unsigned long long)call);
+    }
+    return 1;
+}
+
+/* Internal evidence API; intentionally absent from the public backend header. */
+extern "C" int ds4_gpu_test_compressor_pair_state_store_resources(
+        int *registers, int *static_shared_bytes, int *local_bytes,
+        int *max_threads_per_block, int *active_blocks_per_sm) {
+    if (!registers || !static_shared_bytes || !local_bytes ||
+        !max_threads_per_block || !active_blocks_per_sm) return 0;
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(
+            &attr, matmul_f16_pair_compressor_store_ordered_chunks_kernel) !=
+        cudaSuccess) return 0;
+    int active = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &active, matmul_f16_pair_compressor_store_ordered_chunks_kernel,
+            32, 0) != cudaSuccess) return 0;
+    *registers = attr.numRegs;
+    *static_shared_bytes = (int)attr.sharedSizeBytes;
+    *local_bytes = (int)attr.localSizeBytes;
+    *max_threads_per_block = attr.maxThreadsPerBlock;
+    *active_blocks_per_sm = active;
+    return 1;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

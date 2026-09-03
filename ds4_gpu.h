@@ -848,7 +848,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Optional Metal decode fusion. Returns 1 when the paired projection and
+/* Optional accelerator decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
  * is unavailable, and -1 on an attempted-path error. */
 int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
