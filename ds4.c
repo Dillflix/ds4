@@ -30220,12 +30220,15 @@ attention_rows_cleanup:
 static bool metal_graph_cuda_tp_prefill_attention_output(
         ds4_gpu_graph *g, const ds4_model *model,
         const ds4_layer_weights *layer, uint32_t n_tokens,
-        uint32_t group_dim, uint32_t rank, uint32_t n_groups) {
+        uint32_t group_dim, uint32_t rank, uint32_t n_groups,
+        bool *result_f16) {
 #if defined(__APPLE__) || defined(DS4_NO_GPU)
     (void)g; (void)model; (void)layer; (void)n_tokens;
     (void)group_dim; (void)rank; (void)n_groups;
+    if (result_f16) *result_f16 = false;
     return false;
 #else
+    if (result_f16) *result_f16 = false;
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
     const uint32_t half_groups = n_groups / 2u;
@@ -30259,12 +30262,21 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
                 n_tokens, half_low) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_b_tensor(
-                g->batch_attn_out_by_tier[home],
-                model->map, model->size,
+        const bool f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(
+                g->batch_attn_out_by_tier[home], model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_total, DS4_N_EMBD,
                 g->batch_q_by_tier[home], n_tokens) != 0;
+        if (f16) {
+            if (result_f16) *result_f16 = true;
+        } else {
+            ok = ds4_gpu_attention_output_q8_batch_b_tensor(
+                    g->batch_attn_out_by_tier[home],
+                    model->map, model->size,
+                    layer->attn_output_b->abs_offset,
+                    low_total, DS4_N_EMBD,
+                    g->batch_q_by_tier[home], n_tokens) != 0;
+        }
     }
     return ok;
 #endif
@@ -32005,7 +32017,8 @@ static bool metal_graph_encode_layer_attention_batch(
     bool cuda_tp_attn_output_done = false;
     if (ok && cuda_tp_prefill_heads_done) {
         ok = metal_graph_cuda_tp_prefill_attention_output(
-                g, model, layer, n_tokens, group_dim, rank, n_groups);
+                g, model, layer, n_tokens, group_dim, rank, n_groups,
+                &attn_out_f16);
         cuda_tp_attn_output_done = ok;
     }
     if (ok &&
@@ -32015,7 +32028,7 @@ static bool metal_graph_encode_layer_attention_batch(
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_directional_steering_attn_enabled(g)) {
-        attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
+        attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(metal_graph_batch_attn_out(g),
                                                                     metal_graph_batch_attn_low(g),
                                                                     model->map,
                                                                     model->size,
@@ -32155,7 +32168,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     if (ok && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
-                                                 g->batch_q_half,
+                                                 metal_graph_batch_attn_out(g),
                                                  metal_graph_batch_cur_hc(g),
                                                  hc_split_view,
                                                  DS4_N_EMBD,

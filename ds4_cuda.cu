@@ -1495,6 +1495,8 @@ static std::atomic<uint64_t>
     g_q8_f16_partner_pre_activation_fence_last_sequence[DS4_MAX_GPUS] = {};
 static std::atomic<uint64_t> g_t32_f16_fused_local_calls = 0;
 static std::atomic<uint64_t> g_t32_f16_fused_partner_calls = 0;
+static std::atomic<uint64_t> g_t256_f16_final_local_calls = 0;
+static std::atomic<uint64_t> g_t256_f16_final_partner_calls = 0;
 
 struct cuda_q8_audit_record {
     uint64_t sequence;
@@ -2184,6 +2186,8 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_f16_partner_phase_audit_max_occurrences = 0u;
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
+    g_t256_f16_final_local_calls.store(0, std::memory_order_relaxed);
+    g_t256_f16_final_partner_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_direct_xq_calls.store(
@@ -5523,6 +5527,16 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)t32_fused_local,
                 (unsigned long long)t32_fused_partner);
     }
+    const uint64_t t256_final_local =
+        g_t256_f16_final_local_calls.load(std::memory_order_relaxed);
+    const uint64_t t256_final_partner =
+        g_t256_f16_final_partner_calls.load(std::memory_order_relaxed);
+    if (t256_final_local != 0u || t256_final_partner != 0u) {
+        fprintf(stderr,
+                "ds4: CUDA T256 f16-final summary: local=%llu partner=%llu\n",
+                (unsigned long long)t256_final_local,
+                (unsigned long long)t256_final_partner);
+    }
     const uint64_t compressor_staged_256 =
         g_cuda_compressor_projection_staged_calls[0].load(
             std::memory_order_relaxed);
@@ -8057,6 +8071,8 @@ extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
     g_q8_f16_partner_phase_audit_max_occurrences = 0u;
     g_t32_f16_fused_local_calls.store(0, std::memory_order_relaxed);
     g_t32_f16_fused_partner_calls.store(0, std::memory_order_relaxed);
+    g_t256_f16_final_local_calls.store(0, std::memory_order_relaxed);
+    g_t256_f16_final_partner_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_direct_xq_calls.store(
@@ -15473,6 +15489,43 @@ __global__ static void hc_expand_kernel(
         acc += comb_v * res_v;
     }
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+}
+
+/* Identical HC expansion arithmetic with an FP16 block result.  The only
+ * intentional numerical change is the conversion performed by the output-B
+ * GEMM before this kernel; every multiply/add below retains the shipping
+ * FP32 order. */
+__global__ static void hc_expand_half_kernel(
+        float *out_hc,
+        const __half *block_out,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    const uint32_t d = gid % n_embd;
+    const uint64_t tmp = gid / n_embd;
+    const uint32_t dst_hc = tmp % n_hc;
+    const uint32_t t = tmp / n_hc;
+
+    const float block_v = __half2float(
+        block_out[(uint64_t)t * n_embd + d]);
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+        const float comb_v = comb[(uint64_t)t * comb_stride + dst_hc +
+                                  (uint64_t)src_hc * n_hc];
+        const float res_v = residual_hc[(uint64_t)t * n_hc * n_embd +
+                                        (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    out_hc[(uint64_t)t * n_hc * n_embd +
+           (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
 __global__ static void hc_split_weighted_sum_fused_kernel(
@@ -39999,9 +40052,90 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
-    (void)out_h; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    return 0;
+    /* Keep this candidate confined to the production T256 attention-output B
+     * shape until four-GPU A/B evidence qualifies it.  In particular, do not
+     * silently enable the other dormant callers of this generic API. */
+    if (!cuda_env_flag_enabled("DS4_CUDA_T256_F16_FINAL", 0) ||
+        getenv("DS4_CUDA_NO_T256_F16_FINAL") != NULL ||
+        !g_cublas_ready || !out_h || !x || !model_map ||
+        in_dim != 2048u || out_dim != 4096u || n_tok < 8u ||
+        in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (out_dim > UINT64_MAX / (blocks * 34u)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim ||
+        n_tok * out_dim > UINT64_MAX / sizeof(__half) ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out_h->bytes < n_tok * out_dim * sizeof(__half)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out_h);
+    if (logical_tier != ds4_tensor_device_idx(x)) return 0;
+    const int physical_device =
+        (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
+            ? g_gpu[logical_tier].device_id : 0;
+    cuda_q8_f16_binding *partner_binding =
+        cuda_q8_f16_runtime_partner_binding(
+            model_map, weight_offset, weight_bytes, in_dim, out_dim,
+            physical_device);
+    const __half *w_f16 = cuda_q8_f16_ptr_impl(
+        model_map, weight_offset, weight_bytes, in_dim, out_dim,
+        physical_device, "attn_output_b_f16_final", 0, NULL,
+        partner_binding ? 0 : 1);
+    bool partner_projected = false;
+    if (w_f16) {
+        const uint64_t xh_count = n_tok * in_dim;
+        __half *xh = (__half *)cuda_tmp_alloc_on(
+            logical_tier, xh_count * sizeof(__half),
+            "T256 f16-final activations");
+        if (!xh) return 0;
+        f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
+            xh, (const float *)x->ptr, xh_count);
+        if (!cuda_ok(cudaGetLastError(),
+                     "T256 f16-final activation convert launch")) return 0;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const cublasStatus_t st = cublasGemmEx(
+            cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+            w_f16, CUDA_R_16F, (int)in_dim,
+            xh, CUDA_R_16F, (int)in_dim, &beta,
+            out_h->ptr, CUDA_R_16F, (int)out_dim,
+            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) return 0;
+        cuda_q8_f16_binding_mark_used(
+            model_map, weight_offset, weight_bytes, in_dim, out_dim,
+            physical_device, physical_device);
+    } else {
+        if (!partner_binding) return 0;
+        const int rc = cuda_q8_f16_partner_matmul_impl(
+            out_h, x, model_map, weight_offset, weight_bytes,
+            in_dim, out_dim, n_tok, logical_tier, physical_device,
+            "attn_output_b_f16_final", 1);
+        if (rc <= 0) return 0;
+        partner_projected = true;
+    }
+    if (partner_projected) {
+        g_t256_f16_final_partner_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        g_t256_f16_final_local_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    static std::atomic<uint32_t> logged{0u};
+    if (logged.exchange(1u, std::memory_order_relaxed) == 0u) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final attention result enabled "
+                "(2048->4096, fused HC consumer)\n");
+        fflush(stderr);
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
@@ -40203,10 +40337,26 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         uint64_t out_a_offset, uint64_t out_b_offset,
         uint64_t group_dim, uint64_t rank, uint32_t n_groups,
         uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
-    (void)out_h; (void)low; (void)model_map; (void)model_size;
-    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
-    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    return 0;
+    if (!out_h || !low || !heads || !model_map || group_dim == 0u ||
+        rank == 0u || n_groups == 0u || out_dim == 0u || n_tokens == 0u) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (low_dim != 2048u || out_dim != 4096u ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim *
+                           sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
+        out_h->bytes < (uint64_t)n_tokens * out_dim * sizeof(__half)) {
+        return 0;
+    }
+    if (!ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+            low, model_map, model_size, out_a_offset, group_dim, rank,
+            n_groups, 0u, n_groups, heads, n_tokens)) {
+        return 0;
+    }
+    return ds4_gpu_matmul_q8_0_f16_out_tensor(
+        out_h, model_map, model_size, out_b_offset, low_dim, out_dim,
+        low, n_tokens);
 }
 
 extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
@@ -40238,9 +40388,30 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h,
         const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
         uint32_t n_embd, uint32_t n_hc) {
-    (void)out_hc; (void)block_out_h; (void)residual_hc; (void)split;
-    (void)n_embd; (void)n_hc;
-    return 0;
+    if (!out_hc || !block_out_h || !residual_hc || !split ||
+        n_embd == 0u || n_hc == 0u) return 0;
+    const uint64_t hc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (hc_row_bytes == 0u || out_hc->bytes % hc_row_bytes != 0u) return 0;
+    const uint64_t n_tokens64 = out_hc->bytes / hc_row_bytes;
+    if (n_tokens64 == 0u || n_tokens64 > UINT32_MAX ||
+        block_out_h->bytes < n_tokens64 * n_embd * sizeof(__half) ||
+        residual_hc->bytes < out_hc->bytes ||
+        split->bytes < n_tokens64 *
+            (2u * n_hc + (uint64_t)n_hc * n_hc) * sizeof(float) ||
+        ds4_tensor_device_idx(out_hc) != ds4_tensor_device_idx(block_out_h) ||
+        ds4_tensor_device_idx(out_hc) != ds4_tensor_device_idx(residual_hc) ||
+        ds4_tensor_device_idx(out_hc) != ds4_tensor_device_idx(split)) {
+        return 0;
+    }
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    const uint64_t n_elem = n_tokens64 * n_hc * n_embd;
+    const float *base = (const float *)split->ptr;
+    hc_expand_half_kernel<<<(n_elem + 255u) / 256u, 256>>>(
+        (float *)out_hc->ptr, (const __half *)block_out_h->ptr,
+        (const float *)residual_hc->ptr, base + n_hc,
+        base + 2u * n_hc, n_embd, n_hc, n_tokens, mix_hc, mix_hc);
+    return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
 }
 
 extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(

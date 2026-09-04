@@ -5274,3 +5274,13 @@ TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 ```
+# T256 FP16 final-result production A/B
+
+`cuda-sm75-t256-f16-final-production-ab.sh` compares the shipping FP32
+attention-output B boundary with an opt-in FP16 result written by the same
+cached-F16/partner GEMM and consumed directly by HC expansion.  It preserves
+the accepted pair-0 suppression and pair-1 prefill attention split, exercises
+both `mixed15` and `all43`, and holds the accepted 22/21 placement fixed. The
+candidate selector is `DS4_CUDA_T256_F16_FINAL=1`; it remains off by default
+pending four-GPU performance and quality evidence. The separate 21/22
+placement qualification follows this result-boundary decision.
