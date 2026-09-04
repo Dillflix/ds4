@@ -20,15 +20,20 @@ Optional environment:
   GPU_VRAM=auto
   STAGE_SPLIT=22
   REQUIRED_POWER_LIMITS_W=250,260,250,250
+  VARIANTS=control,candidate  comma-separated subset/order of:
+                              control,candidate,native-q8-transfer,
+                              compact-routed-slots,attention-row-tile16,
+                              fused-indexer-selection
   REPEATS=1
   CASE_TIMEOUT_SECONDS=900
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   PREFILL_NATIVE_PIPELINE_AB_DIR=...
 
-Both arms retain the stable topology: pair-0 attention row splitting disabled,
-pair-1 enabled. The candidate changes only the four independently rollbackable
-native-prefill selectors above. Frontier logits must be byte-identical.
+Every arm retains the stable topology: pair-0 attention row splitting disabled,
+pair-1 enabled. `candidate` enables all four independently rollbackable
+native-prefill selectors; the individually named arms enable exactly one.
+Frontier logits must be byte-identical to `control`.
 EOF
 }
 
@@ -51,6 +56,7 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
+VARIANTS=${VARIANTS:-control,candidate}
 REPEATS=${REPEATS:-1}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-900}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -74,6 +80,22 @@ for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+IFS=, read -r -a requested_variants <<<"$VARIANTS"
+(( ${#requested_variants[@]} >= 2 )) ||
+    die "VARIANTS must contain control and at least one candidate arm"
+declare -A variant_seen=()
+has_control=0
+for variant in "${requested_variants[@]}"; do
+    case "$variant" in
+        control) has_control=1 ;;
+        candidate|native-q8-transfer|compact-routed-slots|attention-row-tile16|fused-indexer-selection) ;;
+        *) die "unknown VARIANTS arm: ${variant:-<empty>}" ;;
+    esac
+    [[ -z ${variant_seen[$variant]+x} ]] ||
+        die "VARIANTS contains duplicate arm: $variant"
+    variant_seen[$variant]=1
+done
+(( has_control )) || die "VARIANTS must include control"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
 for tool in awk basename cmp date dirname env find git grep make mkdir mv nproc \
@@ -182,7 +204,7 @@ capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
     printf 'gpu_devices=%s\nstage_split=22/21\ncontext=32768\nrepeats=%s\n' \
         "$GPU_DEVICES" "$REPEATS"
     printf 'pair0_attention_rows=disabled\npair1_attention_rows=enabled\n'
-    printf 'candidate=native-q8-transfer,compact-routed-slots,attention-row-tile16,fused-indexer-selection\n'
+    printf 'variants=%s\n' "$VARIANTS"
     cat "$OUTPUT_DIR/initial-gpu.csv"
     printf '\ntopology:\n'
     nvidia-smi topo -m
@@ -201,8 +223,45 @@ production_env=(
     DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0
 )
 
+set_selector_flags() {
+    native_q8=0
+    compact_slots=0
+    row_tile16=0
+    fused_indexer=0
+    case "$1" in
+        control) ;;
+        candidate)
+            native_q8=1
+            compact_slots=1
+            row_tile16=1
+            fused_indexer=1
+            ;;
+        native-q8-transfer) native_q8=1 ;;
+        compact-routed-slots) compact_slots=1 ;;
+        attention-row-tile16) row_tile16=1 ;;
+        fused-indexer-selection) fused_indexer=1 ;;
+    esac
+}
+
+validate_selector_marker() {
+    local expected=$1 marker=$2 log=$3
+    if [[ $expected == 1 ]]; then
+        grep -Fq "$marker" "$log" || {
+            printf 'validation: enabled selector marker missing: %s\n' \
+                "$marker" >&2
+            return 1
+        }
+    else
+        ! grep -Fq "$marker" "$log" || {
+            printf 'validation: disabled selector marker present: %s\n' \
+                "$marker" >&2
+            return 1
+        }
+    fi
+}
+
 validate_log() {
-    local variant=$1 log=$2 marker
+    local log=$1 marker
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   'dense-placement=stage-aware-fixed-22-21' \
                   'materialized 344/344 candidates'; do
@@ -214,30 +273,32 @@ validate_log() {
     ! grep -Fq 'required but unavailable' "$log" || return 1
     ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
     grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
-    if [[ $variant == candidate ]]; then
-        for marker in \
-            'SM75 shared native Q8 routed activation selected' \
-            'SM75 compact owner-local routed slots selected' \
-            'SM75 fused indexer selection/index-order selected' \
-            'SM75 indexed prefill attention row tile16 selected'; do
-            grep -Fq "$marker" "$log" || {
-                printf 'validation: candidate marker missing: %s\n' "$marker" >&2
-                return 1
-            }
-        done
-    else
-        ! grep -Eq 'shared native Q8 routed activation selected|compact owner-local routed slots selected|fused indexer selection/index-order selected|indexed prefill attention row tile16 selected' "$log"
-    fi
+    validate_selector_marker "$native_q8" \
+        'SM75 shared native Q8 routed activation selected' "$log" || return 1
+    validate_selector_marker "$native_q8" \
+        'SM75 direct native Q8 producer selected' "$log" || return 1
+    validate_selector_marker "$compact_slots" \
+        'SM75 compact owner-local routed slots selected' "$log" || return 1
+    validate_selector_marker "$fused_indexer" \
+        'SM75 fused indexer selection/index-order selected' "$log" || return 1
+    validate_selector_marker "$row_tile16" \
+        'SM75 indexed prefill attention row tile16 selected' "$log" || return 1
 }
 
 phase=production-ab
 printf 'repeat,slot,variant,csv,log,logits\n' >"$OUTPUT_DIR/runs/index.csv"
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
-    if (( repeat % 2 )); then variants=(control candidate); else variants=(candidate control); fi
+    variants=("${requested_variants[@]}")
+    if (( repeat % 2 == 0 )); then
+        variants=()
+        for ((i=${#requested_variants[@]}-1; i>=0; i--)); do
+            variants+=("${requested_variants[i]}")
+        done
+    fi
     slot=0
     for variant in "${variants[@]}"; do
         slot=$((slot + 1))
-        enabled=0; [[ $variant == candidate ]] && enabled=1
+        set_selector_flags "$variant"
         base="$OUTPUT_DIR/runs/r${repeat}-s${slot}-$variant"
         logits="$base-logits"
         mkdir -p "$logits"
@@ -246,10 +307,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
         capture_gpu_health "$base.pre-gpu.csv" || die "pre-run GPU health capture failed"
         set +e
         "${production_env[@]}" \
-            "DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER=$enabled" \
-            "DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS=$enabled" \
-            "DS4_CUDA_PREFILL_ATTN_ROW_TILE16=$enabled" \
-            "DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION=$enabled" \
+            "DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER=$native_q8" \
+            "DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS=$compact_slots" \
+            "DS4_CUDA_PREFILL_ATTN_ROW_TILE16=$row_tile16" \
+            "DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION=$fused_indexer" \
             timeout --signal=INT --kill-after=30s "${CASE_TIMEOUT_SECONDS}s" \
             stdbuf -oL -eL ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
@@ -270,7 +331,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv" ||
             die "GPU identity or power limits changed during $variant"
         [[ -s $base.csv ]] || die "$variant omitted benchmark CSV"
-        validate_log "$variant" "$base.log" || die "$variant production validation failed"
+        validate_log "$base.log" || die "$variant production validation failed"
         awk -F, 'NR>1 && $1==32768 && ($3+0)>0 {ok=1} END {exit !ok}' \
             "$base.csv" || die "$variant omitted a successful 32K result"
         printf '%s,%s,%s,%s,%s,%s\n' "$repeat" "$slot" "$variant" \
@@ -279,15 +340,19 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
 
     control_logits=$(awk -F, -v r="$repeat" '$1==r && $3=="control" {print $6}' \
         "$OUTPUT_DIR/runs/index.csv")
-    candidate_logits=$(awk -F, -v r="$repeat" '$1==r && $3=="candidate" {print $6}' \
-        "$OUTPUT_DIR/runs/index.csv")
     mapfile -t control_files < <(find "$control_logits" -maxdepth 1 -type f -printf '%f\n' | sort)
-    mapfile -t candidate_files < <(find "$candidate_logits" -maxdepth 1 -type f -printf '%f\n' | sort)
-    [[ ${#control_files[@]} -gt 0 && "${control_files[*]}" == "${candidate_files[*]}" ]] ||
-        die "repeat $repeat logits inventory differs"
-    for file in "${control_files[@]}"; do
-        cmp -s "$control_logits/$file" "$candidate_logits/$file" ||
-            die "repeat $repeat logits differ: $file"
+    (( ${#control_files[@]} > 0 )) || die "repeat $repeat control logits are empty"
+    for variant in "${requested_variants[@]}"; do
+        [[ $variant != control ]] || continue
+        candidate_logits=$(awk -F, -v r="$repeat" -v v="$variant" \
+            '$1==r && $3==v {print $6}' "$OUTPUT_DIR/runs/index.csv")
+        mapfile -t candidate_files < <(find "$candidate_logits" -maxdepth 1 -type f -printf '%f\n' | sort)
+        [[ "${control_files[*]}" == "${candidate_files[*]}" ]] ||
+            die "repeat $repeat $variant logits inventory differs"
+        for file in "${control_files[@]}"; do
+            cmp -s "$control_logits/$file" "$candidate_logits/$file" ||
+                die "repeat $repeat $variant logits differ: $file"
+        done
     done
 done
 
@@ -295,28 +360,36 @@ python3 - "$OUTPUT_DIR" <<'PY'
 import csv, pathlib, statistics, sys
 root = pathlib.Path(sys.argv[1])
 runs = list(csv.DictReader((root / "runs/index.csv").open()))
-rates = {"control": [], "candidate": []}
+rates = {}
 paired = {}
+variant_order = []
 for run in runs:
     rows = list(csv.DictReader(pathlib.Path(run["csv"]).open()))
     row = next(x for x in rows if int(x["ctx_tokens"]) == 32768)
     value = float(row["prefill_tps"])
-    rates[run["variant"]].append(value)
-    paired[(int(run["repeat"]), run["variant"])] = value
-ratios = [paired[(r, "candidate")] / paired[(r, "control")]
-          for r in range(1, max(x[0] for x in paired) + 1)]
-speed = statistics.median(ratios)
+    variant = run["variant"]
+    if variant not in rates:
+        rates[variant] = []
+        variant_order.append(variant)
+    rates[variant].append(value)
+    paired[(int(run["repeat"]), variant)] = value
+repeats = range(1, max(x[0] for x in paired) + 1)
+layout = next(x.split("=", 1)[1] for x in
+              (root / "manifest.txt").read_text().splitlines()
+              if x.startswith("model_layout="))
 with (root / "summary/summary.csv").open("w", newline="") as f:
     w = csv.writer(f)
-    w.writerow(["model_layout", "ctx_tokens", "control_median_tps",
-                "candidate_median_tps", "paired_median_speedup",
-                "change_pct", "logits"])
-    w.writerow([next(x.split("=", 1)[1] for x in
-                     (root / "manifest.txt").read_text().splitlines()
-                     if x.startswith("model_layout=")),
-                32768, f'{statistics.median(rates["control"]):.3f}',
-                f'{statistics.median(rates["candidate"]):.3f}',
-                f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}', "byte-identical"])
+    w.writerow(["model_layout", "ctx_tokens", "variant", "median_tps",
+                "paired_median_speedup_vs_control", "change_pct",
+                "logits"])
+    for variant in variant_order:
+        ratios = [paired[(r, variant)] / paired[(r, "control")]
+                  for r in repeats]
+        speed = statistics.median(ratios)
+        w.writerow([layout, 32768, variant,
+                    f'{statistics.median(rates[variant]):.3f}',
+                    f'{speed:.6f}', f'{(speed - 1.0) * 100.0:.3f}',
+                    "reference" if variant == "control" else "byte-identical"])
 PY
 cat "$OUTPUT_DIR/summary/summary.csv"
 

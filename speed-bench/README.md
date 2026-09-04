@@ -5311,8 +5311,8 @@ bash ./speed-bench/cuda-sm75-q3a4-prefill-kstream.sh
 ### SM75 quantize-once/compact-slot and indexed-attention native-prefill A/B
 
 `cuda-sm75-prefill-native-pipeline-ab.sh` tests four independent, opt-in
-prefill changes together against the current production control at the exact
-four-GPU 32K frontier:
+prefill changes against the current production control at the exact four-GPU
+32K frontier. The default `candidate` arm enables all four:
 
 * `DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER=1` quantizes the post-norm routed-FFN
   activation once on its home GPU into the size-neutral lane-major native
@@ -5335,13 +5335,20 @@ four-GPU 32K frontier:
 
 All selectors are restricted to multi-token prefill and remain independently
 rollbackable. The harness first runs the production APIs through bit-exact
-CUDA regressions, then alternates control/candidate 32K runs, verifies the
-stable pair-0-off/pair-1-on attention topology and all candidate dispatch
-markers, checks GPU identity/power state, and requires byte-identical frontier
-logits. Run all43 first, then repeat with `MODEL_LAYOUT=mixed15` if accepted.
+CUDA regressions, then runs the requested arms, verifies the stable
+pair-0-off/pair-1-on attention topology and exact per-arm dispatch markers,
+checks GPU identity/power state, and requires every arm's frontier logits to
+be byte-identical to `control`. Repeats reverse arm order to limit ordering
+bias.
+
+The first accepted all43 combined A/B was byte-identical but regressed 32K
+prefill from 481.190 to 441.690 tok/s (`-8.209%`), so the bundle is rejected.
+Use `VARIANTS` to attribute that result in one production pass without
+repeating a separate control for every selector:
 
 ```bash
 MODEL_LAYOUT=all43 \
+VARIANTS=control,native-q8-transfer,compact-routed-slots,attention-row-tile16,fused-indexer-selection \
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
