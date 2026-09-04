@@ -311,6 +311,8 @@ static int check_sm75_q8_warp_interleaved_attention_output_exact(void) {
     }
 
     (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4", "1", 1);
     (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "1", 1);
     (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ", "1", 1);
     (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128", "1", 1);
@@ -354,6 +356,8 @@ static int check_sm75_q8_warp_interleaved_attention_output_exact(void) {
 
 cleanup:
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4");
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE");
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ");
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128");

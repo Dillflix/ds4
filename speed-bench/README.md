@@ -5059,12 +5059,29 @@ remain disabled by default behind independent
 `DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE` selectors. The B cache contains
 only the consumed 4096-wide slice of the canonical 8192-wide matrix.
 
-The bounded diagnostic requires bit-identical A intermediates and B outputs,
-reports paired inclusive timings at the production shapes, and runs both
-candidates under Compute Sanitizer:
+The specialized A follow-up addresses its four-block shape directly. The
+generic implementation assigns a full warp to one 128-wide output row, leaving
+28 lanes without a block. The rowtile4 representation packs eight adjacent
+rows into a 32-lane scale plane plus eight coalesced word planes, and the
+kernel assigns four lanes to each row. It therefore computes eight rows per
+warp and 64 per CTA while retaining the original block ownership and
+`(term0 + term2) + (term1 + term3)` reduction tree. Its activation quantizer
+writes the matching word planes directly. Set
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4=0` or
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ=0` for independent rollback.
+
+The bounded diagnostic requires bit-identical A intermediates and B outputs.
+The A acceptance test is deliberately two-arm: canonical versus the specialized
+rowtile4/direct-XQ candidate. The previously rejected block-interleaved A path
+is retained only as historical evidence, not rerun as an acceptance arm. Set
+`PROJECTIONS=a` to time and sanitize A alone before any four-GPU production
+test. B retains its useful three-arm comparison because both of its interleaved
+implementations were accepted and the incremental result measures the K128
+follow-up directly.
 
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 \
+PROJECTIONS=a \
 TIMING_ROUNDS=9 TIMING_REPEATS=100 \
 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-output-interleaved.sh

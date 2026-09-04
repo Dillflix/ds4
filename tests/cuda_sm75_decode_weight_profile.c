@@ -1002,6 +1002,8 @@ static int run_q8_grouped_a(void) {
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "0", 1);
         if (!RUN_Q8_GROUPED_A() || !ds4_gpu_synchronize()) goto timing_error;
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "1", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ", "1", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4", "1", 1);
         if (!RUN_Q8_GROUPED_A() || !ds4_gpu_synchronize()) goto timing_error;
         const uint32_t rounds = positive_env_u32("TIMING_ROUNDS", 9u);
         const uint32_t repeats = positive_env_u32("TIMING_REPEATS", 100u);
@@ -1013,14 +1015,19 @@ static int run_q8_grouped_a(void) {
         float *candidate_ms = (float *)malloc(rounds * sizeof(float));
         ds4_gpu_timer *timer = ds4_gpu_timer_create();
         if (!control_ms || !candidate_ms || !timer) {
-            free(candidate_ms); free(control_ms); ds4_gpu_timer_free(timer);
+            free(candidate_ms); free(control_ms);
+            ds4_gpu_timer_free(timer);
             goto timing_error;
         }
         for (uint32_t round = 0u; round < rounds; ++round) {
             for (uint32_t order = 0u; order < 2u; ++order) {
-                const int candidate = ((round & 1u) ^ order) != 0u;
+                const uint32_t arm = (round + order) % 2u;
                 (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE",
-                             candidate ? "1" : "0", 1);
+                             arm == 0u ? "0" : "1", 1);
+                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ",
+                             arm == 1u ? "1" : "0", 1);
+                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4",
+                             arm == 1u ? "1" : "0", 1);
                 if (!ds4_gpu_timer_record_start(timer)) goto timing_alloc_error;
                 for (uint32_t repeat = 0u; repeat < repeats; ++repeat) {
                     if (!RUN_Q8_GROUPED_A()) goto timing_alloc_error;
@@ -1029,16 +1036,17 @@ static int run_q8_grouped_a(void) {
                 float elapsed = 0.0f;
                 if (!ds4_gpu_timer_elapsed_ms(timer, &elapsed))
                     goto timing_alloc_error;
-                (candidate ? candidate_ms : control_ms)[round] =
-                    elapsed / (float)repeats;
+                float *samples = arm == 0u ? control_ms : candidate_ms;
+                samples[round] = elapsed / (float)repeats;
             }
         }
         qsort(control_ms, rounds, sizeof(float), compare_float);
         qsort(candidate_ms, rounds, sizeof(float), compare_float);
         printf("timing_scope=production-shape-owned-call-inclusive\n"
                "timing_rounds=%u\ntiming_repeats=%u\n"
-               "candidate_kind=q8-grouped-a-warp-interleaved\n"
-               "control_median_ms=%.9g\ncandidate_median_ms=%.9g\n"
+               "candidate_kind=q8-grouped-a-rowtile4-direct-xq\n"
+               "control_median_ms=%.9g\n"
+               "candidate_median_ms=%.9g\n"
                "candidate_speedup=%.9g\n",
                rounds, repeats, control_ms[rounds / 2u],
                candidate_ms[rounds / 2u],
@@ -1057,6 +1065,8 @@ timing_done:;
     ok = verify_zero_tensor(low, low_dim, "q8-grouped-a-half");
 cleanup:
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4");
     ds4_gpu_tensor_free(low);
     ds4_gpu_tensor_free(heads);
 #undef RUN_Q8_GROUPED_A
