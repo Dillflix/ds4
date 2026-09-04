@@ -3619,6 +3619,17 @@ static void cuda_q8_f16_plan_materialize(void) {
             else
                 choose_partner = projected_work[partner_device] <
                                  projected_work[home_device];
+            const int home_tier =
+                cuda_logical_tier_for_physical(home_device);
+            if (cuda_env_pair_list_contains(
+                    "DS4_CUDA_NO_Q8_F16_PARTNER_ADMISSION_PAIRS",
+                    home_tier)) {
+                /* Pair-scoped admission diagnostics keep the candidate on
+                 * its home device. An ordinary home-capacity miss may then
+                 * use native primary; it must not become a locked partner
+                 * assignment that the admission filter necessarily rejects. */
+                choose_partner = false;
+            }
             const int target = choose_partner ? partner_device : home_device;
             uint64_t &target_free = projected_free[target];
             target_free = target_free > bytes ? target_free - bytes : 0u;

@@ -5226,6 +5226,17 @@ and other admitted pair-0 Q8/F16 partner work. The harness requires both the
 pair-wide suppression and full-home-fallback markers and rejects every pair-0
 partner-dispatch marker.
 
+If that arm still loses GPU 1, use
+`NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS=0`. This moves the boundary
+earlier: pair 0 admits no partner F16 weights or partner scratch, and the
+stage-aware planner cannot assign its movable candidates to GPU1. Pair 1 keeps
+normal admission and execution. Pair-0 native-primary partner shards and the
+peer-access topology remain installed, while attention B retains the explicit
+full-home fallback above. A stable result therefore implicates pair-0 F16
+admission/materialization or its added residency. Another GPU1 loss instead
+moves the suspect boundary to native-primary/base selective residency or peer
+mapping, rather than active Q8/F16 partner execution.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \

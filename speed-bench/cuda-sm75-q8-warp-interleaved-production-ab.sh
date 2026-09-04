@@ -21,6 +21,7 @@ Q8_INTERLEAVED_PRODUCTION_TARGET=${Q8_INTERLEAVED_PRODUCTION_TARGET:-t32}
 NATIVE_PRIMARY_PREFLIGHT_ONLY=${NATIVE_PRIMARY_PREFLIGHT_ONLY:-0}
 NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS=${NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS:-}
 NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS=${NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS:-}
+NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS=${NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS:-}
 case $Q8_INTERLEAVED_PRODUCTION_TARGET in
     t32) default_interleaved_cache_mb=1024 ;;
     attention-b|attention-ab|native-primary) default_interleaved_cache_mb=1536 ;;
@@ -89,9 +90,21 @@ if [[ -n $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS ]]; then
     [[ $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS == 0 ]] ||
         die "this isolation requires NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS=0"
 fi
-if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS &&
-      -n $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS ]]; then
-    die "select exactly one native-primary partner-execution isolation"
+if [[ -n $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS ]]; then
+    [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]] ||
+        die "NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS requires native-primary"
+    [[ $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS == 0 ]] ||
+        die "this isolation requires NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS=0"
+fi
+native_primary_isolations=0
+[[ -z $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]] ||
+    (( native_primary_isolations += 1 ))
+[[ -z $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS ]] ||
+    (( native_primary_isolations += 1 ))
+[[ -z $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS ]] ||
+    (( native_primary_isolations += 1 ))
+if (( native_primary_isolations > 1 )); then
+    die "select exactly one native-primary partner isolation"
 fi
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset"
@@ -236,6 +249,8 @@ phase=manifest
         "${NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS:-none}"
     printf 'native_primary_disable_all_partner_pairs=%s\n' \
         "${NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS:-none}"
+    printf 'native_primary_disable_partner_admission_pairs=%s\n' \
+        "${NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS:-none}"
     printf 'throughput_repeats=1\nfrontiers=512,4096,32768\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
@@ -399,9 +414,13 @@ validate_common_log() {
         "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
     ! grep -Fq 'selective-cache miss' "$log" || return 1
-    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary &&
+          -z $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS ]]; then
         grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' \
             "$log" || return 1
+    elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        grep -Fq 'CUDA q8 fp16 benefit plan materialized ' "$log" || return 1
+        ! grep -Fq 'CUDA q8 fp16 plan rejected' "$log" || return 1
     fi
     if [[ $layout == mixed15 ]]; then
         grep -Fq 'SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
@@ -420,6 +439,10 @@ run_native_primary_preflight() {
     if [[ -n $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS ]]; then
         isolation_env+=(
             "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS=$NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS")
+    fi
+    if [[ -n $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS ]]; then
+        isolation_env+=(
+            "DS4_CUDA_NO_Q8_F16_PARTNER_ADMISSION_PAIRS=$NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS")
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     cmd=("${production_env[@]}"
@@ -467,6 +490,16 @@ run_native_primary_preflight() {
         grep -Fq "native-primary T256 full-home fallback retained for logical pair $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS" \
             "$base.log" || return 1
         ! grep -Fq 'home tier 0 device 0 -> partner tier 2 device 1 (' \
+            "$base.log" || return 1
+    fi
+    if [[ -n $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS ]]; then
+        grep -Fq "CUDA q8 fp16 partner admission suppressed for logical pair $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS" \
+            "$base.log" || return 1
+        grep -Fq "native-primary T256 full-home fallback retained for logical pair $NATIVE_PRIMARY_DISABLE_PARTNER_ADMISSION_PAIRS" \
+            "$base.log" || return 1
+        ! grep -Fq 'home tier 0 device 0 -> partner tier 2 device 1 (' \
+            "$base.log" || return 1
+        grep -Fq 'home tier 1 device 3 -> partner tier 3 device 2 (' \
             "$base.log" || return 1
     fi
 }

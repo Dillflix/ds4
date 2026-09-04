@@ -59105,7 +59105,9 @@ static int engine_plan_q8_native_primary_tensor(
         const uint64_t half_blocks = full_blocks / 2u;
         const bool full_home_fallback =
             env_pair_list_contains(
-                "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS", home_tier);
+                "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS", home_tier) ||
+            env_pair_list_contains(
+                "DS4_CUDA_NO_Q8_F16_PARTNER_ADMISSION_PAIRS", home_tier);
         if ((full_blocks & 1u) != 0u) return -1;
         if (engine_append_q8_native_range(
                 per_dev_ranges, per_dev_n, per_dev_cap,
