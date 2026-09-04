@@ -292,24 +292,6 @@ validate_csv() {
     ' "$csv"
 }
 
-validate_native_residency_shadow() {
-    local log=$1
-    awk -v expected="$((4386 * 1024 * 1024))" '
-        /CUDA q8 fp16 planner canonical-equivalent residency shadow/ {
-            device=""; bytes=""
-            for (i=1; i<=NF; i++) {
-                split($i,a,"=")
-                if (a[1]=="device") device=a[2]
-                if (a[1]=="bytes") bytes=a[2]
-            }
-            if (device !~ /^[0-9]+$/ || bytes !~ /^[0-9]+$/ ||
-                seen_device[device]++) bad=1
-            seen++; total+=bytes
-        }
-        END {exit !(seen==4 && !bad && total==expected)}
-    ' "$log"
-}
-
 validate_dispatch() {
     local variant=$1 log=$2
     if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
@@ -350,8 +332,30 @@ validate_dispatch() {
             END {exit !(seen==1 && !bad)}
         ' "$log" || return 1
         if [[ $variant == interleaved ]]; then
-            grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
-                "$log" && validate_native_residency_shadow "$log" &&
+            awk '
+                /native-primary Q8 device=/ {
+                    device=""; canonical=-1; deferred=-1
+                    for (i=1; i<=NF; i++) {
+                        split($i,a,"=")
+                        if (a[1]=="device") device=a[2]
+                        if (a[1]=="canonical-prefill") canonical=a[2]+0
+                        if (a[1]=="deferred-native") deferred=a[2]+0
+                    }
+                    if (device !~ /^[0-9]+$/ || seen_device[device]++ ||
+                        canonical<=0 || deferred<=0) bad=1
+                    seen++; canonical_total+=canonical
+                    deferred_total+=deferred
+                }
+                END {exit !(seen==4 && !bad && canonical_total==8772 &&
+                            deferred_total==4386)}
+            ' "$log" &&
+            grep -Fq 'CUDA native-primary Q8 enabled for deferred exact T32/A/B TP decode shards; canonical sources remain resident through prefill' \
+                "$log" &&
+                [[ $(grep -Fc 'native-primary Q8 prefill source cache released 8772.00 MiB before decode materialization' \
+                    "$log") == 1 ]] &&
+                grep -Fq 'deferred native-primary Q8 materialized' \
+                    "$log" &&
+                ! grep -Fq 'canonical-equivalent residency shadow' "$log" &&
                 ! grep -Fq 'SM75 warp-interleaved Q8 cache fill' "$log"
         else
             ! grep -Fq 'CUDA native-primary Q8 enabled' "$log" &&
@@ -496,10 +500,12 @@ run_native_primary_preflight() {
         ' "$base.csv" &&
         [[ -s $base.memory.csv && -s $base.q8-plan.csv ]] &&
         validate_common_log "$layout" "$base.log" &&
-        validate_native_residency_shadow "$base.log" &&
+        validate_dispatch interleaved "$base.log" &&
+        [[ $(grep -Fc 'native-primary Q8 device=' "$base.log") == 4 ]] &&
+        grep -Fq 'deferred native-primary Q8 materialized' "$base.log" &&
         grep -Fq 'CUDA q8 fp16 stage-aware 22/21 planner selected 117/129 movable projections for partner execution' \
             "$base.log" &&
-        grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
+        grep -Fq 'CUDA native-primary Q8 enabled for deferred exact T32/A/B TP decode shards; canonical sources remain resident through prefill' \
             "$base.log" || return 1
     if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]]; then
         grep -Fq "CUDA q8 fp16 T32 partner execution suppressed for logical pair $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS" \

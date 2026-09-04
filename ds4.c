@@ -59693,7 +59693,8 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         }
         fprintf(stderr,
                 "ds4: CUDA tier %d (device %d) native-primary Q8: "
-                "%.2f GiB in %d retained shards plus %d source-only spans\n",
+                "%.2f GiB in %d deferred decode shards plus %d "
+                "source-only spans\n",
                 d, physical_device,
                 (double)native_bytes / 1073741824.0,
                 per_dev_native_n[d] - source_only, source_only);
@@ -59709,8 +59710,9 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     }
     if (q8_native_primary) {
         fprintf(stderr,
-                "ds4: CUDA native-primary Q8 enabled for exact T32/A/B "
-                "TP shards; canonical bytes remain mmap-only\n");
+                "ds4: CUDA native-primary Q8 enabled for deferred exact "
+                "T32/A/B TP decode shards; canonical sources remain "
+                "resident through prefill\n");
     }
     if (engine_plan_q8_f16_cache(e, cuda_tp_decode) != 0) goto cleanup;
     rc = 0;
