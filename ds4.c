@@ -15583,6 +15583,18 @@ static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
     return home_tier != 0;
 }
 
+static bool cuda_tp_prefill_pair1_row_resident_output_enabled(
+        int home_tier) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+    (void)home_tier;
+    return false;
+#else
+    const char *env = getenv(
+        "DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT");
+    return home_tier == 1 && env && env[0] && strcmp(env, "0") != 0;
+#endif
+}
+
 enum {
     DS4_CUDA_TP_CACHE_MIRROR_ATTN  = 1u << 0,
     DS4_CUDA_TP_CACHE_MIRROR_INDEX = 1u << 1,
@@ -16054,6 +16066,17 @@ typedef struct {
     bool cuda_tp_decode;
     bool cuda_tp_attn;
     bool cuda_tp_attn_peer_read;
+    /* Opt-in pair-1 prefill experiment.  When valid, attention rows remain
+     * resident on their producing devices through both output projections;
+     * only the final 4096-wide rows are returned to the home tier. */
+    bool cuda_tp_prefill_row_resident_output_valid;
+    uint32_t cuda_tp_prefill_row_resident_layer;
+    uint32_t cuda_tp_prefill_row_resident_pos0;
+    uint32_t cuda_tp_prefill_row_resident_tokens;
+    uint32_t cuda_tp_prefill_row_resident_home_rows;
+    uint32_t cuda_tp_prefill_row_resident_partner_rows;
+    int cuda_tp_prefill_row_resident_home;
+    int cuda_tp_prefill_row_resident_partner;
     /* Frozen at graph creation so allocation, incremental cache updates, and
      * full-cache restoration cannot disagree if the process environment is
      * changed later. Bits name lower-half logical home tiers. */
@@ -30079,13 +30102,37 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
             ok, "home-attention", home, kind, il, pos0, n_tokens,
             home, partner);
     }
-    const bool audit_result_gather = active_phase_audit && ok;
+    const bool row_resident_output = ok &&
+        cuda_tp_prefill_pair1_row_resident_output_enabled(home) &&
+        layer->attn_output_a && layer->attn_output_b &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        g->batch_attn_low_by_tier[home] &&
+        g->batch_attn_low_by_tier[partner] &&
+        g->batch_attn_out_by_tier[home] &&
+        g->batch_attn_out_by_tier[partner] &&
+        g->batch_group_tmp_by_tier[home] &&
+        g->batch_group_tmp_by_tier[partner] &&
+        g->batch_low_tmp_by_tier[home] &&
+        g->batch_low_tmp_by_tier[partner];
+    if (row_resident_output) {
+        g->cuda_tp_prefill_row_resident_output_valid = true;
+        g->cuda_tp_prefill_row_resident_layer = il;
+        g->cuda_tp_prefill_row_resident_pos0 = pos0;
+        g->cuda_tp_prefill_row_resident_tokens = n_tokens;
+        g->cuda_tp_prefill_row_resident_home_rows = home_rows;
+        g->cuda_tp_prefill_row_resident_partner_rows = partner_rows;
+        g->cuda_tp_prefill_row_resident_home = home;
+        g->cuda_tp_prefill_row_resident_partner = partner;
+    }
+    const bool audit_result_gather =
+        active_phase_audit && ok && !row_resident_output;
     if (audit_result_gather) {
         metal_graph_cuda_tp_prefill_attention_rows_phase_audit_log(
             "begin", "result-gather", kind, il, pos0, n_tokens,
             home, partner);
     }
-    if (ok) {
+    if (ok && !row_resident_output) {
         if (gather_copy_dst) {
             ok = ds4_gpu_tensor_copy_xdev_default_dst_ordered(
                      gather_dst, peer_heads, q_partner_bytes) != 0;
@@ -30172,10 +30219,13 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
         fprintf(stderr,
                 "ds4: CUDA prefill attention query-row split enabled: "
                 "tier %d rows [0,%u), tier %d rows [%u,%u); "
-                "partner-local mirrored KV, full-head gather to home; "
+                "partner-local mirrored KV, %s; "
                 "query-copy-stream=%s gather-copy-stream=%s "
                 "query-copy-transport=%s gather-copy-transport=%s\n",
                 home, home_rows, partner, home_rows, n_tokens,
+                row_resident_output
+                    ? "row-resident A+B and final-row gather"
+                    : "full-head gather to home",
                 query_copy_dst ? "destination" : "source",
                 gather_copy_dst ? "destination" : "source",
                 host_bounce ? "host-bounce" : "peer",
@@ -30191,7 +30241,9 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_launch(
                 kind == DS4_CUDA_PREFILL_ATTN_INDEXED ? "indexed" : "mixed",
                 il, pos0, n_tokens, home, partner,
                 (unsigned long long)q_partner_bytes,
-                (unsigned long long)q_partner_bytes,
+                (unsigned long long)(row_resident_output
+                    ? (uint64_t)partner_rows * DS4_N_EMBD * sizeof(float)
+                    : q_partner_bytes),
                 query_copy_dst ? "destination" : "source",
                 gather_copy_dst ? "destination" : "source",
                 host_bounce ? "host-bounce" : "peer",
@@ -30228,6 +30280,76 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
 #else
     const int home = g->active_tier;
     const int partner = metal_graph_cuda_tp_partner_tier(home);
+    if (g->cuda_tp_prefill_row_resident_output_valid) {
+        const uint32_t home_rows =
+            g->cuda_tp_prefill_row_resident_home_rows;
+        const uint32_t partner_rows =
+            g->cuda_tp_prefill_row_resident_partner_rows;
+        bool ok = home == g->cuda_tp_prefill_row_resident_home &&
+            partner == g->cuda_tp_prefill_row_resident_partner &&
+            n_tokens == g->cuda_tp_prefill_row_resident_tokens &&
+            home_rows + partner_rows == n_tokens;
+        ds4_gpu_tensor *home_heads = metal_graph_tensor_row_range_view(
+            g->batch_heads_by_tier[home], 0, home_rows,
+            (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+        ds4_gpu_tensor *partner_heads = metal_graph_tensor_row_range_view(
+            g->batch_heads_by_tier[partner], 0, partner_rows,
+            (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+        ds4_gpu_tensor *home_out = metal_graph_tensor_row_range_view(
+            g->batch_attn_out_by_tier[home], 0, home_rows, DS4_N_EMBD);
+        ds4_gpu_tensor *partner_out = metal_graph_tensor_row_range_view(
+            g->batch_attn_out_by_tier[partner], 0, partner_rows,
+            DS4_N_EMBD);
+        ds4_gpu_tensor *gather_out = metal_graph_tensor_row_range_view(
+            g->batch_attn_out_by_tier[home], home_rows, partner_rows,
+            DS4_N_EMBD);
+        ok = ok && home_heads && partner_heads && home_out && partner_out &&
+            gather_out;
+        if (ok) ok = ds4_gpu_set_current_device(partner) == 0;
+        if (ok) {
+            ok = ds4_gpu_attention_output_q8_batch_tensor(
+                partner_out, g->batch_attn_low_by_tier[partner],
+                g->batch_group_tmp_by_tier[partner],
+                g->batch_low_tmp_by_tier[partner], model->map, model->size,
+                layer->attn_output_a->abs_offset,
+                layer->attn_output_b->abs_offset, group_dim, rank, n_groups,
+                DS4_N_EMBD, partner_heads, partner_rows) != 0;
+        }
+        if (ok) ok = ds4_gpu_set_current_device(home) == 0;
+        if (ok) {
+            ok = ds4_gpu_attention_output_q8_batch_tensor(
+                home_out, g->batch_attn_low_by_tier[home],
+                g->batch_group_tmp_by_tier[home],
+                g->batch_low_tmp_by_tier[home], model->map, model->size,
+                layer->attn_output_a->abs_offset,
+                layer->attn_output_b->abs_offset, group_dim, rank, n_groups,
+                DS4_N_EMBD, home_heads, home_rows) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_tensor_wait_xdev_default(gather_out, partner) != 0 &&
+                 ds4_gpu_tensor_copy_xdev_default(
+                     gather_out, partner_out,
+                     (uint64_t)partner_rows * DS4_N_EMBD * sizeof(float)) != 0;
+        }
+        static bool logged = false;
+        if (ok && !logged) {
+            logged = true;
+            fprintf(stderr,
+                    "ds4: CUDA pair-1 prefill row-resident attention output "
+                    "enabled: attention heads and Q8 A+B remain owner-local; "
+                    "final-row gather bytes=%llu\n",
+                    (unsigned long long)partner_rows * DS4_N_EMBD *
+                        sizeof(float));
+            fflush(stderr);
+        }
+        g->cuda_tp_prefill_row_resident_output_valid = false;
+        ds4_gpu_tensor_free(gather_out);
+        ds4_gpu_tensor_free(partner_out);
+        ds4_gpu_tensor_free(home_out);
+        ds4_gpu_tensor_free(partner_heads);
+        ds4_gpu_tensor_free(home_heads);
+        return ok;
+    }
     const uint32_t half_groups = n_groups / 2u;
     const uint64_t half_low = (uint64_t)half_groups * rank;
     const uint64_t low_total = (uint64_t)n_groups * rank;
@@ -30278,6 +30400,7 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    g->cuda_tp_prefill_row_resident_output_valid = false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -31957,7 +32080,35 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok && cuda_tp_prefill_heads_done) {
+    if (ok && g->cuda_tp_prefill_row_resident_output_valid) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+        const int home = g->cuda_tp_prefill_row_resident_home;
+        const int partner = g->cuda_tp_prefill_row_resident_partner;
+        const uint32_t home_rows =
+            g->cuda_tp_prefill_row_resident_home_rows;
+        const uint32_t partner_rows =
+            g->cuda_tp_prefill_row_resident_partner_rows;
+        if (ok) ok = ds4_gpu_set_current_device(partner) == 0 &&
+            ds4_gpu_rope_tail_tensor(g->batch_heads_by_tier[partner],
+                                    partner_rows, DS4_N_HEAD,
+                                    DS4_N_HEAD_DIM, DS4_N_ROT,
+                                    pos0 + home_rows,
+                                    compressed
+                                        ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                                    true, freq_base, freq_scale, ext_factor,
+                                    attn_factor, DS4_ROPE_YARN_BETA_FAST,
+                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_set_current_device(home) == 0 &&
+            ds4_gpu_rope_tail_tensor(g->batch_heads_by_tier[home],
+                                    home_rows, DS4_N_HEAD,
+                                    DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
+                                    compressed
+                                        ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                                    true, freq_base, freq_scale, ext_factor,
+                                    attn_factor, DS4_ROPE_YARN_BETA_FAST,
+                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+#endif
+    } else if (ok && cuda_tp_prefill_heads_done) {
 #if !defined(__APPLE__) && !defined(DS4_NO_GPU)
         const int home = g->active_tier;
         const int partner = metal_graph_cuda_tp_partner_tier(home);
@@ -32003,7 +32154,8 @@ static bool metal_graph_encode_layer_attention_batch(
 #endif
     bool attn_out_f16 = false;
     bool cuda_tp_attn_output_done = false;
-    if (ok && cuda_tp_prefill_heads_done) {
+    if (ok && (cuda_tp_prefill_heads_done ||
+               g->cuda_tp_prefill_row_resident_output_valid)) {
         ok = metal_graph_cuda_tp_prefill_attention_output(
                 g, model, layer, n_tokens, group_dim, rank, n_groups);
         cuda_tp_attn_output_done = ok;
@@ -59885,6 +60037,11 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
     return cuda_tp_prefill_attn_rows_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(
+        int home_tier) {
+    return cuda_tp_prefill_pair1_row_resident_output_enabled(home_tier);
 }
 
 bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void) {

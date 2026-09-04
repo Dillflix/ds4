@@ -19,6 +19,8 @@ Optional environment:
   CTX_ALLOC=CTX_MAX+1           preserves complete dense-F16 admission
   REPEATS=3
   RUN_HARNESS=1
+  ROW_RESIDENT_AB=0        1 compares normal pair-1 row split (home column)
+                           with pair-1 row-resident attention A+B (rows column)
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   ROWSPLIT_PRODUCTION_DIR=/absolute/output/directory
@@ -47,6 +49,7 @@ CTX_MAX=${CTX_MAX:-${CTX_TOKENS:-32768}}
 CTX_ALLOC=${CTX_ALLOC:-$((CTX_MAX + 1))}
 REPEATS=${REPEATS:-3}
 RUN_HARNESS=${RUN_HARNESS:-1}
+ROW_RESIDENT_AB=${ROW_RESIDENT_AB:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -57,7 +60,8 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_START:$CTX_START" \
             "CTX_MAX:$CTX_MAX" \
             "CTX_ALLOC:$CTX_ALLOC" "REPEATS:$REPEATS" \
             "RUN_HARNESS:$RUN_HARNESS" "SKIP_BUILD:$SKIP_BUILD" \
-            "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
+            "ROW_RESIDENT_AB:$ROW_RESIDENT_AB"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -69,7 +73,7 @@ ctx_ratio=$((CTX_MAX / CTX_START))
 (( CTX_MAX % CTX_START == 0 &&
    (ctx_ratio & (ctx_ratio - 1)) == 0 )) ||
     die "CTX_MAX/CTX_START must be an integer power of two"
-for flag in RUN_HARNESS SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_HARNESS SKIP_BUILD CREATE_ARCHIVE ROW_RESIDENT_AB; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 for tool in awk basename cat cmp date dirname env find git grep make mkdir nproc \
@@ -166,7 +170,18 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
     slot=0
     for variant in "${variants[@]}"; do
         slot=$((slot + 1))
-        rows=0; [[ $variant == rows ]] && rows=1
+        rows=0
+        row_resident=0
+        if [[ $ROW_RESIDENT_AB == 1 ]]; then
+            rows=1
+            [[ $variant == rows ]] && row_resident=1
+            no_attn_pairs=0
+        elif [[ $variant == rows ]]; then
+            rows=1
+            no_attn_pairs=999
+        else
+            no_attn_pairs=999
+        fi
         base="$OUTPUT_DIR/production/r${repeat}-s${slot}-$variant"
         logits="$base-logits"
         mkdir -p "$logits"
@@ -180,6 +195,8 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=2048 \
             DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
             "DS4_CUDA_TP_PREFILL_ATTN_ROWS=$rows" \
+            "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=$no_attn_pairs" \
+            "DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT=$row_resident" \
             DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1 \
             ./ds4-bench --cuda --cuda-tensor-parallel \
                 --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
@@ -201,7 +218,7 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             die "$variant did not retain complete dense-F16 admission"
         ! grep -Fq 'required but unavailable' "$base.log" ||
             die "$variant encountered a forbidden row-split fallback"
-        if [[ $variant == rows ]]; then
+        if [[ $variant == rows || $ROW_RESIDENT_AB == 1 ]]; then
             grep -Fq 'dispatch=split kind=indexed' "$base.log" ||
                 die "row candidate omitted indexed split dispatch"
             grep -Fq 'dispatch=split kind=mixed' "$base.log" ||
@@ -215,6 +232,17 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
             ! grep -Fq 'CUDA prefill indexer score/top-k row split enabled:' \
                     "$base.log" ||
                 die "home control unexpectedly split indexer score/top-k"
+        fi
+        if [[ $ROW_RESIDENT_AB == 1 ]]; then
+            if [[ $variant == rows ]]; then
+                grep -Fq 'pair-1 prefill row-resident attention output enabled' \
+                    "$base.log" ||
+                    die "row-resident candidate marker missing"
+            else
+                ! grep -Fq 'pair-1 prefill row-resident attention output enabled' \
+                    "$base.log" ||
+                    die "row-split control unexpectedly used row-resident output"
+            fi
         fi
         printf '%s,%s,%s,%s,%s,%s\n' "$repeat" "$slot" "$variant" \
             "$base.csv" "$base.log" "$logits" \

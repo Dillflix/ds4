@@ -43,6 +43,8 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(
+        int home_tier);
 bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier);
 uint32_t ds4_test_cuda_tp_cache_mirror_classes_for_pair(
@@ -908,6 +910,8 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
         "DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
     char *old_compute_suppressed = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
+    char *old_row_resident = save_env_value(
+        "DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT");
     const int old_n_gpus = g_n_gpus;
     ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
     int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
@@ -919,6 +923,14 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memset(g_gpu, 0, sizeof(old_gpu));
     memset(g_gpu_peer_ok, 0, sizeof(old_peer_ok));
     memset(g_gpu_peer_gib_per_sec, 0, sizeof(old_peer_speed));
+    unsetenv("DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT");
+    CHECK(!ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(1),
+          "pair-1 row-resident output remains opt-in");
+    setenv("DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT", "1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(0) &&
+          ds4_test_cuda_tp_prefill_pair1_row_resident_output_enabled(1),
+          "row-resident output selector is restricted to stable pair 1");
     g_n_gpus = 4;
     for (int i = 0; i < g_n_gpus; i++) {
         g_gpu[i].compute_major = 7;
@@ -1181,6 +1193,8 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memcpy(g_gpu_peer_ok, old_peer_ok, sizeof(old_peer_ok));
     memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
+    restore_env_value("DS4_CUDA_TP_PREFILL_PAIR1_ROW_RESIDENT_OUTPUT",
+                      old_row_resident);
     restore_env_value("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", old_pairs);
     restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", old_indexer);
     restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS",
