@@ -5053,11 +5053,12 @@ bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
 
 `cuda-sm75-q8-attention-output-interleaved.sh` extends the size-neutral
 warp-interleaved Q8_0 representation to the two single-token attention-output
-consumers: the grouped A projection and K-sliced B projection. The two paths
-remain disabled by default behind independent
+consumers: the grouped A projection and K-sliced B projection. Both paths are
+SM75 production defaults behind independent
 `DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE` and
-`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE` selectors. The B cache contains
-only the consumed 4096-wide slice of the canonical 8192-wide matrix.
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE` selectors. Set either selector to
+zero for exact rollback. The B cache contains only the consumed 4096-wide
+slice of the canonical 8192-wide matrix.
 
 The first A follow-up used a four-block 128-wide fixture. The subsequent
 `20260904T013039Z` production audit proved that fixture was not representative:
@@ -5090,9 +5091,10 @@ RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-output-interleaved.sh
 ```
 
-This experiment does not change production defaults. A four-GPU production
-A/B with exact logits and explicit interleaved-cache residency is required
-before either selector can be promoted.
+The corrected `20260904T022051Z` A-only run exercised the real 4096x4096 TP
+slice. Its engine regression was bit-identical, Compute Sanitizer passed, and
+the K128/direct-XQ candidate reduced the owned call from 0.078653 ms to
+0.039485 ms (1.992x).
 
 The B follow-up removes the canonical activation scratch plus repack launch by
 quantizing directly into the interleaved word planes. It also specializes the
@@ -5140,6 +5142,17 @@ INTERLEAVED_CACHE_MB=1536 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-ab-production-ab.sh
 ```
+
+The `20260904T022454Z` four-GPU run accepted the combined A+B path for both
+model layouts. All 96 control/candidate decode-logit files were byte-identical;
+every selected A and B call used direct-XQ/K128; all candidate arms recorded
+215 cache fills, zero fallbacks, and 4386 MiB total resident interleaved
+weights; and every pre/post GPU identity and power snapshot matched. Decode
+improved by 9.90%, 8.55%, and 7.84% for mixed15 and by 10.62%, 8.49%, and
+7.65% for all43 at 512, 4096, and 32768 tokens. This promotes both attention
+output paths to the SM75 single-token defaults and raises the default
+per-device interleaved-cache ceiling from 1024 MiB to the validated 1536 MiB.
+The A/B harness still forces both selectors off in its control arms.
 
 ### SM75 width-1024 compressor projection layout diagnostic
 

@@ -111,7 +111,7 @@ trap finalize EXIT
     printf 'free_mib_at_preflight=%s\ntiming_rounds=%s\ntiming_repeats=%s\n' \
         "$free_mib" "$TIMING_ROUNDS" "$TIMING_REPEATS"
     printf 'timed_projections=%s\n' "$PROJECTIONS"
-    printf 'candidate_default=off\na_layout=warp-interleaved-k128\n'
+    printf 'production_default=on\na_layout=warp-interleaved-k128\n'
     printf 'a_activation=direct-interleaved-xq\nb_slice_cache=consumed-half-only\n'
     printf '\n[gpu]\n'
     nvidia-smi -i "$PROFILE_GPU" \
@@ -239,7 +239,7 @@ phase=summarization
         printf '| q8-kslice-t256 | %s | %s | %s | %sx | %sx |\n\n' \
             "$control" "$baseline" "$candidate" "$incremental" "$speedup"
     fi
-    printf '\nCandidate selectors remain opt-in and independently rollbackable.\n'
+    printf '\nProduction selectors are enabled and independently rollbackable.\n'
 } >"$OUTPUT_DIR/summary.md"
 cat "$OUTPUT_DIR/summary.md"
 

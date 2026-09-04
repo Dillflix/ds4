@@ -310,12 +310,12 @@ static int check_sm75_q8_warp_interleaved_attention_output_exact(void) {
         goto cleanup;
     }
 
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128", "1", 1);
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128");
     (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB", "64", 1);
     if (!ds4_gpu_attention_output_q8_tp_tensor(
             out, low, model, model_bytes, 0u, a_bytes,
@@ -352,6 +352,8 @@ static int check_sm75_q8_warp_interleaved_attention_output_exact(void) {
     fprintf(stderr,
             "cuda-regression: SM75 warp-interleaved Q8 attention-output A+B exact (%u low, %u output values)\n",
             low_count, out_dim);
+    fprintf(stderr,
+            "cuda-regression: SM75 warp-interleaved Q8 attention-output A+B production defaults exact\n");
     rc = 0;
 
 cleanup:
