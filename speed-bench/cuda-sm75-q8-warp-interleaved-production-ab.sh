@@ -17,14 +17,25 @@ TG_TOKENS=${TG_TOKENS:-256}
 EXACT_TOKENS=${EXACT_TOKENS:-16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
-INTERLEAVED_CACHE_MB=${INTERLEAVED_CACHE_MB:-1024}
+Q8_INTERLEAVED_PRODUCTION_TARGET=${Q8_INTERLEAVED_PRODUCTION_TARGET:-t32}
+case $Q8_INTERLEAVED_PRODUCTION_TARGET in
+    t32) default_interleaved_cache_mb=1024 ;;
+    attention-b) default_interleaved_cache_mb=1536 ;;
+    *) die "Q8_INTERLEAVED_PRODUCTION_TARGET must be t32 or attention-b" ;;
+esac
+INTERLEAVED_CACHE_MB=${INTERLEAVED_CACHE_MB:-$default_interleaved_cache_mb}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CTX_ALLOC=33025
 VOCAB_SIZE=129280
 LOGITS_BYTES=$((VOCAB_SIZE * 4))
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-OUTPUT_DIR=${Q8_WARP_INTERLEAVED_PRODUCTION_AB_DIR:-$repo_dir/sm75-q8-warp-interleaved-production-ab-$stamp}
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-b ]]; then
+    output_prefix=sm75-q8-attention-b-warp-interleaved-production-ab
+else
+    output_prefix=sm75-q8-warp-interleaved-production-ab
+fi
+OUTPUT_DIR=${Q8_WARP_INTERLEAVED_PRODUCTION_AB_DIR:-$repo_dir/$output_prefix-$stamp}
 layouts=(mixed15 all43)
 models=("$MIXED_MODEL" "$ALL43_MODEL")
 
@@ -44,9 +55,13 @@ for item in "TG_TOKENS:$TG_TOKENS" "EXACT_TOKENS:$EXACT_TOKENS" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 done
+minimum_interleaved_cache_mb=768
+[[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]] ||
+    minimum_interleaved_cache_mb=1536
 (( TG_TOKENS == 256 && EXACT_TOKENS == 16 && PREFILL_CHUNK == 2048 &&
-   PIPELINE_MB == 512 && INTERLEAVED_CACHE_MB >= 768 )) ||
-    die "require TG=256 EXACT=16 PREFILL_CHUNK=2048 PIPELINE_MB=512 cache>=768 MiB"
+   PIPELINE_MB == 512 &&
+   INTERLEAVED_CACHE_MB >= minimum_interleaved_cache_mb )) ||
+    die "require TG=256 EXACT=16 PREFILL_CHUNK=2048 PIPELINE_MB=512 cache>=${minimum_interleaved_cache_mb} MiB"
 for flag in SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
@@ -145,6 +160,11 @@ fi
     }
 grep -Fq 'SM75 warp-interleaved Q8 engine T32 production default exact' "$OUTPUT_DIR/smoke.log" ||
     die "interleaved engine regression marker missing"
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-b ]]; then
+    grep -Fq 'SM75 warp-interleaved Q8 attention-output A+B exact' \
+        "$OUTPUT_DIR/smoke.log" ||
+        die "attention-output interleaved engine regression marker missing"
+fi
 "${clean[@]}" ./tests/cuda_sm75_q8_warp_interleaved --correctness-only \
     >"$OUTPUT_DIR/interleaved-correctness.log" 2>&1 || {
         tail -n 220 "$OUTPUT_DIR/interleaved-correctness.log" >&2
@@ -166,7 +186,7 @@ phase=manifest
         "$(sha256sum "$PROMPT" | awk '{print $1}')"
     printf 'gpu_devices=%s\nrequired_power_limits_w=%s\nstage_split=22/21\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
-    printf 'candidate_scope=single-token-q8-t32-1024x32768\n'
+    printf 'candidate_scope=%s\n' "$Q8_INTERLEAVED_PRODUCTION_TARGET"
     printf 'candidate_cache_mib_per_device=%s\n' "$INTERLEAVED_CACHE_MB"
     printf 'throughput_repeats=1\nfrontiers=512,4096,32768\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
@@ -211,24 +231,51 @@ validate_csv() {
 
 validate_dispatch() {
     local variant=$1 log=$2
-    if [[ $variant == control ]]; then
-        ! grep -Fq 'SM75 warp-interleaved Q8 summary' "$log"
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
+        if [[ $variant == control ]]; then
+            ! grep -Fq 'SM75 warp-interleaved Q8 summary' "$log"
+        else
+            awk '
+                /SM75 warp-interleaved Q8 summary/ {
+                    seen++; calls=fills=fallbacks=-1
+                    for (i=1; i<=NF; i++) {
+                        split($i,a,"=")
+                        if (a[1]=="calls") calls=a[2]+0
+                        if (a[1]=="fills") fills=a[2]+0
+                        if (a[1]=="fallbacks") fallbacks=a[2]+0
+                    }
+                    if (calls<fills || fills<43 || fills>86 || fallbacks!=0) bad=1
+                }
+                END {exit !(seen==1 && !bad)}
+            ' "$log"
+            [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=1024 out=32768$' \
+                  "$log") -ge 43 ]]
+        fi
     else
-        awk '
+        awk -v candidate="$([[ $variant == interleaved ]] && printf 1 || printf 0)" '
             /SM75 warp-interleaved Q8 summary/ {
-                seen++; calls=fills=fallbacks=-1
+                seen++; calls=attn_a=attn_b=direct_xq=k128=fills=fallbacks=-1
                 for (i=1; i<=NF; i++) {
                     split($i,a,"=")
                     if (a[1]=="calls") calls=a[2]+0
+                    if (a[1]=="attn-a-calls") attn_a=a[2]+0
+                    if (a[1]=="attn-b-calls") attn_b=a[2]+0
+                    if (a[1]=="attn-b-direct-xq-calls") direct_xq=a[2]+0
+                    if (a[1]=="attn-b-k128-calls") k128=a[2]+0
                     if (a[1]=="fills") fills=a[2]+0
                     if (a[1]=="fallbacks") fallbacks=a[2]+0
                 }
-                if (calls<fills || fills<43 || fills>86 || fallbacks!=0) bad=1
+                if (calls<=0 || attn_a!=0 || fallbacks!=0) bad=1
+                if (!candidate && (attn_b!=0 || direct_xq!=0 || k128!=0)) bad=1
+                if (candidate && (attn_b<=0 || direct_xq!=attn_b ||
+                                  k128!=attn_b || fills<43)) bad=1
             }
             END {exit !(seen==1 && !bad)}
         ' "$log"
-        [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=1024 out=32768$' \
-              "$log") -ge 43 ]]
+        if [[ $variant == interleaved ]]; then
+            [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=4096 out=' \
+                  "$log") -ge 43 ]]
+        fi
     fi
 }
 
@@ -273,12 +320,28 @@ PY
 run_engine() {
     local model=$1 variant=$2 tokens=$3 base=$4 logits=${5:-} rc=0
     local -a candidate=() cmd
-    if [[ $variant == control ]]; then
-        candidate=(DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=0)
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
+        if [[ $variant == control ]]; then
+            candidate=(DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=0)
+        else
+            candidate=(
+                "DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=$INTERLEAVED_CACHE_MB"
+                DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
+            )
+        fi
+    elif [[ $variant == control ]]; then
+        candidate=(
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=0
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE=0
+        )
     else
         candidate=(
             "DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=$INTERLEAVED_CACHE_MB"
             DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=0
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=1
         )
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
@@ -310,8 +373,8 @@ for i in 0 1; do
     layout=${layouts[$i]}; model=${models[$i]}
     for variant in control interleaved; do
         base="$OUTPUT_DIR/runs/$layout-$variant"
-        printf 'Warp-interleaved Q8 production A/B model=%s variant=%s...\n' \
-            "$layout" "$variant"
+        printf 'Warp-interleaved Q8 %s production A/B model=%s variant=%s...\n' \
+            "$Q8_INTERLEAVED_PRODUCTION_TARGET" "$layout" "$variant"
         run_engine "$model" "$variant" "$TG_TOKENS" "$base" || {
             tail -n 240 "$base.log" >&2 || true
             die "$layout $variant throughput run failed"
@@ -329,8 +392,8 @@ for i in 0 1; do
     for variant in control interleaved; do
         base="$OUTPUT_DIR/exact/$layout-$variant"
         logits="$base-logits"; mkdir -p "$logits"
-        printf 'Exact warp-interleaved Q8 logits model=%s variant=%s...\n' \
-            "$layout" "$variant"
+        printf 'Exact warp-interleaved Q8 %s logits model=%s variant=%s...\n' \
+            "$Q8_INTERLEAVED_PRODUCTION_TARGET" "$layout" "$variant"
         run_engine "$model" "$variant" "$EXACT_TOKENS" "$base" "$logits" || {
             tail -n 240 "$base.log" >&2 || true
             die "$layout $variant exact run failed"
@@ -350,7 +413,8 @@ done
 
 phase=summarize
 {
-    printf '# SM75 four-GPU warp-interleaved Q8 decode A/B\n\n'
+    printf '# SM75 four-GPU warp-interleaved Q8 %s decode A/B\n\n' \
+        "$Q8_INTERLEAVED_PRODUCTION_TARGET"
     printf '| Model | Context | Control tok/s | Interleaved tok/s | Speedup |\n'
     printf '| --- | ---: | ---: | ---: | ---: |\n'
     for layout in "${layouts[@]}"; do

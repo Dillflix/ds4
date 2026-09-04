@@ -5074,6 +5074,34 @@ This experiment does not change production defaults. A four-GPU production
 A/B with exact logits and explicit interleaved-cache residency is required
 before either selector can be promoted.
 
+The B follow-up removes the canonical activation scratch plus repack launch by
+quantizing directly into the interleaved word planes. It also specializes the
+production 4096-wide slice as four fixed 32-block groups, eliminating dynamic
+group/tail control without changing DP4A, floating accumulation, or warp
+reduction order. The bounded harness reports three arms: canonical control,
+the original interleaved implementation, and the direct-XQ/fixed-K128
+candidate. The two refinements can be rolled back independently with
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ=0` and
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=0`.
+
+The B-only production A/B leaves the accepted T32 interleaved default enabled
+in both arms, explicitly keeps A disabled, and changes only the B selector.
+Its 1536 MiB per-device cache floor accommodates the T32 and B representations
+together. It requires direct-XQ and K128 dispatch on every candidate B call,
+zero cache fallback, stable GPU identity, and byte-identical logits for both
+models at all three frontiers.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+INTERLEAVED_CACHE_MB=1536 TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-attention-b-production-ab.sh
+```
+
 ### SM75 width-1024 compressor projection layout diagnostic
 
 `cuda-sm75-compressor-projection-layout.sh` targets the expensive one-token

@@ -143,19 +143,24 @@ for scenario in q8-grouped-a-half q8-kslice-t256; do
     grep -Eq '^candidate_speedup=[0-9]' "$log" || die "$scenario timing result missing"
     if [[ $scenario == q8-grouped-a-half ]]; then
         counter=attn-a-calls
+        require_b_refinements=0
     else
         counter=attn-b-calls
+        require_b_refinements=1
     fi
-    awk -v counter="$counter" '
+    awk -v counter="$counter" -v require_b="$require_b_refinements" '
         /SM75 warp-interleaved Q8 summary/ {
-            seen++; selected=fills=fallbacks=-1
+            seen++; selected=direct_xq=k128=fills=fallbacks=-1
             for (i=1; i<=NF; i++) {
                 split($i,a,"=")
                 if (a[1]==counter) selected=a[2]+0
+                if (a[1]=="attn-b-direct-xq-calls") direct_xq=a[2]+0
+                if (a[1]=="attn-b-k128-calls") k128=a[2]+0
                 if (a[1]=="fills") fills=a[2]+0
                 if (a[1]=="fallbacks") fallbacks=a[2]+0
             }
             if (selected<1 || fills!=1 || fallbacks!=0) bad=1
+            if (require_b && (direct_xq<1 || k128<1)) bad=1
         }
         END {exit !(seen==1 && !bad)}
     ' "$log" || die "$scenario silently missed the candidate dispatch"
@@ -195,6 +200,13 @@ phase=summarization
         speedup=$(awk -F= '$1=="candidate_speedup" {print $2}' "$log")
         printf '| %s | %s | %s | %sx |\n' "$scenario" "$control" "$candidate" "$speedup"
     done
+    b_log="$OUTPUT_DIR/q8-kslice-t256.log"
+    b_baseline=$(awk -F= '$1=="baseline_interleaved_median_ms" {print $2}' \
+        "$b_log")
+    b_incremental=$(awk -F= '$1=="candidate_over_baseline_speedup" {print $2}' \
+        "$b_log")
+    printf '\nB original interleaved median: %s ms; direct-XQ/K128 incremental speedup: %sx.\n' \
+        "$b_baseline" "$b_incremental"
     printf '\nCandidate selectors remain opt-in and independently rollbackable.\n'
 } >"$OUTPUT_DIR/summary.md"
 cat "$OUTPUT_DIR/summary.md"

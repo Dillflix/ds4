@@ -894,6 +894,11 @@ static int run_q8_kslice(void) {
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "0", 1);
         if (!RUN_Q8_KSLICE() || !ds4_gpu_synchronize()) goto timing_error;
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "1", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ", "0", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128", "0", 1);
+        if (!RUN_Q8_KSLICE() || !ds4_gpu_synchronize()) goto timing_error;
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ", "1", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128", "1", 1);
         if (!RUN_Q8_KSLICE() || !ds4_gpu_synchronize()) goto timing_error;
         const uint32_t rounds = positive_env_u32("TIMING_ROUNDS", 9u);
         const uint32_t repeats = positive_env_u32("TIMING_REPEATS", 100u);
@@ -902,17 +907,23 @@ static int run_q8_kslice(void) {
             goto timing_error;
         }
         float *control_ms = (float *)malloc(rounds * sizeof(float));
+        float *baseline_ms = (float *)malloc(rounds * sizeof(float));
         float *candidate_ms = (float *)malloc(rounds * sizeof(float));
         ds4_gpu_timer *timer = ds4_gpu_timer_create();
-        if (!control_ms || !candidate_ms || !timer) {
-            free(candidate_ms); free(control_ms); ds4_gpu_timer_free(timer);
+        if (!control_ms || !baseline_ms || !candidate_ms || !timer) {
+            free(candidate_ms); free(baseline_ms); free(control_ms);
+            ds4_gpu_timer_free(timer);
             goto timing_error;
         }
         for (uint32_t round = 0u; round < rounds; ++round) {
-            for (uint32_t order = 0u; order < 2u; ++order) {
-                const int candidate = ((round & 1u) ^ order) != 0u;
+            for (uint32_t order = 0u; order < 3u; ++order) {
+                const uint32_t arm = (round + order) % 3u;
                 (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE",
-                             candidate ? "1" : "0", 1);
+                             arm == 0u ? "0" : "1", 1);
+                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ",
+                             arm == 2u ? "1" : "0", 1);
+                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128",
+                             arm == 2u ? "1" : "0", 1);
                 if (!ds4_gpu_timer_record_start(timer)) goto timing_alloc_error;
                 for (uint32_t repeat = 0u; repeat < repeats; ++repeat) {
                     if (!RUN_Q8_KSLICE()) goto timing_alloc_error;
@@ -921,26 +932,36 @@ static int run_q8_kslice(void) {
                 float elapsed = 0.0f;
                 if (!ds4_gpu_timer_elapsed_ms(timer, &elapsed))
                     goto timing_alloc_error;
-                (candidate ? candidate_ms : control_ms)[round] =
-                    elapsed / (float)repeats;
+                float *samples = arm == 0u ? control_ms :
+                    (arm == 1u ? baseline_ms : candidate_ms);
+                samples[round] = elapsed / (float)repeats;
             }
         }
         qsort(control_ms, rounds, sizeof(float), compare_float);
+        qsort(baseline_ms, rounds, sizeof(float), compare_float);
         qsort(candidate_ms, rounds, sizeof(float), compare_float);
         printf("timing_scope=production-shape-owned-call-inclusive\n"
                "timing_rounds=%u\ntiming_repeats=%u\n"
-               "candidate_kind=q8-kslice-warp-interleaved\n"
-               "control_median_ms=%.9g\ncandidate_median_ms=%.9g\n"
+               "baseline_kind=q8-kslice-warp-interleaved\n"
+               "candidate_kind=q8-kslice-warp-interleaved-direct-xq-k128\n"
+               "control_median_ms=%.9g\n"
+               "baseline_interleaved_median_ms=%.9g\n"
+               "candidate_median_ms=%.9g\n"
+               "baseline_over_control_speedup=%.9g\n"
+               "candidate_over_baseline_speedup=%.9g\n"
                "candidate_speedup=%.9g\n",
                rounds, repeats, control_ms[rounds / 2u],
+               baseline_ms[rounds / 2u],
                candidate_ms[rounds / 2u],
+               control_ms[rounds / 2u] / baseline_ms[rounds / 2u],
+               baseline_ms[rounds / 2u] / candidate_ms[rounds / 2u],
                control_ms[rounds / 2u] / candidate_ms[rounds / 2u]);
         ds4_gpu_timer_free(timer);
-        free(candidate_ms); free(control_ms);
+        free(candidate_ms); free(baseline_ms); free(control_ms);
         goto timing_done;
 timing_alloc_error:
         ds4_gpu_timer_free(timer);
-        free(candidate_ms); free(control_ms);
+        free(candidate_ms); free(baseline_ms); free(control_ms);
 timing_error:
         fprintf(stderr, "error: K-slice interleaved timing failed\n");
         goto cleanup;
@@ -949,6 +970,8 @@ timing_done:;
     ok = verify_zero_tensor(out, out_dim, "q8-kslice-t256");
 cleanup:
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128");
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
 #undef RUN_Q8_KSLICE

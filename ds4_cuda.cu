@@ -1419,6 +1419,8 @@ static std::atomic<uint64_t> g_q8_f16_partner_offloads = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_calls = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_attn_a_calls = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_attn_b_calls = 0;
+static std::atomic<uint64_t> g_q8_warp_interleaved_attn_b_direct_xq_calls = 0;
+static std::atomic<uint64_t> g_q8_warp_interleaved_attn_b_k128_calls = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_fills = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_fallbacks = 0;
 static std::mutex g_q8_warp_interleaved_mutex;
@@ -2183,6 +2185,10 @@ static void cuda_q8_f16_plan_reset(void) {
     g_q8_warp_interleaved_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_b_calls.store(0, std::memory_order_relaxed);
+    g_q8_warp_interleaved_attn_b_direct_xq_calls.store(
+        0, std::memory_order_relaxed);
+    g_q8_warp_interleaved_attn_b_k128_calls.store(
+        0, std::memory_order_relaxed);
     g_q8_warp_interleaved_fills.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_fallbacks.store(0, std::memory_order_relaxed);
 }
@@ -5469,6 +5475,12 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_q8_warp_interleaved_attn_a_calls.load(std::memory_order_relaxed);
     const uint64_t interleaved_attn_b_calls =
         g_q8_warp_interleaved_attn_b_calls.load(std::memory_order_relaxed);
+    const uint64_t interleaved_attn_b_direct_xq_calls =
+        g_q8_warp_interleaved_attn_b_direct_xq_calls.load(
+            std::memory_order_relaxed);
+    const uint64_t interleaved_attn_b_k128_calls =
+        g_q8_warp_interleaved_attn_b_k128_calls.load(
+            std::memory_order_relaxed);
     const uint64_t interleaved_fills =
         g_q8_warp_interleaved_fills.load(std::memory_order_relaxed);
     const uint64_t interleaved_fallbacks =
@@ -5477,10 +5489,12 @@ extern "C" void ds4_gpu_cleanup(void) {
         interleaved_attn_b_calls != 0u || interleaved_fills != 0u ||
         interleaved_fallbacks != 0u) {
         fprintf(stderr,
-                "ds4: SM75 warp-interleaved Q8 summary calls=%llu attn-a-calls=%llu attn-b-calls=%llu fills=%llu fallbacks=%llu resident=%.2f MiB\n",
+                "ds4: SM75 warp-interleaved Q8 summary calls=%llu attn-a-calls=%llu attn-b-calls=%llu attn-b-direct-xq-calls=%llu attn-b-k128-calls=%llu fills=%llu fallbacks=%llu resident=%.2f MiB\n",
                 (unsigned long long)interleaved_calls,
                 (unsigned long long)interleaved_attn_a_calls,
                 (unsigned long long)interleaved_attn_b_calls,
+                (unsigned long long)interleaved_attn_b_direct_xq_calls,
+                (unsigned long long)interleaved_attn_b_k128_calls,
                 (unsigned long long)interleaved_fills,
                 (unsigned long long)interleaved_fallbacks,
                 (double)g_q8_warp_interleaved_bytes / 1048576.0);
@@ -8032,6 +8046,10 @@ extern "C" void ds4_gpu_q8_f16_plan_begin(void) {
     g_q8_warp_interleaved_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_a_calls.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_attn_b_calls.store(0, std::memory_order_relaxed);
+    g_q8_warp_interleaved_attn_b_direct_xq_calls.store(
+        0, std::memory_order_relaxed);
+    g_q8_warp_interleaved_attn_b_k128_calls.store(
+        0, std::memory_order_relaxed);
     g_q8_warp_interleaved_fills.store(0, std::memory_order_relaxed);
     g_q8_warp_interleaved_fallbacks.store(0, std::memory_order_relaxed);
 }
@@ -8654,6 +8672,55 @@ __global__ static void quantize_q8_0_f32_kernel(
     }
 }
 
+/* Quantize directly into the word-major activation layout consumed by the
+ * warp-interleaved one-token kernels.  The reduction and rounding are kept
+ * identical to quantize_q8_0_f32_kernel; only the final byte address changes.
+ * This removes a second kernel launch and the canonical Q8 scratch copy. */
+__global__ static void quantize_q8_0_f32_interleaved_kernel(
+        unsigned char *xq_words,
+        float *xscale,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t blocks) {
+    const uint64_t b = blockIdx.x;
+    const uint64_t tok = blockIdx.y;
+    if (b >= blocks) return;
+    const uint64_t i0 = b * 32u;
+    const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+    const float *xr = x + tok * in_dim + i0;
+
+    float a = 0.0f;
+    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
+    __shared__ float vals[32];
+    vals[threadIdx.x] = a;
+    __syncthreads();
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            vals[threadIdx.x] =
+                fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float d = vals[0] / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (threadIdx.x == 0u) xscale[tok * blocks + b] = d;
+
+    int v = 0;
+    if (threadIdx.x < bn) {
+        v = (int)lrintf(xr[threadIdx.x] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    }
+    const uint64_t first = (b / 32u) * 32u;
+    const uint32_t lane = (uint32_t)(b - first);
+    const uint32_t count = (uint32_t)(
+        blocks - first < 32u ? blocks - first : 32u);
+    const uint32_t word = threadIdx.x >> 2u;
+    const uint32_t byte = threadIdx.x & 3u;
+    const uint64_t dst = tok * blocks * 32u + first * 32u +
+        4u * ((uint64_t)word * count + lane) + byte;
+    xq_words[dst] = (unsigned char)(int8_t)v;
+}
+
 __global__ static void quantize_q8_0_group_slice_rows_kernel(
         int8_t *xq,
         float *xscale,
@@ -9048,6 +9115,49 @@ __global__ static void matmul_q8_0_kslice_preq_warp8_interleaved_kernel(
                 dot += (int32_t)(int8_t)(ww >> (8u * (i & 3u))) *
                        (int32_t)(int8_t)(xw >> (8u * (i & 3u)));
             }
+        }
+        acc += __half2float(scale) * xscale[block] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+/* The attention-output B projection always consumes the complete 4096-value
+ * low-rank vector.  Specializing that invariant removes the dynamic group and
+ * tail machinery from the hot loop while retaining the canonical four-group
+ * accumulation order exactly. */
+__global__ static void matmul_q8_0_kslice_preq_warp8_interleaved_k128_kernel(
+        float *out,
+        const unsigned char *w,
+        const unsigned char *xq_words,
+        const float *xscale,
+        uint64_t out_dim) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u +
+                         (threadIdx.x >> 5u);
+    const uint64_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    out += tok * out_dim;
+    xq_words += tok * 128u * 32u;
+    xscale += tok * 128u;
+    const unsigned char *weight_row = w + row * (128u * 34u);
+    float acc = 0.0f;
+#pragma unroll
+    for (uint32_t group = 0u; group < 4u; ++group) {
+        const uint32_t first = group * 32u;
+        const uint32_t block = first + lane;
+        const unsigned char *group_base = weight_row + first * 34u;
+        const __half scale = *(const __half *)(group_base + 2u * lane);
+        const unsigned char *weight_words = group_base + 64u;
+        const unsigned char *activation_words = xq_words + first * 32u;
+        int32_t dot = 0;
+#pragma unroll
+        for (uint32_t word = 0u; word < 8u; ++word) {
+            dot = __dp4a(q8_warp_interleaved_word(
+                             weight_words, 32u, lane, word),
+                         q8_warp_interleaved_word(
+                             activation_words, 32u, lane, word),
+                         dot);
         }
         acc += __half2float(scale) * xscale[block] * (float)dot;
     }
@@ -20896,42 +21006,72 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             full_blocks, block_start, physical_device, wptr);
     }
 
+    const int direct_interleaved_xq = interleaved_w &&
+        cuda_env_flag_enabled(
+            "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ", 1);
     const uint64_t xq_bytes = n_tok * slice_blocks * 32u;
-    const uint64_t interleaved_xq_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t interleaved_xq_offset = direct_interleaved_xq
+        ? 0u : ((xq_bytes + 15u) & ~15ull);
     const uint64_t scale_offset = interleaved_w
         ? ((interleaved_xq_offset + xq_bytes + 15u) & ~15ull)
-        : interleaved_xq_offset;
+        : ((xq_bytes + 15u) & ~15ull);
     const uint64_t tmp_bytes =
         scale_offset + n_tok * slice_blocks * sizeof(float);
     void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "q8_0 kslice prequant");
     if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
+    int8_t *xq = direct_interleaved_xq ? NULL : (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
-            xq,
-            xscale,
-            (const float *)x->ptr,
-            in_count,
-            slice_blocks);
+    if (direct_interleaved_xq) {
+        quantize_q8_0_f32_interleaved_kernel<<<qgrid, 32>>>(
+                (unsigned char *)tmp,
+                xscale,
+                (const float *)x->ptr,
+                in_count,
+                slice_blocks);
+        g_q8_warp_interleaved_attn_b_direct_xq_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                xq,
+                xscale,
+                (const float *)x->ptr,
+                in_count,
+                slice_blocks);
+    }
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);
     if (interleaved_w) {
         unsigned char *interleaved_xq =
             (unsigned char *)tmp + interleaved_xq_offset;
-        const dim3 pack_grid((unsigned)((slice_blocks + 31u) / 32u),
-                             (unsigned)n_tok, 1u);
-        q8_0_xq_warp_interleaved_pack_rows_kernel<<<pack_grid, 32>>>(
-            interleaved_xq, xq, slice_blocks, n_tok);
-        if (!cuda_ok(cudaGetLastError(),
-                     "matmul_q8_0_kslice interleaved activation pack launch")) {
-            return 0;
+        if (!direct_interleaved_xq) {
+            const dim3 pack_grid((unsigned)((slice_blocks + 31u) / 32u),
+                                 (unsigned)n_tok, 1u);
+            q8_0_xq_warp_interleaved_pack_rows_kernel<<<pack_grid, 32>>>(
+                interleaved_xq, xq, slice_blocks, n_tok);
+            if (!cuda_ok(
+                    cudaGetLastError(),
+                    "matmul_q8_0_kslice interleaved activation pack launch")) {
+                return 0;
+            }
         }
-        matmul_q8_0_kslice_preq_warp8_interleaved_kernel<<<grid, 256>>>(
-            (float *)out->ptr, interleaved_w, interleaved_xq, xscale,
-            in_count, out_dim, slice_blocks);
+        const int use_k128 = slice_blocks == 128u && in_count == 4096u &&
+            cuda_env_flag_enabled(
+                "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128", 1);
+        if (use_k128) {
+            matmul_q8_0_kslice_preq_warp8_interleaved_k128_kernel
+                <<<grid, 256>>>(
+                    (float *)out->ptr, interleaved_w, interleaved_xq,
+                    xscale, out_dim);
+            g_q8_warp_interleaved_attn_b_k128_calls.fetch_add(
+                1u, std::memory_order_relaxed);
+        } else {
+            matmul_q8_0_kslice_preq_warp8_interleaved_kernel<<<grid, 256>>>(
+                (float *)out->ptr, interleaved_w, interleaved_xq, xscale,
+                in_count, out_dim, slice_blocks);
+        }
         g_q8_warp_interleaved_attn_b_calls.fetch_add(
             1u, std::memory_order_relaxed);
         return cuda_ok(cudaGetLastError(),
