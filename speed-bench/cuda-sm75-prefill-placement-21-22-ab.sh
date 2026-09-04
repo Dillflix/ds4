@@ -16,7 +16,7 @@ Optional environment:
   PROMPT=/absolute/path/to/prompt.txt
   GPU_DEVICES=0,3,1,2
   GPU_VRAM=auto
-  REQUIRED_POWER_LIMITS_W=250,260,250,250
+  REQUIRED_POWER_LIMITS_W=250,260,250,250  physical GPU 0,1,2,3 order
   REPEATS=3
   TELEMETRY_INTERVAL_MS=500
   SKIP_BUILD=0
@@ -107,13 +107,19 @@ printf '%s\n' "${inherited_ds4[@]:-}" >"$OUTPUT_DIR/provenance/cleared-ds4-env.t
 IFS=, read -r -a gpu_ids <<<"$GPU_DEVICES"
 IFS=, read -r -a required_limits <<<"$REQUIRED_POWER_LIMITS_W"
 (( ${#gpu_ids[@]} == 4 && ${#required_limits[@]} == 4 )) ||
-    die "GPU_DEVICES and REQUIRED_POWER_LIMITS_W must each contain four values"
+    die "GPU_DEVICES must select four GPUs and REQUIRED_POWER_LIMITS_W must" \
+        "contain physical GPU 0,1,2,3 limits"
 for i in 0 1 2 3; do
-    actual=$(nvidia-smi -i "${gpu_ids[$i]}" --query-gpu=power.limit \
+    gpu=${gpu_ids[$i]}
+    [[ $gpu =~ ^[0-3]$ ]] || die "invalid physical GPU index: $gpu"
+    want=${required_limits[$gpu]}
+    [[ $want =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        die "invalid power limit for physical GPU $gpu: $want"
+    actual=$(nvidia-smi -i "$gpu" --query-gpu=power.limit \
         --format=csv,noheader,nounits | tr -d '[:space:]')
-    awk -v a="$actual" -v r="${required_limits[$i]}" \
+    awk -v a="$actual" -v r="$want" \
         'BEGIN { exit !((a-r < 0.01) && (r-a < 0.01)) }' ||
-        die "GPU ${gpu_ids[$i]} power limit is $actual W, expected ${required_limits[$i]} W"
+        die "GPU $gpu power limit is $actual W, expected $want W"
 done
 
 capture_health() {

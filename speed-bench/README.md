@@ -5285,6 +5285,8 @@ pair-0 attention-row suppression, pair-1 attention-row split, and unchanged
 FP32 T256 final results. The runner alternates arm order, captures 500 ms GPU
 telemetry, requires byte-identical frontier logits at 512, 4096, and 32768,
 and reports paired throughput and per-pair activity balance.
+`REQUIRED_POWER_LIMITS_W` is always listed in physical GPU 0,1,2,3 order,
+independent of the logical tier order in `GPU_DEVICES`.
 
 The stage-aware dense-cache planner accepts only the two balanced four-GPU
 placements, 22/21 and 21/22. Other transformer placements remain rejected.
