@@ -1325,8 +1325,8 @@ requires a reboot and must not be combined with a later process history.
 
 `cuda-sm75-prefill-indexer-pair0-probe.sh` removes the earlier diagnostic
 confound between pair-0 prefill attention and pair-0 prefill indexer splitting.
-Both one-shot arms keep pair-0 attention disabled, retain pair-1 attention and
-indexer splitting, use the default fused T32 path, and run the same 32K
+The accepted two-arm comparison keeps pair-0 attention disabled, retains pair-1 attention and
+indexer splitting, uses the default fused T32 path, and runs the same 32K
 production-shaped prefill. `VARIANT=indexer-on` alone runs pair-0 indexer
 score/top-k 50/50 and gathers the partner's integer top-k rows home before
 unsplit attention; `VARIANT=control` keeps that pair's indexer work home. Run
@@ -1334,6 +1334,22 @@ the candidate first. If it leaves all GPUs healthy, run the control separately
 with `REFERENCE_DIR` pointing at the candidate directory; the control then
 requires every dumped frontier-logit file to be byte-identical. Separate
 processes are mandatory because a GPU-loss arm requires a reboot.
+
+`VARIANT=attention-indexer-on` is a separate destructive-fault probe. It
+explicitly restores pair-0 attention splitting alongside the already accepted
+pair-0 indexer split, requires the all-pairs cache mirrors and both row-split
+dispatches, and requires evidence that scratch growth quiesced all four tiers
+before replacement. It has no control/resume dependency; run it once and
+return its archive after either completion or GPU loss.
+
+```bash
+VARIANT=attention-indexer-on \
+MODEL_LAYOUT=mixed15 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-prefill-indexer-pair0-probe.sh
+```
 
 The accepted mixed15 candidate/control pair measured 510.42 versus 498.81
 tok/s (+2.33%); the all43-Q3A4 pair measured 479.59 versus 468.11 tok/s
@@ -5279,12 +5295,17 @@ bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 
 `cuda-sm75-prefill-placement-21-22-ab.sh` compares the candidate 21/22
 transformer-stage boundary with the accepted 22/21 boundary on both mixed15
-and all43. The stage boundary is the only changed execution setting: both arms
-retain the production 512-token pipeline, complete dense-F16 cache admission,
-pair-0 attention-row suppression, pair-1 attention-row split, and unchanged
-FP32 T256 final results. The runner alternates arm order, captures 500 ms GPU
+and all43. Moving the boundary also moves layer 21 from pair 0, whose stable
+policy uses home attention, to pair 1, whose policy uses row-split attention.
+The harness therefore keeps layer 21 on home attention in both arms while
+retaining row splitting for every other pair-1 layer; without that match the
+old A/B accidentally compared two attention algorithms and changed logits.
+Both arms retain the production 512-token pipeline, complete dense-F16 cache
+admission, pair-0 attention-row suppression, and unchanged FP32 T256 final
+results. The runner alternates arm order, captures 500 ms GPU
 telemetry, requires byte-identical frontier logits at 512, 4096, and 32768,
-and reports paired throughput and per-pair activity balance.
+exports each dense-cache plan/binding inventory, and reports paired throughput
+and per-pair activity balance.
 `REQUIRED_POWER_LIMITS_W` is always listed in physical GPU 0,1,2,3 order,
 independent of the logical tier order in `GPU_DEVICES`.
 

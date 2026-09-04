@@ -6,9 +6,11 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     cat <<'EOF'
 Qualify the 21/22 four-GPU SM75 prefill placement against production 22/21.
 
-The A/B changes only DS4_CUDA_EP_STAGE_SPLIT. Both arms retain the production
-pipeline, dense-F16 cache plan, pair-0 attention-row suppression, pair-1
-attention-row split, and FP32 T256 final-result boundary.
+The A/B changes only DS4_CUDA_EP_STAGE_SPLIT. Layer 21 uses home attention in
+both arms because it crosses between pair 0 (production home-attention policy)
+and pair 1 (production row-split policy); every other pair-1 layer retains
+row splitting. Both arms retain the production pipeline, dense-F16 cache plan,
+pair-0 attention-row suppression, and FP32 T256 final-result boundary.
 
 Optional environment:
   MIXED_MODEL=/absolute/path/to/mixed15.gguf
@@ -166,6 +168,7 @@ phase=manifest
     printf 'contexts=512,4096,32768\nrepeats=%s\nprefill_chunk=%s\n' \
         "$REPEATS" "$PREFILL_CHUNK"
     printf 't256_result_boundary=fp32-unchanged\nchanged_axis=transformer-stage-boundary-only\n'
+    printf 'matched_attention_boundary_layer=21\nmatched_attention_policy=home-compute\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
     printf '\ntopology:\n'; nvidia-smi topo -m
@@ -181,6 +184,8 @@ production=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
     DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0
+    DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS=21
+    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
     DS4_CUDA_SCRATCH_REPLACEMENT_AUDIT=1
     DS4_BENCH_UNTIMED_WARMUP_TOKENS=512
     DS4_METAL_GRAPH_PREFILL_PROFILE=1
@@ -204,9 +209,13 @@ validate_run() {
     grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
     [[ $(grep -Fc 'CUDA prefill indexer score/top-k row split enabled:' "$log") == 2 ]] || return 1
     grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' "$log" || return 1
+    grep -Fq 'CUDA prefill attention row compute layer-scoped disable: layers=21' "$log" || return 1
+    ! grep -Eq 'CUDA prefill attention row audit dispatch=split .*layer=21 ' "$log" || return 1
+    grep -Eq 'CUDA prefill attention row audit dispatch=split .*home=1 partner=3 ' "$log" || return 1
+    grep -Fq 'CUDA scratch replacement quiesced all tiers:' "$log" || return 1
+    [[ -s $base.q8-plan.csv && -s $base.q8-bindings.csv ]] || return 1
     ! grep -Fqi 'T256 FP16 final attention result enabled' "$log" || return 1
     grep -Eq 'CUDA T32 f16-output fused summary: local=[0-9]+ partner=[1-9][0-9]*' "$log" || return 1
-    grep -Fq 'CUDA scratch replacement quiesced all tiers:' "$log" || return 1
     capture_health "$base.post-gpu.csv" || return 1
     cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv"
 }
@@ -230,7 +239,10 @@ for ((repeat=1; repeat<=REPEATS; repeat++)); do
                 "$layout" "$repeat" "$REPEATS" "$slot" "$split" "$((43-split))"
             start_telemetry "$telemetry"
             run_status=0
-            "${production[@]}" "DS4_CUDA_EP_STAGE_SPLIT=$split" ./ds4-bench \
+            "${production[@]}" "DS4_CUDA_EP_STAGE_SPLIT=$split" \
+                "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$base.q8-plan.csv" \
+                "DS4_CUDA_Q8_BINDING_STATE_CSV=$base.q8-bindings.csv" \
+                ./ds4-bench \
                 --cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES" \
                 --gpu-vram "$GPU_VRAM" --model "$model" --prompt-file "$PROMPT" \
                 --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC" \

@@ -3,16 +3,15 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Run one production-shaped 32K prefill process with pair-0 attention row
-splitting disabled and pair-0 prefill indexer row splitting independently
-selected.
+Run one production-shaped 32K prefill process with independently selected
+pair-0 attention and prefill-indexer row splitting.
 
 Run VARIANT=indexer-on first. If it completes with healthy GPUs, run
 VARIANT=control as a separate process. This runner deliberately has no resume
 mode because a GPU-loss result requires a reboot.
 
 Optional environment:
-  VARIANT=indexer-on|control  default: indexer-on
+  VARIANT=attention-indexer-on|indexer-on|control  default: indexer-on
   MODEL_LAYOUT=mixed15|all43 default: mixed15
   MIXED_MODEL=...            default: gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf
   ALL43_MODEL=...            default: gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf
@@ -27,10 +26,12 @@ Optional environment:
   REFERENCE_DIR=...          control-only completed indexer-on directory
   PREFILL_INDEXER_PAIR0_PROBE_DIR=...
 
-Both variants keep pair-1 attention and prefill-indexer row splitting active,
-use the default fused T32 FP16-output path, and differ only in whether pair 0
-also splits the prefill indexer. Pair-0 home attention consumes the exact
-gathered top-k result in indexer-on.
+All variants keep pair-1 attention and prefill-indexer row splitting active
+and use the default fused T32 FP16-output path. attention-indexer-on explicitly
+restores both pair-0 row splits and is a one-shot fault probe. indexer-on keeps
+pair-0 attention disabled but splits its indexer; control keeps both pair-0
+computations home. Pair-0 home attention consumes the exact gathered top-k
+result in indexer-on.
 EOF
 }
 
@@ -50,9 +51,19 @@ case "$MODEL_LAYOUT" in
     *) die "MODEL_LAYOUT must be mixed15 or all43" ;;
 esac
 case "$VARIANT" in
-    indexer-on) INDEXER_PAIRS=0,1 ;;
-    control) INDEXER_PAIRS=1 ;;
-    *) die "VARIANT must be indexer-on or control" ;;
+    attention-indexer-on)
+        INDEXER_PAIRS=0,1
+        PAIR0_ATTENTION=enabled
+        ;;
+    indexer-on)
+        INDEXER_PAIRS=0,1
+        PAIR0_ATTENTION=disabled
+        ;;
+    control)
+        INDEXER_PAIRS=1
+        PAIR0_ATTENTION=disabled
+        ;;
+    *) die "VARIANT must be attention-indexer-on, indexer-on, or control" ;;
 esac
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -163,10 +174,16 @@ production_env=(
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
     DS4_BENCH_UNTIMED_WARMUP_TOKENS=512
     DS4_BENCH_ROUTED_QUANT_AUDIT=1
-    DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0
     "DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS=$INDEXER_PAIRS"
     DS4_CUDA_TP_PREFILL_INDEXER_ROWS_AUDIT=1
+    DS4_CUDA_TP_PREFILL_ATTN_ROWS_AUDIT=1
+    DS4_CUDA_SCRATCH_REPLACEMENT_AUDIT=1
 )
+if [[ $PAIR0_ATTENTION == enabled ]]; then
+    production_env+=(DS4_CUDA_TP_PREFILL_ATTN_ROWS=1)
+else
+    production_env+=(DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0)
+fi
 
 phase=build
 targets=(ds4-bench tests/test_engine_mgpu_placement)
@@ -210,8 +227,9 @@ capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
         "$PROMPT" "$GPU_DEVICES"
     printf 'context=32768\nprefill_chunk=%s\npipeline_mb=%s\nctx_alloc=%s\n' \
         "$PREFILL_CHUNK" "$PIPELINE_MB" "$CTX_ALLOC"
-    printf 'pair0_attention_rows=disabled\nprefill_indexer_pairs=%s\n' \
-        "$INDEXER_PAIRS"
+    printf 'pair0_attention_rows=%s\nprefill_indexer_pairs=%s\n' \
+        "$PAIR0_ATTENTION" "$INDEXER_PAIRS"
+    printf 'scratch_growth_policy=all-tier-synchronize-and-continue\n'
     printf 't32_f16_fused=engine-default\nrequired_power_limits_w=%s\n' \
         "$REQUIRED_POWER_LIMITS_W"
     printf 'reference_dir=%s\n' "${REFERENCE_DIR:-none}"
@@ -254,23 +272,37 @@ capture_gpu_health "$OUTPUT_DIR/case.post-gpu.csv" ||
 cmp -s "$OUTPUT_DIR/case.pre-gpu.csv" "$OUTPUT_DIR/case.post-gpu.csv" ||
     die "GPU identity or power limits changed during $VARIANT"
 
-grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
-    "$OUTPUT_DIR/case.log" || die "pair-0 attention suppression was not active"
-grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' \
-    "$OUTPUT_DIR/case.log" ||
-    die "pair-specific attention/index cache mirror policy was not active"
-! grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
-    "$OUTPUT_DIR/case.log" || die "pair-0 attention row splitting dispatched"
+if [[ $PAIR0_ATTENTION == enabled ]]; then
+    ! grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
+        "$OUTPUT_DIR/case.log" || die "pair-0 attention remained suppressed"
+    grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x3 index-pair-mask=0x3' \
+        "$OUTPUT_DIR/case.log" ||
+        die "all-pairs attention/index cache mirror policy was not active"
+    grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+        "$OUTPUT_DIR/case.log" || die "pair-0 attention row splitting did not dispatch"
+    grep -Eq 'CUDA prefill attention row audit dispatch=split .*home=0 partner=2 ' \
+        "$OUTPUT_DIR/case.log" || die "pair-0 attention row audit was absent"
+else
+    grep -Fq 'prefill attention row split pair-scoped disable: logical-pairs=0' \
+        "$OUTPUT_DIR/case.log" || die "pair-0 attention suppression was not active"
+    grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' \
+        "$OUTPUT_DIR/case.log" ||
+        die "pair-specific attention/index cache mirror policy was not active"
+    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+        "$OUTPUT_DIR/case.log" || die "pair-0 attention row splitting dispatched"
+fi
 grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
     "$OUTPUT_DIR/case.log" || die "pair-1 attention row splitting did not dispatch"
+grep -Fq 'CUDA scratch replacement quiesced all tiers:' \
+    "$OUTPUT_DIR/case.log" || die "scratch-growth synchronization did not execute"
 grep -Eq 'CUDA T32 f16-output fused summary: local=0 partner=[1-9][0-9]*' \
     "$OUTPUT_DIR/case.log" || die "default T32 FP16-output path did not dispatch"
 grep -Eq 'prefill indexer row audit event=complete .*home_tier=1 .*selected_mode=partner-local' \
     "$OUTPUT_DIR/case.log" || die "pair-1 prefill indexer split did not dispatch"
 
-if [[ $VARIANT == indexer-on ]]; then
+if [[ $VARIANT == indexer-on || $VARIANT == attention-indexer-on ]]; then
     grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 .*selected_mode=gather-home' \
-        "$OUTPUT_DIR/case.log" || die "pair-0 indexer-only split did not dispatch"
+        "$OUTPUT_DIR/case.log" || die "pair-0 indexer split did not dispatch"
 else
     ! grep -Eq 'prefill indexer row audit event=complete .*home_tier=0 ' \
         "$OUTPUT_DIR/case.log" || die "control dispatched pair-0 prefill indexer split"
@@ -301,5 +333,5 @@ if [[ -n $REFERENCE_DIR ]]; then
 fi
 
 phase=complete
-printf 'SM75 pair-0 prefill indexer %s probe complete: %s\n' \
+printf 'SM75 pair-0 prefill row-split %s probe complete: %s\n' \
     "$VARIANT" "$OUTPUT_DIR"

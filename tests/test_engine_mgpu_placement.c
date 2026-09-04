@@ -52,6 +52,8 @@ uint32_t ds4_test_cuda_tp_cache_mirror_classes_for_pair(
         int decode_indexer_rows);
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(
+        uint32_t il);
 int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_query_copy_dst_pair_enabled(
         int home_tier);
@@ -911,6 +913,8 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
         "DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
     char *old_compute_suppressed = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
+    char *old_compute_layers_suppressed = save_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS");
     const int old_n_gpus = g_n_gpus;
     ds4_gpu_ctx old_gpu[DS4_MAX_GPUS];
     int old_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
@@ -947,6 +951,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_HOST_BOUNCE_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_SERIALIZE_COMPUTE_PAIRS");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_requested(),
           "qualified four-GPU SM75 NVLink layout enables query-row splitting");
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
@@ -1091,6 +1096,25 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
           "malformed attention row-compute suppression lists fail closed");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS");
 
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(21),
+          "attention row computation is enabled on every layer by default");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS", "21", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(20) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(21) &&
+          !ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(22),
+          "attention row-compute suppression isolates one placement boundary layer");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS", "20-22,42", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(20) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(21) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(22) &&
+          ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(42) &&
+          !ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(19),
+          "attention row-compute layer suppression accepts ranges and lists");
+    setenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS", "21,", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(21),
+          "malformed attention row-compute layer lists fail closed");
+    unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS");
+
     CHECK(ds4_test_cuda_tp_prefill_attn_row_shadow_phase(0) == 0 &&
           ds4_test_cuda_tp_prefill_attn_row_shadow_phase(1) == 0,
           "attention row shadow auditing is disabled by default");
@@ -1205,6 +1229,9 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     restore_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS",
         old_compute_suppressed);
+    restore_env_value(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS",
+        old_compute_layers_suppressed);
 }
 
 static void test_cuda_tp_decode_indexer_rows_default(void) {

@@ -15667,6 +15667,20 @@ static bool cuda_tp_prefill_attn_row_compute_pair_suppressed(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_PAIRS", home_tier);
 }
 
+/* Placement experiments may move one boundary layer between two pairs whose
+ * qualified attention policies differ.  Suppress split attention for that
+ * layer, rather than for the entire destination pair, so a stage-placement
+ * A/B does not silently become an attention-kernel A/B as well. */
+static bool cuda_tp_prefill_attn_row_compute_layer_suppressed(uint32_t il) {
+    const char *layers = getenv(
+        "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS");
+    if (!layers || !layers[0]) return false;
+    bool valid = true;
+    const bool suppressed = accelerator_q8_cache_partner_layer_enabled(
+        layers, il, &valid);
+    return valid && suppressed;
+}
+
 typedef enum {
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_NONE = 0,
     DS4_CUDA_PREFILL_ATTN_ROW_SHADOW_QUERY_COPY = 1,
@@ -18022,6 +18036,30 @@ static bool metal_graph_alloc_raw_cap(
                 "retained; disabled pairs use home attention while indexer "
                 "dispatch follows its independent pair policy\n",
                 prefill_attn_compute_disabled_pairs);
+        fflush(stderr);
+    }
+    const char *prefill_attn_compute_disabled_layers =
+        getenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS");
+    if (prefill_attn_compute_disabled_layers &&
+        prefill_attn_compute_disabled_layers[0]) {
+        bool valid = true;
+        (void)accelerator_q8_cache_partner_layer_enabled(
+            prefill_attn_compute_disabled_layers, 0u, &valid);
+        if (!valid) {
+            fprintf(stderr,
+                    "ds4: invalid "
+                    "DS4_CUDA_NO_TP_PREFILL_ATTN_ROW_COMPUTE_LAYERS='%s'; "
+                    "expected comma-separated layers/ranges within [0,%u]\n",
+                    prefill_attn_compute_disabled_layers,
+                    (unsigned)(DS4_N_LAYER - 1u));
+            metal_graph_free(g);
+            return false;
+        }
+        fprintf(stderr,
+                "ds4: CUDA prefill attention row compute layer-scoped disable: "
+                "layers=%s; selected layers use home attention while all other "
+                "pair policy remains unchanged\n",
+                prefill_attn_compute_disabled_layers);
         fflush(stderr);
     }
     const char *prefill_attn_shadow_pairs =
@@ -29007,13 +29045,14 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_pair_requested(
 }
 
 static bool metal_graph_cuda_tp_prefill_attention_rows_compute_requested(
-        const ds4_gpu_graph *g) {
+        const ds4_gpu_graph *g, uint32_t il) {
 #if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
-    (void)g;
+    (void)g; (void)il;
     return false;
 #else
     return metal_graph_cuda_tp_prefill_attention_rows_pair_requested(g) &&
-           !cuda_tp_prefill_attn_row_compute_pair_suppressed(g->active_tier);
+           !cuda_tp_prefill_attn_row_compute_pair_suppressed(g->active_tier) &&
+           !cuda_tp_prefill_attn_row_compute_layer_suppressed(il);
 #endif
 }
 
@@ -29029,7 +29068,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_active(
     return false;
 #else
     if (!g || !layer ||
-        !metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) ||
+        !metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) ||
         !metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
             n_tokens, n_raw) ||
         metal_graph_directional_steering_attn_enabled(g) ||
@@ -31487,13 +31526,13 @@ static bool metal_graph_encode_layer_attention_batch(
                     const bool rows_shape =
                         metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
                             n_tokens, n_raw);
-                    if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                    if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                         !rows_shape) {
                         metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
                             DS4_CUDA_PREFILL_ATTN_INDEXED, il, pos0,
                             n_tokens, n_raw);
                     }
-                    if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                    if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                         rows_shape) {
                         if (!metal_graph_cuda_tp_prefill_attention_rows_active(
                                 g, layer, il, pos0, n_tokens, n_raw)) {
@@ -31555,14 +31594,14 @@ static bool metal_graph_encode_layer_attention_batch(
                         metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
                             n_tokens, n_raw);
                     if (!use_comp_mask &&
-                        metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                        metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                         !rows_shape) {
                         metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
                             DS4_CUDA_PREFILL_ATTN_DECODE_MIXED, il, pos0,
                             n_tokens, n_raw);
                     }
                     if (!use_comp_mask &&
-                        metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                        metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                         rows_shape) {
                         if (!metal_graph_cuda_tp_prefill_attention_rows_active(
                                 g, layer, il, pos0, n_tokens, n_raw)) {
@@ -31690,7 +31729,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     &index_stage_t0);
                 }
             } else if (ok &&
-                       metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                       metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                        metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
                            n_tokens, n_tokens)) {
                 if (!metal_graph_cuda_tp_prefill_attention_rows_active(
@@ -31732,7 +31771,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     &index_stage_t0);
                 }
             } else if (ok) {
-                if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g) &&
+                if (metal_graph_cuda_tp_prefill_attention_rows_compute_requested(g, il) &&
                     !metal_graph_cuda_tp_prefill_attention_rows_shape_eligible(
                         n_tokens, n_tokens)) {
                     metal_graph_cuda_tp_prefill_attention_rows_audit_home_shape(
@@ -59937,6 +59976,11 @@ uint32_t ds4_test_cuda_tp_cache_mirror_classes_for_pair(
 bool ds4_test_cuda_tp_prefill_attn_row_compute_pair_suppressed(
         int home_tier) {
     return cuda_tp_prefill_attn_row_compute_pair_suppressed(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_row_compute_layer_suppressed(
+        uint32_t il) {
+    return cuda_tp_prefill_attn_row_compute_layer_suppressed(il);
 }
 
 int ds4_test_cuda_tp_prefill_attn_row_shadow_phase(int home_tier) {
