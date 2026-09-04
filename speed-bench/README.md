@@ -5200,6 +5200,16 @@ batched F16 execution, so these storage-policy violations fail before the
 four-GPU run. Canonical Q8 is resolved only after every resident batched path
 has declined the operation.
 
+For transfer isolation after a GPU-loss event, set
+`NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS=0` together with
+`NATIVE_PRIMARY_PREFLIGHT_ONLY=1`. The F16 planner, partner-resident weights,
+scratch reservations, and native-primary layout remain unchanged, but T32
+`attn_q_b` calls for logical pair 0 fall through to the full native-primary
+matrix on the home GPU. Attention-output partner execution and all pair-1
+execution remain enabled. The harness requires the scoped-suppression marker,
+rejects any pair-0 T32 partner-dispatch marker, runs only the 512-token
+preflight, archives it, and exits before the production A/B.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \

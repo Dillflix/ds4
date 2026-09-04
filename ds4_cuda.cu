@@ -19884,18 +19884,38 @@ static int cuda_q8_f16_partner_matmul_impl(
     const bool suppress_pair_partner_execution =
         cuda_env_pair_list_contains(
             "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS", home_tier);
-    if (suppress_all_partner_execution || suppress_pair_partner_execution) {
+    const bool is_t32 = label && strstr(label, "attn_q_b") != NULL;
+    const bool suppress_t32_pair_partner_execution = is_t32 &&
+        cuda_env_pair_list_contains(
+            "DS4_CUDA_NO_Q8_F16_T32_PARTNER_EXECUTION_PAIRS", home_tier);
+    if (suppress_all_partner_execution || suppress_pair_partner_execution ||
+        suppress_t32_pair_partner_execution) {
         static std::atomic<uint32_t> logged_pair_mask = 0u;
+        static std::atomic<uint32_t> logged_t32_pair_mask = 0u;
         const uint32_t bit = home_tier < 32
             ? (UINT32_C(1) << (uint32_t)home_tier) : 0u;
-        const uint32_t old = bit != 0u
-            ? logged_pair_mask.fetch_or(bit, std::memory_order_relaxed) : bit;
+        const bool t32_only = suppress_t32_pair_partner_execution &&
+            !suppress_all_partner_execution && !suppress_pair_partner_execution;
+        const uint32_t old = bit == 0u ? bit :
+            (t32_only
+                ? logged_t32_pair_mask.fetch_or(
+                      bit, std::memory_order_relaxed)
+                : logged_pair_mask.fetch_or(
+                      bit, std::memory_order_relaxed));
         if (bit == 0u || (old & bit) == 0u) {
-            fprintf(stderr,
-                    "ds4: CUDA q8 fp16 partner execution suppressed for "
-                    "logical pair %d; admitted partner weights and scratch "
-                    "retained\n",
-                    home_tier);
+            if (t32_only) {
+                fprintf(stderr,
+                        "ds4: CUDA q8 fp16 T32 partner execution suppressed "
+                        "for logical pair %d; admitted partner weights and "
+                        "scratch retained\n",
+                        home_tier);
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA q8 fp16 partner execution suppressed for "
+                        "logical pair %d; admitted partner weights and "
+                        "scratch retained\n",
+                        home_tier);
+            }
             fflush(stderr);
         }
         g_q8_f16_partner_execution_suppressed.fetch_add(

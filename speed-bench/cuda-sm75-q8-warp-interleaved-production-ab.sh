@@ -18,6 +18,8 @@ EXACT_TOKENS=${EXACT_TOKENS:-16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 PIPELINE_MB=${PIPELINE_MB:-512}
 Q8_INTERLEAVED_PRODUCTION_TARGET=${Q8_INTERLEAVED_PRODUCTION_TARGET:-t32}
+NATIVE_PRIMARY_PREFLIGHT_ONLY=${NATIVE_PRIMARY_PREFLIGHT_ONLY:-0}
+NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS=${NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS:-}
 case $Q8_INTERLEAVED_PRODUCTION_TARGET in
     t32) default_interleaved_cache_mb=1024 ;;
     attention-b|attention-ab|native-primary) default_interleaved_cache_mb=1536 ;;
@@ -66,10 +68,20 @@ minimum_interleaved_cache_mb=768
    PIPELINE_MB == 512 &&
    INTERLEAVED_CACHE_MB >= minimum_interleaved_cache_mb )) ||
     die "require TG=256 EXACT=16 PREFILL_CHUNK=2048 PIPELINE_MB=512 cache>=${minimum_interleaved_cache_mb} MiB"
-for flag in SKIP_BUILD CREATE_ARCHIVE; do
+for flag in SKIP_BUILD CREATE_ARCHIVE NATIVE_PRIMARY_PREFLIGHT_ONLY; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
+if [[ $NATIVE_PRIMARY_PREFLIGHT_ONLY == 1 &&
+      $Q8_INTERLEAVED_PRODUCTION_TARGET != native-primary ]]; then
+    die "NATIVE_PRIMARY_PREFLIGHT_ONLY=1 requires native-primary"
+fi
+if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]]; then
+    [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]] ||
+        die "NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS requires native-primary"
+    [[ $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS == 0 ]] ||
+        die "this isolation requires NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS=0"
+fi
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset"
 
@@ -208,6 +220,9 @@ phase=manifest
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
     printf 'candidate_scope=%s\n' "$Q8_INTERLEAVED_PRODUCTION_TARGET"
     printf 'candidate_cache_mib_per_device=%s\n' "$INTERLEAVED_CACHE_MB"
+    printf 'native_primary_preflight_only=%s\n' "$NATIVE_PRIMARY_PREFLIGHT_ONLY"
+    printf 'native_primary_disable_t32_partner_pairs=%s\n' \
+        "${NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS:-none}"
     printf 'throughput_repeats=1\nfrontiers=512,4096,32768\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
@@ -384,9 +399,14 @@ validate_common_log() {
 run_native_primary_preflight() {
     local model=$1 layout=$2
     local base="$OUTPUT_DIR/runs/$layout-native-primary-preflight" rc=0
-    local -a cmd
+    local -a cmd isolation_env=()
+    if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]]; then
+        isolation_env+=(
+            "DS4_CUDA_NO_Q8_F16_T32_PARTNER_EXECUTION_PAIRS=$NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS")
+    fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     cmd=("${production_env[@]}"
+        "${isolation_env[@]}"
         DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
         DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=1
         DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=1
@@ -417,7 +437,13 @@ run_native_primary_preflight() {
         [[ -s $base.memory.csv ]] &&
         validate_common_log "$layout" "$base.log" &&
         grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
-            "$base.log"
+            "$base.log" || return 1
+    if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]]; then
+        grep -Fq "CUDA q8 fp16 T32 partner execution suppressed for logical pair $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS" \
+            "$base.log" || return 1
+        ! grep -Fq 'home tier 0 device 0 -> partner tier 2 device 1 (attn_q_b' \
+            "$base.log" || return 1
+    fi
 }
 
 validate_logits() {
@@ -606,6 +632,12 @@ if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
             >&2 || true
         die "mixed15 native-primary preflight failed; full A/B not started"
     }
+    if [[ $NATIVE_PRIMARY_PREFLIGHT_ONLY == 1 ]]; then
+        phase=complete
+        printf 'SM75 native-primary preflight-only run complete: %s\n' \
+            "$OUTPUT_DIR"
+        exit 0
+    fi
     phase=production-ab
 fi
 for i in 0 1; do
