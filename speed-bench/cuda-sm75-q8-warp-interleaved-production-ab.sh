@@ -254,18 +254,22 @@ validate_dispatch() {
                   "$log") -ge 43 ]]
         fi
     else
-        local require_a=0
-        [[ $Q8_INTERLEAVED_PRODUCTION_TARGET != attention-ab ]] || require_a=1
+        local require_a=0 minimum_4096_fills=86 minimum_total_fills=129
+        if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-ab ]]; then
+            require_a=1
+            minimum_4096_fills=172
+            minimum_total_fills=215
+        fi
         awk -v candidate="$([[ $variant == interleaved ]] && printf 1 || printf 0)" \
-            -v require_a="$require_a" '
+            -v require_a="$require_a" -v minimum_fills="$minimum_total_fills" '
             /SM75 warp-interleaved Q8 summary/ {
-                seen++; calls=attn_a=a_direct=a_rowtile=attn_b=direct_xq=k128=fills=fallbacks=-1
+                seen++; calls=attn_a=a_direct=a_k128=attn_b=direct_xq=k128=fills=fallbacks=-1
                 for (i=1; i<=NF; i++) {
                     split($i,a,"=")
                     if (a[1]=="calls") calls=a[2]+0
                     if (a[1]=="attn-a-calls") attn_a=a[2]+0
                     if (a[1]=="attn-a-direct-xq-calls") a_direct=a[2]+0
-                    if (a[1]=="attn-a-rowtile4-calls") a_rowtile=a[2]+0
+                    if (a[1]=="attn-a-k128-calls") a_k128=a[2]+0
                     if (a[1]=="attn-b-calls") attn_b=a[2]+0
                     if (a[1]=="attn-b-direct-xq-calls") direct_xq=a[2]+0
                     if (a[1]=="attn-b-k128-calls") k128=a[2]+0
@@ -273,24 +277,20 @@ validate_dispatch() {
                     if (a[1]=="fallbacks") fallbacks=a[2]+0
                 }
                 if (calls<=0 || fallbacks!=0) bad=1
-                if (!candidate && (attn_a!=0 || a_direct!=0 || a_rowtile!=0 ||
+                if (!candidate && (attn_a!=0 || a_direct!=0 || a_k128!=0 ||
                                     attn_b!=0 || direct_xq!=0 || k128!=0)) bad=1
                 if (candidate && (attn_b<=0 || direct_xq!=attn_b ||
-                                  k128!=attn_b || fills<43)) bad=1
+                                  k128!=attn_b || fills<minimum_fills)) bad=1
                 if (candidate && require_a &&
-                    (attn_a<=0 || a_direct!=attn_a || a_rowtile!=attn_a)) bad=1
+                    (attn_a<=0 || a_direct!=attn_a || a_k128!=attn_a)) bad=1
                 if (candidate && !require_a &&
-                    (attn_a!=0 || a_direct!=0 || a_rowtile!=0)) bad=1
+                    (attn_a!=0 || a_direct!=0 || a_k128!=0)) bad=1
             }
             END {exit !(seen==1 && !bad)}
         ' "$log"
         if [[ $variant == interleaved ]]; then
             [[ $(grep -Ec 'SM75 warp-interleaved Q8 cache fill .* in=4096 out=' \
-                  "$log") -ge 43 ]]
-            if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-ab ]]; then
-                [[ $(grep -Ec 'SM75 warp-interleaved Q8 A rowtile4 cache fill ' \
-                      "$log") -ge 43 ]]
-            fi
+                  "$log") -ge $minimum_4096_fills ]]
         fi
     fi
 }
@@ -365,7 +365,7 @@ run_engine() {
             DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
             DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=1
             DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ=1
-            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128=1
             DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE=1
             DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ=1
             DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=1

@@ -5059,21 +5059,24 @@ remain disabled by default behind independent
 `DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE` selectors. The B cache contains
 only the consumed 4096-wide slice of the canonical 8192-wide matrix.
 
-The specialized A follow-up addresses its four-block shape directly. The
-generic implementation assigns a full warp to one 128-wide output row, leaving
-28 lanes without a block. The rowtile4 representation packs eight adjacent
-rows into a 32-lane scale plane plus eight coalesced word planes, and the
-kernel assigns four lanes to each row. It therefore computes eight rows per
-warp and 64 per CTA while retaining the original block ownership and
-`(term0 + term2) + (term1 + term3)` reduction tree. Its activation quantizer
-writes the matching word planes directly. Set
-`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4=0` or
+The first A follow-up used a four-block 128-wide fixture. The subsequent
+`20260904T013039Z` production audit proved that fixture was not representative:
+each one-token TP A call consumes four independent 4096-value groups and its
+weight slice is 4096x4096 (128 Q8 blocks per output row). Direct-XQ selected,
+but the rowtile4 gate correctly did not. That bounded result is therefore not
+promotion evidence.
+
+The corrected A candidate uses the same size-neutral 32-lane word planes and
+fixed four-group K128 loop accepted for B. It selects the proper activation row
+for each 1024-row rank slice, preserves the canonical per-lane accumulation
+and final warp reduction, and quantizes the four source groups directly into
+the interleaved representation. Set
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128=0` or
 `DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ=0` for independent rollback.
 
 The bounded diagnostic requires bit-identical A intermediates and B outputs.
 The A acceptance test is deliberately two-arm: canonical versus the specialized
-rowtile4/direct-XQ candidate. The previously rejected block-interleaved A path
-is retained only as historical evidence, not rerun as an acceptance arm. Set
+K128/direct-XQ candidate. Set
 `PROJECTIONS=a` to time and sanitize A alone before any four-GPU production
 test. B retains its useful three-arm comparison because both of its interleaved
 implementations were accepted and the incremental result measures the K128
@@ -5086,12 +5089,6 @@ TIMING_ROUNDS=9 TIMING_REPEATS=100 \
 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-output-interleaved.sh
 ```
-
-The `20260904T012316Z` A-only run accepted rowtile4/direct-XQ: its nonzero
-engine regression was bit-identical, all 901 measured candidate calls selected
-both refinements with one cache fill and zero fallbacks, Compute Sanitizer
-reported zero errors, and inclusive A time fell from 0.008516 ms to
-0.006225 ms (1.368x).
 
 This experiment does not change production defaults. A four-GPU production
 A/B with exact logits and explicit interleaved-cache residency is required
@@ -5128,7 +5125,7 @@ bash ./speed-bench/cuda-sm75-q8-attention-b-production-ab.sh
 After bounded acceptance of both specialized projections, the combined A+B
 production A/B changes both attention-output selectors together while leaving
 the accepted T32 interleaved default enabled in both arms. Candidate validation
-requires direct-XQ/rowtile4 on every selected A call, direct-XQ/K128 on every
+requires direct-XQ/K128 on every selected A call, direct-XQ/K128 on every
 selected B call, at least 43 cache fills for each representation, zero cache
 fallback, stable GPU identity, and byte-identical logits for mixed15 and all43
 at 512, 4096, and 32768 tokens.

@@ -979,10 +979,10 @@ cleanup:
 }
 
 static int run_q8_grouped_a(void) {
-    const uint32_t groups_total = 64u;
-    const uint32_t group_count = 32u;
-    const uint64_t group_dim = 128u;
-    const uint64_t rank = 128u;
+    const uint32_t groups_total = 8u;
+    const uint32_t group_count = 4u;
+    const uint64_t group_dim = 4096u;
+    const uint64_t rank = 1024u;
     const uint64_t low_dim = (uint64_t)group_count * rank;
     const uint64_t model_bytes =
         q8_matrix_bytes(group_dim, (uint64_t)groups_total * rank);
@@ -1003,7 +1003,7 @@ static int run_q8_grouped_a(void) {
         if (!RUN_Q8_GROUPED_A() || !ds4_gpu_synchronize()) goto timing_error;
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "1", 1);
         (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ", "1", 1);
-        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4", "1", 1);
+        (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128", "1", 1);
         if (!RUN_Q8_GROUPED_A() || !ds4_gpu_synchronize()) goto timing_error;
         const uint32_t rounds = positive_env_u32("TIMING_ROUNDS", 9u);
         const uint32_t repeats = positive_env_u32("TIMING_REPEATS", 100u);
@@ -1026,7 +1026,7 @@ static int run_q8_grouped_a(void) {
                              arm == 0u ? "0" : "1", 1);
                 (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ",
                              arm == 1u ? "1" : "0", 1);
-                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4",
+                (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128",
                              arm == 1u ? "1" : "0", 1);
                 if (!ds4_gpu_timer_record_start(timer)) goto timing_alloc_error;
                 for (uint32_t repeat = 0u; repeat < repeats; ++repeat) {
@@ -1044,7 +1044,7 @@ static int run_q8_grouped_a(void) {
         qsort(candidate_ms, rounds, sizeof(float), compare_float);
         printf("timing_scope=production-shape-owned-call-inclusive\n"
                "timing_rounds=%u\ntiming_repeats=%u\n"
-               "candidate_kind=q8-grouped-a-rowtile4-direct-xq\n"
+               "candidate_kind=q8-grouped-a-warp-interleaved-direct-xq-k128\n"
                "control_median_ms=%.9g\n"
                "candidate_median_ms=%.9g\n"
                "candidate_speedup=%.9g\n",
@@ -1066,7 +1066,7 @@ timing_done:;
 cleanup:
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE");
     (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ");
-    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128");
     ds4_gpu_tensor_free(low);
     ds4_gpu_tensor_free(heads);
 #undef RUN_Q8_GROUPED_A

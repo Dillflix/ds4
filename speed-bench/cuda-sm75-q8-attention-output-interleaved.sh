@@ -6,9 +6,8 @@ usage() {
 Run the bounded SM75 attention-output Q8_0 warp-interleaved A/B.
 
 The grouped A projection and K-sliced B projection are measured independently
-at their production single-token shapes. The opt-in A candidate uses an
-eight-row/four-lane row-tiled layout; B stores only its consumed K-slice in the
-auxiliary interleaved cache.
+at their production single-token 4096x4096 TP-slice shapes. Both candidates
+use the fixed-K128 warp-interleaved layout and direct activation quantization.
 
 Optional environment:
   PROFILE_GPU=0
@@ -75,7 +74,7 @@ targets=(tests/cuda_long_context_smoke tests/cuda_sm75_decode_weight_profile)
 clean=(env
     -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE
     -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ
-    -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_ROWTILE4
+    -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128
     -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE
     -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ
     -u DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128
@@ -112,7 +111,7 @@ trap finalize EXIT
     printf 'free_mib_at_preflight=%s\ntiming_rounds=%s\ntiming_repeats=%s\n' \
         "$free_mib" "$TIMING_ROUNDS" "$TIMING_REPEATS"
     printf 'timed_projections=%s\n' "$PROJECTIONS"
-    printf 'candidate_default=off\na_layout=rowtile4-8-rows-per-warp\n'
+    printf 'candidate_default=off\na_layout=warp-interleaved-k128\n'
     printf 'a_activation=direct-interleaved-xq\nb_slice_cache=consumed-half-only\n'
     printf '\n[gpu]\n'
     nvidia-smi -i "$PROFILE_GPU" \
@@ -172,19 +171,19 @@ for scenario in "${scenarios[@]}"; do
         -v require_a="$require_a_refinements" \
         -v require_b="$require_b_refinements" '
         /SM75 warp-interleaved Q8 summary/ {
-            seen++; selected=a_direct=a_rowtile=direct_xq=k128=fills=fallbacks=-1
+            seen++; selected=a_direct=a_k128=direct_xq=k128=fills=fallbacks=-1
             for (i=1; i<=NF; i++) {
                 split($i,a,"=")
                 if (a[1]==counter) selected=a[2]+0
                 if (a[1]=="attn-a-direct-xq-calls") a_direct=a[2]+0
-                if (a[1]=="attn-a-rowtile4-calls") a_rowtile=a[2]+0
+                if (a[1]=="attn-a-k128-calls") a_k128=a[2]+0
                 if (a[1]=="attn-b-direct-xq-calls") direct_xq=a[2]+0
                 if (a[1]=="attn-b-k128-calls") k128=a[2]+0
                 if (a[1]=="fills") fills=a[2]+0
                 if (a[1]=="fallbacks") fallbacks=a[2]+0
             }
             if (selected<1 || fills!=expected_fills || fallbacks!=0) bad=1
-            if (require_a && (a_direct<1 || a_rowtile<1)) bad=1
+            if (require_a && (a_direct<1 || a_k128<1)) bad=1
             if (require_b && (direct_xq<1 || k128<1)) bad=1
         }
         END {exit !(seen==1 && !bad)}
@@ -223,7 +222,7 @@ phase=summarization
         control=$(awk -F= '$1=="control_median_ms" {print $2}' "$log")
         candidate=$(awk -F= '$1=="candidate_median_ms" {print $2}' "$log")
         speedup=$(awk -F= '$1=="candidate_speedup" {print $2}' "$log")
-        printf '| A projection | Canonical ms | Rowtile4/direct-XQ ms | Speedup |\n'
+        printf '| A projection | Canonical ms | Warp-interleaved K128/direct-XQ ms | Speedup |\n'
         printf '| --- | ---: | ---: | ---: |\n'
         printf '| q8-grouped-a-half | %s | %s | %sx |\n\n' \
             "$control" "$candidate" "$speedup"
