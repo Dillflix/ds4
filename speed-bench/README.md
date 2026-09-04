@@ -5210,6 +5210,15 @@ execution remain enabled. The harness requires the scoped-suppression marker,
 rejects any pair-0 T32 partner-dispatch marker, runs only the 512-token
 preflight, archives it, and exits before the production A/B.
 
+If that T32-only suppression still loses GPU 1, replace it with
+`NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS=0`. This preserves the same F16
+admission, partner-resident weights, scratch reservations, native-primary
+layout, pair-1 execution, and preflight workload, while making every pair-0
+Q8/F16 partner call fall through to its home-side native-primary path. Relative
+to the T32-only arm, the additional removed execution is the pair-0
+attention-output projection. The harness requires the pair-wide suppression
+marker and rejects every pair-0 partner-dispatch marker.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
