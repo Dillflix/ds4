@@ -4,7 +4,8 @@ set -euo pipefail
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     cat <<'EOF'
-Qualify the 21/22 four-GPU SM75 prefill placement against production 22/21.
+Qualify the 21/22 four-GPU SM75 prefill placement against production 22/21
+with the all-43-layer Q3A4 model.
 
 The A/B changes only DS4_CUDA_EP_STAGE_SPLIT. Layer 21 uses home attention in
 both arms because it crosses between pair 0 (production home-attention policy)
@@ -13,7 +14,6 @@ row splitting. Both arms retain the production pipeline, dense-F16 cache plan,
 pair-0 attention-row suppression, and FP32 T256 final-result boundary.
 
 Optional environment:
-  MIXED_MODEL=/absolute/path/to/mixed15.gguf
   ALL43_MODEL=/absolute/path/to/all43.gguf
   PROMPT=/absolute/path/to/prompt.txt
   GPU_DEVICES=0,3,1,2
@@ -31,7 +31,6 @@ fi
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
-MIXED_MODEL=${MIXED_MODEL:-$repo_dir/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf}
 ALL43_MODEL=${ALL43_MODEL:-$repo_dir/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf}
 PROMPT=${PROMPT:-$repo_dir/speed-bench/promessi_sposi.txt}
 GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
@@ -46,9 +45,8 @@ PREFILL_CHUNK=2048
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${PREFILL_PLACEMENT_21_22_DIR:-$repo_dir/sm75-prefill-placement-21-22-ab-$stamp}
 
-for model in "$MIXED_MODEL" "$ALL43_MODEL"; do
-    [[ $model == /* && -f $model ]] || die "model not found: $model"
-done
+[[ $ALL43_MODEL == /* && -f $ALL43_MODEL ]] ||
+    die "model not found: $ALL43_MODEL"
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 [[ $GPU_DEVICES == 0,3,1,2 && $GPU_VRAM == auto ]] ||
     die "require GPU_DEVICES=0,3,1,2 and GPU_VRAM=auto"
@@ -160,8 +158,8 @@ phase=manifest
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$(git branch --show-current)"
-    printf 'mixed_model=%s\nall43_model=%s\nprompt=%s\n' \
-        "$MIXED_MODEL" "$ALL43_MODEL" "$PROMPT"
+    printf 'model_layout=all43\nall43_model=%s\nprompt=%s\n' \
+        "$ALL43_MODEL" "$PROMPT"
     printf 'gpu_devices=%s\nrequired_power_limits_w=%s\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
     printf 'control_split=22/21\ncandidate_split=21/22\n'
@@ -223,10 +221,10 @@ validate_run() {
 phase=production-ab
 printf 'model_layout\trepeat\tslot\tsplit\tcsv\tlog\tlogits\ttelemetry\n' \
     >"$OUTPUT_DIR/runs.tsv"
-layouts=(mixed15 all43)
-models=("$MIXED_MODEL" "$ALL43_MODEL")
+layouts=(all43)
+models=("$ALL43_MODEL")
 for ((repeat=1; repeat<=REPEATS; repeat++)); do
-    for i in 0 1; do
+    for i in "${!layouts[@]}"; do
         layout=${layouts[$i]}; model=${models[$i]}
         if (( (repeat + i) % 2 )); then splits=(22 21); else splits=(21 22); fi
         slot=0
@@ -297,7 +295,7 @@ for run in runs:
         }
 
 samples = []
-for layout in ("mixed15", "all43"):
+for layout in ("all43",):
     repeats = sorted({int(r["repeat"]) for r in runs if r["model_layout"] == layout})
     for repeat in repeats:
         for ctx in (512, 4096, 32768):
@@ -314,7 +312,7 @@ with (out / "samples.csv").open("w", newline="", encoding="utf-8") as stream:
     writer.writeheader(); writer.writerows(samples)
 
 summary = []
-for layout in ("mixed15", "all43"):
+for layout in ("all43",):
     for ctx in (512, 4096, 32768):
         rows = [r for r in samples if r["model_layout"] == layout and r["ctx_tokens"] == ctx]
         ratios = [r["speedup_21_22_vs_22_21"] for r in rows]
@@ -388,7 +386,7 @@ for row in summary:
           f'{row["candidate_21_22_median_tps"]:.3f},'
           f'{row["paired_median_speedup"]:.6f},byte-identical')
 print("\nmodel_layout,split,median_pair_activity_balance")
-for layout in ("mixed15", "all43"):
+for layout in ("all43",):
     for split in (22, 21):
         vals = [r["pair_activity_balance"] for r in pair_rows
                 if r["model_layout"] == layout and int(r["split"]) == split]

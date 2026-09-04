@@ -5294,8 +5294,8 @@ bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 ### SM75 FP32 prefill placement 21/22 qualification
 
 `cuda-sm75-prefill-placement-21-22-ab.sh` compares the candidate 21/22
-transformer-stage boundary with the accepted 22/21 boundary on both mixed15
-and all43. Moving the boundary also moves layer 21 from pair 0, whose stable
+transformer-stage boundary with the accepted 22/21 boundary on the all-43-layer
+Q3A4 model. Moving the boundary also moves layer 21 from pair 0, whose stable
 policy uses home attention, to pair 1, whose policy uses row-split attention.
 The harness therefore keeps layer 21 on home attention in both arms while
 retaining row splitting for every other pair-1 layer; without that match the
@@ -5313,7 +5313,6 @@ The stage-aware dense-cache planner accepts only the two balanced four-GPU
 placements, 22/21 and 21/22. Other transformer placements remain rejected.
 
 ```bash
-MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto \
