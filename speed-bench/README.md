@@ -31,14 +31,21 @@ The F16 admission plan is part of that representation contract. Attention row
 splitting is conditional on each chunk's geometry, so even an enabled pair can
 fall back to a complete home-local A+B projection for a tail or another
 ineligible shape. All 43 layers' attention-A and attention-B bindings
-(`86/86`) are therefore mandatory and home-local. The partner half of each
-T32 projection has no persistent Q8 duplicate and contributes another 43
-mandatory F16 bindings. All 129 required bindings are materialized and
-synchronized during session startup; the engine rejects the tagged model
-before prefill if any one is unavailable. Eligible split chunks still consume
-the native A-row and B-K shards directly. Decode and prefill therefore share
-one native-Q8 residency without making either phase an afterthought or relying
-on a mid-run allocation fallback.
+(`86/86`) are therefore mandatory and home-local. T32 already has one complete
+native-Q8 residency on the layer's home GPU, and the fused F16 path excludes
+single-token decode. Its prefill binding is consequently one required,
+complete home-local F16 matrix per layer. The optional pair attention
+query-row split happens only after `q_b` has assembled the complete query
+tensor, so it does not require T32 row-half bindings or T32 partner execution.
+This removes the failing plan's redundant 64 MiB F16 expansion per layer
+(`2.6875 GiB` system-wide) and eliminates its new T32 activation/result traffic
+without adding another persistent representation. The fixed 22/21 topology
+therefore registers 344 candidates and requires 129 execution bindings; all
+are materialized and synchronized during session startup. The engine rejects
+the tagged model before prefill if any required binding is unavailable.
+Eligible split chunks still consume the native A-row and B-K shards directly.
+Decode and prefill therefore share one native-Q8 residency without making
+either phase an afterthought or relying on a mid-run allocation fallback.
 
 The legacy F32-expanded Q8 cache remains available only to older, explicitly
 selected diagnostic SGEMM experiments. It is not a production fallback. A

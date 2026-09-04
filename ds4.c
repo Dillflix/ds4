@@ -3089,30 +3089,15 @@ static bool engine_q8_native_full_prefill_binding_required(
         const ds4_tensor *t, uint32_t path_class,
         bool pair_prefill_attn_rows) {
     /* Pair row splitting is an eligibility policy, not a guarantee for every
-     * chunk.  Tails and other ineligible shapes execute the complete A+B
-     * projection on the home GPU even when the pair is enabled.  A tagged
-     * model therefore requires full home-local A and B execution bindings for
-     * every layer before any prefill begins. */
+     * chunk. T32 completes before that policy is selected, while tails and
+     * other ineligible shapes execute complete A+B projections on the home
+     * GPU. A tagged model therefore requires full home-local T32, A, and B
+     * execution bindings for every layer before any prefill begins. */
     (void)pair_prefill_attn_rows;
     return t && t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
-           (path_class == ACCEL_Q8_CACHE_OUTPUT_A ||
+           (path_class == ACCEL_Q8_CACHE_T32_Q_B ||
+            path_class == ACCEL_Q8_CACHE_OUTPUT_A ||
             path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B);
-}
-
-static bool engine_q8_native_partner_t32_binding_required(
-        const ds4_tensor *t, uint32_t path_class,
-        bool cuda_tp_decode) {
-    /* T32 keeps its one persistent native-Q8 copy on the home GPU so the
-     * complete projection remains available without duplicating residency.
-     * The partner nevertheless owns half of T32 execution under the required
-     * attention/decode TP topology. Its half-width F16 binding is therefore
-     * mandatory rather than a benefit-ranked cache candidate.  This is
-     * independent of prefill attention-head splitting: the production decode
-     * TP path uses the partner even while that experimental prefill switch is
-     * disabled. */
-    return t && t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
-           path_class == ACCEL_Q8_CACHE_T32_Q_B &&
-           cuda_tp_decode;
 }
 
 static const char *engine_q8_native_gguf_incompatible_f32_env(void) {
@@ -59651,9 +59636,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         const bool required_full_prefill_binding =
             engine_q8_native_full_prefill_binding_required(
                 t, path_class, pair_prefill_attn_rows);
-        const bool required_partner_t32_binding =
-            engine_q8_native_partner_t32_binding_required(
-                t, path_class, cuda_tp_decode);
+        const bool native_home_t32 =
+            t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
+            path_class == ACCEL_Q8_CACHE_T32_Q_B;
         /* Pair row splitting is conditional on each chunk's geometry.  The
          * tagged file intentionally owns only A row halves and B K halves, so
          * every layer's full-width F16 fallback binding must stay home-local
@@ -59662,7 +59647,21 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             required_full_prefill_binding ? -1 : fallback_device;
         bool ok = true;
 
-        if (path_class == ACCEL_Q8_CACHE_OUTPUT_A && candidate_copies == 3u) {
+        if (native_home_t32) {
+            /* Tagged native T32 already has one complete native-Q8 residency
+             * on the layer's home GPU.  Prefill q_b must therefore use one
+             * complete home-local F16 execution binding as well.  The fused
+             * F16 path excludes single-token decode, and the optional pair
+             * attention query-row split happens only after q_b has assembled
+             * the complete query tensor.  Planning row-half F16 bindings here
+             * only duplicated 64 MiB per layer and introduced an unnecessary
+             * partner projection/transfer on the unstable pair. */
+            ok = accelerator_q8_cache_candidate_append(
+                    &plan, &plan_count, &plan_capacity, &e->model, t,
+                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                    home_device, -1, path_class, true);
+        } else if (path_class == ACCEL_Q8_CACHE_OUTPUT_A &&
+                   candidate_copies == 3u) {
             /* Production TP output uses one contiguous group/row half on each
              * member of the NVLink pair. Plan the exact slices looked up by
              * cuda_q8_f16_ptr; a full-tensor entry would never hit them. */
@@ -59682,8 +59681,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                     home_device, full_fallback_device, path_class,
                     required_full_prefill_binding);
         } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B &&
-                   (candidate_copies == 3u ||
-                    required_partner_t32_binding)) {
+                   candidate_copies == 3u) {
             const uint64_t half_rows = t->dim[1] / 2u;
             const uint64_t half_bytes = half_rows * row_bytes;
             ok = accelerator_q8_cache_candidate_append(
@@ -59693,12 +59691,11 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
-                    partner_device, -1, path_class,
-                    required_partner_t32_binding) &&
+                    partner_device, -1, path_class, false) &&
                  accelerator_q8_cache_candidate_append(
-                    &plan, &plan_count, &plan_capacity, &e->model, t,
-                    t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, fallback_device, path_class, false);
+                     &plan, &plan_count, &plan_capacity, &e->model, t,
+                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
+                     home_device, fallback_device, path_class, false);
         } else {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
@@ -60466,17 +60463,6 @@ int ds4_test_q8_native_full_prefill_binding_required(
     return engine_q8_native_full_prefill_binding_required(
         &t, accelerator_q8_cache_classify(t.name),
         pair_prefill_attn_rows != 0) ? 1 : 0;
-}
-
-int ds4_test_q8_native_partner_t32_binding_required(
-        const char *name, uint32_t type, int cuda_tp_decode) {
-    ds4_tensor t;
-    memset(&t, 0, sizeof(t));
-    t.name = (ds4_str){name, name ? strlen(name) : 0u};
-    t.type = type;
-    return engine_q8_native_partner_t32_binding_required(
-        &t, accelerator_q8_cache_classify(t.name),
-        cuda_tp_decode != 0) ? 1 : 0;
 }
 
 const char *ds4_test_q8_native_gguf_incompatible_f32_env(void) {

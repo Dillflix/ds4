@@ -23,6 +23,7 @@ Optional environment:
   CASE_TIMEOUT_SECONDS=1800
   MIN_NATIVE_VRAM_SAVING_MIB=3500
   MIN_THROUGHPUT_RATIO=0.95
+  NATIVE_SMOKE_ONLY=0              1: run only native PP512/TG16
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   NATIVE_Q8_GGUF_PRODUCTION_AB_DIR=...
@@ -54,13 +55,16 @@ TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_NATIVE_VRAM_SAVING_MIB=${MIN_NATIVE_VRAM_SAVING_MIB:-3500}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
+NATIVE_SMOKE_ONLY=${NATIVE_SMOKE_ONLY:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 PREFILL_CHUNK=2048
 PIPELINE_MB=512
 CTX_ALLOC=33025
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-OUTPUT_DIR=${NATIVE_Q8_GGUF_PRODUCTION_AB_DIR:-$repo_dir/sm75-native-q8-gguf-$MODEL_LAYOUT-production-ab-$stamp}
+run_kind=production-ab
+[[ $NATIVE_SMOKE_ONLY == 1 ]] && run_kind=native-smoke
+OUTPUT_DIR=${NATIVE_Q8_GGUF_PRODUCTION_AB_DIR:-$repo_dir/sm75-native-q8-gguf-$MODEL_LAYOUT-$run_kind-$stamp}
 
 [[ $MODEL_LAYOUT == mixed15 || $MODEL_LAYOUT == all43 ]] ||
     die "MODEL_LAYOUT must be mixed15 or all43"
@@ -82,7 +86,7 @@ done
 awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
-for flag in SKIP_BUILD CREATE_ARCHIVE; do
+for flag in NATIVE_SMOKE_ONLY SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -203,8 +207,9 @@ phase=manifest
         "$NATIVE_MODEL" "$(stat -c %s "$NATIVE_MODEL")" "$PROMPT"
     printf 'gpu_devices=%s\npower_limits_w=%s\nstage_split=22/21\n' \
         "$GPU_DEVICES" "$REQUIRED_POWER_LIMITS_W"
-    printf 'contexts=512,4096,32768\ntg_tokens=%s\nexact_tokens=%s\n' \
-        "$TG_TOKENS" "$EXACT_TOKENS"
+    printf 'contexts=%s\ntg_tokens=%s\nexact_tokens=%s\nnative_smoke_only=%s\n' \
+        "$([[ $NATIVE_SMOKE_ONLY == 1 ]] && printf 512 || printf 512,4096,32768)" \
+        "$TG_TOKENS" "$EXACT_TOKENS" "$NATIVE_SMOKE_ONLY"
     printf 'pair0_prefill_attention_rows=disabled\npair1_prefill_attention_rows=enabled\n'
     printf 'pair0_prefill_indexer_rows=enabled\npair1_prefill_indexer_rows=enabled\n'
     printf 'minimum_native_vram_saving_mib=%s\nminimum_throughput_ratio=%s\n' \
@@ -249,39 +254,59 @@ start_telemetry() {
 }
 
 validate_csv() {
-    local csv=$1 expected_tokens=$2
-    awk -F, -v tg="$expected_tokens" '
+    local csv=$1 expected_tokens=$2 expected_contexts=$3
+    awk -F, -v tg="$expected_tokens" -v expected="$expected_contexts" '
+        BEGIN {
+            n_expected=split(expected, list, ",")
+            for (i=1; i<=n_expected; i++) wanted[list[i]+0]=1
+        }
         NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
                        $4=="gen_tokens" && $8=="gen_steady_tps"); next}
         NR>1 {
             rows++; ctx=$1+0
-            if ((ctx!=512 && ctx!=4096 && ctx!=32768) || seen[ctx]++ ||
+            if (!wanted[ctx] || seen[ctx]++ ||
                 ($3+0)<=0 || $4!=tg || ($8+0)<=0) bad=1
         }
-        END {exit !(header && rows==3 && !bad)}
+        END {
+            for (ctx in wanted) if (!seen[ctx]) bad=1
+            exit !(header && rows==n_expected && !bad)
+        }
     ' "$csv"
 }
 
 validate_topology() {
-    local arm=$1 log=$2 marker route required
+    local arm=$1 log=$2 kind=$3 marker route required materialized
+    materialized='materialized 344/344 candidates'
+    required='required-native=0/0'
+    if [[ $arm == native ]]; then
+        # Tagged T32 owns one complete native-Q8 home residency and uses one
+        # complete home-local F16 prefill binding. Pair attention splitting is
+        # later and must not introduce a T32 partner projection.
+        required='required-native=129/129'
+    fi
     for marker in 'CUDA EP forced pipeline split 22/21' \
                   't256-placement=stage-aware' \
                   'dense-placement=stage-aware-fixed-22-21' \
-                  'materialized 344/344 candidates'; do
+                  "$materialized"; do
         grep -Fq "$marker" "$log" || return 1
     done
-    required='required-native=0/0'
-    [[ $arm == native ]] && required='required-native=129/129'
     grep -Eq "${required}([[:space:]]|$)" "$log" || return 1
     for route in '0->2 DIRECT' '2->0 DIRECT' '1->3 DIRECT' '3->1 DIRECT'; do
         grep -Fq "$route" "$log" || return 1
     done
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$log" || return 1
     ! grep -Fq 'tagged native dense-Q8 startup rejected' "$log" || return 1
-    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
-    grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || return 1
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" || return 1
+    if [[ $kind != smoke ]]; then
+        ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$log" || return 1
+        grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$log" || return 1
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$log" || return 1
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$log" || return 1
+    fi
+    if [[ $arm == native ]]; then
+        ! grep -Fq 'CUDA q8 partner execution enabled: home tier 0 device 0 -> partner tier 2 device 1 (attn_q_b, ' "$log" || return 1
+        ! grep -Fq 'CUDA q8 partner execution enabled: home tier 1 device 3 -> partner tier 3 device 2 (attn_q_b, ' "$log" || return 1
+        ! grep -Fq 'CUDA T32 projection-only pair split enabled:' "$log" || return 1
+    fi
 }
 
 validate_representation() {
@@ -319,8 +344,10 @@ validate_exact_inventory() {
 
 run_case() {
     local arm=$1 model=$2 kind=$3 tokens=$4 base=$5 logits=${6:-}
+    local contexts=${7:-512,4096,32768} ctx_max=32768
     local rc=0 telemetry="$OUTPUT_DIR/telemetry/$arm-$kind.csv"
     local -a cmd
+    [[ $contexts == 512 ]] && ctx_max=512
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     start_telemetry "$telemetry"
     cmd=("${production_env[@]}"
@@ -329,7 +356,7 @@ run_case() {
         ./ds4-bench --cuda --cuda-tensor-parallel
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM"
         --model "$model" --prompt-file "$PROMPT"
-        --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC"
+        --ctx-start 512 --ctx-max "$ctx_max" --ctx-alloc "$CTX_ALLOC"
         --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
         --gen-tokens "$tokens" --csv "$base.csv")
     if [[ -n $logits ]]; then
@@ -342,8 +369,9 @@ run_case() {
     capture_gpu_health "$base.post-gpu.csv" || return 1
     [[ $rc == 0 ]] || return "$rc"
     [[ -s $telemetry && $(wc -l <"$telemetry") -ge 4 ]] || return 1
-    validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
-        validate_topology "$arm" "$base.log" &&
+    validate_health "$base" &&
+        validate_csv "$base.csv" "$tokens" "$contexts" &&
+        validate_topology "$arm" "$base.log" "$kind" &&
         validate_representation "$arm" "$base.log"
 }
 
@@ -354,6 +382,19 @@ declare -A model_by_arm=(
     [canonical]="$CANONICAL_MODEL"
     [native]="$NATIVE_MODEL"
 )
+if [[ $NATIVE_SMOKE_ONLY == 1 ]]; then
+    base="$OUTPUT_DIR/runs/native-smoke"
+    printf 'Native-Q8 GGUF PP512 smoke model=%s arm=native...\n' \
+        "$MODEL_LAYOUT"
+    run_case native "$NATIVE_MODEL" smoke 16 "$base" '' 512 || {
+        tail -n 240 "$base.log" >&2 || true
+        die "native PP512 smoke failed validation"
+    }
+    phase=complete
+    printf 'SM75 tagged native-Q8 GGUF %s PP512 smoke complete: %s\n' \
+        "$MODEL_LAYOUT" "$OUTPUT_DIR"
+    exit 0
+fi
 for arm in canonical native; do
     base="$OUTPUT_DIR/runs/$arm"
     printf 'Native-Q8 GGUF production performance model=%s arm=%s...\n' \
