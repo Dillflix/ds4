@@ -464,6 +464,8 @@ run_native_primary_preflight() {
     if [[ -n $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS ]]; then
         grep -Fq "CUDA q8 fp16 partner execution suppressed for logical pair $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS" \
             "$base.log" || return 1
+        grep -Fq "native-primary T256 full-home fallback retained for logical pair $NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS" \
+            "$base.log" || return 1
         ! grep -Fq 'home tier 0 device 0 -> partner tier 2 device 1 (' \
             "$base.log" || return 1
     fi

@@ -5213,11 +5213,18 @@ preflight, archives it, and exits before the production A/B.
 If that T32-only suppression still loses GPU 1, replace it with
 `NATIVE_PRIMARY_DISABLE_ALL_PARTNER_PAIRS=0`. This preserves the same F16
 admission, partner-resident weights, scratch reservations, native-primary
-layout, pair-1 execution, and preflight workload, while making every pair-0
-Q8/F16 partner call fall through to its home-side native-primary path. Relative
-to the T32-only arm, the additional removed execution is the pair-0
-attention-output projection. The harness requires the pair-wide suppression
-marker and rejects every pair-0 partner-dispatch marker.
+partner shards, pair-1 execution, and preflight workload, while making every
+pair-0 Q8/F16 partner call fall through to its home-side path. Because the
+production attention-B native representation is normally K-split, this
+diagnostic expands its pair-0 home shard from 17 to 34 MiB per layer while
+retaining the original 17 MiB partner shard. The resulting approximately
+374 MiB of extra GPU0 residency is explicit and confined to the diagnostic;
+without it there is no complete home-side B matrix and execution suppression
+fails with a selective-cache miss before exercising the workload. Relative to
+the T32-only arm, the additional removed execution is pair-0 attention-output
+and other admitted pair-0 Q8/F16 partner work. The harness requires both the
+pair-wide suppression and full-home-fallback markers and rejects every pair-0
+partner-dispatch marker.
 
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \

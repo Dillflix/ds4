@@ -59103,18 +59103,36 @@ static int engine_plan_q8_native_primary_tensor(
 
     if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B) {
         const uint64_t half_blocks = full_blocks / 2u;
+        const bool full_home_fallback =
+            env_pair_list_contains(
+                "DS4_CUDA_NO_Q8_F16_PARTNER_EXECUTION_PAIRS", home_tier);
         if ((full_blocks & 1u) != 0u) return -1;
         if (engine_append_q8_native_range(
                 per_dev_ranges, per_dev_n, per_dev_cap,
                 home_tier, home_device,
                 t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
-                full_blocks, 0u, half_blocks, t->dim[1]) != 0 ||
+                full_blocks, 0u,
+                full_home_fallback ? full_blocks : half_blocks,
+                t->dim[1]) != 0 ||
             engine_append_q8_native_range(
                 per_dev_ranges, per_dev_n, per_dev_cap,
                 partner_tier, partner_device,
                 t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
                 full_blocks, half_blocks, half_blocks, t->dim[1]) != 0) {
             return -1;
+        }
+        if (full_home_fallback) {
+            static uint32_t logged_pair_mask = 0u;
+            const uint32_t bit = home_tier < 32
+                ? (UINT32_C(1) << (uint32_t)home_tier) : 0u;
+            if (bit == 0u || (logged_pair_mask & bit) == 0u) {
+                fprintf(stderr,
+                        "ds4: native-primary T256 full-home fallback retained "
+                        "for logical pair %d; partner shard and F16 admission "
+                        "remain present\n",
+                        home_tier);
+                logged_pair_mask |= bit;
+            }
         }
         return 1;
     }
