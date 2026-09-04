@@ -30219,11 +30219,11 @@ attention_rows_cleanup:
 
 static bool metal_graph_cuda_tp_prefill_attention_output(
         ds4_gpu_graph *g, const ds4_model *model,
-        const ds4_layer_weights *layer, uint32_t n_tokens,
+        const ds4_layer_weights *layer, uint32_t il, uint32_t n_tokens,
         uint32_t group_dim, uint32_t rank, uint32_t n_groups,
         bool *result_f16) {
 #if defined(__APPLE__) || defined(DS4_NO_GPU)
-    (void)g; (void)model; (void)layer; (void)n_tokens;
+    (void)g; (void)model; (void)layer; (void)il; (void)n_tokens;
     (void)group_dim; (void)rank; (void)n_groups;
     if (result_f16) *result_f16 = false;
     return false;
@@ -30261,8 +30261,12 @@ static bool metal_graph_cuda_tp_prefill_attention_output(
                 g->batch_attn_low_by_tier[partner],
                 n_tokens, half_low) != 0;
     }
+    const char *t256_layers = getenv("DS4_CUDA_T256_F16_FINAL_LAYERS");
+    const bool t256_layer_enabled =
+        accelerator_q8_cache_partner_layer_enabled(t256_layers, il, NULL);
     if (ok) {
-        const bool f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(
+        const bool f16 = t256_layer_enabled &&
+            ds4_gpu_matmul_q8_0_f16_out_tensor(
                 g->batch_attn_out_by_tier[home], model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_total, DS4_N_EMBD,
@@ -32017,7 +32021,7 @@ static bool metal_graph_encode_layer_attention_batch(
     bool cuda_tp_attn_output_done = false;
     if (ok && cuda_tp_prefill_heads_done) {
         ok = metal_graph_cuda_tp_prefill_attention_output(
-                g, model, layer, n_tokens, group_dim, rank, n_groups,
+                g, model, layer, il, n_tokens, group_dim, rank, n_groups,
                 &attn_out_f16);
         cuda_tp_attn_output_done = ok;
     }
@@ -32028,7 +32032,13 @@ static bool metal_graph_encode_layer_attention_batch(
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_directional_steering_attn_enabled(g)) {
-        attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(metal_graph_batch_attn_out(g),
+        const char *t256_layers =
+            getenv("DS4_CUDA_T256_F16_FINAL_LAYERS");
+        const bool t256_layer_enabled =
+            accelerator_q8_cache_partner_layer_enabled(
+                t256_layers, il, NULL);
+        attn_out_f16 = t256_layer_enabled &&
+            ds4_gpu_attention_output_q8_batch_f16_tensor(metal_graph_batch_attn_out(g),
                                                                     metal_graph_batch_attn_low(g),
                                                                     model->map,
                                                                     model->size,
@@ -59055,6 +59065,19 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                 "ds4: invalid DS4_CUDA_Q8_F16_PARTNER_LAYERS='%s'; "
                 "expected comma-separated layers/ranges within [0,%u]\n",
                 partner_layers_env ? partner_layers_env : "",
+                (unsigned)(DS4_N_LAYER - 1u));
+        return -1;
+    }
+    const char *t256_final_layers_env =
+        getenv("DS4_CUDA_T256_F16_FINAL_LAYERS");
+    bool t256_final_layers_valid = true;
+    (void)accelerator_q8_cache_partner_layer_enabled(
+        t256_final_layers_env, 0u, &t256_final_layers_valid);
+    if (!t256_final_layers_valid) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_T256_F16_FINAL_LAYERS='%s'; "
+                "expected comma-separated layers/ranges within [0,%u]\n",
+                t256_final_layers_env ? t256_final_layers_env : "",
                 (unsigned)(DS4_N_LAYER - 1u));
         return -1;
     }

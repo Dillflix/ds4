@@ -19543,6 +19543,159 @@ static bool cuda_q8_f16_partner_phase_audit_binding_selected(
     return true;
 }
 
+struct cuda_t256_f16_oracle_result {
+    unsigned long long mismatches;
+    unsigned long long first_index;
+    unsigned int expected_bits;
+    unsigned int actual_bits;
+};
+
+__global__ static void cuda_t256_f16_rounding_oracle_kernel(
+        cuda_t256_f16_oracle_result *result,
+        const __half *candidate,
+        const float *reference,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const unsigned int expected = (unsigned int)__half_as_ushort(
+        __float2half_rn(reference[i]));
+    const unsigned int actual =
+        (unsigned int)__half_as_ushort(candidate[i]);
+    if (expected == actual) return;
+    atomicAdd(&result->mismatches, 1ull);
+    if (atomicCAS(&result->first_index, ~0ull,
+                  (unsigned long long)i) == ~0ull) {
+        result->expected_bits = expected;
+        result->actual_bits = actual;
+    }
+}
+
+__global__ static void cuda_t256_f32_exact_oracle_kernel(
+        cuda_t256_f16_oracle_result *result,
+        const float *candidate,
+        const float *reference,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const unsigned int expected = __float_as_uint(reference[i]);
+    const unsigned int actual = __float_as_uint(candidate[i]);
+    if (expected == actual) return;
+    atomicAdd(&result->mismatches, 1ull);
+    if (atomicCAS(&result->first_index, ~0ull,
+                  (unsigned long long)i) == ~0ull) {
+        result->expected_bits = expected;
+        result->actual_bits = actual;
+    }
+}
+
+/* Diagnostic only.  Re-run the exact same F16-input/F16-weight GEMM with an
+ * FP32 destination, then prove that the production candidate is precisely a
+ * single round-to-nearest conversion of that result.  This distinguishes an
+ * intended storage boundary from an output-type-dependent cuBLAS reduction.
+ * One call per logical execution location is sufficient and keeps the audit
+ * out of measured steady-state work. */
+static int cuda_t256_f16_output_oracle(
+        cublasHandle_t handle,
+        const __half *weight,
+        const __half *activation,
+        const __half *candidate,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        int logical_tier,
+        bool partner_scope) {
+    if (!cuda_env_flag_enabled("DS4_CUDA_T256_F16_FINAL_ORACLE", 0))
+        return 1;
+    if (!weight || !activation || !candidate ||
+        in_dim != 8192u || out_dim != 4096u || n_tok < 8u ||
+        logical_tier < 0 || logical_tier >= 32) return 0;
+
+    static std::atomic<uint32_t> local_mask{0u};
+    static std::atomic<uint32_t> partner_mask{0u};
+    static std::atomic<uint32_t> local_failed_mask{0u};
+    static std::atomic<uint32_t> partner_failed_mask{0u};
+    std::atomic<uint32_t> &mask = partner_scope ? partner_mask : local_mask;
+    std::atomic<uint32_t> &failed_mask =
+        partner_scope ? partner_failed_mask : local_failed_mask;
+    const uint32_t bit = UINT32_C(1) << (uint32_t)logical_tier;
+    if ((mask.fetch_or(bit, std::memory_order_relaxed) & bit) != 0u)
+        return (failed_mask.load(std::memory_order_relaxed) & bit) == 0u;
+
+    if (n_tok > UINT64_MAX / out_dim ||
+        n_tok * out_dim > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t count = n_tok * out_dim;
+    const uint64_t reference_bytes = count * sizeof(float);
+    float *reference = NULL;
+    cuda_t256_f16_oracle_result *device_result = NULL;
+    cuda_t256_f16_oracle_result host_result = {
+        0ull, ~0ull, 0u, 0u
+    };
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
+    int ok = 0;
+    if (cudaMalloc((void **)&reference, reference_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&device_result, sizeof(*device_result)) !=
+            cudaSuccess ||
+        cudaMemcpy(device_result, &host_result, sizeof(host_result),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final oracle allocation failed "
+                "scope=%s logical_tier=%d tokens=%llu\n",
+                partner_scope ? "partner" : "local", logical_tier,
+                (unsigned long long)n_tok);
+        goto cleanup;
+    }
+
+    st = cublasGemmEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+        weight, CUDA_R_16F, (int)in_dim,
+        activation, CUDA_R_16F, (int)in_dim, &beta,
+        reference, CUDA_R_32F, (int)out_dim,
+        CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final oracle FP32 GEMM failed "
+                "scope=%s logical_tier=%d status=%d\n",
+                partner_scope ? "partner" : "local", logical_tier,
+                (int)st);
+        goto cleanup;
+    }
+    cuda_t256_f16_rounding_oracle_kernel<<<(count + 255u) / 256u, 256>>>(
+        device_result, candidate, reference, count);
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaMemcpy(&host_result, device_result, sizeof(host_result),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final oracle comparison failed "
+                "scope=%s logical_tier=%d\n",
+                partner_scope ? "partner" : "local", logical_tier);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "ds4: CUDA T256 FP16 final oracle scope=%s logical_tier=%d "
+            "tokens=%llu elements=%llu rounded_half_mismatches=%llu",
+            partner_scope ? "partner" : "local", logical_tier,
+            (unsigned long long)n_tok, (unsigned long long)count,
+            host_result.mismatches);
+    if (host_result.mismatches != 0ull) {
+        fprintf(stderr,
+                " first_index=%llu expected=0x%04x actual=0x%04x",
+                host_result.first_index, host_result.expected_bits,
+                host_result.actual_bits);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    ok = host_result.mismatches == 0ull;
+
+cleanup:
+    if (!ok) failed_mask.fetch_or(bit, std::memory_order_relaxed);
+    if (device_result) (void)cudaFree(device_result);
+    if (reference) (void)cudaFree(reference);
+    return ok;
+}
+
 /* Execute a planned Q8 projection on its NVLink partner. Production uses the
  * resident F16 expansion. Diagnostic arms can substitute controlled FP32
  * expansions or transfer the native Q8 activations/scales into the existing
@@ -20201,6 +20354,27 @@ static int cuda_q8_f16_partner_matmul_impl(
                         "failed: %s\n", cudaGetErrorString(sync_err));
                 (void)cudaGetLastError();
             }
+            return -1;
+        }
+        return 0;
+    }
+    if (result_f16 && !use_f32 && !use_native_q8 && label &&
+        strcmp(label, "attn_output_b_f16_final") == 0 &&
+        !cuda_t256_f16_output_oracle(
+            cuda_cublas_for_tier(partner_tier), range_f16->device_ptr,
+            (const __half *)partner_scratch,
+            (const __half *)partner_result,
+            in_dim, out_dim, n_tok, partner_tier, true)) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final partner oracle rejected "
+                "the candidate; disabling this binding\n");
+        fflush(stderr);
+        binding->partner_offload = 0;
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        const int restore_rc = cuda_q8_f16_restore_home(
+            home_tier, "failed T256 FP16 final partner oracle");
+        if (sync_err != cudaSuccess || restore_rc < 0) {
+            (void)cudaGetLastError();
             return -1;
         }
         return 0;
@@ -40109,6 +40283,16 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
             out_h->ptr, CUDA_R_16F, (int)out_dim,
             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
         if (st != CUBLAS_STATUS_SUCCESS) return 0;
+        if (!cuda_t256_f16_output_oracle(
+                cuda_cublas_for_tier(logical_tier), w_f16, xh,
+                (const __half *)out_h->ptr,
+                in_dim, out_dim, n_tok, logical_tier, false)) {
+            fprintf(stderr,
+                    "ds4: CUDA T256 FP16 final local oracle rejected "
+                    "the candidate\n");
+            fflush(stderr);
+            return 0;
+        }
         cuda_q8_f16_binding_mark_used(
             model_map, weight_offset, weight_bytes, in_dim, out_dim,
             physical_device, physical_device);
@@ -40384,6 +40568,98 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
     return 0;
 }
 
+static int cuda_t256_f16_hc_oracle(
+        const ds4_gpu_tensor *out_hc,
+        const ds4_gpu_tensor *block_out_h,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t mix_hc) {
+    if (!cuda_env_flag_enabled("DS4_CUDA_T256_F16_FINAL_ORACLE", 0))
+        return 1;
+    if (!out_hc || !block_out_h || !residual_hc || !split ||
+        n_embd != 4096u || n_hc != 4u || n_tokens == 0u) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    if (logical_tier < 0 || logical_tier >= 32) return 0;
+    static std::atomic<uint32_t> audited_mask{0u};
+    static std::atomic<uint32_t> failed_mask{0u};
+    const uint32_t bit = UINT32_C(1) << (uint32_t)logical_tier;
+    if ((audited_mask.fetch_or(bit, std::memory_order_relaxed) & bit) != 0u)
+        return (failed_mask.load(std::memory_order_relaxed) & bit) == 0u;
+
+    const uint64_t block_count = (uint64_t)n_tokens * n_embd;
+    const uint64_t output_count = block_count * n_hc;
+    if (block_count > UINT64_MAX / sizeof(float) ||
+        output_count > UINT64_MAX / sizeof(float)) return 0;
+    float *block_widened = NULL;
+    float *reference = NULL;
+    cuda_t256_f16_oracle_result *device_result = NULL;
+    cuda_t256_f16_oracle_result host_result = {
+        0ull, ~0ull, 0u, 0u
+    };
+    const float *base = (const float *)split->ptr;
+    int ok = 0;
+    if (cudaMalloc((void **)&block_widened,
+                   block_count * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **)&reference,
+                   output_count * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **)&device_result, sizeof(*device_result)) !=
+            cudaSuccess ||
+        cudaMemcpy(device_result, &host_result, sizeof(host_result),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final HC oracle allocation failed "
+                "logical_tier=%d tokens=%u\n",
+                logical_tier, n_tokens);
+        goto cleanup;
+    }
+
+    f16_to_f32_kernel<<<(block_count + 255u) / 256u, 256>>>(
+        block_widened, (const __half *)block_out_h->ptr, block_count);
+    hc_expand_kernel<<<(output_count + 255u) / 256u, 256>>>(
+        reference, block_widened, block_widened, block_widened,
+        (const float *)residual_hc->ptr, base + n_hc,
+        base + 2u * n_hc, n_embd, n_hc, n_tokens,
+        mix_hc, mix_hc, 0, 0);
+    cuda_t256_f32_exact_oracle_kernel<<<
+        (output_count + 255u) / 256u, 256>>>(
+        device_result, (const float *)out_hc->ptr,
+        reference, output_count);
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaMemcpy(&host_result, device_result, sizeof(host_result),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA T256 FP16 final HC oracle comparison failed "
+                "logical_tier=%d tokens=%u\n",
+                logical_tier, n_tokens);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "ds4: CUDA T256 FP16 final HC oracle logical_tier=%d "
+            "tokens=%u elements=%llu bit_mismatches=%llu",
+            logical_tier, n_tokens, (unsigned long long)output_count,
+            host_result.mismatches);
+    if (host_result.mismatches != 0ull) {
+        fprintf(stderr,
+                " first_index=%llu expected=0x%08x actual=0x%08x",
+                host_result.first_index, host_result.expected_bits,
+                host_result.actual_bits);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    ok = host_result.mismatches == 0ull;
+
+cleanup:
+    if (!ok) failed_mask.fetch_or(bit, std::memory_order_relaxed);
+    if (device_result) (void)cudaFree(device_result);
+    if (reference) (void)cudaFree(reference);
+    if (block_widened) (void)cudaFree(block_widened);
+    return ok;
+}
+
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h,
         const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
@@ -40411,7 +40687,11 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
         (float *)out_hc->ptr, (const __half *)block_out_h->ptr,
         (const float *)residual_hc->ptr, base + n_hc,
         base + 2u * n_hc, n_embd, n_hc, n_tokens, mix_hc, mix_hc);
-    return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
+    if (!cuda_ok(cudaGetLastError(), "hc_expand_split_half launch"))
+        return 0;
+    return cuda_t256_f16_hc_oracle(
+        out_hc, block_out_h, residual_hc, split,
+        n_embd, n_hc, n_tokens, mix_hc);
 }
 
 extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(

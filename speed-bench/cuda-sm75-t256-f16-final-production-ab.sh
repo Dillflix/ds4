@@ -18,6 +18,9 @@ GPU_DEVICES=${GPU_DEVICES:-0,3,1,2}
 GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 REPEATS=${REPEATS:-1}
+T256_F16_FINAL_LAYERS=${T256_F16_FINAL_LAYERS:-}
+T256_F16_FINAL_ORACLE=${T256_F16_FINAL_ORACLE:-0}
+REQUIRE_TOP1_MATCH=${REQUIRE_TOP1_MATCH:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CTX_ALLOC=33025
@@ -34,7 +37,7 @@ done
 [[ $STAGE_SPLIT == 22 ]] ||
     die "this T256 result qualification requires STAGE_SPLIT=22"
 [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || die "REPEATS must be positive"
-for flag in SKIP_BUILD CREATE_ARCHIVE; do
+for flag in T256_F16_FINAL_ORACLE REQUIRE_TOP1_MATCH SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] || die "CUDA_VISIBLE_DEVICES must be unset"
@@ -97,6 +100,9 @@ phase=manifest
         "$MIXED_MODEL" "$ALL43_MODEL" "$PROMPT"
     printf 'gpu_devices=%s\nstage_split=%s/%s\ncontexts=512,4096,32768\nrepeats=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$REPEATS"
+    printf 'candidate_layers=%s\noutput_and_hc_oracle=%s\nrequire_top1_match=%s\n' \
+        "${T256_F16_FINAL_LAYERS:-all}" "$T256_F16_FINAL_ORACLE" \
+        "$REQUIRE_TOP1_MATCH"
     printf 'candidate=T256-output-B-FP16-final-plus-half-HC-consumer\n'
     nvidia-smi --query-gpu=index,name,pci.bus_id,uuid,serial,power.limit,memory.total,compute_cap \
         --format=csv
@@ -147,6 +153,12 @@ validate_run() {
         grep -Fq 'CUDA T256 FP16 final attention result enabled (8192->4096, fused HC consumer)' "$log" || return 1
         [[ $summary =~ local=([0-9]+)[[:space:]]partner=([0-9]+) ]] || return 1
         (( BASH_REMATCH[1] + BASH_REMATCH[2] > 0 )) || return 1
+        if [[ $T256_F16_FINAL_ORACLE == 1 ]]; then
+            grep -Eq 'T256 FP16 final oracle scope=local .*rounded_half_mismatches=0$' "$log" || return 1
+            grep -Eq 'T256 FP16 final oracle scope=partner .*rounded_half_mismatches=0$' "$log" || return 1
+            grep -Eq 'T256 FP16 final HC oracle .*bit_mismatches=0$' "$log" || return 1
+            ! grep -Eq 'T256 FP16 final (HC )?oracle .*mismatches=[1-9]' "$log" || return 1
+        fi
     fi
     capture_health "$base.post-gpu.csv" || return 1
     cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv"
@@ -167,6 +179,12 @@ for i in 0 1; do
                 selector=(DS4_CUDA_NO_T256_F16_FINAL=1)
             else
                 selector=(DS4_CUDA_T256_F16_FINAL=1)
+                if [[ -n $T256_F16_FINAL_LAYERS ]]; then
+                    selector+=("DS4_CUDA_T256_F16_FINAL_LAYERS=$T256_F16_FINAL_LAYERS")
+                fi
+                if [[ $T256_F16_FINAL_ORACLE == 1 ]]; then
+                    selector+=(DS4_CUDA_T256_F16_FINAL_ORACLE=1)
+                fi
             fi
             printf 'T256 FP16-final production A/B model=%s repeat=%s/%s arm=%s...\n' \
                 "$layout" "$repeat" "$REPEATS" "$arm"
@@ -191,7 +209,8 @@ for i in 0 1; do
 done
 
 phase=summarize
-python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/summary" <<'PY'
+python3 - "$OUTPUT_DIR/runs.tsv" "$OUTPUT_DIR/summary" \
+    "$REQUIRE_TOP1_MATCH" <<'PY'
 import array, csv, json, math, pathlib, statistics, sys
 runs = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
 out = pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
@@ -241,8 +260,9 @@ for r in summary:
     print(f'{r["model_layout"]},{r["ctx_tokens"]},{r["control_median_tps"]:.3f},'
           f'{r["candidate_median_tps"]:.3f},{r["paired_median_speedup"]:.6f},'
           f'{int(r["top1_all"])},{r["max_nrmse"]:.9g},{r["max_abs"]:.9g}')
-if not all(r["top1_equal"] for r in samples):
+if int(sys.argv[3]) and not all(r["top1_equal"] for r in samples):
     raise SystemExit("error: candidate changed a frontier top-1 token")
+print("quality_gate=" + ("enforced" if int(sys.argv[3]) else "reported-only"))
 PY
 
 phase=complete

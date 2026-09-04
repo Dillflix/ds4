@@ -5285,3 +5285,30 @@ both `mixed15` and `all43`, and holds the accepted 22/21 placement fixed. The
 candidate selector is `DS4_CUDA_T256_F16_FINAL=1`; it remains off by default
 pending four-GPU performance and quality evidence. The separate 21/22
 placement qualification follows this result-boundary decision.
+
+Quality diagnosis is deliberately separated from promotion. Set
+`T256_F16_FINAL_ORACLE=1` in the runner to enable one untimed audit per local
+and partner execution location. Each audit reruns the same F16-input/F16-weight
+GEMM with an FP32 destination and requires every candidate half to equal the
+round-to-nearest half of that FP32 result. The same switch checks that the
+half-input HC consumer is byte-identical to the established FP32 HC consumer
+after exact half widening. A nonzero mismatch rejects the implementation; zero
+mismatches prove that any remaining end-to-end drift enters only at the
+intentional FP16 storage boundary and its accumulation through later layers.
+
+`T256_F16_FINAL_LAYERS` accepts comma-separated layer numbers or inclusive
+ranges such as `0-10,22-31`. It limits only candidate dispatch, not cache
+placement, so candidate subsets can localize accumulated quality loss without
+changing the balanced local/partner weight plan. `REQUIRE_TOP1_MATCH=0` makes
+that diagnostic report quality metrics and finish successfully even when a
+frontier top-1 differs; the default remains the strict promotion gate.
+
+```bash
+T256_F16_FINAL_ORACLE=1 REQUIRE_TOP1_MATCH=0 \
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 REPEATS=1 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t256-f16-final-production-ab.sh
+```
