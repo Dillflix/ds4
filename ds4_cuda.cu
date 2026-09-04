@@ -17221,14 +17221,14 @@ __global__ static void indexer_topk_8192_cub_kernel(
         if (tid < top_k) {
             selected[(uint64_t)t * top_k + tid] = rows[tid];
         }
-        return;
-    }
-
+    } else {
 #pragma unroll
-    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
-        const uint32_t i = tid * ITEMS_PER_THREAD + item;
-        if (i < top_k) {
-            selected[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
+        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+            const uint32_t i = tid * ITEMS_PER_THREAD + item;
+            if (i < top_k) {
+                selected[(uint64_t)t * top_k + i] =
+                    0xffffffffu - (uint32_t)keys[item];
+            }
         }
     }
 }
