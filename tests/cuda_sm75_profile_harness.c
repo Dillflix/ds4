@@ -762,7 +762,7 @@ static int run_moe(const scenario_spec *spec, uint32_t gate_type,
             in_dim, mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert,
             0u, resident_experts, 10.0f, x,
-            spec->layer, n_tokens, 0u, &mid_is_f16) ||
+            spec->layer, n_tokens, 0u, NULL, &mid_is_f16) ||
         mid_is_f16 || !ds4_gpu_synchronize()) {
         fprintf(stderr, "error: routed-MoE production kernel launch failed\n");
         goto cleanup;
@@ -791,7 +791,7 @@ static int run_moe(const scenario_spec *spec, uint32_t gate_type,
                 in_dim, mid_dim, out_dim,
                 selected, weights, n_total_expert, n_expert,
                 0u, resident_experts, 10.0f, x,
-                spec->layer, n_tokens, 0u, &mid_is_f16) ||
+                spec->layer, n_tokens, 0u, NULL, &mid_is_f16) ||
             mid_is_f16 || !ds4_gpu_synchronize() ||
             !ds4_gpu_tensor_read(mid, 0, mid_reference,
                                  mid_count * sizeof(float))) {
@@ -837,7 +837,7 @@ static int run_moe(const scenario_spec *spec, uint32_t gate_type,
                     in_dim, mid_dim, out_dim,
                     selected, weights, n_total_expert, n_expert,
                     0u, resident_experts, 10.0f, x,
-                    spec->layer, n_tokens, 0u, &mid_is_f16) ||
+                    spec->layer, n_tokens, 0u, NULL, &mid_is_f16) ||
                 mid_is_f16) {
                 fprintf(stderr,
                         "error: routed-MoE timed production launch failed\n");

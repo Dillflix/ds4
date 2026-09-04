@@ -124,6 +124,57 @@ __global__ __launch_bounds__(256) static void q8_K_quantize_sm75_native_kernel(
     sm75_q4_store_native_q8_K(yb, qv, tid, d);
 }
 
+/* Owner-filtered prefill keeps canonical slot IDs but marks remote slots -1.
+ * Quantize only rows that a local Down kernel can consume. This is the native
+ * equivalent of q8_K_quantize_owned_kernel and deliberately repeats the exact
+ * canonical extrema/scale/rounding sequence above. */
+__global__ __launch_bounds__(256) static void
+q8_K_quantize_sm75_native_owned_kernel(
+        cuda_sm75_native_q8_K *out,
+        const float *x,
+        const int32_t *selected,
+        uint32_t in_dim,
+        uint32_t n_rows) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / CUDA_QK_K || selected[row] < 0) return;
+    const float *xr = x + (uint64_t)row * in_dim +
+                      (uint64_t)b * CUDA_QK_K;
+    cuda_sm75_native_q8_K *yb =
+        out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
+    __shared__ float abs_part[CUDA_QK_K];
+    __shared__ float val_part[CUDA_QK_K];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float amax = abs_part[0];
+    if (amax == 0.0f) {
+        sm75_q4_store_native_q8_K(yb, 0, tid, 0.0f);
+        return;
+    }
+    if (tid == 0u) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    int qv = (int)lrintf(iscale_s * xr[tid]);
+    if (qv > 127) qv = 127;
+    if (qv < -128) qv = -128;
+    const float d = tid == 0u ? 1.0f / iscale_s : 0.0f;
+    sm75_q4_store_native_q8_K(yb, qv, tid, d);
+}
+
 /* Decode can share one input quantization launch with the 32-value Q8_0
  * indexer representation.  Preserve that half's exact reduction and write
  * order while changing only the Q8_K half to the direct native encoding. */

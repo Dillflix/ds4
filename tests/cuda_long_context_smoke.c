@@ -1262,6 +1262,8 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
     const uint64_t scratch_bytes = x_count * sizeof(float) >
         out_count * sizeof(float) ? x_count * sizeof(float) :
                                    out_count * sizeof(float);
+    const uint64_t native_q8_bytes =
+        ds4_gpu_sm75_native_q8_K_bytes(n_tokens, in_dim);
     unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
     float *xh = (float *)malloc((size_t)x_count * sizeof(float));
     int32_t *selh = (int32_t *)malloc(n_tokens * sizeof(int32_t));
@@ -1278,10 +1280,12 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
     ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
     ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(scratch_bytes);
+    ds4_gpu_tensor *native_xq = ds4_gpu_tensor_alloc(native_q8_bytes);
     int rc = 1;
     if (!model || !xh || !selh || !wh || !mid_ref || !mid_got ||
         !out_ref || !out_got || !x || !selected || !weights || !out ||
-        !gate || !up || !mid || !down) goto cleanup;
+        !gate || !up || !mid || !down || !native_xq ||
+        native_q8_bytes == 0u) goto cleanup;
     if (gate_type == 43u) {
         fill_sm75_q3a4_tensor(model + gate_off, 0u, n_total,
                               mid_dim, in_blocks);
@@ -1351,17 +1355,72 @@ static int check_sm75_q32_production_exact_case(uint32_t gate_type,
                                out_ref, out_got, out_count)) goto cleanup;
         (void)unsetenv("DS4_CUDA_MOE_Q3A4_PREFILL_TILE16_KSTREAM");
     }
+    /* Exercise the actual owned production API used by the four-GPU path:
+     * quantize the normalized rows once, consume the packed tensor without x,
+     * and leave inactive owner slots implicit instead of clearing/rereading
+     * the full six-slot surface. */
+    (void)setenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS", "1", 1);
+    if (!ds4_gpu_quantize_sm75_native_q8_K_tensor(
+             native_xq, x, in_dim, n_tokens) ||
+        !ds4_gpu_routed_moe_batch_owned_tensor(
+             out, gate, up, mid, down, model, model_bytes,
+             gate_off, up_off, down_off, gate_type, 42u,
+             gate_expert, gate_row, down_expert, down_row,
+             in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert,
+             0u, n_total, 10.0f, NULL, 0u, n_tokens, 0u, native_xq,
+             &mid_is_f16) ||
+        mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(mid, 0, mid_got,
+                             mid_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0, out_got,
+                             out_count * sizeof(float)) ||
+        !compare_exact_f32("SM75 shared native-Q8 owned prefill mid",
+                           mid_ref, mid_got, mid_count) ||
+        !compare_exact_f32("SM75 shared native-Q8 compact-slot prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    /* Restrict ownership so the final eight tokens have an inactive (-1)
+     * route. Compare the cleared-slot control with implicit inactive slots;
+     * this protects the optimization rather than merely dispatching it on an
+     * all-active fixture. */
+    (void)setenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS", "0", 1);
+    if (!ds4_gpu_routed_moe_batch_owned_tensor(
+             out, gate, up, mid, down, model, model_bytes,
+             gate_off, up_off, down_off, gate_type, 42u,
+             gate_expert, gate_row, down_expert, down_row,
+             in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert,
+             0u, 2u, 10.0f, NULL, 0u, n_tokens, 0u, native_xq,
+             &mid_is_f16) ||
+        mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, out_ref,
+                             out_count * sizeof(float))) goto cleanup;
+    (void)setenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS", "1", 1);
+    if (!ds4_gpu_routed_moe_batch_owned_tensor(
+             out, gate, up, mid, down, model, model_bytes,
+             gate_off, up_off, down_off, gate_type, 42u,
+             gate_expert, gate_row, down_expert, down_row,
+             in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert,
+             0u, 2u, 10.0f, NULL, 0u, n_tokens, 0u, native_xq,
+             &mid_is_f16) ||
+        mid_is_f16 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out, 0, out_got,
+                             out_count * sizeof(float)) ||
+        !compare_exact_f32("SM75 inactive compact-slot owned prefill output",
+                           out_ref, out_got, out_count)) goto cleanup;
+    (void)unsetenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS");
     fprintf(stderr,
             "cuda-regression: SM75 %s gate/up + Q4-32 down production "
-            "16/8/4 prefill/direct-decode%s exact\n", label,
+            "16/8/4 prefill/direct-decode%s, shared-native-Q8/compact-slot "
+            "owned prefill exact\n", label,
             gate_type == 43u ? ", tile16-K-stream" : "");
     rc = 0;
 #undef RUN_Q32
 
 cleanup:
     (void)unsetenv("DS4_CUDA_MOE_Q3A4_PREFILL_TILE16_KSTREAM");
+    (void)unsetenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS");
     ds4_gpu_set_routed_q4_layout(0u);
     if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(native_xq);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(weights);
@@ -2762,7 +2821,7 @@ static int check_sm75_native_q4_layout_exact(void) {
         0u, iq2_up_off, iq2_down_off, 16u, 12u, \
         iq2_gate_expert, iq2_gate_row, down_expert, down_row, \
         in_dim, mid_dim, out_dim, selected, weights, n_total, n_expert, \
-        0u, n_total, 10.0f, x, 3u, n_tokens, 0u, &mid_is_f16) && \
+        0u, n_total, 10.0f, x, 3u, n_tokens, 0u, NULL, &mid_is_f16) && \
      !mid_is_f16 && ds4_gpu_synchronize() && \
      ds4_gpu_tensor_read(mid, 0, (MID_DST), mid_count * sizeof(float)) && \
      ds4_gpu_tensor_read(out, 0, (OUT_DST), out_count * sizeof(float)))
@@ -2862,6 +2921,67 @@ static int check_large_topk(void) {
     }
 
 cleanup:
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(scores);
+    free(selected_host);
+    free(scores_host);
+    return rc;
+}
+
+static int check_sm75_fused_indexer_selection_exact(void) {
+    const uint32_t n_comp = 8192u;
+    const uint32_t n_tokens = 4u;
+    const uint32_t top_k = 512u;
+    const uint64_t score_count = (uint64_t)n_comp * n_tokens;
+    const uint64_t selected_count = (uint64_t)n_tokens * top_k;
+    float *scores_host = (float *)malloc((size_t)score_count * sizeof(float));
+    uint32_t *selected_host =
+        (uint32_t *)malloc((size_t)selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    int rc = 1;
+    if (!scores_host || !selected_host || !scores || !selected) goto cleanup;
+
+    /* Multiplication by an odd number is a permutation modulo 8192, so each
+     * token has unique scores while presenting a different index ordering. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t i = 0; i < n_comp; i++) {
+            const uint32_t rank = (i * 4051u + t * 997u) & (n_comp - 1u);
+            scores_host[(uint64_t)t * n_comp + i] = (float)rank;
+        }
+    }
+    if (!ds4_gpu_tensor_write(scores, 0, scores_host,
+                              score_count * sizeof(float))) goto cleanup;
+    (void)setenv("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION", "1", 1);
+    if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(selected, 0, selected_host,
+                             selected_count * sizeof(uint32_t))) goto cleanup;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        uint32_t previous = 0u;
+        for (uint32_t k = 0; k < top_k; k++) {
+            const uint32_t index = selected_host[(uint64_t)t * top_k + k];
+            const uint32_t rank = (index * 4051u + t * 997u) & (n_comp - 1u);
+            if (index >= n_comp || rank < n_comp - top_k ||
+                (k != 0u && index <= previous)) {
+                fprintf(stderr,
+                        "SM75 fused indexer selection mismatch token=%u rank=%u "
+                        "index=%u score-rank=%u previous=%u\n",
+                        t, k, index, rank, previous);
+                goto cleanup;
+            }
+            previous = index;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 fused top-k + ascending attention index "
+            "selection exact (%llu indices)\n",
+            (unsigned long long)selected_count);
+    rc = 0;
+
+cleanup:
+    (void)unsetenv("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION");
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(scores);
     free(selected_host);
@@ -3069,6 +3189,10 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
     if (!RUN_INDEXED_HEADS8(candidate) ||
         !compare_exact_f32("SM75 indexed attention heads8",
                            reference, candidate, q_count)) goto cleanup;
+    (void)setenv("DS4_CUDA_PREFILL_ATTN_ROW_TILE16", "1", 1);
+    if (!RUN_INDEXED_HEADS8(candidate) ||
+        !compare_exact_f32("SM75 indexed attention row-tile16",
+                           reference, candidate, q_count)) goto cleanup;
     if (!ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
             heads, sinks, n_head * sizeof(float), 0u, q, raw, comp, 0u,
             topk, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
@@ -3080,7 +3204,7 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(heads, 0, candidate,
                              q_count * sizeof(float)) ||
-        !compare_exact_f32("SM75 indexed attention heads8 shards",
+        !compare_exact_f32("SM75 indexed attention row-tile16 shards",
                            reference, candidate, q_count)) goto cleanup;
     {
         uint64_t nonzero = 0u;
@@ -3094,13 +3218,15 @@ static int check_sm75_indexed_attention_heads8_exact(void) {
     }
     fprintf(stderr,
             "cuda-regression: SM75 indexed attention 16-head/512-thread "
-            "versus 8-head/256-thread whole and sharded exact (%llu values)\n",
+            "versus 8-head/256-thread tile8/tile16 whole and tile16-sharded "
+            "exact (%llu values)\n",
             (unsigned long long)q_count);
     rc = 0;
 #undef RUN_INDEXED_HEADS8
 
 cleanup:
     (void)unsetenv("DS4_CUDA_INDEXED_HEADS8_SM75");
+    (void)unsetenv("DS4_CUDA_PREFILL_ATTN_ROW_TILE16");
     if (sinks && !retire_temporary_model_map()) rc = 1;
     ds4_gpu_tensor_free(heads);
     ds4_gpu_tensor_free(topk);
@@ -3115,6 +3241,10 @@ cleanup:
 }
 
 int main(void) {
+    (void)unsetenv("DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER");
+    (void)unsetenv("DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS");
+    (void)unsetenv("DS4_CUDA_PREFILL_ATTN_ROW_TILE16");
+    (void)unsetenv("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION");
     /* The regression owns the path and both halves of each new A/B.  Do not
      * let a debug shell silently change tile width, row span, MMA eligibility,
      * staging, or turn an array baseline into a scalar/scalar comparison. */
@@ -3259,6 +3389,7 @@ int main(void) {
     if (check_sm75_q4_32_down_tile32_exact() != 0) rc = 1;
     if (check_sm75_native_q4_layout_exact() != 0) rc = 1;
     if (check_large_topk() != 0) rc = 1;
+    if (check_sm75_fused_indexer_selection_exact() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
     if (check_sm75_indexed_attention_heads8_exact() != 0) rc = 1;

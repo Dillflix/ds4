@@ -240,6 +240,16 @@ int ds4_gpu_moe_handoff_pack_tensor(
     (void)packed; (void)ffn_norm; (void)selected; (void)weights;
     (void)n_embd; (void)n_expert; return -1;
 }
+uint64_t ds4_gpu_sm75_native_q8_K_bytes(uint32_t rows, uint32_t cols) {
+    (void)rows; (void)cols; return 0;
+}
+int ds4_gpu_quantize_sm75_native_q8_K_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t              cols,
+        uint32_t              rows) {
+    (void)out; (void)x; (void)cols; (void)rows; return 0;
+}
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         const void *model_map, uint64_t model_size,
@@ -67506,6 +67516,7 @@ static bool metal_graph_encode_routed_session_batch(
                 DS4_N_EXPERT - DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
                 &peer_norm, il, (uint32_t)count, g->batch_token_offset,
+                NULL,
                 &peer_mid_is_f16) != 0;
     }
 
@@ -67533,6 +67544,7 @@ static bool metal_graph_encode_routed_session_batch(
                 0, DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
                 &local_norm, il, (uint32_t)count, g->batch_token_offset,
+                NULL,
                 &g->batch_routed_mid_is_f16) != 0;
     }
     if (ok) {
@@ -67636,11 +67648,20 @@ static bool metal_graph_encode_mixed_routed_rows(
         (uint64_t)total_rows * routed_out_dim * sizeof(float);
     const uint64_t prefill_output_bytes =
         (uint64_t)prefill_rows * routed_out_dim * sizeof(float);
+    const bool native_q8_transfer =
+        metal_graph_tp_env_flag(
+            "DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER", false) &&
+        (layer->ffn_gate_exps->type == 42u ||
+         layer->ffn_gate_exps->type == 43u);
+    const uint64_t native_q8_bytes = native_q8_transfer
+        ? ds4_gpu_sm75_native_q8_K_bytes(total_rows,
+                                         (uint32_t)expert_in_dim)
+        : 0u;
 
     ds4_gpu_tensor local_norm, local_selected, local_weights, original_selected;
-    ds4_gpu_tensor local_out, local_down, prefill_peer_out;
+    ds4_gpu_tensor local_out, local_down, prefill_peer_out, local_native_q8;
     ds4_gpu_tensor peer_norm, peer_selected, peer_weights, peer_out, peer_down;
-    ds4_gpu_tensor peer_prefill_out;
+    ds4_gpu_tensor peer_prefill_out, peer_native_q8;
     bool ok =
         metal_graph_borrow_tensor_view(&local_norm,
                 metal_graph_batch_ffn_norm(g), 0, norm_bytes) &&
@@ -67670,15 +67691,33 @@ static bool metal_graph_encode_mixed_routed_rows(
         metal_graph_borrow_tensor_view(&peer_down,
                 g->batch_routed_down_by_tier[partner_tier], 0, slots_bytes) &&
         metal_graph_borrow_tensor_view(&peer_prefill_out,
-                &peer_out, 0, prefill_output_bytes);
+                &peer_out, 0, prefill_output_bytes) &&
+        (!native_q8_transfer ||
+         (native_q8_bytes != 0u &&
+          metal_graph_borrow_tensor_view(
+              &local_native_q8, g->batch_q_by_tier[home_tier], 0,
+              native_q8_bytes) &&
+          metal_graph_borrow_tensor_view(
+              &peer_native_q8, g->batch_q_by_tier[partner_tier], 0,
+              native_q8_bytes)));
 
     if (ok) {
         ok = ds4_gpu_tensor_copy_xdev_default(
-                &original_selected, &local_selected, selected_bytes) != 0 &&
+                &original_selected, &local_selected, selected_bytes) != 0;
+    }
+    if (ok && native_q8_transfer) {
+        ok = ds4_gpu_quantize_sm75_native_q8_K_tensor(
+                 &local_native_q8, &local_norm,
+                 (uint32_t)expert_in_dim, total_rows) != 0 &&
              ds4_gpu_tensor_copy_xdev3_default_dst(
-                &peer_norm, &local_norm, norm_bytes,
-                &peer_selected, &local_selected, selected_bytes,
-                &peer_weights, &local_weights, weights_bytes) != 0;
+                 &peer_native_q8, &local_native_q8, native_q8_bytes,
+                 &peer_selected, &local_selected, selected_bytes,
+                 &peer_weights, &local_weights, weights_bytes) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_tensor_copy_xdev3_default_dst(
+                 &peer_norm, &local_norm, norm_bytes,
+                 &peer_selected, &local_selected, selected_bytes,
+                 &peer_weights, &local_weights, weights_bytes) != 0;
     }
 
     bool peer_mid_is_f16 = false;
@@ -67706,7 +67745,9 @@ static bool metal_graph_encode_mixed_routed_rows(
                 DS4_N_EXPERT / 2u,
                 DS4_N_EXPERT - DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
-                &peer_norm, il, total_rows, g->batch_token_offset,
+                native_q8_transfer ? NULL : &peer_norm,
+                il, total_rows, g->batch_token_offset,
+                native_q8_transfer ? &peer_native_q8 : NULL,
                 &peer_mid_is_f16) != 0;
     }
 
@@ -67734,6 +67775,7 @@ static bool metal_graph_encode_mixed_routed_rows(
                 0, DS4_N_EXPERT / 2u,
                 DS4_SWIGLU_CLAMP_EXP,
                 &local_norm, il, total_rows, g->batch_token_offset,
+                native_q8_transfer ? &local_native_q8 : NULL,
                 &g->batch_routed_mid_is_f16) != 0;
     }
 

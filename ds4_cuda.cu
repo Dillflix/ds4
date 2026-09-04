@@ -17159,6 +17159,7 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
+template <bool SORT_SELECTED_ASC>
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
@@ -17189,6 +17190,39 @@ __global__ static void indexer_topk_8192_cub_kernel(
     }
 
     BlockSort(sort_storage).SortDescending(keys);
+
+    if (SORT_SELECTED_ASC) {
+        /* Reuse CUB's dynamic scratch after its final barrier.  This folds the
+         * index-order pass required by exact attention into selection without
+         * another 2 KiB/token global write/read round trip. */
+        __syncthreads();
+        uint32_t *rows = reinterpret_cast<uint32_t *>(sort_smem);
+#pragma unroll
+        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+            const uint32_t i = tid * ITEMS_PER_THREAD + item;
+            if (i < top_k) rows[i] = 0xffffffffu - (uint32_t)keys[item];
+        }
+        __syncthreads();
+        for (uint32_t k = 2u; k <= 512u; k <<= 1u) {
+            for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+                const uint32_t other = tid ^ j;
+                if (tid < top_k && other > tid && other < top_k) {
+                    const uint32_t a = rows[tid];
+                    const uint32_t b = rows[other];
+                    const bool up = (tid & k) == 0u;
+                    if ((up && a > b) || (!up && a < b)) {
+                        rows[tid] = b;
+                        rows[other] = a;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        if (tid < top_k) {
+            selected[(uint64_t)t * top_k + tid] = rows[tid];
+        }
+        return;
+    }
 
 #pragma unroll
     for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
@@ -18092,6 +18126,9 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
+    const bool fused_index_order = n_tokens > 1u && top_k == 512u &&
+        n_comp >= 4096u &&
+        cuda_env_flag_enabled("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION", 0);
     if (top_k == 512u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         if (n_comp == 4096u) {
@@ -18106,16 +18143,39 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                attr_err = fused_index_order
+                    ? cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<true>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           smem)
+                    : cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<false>,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                    if (fused_index_order) {
+                        indexer_topk_8192_cub_kernel<true>
+                            <<<n_tokens, 512, (size_t)smem>>>(
+                                (uint32_t *)selected->ptr,
+                                (const float *)scores->ptr,
+                                n_comp, n_tokens, top_k);
+                    } else {
+                        indexer_topk_8192_cub_kernel<false>
+                            <<<n_tokens, 512, (size_t)smem>>>(
+                                (uint32_t *)selected->ptr,
+                                (const float *)scores->ptr,
+                                n_comp, n_tokens, top_k);
+                    }
+                    if (fused_index_order) {
+                        static std::atomic<bool> logged = false;
+                        if (!logged.exchange(true, std::memory_order_relaxed)) {
+                            fprintf(stderr,
+                                    "ds4: SM75 fused indexer selection/index-order "
+                                    "selected\n");
+                        }
+                    }
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
+            if (fused_index_order) return 0;
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
@@ -18137,16 +18197,39 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                attr_err = fused_index_order
+                    ? cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<true>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           smem)
+                    : cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<false>,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                    if (fused_index_order) {
+                        indexer_topk_8192_cub_kernel<true>
+                            <<<n_tokens, 512, (size_t)smem>>>(
+                                (uint32_t *)selected->ptr,
+                                (const float *)scores->ptr,
+                                n_comp, n_tokens, top_k);
+                    } else {
+                        indexer_topk_8192_cub_kernel<false>
+                            <<<n_tokens, 512, (size_t)smem>>>(
+                                (uint32_t *)selected->ptr,
+                                (const float *)scores->ptr,
+                                n_comp, n_tokens, top_k);
+                    }
+                    if (fused_index_order) {
+                        static std::atomic<bool> logged = false;
+                        if (!logged.exchange(true, std::memory_order_relaxed)) {
+                            fprintf(stderr,
+                                    "ds4: SM75 fused indexer selection/index-order "
+                                    "selected\n");
+                        }
+                    }
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
+            if (fused_index_order) return 0;
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
@@ -24156,7 +24239,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    const bool fused_index_order = n_tokens > 1u && top_k == 512u &&
+        n_comp >= 4096u &&
+        cuda_env_flag_enabled("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION", 0);
     if (n_tokens > 1u && top_k == 512u &&
+        !fused_index_order &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier, sort_bytes, "indexed attention topk sort");
@@ -24170,12 +24257,23 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             const int sm75_heads8 = cuda_sm75_mma_ok() &&
                 cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
+            const bool row_tile16 = n_tokens > 1u && sm75_heads8 &&
+                cuda_env_flag_enabled(
+                    "DS4_CUDA_PREFILL_ATTN_ROW_TILE16", 0);
             if (sm75_heads8) {
                 static std::atomic<bool> logged = false;
                 if (!logged.exchange(true, std::memory_order_relaxed))
                     fprintf(stderr,
                             "ds4: SM75 indexed attention selected: "
                             "8 heads / 256 threads\n");
+            }
+            if (row_tile16) {
+                static std::atomic<bool> logged = false;
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    fprintf(stderr,
+                            "ds4: SM75 indexed prefill attention row tile16 "
+                            "selected\n");
+                }
             }
             dim3 grid(n_tokens,
                       sm75_heads8 ? (n_head + 7u) / 8u :
@@ -24186,7 +24284,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
                 topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
                 top_k, window, ratio, 0, n_head, n_head, head_dim
-            if (sm75_heads8) {
+            if (row_tile16) {
+                attention_indexed_mixed_heads8_online_kernel<16, 8>
+                    <<<grid, 256>>>(DS4_INDEXED_ONLINE_ARGS);
+            } else if (sm75_heads8) {
                 attention_indexed_mixed_heads8_online_kernel<8, 8>
                     <<<grid, 256>>>(DS4_INDEXED_ONLINE_ARGS);
             } else {
@@ -24265,7 +24366,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
             logical_tier, "attn_sinks_shard");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
-    if (top_k == 512u && getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+    const bool fused_index_order = n_tokens > 1u && top_k == 512u &&
+        n_comp >= 4096u &&
+        cuda_env_flag_enabled("DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION", 0);
+    if (top_k == 512u && !fused_index_order &&
+        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(
                 logical_tier, sort_bytes, "indexed attention shard topk sort");
@@ -24278,6 +24383,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
     }
     const int sm75_heads8 = cuda_sm75_mma_ok() &&
         cuda_env_flag_enabled("DS4_CUDA_INDEXED_HEADS8_SM75", 1);
+    const bool row_tile16 = n_tokens > 1u && sm75_heads8 &&
+        cuda_env_flag_enabled("DS4_CUDA_PREFILL_ATTN_ROW_TILE16", 0);
     if (sm75_heads8) {
         static std::atomic<bool> logged = false;
         if (!logged.exchange(true, std::memory_order_relaxed))
@@ -24294,7 +24401,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
         (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, \
         topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, \
         top_k, window, ratio, head0, n_head_work, n_head_total, head_dim
-    if (sm75_heads8) {
+    if (row_tile16) {
+        attention_indexed_mixed_heads8_online_kernel<16, 8><<<grid, 256>>>(
+            DS4_INDEXED_SHARD_ARGS);
+    } else if (sm75_heads8) {
         attention_indexed_mixed_heads8_online_kernel<8, 8><<<grid, 256>>>(
             DS4_INDEXED_SHARD_ARGS);
     } else {
@@ -31462,12 +31572,14 @@ static int routed_moe_launch(
         int owned_filtered,
         uint32_t audit_owner_base,
         uint32_t audit_owner_count,
-        uint32_t audit_token_offset) {
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        uint32_t audit_token_offset,
+        const ds4_gpu_tensor *prequant_xq) {
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights ||
+        (!x && !prequant_xq) ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
-        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        (x && x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float)) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
@@ -31707,7 +31819,9 @@ static int routed_moe_launch(
     const uint64_t xq_bytes = xq_count * sizeof(cuda_block_q8_K);
     const uint64_t midq_bytes = midq_count * sizeof(cuda_block_q8_K);
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
-        cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+        cuda_block_q8_K *xq = prequant_xq
+            ? (cuda_block_q8_K *)prequant_xq->ptr
+            : (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -31752,6 +31866,23 @@ static int routed_moe_launch(
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
         const uint32_t use_owned_sparse_buffers = owned_filtered && !any_native_layout &&
             getenv("DS4_CUDA_MOE_NO_OWNED_SPARSE_BUFFERS") == NULL;
+        /* Native prefill down kernels already dispatch only sorted, active
+         * owner pairs.  The legacy path nevertheless cleared and reread all
+         * six routed slots.  The compact path treats filtered (-1) entries as
+         * implicit +0, so only active slots are touched while the six-slot
+         * accumulation order remains unchanged. */
+        const uint32_t use_owned_compact_slots =
+            owned_filtered && any_native_layout && n_tokens > 1u &&
+            cuda_env_flag_enabled(
+                "DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS", 0);
+        if (use_owned_compact_slots) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                        "ds4: SM75 compact owner-local routed slots selected "
+                        "(inactive slots implicit)\n");
+            }
+        }
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
             (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
              getenv("DS4_CUDA_MOE_GATE_ROW256") != NULL ||
@@ -31963,19 +32094,37 @@ static int routed_moe_launch(
         uint32_t iq2_tail8_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         const bool native_xq = native_gate_q4 || gate_q32;
+        const bool supplied_native_xq = prequant_xq != NULL;
+        if (supplied_native_xq &&
+            (!native_xq || prequant_xq->bytes < xq_bytes ||
+             ds4_tensor_device_idx(prequant_xq) != logical_tier)) {
+            return 0;
+        }
         const bool use_direct_native_q8 = n_tokens == 1u
             ? g_cuda_moe_direct_native_q8_decode != 0
             : g_cuda_moe_direct_native_q8_prefill != 0;
-        const bool use_direct_native_xq = use_direct_native_q8 && native_xq;
-        if (use_direct_native_xq) {
+        const bool use_direct_native_xq =
+            supplied_native_xq || (use_direct_native_q8 && native_xq);
+        if (supplied_native_xq) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                        "ds4: SM75 shared native Q8 routed activation selected "
+                        "(quantize once / peer transfer)\n");
+            }
+        } else if (use_direct_native_xq) {
             q8_K_quantize_sm75_native_kernel<<<xq_grid, 256>>>(
                 (cuda_sm75_native_q8_K *)xq,
                 (const float *)x->ptr, expert_in_dim, n_tokens);
-        } else {
+        } else if (x) {
             q8_K_quantize_kernel<<<xq_grid, 256>>>(
                 xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        } else {
+            ok = 0;
         }
-        ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        if (!supplied_native_xq && ok) {
+            ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        }
         if (ok && native_xq && !use_direct_native_xq) {
             ok = sm75_q4_pack_activations_inplace(
                 xq, xq_count, "routed_moe native x pack launch");
@@ -32163,7 +32312,7 @@ static int routed_moe_launch(
         }
         if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
         if (ok && owned_filtered && use_sorted_pairs &&
-            !use_owned_sparse_buffers) {
+            !use_owned_sparse_buffers && !use_owned_compact_slots) {
             const uint64_t mid_bytes =
                 (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
             ok = cuda_ok(cudaMemset(mid->ptr, 0, (size_t)mid_bytes),
@@ -32971,15 +33120,25 @@ static int routed_moe_launch(
         if (ok && !use_direct_midq) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
             const bool use_direct_native_midq =
-                use_direct_native_q8 &&
+                (use_direct_native_q8 || use_owned_compact_slots) &&
                 (native_down_q4 || down_q4_32) &&
                 !use_q4_midq_sidecar && !use_owned_sparse_buffers;
             if (use_direct_native_midq) {
-                q8_K_quantize_sm75_native_kernel<<<midq_grid, 256>>>(
-                    (cuda_sm75_native_q8_K *)midq,
-                    (const float *)mid->ptr,
-                    expert_mid_dim,
-                    n_tokens * n_expert);
+                if (use_owned_compact_slots) {
+                    q8_K_quantize_sm75_native_owned_kernel
+                        <<<midq_grid, 256>>>(
+                            (cuda_sm75_native_q8_K *)midq,
+                            (const float *)mid->ptr,
+                            (const int32_t *)selected->ptr,
+                            expert_mid_dim,
+                            n_tokens * n_expert);
+                } else {
+                    q8_K_quantize_sm75_native_kernel<<<midq_grid, 256>>>(
+                        (cuda_sm75_native_q8_K *)midq,
+                        (const float *)mid->ptr,
+                        expert_mid_dim,
+                        n_tokens * n_expert);
+                }
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe direct native mid quantize launch");
                 if (ok) {
@@ -33027,7 +33186,7 @@ static int routed_moe_launch(
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
         if (ok && owned_filtered && use_sorted_pairs && !use_atomic_down &&
-            !use_owned_sparse_buffers) {
+            !use_owned_sparse_buffers && !use_owned_compact_slots) {
             const uint64_t down_clear_bytes =
                 (uint64_t)n_tokens * n_expert * out_dim * sizeof(float);
             ok = cuda_ok(cudaMemset(down->ptr, 0, (size_t)down_clear_bytes),
@@ -33543,7 +33702,7 @@ static int routed_moe_launch(
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            if (use_owned_sparse_buffers) {
+            if (use_owned_sparse_buffers || use_owned_compact_slots) {
                 moe_sum_owned_kernel<<<(n + 255) / 256, 256>>>(
                         (float *)out->ptr,
                         (const float *)down->ptr,
@@ -33585,7 +33744,7 @@ static int routed_moe_launch(
      * recipe. Returning failure is safer than silently interpreting Q4 blocks
      * as IQ2/Q2 if a future graph is allocated without the Q8_K scratch used
      * by every optimized Q4 or hybrid path. */
-    if (!gate_iq2 || !down_q2k) {
+    if (!gate_iq2 || !down_q2k || !x) {
         fprintf(stderr,
                 "ds4: CUDA routed-MoE scratch too small "
                 "(down=%llu need_xq=%llu gate=%llu need_midq=%llu, "
@@ -34762,7 +34921,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
                              layer_index, 1, force_resident ? 0 : 1, 0,
-                             0u, n_total_expert, 0u);
+                             0u, n_total_expert, 0u, NULL);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     (void)force_resident;
@@ -34775,7 +34934,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
                              layer_index, n_tokens, 1, 0,
-                             0u, n_total_expert, 0u);
+                             0u, n_total_expert, 0u, NULL);
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
@@ -34809,6 +34968,7 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
         uint32_t layer_index,
         uint32_t n_tokens,
         uint32_t token_offset,
+        const ds4_gpu_tensor *native_xq,
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (!selected || !weights || n_tokens == 0u || n_expert == 0u ||
@@ -34856,7 +35016,36 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, resident_expert_count, n_expert,
             clamp, x, layer_index, n_tokens, 0, 1,
-            resident_expert_base, resident_expert_count, token_offset);
+            resident_expert_base, resident_expert_count, token_offset,
+            native_xq);
+}
+
+extern "C" uint64_t ds4_gpu_sm75_native_q8_K_bytes(
+        uint32_t rows, uint32_t cols) {
+    if (rows == 0u || cols == 0u || cols % CUDA_QK_K != 0u) return 0u;
+    const uint64_t blocks = (uint64_t)rows * (cols / CUDA_QK_K);
+    if (blocks > UINT64_MAX / sizeof(cuda_sm75_native_q8_K)) return 0u;
+    return blocks * sizeof(cuda_sm75_native_q8_K);
+}
+
+extern "C" int ds4_gpu_quantize_sm75_native_q8_K_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        uint32_t cols,
+        uint32_t rows) {
+    const uint64_t out_bytes = ds4_gpu_sm75_native_q8_K_bytes(rows, cols);
+    if (!out || !x || out_bytes == 0u || out->bytes < out_bytes ||
+        x->bytes < (uint64_t)rows * cols * sizeof(float) ||
+        ds4_tensor_device_idx(out) != ds4_tensor_device_idx(x) ||
+        !cuda_sm75_mma_ok()) {
+        return 0;
+    }
+    const dim3 grid(cols / CUDA_QK_K, rows, 1u);
+    q8_K_quantize_sm75_native_kernel<<<grid, 256>>>(
+            (cuda_sm75_native_q8_K *)out->ptr,
+            (const float *)x->ptr, cols, rows);
+    return cuda_ok(cudaGetLastError(),
+                   "SM75 shared native Q8 activation quantize launch");
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

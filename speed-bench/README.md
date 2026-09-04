@@ -5293,6 +5293,14 @@ candidate dispatch, and balanced production-shaped timing.  The selector
 gate does not promote the kernel: the next acceptance step is a four-GPU 32K
 A/B using the all-43-layer Q3A4 model, followed by mixed15 coverage.
 
+The `20260904T051136Z` bounded run rejected this design before full-model
+testing. It was bit-exact, sanitizer-clean, and compiled to 32 IMMA
+instructions with no SASS local-memory traffic, but changed median production-
+shaped time from 7.796209 ms to 8.668296 ms: `0.899393x`, or 11.19% slower.
+The per-K CTA barriers and reduced CTA-level parallelism cost more than the
+saved weight reads. The candidate remains opt-in only as architecture evidence
+and must not be enabled in production.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 \
 TIMING_ROUNDS=7 TIMING_REPEATS=10 \
@@ -5300,9 +5308,48 @@ RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q3a4-prefill-kstream.sh
 ```
 
-The remaining prefill program, in order after this gate, is: a pair-1
-row-resident T32 to attention to A+B pipeline; T256 FP16 final results;
-quantize-once native-Q8 transfer plus compact routed slots; qualification of
-the 21/22 placement against 22/21; and attention-row tiling with fused indexer
-selection.  Each item retains an exact rollback until its production A/B is
-accepted.
+### SM75 quantize-once/compact-slot and indexed-attention native-prefill A/B
+
+`cuda-sm75-prefill-native-pipeline-ab.sh` tests four independent, opt-in
+prefill changes together against the current production control at the exact
+four-GPU 32K frontier:
+
+* `DS4_CUDA_PREFILL_NATIVE_Q8_TRANSFER=1` quantizes the post-norm routed-FFN
+  activation once on its home GPU into the size-neutral lane-major native
+  Q8_K format. Both expert owners consume that tensor directly; the partner
+  receives the packed bytes instead of the FP32 rows and does not requantize.
+  Dead-after-attention query scratch holds the packed rows, so this adds no
+  persistent VRAM or GGUF cache.
+* `DS4_CUDA_PREFILL_COMPACT_ROUTED_SLOTS=1` keeps only sorted active owner
+  pairs live in the native routed down path. Inactive selected slots are
+  implicit `+0.0f`, eliminating the full six-slot clear and inactive-slot
+  rereads while preserving the six-add reduction order exactly.
+* `DS4_CUDA_PREFILL_ATTN_ROW_TILE16=1` stages 16 indexed-attention rows per
+  CTA barrier instead of eight. Per-row score and online-softmax arithmetic is
+  unchanged.
+* `DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION=1` reuses the CUB top-k scratch to
+  sort the selected 512 indices into the exact order consumed by attention.
+  This removes the separate global-memory index-sort launch and round trip.
+
+All selectors are restricted to multi-token prefill and remain independently
+rollbackable. The harness first runs the production APIs through bit-exact
+CUDA regressions, then alternates control/candidate 32K runs, verifies the
+stable pair-0-off/pair-1-on attention topology and all candidate dispatch
+markers, checks GPU identity/power state, and requires byte-identical frontier
+logits. Run all43 first, then repeat with `MODEL_LAYOUT=mixed15` if accepted.
+
+```bash
+MODEL_LAYOUT=all43 \
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+REPEATS=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-prefill-native-pipeline-ab.sh
+```
+
+The remaining prefill program after this A/B is: a pair-1 row-resident T32 to
+attention to A+B pipeline; T256 FP16 final results; and qualification of the
+21/22 placement against 22/21. Each item retains an exact rollback until its
+production A/B is accepted.

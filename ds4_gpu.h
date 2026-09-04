@@ -2526,7 +2526,19 @@ int ds4_gpu_routed_moe_batch_owned_tensor(
         uint32_t              layer_index,
         uint32_t              n_tokens,
         uint32_t              token_offset,
+        const ds4_gpu_tensor *native_xq,
         bool                 *mid_is_f16);
+
+/* Produce the size-neutral SM75 lane-major Q8_K activation layout consumed by
+ * the native Q4-32/Q3A4 routed kernels.  A caller may quantize once on the
+ * owner, transfer this tensor, and pass it as native_xq above; x may then be
+ * NULL.  The packed tensor contains rows * (cols / 256) 292-byte blocks. */
+uint64_t ds4_gpu_sm75_native_q8_K_bytes(uint32_t rows, uint32_t cols);
+int ds4_gpu_quantize_sm75_native_q8_K_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t              cols,
+        uint32_t              rows);
 
 int ds4_gpu_routed_moe_owned_slots_combine_tensor(
         ds4_gpu_tensor       *out,

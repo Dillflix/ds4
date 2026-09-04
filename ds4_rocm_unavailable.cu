@@ -28,6 +28,7 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_moe_handoff_pack_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_register_model_map_no_copy)
 ROCM_UNAVAILABLE_INT(ds4_gpu_register_support_map)
 ROCM_UNAVAILABLE_INT(ds4_gpu_rope_tail_decode_rows_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_quantize_sm75_native_q8_K_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_batch_owned_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_one_owned_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_packed_combine_tensor)
@@ -37,5 +38,6 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
 
+extern "C" uint64_t ds4_gpu_sm75_native_q8_K_bytes(...) { return 0; }
 extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
 ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)
