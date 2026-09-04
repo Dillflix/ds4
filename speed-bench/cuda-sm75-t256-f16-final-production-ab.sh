@@ -144,7 +144,7 @@ validate_run() {
     if [[ $arm == control ]]; then
         [[ -z $summary ]] || return 1
     else
-        grep -Fq 'CUDA T256 FP16 final attention result enabled' "$log" || return 1
+        grep -Fq 'CUDA T256 FP16 final attention result enabled (8192->4096, fused HC consumer)' "$log" || return 1
         [[ $summary =~ local=([0-9]+)[[:space:]]partner=([0-9]+) ]] || return 1
         (( BASH_REMATCH[1] + BASH_REMATCH[2] > 0 )) || return 1
     fi

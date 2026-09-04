@@ -40058,7 +40058,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
     if (!cuda_env_flag_enabled("DS4_CUDA_T256_F16_FINAL", 0) ||
         getenv("DS4_CUDA_NO_T256_F16_FINAL") != NULL ||
         !g_cublas_ready || !out_h || !x || !model_map ||
-        in_dim != 2048u || out_dim != 4096u || n_tok < 8u ||
+        in_dim != 8192u || out_dim != 4096u || n_tok < 8u ||
         in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
         weight_offset > model_size) {
         return 0;
@@ -40132,7 +40132,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
     if (logged.exchange(1u, std::memory_order_relaxed) == 0u) {
         fprintf(stderr,
                 "ds4: CUDA T256 FP16 final attention result enabled "
-                "(2048->4096, fused HC consumer)\n");
+                "(8192->4096, fused HC consumer)\n");
         fflush(stderr);
     }
     return 1;
@@ -40342,7 +40342,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         return 0;
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
-    if (low_dim != 2048u || out_dim != 4096u ||
+    if (low_dim != 8192u || out_dim != 4096u ||
         heads->bytes < (uint64_t)n_tokens * n_groups * group_dim *
                            sizeof(float) ||
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
