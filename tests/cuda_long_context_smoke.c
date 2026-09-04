@@ -223,6 +223,150 @@ cleanup:
     return rc;
 }
 
+static int check_sm75_q8_warp_interleaved_attention_output_exact(void) {
+    const uint32_t groups_total = 64u;
+    const uint32_t group0 = 32u;
+    const uint32_t group_count = 32u;
+    const uint32_t group_dim = 128u;
+    const uint32_t rank = 128u;
+    const uint32_t low_total = groups_total * rank;
+    const uint32_t low_count = group_count * rank;
+    const uint32_t out_dim = 256u;
+    const uint32_t blocks_a = group_dim / 32u;
+    const uint32_t blocks_b = low_total / 32u;
+    const size_t a_bytes =
+        (size_t)low_total * blocks_a * 34u;
+    const size_t b_bytes =
+        (size_t)out_dim * blocks_b * 34u;
+    const size_t model_bytes = a_bytes + b_bytes;
+    const size_t heads_count = (size_t)groups_total * group_dim;
+    unsigned char *model = (unsigned char *)malloc(model_bytes);
+    float *heads_host = (float *)malloc(heads_count * sizeof(float));
+    float *reference_low = (float *)malloc((size_t)low_count * sizeof(float));
+    float *candidate_low = (float *)malloc((size_t)low_count * sizeof(float));
+    float *reference_out = (float *)malloc((size_t)out_dim * sizeof(float));
+    float *candidate_out = (float *)malloc((size_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *heads =
+        ds4_gpu_tensor_alloc(heads_count * sizeof(float));
+    ds4_gpu_tensor *low =
+        ds4_gpu_tensor_alloc((size_t)low_count * sizeof(float));
+    ds4_gpu_tensor *out =
+        ds4_gpu_tensor_alloc((size_t)out_dim * sizeof(float));
+    int rc = 1;
+    if (!model || !heads_host || !reference_low || !candidate_low ||
+        !reference_out || !candidate_out || !heads || !low || !out) {
+        goto cleanup;
+    }
+
+    for (uint32_t row = 0u; row < low_total; ++row) {
+        for (uint32_t b = 0u; b < blocks_a; ++b) {
+            unsigned char *blk =
+                model + ((size_t)row * blocks_a + b) * 34u;
+            const uint16_t d = (uint16_t)(0x2000u +
+                ((row * 5u + b * 3u) & 31u));
+            memcpy(blk, &d, sizeof(d));
+            for (uint32_t i = 0u; i < 32u; ++i) {
+                const int q =
+                    (int)((row * 17u + b * 13u + i * 7u) % 255u) - 127;
+                blk[2u + i] = (unsigned char)(int8_t)q;
+            }
+        }
+    }
+    for (uint32_t row = 0u; row < out_dim; ++row) {
+        for (uint32_t b = 0u; b < blocks_b; ++b) {
+            unsigned char *blk = model + a_bytes +
+                ((size_t)row * blocks_b + b) * 34u;
+            const uint16_t d = (uint16_t)(0x2100u +
+                ((row * 11u + b * 7u) & 31u));
+            memcpy(blk, &d, sizeof(d));
+            for (uint32_t i = 0u; i < 32u; ++i) {
+                const int q =
+                    (int)((row * 19u + b * 23u + i * 5u) % 255u) - 127;
+                blk[2u + i] = (unsigned char)(int8_t)q;
+            }
+        }
+    }
+    for (size_t i = 0u; i < heads_count; ++i) {
+        const int v = (int)((i * 29u + (i >> 3u) * 11u) % 193u) - 96;
+        heads_host[i] = (float)v / 101.0f;
+    }
+    if (!ds4_gpu_tensor_write(heads, 0u, heads_host,
+                              heads_count * sizeof(float)) ||
+        !ds4_gpu_set_model_map(model, model_bytes)) {
+        goto cleanup;
+    }
+
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "0", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "0", 1);
+    if (!ds4_gpu_attention_output_q8_tp_tensor(
+            out, low, model, model_bytes, 0u, a_bytes,
+            group_dim, rank, groups_total, group0, group_count,
+            out_dim, heads) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low, 0u, reference_low,
+                             (size_t)low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0u, reference_out,
+                             (size_t)out_dim * sizeof(float))) {
+        goto cleanup;
+    }
+
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", "1", 1);
+    (void)setenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB", "64", 1);
+    if (!ds4_gpu_attention_output_q8_tp_tensor(
+            out, low, model, model_bytes, 0u, a_bytes,
+            group_dim, rank, groups_total, group0, group_count,
+            out_dim, heads) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low, 0u, candidate_low,
+                             (size_t)low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0u, candidate_out,
+                             (size_t)out_dim * sizeof(float))) {
+        goto cleanup;
+    }
+    if (memcmp(reference_low, candidate_low,
+               (size_t)low_count * sizeof(float)) != 0 ||
+        memcmp(reference_out, candidate_out,
+               (size_t)out_dim * sizeof(float)) != 0) {
+        size_t first = 0u;
+        const int low_mismatch = memcmp(reference_low, candidate_low,
+            (size_t)low_count * sizeof(float)) != 0;
+        const size_t count = low_mismatch ? low_count : out_dim;
+        const float *reference = low_mismatch ? reference_low : reference_out;
+        const float *candidate = low_mismatch ? candidate_low : candidate_out;
+        while (first < count &&
+               memcmp(reference + first, candidate + first,
+                      sizeof(float)) == 0) {
+            ++first;
+        }
+        fprintf(stderr,
+                "SM75 warp-interleaved attention-output %s mismatch at %zu: reference=%a candidate=%a\n",
+                low_mismatch ? "A" : "B", first,
+                (double)reference[first], (double)candidate[first]);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 warp-interleaved Q8 attention-output A+B exact (%u low, %u output values)\n",
+            low_count, out_dim);
+    rc = 0;
+
+cleanup:
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE");
+    (void)unsetenv("DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB");
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(heads);
+    free(candidate_out);
+    free(reference_out);
+    free(candidate_low);
+    free(reference_low);
+    free(heads_host);
+    free(model);
+    return rc;
+}
+
 static int check_sm75_iq2_moe_mma_exact(void) {
     const uint32_t n_total_expert = 8;
     /* One selected expert per token isolates every final-output write.  The
@@ -3085,6 +3229,7 @@ int main(void) {
     }
     int rc = check_sm75_q8_mma_exact();
     if (check_sm75_q8_warp_interleaved_engine_exact() != 0) rc = 1;
+    if (check_sm75_q8_warp_interleaved_attention_output_exact() != 0) rc = 1;
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
     if (check_sm75_q32_production_exact() != 0) rc = 1;

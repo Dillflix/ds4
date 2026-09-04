@@ -5049,6 +5049,31 @@ SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
 ```
 
+### SM75 attention-output Q8_0 warp-interleaved A/B
+
+`cuda-sm75-q8-attention-output-interleaved.sh` extends the size-neutral
+warp-interleaved Q8_0 representation to the two single-token attention-output
+consumers: the grouped A projection and K-sliced B projection. The two paths
+remain disabled by default behind independent
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE` and
+`DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE` selectors. The B cache contains
+only the consumed 4096-wide slice of the canonical 8192-wide matrix.
+
+The bounded diagnostic requires bit-identical A intermediates and B outputs,
+reports paired inclusive timings at the production shapes, and runs both
+candidates under Compute Sanitizer:
+
+```bash
+PROFILE_GPU=0 CUDA_ARCH=sm_75 \
+TIMING_ROUNDS=9 TIMING_REPEATS=100 \
+RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-attention-output-interleaved.sh
+```
+
+This experiment does not change production defaults. A four-GPU production
+A/B with exact logits and explicit interleaved-cache residency is required
+before either selector can be promoted.
+
 ### SM75 width-1024 compressor projection layout diagnostic
 
 `cuda-sm75-compressor-projection-layout.sh` targets the expensive one-token
