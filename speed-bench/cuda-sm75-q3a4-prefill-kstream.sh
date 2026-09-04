@@ -228,8 +228,7 @@ for ((round=0; round<TIMING_ROUNDS; round++)); do
         run_sample "$round" 2 control 0
     fi
 done
-python3 - "$samples" "$OUTPUT_DIR/timing/summary.csv" <<'PY' |
-        tee "$OUTPUT_DIR/timing/summary.txt"
+python3 - "$samples" "$OUTPUT_DIR/timing/summary.csv" <<'PY' | tee "$OUTPUT_DIR/timing/summary.txt"
 import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
 values = {"control": [], "tile16-kstream": []}
