@@ -73,6 +73,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
     [DS4Q_TYPE_SM75_Q4_32] = { "sm75_q4_32", QK_K, 136, true, true },
     [DS4Q_TYPE_SM75_Q3A4]  = { "sm75_q3a4",  QK_K, 108, true, true },
+    [DS4Q_TYPE_SM75_Q8_WARP32] = { "sm75_q8_warp32", 32, 34, false, false },
 };
 
 static float ds4q_f32_from_bits(uint32_t bits) {

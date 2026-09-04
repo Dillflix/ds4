@@ -1553,6 +1553,8 @@ typedef struct {
     size_t alignment;
     int n_experts;
     bool sm75_native_q4;
+    bool sm75_q32;
+    bool sm75_native_q8;
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
@@ -1567,6 +1569,7 @@ typedef struct {
     size_t tensor_bytes;
     size_t alignment;
     bool sm75_q32;
+    bool sm75_native_q8;
 } output_context;
 
 static size_t gguf_scalar_size(uint32_t type) {
@@ -1646,11 +1649,34 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
-static bool is_q4_layout_kv_key(const char *key) {
+static bool is_private_layout_kv_key(const char *key) {
     return strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT) == 0 ||
            strcmp(key, DS4_KV_Q4_ROUTED_LAYOUT_VERSION) == 0 ||
            strcmp(key, DS4_KV_SM75_ROUTED_LAYOUT) == 0 ||
-           strcmp(key, DS4_KV_SM75_ROUTED_LAYOUT_VERSION) == 0;
+           strcmp(key, DS4_KV_SM75_ROUTED_LAYOUT_VERSION) == 0 ||
+           strcmp(key, DS4_KV_SM75_DENSE_Q8_LAYOUT) == 0 ||
+           strcmp(key, DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION) == 0;
+}
+
+static size_t extra_sm75_dense_q8_kv_size(bool enabled) {
+    if (!enabled) return 0;
+    return gguf_string_size(DS4_KV_SM75_DENSE_Q8_LAYOUT) + 4 +
+               gguf_string_size(DS4_SM75_DENSE_Q8_LAYOUT_WARP32_TP2) +
+           gguf_string_size(DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION) + 4 + 4;
+}
+
+static uint64_t extra_sm75_dense_q8_kv_count(bool enabled) {
+    return enabled ? 2u : 0u;
+}
+
+static void write_sm75_dense_q8_kvs(FILE *fp, bool enabled) {
+    if (!enabled) return;
+    write_gguf_string(fp, DS4_KV_SM75_DENSE_Q8_LAYOUT);
+    write_u32(fp, GGUF_TYPE_STRING);
+    write_gguf_string(fp, DS4_SM75_DENSE_Q8_LAYOUT_WARP32_TP2);
+    write_gguf_string(fp, DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u32(fp, 1u);
 }
 
 static size_t extra_sm75_q32_kv_size(bool enabled) {
@@ -1749,6 +1775,10 @@ static gguf_file load_gguf_metadata(const char *path) {
     uint64_t n_kv_keep = 0;
     bool q4_layout_seen = false;
     bool q4_layout_version_seen = false;
+    bool sm75_q32_layout_seen = false;
+    bool sm75_q32_layout_version_seen = false;
+    bool sm75_q8_layout_seen = false;
+    bool sm75_q8_layout_version_seen = false;
 
     off_t kv_start = ftello(fp);
     if (kv_start < 0) die("GGUF ftell failed");
@@ -1781,6 +1811,36 @@ static gguf_file load_gguf_metadata(const char *path) {
             uint32_t version = read_u32_le_fp(fp, "routed-Q4 layout version");
             if (version != 1u) die("unsupported routed-Q4 layout version");
             q4_layout_version_seen = true;
+        } else if (strcmp(key, DS4_KV_SM75_ROUTED_LAYOUT) == 0) {
+            if (type != GGUF_TYPE_STRING) die("bad SM75 routed layout metadata type");
+            char *layout = read_gguf_string_fp(fp);
+            if (strcmp(layout, DS4_SM75_ROUTED_LAYOUT_Q4_32_Q3A4) != 0) {
+                fprintf(stderr, "error: unsupported SM75 routed layout: %s\n", layout);
+                free(layout);
+                exit(1);
+            }
+            free(layout);
+            sm75_q32_layout_seen = true;
+        } else if (strcmp(key, DS4_KV_SM75_ROUTED_LAYOUT_VERSION) == 0) {
+            if (type != GGUF_TYPE_UINT32) die("bad SM75 routed layout-version metadata type");
+            const uint32_t version = read_u32_le_fp(fp, "SM75 routed layout version");
+            if (version != 1u) die("unsupported SM75 routed layout version");
+            sm75_q32_layout_version_seen = true;
+        } else if (strcmp(key, DS4_KV_SM75_DENSE_Q8_LAYOUT) == 0) {
+            if (type != GGUF_TYPE_STRING) die("bad SM75 dense-Q8 layout metadata type");
+            char *layout = read_gguf_string_fp(fp);
+            if (strcmp(layout, DS4_SM75_DENSE_Q8_LAYOUT_WARP32_TP2) != 0) {
+                fprintf(stderr, "error: unsupported SM75 dense-Q8 layout: %s\n", layout);
+                free(layout);
+                exit(1);
+            }
+            free(layout);
+            sm75_q8_layout_seen = true;
+        } else if (strcmp(key, DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION) == 0) {
+            if (type != GGUF_TYPE_UINT32) die("bad SM75 dense-Q8 layout-version metadata type");
+            const uint32_t version = read_u32_le_fp(fp, "SM75 dense-Q8 layout version");
+            if (version != 1u) die("unsupported SM75 dense-Q8 layout version");
+            sm75_q8_layout_version_seen = true;
         } else {
             skip_gguf_value_fp(fp, type);
         }
@@ -1793,7 +1853,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key) && !is_q4_layout_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) && !is_private_layout_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1804,7 +1864,15 @@ static gguf_file load_gguf_metadata(const char *path) {
     if (q4_layout_seen != q4_layout_version_seen) {
         die("incomplete routed-Q4 layout metadata");
     }
+    if (sm75_q32_layout_seen != sm75_q32_layout_version_seen) {
+        die("incomplete SM75 routed layout metadata");
+    }
+    if (sm75_q8_layout_seen != sm75_q8_layout_version_seen) {
+        die("incomplete SM75 dense-Q8 layout metadata");
+    }
     g.sm75_native_q4 = q4_layout_seen;
+    g.sm75_q32 = sm75_q32_layout_seen;
+    g.sm75_native_q8 = sm75_q8_layout_seen;
     off_t tensor_start = ftello(fp);
     if (tensor_start < 0 || tensor_start < kv_start) die("GGUF ftell failed");
     size_t kv_full_len = (size_t)(tensor_start - kv_start);
@@ -2277,6 +2345,281 @@ static void write_sm75_q4_repack(const gguf_file *src,
     if (fclose(out) != 0) die_errno("close output GGUF", out_path);
 }
 
+enum sm75_dense_q8_family {
+    SM75_DENSE_Q8_NONE = 0,
+    SM75_DENSE_Q8_T32,
+    SM75_DENSE_Q8_ATTN_A,
+    SM75_DENSE_Q8_ATTN_B,
+};
+
+static enum sm75_dense_q8_family sm75_dense_q8_tensor_family(
+        const tensor_meta *t, uint32_t *layer_out) {
+    if (!t || !t->name || t->n_dims != 2 || !str_starts(t->name, "blk."))
+        return SM75_DENSE_Q8_NONE;
+    const char *p = t->name + 4;
+    if (*p < '0' || *p > '9') return SM75_DENSE_Q8_NONE;
+    uint32_t layer = 0u;
+    while (*p >= '0' && *p <= '9') {
+        const uint32_t digit = (uint32_t)(*p - '0');
+        if (layer > (UINT32_MAX - digit) / 10u) return SM75_DENSE_Q8_NONE;
+        layer = layer * 10u + digit;
+        p++;
+    }
+    if (*p != '.') return SM75_DENSE_Q8_NONE;
+    enum sm75_dense_q8_family family = SM75_DENSE_Q8_NONE;
+    if (str_ends(t->name, ".attn_q_b.weight") &&
+        t->ne[0] == 1024 && t->ne[1] == 32768) {
+        family = SM75_DENSE_Q8_T32;
+    } else if (str_ends(t->name, ".attn_output_a.weight") &&
+               t->ne[0] == 4096 && t->ne[1] == 8192) {
+        family = SM75_DENSE_Q8_ATTN_A;
+    } else if (str_ends(t->name, ".attn_output_b.weight") &&
+               t->ne[0] == 8192 && t->ne[1] == 4096) {
+        family = SM75_DENSE_Q8_ATTN_B;
+    }
+    if (family != SM75_DENSE_Q8_NONE && layer_out) *layer_out = layer;
+    return family;
+}
+
+static output_context build_sm75_dense_q8_repack_context(
+        const gguf_file *src) {
+    enum { LAYERS = 43 };
+    output_context out = {0};
+    out.n_tensors = src->n_tensors;
+    out.n_kv_extra = extra_q4_layout_kv_count(src->sm75_native_q4) +
+                     extra_sm75_q32_kv_count(src->sm75_q32) +
+                     extra_sm75_dense_q8_kv_count(true);
+    out.alignment = src->alignment;
+    out.sm75_q32 = src->sm75_q32;
+    out.sm75_native_q8 = true;
+    out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
+    uint8_t seen[LAYERS] = {0};
+    uint32_t converted = 0u;
+    size_t tensor_info = 0u;
+    size_t off = 0u;
+    for (uint64_t i = 0; i < out.n_tensors; i++) {
+        const tensor_meta *st = &src->tensors[i];
+        tensor_meta *dt = &out.tensors[i];
+        *dt = *st;
+        dt->name = st->name;
+        uint32_t layer = UINT32_MAX;
+        const enum sm75_dense_q8_family family =
+            sm75_dense_q8_tensor_family(st, &layer);
+        if (family != SM75_DENSE_Q8_NONE) {
+            if (layer >= LAYERS) die("SM75 dense-Q8 tensor layer is outside 0..42");
+            if (st->type != DS4Q_TYPE_Q8_0) {
+                fprintf(stderr,
+                        "error: native dense-Q8 source tensor %s is %s, not q8_0\n",
+                        st->name, ds4q_type_name(st->type));
+                exit(1);
+            }
+            const uint8_t bit = family == SM75_DENSE_Q8_T32 ? 1u :
+                (family == SM75_DENSE_Q8_ATTN_A ? 2u : 4u);
+            if (seen[layer] & bit) die("duplicate native dense-Q8 source tensor");
+            seen[layer] |= bit;
+            converted++;
+            dt->type = DS4Q_TYPE_SM75_Q8_WARP32;
+            dt->size = tensor_nbytes(dt->type, dt->ne, dt->n_dims);
+            if (dt->size != st->size) die("SM75 dense-Q8 transform is not size-neutral");
+        } else if (st->type == DS4Q_TYPE_SM75_Q8_WARP32) {
+            die("SM75 private dense-Q8 type is present outside the exact tensor set");
+        }
+        dt->new_offset = off;
+        off += ds4q_pad(dt->size, out.alignment);
+        tensor_info += gguf_string_size(dt->name) + 4u +
+                       (size_t)dt->n_dims * 8u + 4u + 8u;
+    }
+    if (converted != LAYERS * 3u) {
+        die("SM75 dense-Q8 repack requires T32, attention A, and attention B for all 43 layers");
+    }
+    for (uint32_t layer = 0; layer < LAYERS; layer++) {
+        if (seen[layer] != 7u) die("SM75 dense-Q8 repack found an incomplete layer tensor set");
+    }
+    out.tensor_bytes = off;
+    out.meta_size = 4u + 4u + 8u + 8u + src->kv_raw_len +
+                    extra_q4_layout_kv_size(src->sm75_native_q4) +
+                    extra_sm75_q32_kv_size(src->sm75_q32) +
+                    extra_sm75_dense_q8_kv_size(true) + tensor_info;
+    out.data_offset = ds4q_pad(out.meta_size, out.alignment);
+    return out;
+}
+
+static void repack_sm75_dense_q8_rows(uint8_t *dst, const uint8_t *src,
+                                      size_t rows, size_t source_blocks,
+                                      size_t source_block_start,
+                                      size_t blocks) {
+    if (!dst || !src || blocks == 0u || (blocks % 32u) != 0u ||
+        source_block_start > source_blocks ||
+        blocks > source_blocks - source_block_start) {
+        die("invalid SM75 dense-Q8 row repack geometry");
+    }
+    const size_t source_row_bytes = source_blocks * 34u;
+    const size_t output_row_bytes = blocks * 34u;
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *source_row = src + row * source_row_bytes +
+            source_block_start * 34u;
+        uint8_t *output_row = dst + row * output_row_bytes;
+        for (size_t group = 0; group < blocks / 32u; group++) {
+            const uint8_t *source_group = source_row + group * 32u * 34u;
+            uint8_t *output_group = output_row + group * 32u * 34u;
+            for (size_t lane = 0; lane < 32u; lane++) {
+                memcpy(output_group + lane * 2u,
+                       source_group + lane * 34u, 2u);
+            }
+            uint8_t *word_planes = output_group + 64u;
+            for (size_t word = 0; word < 8u; word++) {
+                for (size_t lane = 0; lane < 32u; lane++) {
+                    memcpy(word_planes + (word * 32u + lane) * 4u,
+                           source_group + lane * 34u + 2u + word * 4u,
+                           4u);
+                }
+            }
+        }
+    }
+}
+
+static byte_buf repack_sm75_dense_q8_tensor(
+        const tensor_meta *t, byte_buf canonical) {
+    const enum sm75_dense_q8_family family =
+        sm75_dense_q8_tensor_family(t, NULL);
+    if (family == SM75_DENSE_Q8_NONE || t->type != DS4Q_TYPE_Q8_0 ||
+        !canonical.data || canonical.size != t->size) {
+        die("invalid SM75 dense-Q8 tensor repack request");
+    }
+    const size_t blocks = (size_t)t->ne[0] / 32u;
+    const size_t rows = (size_t)t->ne[1];
+    byte_buf native = { .size = canonical.size,
+                        .data = xmalloc(canonical.size) };
+    if (family != SM75_DENSE_Q8_ATTN_B) {
+        repack_sm75_dense_q8_rows(native.data, canonical.data, rows,
+                                  blocks, 0u, blocks);
+    } else {
+        if ((blocks & 1u) != 0u) die("attention B K dimension is not even");
+        const size_t half = blocks / 2u;
+        const size_t shard_bytes = rows * half * 34u;
+        repack_sm75_dense_q8_rows(native.data, canonical.data, rows,
+                                  blocks, 0u, half);
+        repack_sm75_dense_q8_rows(native.data + shard_bytes, canonical.data,
+                                  rows, blocks, half, half);
+    }
+    return native;
+}
+
+static void verify_sm75_dense_q8_tensor(
+        const tensor_meta *t, const byte_buf canonical,
+        const byte_buf native) {
+    const enum sm75_dense_q8_family family =
+        sm75_dense_q8_tensor_family(t, NULL);
+    if (family == SM75_DENSE_Q8_NONE || !canonical.data || !native.data ||
+        canonical.size != t->size || native.size != t->size) {
+        die("invalid SM75 dense-Q8 verification request");
+    }
+    const size_t blocks = (size_t)t->ne[0] / 32u;
+    const size_t rows = (size_t)t->ne[1];
+    const size_t shard_blocks = family == SM75_DENSE_Q8_ATTN_B
+        ? blocks / 2u : blocks;
+    const size_t shard_bytes = rows * shard_blocks * 34u;
+    if (blocks == 0u || (blocks % 32u) != 0u ||
+        shard_blocks == 0u || (shard_blocks % 32u) != 0u) {
+        die("invalid SM75 dense-Q8 verification geometry");
+    }
+    for (size_t row = 0; row < rows; row++) {
+        for (size_t block = 0; block < blocks; block++) {
+            const size_t shard = family == SM75_DENSE_Q8_ATTN_B
+                ? block / shard_blocks : 0u;
+            const size_t local_block = block - shard * shard_blocks;
+            const size_t group = local_block / 32u;
+            const size_t lane = local_block % 32u;
+            const uint8_t *src = canonical.data +
+                (row * blocks + block) * 34u;
+            const uint8_t *plane = native.data + shard * shard_bytes +
+                row * shard_blocks * 34u + group * 1088u;
+            if (memcmp(src, plane + lane * 2u, 2u) != 0) {
+                fprintf(stderr,
+                        "error: SM75 dense-Q8 scale verification failed for "
+                        "%s row=%zu block=%zu\n", t->name, row, block);
+                exit(1);
+            }
+            for (size_t word = 0; word < 8u; word++) {
+                const uint8_t *packed = plane + 64u +
+                    (word * 32u + lane) * 4u;
+                if (memcmp(src + 2u + word * 4u, packed, 4u) != 0) {
+                    fprintf(stderr,
+                            "error: SM75 dense-Q8 quant verification failed "
+                            "for %s row=%zu block=%zu word=%zu\n",
+                            t->name, row, block, word);
+                    exit(1);
+                }
+            }
+        }
+    }
+}
+
+static void write_sm75_dense_q8_repack(const gguf_file *src,
+                                       const output_context *out_ctx,
+                                       const char *out_path) {
+    enum { COPY_CHUNK = 16 * 1024 * 1024 };
+    FILE *in = fopen(src->path, "rb");
+    if (!in) die_errno("open source GGUF", src->path);
+    FILE *out = fopen(out_path, "wb");
+    if (!out) die_errno("open output", out_path);
+    if (fwrite("GGUF", 1, 4, out) != 4) die("write GGUF magic failed");
+    write_u32(out, src->version);
+    write_u64(out, src->n_tensors);
+    write_u64(out, src->n_kv + out_ctx->n_kv_extra);
+    if (fwrite(src->kv_raw, 1, src->kv_raw_len, out) != src->kv_raw_len)
+        die("write GGUF KV failed");
+    write_q4_layout_kvs(out, src->sm75_native_q4);
+    write_sm75_q32_kvs(out, src->sm75_q32);
+    write_sm75_dense_q8_kvs(out, true);
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        const tensor_meta *t = &out_ctx->tensors[i];
+        write_gguf_string(out, t->name);
+        write_u32(out, (uint32_t)t->n_dims);
+        for (int j = 0; j < t->n_dims; j++) write_u64(out, (uint64_t)t->ne[j]);
+        write_u32(out, (uint32_t)t->type);
+        write_u64(out, t->new_offset);
+    }
+    const off_t pos = ftello(out);
+    if (pos < 0 || (size_t)pos > out_ctx->data_offset)
+        die("native dense-Q8 GGUF metadata larger than planned");
+    write_padding(out, out_ctx->data_offset - (size_t)pos);
+
+    uint8_t *scratch = xmalloc(COPY_CHUNK);
+    for (uint64_t i = 0; i < src->n_tensors; i++) {
+        const tensor_meta *st = &src->tensors[i];
+        const tensor_meta *dt = &out_ctx->tensors[i];
+        const enum sm75_dense_q8_family family =
+            sm75_dense_q8_tensor_family(st, NULL);
+        fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s %s\n",
+                i + 1u, src->n_tensors, st->name,
+                family == SM75_DENSE_Q8_NONE
+                    ? "-> verbatim" : "-> sm75-native-q8");
+        if (fseeko(in, (off_t)(src->data_offset + st->old_offset), SEEK_SET) != 0)
+            die_errno("seek source GGUF", src->path);
+        if (family == SM75_DENSE_Q8_NONE) {
+            copy_exact_bytes(in, out, st->size, scratch, COPY_CHUNK, src->path);
+        } else {
+            byte_buf canonical = { .size = st->size,
+                                   .data = xmalloc(st->size) };
+            if (fread(canonical.data, 1, canonical.size, in) != canonical.size)
+                die_errno("read native dense-Q8 source", src->path);
+            byte_buf native = repack_sm75_dense_q8_tensor(st, canonical);
+            verify_sm75_dense_q8_tensor(st, canonical, native);
+            if (native.size != dt->size ||
+                fwrite(native.data, 1, native.size, out) != native.size)
+                die_errno("write native dense-Q8 tensor", out_path);
+            free(canonical.data);
+            free(native.data);
+        }
+        const size_t padded = ds4q_pad(dt->size, out_ctx->alignment);
+        write_padding(out, padded - dt->size);
+    }
+    free(scratch);
+    if (fclose(in) != 0) die_errno("close source GGUF", src->path);
+    if (fclose(out) != 0) die_errno("close output GGUF", out_path);
+}
+
 static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
     size_t tensor_bytes = 0;
     size_t changed = 0;
@@ -2328,6 +2671,7 @@ typedef struct {
     char *hf_dir;
     char *template_gguf;
     char *repack_sm75_q4;
+    char *repack_sm75_q8;
     char *out_gguf;
     char *compare_gguf;
     char *compare_tensor;
@@ -3328,11 +3672,13 @@ static void run_sm75_q3_q4_quality(st_db *db, const imatrix_store *imatrix,
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
     printf("       %s --repack-sm75-native-q4 MODEL.gguf --out OUT.gguf\n", argv0);
+    printf("       %s --repack-sm75-native-q8 MODEL.gguf --out OUT.gguf\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
     printf("  --repack-sm75-native-q4 FILE  losslessly repack an all-Q4 routed model; no HF input/hash\n");
+    printf("  --repack-sm75-native-q8 FILE  losslessly repack all 43 T32/attention A/B tensors\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, checksum, optionally byte-compare, and exit\n");
@@ -3445,6 +3791,8 @@ static params parse_args(int argc, char **argv) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--repack-sm75-native-q4") == 0) {
             p.repack_sm75_q4 = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--repack-sm75-native-q8") == 0) {
+            p.repack_sm75_q8 = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
             p.out_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--compare-gguf") == 0) {
@@ -3529,7 +3877,7 @@ static params parse_args(int argc, char **argv) {
     if (p.sm75_q3_q4_quality) {
         if (!p.hf_dir) die("--hf is required");
         if (!p.imatrix_file) die("--sm75-q3-q4-quality requires --imatrix");
-        if (p.template_gguf || p.repack_sm75_q4 || p.out_gguf ||
+        if (p.template_gguf || p.repack_sm75_q4 || p.repack_sm75_q8 || p.out_gguf ||
             p.compare_gguf || p.compare_tensor || p.dspark_manifest ||
             p.dspark_support || p.dry_run || p.sm75_native_q4 ||
             p.quant_backend || p.quant_gpu_devices || p.policy.n_overrides ||
@@ -3548,7 +3896,7 @@ static params parse_args(int argc, char **argv) {
         return p;
     }
     if (p.repack_sm75_q4) {
-        if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
+        if (p.repack_sm75_q8 || p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
             p.imatrix_file || p.dspark_manifest || p.dspark_support ||
             p.imatrix_strict || p.sm75_native_q4 || p.n_experts != 0 ||
             p.policy.n_overrides ||
@@ -3579,6 +3927,38 @@ static params parse_args(int argc, char **argv) {
         if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) {
             die("output exists; use --overwrite");
         }
+        return p;
+    }
+    if (p.repack_sm75_q8) {
+        if (p.hf_dir || p.template_gguf || p.compare_gguf || p.compare_tensor ||
+            p.imatrix_file || p.dspark_manifest || p.dspark_support ||
+            p.imatrix_strict || p.sm75_native_q4 || p.n_experts != 0 ||
+            p.quant_backend || p.quant_gpu_devices || p.policy.n_overrides ||
+            p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
+            p.policy.attention_proj != DS4Q_TYPE_COUNT ||
+            p.policy.attention != DS4Q_TYPE_COUNT ||
+            p.policy.shared != DS4Q_TYPE_COUNT ||
+            p.policy.embedding != DS4Q_TYPE_COUNT ||
+            p.policy.output != DS4Q_TYPE_COUNT ||
+            p.policy.dense != DS4Q_TYPE_COUNT) {
+            die("--repack-sm75-native-q8 cannot be combined with quantization options");
+        }
+        if (!p.dry_run && !p.out_gguf) die("--out is required unless --dry-run is used");
+        if (p.out_gguf && strcmp(p.repack_sm75_q8, p.out_gguf) == 0)
+            die("SM75 dense-Q8 repack input and output must be different files");
+        if (p.out_gguf && file_exists(p.out_gguf)) {
+            struct stat in_stat, out_stat;
+            if (stat(p.repack_sm75_q8, &in_stat) == 0 &&
+                stat(p.out_gguf, &out_stat) == 0 &&
+                in_stat.st_dev == out_stat.st_dev &&
+                in_stat.st_ino == out_stat.st_ino) {
+                die("SM75 dense-Q8 repack output aliases the input file");
+            }
+        }
+        if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite)
+            die("output exists; use --overwrite");
         return p;
     }
     if (!p.hf_dir) die("--hf is required");
@@ -3770,6 +4150,9 @@ int main(int argc, char **argv) {
         if (src.sm75_native_q4) {
             die("source GGUF is already tagged with the SM75-native Q4 layout");
         }
+        if (src.sm75_native_q8) {
+            die("apply the SM75 routed-Q4 repack before the dense-Q8 repack");
+        }
         if (src.n_experts <= 0) {
             die("source GGUF has no routed expert-count metadata");
         }
@@ -3780,6 +4163,25 @@ int main(int argc, char **argv) {
         printf("tensor_hashing: disabled\n");
         if (!p.dry_run) {
             write_sm75_q4_repack(&src, &out_ctx, p.out_gguf, p.n_threads);
+            fprintf(stderr, "wrote %s\n", p.out_gguf);
+        }
+        free_gguf_file(&src);
+        free(out_ctx.tensors);
+        return 0;
+    }
+    if (p.repack_sm75_q8) {
+        gguf_file src = load_gguf_metadata(p.repack_sm75_q8);
+        if (src.sm75_native_q8) {
+            die("source GGUF is already tagged with the SM75-native dense-Q8 layout");
+        }
+        output_context out_ctx = build_sm75_dense_q8_repack_context(&src);
+        print_plan(&src, &out_ctx);
+        printf("repack: q8_0 -> %s\n",
+               DS4_SM75_DENSE_Q8_LAYOUT_WARP32_TP2);
+        printf("converted_tensors: 129\n");
+        printf("persistent_duplicate_cache: none\n");
+        if (!p.dry_run) {
+            write_sm75_dense_q8_repack(&src, &out_ctx, p.out_gguf);
             fprintf(stderr, "wrote %s\n", p.out_gguf);
         }
         free_gguf_file(&src);
@@ -3835,6 +4237,10 @@ int main(int argc, char **argv) {
     }
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    if (tmpl.sm75_native_q8) {
+        die("SM75-native dense-Q8 GGUF cannot be used as a quantization "
+            "template; use its standard-layout source template");
+    }
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;

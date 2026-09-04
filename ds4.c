@@ -1126,6 +1126,28 @@ static bool ds4_str_contains(ds4_str s, const char *needle) {
     return false;
 }
 
+static bool ds4_str_ends_with(ds4_str s, const char *suffix) {
+    const size_t n = strlen(suffix);
+    return s.len >= n && memcmp(s.ptr + s.len - n, suffix, n) == 0;
+}
+
+static bool ds4_tensor_layer_id(ds4_str name, uint32_t *layer_out) {
+    if (!layer_out || !ds4_str_starts_with(name, "blk.")) return false;
+    uint64_t pos = 4u;
+    uint32_t layer = 0u;
+    bool have_digit = false;
+    while (pos < name.len && name.ptr[pos] >= '0' && name.ptr[pos] <= '9') {
+        const uint32_t digit = (uint32_t)(name.ptr[pos] - '0');
+        if (layer > (UINT32_MAX - digit) / 10u) return false;
+        layer = layer * 10u + digit;
+        have_digit = true;
+        pos++;
+    }
+    if (!have_digit || pos >= name.len || name.ptr[pos] != '.') return false;
+    *layer_out = layer;
+    return true;
+}
+
 static bool ds4_str_eq(ds4_str a, ds4_str b) {
     return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
 }
@@ -2059,6 +2081,7 @@ static const gguf_type_info gguf_types[] = {
     [30] = {"bf16",     1,   2},
     [42] = {"sm75_q4_32", 256, 136},
     [43] = {"sm75_q3a4",  256, 108},
+    [44] = {"sm75_q8_warp32", 32, 34},
 };
 
 enum {
@@ -2075,6 +2098,7 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_SM75_Q4_32 = 42,
     DS4_TENSOR_SM75_Q3A4  = 43,
+    DS4_TENSOR_SM75_Q8_WARP32 = 44,
 };
 
 /* Kept outside DS4_NO_GPU so CPU-only placement tests exercise the exact
@@ -2123,6 +2147,7 @@ typedef struct {
     uint64_t max_tensor_bytes;
     uint32_t q4_routed_layout;
     uint32_t sm75_q32_layouts;
+    uint32_t sm75_dense_q8_layout;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
@@ -2543,6 +2568,26 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     } else if (model_find_kv(m, DS4_KV_SM75_ROUTED_LAYOUT_VERSION)) {
         ds4_die("SM75 routed layout version exists without a layout tag");
     }
+
+    ds4_str dense_q8_layout = {0};
+    uint32_t dense_q8_layout_version = 0;
+    if (model_get_string(m, DS4_KV_SM75_DENSE_Q8_LAYOUT,
+                         &dense_q8_layout)) {
+        if (!ds4_streq(dense_q8_layout,
+                       DS4_SM75_DENSE_Q8_LAYOUT_WARP32_TP2) ||
+            !model_get_u32(m, DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION,
+                           &dense_q8_layout_version) ||
+            dense_q8_layout_version != 1u) {
+            ds4_die("unsupported SM75 dense-Q8 tensor layout metadata");
+        }
+        m->sm75_dense_q8_layout = DS4_TENSOR_LAYOUT_SM75_Q8_WARP32;
+    } else if (model_find_kv(m, DS4_KV_SM75_DENSE_Q8_LAYOUT_VERSION)) {
+        ds4_die("SM75 dense-Q8 layout version exists without a layout tag");
+    }
+
+    enum { DS4_NATIVE_Q8_LAYER_COUNT = 43 };
+    uint8_t dense_q8_seen[DS4_NATIVE_Q8_LAYER_COUNT] = {0};
+    uint32_t dense_q8_count = 0u;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *tensor = &m->tensors[i];
         const uint32_t type = tensor->type;
@@ -2568,6 +2613,48 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         }
         if (type == DS4_TENSOR_SM75_Q3A4 && routed_down) {
             ds4_die("SM75 Q3A4 is valid only for routed gate/up tensors");
+        }
+
+        if (type == DS4_TENSOR_SM75_Q8_WARP32) {
+            uint32_t layer = UINT32_MAX;
+            const bool q_b = ds4_str_ends_with(
+                tensor->name, ".attn_q_b.weight");
+            const bool out_a = ds4_str_ends_with(
+                tensor->name, ".attn_output_a.weight");
+            const bool out_b = ds4_str_ends_with(
+                tensor->name, ".attn_output_b.weight");
+            if (m->sm75_dense_q8_layout == 0u) {
+                ds4_die("SM75 private dense-Q8 tensor lacks its layout tag");
+            }
+            if (!ds4_tensor_layer_id(tensor->name, &layer) ||
+                layer >= DS4_NATIVE_Q8_LAYER_COUNT ||
+                tensor->ndim != 2u ||
+                ((!q_b || tensor->dim[0] != 1024u ||
+                           tensor->dim[1] != 32768u) &&
+                 (!out_a || tensor->dim[0] != 4096u ||
+                             tensor->dim[1] != 8192u) &&
+                 (!out_b || tensor->dim[0] != 8192u ||
+                             tensor->dim[1] != 4096u))) {
+                ds4_die("SM75 private dense-Q8 type is valid only for exact "
+                        "T32/attention-output A/B layer tensors");
+            }
+            const uint8_t family = q_b ? 1u : (out_a ? 2u : 4u);
+            if ((dense_q8_seen[layer] & family) != 0u) {
+                ds4_die("duplicate SM75 private dense-Q8 layer tensor");
+            }
+            dense_q8_seen[layer] |= family;
+            dense_q8_count++;
+        }
+    }
+    if (m->sm75_dense_q8_layout != 0u) {
+        if (dense_q8_count != DS4_NATIVE_Q8_LAYER_COUNT * 3u) {
+            ds4_die("SM75 dense-Q8 GGUF must contain all three native tensors "
+                    "for all 43 layers");
+        }
+        for (uint32_t layer = 0; layer < DS4_NATIVE_Q8_LAYER_COUNT; layer++) {
+            if (dense_q8_seen[layer] != 7u) {
+                ds4_die("SM75 dense-Q8 GGUF has an incomplete layer tensor set");
+            }
         }
     }
 
@@ -2943,6 +3030,7 @@ typedef struct {
     uint32_t layer;
     int physical_device;
     int fallback_physical_device;
+    bool required;
     char label[128];
 } accelerator_q8_cache_candidate;
 
@@ -2975,13 +3063,16 @@ static uint32_t accelerator_q8_cache_classify(ds4_str name) {
     return ACCEL_Q8_CACHE_NONE;
 }
 
-/* Exact shapes whose Q8_0 bytes can be replaced by the size-neutral SM75
- * native-primary representation under the fixed four-GPU TP recipe.  Kept
- * outside GPU-only compilation so the placement regression exercises the
- * same predicate as production. */
+/* Exact shapes whose Q8_0 bytes can use the size-neutral SM75 native
+ * representation under the fixed four-GPU TP recipe.  Kept outside GPU-only
+ * compilation so the placement regression exercises the same predicate as
+ * production. */
 static bool engine_q8_native_primary_shape(
         const ds4_tensor *t, uint32_t path_class) {
-    if (!t || t->type != DS4_TENSOR_Q8_0 || t->ndim != 2u) return false;
+    if (!t ||
+        (t->type != DS4_TENSOR_Q8_0 &&
+         t->type != DS4_TENSOR_SM75_Q8_WARP32) ||
+        t->ndim != 2u) return false;
     switch (path_class) {
     case ACCEL_Q8_CACHE_T32_Q_B:
         return t->dim[0] == 1024u && t->dim[1] == 32768u;
@@ -2992,6 +3083,52 @@ static bool engine_q8_native_primary_shape(
     default:
         return false;
     }
+}
+
+static bool engine_q8_native_full_prefill_binding_required(
+        const ds4_tensor *t, uint32_t path_class,
+        bool pair_prefill_attn_rows) {
+    /* Pair row splitting is an eligibility policy, not a guarantee for every
+     * chunk.  Tails and other ineligible shapes execute the complete A+B
+     * projection on the home GPU even when the pair is enabled.  A tagged
+     * model therefore requires full home-local A and B execution bindings for
+     * every layer before any prefill begins. */
+    (void)pair_prefill_attn_rows;
+    return t && t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
+           (path_class == ACCEL_Q8_CACHE_OUTPUT_A ||
+            path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B);
+}
+
+static bool engine_q8_native_partner_t32_binding_required(
+        const ds4_tensor *t, uint32_t path_class,
+        uint32_t candidate_copies) {
+    /* T32 keeps its one persistent native-Q8 copy on the home GPU so the
+     * complete projection remains available without duplicating residency.
+     * The partner nevertheless owns half of T32 execution under the required
+     * attention/decode TP topology. Its half-width F16 binding is therefore
+     * mandatory rather than a benefit-ranked cache candidate. */
+    return t && t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
+           path_class == ACCEL_Q8_CACHE_T32_Q_B &&
+           candidate_copies == 3u;
+}
+
+static const char *engine_q8_native_gguf_incompatible_f32_env(void) {
+    static const char *const f32_envs[] = {
+        "DS4_CUDA_Q8_F32_PRELOAD",
+        "DS4_CUDA_Q8_F32_ALL",
+        "DS4_CUDA_Q8_F32_LARGE",
+        "DS4_CUDA_ATTN_Q_B_F32_CACHE",
+    };
+    for (size_t i = 0; i < sizeof(f32_envs) / sizeof(f32_envs[0]); i++) {
+        if (getenv(f32_envs[i]) != NULL) return f32_envs[i];
+    }
+    const char *partner_arithmetic =
+        getenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+    if (partner_arithmetic && partner_arithmetic[0] &&
+        strcmp(partner_arithmetic, "f16") != 0) {
+        return "DS4_CUDA_Q8_PARTNER_ARITHMETIC";
+    }
+    return NULL;
 }
 
 static uint32_t accelerator_q8_cache_layer(ds4_str name) {
@@ -3241,6 +3378,10 @@ static int accelerator_q8_cache_partner_tier(
 static int accelerator_q8_cache_candidate_cmp(const void *va, const void *vb) {
     const accelerator_q8_cache_candidate *a = va;
     const accelerator_q8_cache_candidate *b = vb;
+    /* A tagged native GGUF can deliberately shard or omit the persistent Q8
+     * bytes on an execution device. Its full A/B fallbacks and partner T32
+     * half are therefore execution requirements, not benefit-ranked options. */
+    if (a->required != b->required) return a->required ? -1 : 1;
     /* The controlled all-local and balanced experiments require their exact
      * local T256 subsets to survive admission. Rank that class before equally
      * valued T32 candidates so the result is not silently determined by
@@ -3295,15 +3436,21 @@ static bool accelerator_q8_cache_candidate_append(
         uint64_t offset, uint64_t weight_bytes,
         uint64_t in_dim, uint64_t out_dim,
         int physical_device, int fallback_physical_device,
-        uint32_t path_class) {
+        uint32_t path_class, bool required) {
     if (!items || !count || !capacity || !m || !t || path_class == ACCEL_Q8_CACHE_NONE ||
         in_dim == 0u || out_dim == 0u || in_dim > UINT64_MAX / out_dim / 2u) return false;
     for (uint64_t i = 0; i < *count; i++) {
-        const accelerator_q8_cache_candidate *c = &(*items)[i];
+        accelerator_q8_cache_candidate *c = &(*items)[i];
         if (c->model_map == m->map && c->offset == offset &&
             c->weight_bytes == weight_bytes && c->in_dim == in_dim &&
             c->out_dim == out_dim && c->physical_device == physical_device &&
-            c->fallback_physical_device == fallback_physical_device) return true;
+            c->fallback_physical_device == fallback_physical_device) {
+            if (required) {
+                c->required = true;
+                c->fallback_physical_device = -1;
+            }
+            return true;
+        }
     }
     if (*count == *capacity) {
         uint64_t next = *capacity ? *capacity * 2u : 128u;
@@ -3327,6 +3474,7 @@ static bool accelerator_q8_cache_candidate_append(
     c->layer = accelerator_q8_cache_layer(t->name);
     c->physical_device = physical_device;
     c->fallback_physical_device = fallback_physical_device;
+    c->required = required;
     snprintf(c->label, sizeof(c->label), "tensor:%.*s",
              (int)(t->name.len < 110u ? t->name.len : 110u), t->name.ptr);
     return true;
@@ -3550,7 +3698,7 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                 !accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, m, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    0, -1, path_class)) {
+                    0, -1, path_class, false)) {
                 free(plan);
                 return false;
             }
@@ -4850,8 +4998,14 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_SM75_Q8_WARP32 ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q4_0;
+}
+
+static bool tensor_type_is_q8_0_storage(uint32_t type) {
+    return type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_SM75_Q8_WARP32;
 }
 
 static void tensor_expect_glm_dense_quant_layout(
@@ -4881,7 +5035,8 @@ static void tensor_expect_dense_quant_layout(
     if (!t) ds4_die("internal error: missing tensor while validating dense quant layout");
     if (!tensor_type_is_dense_quant(t->type)) {
         fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
+                "ds4: tensor %.*s has type %s, expected q8_0, "
+                "sm75_q8_warp32, q4_K, or q4_0\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -24422,8 +24577,8 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool fuse_attn_out_hc =
         !cuda_tp_attn &&
         g->tp_world < 2 &&
-        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        tensor_type_is_q8_0_storage(layer->attn_output_a->type) &&
+        tensor_type_is_q8_0_storage(layer->attn_output_b->type) &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
     const bool fuse_tp_attn_out_hc =
@@ -24589,7 +24744,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 g->tp_rank * tp_groups, tp_groups,
                 DS4_N_EMBD,
                 metal_graph_heads(g));
-    } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
+    } else if (ok && !tensor_type_is_q8_0_storage(layer->attn_output_a->type)) {
         ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = metal_graph_attention_output_dense_quant_low(metal_graph_attn_low(g),
@@ -26742,7 +26897,7 @@ static bool metal_graph_attention_output_dense_quant_low(
         group_dim == 0 || rank == 0 || group_cnt == 0) {
         return false;
     }
-    if (out_a->type == DS4_TENSOR_Q8_0 && group0 == 0) {
+    if (tensor_type_is_q8_0_storage(out_a->type) && group0 == 0) {
         return ds4_gpu_attention_output_low_q8_tensor(low,
                                                       model->map,
                                                       model->size,
@@ -26810,7 +26965,8 @@ static bool metal_graph_attention_output_dense_quant_tp(
         group0 + group_cnt > n_groups_total) {
         return false;
     }
-    if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
+    if (tensor_type_is_q8_0_storage(out_a->type) &&
+        tensor_type_is_q8_0_storage(out_b->type)) {
         return ds4_gpu_attention_output_q8_tp_tensor(out,
                                                      low,
                                                      model->map,
@@ -26864,7 +27020,8 @@ static bool metal_graph_attention_output_dense_quant_batch(
         n_groups == 0 || n_tokens == 0) {
         return false;
     }
-    if (out_a->type == DS4_TENSOR_Q8_0 && out_b->type == DS4_TENSOR_Q8_0) {
+    if (tensor_type_is_q8_0_storage(out_a->type) &&
+        tensor_type_is_q8_0_storage(out_b->type)) {
         return ds4_gpu_attention_output_q8_batch_tensor(out,
                                                         low,
                                                         metal_graph_batch_group_tmp(g),
@@ -28801,8 +28958,8 @@ static bool metal_graph_cuda_tp_prefill_heads_active(
     if (!g || !layer || !g->cuda_tp_prefill_attn_heads ||
         n_tokens < 128u || (DS4_N_HEAD & 1u) != 0u ||
         (DS4_N_OUT_GROUP & 1u) != 0u ||
-        layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
-        layer->attn_output_b->type != DS4_TENSOR_Q8_0 ||
+        !tensor_type_is_q8_0_storage(layer->attn_output_a->type) ||
+        !tensor_type_is_q8_0_storage(layer->attn_output_b->type) ||
         metal_graph_directional_steering_attn_enabled(g) ||
         metal_graph_debug_wants("kqv_out", il, pos0) ||
         metal_graph_debug_wants("kqv_back", il, pos0) ||
@@ -30575,7 +30732,7 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_q8_audit_set_context("attn_q_b", il, pos0);
 #endif
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
+    if (ok && !q_path_debug && tensor_type_is_q8_0_storage(layer->attn_q_b->type)) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
                                                                      tp_q_half ? tp_q_half : g->batch_q_half,
                                                                      model->map,
@@ -32035,8 +32192,8 @@ static bool metal_graph_encode_layer_attention_batch(
         !cuda_tp_attn_output_done &&
         !attn_out_debug &&
         !tp_row_split_attn &&
-        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
-        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        tensor_type_is_q8_0_storage(layer->attn_output_a->type) &&
+        tensor_type_is_q8_0_storage(layer->attn_output_b->type) &&
         !metal_graph_directional_steering_attn_enabled(g)) {
         attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
                                                                     metal_graph_batch_attn_low(g),
@@ -59063,6 +59220,139 @@ static int engine_append_q8_native_range(
     return 0;
 }
 
+static int engine_append_q8_native_gguf_range(
+        ds4_q8_native_range **per_dev_ranges,
+        int                  *per_dev_n,
+        int                  *per_dev_cap,
+        int                   logical_tier,
+        int                   physical_device,
+        uint64_t              source_offset,
+        uint64_t              resident_bytes,
+        uint64_t              canonical_offset,
+        uint64_t              canonical_bytes,
+        uint64_t              cache_key_offset,
+        uint64_t              source_row_blocks,
+        uint64_t              source_block_start,
+        uint64_t              packed_blocks,
+        uint64_t              packed_rows,
+        uint32_t              source_layout) {
+    if (engine_append_q8_native_range(
+            per_dev_ranges, per_dev_n, per_dev_cap,
+            logical_tier, physical_device, source_offset,
+            canonical_offset, canonical_bytes, cache_key_offset,
+            source_row_blocks, source_block_start,
+            packed_blocks, packed_rows) != 0) return -1;
+    ds4_q8_native_range *r =
+        &per_dev_ranges[logical_tier][per_dev_n[logical_tier] - 1];
+    r->resident_bytes = resident_bytes;
+    r->source_layout = source_layout;
+    r->source_is_native = 1;
+    return 0;
+}
+
+/* Tagged GGUF data is already in its final SM75 representation.  Plan one
+ * ordinary selective-cache span for each final owner, plus borrowed execution
+ * views over those same allocations.  Those views serve prefill, decode, and
+ * fused paths without allocating or owning a second copy.  T32 remains
+ * home-only, A is split by output rows, and B's file representation places its
+ * two K halves in two contiguous spans. */
+static int engine_plan_q8_native_gguf_tensor(
+        const ds4_tensor      *t,
+        uint32_t               path_class,
+        int                    home_tier,
+        int                    partner_tier,
+        ds4_tensor_range     **per_dev_ranges,
+        int                   *per_dev_n,
+        int                   *per_dev_cap,
+        ds4_q8_native_range  **per_dev_native,
+        int                   *per_dev_native_n,
+        int                   *per_dev_native_cap) {
+    if (!engine_q8_native_primary_shape(t, path_class) ||
+        t->type != DS4_TENSOR_SM75_Q8_WARP32 ||
+        home_tier < 0 || partner_tier < 0) return 0;
+    const uint64_t full_blocks = t->dim[0] / 32u;
+    const int home_device = g_gpu[home_tier].device_id;
+    const int partner_device = g_gpu[partner_tier].device_id;
+
+    if (path_class == ACCEL_Q8_CACHE_T32_Q_B) {
+        if (engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device, t->abs_offset, t->bytes) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                home_tier, home_device, t->abs_offset, t->bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, full_blocks, t->dim[1],
+                DS4_Q8_NATIVE_LAYOUT_ROW_WARP32) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                partner_tier, partner_device, t->abs_offset, 0u,
+                t->abs_offset, t->bytes, t->abs_offset,
+                0u, 0u, 0u, 0u,
+                DS4_Q8_NATIVE_LAYOUT_ROW_WARP32) != 0) return -1;
+        return 1;
+    }
+
+    if (path_class == ACCEL_Q8_CACHE_OUTPUT_A) {
+        if ((t->dim[1] & 1u) != 0u) return -1;
+        const uint64_t half_rows = t->dim[1] / 2u;
+        const uint64_t half_bytes = half_rows * full_blocks * 34u;
+        if (half_bytes > t->bytes || t->bytes - half_bytes != half_bytes)
+            return -1;
+        if (engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device, t->abs_offset, half_bytes) != 0 ||
+            engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                partner_tier, partner_device,
+                t->abs_offset + half_bytes, half_bytes) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                home_tier, home_device, t->abs_offset, half_bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, full_blocks, half_rows,
+                DS4_Q8_NATIVE_LAYOUT_ROW_WARP32) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                partner_tier, partner_device,
+                t->abs_offset + half_bytes, half_bytes,
+                t->abs_offset, t->bytes, t->abs_offset + half_bytes,
+                full_blocks, 0u, full_blocks, half_rows,
+                DS4_Q8_NATIVE_LAYOUT_ROW_WARP32) != 0) return -1;
+        return 1;
+    }
+
+    if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B) {
+        if ((full_blocks & 1u) != 0u) return -1;
+        const uint64_t half_blocks = full_blocks / 2u;
+        const uint64_t half_bytes = t->dim[1] * half_blocks * 34u;
+        if (half_bytes > t->bytes || t->bytes - half_bytes != half_bytes)
+            return -1;
+        if (engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device, t->abs_offset, half_bytes) != 0 ||
+            engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                partner_tier, partner_device,
+                t->abs_offset + half_bytes, half_bytes) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                home_tier, home_device, t->abs_offset, half_bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, half_blocks, t->dim[1],
+                DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                partner_tier, partner_device,
+                t->abs_offset + half_bytes, half_bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, half_blocks, half_blocks, t->dim[1],
+                DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32) != 0) return -1;
+        return 1;
+    }
+    return 0;
+}
+
 /* Replace replicated canonical matrices with their exact production-native
  * residency: one full home T32 matrix, two A row shards, or two B K shards.
  * B therefore uses a strided canonical source but a contiguous native cache
@@ -59174,6 +59464,13 @@ static bool engine_cuda_tp_fixed_22_21(const ds4_engine *e) {
 static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     if (!e || !e->model.map || e->model.n_tensors == 0u) return 0;
     if (getenv("DS4_CUDA_Q8_F16_FIRST_USE") != NULL) {
+        if (e->model.sm75_dense_q8_layout ==
+                DS4_TENSOR_LAYOUT_SM75_Q8_WARP32) {
+            fprintf(stderr,
+                    "ds4: tagged native dense-Q8 requires complete startup "
+                    "F16 planning; DS4_CUDA_Q8_F16_FIRST_USE is unsupported\n");
+            return -1;
+        }
         fprintf(stderr, "ds4: CUDA q8 fp16 planner disabled; using legacy first-use admission\n");
         return 0;
     }
@@ -59182,7 +59479,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t plan_count = 0;
     uint64_t plan_capacity = 0;
     uint64_t class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
+    uint64_t required_class_count[ACCEL_Q8_CACHE_OTHER_ATTN + 1u] = {0};
     uint64_t partner_fallback_count = 0u;
+    uint64_t required_count = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!partner_classes || !partner_classes[0])
         partner_classes = "automatic:t32,t256,shared_down";
@@ -59273,7 +59572,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
 
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
-        if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0u) continue;
+        if (!tensor_type_is_q8_0_storage(t->type) || t->ndim != 2 || t->bytes == 0u) continue;
         const uint32_t path_class = accelerator_q8_cache_classify(t->name);
         if (path_class == ACCEL_Q8_CACHE_NONE) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
@@ -59343,6 +59642,21 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             accelerator_q8_cache_candidate_copies(
                 path_class, split_attn_heads, partner_peer_available,
                 sliceable);
+        const bool pair_prefill_attn_rows =
+            split_attn_heads &&
+            cuda_tp_prefill_attn_rows_pair_enabled(home_tier);
+        const bool required_full_prefill_binding =
+            engine_q8_native_full_prefill_binding_required(
+                t, path_class, pair_prefill_attn_rows);
+        const bool required_partner_t32_binding =
+            engine_q8_native_partner_t32_binding_required(
+                t, path_class, candidate_copies);
+        /* Pair row splitting is conditional on each chunk's geometry.  The
+         * tagged file intentionally owns only A row halves and B K halves, so
+         * every layer's full-width F16 fallback binding must stay home-local
+         * and cannot be silently dropped by benefit-based admission. */
+        const int full_fallback_device =
+            required_full_prefill_binding ? -1 : fallback_device;
         bool ok = true;
 
         if (path_class == ACCEL_Q8_CACHE_OUTPUT_A && candidate_copies == 3u) {
@@ -59354,15 +59668,16 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, half_bytes, t->dim[0], half_rows,
-                    home_device, -1, path_class) &&
+                    home_device, -1, path_class, false) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
-                    partner_device, -1, path_class) &&
+                    partner_device, -1, path_class, false) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, fallback_device, path_class);
+                    home_device, full_fallback_device, path_class,
+                    required_full_prefill_binding);
         } else if (path_class == ACCEL_Q8_CACHE_T32_Q_B &&
                    candidate_copies == 3u) {
             const uint64_t half_rows = t->dim[1] / 2u;
@@ -59370,20 +59685,22 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, half_bytes, t->dim[0], half_rows,
-                    home_device, -1, path_class) &&
+                    home_device, -1, path_class, false) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset + half_bytes, half_bytes, t->dim[0], half_rows,
-                    partner_device, -1, path_class) &&
+                    partner_device, -1, path_class,
+                    required_partner_t32_binding) &&
                  accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, fallback_device, path_class);
+                    home_device, fallback_device, path_class, false);
         } else {
             ok = accelerator_q8_cache_candidate_append(
                     &plan, &plan_count, &plan_capacity, &e->model, t,
                     t->abs_offset, t->bytes, t->dim[0], t->dim[1],
-                    home_device, fallback_device, path_class);
+                    home_device, full_fallback_device, path_class,
+                    required_full_prefill_binding);
         }
         if (!ok) {
             free(plan);
@@ -59397,11 +59714,37 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     for (uint64_t i = 0; i < plan_count; i++) {
         class_count[plan[i].path_class]++;
         if (plan[i].fallback_physical_device >= 0) partner_fallback_count++;
+        if (plan[i].required) {
+            required_count++;
+            required_class_count[plan[i].path_class]++;
+        }
+    }
+    if (e->model.sm75_dense_q8_layout ==
+            DS4_TENSOR_LAYOUT_SM75_Q8_WARP32 &&
+        (required_class_count[ACCEL_Q8_CACHE_T32_Q_B] != DS4_N_LAYER ||
+         required_class_count[ACCEL_Q8_CACHE_OUTPUT_A] != DS4_N_LAYER ||
+         required_class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B] != DS4_N_LAYER ||
+         required_count != 3u * DS4_N_LAYER)) {
+        fprintf(stderr,
+                "ds4: tagged native dense-Q8 produced an invalid required "
+                "execution-binding plan: T32=%llu A=%llu B=%llu total=%llu; "
+                "expected %u each/%u total\n",
+                (unsigned long long)
+                    required_class_count[ACCEL_Q8_CACHE_T32_Q_B],
+                (unsigned long long)
+                    required_class_count[ACCEL_Q8_CACHE_OUTPUT_A],
+                (unsigned long long)
+                    required_class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
+                (unsigned long long)required_count,
+                (unsigned)DS4_N_LAYER, (unsigned)(3u * DS4_N_LAYER));
+        free(plan);
+        return -1;
     }
     fprintf(stderr,
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
-            "other=%llu partner-fallback=%llu partner-classes=%s "
+            "other=%llu partner-fallback=%llu required-native=%llu "
+            "partner-classes=%s "
             "partner-layers=%s "
             "home-order=%s partner-arithmetic=%s t256-placement=%s "
             "dense-placement=%s\n",
@@ -59413,6 +59756,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             (unsigned long long)(class_count[ACCEL_Q8_CACHE_SHARED_GATE_UP] +
                                  class_count[ACCEL_Q8_CACHE_OTHER_ATTN]),
             (unsigned long long)partner_fallback_count,
+            (unsigned long long)required_count,
             partner_classes,
             partner_layers,
             freeze_home_plan ? "frozen" : "partner-priority",
@@ -59424,10 +59768,16 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {
         const accelerator_q8_cache_candidate *c = &plan[i];
-        (void)ds4_gpu_cache_q8_f16_range_on_device_or_partner(
-            c->model_map, c->model_size, c->offset, c->weight_bytes,
-            c->in_dim, c->out_dim, c->physical_device,
-            c->fallback_physical_device, c->label);
+        if (c->required) {
+            (void)ds4_gpu_cache_q8_f16_required_range_on_device(
+                c->model_map, c->model_size, c->offset, c->weight_bytes,
+                c->in_dim, c->out_dim, c->physical_device, c->label);
+        } else {
+            (void)ds4_gpu_cache_q8_f16_range_on_device_or_partner(
+                c->model_map, c->model_size, c->offset, c->weight_bytes,
+                c->in_dim, c->out_dim, c->physical_device,
+                c->fallback_physical_device, c->label);
+        }
     }
     ds4_gpu_q8_f16_plan_end();
     free(plan);
@@ -59465,6 +59815,8 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
     bool q8_native_primary = false;
     bool q8_native_primary_requested = false;
+    const bool q8_native_gguf =
+        e->model.sm75_dense_q8_layout == DS4_TENSOR_LAYOUT_SM75_Q8_WARP32;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     q8_native_primary_requested =
         metal_graph_tp_env_flag(
@@ -59487,6 +59839,36 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                 "topology and failed four-GPU qualification; use canonical "
                 "residency or an explicitly tagged native GGUF model\n");
         goto cleanup;
+    }
+    if (q8_native_gguf) {
+        const char *incompatible_f32_env =
+            engine_q8_native_gguf_incompatible_f32_env();
+        if (incompatible_f32_env) {
+            fprintf(stderr,
+                    "ds4: tagged native dense-Q8 GGUF rejects diagnostic "
+                    "F32/partner-arithmetic mode selected by %s; production "
+                    "uses planned F16 bindings plus native-Q8 execution\n",
+                    incompatible_f32_env);
+            goto cleanup;
+        }
+        if (!cuda_tp_decode || !metal_graph_cuda_tp_attn_requested() ||
+            !engine_cuda_tp_fixed_22_21(e)) {
+            fprintf(stderr,
+                    "ds4: tagged native dense-Q8 GGUF requires CUDA "
+                    "decode/attention TP, four GPUs, and the fixed 22/21 "
+                    "layer split\n");
+            goto cleanup;
+        }
+        for (int d = 0; d < e->gpu_cfg.n_gpus; ++d) {
+            if (g_gpu[d].compute_major != 7 ||
+                g_gpu[d].compute_minor != 5) {
+                fprintf(stderr,
+                        "ds4: tagged native dense-Q8 GGUF requires sm_75 "
+                        "on every selected GPU; tier %d is sm_%d%d\n",
+                        d, g_gpu[d].compute_major, g_gpu[d].compute_minor);
+                goto cleanup;
+            }
+        }
     }
     const bool cuda_tp_output =
         cuda_tp_decode && metal_graph_cuda_tp_output_requested();
@@ -59555,6 +59937,32 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         }
         const int physical_device = g_gpu[logical_tier].device_id;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (q8_native_gguf &&
+            t->type == DS4_TENSOR_SM75_Q8_WARP32 &&
+            entry >= 1 && entry <= (int)DS4_N_LAYER) {
+            if (logical_tier >= tp_half) {
+                fprintf(stderr,
+                        "ds4: tagged native dense-Q8 requires lower-half "
+                        "layer homes; tensor %.*s is on tier %d\n",
+                        (int)t->name.len, t->name.ptr, logical_tier);
+                goto cleanup;
+            }
+            const uint32_t path_class =
+                accelerator_q8_cache_classify(t->name);
+            const int planned = engine_plan_q8_native_gguf_tensor(
+                t, path_class, logical_tier, logical_tier + tp_half,
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                per_dev_native, per_dev_native_n,
+                per_dev_native_cap);
+            if (planned <= 0) {
+                fprintf(stderr,
+                        "ds4: invalid tagged native dense-Q8 placement for "
+                        "tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                goto cleanup;
+            }
+            continue;
+        }
         if (q8_native_primary && entry >= 1 && entry <= (int)DS4_N_LAYER) {
             if (logical_tier >= tp_half) {
                 fprintf(stderr,
@@ -59704,21 +60112,34 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                         "ds4: native-primary Q8 byte accounting overflow\n");
                 goto cleanup;
             }
-            native_bytes += r->packed_rows * r->packed_blocks * 34u;
+            native_bytes += r->source_is_native
+                ? r->resident_bytes
+                : r->packed_rows * r->packed_blocks * 34u;
         }
-        fprintf(stderr,
-                "ds4: CUDA tier %d (device %d) native-primary Q8: "
-                "%.2f GiB in %d deferred decode shards plus %d "
-                "source-only spans\n",
-                d, physical_device,
-                (double)native_bytes / 1073741824.0,
-                per_dev_native_n[d] - source_only, source_only);
+        if (q8_native_gguf) {
+            fprintf(stderr,
+                    "ds4: CUDA tier %d (device %d) tagged native dense-Q8: "
+                    "%.2f GiB in %d borrowed execution ranges plus %d "
+                    "source-only spans\n",
+                    d, physical_device,
+                    (double)native_bytes / 1073741824.0,
+                    per_dev_native_n[d] - source_only, source_only);
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA tier %d (device %d) native-primary Q8: "
+                    "%.2f GiB in %d deferred decode shards plus %d "
+                    "source-only spans\n",
+                    d, physical_device,
+                    (double)native_bytes / 1073741824.0,
+                    per_dev_native_n[d] - source_only, source_only);
+        }
         const int native_rc = ds4_gpu_device_cache_q8_native_tensors(
             physical_device, per_dev_native[d], per_dev_native_n[d]);
         if (native_rc != 0) {
             fprintf(stderr,
-                    "ds4: native-primary Q8 install failed for tier %d "
+                    "ds4: %s Q8 install failed for tier %d "
                     "(physical device %d) rc=%d\n",
+                    q8_native_gguf ? "tagged native dense" : "native-primary",
                     d, physical_device, native_rc);
             goto cleanup;
         }
@@ -59728,6 +60149,12 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                 "ds4: CUDA native-primary Q8 enabled for deferred exact "
                 "T32/A/B TP decode shards; canonical sources remain "
                 "resident through prefill\n");
+    }
+    if (q8_native_gguf) {
+        fprintf(stderr,
+                "ds4: tagged SM75 dense-Q8 GGUF installed through ordinary "
+                "single-owner residency (T32 home, A rows split, B K shards "
+                "split); runtime replacement disabled\n");
     }
     if (engine_plan_q8_f16_cache(e, cuda_tp_decode) != 0) goto cleanup;
     rc = 0;
@@ -60024,6 +60451,31 @@ uint32_t ds4_test_q8_native_primary_ranges_per_layer(void) {
 
 uint32_t ds4_test_q8_native_primary_source_spans_per_layer(void) {
     return 6u;
+}
+
+int ds4_test_q8_native_full_prefill_binding_required(
+        const char *name, uint32_t type, int pair_prefill_attn_rows) {
+    ds4_tensor t;
+    memset(&t, 0, sizeof(t));
+    t.name = (ds4_str){name, name ? strlen(name) : 0u};
+    t.type = type;
+    return engine_q8_native_full_prefill_binding_required(
+        &t, accelerator_q8_cache_classify(t.name),
+        pair_prefill_attn_rows != 0) ? 1 : 0;
+}
+
+int ds4_test_q8_native_partner_t32_binding_required(
+        const char *name, uint32_t type, uint32_t candidate_copies) {
+    ds4_tensor t;
+    memset(&t, 0, sizeof(t));
+    t.name = (ds4_str){name, name ? strlen(name) : 0u};
+    t.type = type;
+    return engine_q8_native_partner_t32_binding_required(
+        &t, accelerator_q8_cache_classify(t.name), candidate_copies) ? 1 : 0;
+}
+
+const char *ds4_test_q8_native_gguf_incompatible_f32_env(void) {
+    return engine_q8_native_gguf_incompatible_f32_env();
 }
 
 uint32_t ds4_test_q8_cache_candidate_copies(
@@ -60589,11 +61041,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if ((e->model.q4_routed_layout != 0u ||
-         e->model.sm75_q32_layouts != 0u) &&
+         e->model.sm75_q32_layouts != 0u ||
+         e->model.sm75_dense_q8_layout != 0u) &&
         opt->backend != DS4_BACKEND_CUDA) {
         fprintf(stderr,
-                "ds4: this GGUF stores routed experts in an SM75-native "
-                "layout and requires --cuda on Turing\n");
+                "ds4: this GGUF contains SM75-native tensor layouts and "
+                "requires --cuda on Turing\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -61976,6 +62429,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    bool publish_shared_prefill_workspace = false;
+    uint64_t shared_prefill_workspace_bytes = 0u;
     if (e->share_session_prefill_workspace &&
         !e->shared_prefill_workspace_ready) {
         bool workspace_ok = true;
@@ -61990,8 +62445,29 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
-        const uint64_t workspace_bytes =
+        shared_prefill_workspace_bytes =
             metal_graph_prefill_workspace_bytes(&s->graph);
+        publish_shared_prefill_workspace = true;
+    }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (e->backend == DS4_BACKEND_CUDA &&
+        e->model.sm75_dense_q8_layout ==
+            DS4_TENSOR_LAYOUT_SM75_Q8_WARP32 &&
+        !ds4_gpu_q8_f16_plan_materialize_and_validate()) {
+        fprintf(stderr,
+                "ds4: tagged native dense-Q8 startup rejected before "
+                "prefill: required execution bindings are "
+                "unavailable\n");
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
+#endif
+    if (publish_shared_prefill_workspace) {
+        /* Do not transfer ownership into the engine until every tagged-native
+         * startup requirement has succeeded. A rejected first session can
+         * then release the graph transaction normally without stranding a
+         * partially initialized shared workspace. */
         metal_graph_transfer_prefill_workspace(
                 &e->shared_prefill_workspace, &s->graph);
         e->shared_prefill_workspace_ready = true;
@@ -62000,7 +62476,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 "cap=%u, %.2f GiB total GPU memory; each additional "
                 "session aliases this allocation\n",
                 e->shared_prefill_workspace.prefill_cap,
-                (double)workspace_bytes / 1073741824.0);
+                (double)shared_prefill_workspace_bytes / 1073741824.0);
     }
     s->graph.quality = e->quality;
     s->graph.ssd_streaming = e->ssd_streaming;
@@ -66636,8 +67112,8 @@ static bool metal_graph_session_batch_attn_post_supported(
             !g_gpu_peer_ok[home][partner] ||
             !g_gpu_peer_ok[partner][home] ||
             !layer->attn_output_a || !layer->attn_output_b ||
-            layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
-            layer->attn_output_b->type != DS4_TENSOR_Q8_0 ||
+            !tensor_type_is_q8_0_storage(layer->attn_output_a->type) ||
+            !tensor_type_is_q8_0_storage(layer->attn_output_b->type) ||
             !first->batch_heads_by_tier[home] ||
             !first->batch_attn_low_by_tier[home] ||
             !first->batch_attn_out_by_tier[home] ||
@@ -66690,7 +67166,7 @@ static bool metal_graph_session_batch_qkv_supported(
             !layer->attn_kv || !layer->attn_q_a_norm ||
             !layer->attn_kv_a_norm ||
             layer->attn_q_a->type != DS4_TENSOR_Q8_0 ||
-            layer->attn_q_b->type != DS4_TENSOR_Q8_0 ||
+            !tensor_type_is_q8_0_storage(layer->attn_q_b->type) ||
             layer->attn_kv->type != DS4_TENSOR_Q8_0 ||
             !first->batch_attn_norm_by_tier[home] ||
             !first->batch_qr_by_tier[home] ||

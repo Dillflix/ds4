@@ -153,6 +153,58 @@ before retrying. No model hash is calculated.
 Tagged files are deliberately accepted only by the SM75 CUDA path. Untagged
 Q4_K files retain the existing CUDA/Metal/CPU/ROCm implementations.
 
+### Repack Dense Q8 For The Four-GPU SM75 Layout
+
+The T32 query projection and attention-output A/B matrices can also be
+losslessly rewritten into DS4's size-neutral SM75 Q8 layout. This is a storage
+layout conversion, not requantization: every Q8_0 half scale and signed byte is
+preserved. The converter requires the exact T32/A/B shapes in all 43 layers,
+verifies the inverse byte mapping for every converted block, changes those 129
+tensors to the private `sm75_q8_warp32` GGUF type, and writes explicit
+layout/version metadata.
+
+```sh
+make -C gguf-tools
+gguf-tools/deepseek4-quantize \
+  --repack-sm75-native-q8 STANDARD-MODEL.gguf \
+  --out SM75-NATIVE-Q8-MODEL.gguf
+```
+
+Run the same command with `--dry-run` and no `--out` first to validate the
+source tensor inventory without reading or writing tensor payloads. A full
+conversion writes another model-sized file; ensure the output filesystem has
+enough free space. Input and output must be different files, and an existing
+output is rejected unless `--overwrite` is explicit.
+
+At runtime, the tagged model is accepted only by CUDA on four `sm_75` GPUs with
+the fixed 22/21 layer split and the production two-way decode/attention TP
+topology. T32 has one ordinary home allocation, attention A is row-sharded,
+and attention B is K-sharded. Eligible sharded prefill, decode, and fused
+kernels borrow views of those ordinary selective-cache allocations. Complete
+unsplit A+B prefill uses a startup-planned F16 execution binding built directly
+from the tagged bytes; this is neither an F32 fallback nor a late allocation.
+There is no runtime repack, replacement, or second persistent interleaved Q8
+allocation, and cleanup never frees a borrowed view.
+
+The tagged format is an engine-wide prefill-and-decode contract, not a decode
+cache format. Attention row splitting is conditional on chunk geometry. Every
+pair can therefore execute both eligible native row/K shards and a complete
+home-local A+B projection for tails or other ineligible chunks. All 86 full
+attention-A/B F16 bindings are therefore required. Because T32 has only one
+persistent home copy while its partner executes half the output rows, the 43
+partner T32 half-bindings are required too. All 129 bindings are admitted and
+synchronized before prefill begins or model startup fails. These F16 bindings
+are also present in the canonical production plan, so the persistent Q8
+ownership reduction remains 4386 MiB system-wide (8772 MiB replicated
+canonical T32/A/B residency versus 4386 MiB tagged single-owner/sharded
+residency).
+
+Legacy F32-expanded Q8 weights are diagnostic-only and are not a fallback for
+this format. Tagged-model startup rejects the opt-in F32 cache variables and
+non-F16 partner-arithmetic experiments. Production uses planned F16 execution
+bindings where required and otherwise consumes the native Q8 representation
+directly.
+
 The CUDA routed-MoE path supports the Cartesian product below. Gate and up
 must use the same type because they are fused; down is selected independently.
 

@@ -58,7 +58,8 @@ typedef enum {
      * They must never be read as standard GGUF quant types. */
     DS4Q_TYPE_SM75_Q4_32 = 42,
     DS4Q_TYPE_SM75_Q3A4  = 43,
-    DS4Q_TYPE_COUNT      = 44,
+    DS4Q_TYPE_SM75_Q8_WARP32 = 44,
+    DS4Q_TYPE_COUNT      = 45,
 } ds4q_type;
 
 static inline size_t ds4q_pad(size_t x, size_t n) {

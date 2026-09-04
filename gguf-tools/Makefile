@@ -35,10 +35,11 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 all: deepseek4-quantize
 
-deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
+deepseek4-quantize: deepseek4-quantize.c quants.c quants.h ../ds4_tensor_layout.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
 
-deepseek4-quantize-cuda.o: deepseek4-quantize.c quants.h quants_cuda.h Makefile
+deepseek4-quantize-cuda.o: deepseek4-quantize.c quants.h quants_cuda.h \
+	../ds4_tensor_layout.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DDS4Q_USE_CUDA -c -o $@ deepseek4-quantize.c
 
 quants-cuda-host.o: quants.c quants.h Makefile

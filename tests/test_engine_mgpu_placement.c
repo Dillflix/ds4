@@ -73,6 +73,11 @@ int ds4_test_q8_native_primary_shape(
 uint64_t ds4_test_q8_native_primary_bytes_per_layer(void);
 uint32_t ds4_test_q8_native_primary_ranges_per_layer(void);
 uint32_t ds4_test_q8_native_primary_source_spans_per_layer(void);
+int ds4_test_q8_native_full_prefill_binding_required(
+        const char *name, uint32_t type, int pair_prefill_attn_rows);
+int ds4_test_q8_native_partner_t32_binding_required(
+        const char *name, uint32_t type, uint32_t candidate_copies);
+const char *ds4_test_q8_native_gguf_incompatible_f32_env(void);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
         int partner_available, int sliceable);
@@ -154,6 +159,7 @@ size_t ds4_test_deepseek_per_layer_kv_bytes(
 #define DS4_TENSOR_IQ2_XXS_LOCAL 16u
 #define DS4_TENSOR_SM75_Q4_32_LOCAL 42u
 #define DS4_TENSOR_SM75_Q3A4_LOCAL 43u
+#define DS4_TENSOR_SM75_Q8_WARP32_LOCAL 44u
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -293,12 +299,28 @@ static void test_q8_native_primary_shapes(void) {
     CHECK(ds4_test_q8_native_primary_shape(
               "blk.3.attn_output_b.weight", 8u, 2u, 8192u, 4096u),
           "production attention B shape is native-primary eligible");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_q_b.weight", DS4_TENSOR_SM75_Q8_WARP32_LOCAL,
+              2u, 1024u, 32768u),
+          "tagged native-GGUF T32 shape is native-primary eligible");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_a.weight", DS4_TENSOR_SM75_Q8_WARP32_LOCAL,
+              2u, 4096u, 8192u),
+          "tagged native-GGUF attention A shape is native-primary eligible");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_b.weight", DS4_TENSOR_SM75_Q8_WARP32_LOCAL,
+              2u, 8192u, 4096u),
+          "tagged native-GGUF attention B shape is native-primary eligible");
     CHECK(!ds4_test_q8_native_primary_shape(
               "blk.3.attn_output_b.weight", 8u, 2u, 4096u, 4096u),
           "non-production attention B shape is rejected");
     CHECK(!ds4_test_q8_native_primary_shape(
               "blk.3.attn_output_a.weight", 1u, 2u, 4096u, 8192u),
           "non-Q8 attention A storage is rejected");
+    CHECK(!ds4_test_q8_native_primary_shape(
+              "blk.3.ffn_gate_shexp.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 2u, 1024u, 32768u),
+          "tagged native-GGUF type is rejected outside its exact tensor set");
     CHECK(ds4_test_q8_native_primary_bytes_per_layer() ==
               102ull * 1024ull * 1024ull,
           "native-primary T32/A/B residency is exactly 102 MiB per layer");
@@ -306,6 +328,83 @@ static void test_q8_native_primary_shapes(void) {
           "native-primary retains one full T32 plus two A and two B shards");
     CHECK(ds4_test_q8_native_primary_source_spans_per_layer() == 6u,
           "native-primary authorizes both rank sources for all three tensors");
+
+    const uint64_t native_system_bytes =
+        ds4_test_q8_native_primary_bytes_per_layer() * 43u;
+    const uint64_t canonical_tp_system_bytes = native_system_bytes * 2u;
+    CHECK(native_system_bytes == 4386ull * 1024ull * 1024ull,
+          "tagged native T32/A/B residency is 4386 MiB system-wide");
+    CHECK(canonical_tp_system_bytes - native_system_bytes ==
+              4386ull * 1024ull * 1024ull,
+          "tagged native ownership removes 4386 MiB of replicated Q8 residency");
+
+    CHECK(ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_output_a.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 0),
+          "unsplit prefill requires full tagged-native attention A binding");
+    CHECK(ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_output_b.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 0),
+          "unsplit prefill requires full tagged-native attention B binding");
+    CHECK(!ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_q_b.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 0),
+          "T32 does not need an unsplit-attention full prefill binding");
+    CHECK(ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_output_a.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 1),
+          "row-split-enabled pairs still require full attention A for ineligible chunks");
+    CHECK(ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_output_b.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 1),
+          "row-split-enabled pairs still require full attention B for ineligible chunks");
+    CHECK(!ds4_test_q8_native_full_prefill_binding_required(
+              "blk.3.attn_output_a.weight", 8u, 0),
+          "canonical Q8 retains its ordinary full-width fallback");
+    CHECK(ds4_test_q8_native_partner_t32_binding_required(
+              "blk.3.attn_q_b.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 3u),
+          "tagged-native partner T32 half is a required execution binding");
+    CHECK(!ds4_test_q8_native_partner_t32_binding_required(
+              "blk.3.attn_q_b.weight", 8u, 3u),
+          "canonical Q8 retains its ordinary partner T32 fallback");
+    CHECK(!ds4_test_q8_native_partner_t32_binding_required(
+              "blk.3.attn_q_b.weight",
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 1u),
+          "unsplit tagged-native T32 does not invent a partner binding");
+
+    (void)unsetenv("DS4_CUDA_Q8_F32_PRELOAD");
+    (void)unsetenv("DS4_CUDA_Q8_F32_ALL");
+    (void)unsetenv("DS4_CUDA_Q8_F32_LARGE");
+    (void)unsetenv("DS4_CUDA_ATTN_Q_B_F32_CACHE");
+    (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+    CHECK(ds4_test_q8_native_gguf_incompatible_f32_env() == NULL,
+          "tagged native GGUF accepts the production F16/native-Q8 policy");
+    const char *const native_incompatible_f32_envs[] = {
+        "DS4_CUDA_Q8_F32_PRELOAD",
+        "DS4_CUDA_Q8_F32_ALL",
+        "DS4_CUDA_Q8_F32_LARGE",
+        "DS4_CUDA_ATTN_Q_B_F32_CACHE",
+    };
+    for (size_t i = 0;
+         i < sizeof(native_incompatible_f32_envs) /
+                 sizeof(native_incompatible_f32_envs[0]);
+         i++) {
+        const char *name = native_incompatible_f32_envs[i];
+        setenv(name, "1", 1);
+        CHECK(strcmp(ds4_test_q8_native_gguf_incompatible_f32_env(), name) == 0,
+              "tagged native GGUF rejects every opt-in F32 weight expansion");
+        (void)unsetenv(name);
+    }
+    setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "f16", 1);
+    CHECK(ds4_test_q8_native_gguf_incompatible_f32_env() == NULL,
+          "tagged native GGUF accepts an explicit production F16 policy");
+    (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
+    setenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC", "w32-x32-sgemm", 1);
+    CHECK(strcmp(ds4_test_q8_native_gguf_incompatible_f32_env(),
+                 "DS4_CUDA_Q8_PARTNER_ARITHMETIC") == 0,
+          "tagged native GGUF rejects diagnostic partner SGEMM arithmetic");
+    (void)unsetenv("DS4_CUDA_Q8_PARTNER_ARITHMETIC");
 }
 
 static void test_q8_cache_partner_mapping(void) {

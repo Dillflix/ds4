@@ -9,10 +9,80 @@ materialization. The experiment changed more than storage format: it removed
 T32/attention-A/attention-B tensors from the ordinary selective-cache ranges,
 introduced dedicated source slabs, and intercepted strict cache lookup.
 
-The bit-exact warp-interleaved decode kernels and their bounded/auxiliary-cache
-tests remain available. A production VRAM reduction must use an explicitly
-tagged native GGUF representation and the ordinary selective-cache ownership
-path; it must not repack, replace, or free primary weight residency at runtime.
+The bit-exact warp-interleaved kernels and their bounded/auxiliary-cache tests
+remain available. A production VRAM reduction must use an explicitly tagged
+native GGUF representation and the ordinary selective-cache ownership path; it
+must not repack, replace, or free primary weight residency at runtime.
+
+The implemented native-GGUF contract uses the private, size-neutral
+`sm75_q8_warp32` type for all 43 T32/attention-A/attention-B tensor triplets.
+T32 is home-resident once, A is split by output rows, and B is stored as two
+contiguous K shards. The runtime registers execution views as borrowed aliases
+of the ordinary selective cache; those aliases allocate and own zero bytes.
+Eligible sharded prefill, single-token decode, and fused epilogues consume the
+borrowed native-Q8 residency. A complete unsplit A+B prefill instead consumes
+its startup-planned F16 execution binding, which is materialized directly from
+the tagged bytes. It never means an F32 expansion or a late allocation after
+the workload starts. Qualification covers both execution forms, not decode
+alone. See `gguf-tools/README.md` for the lossless converter and its disk-space
+boundary.
+
+The F16 admission plan is part of that representation contract. Attention row
+splitting is conditional on each chunk's geometry, so even an enabled pair can
+fall back to a complete home-local A+B projection for a tail or another
+ineligible shape. All 43 layers' attention-A and attention-B bindings
+(`86/86`) are therefore mandatory and home-local. The partner half of each
+T32 projection has no persistent Q8 duplicate and contributes another 43
+mandatory F16 bindings. All 129 required bindings are materialized and
+synchronized during session startup; the engine rejects the tagged model
+before prefill if any one is unavailable. Eligible split chunks still consume
+the native A-row and B-K shards directly. Decode and prefill therefore share
+one native-Q8 residency without making either phase an afterthought or relying
+on a mid-run allocation fallback.
+
+The legacy F32-expanded Q8 cache remains available only to older, explicitly
+selected diagnostic SGEMM experiments. It is not a production fallback. A
+tagged native-Q8 model rejects `DS4_CUDA_Q8_F32_*`,
+`DS4_CUDA_ATTN_Q_B_F32_CACHE`, and non-F16
+`DS4_CUDA_Q8_PARTNER_ARITHMETIC` settings rather than spending 4 bytes per
+weight or allowing an A/B to qualify under different arithmetic. Production
+uses the mandatory F16 execution bindings where appropriate and otherwise the
+native-Q8 kernels.
+
+`cuda-sm75-native-q8-gguf-production-ab.sh` is the engine-wide acceptance
+test. Run it once for `mixed15` and once for `all43`, each with its canonical
+model and the corresponding tagged native model. Every invocation uses the
+stable 22/21 four-GPU policy (pair-0 attention rows disabled, indexer rows
+enabled on both pairs), and executes both arms at PP512, PP4096, and PP32768.
+It accepts the format only when prefill-frontier and per-token decode logits
+are byte-identical, every prefill/decode throughput frontier retains at least
+95% of canonical performance, peak aggregate VRAM falls by at least 3500 MiB,
+and the log proves that all native execution views borrowed ordinary residency
+with zero runtime repack/replacement allocation. The thresholds are explicit
+environment variables, but lowering them does not constitute production
+qualification.
+
+```sh
+unset CUDA_VISIBLE_DEVICES NATIVE_Q8_GGUF_PRODUCTION_AB_DIR
+MODEL_LAYOUT=mixed15 \
+CANONICAL_MODEL=/absolute/path/to/mixed15.gguf \
+NATIVE_MODEL=/absolute/path/to/mixed15-sm75-native-q8.gguf \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-native-q8-gguf-production-ab.sh
+
+unset NATIVE_Q8_GGUF_PRODUCTION_AB_DIR
+MODEL_LAYOUT=all43 \
+CANONICAL_MODEL=/absolute/path/to/all43.gguf \
+NATIVE_MODEL=/absolute/path/to/all43-sm75-native-q8.gguf \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-native-q8-gguf-production-ab.sh
+```
 
 ### SM75-native Q4-32 decode gate/up mappings
 

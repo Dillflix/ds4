@@ -154,8 +154,14 @@ int ds4_gpu_cache_q8_f16_range_on_device_or_partner(
         uint64_t in_dim, uint64_t out_dim,
         int physical_device, int fallback_physical_device,
         const char *label);
+int ds4_gpu_cache_q8_f16_required_range_on_device(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes,
+        uint64_t in_dim, uint64_t out_dim,
+        int physical_device, const char *label);
 void ds4_gpu_q8_f16_plan_begin(void);
 void ds4_gpu_q8_f16_plan_end(void);
+int ds4_gpu_q8_f16_plan_materialize_and_validate(void);
 uint64_t ds4_gpu_q8_f16_partner_offload_count(void);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
@@ -174,16 +180,18 @@ typedef struct {
     int target_device;
 } ds4_tensor_range;
 
-/* Size-neutral SM75 Q8_0 representation used by the single-token dense
- * kernels.  The canonical tensor remains the source of truth in the mmap,
- * while only the exact row or K shard described here is retained on the
- * target GPU.  cache_key_offset is the offset used by dispatch; it can differ
- * from source_offset for a K-sharded matrix because canonical rows are
- * strided while the native shard is contiguous.  packed_blocks=packed_rows=0
- * records an intentionally omitted canonical span used only for transient
- * F16-cache materialization; it retains no native bytes. */
+/* Size-neutral SM75 Q8_0 representation used by dense prefill, decode, and
+ * fused kernels.  source_offset/resident_bytes identify the ordinary
+ * single-owner device residency.  For a tagged native GGUF, source_is_native
+ * aliases that residency directly; an untagged diagnostic may instead repack
+ * canonical rows.  cache_key_offset is the offset used by dispatch and can
+ * differ from source_offset for a K-sharded matrix.
+ * packed_blocks=packed_rows=0 records an intentionally omitted source span
+ * used only for transient F16-cache materialization; it retains no native
+ * bytes. */
 typedef struct {
     uint64_t source_offset;
+    uint64_t resident_bytes;
     uint64_t canonical_offset;
     uint64_t canonical_bytes;
     uint64_t cache_key_offset;
@@ -191,6 +199,8 @@ typedef struct {
     uint64_t source_block_start;
     uint64_t packed_blocks;
     uint64_t packed_rows;
+    uint32_t source_layout;
+    int source_is_native;
     int target_device;
 } ds4_q8_native_range;
 
