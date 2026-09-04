@@ -58954,6 +58954,21 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     return 0;
 }
 
+static int engine_cuda_tp_stage_aware_split(const int *placement,
+                                            int n_placement_entries,
+                                            int n_gpus) {
+    if (!placement || n_gpus != 4 ||
+        n_placement_entries != (int)DS4_N_LAYER + 2 ||
+        placement[1] != 0) return -1;
+    uint32_t split = 1u;
+    while (split < DS4_N_LAYER && placement[split + 1u] == 0) split++;
+    if (split == DS4_N_LAYER) return -1;
+    for (uint32_t il = split; il < DS4_N_LAYER; il++) {
+        if (placement[il + 1u] != 1) return -1;
+    }
+    return split == 21u || split == 22u ? (int)split : -1;
+}
+
 #ifndef DS4_NO_GPU
 static int engine_append_device_cache_span(
         ds4_tensor_range **per_dev_ranges,
@@ -58993,21 +59008,6 @@ static int engine_append_device_cache_range(
     return engine_append_device_cache_span(per_dev_ranges, per_dev_n, per_dev_cap,
                                            logical_tier, physical_device,
                                            t->abs_offset, t->bytes);
-}
-
-static int engine_cuda_tp_stage_aware_split(const int *placement,
-                                            int n_placement_entries,
-                                            int n_gpus) {
-    if (!placement || n_gpus != 4 ||
-        n_placement_entries != (int)DS4_N_LAYER + 2 ||
-        placement[1] != 0) return -1;
-    uint32_t split = 1u;
-    while (split < DS4_N_LAYER && placement[split + 1u] == 0) split++;
-    if (split == DS4_N_LAYER) return -1;
-    for (uint32_t il = split; il < DS4_N_LAYER; il++) {
-        if (placement[il + 1u] != 1) return -1;
-    }
-    return split == 21u || split == 22u ? (int)split : -1;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
