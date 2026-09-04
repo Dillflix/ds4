@@ -76,7 +76,7 @@ uint32_t ds4_test_q8_native_primary_source_spans_per_layer(void);
 int ds4_test_q8_native_full_prefill_binding_required(
         const char *name, uint32_t type, int pair_prefill_attn_rows);
 int ds4_test_q8_native_partner_t32_binding_required(
-        const char *name, uint32_t type, uint32_t candidate_copies);
+        const char *name, uint32_t type, int cuda_tp_decode);
 const char *ds4_test_q8_native_gguf_incompatible_f32_env(void);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
@@ -363,15 +363,15 @@ static void test_q8_native_primary_shapes(void) {
           "canonical Q8 retains its ordinary full-width fallback");
     CHECK(ds4_test_q8_native_partner_t32_binding_required(
               "blk.3.attn_q_b.weight",
-              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 3u),
-          "tagged-native partner T32 half is a required execution binding");
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 1),
+          "decode TP requires the tagged-native partner T32 half independently of prefill head splitting");
     CHECK(!ds4_test_q8_native_partner_t32_binding_required(
-              "blk.3.attn_q_b.weight", 8u, 3u),
+              "blk.3.attn_q_b.weight", 8u, 1),
           "canonical Q8 retains its ordinary partner T32 fallback");
     CHECK(!ds4_test_q8_native_partner_t32_binding_required(
               "blk.3.attn_q_b.weight",
-              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 1u),
-          "unsplit tagged-native T32 does not invent a partner binding");
+              DS4_TENSOR_SM75_Q8_WARP32_LOCAL, 0),
+          "tagged-native T32 does not invent a partner binding without decode TP");
 
     (void)unsetenv("DS4_CUDA_Q8_F32_PRELOAD");
     (void)unsetenv("DS4_CUDA_Q8_F32_ALL");
