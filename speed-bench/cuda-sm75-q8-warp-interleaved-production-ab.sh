@@ -292,6 +292,24 @@ validate_csv() {
     ' "$csv"
 }
 
+validate_native_residency_shadow() {
+    local log=$1
+    awk -v expected="$((4386 * 1024 * 1024))" '
+        /CUDA q8 fp16 planner canonical-equivalent residency shadow/ {
+            device=""; bytes=""
+            for (i=1; i<=NF; i++) {
+                split($i,a,"=")
+                if (a[1]=="device") device=a[2]
+                if (a[1]=="bytes") bytes=a[2]
+            }
+            if (device !~ /^[0-9]+$/ || bytes !~ /^[0-9]+$/ ||
+                seen_device[device]++) bad=1
+            seen++; total+=bytes
+        }
+        END {exit !(seen==4 && !bad && total==expected)}
+    ' "$log"
+}
+
 validate_dispatch() {
     local variant=$1 log=$2
     if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
@@ -333,10 +351,11 @@ validate_dispatch() {
         ' "$log" || return 1
         if [[ $variant == interleaved ]]; then
             grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
-                "$log" &&
+                "$log" && validate_native_residency_shadow "$log" &&
                 ! grep -Fq 'SM75 warp-interleaved Q8 cache fill' "$log"
         else
-            ! grep -Fq 'CUDA native-primary Q8 enabled' "$log"
+            ! grep -Fq 'CUDA native-primary Q8 enabled' "$log" &&
+                ! grep -Fq 'canonical-equivalent residency shadow' "$log"
         fi
     elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
         if [[ $variant == control ]]; then
@@ -457,7 +476,8 @@ run_native_primary_preflight() {
         DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=1
         DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY=1
         DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=0
-        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv" ./ds4-bench
+        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv"
+        "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$base.q8-plan.csv" ./ds4-bench
         --cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES"
         --gpu-vram "$GPU_VRAM" --model "$model" --prompt-file "$PROMPT"
         --ctx-start 512 --ctx-max 512 --ctx-alloc "$CTX_ALLOC"
@@ -474,8 +494,11 @@ run_native_primary_preflight() {
             NR>1 {rows++; if ($1==512 && $4==tg && ($3+0)>0 && ($8+0)>0) seen++}
             END {exit !(ok && rows==1 && seen==1)}
         ' "$base.csv" &&
-        [[ -s $base.memory.csv ]] &&
+        [[ -s $base.memory.csv && -s $base.q8-plan.csv ]] &&
         validate_common_log "$layout" "$base.log" &&
+        validate_native_residency_shadow "$base.log" &&
+        grep -Fq 'CUDA q8 fp16 stage-aware 22/21 planner selected 117/129 movable projections for partner execution' \
+            "$base.log" &&
         grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
             "$base.log" || return 1
     if [[ -n $NATIVE_PRIMARY_DISABLE_T32_PARTNER_PAIRS ]]; then
@@ -585,7 +608,8 @@ run_engine() {
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     cmd=("${production_env[@]}" "${candidate[@]}"
-        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv" ./ds4-bench
+        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv"
+        "DS4_CUDA_Q8_PLAN_AUDIT_CSV=$base.q8-plan.csv" ./ds4-bench
         --cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES"
         --gpu-vram "$GPU_VRAM" --model "$model" --prompt-file "$PROMPT"
         --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC"
@@ -600,10 +624,38 @@ run_engine() {
 validate_run() {
     local layout=$1 variant=$2 tokens=$3 base=$4 logits=${5:-}
     validate_gpu_health "$base" && validate_csv "$base.csv" "$tokens" &&
-        [[ -s $base.memory.csv ]] &&
+        [[ -s $base.memory.csv && -s $base.q8-plan.csv ]] &&
         validate_common_log "$layout" "$base.log" &&
         validate_dispatch "$variant" "$base.log" || return 1
     [[ -z $logits ]] || validate_logits "$logits"
+}
+
+validate_native_plan_pair() {
+    local layout=$1 control candidate
+    [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]] || return 0
+    control="$OUTPUT_DIR/runs/$layout-control.q8-plan.csv"
+    candidate="$OUTPUT_DIR/runs/$layout-interleaved.q8-plan.csv"
+    cmp -s "$control" "$candidate" || {
+        python3 - "$control" "$candidate" >&2 <<'PY'
+import csv, sys
+
+with open(sys.argv[1], newline="") as handle:
+    control = list(csv.DictReader(handle))
+with open(sys.argv[2], newline="") as handle:
+    candidate = list(csv.DictReader(handle))
+if len(control) != len(candidate):
+    print(f"q8 plan length differs: control={len(control)} candidate={len(candidate)}")
+else:
+    for index, (left, right) in enumerate(zip(control, candidate)):
+        if left != right:
+            changed = [key for key in left if left[key] != right.get(key)]
+            print(f"q8 plan first difference row={index} fields={','.join(changed)}")
+            for key in changed:
+                print(f"  {key}: control={left[key]} candidate={right.get(key)}")
+            break
+PY
+        return 1
+    }
 }
 
 validate_native_memory_pair() {
@@ -720,6 +772,8 @@ for i in 0 1; do
     done
     validate_native_memory_pair "$layout" ||
         die "$layout native-primary memory validation failed"
+    validate_native_plan_pair "$layout" ||
+        die "$layout native-primary changed the accepted Q8/F16 placement plan"
 done
 
 phase=exact-logits

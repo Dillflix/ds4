@@ -5180,10 +5180,22 @@ decode logits at 512, 4096, and 32768 tokens for mixed15 and all43. It reports
 both total free-memory change and every relevant persistent category instead
 of treating the 1,536 MiB auxiliary cap as the memory result.
 
+Native-primary residency must also be execution-topology neutral. Omitting the
+canonical copies exposes additional allocator headroom before the stage-aware
+F16 planner runs; the first implementation consequently moved 128 of 129
+movable projections to partners instead of the accepted auxiliary-cache
+control's 117. The planner now applies a canonical-equivalent residency shadow:
+it retains the smaller native allocations physically, but hides only the
+canonical-minus-native headroom difference from placement decisions. The A/B
+harness records all 344 plan rows and requires the candidate plan to be
+byte-identical to its control before accepting the memory result.
+
 Before the full two-model A/B, the native-primary mode runs a candidate-only
 512-token mixed15 preflight. It requires the complete F16 plan, healthy GPU
 identity before and after the run, positive prefill/decode results, and zero
-selective-cache misses. This specifically guards the batched-prefill contract:
+selective-cache misses. It also requires the canonical-equivalent planner
+shadow and the accepted 117/129 movable-partner count. This specifically
+guards the batched-prefill contract:
 attention A must select its resident F16 binding before any canonical-Q8
 fallback, while attention B must defer all residency selection to the generic
 F16/native-primary dispatcher. A failed preflight stops the harness before the

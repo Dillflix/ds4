@@ -1457,6 +1457,35 @@ static std::atomic<uint64_t> g_q8_warp_interleaved_fallbacks = 0;
 static int g_test_forbid_attention_output_batch_canonical;
 static std::mutex g_q8_warp_interleaved_mutex;
 
+/* Native-primary residency deliberately replaces canonical Q8 device copies
+ * with the size-neutral warp-interleaved representation.  The stage-aware
+ * F16 planner must not interpret that storage saving as permission to change
+ * the accepted home/partner execution topology: doing so turns a residency
+ * optimization into additional inter-GPU traffic.  Model the headroom that
+ * the corresponding canonical-only residency would have exposed at this
+ * point in initialization.  The native bytes remain physically allocated;
+ * only the excess (canonical - native) is hidden from the placement model.
+ */
+static uint64_t cuda_q8_native_primary_planner_shadow_bytes(int device) {
+    uint64_t canonical_bytes = 0u;
+    uint64_t native_bytes = 0u;
+    std::lock_guard<std::mutex> lock(g_q8_warp_interleaved_mutex);
+    for (const cuda_q8_native_primary_source_span &r :
+             g_q8_native_primary_source_spans) {
+        if (r.device_id != device) continue;
+        canonical_bytes = canonical_bytes > UINT64_MAX - r.bytes
+            ? UINT64_MAX : canonical_bytes + r.bytes;
+    }
+    for (const cuda_q8_warp_interleaved_range &r :
+             g_q8_warp_interleaved_ranges) {
+        if (!r.primary || r.device_id != device) continue;
+        native_bytes = native_bytes > UINT64_MAX - r.weight_bytes
+            ? UINT64_MAX : native_bytes + r.weight_bytes;
+    }
+    return canonical_bytes > native_bytes
+        ? canonical_bytes - native_bytes : 0u;
+}
+
 static void cuda_q8_warp_interleaved_cache_release_all(void);
 static std::atomic<uint64_t> g_q8_f16_partner_activation_bytes = 0;
 static std::atomic<uint64_t> g_q8_f16_partner_result_bytes = 0;
@@ -3572,8 +3601,19 @@ static void cuda_q8_f16_plan_materialize(void) {
             }
             const uint64_t reserve =
                 cuda_q8_f16_cache_reserve_bytes((uint64_t)total_b);
-            projected_free[device] = (uint64_t)free_b > reserve
+            const uint64_t usable = (uint64_t)free_b > reserve
                 ? (uint64_t)free_b - reserve : 0u;
+            const uint64_t residency_shadow =
+                cuda_q8_native_primary_planner_shadow_bytes(device);
+            projected_free[device] = usable > residency_shadow
+                ? usable - residency_shadow : 0u;
+            if (residency_shadow != 0u) {
+                fprintf(stderr,
+                        "ds4: CUDA q8 fp16 planner canonical-equivalent "
+                        "residency shadow device=%d bytes=%llu\n",
+                        device,
+                        (unsigned long long)residency_shadow);
+            }
             projected_work[device] = 0u;
             return true;
         };
