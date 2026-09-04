@@ -5327,9 +5327,11 @@ four-GPU 32K frontier:
 * `DS4_CUDA_PREFILL_ATTN_ROW_TILE16=1` stages 16 indexed-attention rows per
   CTA barrier instead of eight. Per-row score and online-softmax arithmetic is
   unchanged.
-* `DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION=1` reuses the CUB top-k scratch to
-  sort the selected 512 indices into the exact order consumed by attention.
-  This removes the separate global-memory index-sort launch and round trip.
+* `DS4_CUDA_PREFILL_FUSED_INDEXER_SELECTION=1` sorts the selected 512 indices
+  in the selector's existing shared-memory fallback or final merge workspace,
+  including the chunked selector used beyond 8K compressed rows. This removes
+  the separate global-memory index-sort launch and round trip without relying
+  on an SM75-ineligible CUB dynamic-shared-memory configuration.
 
 All selectors are restricted to multi-token prefill and remain independently
 rollbackable. The harness first runs the production APIs through bit-exact

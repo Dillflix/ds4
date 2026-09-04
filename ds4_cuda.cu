@@ -17159,7 +17159,6 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
-template <bool SORT_SELECTED_ASC>
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
@@ -17191,44 +17190,12 @@ __global__ static void indexer_topk_8192_cub_kernel(
 
     BlockSort(sort_storage).SortDescending(keys);
 
-    if (SORT_SELECTED_ASC) {
-        /* Reuse CUB's dynamic scratch after its final barrier.  This folds the
-         * index-order pass required by exact attention into selection without
-         * another 2 KiB/token global write/read round trip. */
-        __syncthreads();
-        uint32_t *rows = reinterpret_cast<uint32_t *>(sort_smem);
 #pragma unroll
-        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
-            const uint32_t i = tid * ITEMS_PER_THREAD + item;
-            if (i < top_k) rows[i] = 0xffffffffu - (uint32_t)keys[item];
-        }
-        __syncthreads();
-        for (uint32_t k = 2u; k <= 512u; k <<= 1u) {
-            for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-                const uint32_t other = tid ^ j;
-                if (tid < top_k && other > tid && other < top_k) {
-                    const uint32_t a = rows[tid];
-                    const uint32_t b = rows[other];
-                    const bool up = (tid & k) == 0u;
-                    if ((up && a > b) || (!up && a < b)) {
-                        rows[tid] = b;
-                        rows[other] = a;
-                    }
-                }
-                __syncthreads();
-            }
-        }
-        if (tid < top_k) {
-            selected[(uint64_t)t * top_k + tid] = rows[tid];
-        }
-    } else {
-#pragma unroll
-        for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
-            const uint32_t i = tid * ITEMS_PER_THREAD + item;
-            if (i < top_k) {
-                selected[(uint64_t)t * top_k + i] =
-                    0xffffffffu - (uint32_t)keys[item];
-            }
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t i = tid * ITEMS_PER_THREAD + item;
+        if (i < top_k) {
+            selected[(uint64_t)t * top_k + i] =
+                0xffffffffu - (uint32_t)keys[item];
         }
     }
 }
@@ -17279,6 +17246,30 @@ __global__ static void indexer_topk_1024_kernel(
     }
 
     if (tid < top_k) selected[(uint64_t)t * top_k + tid] = idxs[tid];
+}
+
+template <typename IndexT>
+__device__ __forceinline__ static void indexer_topk_sort_indices_ascending(
+        IndexT *idxs,
+        uint32_t top_k,
+        uint32_t tid) {
+    for (uint32_t k = 2u; k <= top_k; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = tid; i < top_k; i += blockDim.x) {
+                const uint32_t other = i ^ j;
+                if (other > i && other < top_k) {
+                    const IndexT a = idxs[i];
+                    const IndexT b = idxs[other];
+                    const bool up = (i & k) == 0u;
+                    if ((up && a > b) || (!up && a < b)) {
+                        idxs[i] = b;
+                        idxs[other] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
 }
 
 template <uint32_t SORT_N>
@@ -17336,7 +17327,7 @@ __global__ static void indexer_topk_pow2_kernel(
     }
 }
 
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, bool SORT_SELECTED_ASC = false>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
         const float *scores,
@@ -17386,6 +17377,9 @@ __global__ static void indexer_topk_pow2_u16_kernel(
         }
     }
 
+    if (SORT_SELECTED_ASC) {
+        indexer_topk_sort_indices_ascending(idxs, top_k, tid);
+    }
     for (uint32_t i = tid; i < top_k; i += blockDim.x) {
         selected[(uint64_t)t * top_k + i] = idxs[i];
     }
@@ -17453,7 +17447,7 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
     }
 }
 
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, bool SORT_SELECTED_ASC = false>
 __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t *selected,
         const uint32_t *candidates,
@@ -17508,6 +17502,9 @@ __global__ static void indexer_topk_merge_pow2_kernel(
         }
     }
 
+    if (SORT_SELECTED_ASC) {
+        indexer_topk_sort_indices_ascending(idxs, top_k, tid);
+    }
     for (uint32_t i = tid; i < top_k; i += blockDim.x) {
         selected[(uint64_t)t * top_k + i] = idxs[i];
     }
@@ -18132,6 +18129,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     if (top_k == 512u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         if (n_comp == 4096u) {
+            if (fused_index_order) {
+                indexer_topk_pow2_u16_kernel<4096, true>
+                    <<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                          (const float *)scores->ptr,
+                                          n_comp, n_tokens, top_k);
+                static std::atomic<bool> logged = false;
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    fprintf(stderr,
+                            "ds4: SM75 fused indexer selection/index-order "
+                            "selected\n");
+                }
+                return cuda_ok(cudaGetLastError(),
+                               "indexer topk 4096 fused launch");
+            }
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
             int dev = 0;
@@ -18143,39 +18154,19 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = fused_index_order
-                    ? cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<true>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           smem)
-                    : cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<false>,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
+                attr_err = cudaFuncSetAttribute(
+                        indexer_topk_8192_cub_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        smem);
                 if (attr_err == cudaSuccess) {
-                    if (fused_index_order) {
-                        indexer_topk_8192_cub_kernel<true>
-                            <<<n_tokens, 512, (size_t)smem>>>(
-                                (uint32_t *)selected->ptr,
-                                (const float *)scores->ptr,
-                                n_comp, n_tokens, top_k);
-                    } else {
-                        indexer_topk_8192_cub_kernel<false>
-                            <<<n_tokens, 512, (size_t)smem>>>(
-                                (uint32_t *)selected->ptr,
-                                (const float *)scores->ptr,
-                                n_comp, n_tokens, top_k);
-                    }
-                    if (fused_index_order) {
-                        static std::atomic<bool> logged = false;
-                        if (!logged.exchange(true, std::memory_order_relaxed)) {
-                            fprintf(stderr,
-                                    "ds4: SM75 fused indexer selection/index-order "
-                                    "selected\n");
-                        }
-                    }
+                    indexer_topk_8192_cub_kernel
+                        <<<n_tokens, 512, (size_t)smem>>>(
+                            (uint32_t *)selected->ptr,
+                            (const float *)scores->ptr,
+                            n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
-            if (fused_index_order) return 0;
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
@@ -18186,6 +18177,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
         if (n_comp > 4096u) {
+            if (fused_index_order) {
+                indexer_topk_pow2_u16_kernel<8192, true>
+                    <<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                          (const float *)scores->ptr,
+                                          n_comp, n_tokens, top_k);
+                static std::atomic<bool> logged = false;
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    fprintf(stderr,
+                            "ds4: SM75 fused indexer selection/index-order "
+                            "selected\n");
+                }
+                return cuda_ok(cudaGetLastError(),
+                               "indexer topk 8192 fused launch");
+            }
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
             int dev = 0;
@@ -18197,39 +18202,19 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = fused_index_order
-                    ? cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<true>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           smem)
-                    : cudaFuncSetAttribute(indexer_topk_8192_cub_kernel<false>,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                smem);
+                attr_err = cudaFuncSetAttribute(
+                        indexer_topk_8192_cub_kernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        smem);
                 if (attr_err == cudaSuccess) {
-                    if (fused_index_order) {
-                        indexer_topk_8192_cub_kernel<true>
-                            <<<n_tokens, 512, (size_t)smem>>>(
-                                (uint32_t *)selected->ptr,
-                                (const float *)scores->ptr,
-                                n_comp, n_tokens, top_k);
-                    } else {
-                        indexer_topk_8192_cub_kernel<false>
-                            <<<n_tokens, 512, (size_t)smem>>>(
-                                (uint32_t *)selected->ptr,
-                                (const float *)scores->ptr,
-                                n_comp, n_tokens, top_k);
-                    }
-                    if (fused_index_order) {
-                        static std::atomic<bool> logged = false;
-                        if (!logged.exchange(true, std::memory_order_relaxed)) {
-                            fprintf(stderr,
-                                    "ds4: SM75 fused indexer selection/index-order "
-                                    "selected\n");
-                        }
-                    }
+                    indexer_topk_8192_cub_kernel
+                        <<<n_tokens, 512, (size_t)smem>>>(
+                            (uint32_t *)selected->ptr,
+                            (const float *)scores->ptr,
+                            n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
-            if (fused_index_order) return 0;
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
@@ -18287,14 +18272,33 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             cur_stride = next_stride;
         }
 
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                                 cur,
-                                                                 (const float *)scores->ptr,
-                                                                 n_comp,
-                                                                 n_tokens,
-                                                                 top_k,
-                                                                 n_sets * top_k,
-                                                                 cur_stride);
+        if (fused_index_order) {
+            indexer_topk_merge_pow2_kernel<4096, true>
+                <<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                     cur,
+                                     (const float *)scores->ptr,
+                                     n_comp,
+                                     n_tokens,
+                                     top_k,
+                                     n_sets * top_k,
+                                     cur_stride);
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                        "ds4: SM75 fused indexer selection/index-order "
+                        "selected\n");
+            }
+        } else {
+            indexer_topk_merge_pow2_kernel<4096, false>
+                <<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                     cur,
+                                     (const float *)scores->ptr,
+                                     n_comp,
+                                     n_tokens,
+                                     top_k,
+                                     n_sets * top_k,
+                                     cur_stride);
+        }
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,

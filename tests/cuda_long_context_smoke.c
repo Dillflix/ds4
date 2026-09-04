@@ -2928,8 +2928,7 @@ cleanup:
     return rc;
 }
 
-static int check_sm75_fused_indexer_selection_exact(void) {
-    const uint32_t n_comp = 8192u;
+static int check_sm75_fused_indexer_selection_case(uint32_t n_comp) {
     const uint32_t n_tokens = 4u;
     const uint32_t top_k = 512u;
     const uint64_t score_count = (uint64_t)n_comp * n_tokens;
@@ -2943,8 +2942,9 @@ static int check_sm75_fused_indexer_selection_exact(void) {
     int rc = 1;
     if (!scores_host || !selected_host || !scores || !selected) goto cleanup;
 
-    /* Multiplication by an odd number is a permutation modulo 8192, so each
-     * token has unique scores while presenting a different index ordering. */
+    /* Multiplication by an odd number is a permutation modulo each tested
+     * power-of-two n_comp, so every token has unique scores while presenting
+     * a different index ordering. */
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t i = 0; i < n_comp; i++) {
             const uint32_t rank = (i * 4051u + t * 997u) & (n_comp - 1u);
@@ -2957,7 +2957,12 @@ static int check_sm75_fused_indexer_selection_exact(void) {
     if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(selected, 0, selected_host,
-                             selected_count * sizeof(uint32_t))) goto cleanup;
+                             selected_count * sizeof(uint32_t))) {
+        fprintf(stderr,
+                "SM75 fused indexer selection execution failed n_comp=%u\n",
+                n_comp);
+        goto cleanup;
+    }
     for (uint32_t t = 0; t < n_tokens; t++) {
         uint32_t previous = 0u;
         for (uint32_t k = 0; k < top_k; k++) {
@@ -2966,18 +2971,18 @@ static int check_sm75_fused_indexer_selection_exact(void) {
             if (index >= n_comp || rank < n_comp - top_k ||
                 (k != 0u && index <= previous)) {
                 fprintf(stderr,
-                        "SM75 fused indexer selection mismatch token=%u rank=%u "
-                        "index=%u score-rank=%u previous=%u\n",
-                        t, k, index, rank, previous);
+                        "SM75 fused indexer selection mismatch n_comp=%u "
+                        "token=%u rank=%u index=%u score-rank=%u previous=%u\n",
+                        n_comp, t, k, index, rank, previous);
                 goto cleanup;
             }
             previous = index;
         }
     }
     fprintf(stderr,
-            "cuda-regression: SM75 fused top-k + ascending attention index "
-            "selection exact (%llu indices)\n",
-            (unsigned long long)selected_count);
+            "cuda-regression: SM75 fused top-k n_comp=%u exact "
+            "(%llu ascending indices)\n",
+            n_comp, (unsigned long long)selected_count);
     rc = 0;
 
 cleanup:
@@ -2987,6 +2992,18 @@ cleanup:
     free(selected_host);
     free(scores_host);
     return rc;
+}
+
+static int check_sm75_fused_indexer_selection_exact(void) {
+    if (check_sm75_fused_indexer_selection_case(4096u) != 0 ||
+        check_sm75_fused_indexer_selection_case(8192u) != 0 ||
+        check_sm75_fused_indexer_selection_case(16384u) != 0) {
+        return 1;
+    }
+    fprintf(stderr,
+            "cuda-regression: SM75 fused top-k + ascending attention index "
+            "selection exact at 16K/32K/64K frontiers\n");
+    return 0;
 }
 
 static int check_decode_attention_overflow_path(void) {
