@@ -1,5 +1,19 @@
 ## Benchmarking
 
+### Withdrawn runtime native-primary Q8 residency
+
+`DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY` is fail-closed. Repeated four-GPU
+qualification lost PCI device `0000:03:00.0` during the first untimed batched
+prefill, after F16-cache materialization and before deferred decode-native
+materialization. The experiment changed more than storage format: it removed
+T32/attention-A/attention-B tensors from the ordinary selective-cache ranges,
+introduced dedicated source slabs, and intercepted strict cache lookup.
+
+The bit-exact warp-interleaved decode kernels and their bounded/auxiliary-cache
+tests remain available. A production VRAM reduction must use an explicitly
+tagged native GGUF representation and the ordinary selective-cache ownership
+path; it must not repack, replace, or free primary weight residency at runtime.
+
 ### SM75-native Q4-32 decode gate/up mappings
 
 `cuda-sm75-decode-q4-gate-native.sh` compares the former Q4-32 one-row/
@@ -5154,7 +5168,13 @@ output paths to the SM75 single-token defaults and raises the default
 per-device interleaved-cache ceiling from 1024 MiB to the validated 1536 MiB.
 The A/B harness still forces both selectors off in its control arms.
 
-### Native-primary T32/A/B Q8 residency
+### Withdrawn native-primary T32/A/B Q8 residency experiment
+
+The remainder of this section is a historical record of the rejected
+experiment. Do not run it: the harness and engine now reject the selector
+before GPU allocation. Its successive workarounds never restored the exact
+selective-cache allocation and lookup topology used by the stable auxiliary
+configuration.
 
 The interleaved T32, attention-A, and attention-B layouts are individually
 size-neutral, but the first production candidates retain each layout beside
@@ -5163,7 +5183,8 @@ the replicated canonical Q8 tensor. Across 43 layers that arrangement keeps
 the four GPUs. The auxiliary representation is therefore a validation
 mechanism, not the desired storage policy.
 
-Set `Q8_INTERLEAVED_PRODUCTION_TARGET=native-primary` to compare that complete
+The withdrawn experiment set `Q8_INTERLEAVED_PRODUCTION_TARGET=native-primary`
+to compare that complete
 auxiliary-cache arrangement with exact native-primary TP residency. T32 keeps
 one full 34 MiB native matrix on its production home rank; A is row-sharded
 and B is K-sharded into 17 MiB rank slices. The candidate therefore keeps

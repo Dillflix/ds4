@@ -59473,6 +59473,21 @@ static int engine_install_per_device_caches(ds4_engine *e) {
         cuda_tp_decode && metal_graph_cuda_tp_attn_requested() &&
         engine_cuda_tp_fixed_22_21(e);
 #endif
+    /* The runtime-repacked primary-residency experiment is withdrawn.  Four-GPU
+     * qualification repeatedly lost PCI device 0000:03:00.0 during the first
+     * batched prefill, before any deferred decode materialization.  Keep the
+     * request fail-closed: silently falling back would make a purported
+     * low-VRAM qualification exercise the auxiliary-cache layout instead.
+     * Native residency must arrive as an explicitly tagged GGUF layout that
+     * follows the ordinary selective-cache ownership path. */
+    if (q8_native_primary_requested) {
+        fprintf(stderr,
+                "ds4: DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY is withdrawn: "
+                "runtime primary residency changed prefill allocation/lookup "
+                "topology and failed four-GPU qualification; use canonical "
+                "residency or an explicitly tagged native GGUF model\n");
+        goto cleanup;
+    }
     const bool cuda_tp_output =
         cuda_tp_decode && metal_graph_cuda_tp_output_requested();
     int output_tp_tiers[DS4_MAX_GPUS] = {0};

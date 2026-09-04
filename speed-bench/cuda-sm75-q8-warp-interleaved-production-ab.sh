@@ -35,7 +35,7 @@ VOCAB_SIZE=129280
 LOGITS_BYTES=$((VOCAB_SIZE * 4))
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
-    output_prefix=sm75-q8-native-primary-production-ab
+    die "native-primary runtime residency is withdrawn after repeated first-prefill GPU loss; qualify an explicitly tagged native GGUF layout instead"
 elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-ab ]]; then
     output_prefix=sm75-q8-attention-ab-warp-interleaved-production-ab
 elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-b ]]; then
