@@ -5274,3 +5274,28 @@ TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 ```
+
+### SM75 FP32 prefill placement 21/22 qualification
+
+`cuda-sm75-prefill-placement-21-22-ab.sh` compares the candidate 21/22
+transformer-stage boundary with the accepted 22/21 boundary on both mixed15
+and all43. The stage boundary is the only changed execution setting: both arms
+retain the production 512-token pipeline, complete dense-F16 cache admission,
+pair-0 attention-row suppression, pair-1 attention-row split, and unchanged
+FP32 T256 final results. The runner alternates arm order, captures 500 ms GPU
+telemetry, requires byte-identical frontier logits at 512, 4096, and 32768,
+and reports paired throughput and per-pair activity balance.
+
+The stage-aware dense-cache planner accepts only the two balanced four-GPU
+placements, 22/21 and 21/22. Other transformer placements remain rejected.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+REPEATS=3 TELEMETRY_INTERVAL_MS=500 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-prefill-placement-21-22-ab.sh
+```

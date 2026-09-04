@@ -96,6 +96,9 @@ int ds4_test_q8_partner_arithmetic_valid(const char *value);
 int ds4_test_q8_t256_placement_valid(const char *value);
 int ds4_test_q8_t256_placement_matches(const char *value,
                                        const char *expected);
+int ds4_test_cuda_tp_stage_aware_split(const int *placement,
+                                       int n_placement_entries,
+                                       int n_gpus);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -1373,6 +1376,34 @@ static void test_cuda_ep_forced_stage_split(void) {
     restore_env_value("DS4_CUDA_TP_OUTPUT", old_output);
 }
 
+static void test_cuda_tp_stage_aware_balanced_splits(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_stage_aware_balanced_splits\n");
+    int placement[DS4_N_ENTRIES] = {0};
+    placement[DS4_N_ENTRIES - 1] = 1;
+    for (int split = 21; split <= 22; split++) {
+        for (int il = 0; il < DS4_N_LAYER_LOCAL; il++) {
+            placement[il + 1] = il < split ? 0 : 1;
+        }
+        CHECK(ds4_test_cuda_tp_stage_aware_split(
+                  placement, DS4_N_ENTRIES, 4) == split,
+              "stage-aware planner accepts a balanced 21/22 or 22/21 split");
+    }
+    for (int il = 0; il < DS4_N_LAYER_LOCAL; il++) {
+        placement[il + 1] = il < 20 ? 0 : 1;
+    }
+    CHECK(ds4_test_cuda_tp_stage_aware_split(
+              placement, DS4_N_ENTRIES, 4) == -1,
+          "stage-aware planner rejects a contiguous split outside 21/22 and 22/21");
+    placement[11] = 1;
+    placement[12] = 0;
+    CHECK(ds4_test_cuda_tp_stage_aware_split(
+              placement, DS4_N_ENTRIES, 4) == -1,
+          "stage-aware planner rejects a non-contiguous stage placement");
+    CHECK(ds4_test_cuda_tp_stage_aware_split(
+              placement, DS4_N_ENTRIES, 2) == -1,
+          "stage-aware paired planner rejects a non-four-GPU placement");
+}
+
 static int build_output_tp_head_move_model(ds4_test_fake_tensor *out, int cap) {
     if (cap < DS4_N_LAYER_LOCAL + 2) return -1;
     int n = 0;
@@ -1468,6 +1499,7 @@ int main(void) {
     test_cuda_tp_prefill_attn_rows_shape();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_ep_forced_stage_split();
+    test_cuda_tp_stage_aware_balanced_splits();
     test_cuda_tp_output_head_moves_to_lower_half();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",

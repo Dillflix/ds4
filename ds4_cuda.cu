@@ -3438,11 +3438,12 @@ static void cuda_q8_f16_plan_materialize(void) {
         plan_audit_path && plan_audit_path[0] &&
         getenv("DS4_CUDA_Q8_CAPACITY_CALIBRATION") != NULL;
 
-    /* The fixed 22/21 transformer placement defines two independent NVLink
-     * stages. Plan movable dense-F16 weights independently inside each pair,
-     * using current post-selective-cache headroom as the primary signal and
-     * projected saved native-Q8 work as the tie-break. This is deliberately
-     * topology-neutral: physical IDs and layer parity never enter the choice.
+    /* The qualified 22/21 and candidate 21/22 transformer placements define
+     * two independent NVLink stages. Plan movable dense-F16 weights inside
+     * each pair, using current post-selective-cache headroom as the primary
+     * signal and projected saved native-Q8 work as the tie-break. This is
+     * deliberately topology-neutral: physical IDs and layer parity never
+     * enter the choice.
      * Explicit legacy placement modes bypass this planner. */
     std::vector<unsigned char> stage_aware_partner(
         g_q8_f16_plan.size(), 0u);
@@ -3521,9 +3522,21 @@ static void cuda_q8_f16_plan_materialize(void) {
             }
         }
         if (!plan_failed) {
+            unsigned stage_split = 22u;
+            const char *stage_split_env =
+                getenv("DS4_CUDA_EP_STAGE_SPLIT");
+            if (stage_split_env && stage_split_env[0]) {
+                char *end = NULL;
+                const long parsed = strtol(stage_split_env, &end, 10);
+                if (end && end != stage_split_env && *end == '\0' &&
+                    parsed > 0 && parsed < 43) {
+                    stage_split = (unsigned)parsed;
+                }
+            }
             fprintf(stderr,
-                    "ds4: CUDA q8 fp16 stage-aware 22/21 planner selected "
+                    "ds4: CUDA q8 fp16 stage-aware %u/%u planner selected "
                     "%llu/%llu movable projections for partner execution\n",
+                    stage_split, 43u - stage_split,
                     (unsigned long long)moved,
                     (unsigned long long)movable);
         }

@@ -58995,17 +58995,22 @@ static int engine_append_device_cache_range(
                                            t->abs_offset, t->bytes);
 }
 
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-static bool engine_cuda_tp_fixed_22_21(const ds4_engine *e) {
-    if (!e || e->gpu_cfg.n_gpus != 4 ||
-        e->n_placement_entries != (int)DS4_N_LAYER + 2) return false;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const int expected = il < 22u ? 0 : 1;
-        if (e->placement[il + 1u] != expected) return false;
+static int engine_cuda_tp_stage_aware_split(const int *placement,
+                                            int n_placement_entries,
+                                            int n_gpus) {
+    if (!placement || n_gpus != 4 ||
+        n_placement_entries != (int)DS4_N_LAYER + 2 ||
+        placement[1] != 0) return -1;
+    uint32_t split = 1u;
+    while (split < DS4_N_LAYER && placement[split + 1u] == 0) split++;
+    if (split == DS4_N_LAYER) return -1;
+    for (uint32_t il = split; il < DS4_N_LAYER; il++) {
+        if (placement[il + 1u] != 1) return -1;
     }
-    return true;
+    return split == 21u || split == 22u ? (int)split : -1;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     if (!e || !e->model.map || e->model.n_tensors == 0u) return 0;
     if (getenv("DS4_CUDA_Q8_F16_FIRST_USE") != NULL) {
@@ -59056,12 +59061,17 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                 getenv("DS4_CUDA_Q8_T256_PLACEMENT"));
         return -1;
     }
+    const int cuda_tp_stage_split = cuda_tp_decode
+        ? engine_cuda_tp_stage_aware_split(e->placement,
+                                           e->n_placement_entries,
+                                           e->gpu_cfg.n_gpus)
+        : -1;
     if (cuda_tp_decode &&
         t256_placement == ACCEL_Q8_T256_STAGE_AWARE &&
-        !engine_cuda_tp_fixed_22_21(e)) {
+        cuda_tp_stage_split != 21 && cuda_tp_stage_split != 22) {
         fprintf(stderr,
                 "ds4: CUDA q8 fp16 stage-aware placement requires the "
-                "fixed four-GPU 22/21 transformer layout\n");
+                "four-GPU 22/21 or 21/22 transformer layout\n");
         return -1;
     }
     const bool freeze_home_plan =
@@ -59233,6 +59243,16 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         class_count[plan[i].path_class]++;
         if (plan[i].fallback_physical_device >= 0) partner_fallback_count++;
     }
+    const char *dense_placement = "legacy-class-policy";
+    if (t256_placement == ACCEL_Q8_T256_STAGE_AWARE) {
+        if (cuda_tp_stage_split == 22) {
+            dense_placement = "stage-aware-fixed-22-21";
+        } else if (cuda_tp_stage_split == 21) {
+            dense_placement = "stage-aware-qualified-21-22";
+        } else {
+            dense_placement = "stage-aware-non-tp";
+        }
+    }
     fprintf(stderr,
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
@@ -59253,8 +59273,7 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             freeze_home_plan ? "frozen" : "partner-priority",
             partner_arithmetic,
             accelerator_q8_t256_placement_name(t256_placement),
-            t256_placement == ACCEL_Q8_T256_STAGE_AWARE
-                ? "stage-aware-fixed-22-21" : "legacy-class-policy");
+            dense_placement);
 
     ds4_gpu_q8_f16_plan_begin();
     for (uint64_t i = 0; i < plan_count; i++) {
@@ -59808,6 +59827,14 @@ int ds4_test_q8_t256_placement_matches(
         (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
     }
     return matches;
+}
+
+int ds4_test_cuda_tp_stage_aware_split(const int *placement,
+                                       int n_placement_entries,
+                                       int n_gpus) {
+    return engine_cuda_tp_stage_aware_split(placement,
+                                            n_placement_entries,
+                                            n_gpus);
 }
 
 int ds4_test_q8_cache_partner_tier(
