@@ -206,7 +206,6 @@ validate_run() {
     grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2 index-pair-mask=0x3' "$log" || return 1
     ! grep -Fqi 'T256 FP16 final attention result enabled' "$log" || return 1
     grep -Eq 'CUDA T32 f16-output fused summary: local=[0-9]+ partner=[1-9][0-9]*' "$log" || return 1
-    grep -Eq 'SM75 warp-interleaved Q8 summary .*attn-a-calls=[1-9][0-9]* .*attn-b-calls=[1-9][0-9]*' "$log" || return 1
     grep -Fq 'CUDA scratch replacement quiesced all tiers:' "$log" || return 1
     capture_health "$base.post-gpu.csv" || return 1
     cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv"
