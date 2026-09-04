@@ -28,6 +28,7 @@ extern void ds4_gpu_test_set_moe_direct_native_q8(int enabled);
 extern int ds4_gpu_test_get_moe_direct_native_q8(void);
 extern int ds4_gpu_test_get_moe_direct_native_q8_prefill(void);
 extern void ds4_gpu_test_refresh_decode_dispatch_env(void);
+extern void ds4_gpu_test_forbid_attention_output_batch_canonical(int forbidden);
 
 static unsigned char *idle_model_map;
 static const uint64_t idle_model_bytes = 4096u;
@@ -372,6 +373,92 @@ cleanup:
     free(reference_out);
     free(candidate_low);
     free(reference_low);
+    free(heads_host);
+    free(model);
+    return rc;
+}
+
+static int check_sm75_q8_batch_f16_residency_order(void) {
+    const uint32_t n_tokens = 2u;
+    const uint32_t n_groups = 2u;
+    const uint32_t group_dim = 32u;
+    const uint32_t rank = 32u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 32u;
+    const size_t a_bytes = (size_t)low_dim * 34u;
+    const size_t b_bytes = (size_t)out_dim * 2u * 34u;
+    const size_t model_bytes = a_bytes + b_bytes;
+    const size_t heads_count =
+        (size_t)n_tokens * n_groups * group_dim;
+    const size_t low_count = (size_t)n_tokens * low_dim;
+    const size_t out_count = (size_t)n_tokens * out_dim;
+    unsigned char *model = (unsigned char *)malloc(model_bytes);
+    float *heads_host = (float *)malloc(heads_count * sizeof(float));
+    float *reference = (float *)malloc(
+        (low_count + out_count) * sizeof(float));
+    float *candidate = (float *)malloc(
+        (low_count + out_count) * sizeof(float));
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(
+        heads_count * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_count * sizeof(float));
+    int rc = 1;
+    if (!model || !heads_host || !reference || !candidate ||
+        !heads || !low || !out) goto cleanup;
+
+    for (size_t block = 0u; block < model_bytes / 34u; ++block) {
+        unsigned char *q = model + block * 34u;
+        const uint16_t d = (uint16_t)(0x2400u + (block & 7u));
+        memcpy(q, &d, sizeof(d));
+        for (uint32_t i = 0u; i < 32u; ++i) {
+            q[2u + i] = (unsigned char)(int8_t)
+                ((int)((block * 17u + i * 13u) % 127u) - 63);
+        }
+    }
+    for (size_t i = 0u; i < heads_count; ++i) {
+        heads_host[i] = (float)((int)((i * 29u) % 97u) - 48) / 53.0f;
+    }
+    if (!ds4_gpu_tensor_write(heads, 0u, heads_host,
+                              heads_count * sizeof(float)) ||
+        !ds4_gpu_set_model_map(model, model_bytes)) goto cleanup;
+
+    (void)setenv("DS4_CUDA_Q8_F16_ALL", "1", 1);
+    ds4_gpu_test_forbid_attention_output_batch_canonical(0);
+    if (!ds4_gpu_attention_output_q8_batch_tensor(
+            out, low, NULL, NULL, model, model_bytes, 0u, a_bytes,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low, 0u, reference,
+                             low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0u, reference + low_count,
+                             out_count * sizeof(float))) goto cleanup;
+
+    ds4_gpu_test_forbid_attention_output_batch_canonical(1);
+    if (!ds4_gpu_attention_output_q8_batch_tensor(
+            out, low, NULL, NULL, model, model_bytes, 0u, a_bytes,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low, 0u, candidate,
+                             low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(out, 0u, candidate + low_count,
+                             out_count * sizeof(float)) ||
+        memcmp(reference, candidate,
+               (low_count + out_count) * sizeof(float)) != 0) {
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "cuda-regression: native-primary batched-prefill defers canonical attention A/B lookup\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_test_forbid_attention_output_batch_canonical(0);
+    (void)unsetenv("DS4_CUDA_Q8_F16_ALL");
+    if (model && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(heads);
+    free(candidate);
+    free(reference);
     free(heads_host);
     free(model);
     return rc;
@@ -3240,6 +3327,7 @@ int main(void) {
     int rc = check_sm75_q8_mma_exact();
     if (check_sm75_q8_warp_interleaved_engine_exact() != 0) rc = 1;
     if (check_sm75_q8_warp_interleaved_attention_output_exact() != 0) rc = 1;
+    if (check_sm75_q8_batch_f16_residency_order() != 0) rc = 1;
     if (check_sm75_iq2_moe_mma_exact() != 0) rc = 1;
     if (check_sm75_q4_q2_next_targets_exact() != 0) rc = 1;
     if (check_sm75_q32_production_exact() != 0) rc = 1;

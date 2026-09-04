@@ -1454,6 +1454,7 @@ static std::atomic<uint64_t> g_q8_warp_interleaved_attn_b_direct_xq_calls = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_attn_b_k128_calls = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_fills = 0;
 static std::atomic<uint64_t> g_q8_warp_interleaved_fallbacks = 0;
+static int g_test_forbid_attention_output_batch_canonical;
 static std::mutex g_q8_warp_interleaved_mutex;
 
 static void cuda_q8_warp_interleaved_cache_release_all(void);
@@ -1975,6 +1976,14 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t bytes,
                                             int logical_tier,
                                             const char *label) {
+    if (g_test_forbid_attention_output_batch_canonical && label &&
+        (strcmp(label, "attn_out_a") == 0 ||
+         strcmp(label, "attn_out_b") == 0)) {
+        fprintf(stderr,
+                "ds4: test rejected eager canonical attention-output batch lookup: %s\n",
+                label);
+        return NULL;
+    }
     if (g_n_gpus <= 1) {
         return cuda_model_range_ptr(model_map, offset, bytes, label);
     }
@@ -2011,6 +2020,11 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         (unsigned long long)offset, (unsigned long long)bytes,
         logical_tier, physical_device, cur_dev, label ? label : "?");
     return NULL;
+}
+
+extern "C" void ds4_gpu_test_forbid_attention_output_batch_canonical(
+        int forbidden) {
+    g_test_forbid_attention_output_batch_canonical = forbidden != 0;
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -24908,12 +24922,6 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     const int physical_device =
         (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
             ? g_gpu[logical_tier].device_id : 0;
-    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
-            cuda_resolve_weight_ptr(model_map, out_a_offset, out_a_bytes, logical_tier, "attn_out_a"));
-    const unsigned char *out_b = reinterpret_cast<const unsigned char *>(
-            cuda_resolve_weight_ptr(model_map, out_b_offset, out_b_bytes, logical_tier, "attn_out_b"));
-    if (!out_a || !out_b) return 0;
-
     const uint32_t profile = getenv("DS4_CUDA_ATTN_OUTPUT_PROFILE") != NULL;
     cudaEvent_t prof_ev[3] = {NULL, NULL, NULL};
     if (profile) {
@@ -24995,6 +25003,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
             physical_device, physical_device);
     } else {
+        /* Native-primary residency intentionally displaces the canonical Q8
+         * tensor.  Resolve it only after the F16 production path declines the
+         * call; eager resolution here made a fully materialized F16 plan fail
+         * on the first batched-prefill layer. */
+        const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+                cuda_resolve_weight_ptr(model_map, out_a_offset, out_a_bytes,
+                                        logical_tier, "attn_out_a"));
+        if (!out_a) return 0;
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -25060,7 +25076,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
 
     if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
-    (void)out_b;
+    /* Do not pre-resolve canonical B.  The generic dispatcher selects the
+     * resident native-primary or F16 binding before its canonical fallback. */
     int ok = cuda_matmul_q8_0_tensor_labeled(out,
                                              model_map,
                                              model_size,

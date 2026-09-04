@@ -5180,6 +5180,15 @@ decode logits at 512, 4096, and 32768 tokens for mixed15 and all43. It reports
 both total free-memory change and every relevant persistent category instead
 of treating the 1,536 MiB auxiliary cap as the memory result.
 
+Before the full two-model A/B, the native-primary mode runs a candidate-only
+512-token mixed15 preflight. It requires the complete F16 plan, healthy GPU
+identity before and after the run, positive prefill/decode results, and zero
+selective-cache misses. This specifically guards the batched-prefill contract:
+attention A must select its resident F16 binding before any canonical-Q8
+fallback, while attention B must defer all residency selection to the generic
+F16/native-primary dispatcher. A failed preflight stops the harness before the
+long production comparison begins.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \

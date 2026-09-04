@@ -180,6 +180,9 @@ fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/interleaved-correctness.log" ||
     die "interleaved Q8 success marker missing"
 if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    grep -Fq 'native-primary batched-prefill defers canonical attention A/B lookup' \
+        "$OUTPUT_DIR/smoke.log" ||
+        die "native-primary batched-prefill residency regression marker missing"
     "${clean[@]}" ./tests/test_engine_mgpu_placement \
         >"$OUTPUT_DIR/placement.log" 2>&1 || {
             tail -n 220 "$OUTPUT_DIR/placement.log" >&2
@@ -367,6 +370,7 @@ validate_common_log() {
     grep -Fq 'prefill indexer row split pair policy: enabled-pairs=0,1 disabled-pairs=none' \
         "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
+    ! grep -Fq 'selective-cache miss' "$log" || return 1
     if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
         grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' \
             "$log" || return 1
@@ -375,6 +379,45 @@ validate_common_log() {
         grep -Fq 'SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
             "$log" || return 1
     fi
+}
+
+run_native_primary_preflight() {
+    local model=$1 layout=$2
+    local base="$OUTPUT_DIR/runs/$layout-native-primary-preflight" rc=0
+    local -a cmd
+    capture_gpu_health "$base.pre-gpu.csv" || return 1
+    cmd=("${production_env[@]}"
+        DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY=1
+        DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=0
+        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv" ./ds4-bench
+        --cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES"
+        --gpu-vram "$GPU_VRAM" --model "$model" --prompt-file "$PROMPT"
+        --ctx-start 512 --ctx-max 512 --ctx-alloc "$CTX_ALLOC"
+        --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
+        --gen-tokens "$EXACT_TOKENS"
+        --csv "$base.csv")
+    "${cmd[@]}" >"$base.log" 2>&1 || rc=$?
+    capture_gpu_health "$base.post-gpu.csv" || return 1
+    (( rc == 0 )) || return "$rc"
+    validate_gpu_health "$base" &&
+        awk -F, -v tg="$EXACT_TOKENS" '
+            NR==1 {ok=($1=="ctx_tokens" && $3=="prefill_tps" &&
+                       $4=="gen_tokens" && $8=="gen_steady_tps"); next}
+            NR>1 {rows++; if ($1==512 && $4==tg && ($3+0)>0 && ($8+0)>0) seen++}
+            END {exit !(ok && rows==1 && seen==1)}
+        ' "$base.csv" &&
+        [[ -s $base.memory.csv ]] &&
+        validate_common_log "$layout" "$base.log" &&
+        grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
+            "$base.log"
 }
 
 validate_logits() {
@@ -555,6 +598,16 @@ phase=production-ab
 capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
     die "could not capture initial GPU state"
 printf 'layout\tvariant\tcsv\tlog\n' >"$OUTPUT_DIR/runs.tsv"
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    phase=native-primary-preflight
+    printf 'Native-primary 512-token preflight model=mixed15...\n'
+    run_native_primary_preflight "$MIXED_MODEL" mixed15 || {
+        tail -n 240 "$OUTPUT_DIR/runs/mixed15-native-primary-preflight.log" \
+            >&2 || true
+        die "mixed15 native-primary preflight failed; full A/B not started"
+    }
+    phase=production-ab
+fi
 for i in 0 1; do
     layout=${layouts[$i]}; model=${models[$i]}
     for variant in control interleaved; do
