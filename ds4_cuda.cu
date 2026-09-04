@@ -1978,7 +1978,9 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             const char *label) {
     if (g_test_forbid_attention_output_batch_canonical && label &&
         (strcmp(label, "attn_out_a") == 0 ||
-         strcmp(label, "attn_out_b") == 0)) {
+         strcmp(label, "attn_out_b") == 0 ||
+         strcmp(label, "attn_output_a") == 0 ||
+         strcmp(label, "attn_output_b") == 0)) {
         fprintf(stderr,
                 "ds4: test rejected eager canonical attention-output batch lookup: %s\n",
                 label);
@@ -21044,10 +21046,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         cuda_q8_warp_interleaved_primary_ptr(
             model_map, weight_offset, weight_bytes, in_dim, out_dim,
             blocks, 0u, physical_device);
-    const char *wptr = interleaved_primary ? NULL :
-        cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
-                                logical_tier, "q8_0");
-    if (!wptr && !interleaved_primary) return 0;
+    const char *wptr = NULL;
     if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
@@ -21128,6 +21127,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 physical_device, label, "native_q8",
                 "partner_runtime_fallback");
         }
+    }
+    /* Canonical Q8 is the final storage fallback, not a prerequisite for
+     * resident F32/F16 or partner execution.  Native-primary installation
+     * deliberately displaces complete canonical T32/A/B tensors after
+     * retaining exact interleaved shards.  Resolving canonical bytes before
+     * the resident batched paths therefore rejected a valid attention-B F16
+     * binding at layer 0 and poisoned cleanup while partner work was live. */
+    if (!interleaved_primary) {
+        wptr = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            label ? label : "q8_0");
+        if (!wptr) return 0;
     }
     if (wptr && g_q8_dequant_gemm_enabled && g_cublas_ready &&
         n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
@@ -21718,11 +21729,6 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         out1->bytes < out1_dim * sizeof(float)) {
         return 0;
     }
-    const int logical_tier = ds4_tensor_device_idx(out0);
-    const char *w0 = cuda_resolve_weight_ptr(model_map, weight0_offset, weight0_bytes, logical_tier, "q8_0_pair0");
-    const char *w1 = cuda_resolve_weight_ptr(model_map, weight1_offset, weight1_bytes, logical_tier, "q8_0_pair1");
-    if (!w0 || !w1) return 0;
-
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;
     if (n_tok != 1 && !force_decode_warp && !g_q8_cache_suppressed &&
@@ -21732,6 +21738,15 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
                                                in_dim, out1_dim, x, n_tok, "q8_0_pair1");
     }
+
+    const int logical_tier = ds4_tensor_device_idx(out0);
+    const char *w0 = cuda_resolve_weight_ptr(
+        model_map, weight0_offset, weight0_bytes, logical_tier,
+        "q8_0_pair0");
+    const char *w1 = cuda_resolve_weight_ptr(
+        model_map, weight1_offset, weight1_bytes, logical_tier,
+        "q8_0_pair1");
+    if (!w0 || !w1) return 0;
 
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;

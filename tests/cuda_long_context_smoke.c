@@ -447,7 +447,7 @@ static int check_sm75_q8_batch_f16_residency_order(void) {
         goto cleanup;
     }
     fprintf(stderr,
-            "cuda-regression: native-primary batched-prefill defers canonical attention A/B lookup\n");
+            "cuda-regression: native-primary batched-prefill defers canonical attention A and generic B lookup\n");
     rc = 0;
 
 cleanup:

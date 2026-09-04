@@ -5189,6 +5189,17 @@ fallback, while attention B must defer all residency selection to the generic
 F16/native-primary dispatcher. A failed preflight stops the harness before the
 long production comparison begins.
 
+The first native-primary preflight exposed two eager-lookup defects rather
+than a valid storage comparison. The attention wrapper initially requested
+canonical A before consulting its F16 binding. After that was corrected, the
+generic Q8 dispatcher still requested canonical B before consulting resident
+F32/F16 and partner bindings; the paired batched dispatcher had the same
+ordering hazard before delegating to the generic path. The CUDA regression now
+forbids both wrapper and generic attention-output canonical labels during a
+batched F16 execution, so these storage-policy violations fail before the
+four-GPU run. Canonical Q8 is resolved only after every resident batched path
+has declined the operation.
+
 ```bash
 MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
 ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \

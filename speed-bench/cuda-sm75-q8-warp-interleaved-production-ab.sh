@@ -180,7 +180,7 @@ fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/interleaved-correctness.log" ||
     die "interleaved Q8 success marker missing"
 if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
-    grep -Fq 'native-primary batched-prefill defers canonical attention A/B lookup' \
+    grep -Fq 'native-primary batched-prefill defers canonical attention A and generic B lookup' \
         "$OUTPUT_DIR/smoke.log" ||
         die "native-primary batched-prefill residency regression marker missing"
     "${clean[@]}" ./tests/test_engine_mgpu_placement \
