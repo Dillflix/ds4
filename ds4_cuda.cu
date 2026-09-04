@@ -9507,7 +9507,7 @@ static uint64_t cuda_q8_warp_interleaved_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t bytes = cuda_parse_mib_env(
         "DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB", &present);
-    return present ? bytes : 1024ull * 1048576ull;
+    return present ? bytes : 1536ull * 1048576ull;
 }
 
 static int cuda_q8_warp_interleaved_target(
@@ -9521,7 +9521,7 @@ static int cuda_q8_warp_interleaved_target(
 static int cuda_q8_warp_interleaved_attention_a_target(uint64_t n_tok) {
     return n_tok == 1u &&
            cuda_env_flag_enabled(
-               "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", 0) &&
+               "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE", 1) &&
            cuda_sm75_mma_ok();
 }
 
@@ -9540,7 +9540,7 @@ static int cuda_q8_warp_interleaved_attention_b_target(
     return n_tok == 1u && (block_start % 32u) == 0u &&
            slice_blocks != 0u &&
            cuda_env_flag_enabled(
-               "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", 0) &&
+               "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE", 1) &&
            cuda_sm75_mma_ok();
 }
 
