@@ -276,7 +276,8 @@ validate_log() {
     validate_selector_marker "$native_q8" \
         'SM75 shared native Q8 routed activation selected' "$log" || return 1
     validate_selector_marker "$native_q8" \
-        'SM75 direct native Q8 producer selected' "$log" || return 1
+        'SM75 direct native Q8 producer selected for routed MoE activations' \
+        "$log" || return 1
     validate_selector_marker "$compact_slots" \
         'SM75 compact owner-local routed slots selected' "$log" || return 1
     validate_selector_marker "$fused_indexer" \
