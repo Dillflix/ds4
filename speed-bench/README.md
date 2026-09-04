@@ -5087,6 +5087,12 @@ RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-output-interleaved.sh
 ```
 
+The `20260904T012316Z` A-only run accepted rowtile4/direct-XQ: its nonzero
+engine regression was bit-identical, all 901 measured candidate calls selected
+both refinements with one cache fill and zero fallbacks, Compute Sanitizer
+reported zero errors, and inclusive A time fell from 0.008516 ms to
+0.006225 ms (1.368x).
+
 This experiment does not change production defaults. A four-GPU production
 A/B with exact logits and explicit interleaved-cache residency is required
 before either selector can be promoted.
@@ -5117,6 +5123,25 @@ REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 INTERLEAVED_CACHE_MB=1536 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-b-production-ab.sh
+```
+
+After bounded acceptance of both specialized projections, the combined A+B
+production A/B changes both attention-output selectors together while leaving
+the accepted T32 interleaved default enabled in both arms. Candidate validation
+requires direct-XQ/rowtile4 on every selected A call, direct-XQ/K128 on every
+selected B call, at least 43 cache fills for each representation, zero cache
+fallback, stable GPU identity, and byte-identical logits for mixed15 and all43
+at 512, 4096, and 32768 tokens.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+INTERLEAVED_CACHE_MB=1536 TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-attention-ab-production-ab.sh
 ```
 
 ### SM75 width-1024 compressor projection layout diagnostic
