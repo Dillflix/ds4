@@ -15585,7 +15585,7 @@ static bool cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
 
 static bool cuda_tp_prefill_pair1_row_resident_output_enabled(
         int home_tier) {
-#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     (void)home_tier;
     return false;
 #else
