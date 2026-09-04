@@ -181,6 +181,7 @@ production=(
     DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1
     "DS4_CUDA_Q8_F16_PARTNER_MAX_TOKENS=$PREFILL_CHUNK"
     DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0
+    DS4_CUDA_SCRATCH_REPLACEMENT_AUDIT=1
     DS4_BENCH_UNTIMED_WARMUP_TOKENS=512
     DS4_METAL_GRAPH_PREFILL_PROFILE=1
 )
@@ -206,6 +207,7 @@ validate_run() {
     ! grep -Fqi 'T256 FP16 final attention result enabled' "$log" || return 1
     grep -Eq 'CUDA T32 f16-output fused summary: local=[0-9]+ partner=[1-9][0-9]*' "$log" || return 1
     grep -Eq 'SM75 warp-interleaved Q8 summary .*attn-a-calls=[1-9][0-9]* .*attn-b-calls=[1-9][0-9]*' "$log" || return 1
+    grep -Fq 'CUDA scratch replacement quiesced all tiers:' "$log" || return 1
     capture_health "$base.post-gpu.csv" || return 1
     cmp -s "$OUTPUT_DIR/initial-gpu.csv" "$base.post-gpu.csv"
 }

@@ -1631,6 +1631,45 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return g_cuda_tmp;
 }
 
+static int cuda_tmp_quiesce_all_tiers_for_replacement(
+        int owner_tier, uint64_t old_bytes, uint64_t new_bytes,
+        const char *what) {
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        cudaError_t err = cudaSetDevice(g_gpu[tier].device_id);
+        if (err == cudaSuccess) err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: fatal CUDA scratch replacement quiesce failed: "
+                    "owner_tier=%d sync_tier=%d sync_dev=%d what=%s: %s\n",
+                    owner_tier, tier, g_gpu[tier].device_id,
+                    what ? what : "scratch", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaSetDevice(g_gpu[owner_tier].device_id);
+            return 0;
+        }
+    }
+    const cudaError_t restore = cudaSetDevice(g_gpu[owner_tier].device_id);
+    if (restore != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: fatal CUDA scratch replacement owner restore failed: "
+                "owner_tier=%d owner_dev=%d what=%s: %s\n",
+                owner_tier, g_gpu[owner_tier].device_id,
+                what ? what : "scratch", cudaGetErrorString(restore));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (getenv("DS4_CUDA_SCRATCH_REPLACEMENT_AUDIT") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA scratch replacement quiesced all tiers: "
+                "owner_tier=%d owner_dev=%d old=%.2f MiB new=%.2f MiB what=%s\n",
+                owner_tier, g_gpu[owner_tier].device_id,
+                (double)old_bytes / 1048576.0,
+                (double)new_bytes / 1048576.0,
+                what ? what : "scratch");
+    }
+    return 1;
+}
+
 /* Per-tier scratch accessor.
  *
  * Behavior:
@@ -1686,6 +1725,19 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
             (void)cudaGetLastError();
             if (!g_q8_f16_plan_materializing) abort();
         }
+        return NULL;
+    }
+    /* Scratch slabs participate in peer-device transfers. cudaFree on the
+     * allocation's owner cannot establish that every other CUDA context has
+     * finished accessing the old address. Quiesce all tiers only on growth;
+     * steady-state allocations and kernel scheduling remain asynchronous. */
+    if (ctx->scratch &&
+        !cuda_tmp_quiesce_all_tiers_for_replacement(
+            logical_tier, (uint64_t)ctx->scratch_bytes, bytes, what)) {
+        g_current_logical_tier = -1;
+        if (g_q8_f16_plan_materializing) g_q8_f16_plan_device_error = 1;
+        if (prev >= 0) (void)cudaSetDevice(prev);
+        if (!g_q8_f16_plan_materializing) abort();
         return NULL;
     }
     void *p = NULL;
