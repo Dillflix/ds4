@@ -5274,3 +5274,35 @@ TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
 ```
+
+### SM75 Q3A4 prefill tile16/K-streaming gate
+
+`cuda-sm75-q3a4-prefill-kstream.sh` evaluates an opt-in Q3A4 prefill kernel
+that replaces the two full-tile tile8 launches with one 16-pair CTA.  Two
+warps assigned to each eight-row output tile consume the two token halves
+while sharing one streamed gate/up K-record.  This targets the duplicated
+global weight reads in the shipping tile8 path; it is not the previously
+rejected pair-fused traversal.  The IMMA operation, K order, eight partial
+accumulators, reduction order, clamp, and SiLU/product expression remain
+unchanged.
+
+The bounded gate requires direct-decode bit exactness for 16/8/4 routed
+populations, no SASS local-memory traffic, Compute Sanitizer, explicit
+candidate dispatch, and balanced production-shaped timing.  The selector
+`DS4_CUDA_MOE_Q3A4_PREFILL_TILE16_KSTREAM=1` remains opt-in.  Passing this
+gate does not promote the kernel: the next acceptance step is a four-GPU 32K
+A/B using the all-43-layer Q3A4 model, followed by mixed15 coverage.
+
+```bash
+PROFILE_GPU=0 CUDA_ARCH=sm_75 \
+TIMING_ROUNDS=7 TIMING_REPEATS=10 \
+RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q3a4-prefill-kstream.sh
+```
+
+The remaining prefill program, in order after this gate, is: a pair-1
+row-resident T32 to attention to A+B pipeline; T256 FP16 final results;
+quantize-once native-Q8 transfer plus compact routed slots; qualification of
+the 21/22 placement against 22/21; and attention-row tiling with fused indexer
+selection.  Each item retains an exact rollback until its production A/B is
+accepted.

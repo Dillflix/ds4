@@ -31786,6 +31786,12 @@ static int routed_moe_launch(
             (out_dim & 7u) == 0u && cuda_sm75_mma_ok() &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16") == NULL &&
             getenv("DS4_CUDA_MOE_NO_Q4_MMA_TILE16_SM75") == NULL;
+        const uint32_t use_q3a4_tile16_kstream =
+            gate_q3a4 && use_expert_tiles && expert_tile_m == 8u &&
+            n_tokens > 1u && xq_blocks > 0u && xq_blocks <= 16u &&
+            (expert_mid_dim & 63u) == 0u && cuda_sm75_mma_ok() &&
+            cuda_env_flag_enabled(
+                "DS4_CUDA_MOE_Q3A4_PREFILL_TILE16_KSTREAM", 0);
         /* The production correctness/resource suite and balanced full-model
          * timing gate passed on SM75.  Keep the array specializations as
          * explicit =0 rollback paths while selecting scalar slots by default
@@ -31826,6 +31832,13 @@ static int routed_moe_launch(
             if (!logged.exchange(true, std::memory_order_relaxed))
                 fprintf(stderr,
                         "ds4: SM75 IQ2 residual 1..8 tail8 enabled\n");
+        }
+        if (use_q3a4_tile16_kstream) {
+            static std::atomic<bool> logged = false;
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                fprintf(stderr,
+                        "ds4: SM75 Q3A4 prefill candidate selected: "
+                        "tile16 K-streaming\n");
         }
         const uint32_t use_small_sorted_prep =
             !any_native_layout && owned_filtered && (gate_q4k || down_q4k) &&
@@ -32185,8 +32198,28 @@ static int routed_moe_launch(
                         DS4_Q32_GATE_LIST(RS, tail4_total, tail4_experts, \
                             tail4_starts, tail4_capacity, 0, Q3A); \
                     } while (0)
+#define DS4_Q3A4_GATE_TILE16_KSTREAM() \
+                    do { \
+                        dim3 ng((expert_mid_dim + 63u) / 64u, \
+                                tile16_capacity, 1u); \
+                        moe_gate_up_mid_sm75_q3a4_tile16_kstream_kernel \
+                            <<<ng, 512>>>( \
+                                (float *)gate->ptr, (float *)up->ptr, \
+                                (float *)mid->ptr, gate_w, up_w, \
+                                (const cuda_sm75_native_q8_K *)xq, \
+                                sorted_pairs, sorted_offsets, sorted_counts, \
+                                tile16_total, tile16_experts, tile16_starts, \
+                                (const float *)weights->ptr, xq_blocks, \
+                                expert_mid_dim, n_expert, write_gate_up, clamp); \
+                        DS4_Q32_GATE_LIST(512, tail8_total, tail8_experts, \
+                            tail8_starts, tail8_capacity, 0, true); \
+                        DS4_Q32_GATE_LIST(512, tail4_total, tail4_experts, \
+                            tail4_starts, tail4_capacity, 0, true); \
+                    } while (0)
                     if (!tile16_total || !tail8_total || !tail4_total) {
                         ok = 0;
+                    } else if (use_q3a4_tile16_kstream) {
+                        DS4_Q3A4_GATE_TILE16_KSTREAM();
                     } else if (gate_row_span == 1024u) {
                         if (gate_q3a4) DS4_Q32_GATE_ALL(1024, true);
                         else DS4_Q32_GATE_ALL(1024, false);
@@ -32197,6 +32230,7 @@ static int routed_moe_launch(
                         if (gate_q3a4) DS4_Q32_GATE_ALL(512, true);
                         else DS4_Q32_GATE_ALL(512, false);
                     }
+#undef DS4_Q3A4_GATE_TILE16_KSTREAM
 #undef DS4_Q32_GATE_ALL
 #undef DS4_Q32_GATE_LIST
                 } else if (gate_q4k) {

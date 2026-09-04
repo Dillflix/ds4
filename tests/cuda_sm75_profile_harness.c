@@ -236,6 +236,9 @@ static void usage(const char *argv0) {
             "policy, while 0 forces the retained tail4 rollback. Tail8 replaces\n"
             "IQ2 residual 1..4 tail4 work with the exact tile8 path while\n"
             "leaving native-Q4 down's 16/8/4 plan unchanged.\n"
+            "DS4_PROFILE_Q3A4_TILE16_KSTREAM=1 selects the opt-in Q3A4\n"
+            "prefill tile16/K-streaming candidate for the sm75-q3a4 scenario;\n"
+            "0 retains the shipping tile8 path.\n"
             "DS4_PROFILE_INDEXER_TILE selects the indexer score tile: 128\n"
             "(default), 64, 32, or 16. DS4_PROFILE_INDEXER_TOPK selects the\n"
             "8192-entry top-k implementation: monolithic (default) or\n"
@@ -1677,7 +1680,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     uint32_t scalar_enabled = 0u, timed_repeats = 0u;
-    uint32_t iq2_tail8_all = 0u;
+    uint32_t iq2_tail8_all = 0u, q3a4_tile16_kstream = 0u;
     if (!parse_env_u32("DS4_PROFILE_SCALAR", 0u, 1u, &scalar_enabled)) {
         fprintf(stderr, "error: DS4_PROFILE_SCALAR must be 0 or 1\n");
         return 2;
@@ -1692,6 +1695,12 @@ int main(int argc, char **argv) {
                        &iq2_tail8_all)) {
         fprintf(stderr,
                 "error: DS4_PROFILE_IQ2_TAIL8_ALL must be 0 or 1\n");
+        return 2;
+    }
+    if (!parse_env_u32("DS4_PROFILE_Q3A4_TILE16_KSTREAM", 0u, 1u,
+                       &q3a4_tile16_kstream)) {
+        fprintf(stderr,
+                "error: DS4_PROFILE_Q3A4_TILE16_KSTREAM must be 0 or 1\n");
         return 2;
     }
     if (scalar_enabled && scalar_target == SCALAR_TARGET_NONE) {
@@ -1726,6 +1735,12 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "error: the IQ2 tail8 policy requires a "
                 "hybrid-iq2-q4 scenario\n");
+        return 2;
+    }
+    if (q3a4_tile16_kstream && !sm75_q3a4_moe) {
+        fprintf(stderr,
+                "error: Q3A4 tile16/K-streaming requires the sm75-q3a4 "
+                "scenario\n");
         return 2;
     }
 
@@ -1777,6 +1792,8 @@ int main(int argc, char **argv) {
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW2048");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW256");
     (void)unsetenv("DS4_CUDA_MOE_GATE_ROW128");
+    (void)setenv("DS4_CUDA_MOE_Q3A4_PREFILL_TILE16_KSTREAM",
+                 q3a4_tile16_kstream ? "1" : "0", 1);
     (void)unsetenv("DS4_CUDA_MOE_WRITE_GATE_UP");
     (void)setenv("DS4_CUDA_MOE_Q4_GATE_SCALAR_SM75", "0", 1);
     (void)setenv("DS4_CUDA_MOE_Q4_DOWN_SCALAR_SM75", "0", 1);
@@ -1803,10 +1820,11 @@ int main(int argc, char **argv) {
             break;
     }
     printf("scalar_target=%s\nscalar_enabled=%u\n"
-           "iq2_tail8_all=%u\ntimed_repeats=%u\n"
+           "iq2_tail8_all=%u\nq3a4_tile16_kstream=%u\n"
+           "timed_repeats=%u\n"
            "indexed_heads8_sm75=%u\n",
            scalar_target_name(scalar_target), scalar_enabled,
-           iq2_tail8_all, timed_repeats,
+           iq2_tail8_all, q3a4_tile16_kstream, timed_repeats,
            (unsigned)(getenv("DS4_CUDA_INDEXED_HEADS8_SM75") == NULL ||
                strcmp(getenv("DS4_CUDA_INDEXED_HEADS8_SM75"), "0") != 0));
 

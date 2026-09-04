@@ -1731,6 +1731,139 @@ __global__ static void moe_gate_up_mid_sm75_q32_tile8_kernel(
     }
 }
 
+/* Q3A4 prefill candidate for a complete 16-pair expert tile.  The shipping
+ * path launches the tile8 kernel twice, once for each half of the tile.  Each
+ * half consequently traverses the same gate/up weights independently.  This
+ * kernel assigns two warps to every 8-row weight tile (one warp per 8-token
+ * half), streams one K256 record at a time through shared memory, and reuses
+ * that record across all 16 routed pairs before advancing K.
+ *
+ * A 64-row CTA is deliberate.  It keeps the exact eight floating-point K
+ * slots in registers while the shared footprint stays below 20 KiB:
+ * 16 activation records plus eight gate and eight up weight records.  The
+ * sm75_q32_ops<true>::mma_block operation, K order, slot assignment, slot
+ * reduction, clamp, and final SiLU/product expression are identical to the
+ * retained tile8 path.  Only global-memory scheduling and the tile boundary
+ * change. */
+__global__ __launch_bounds__(512, 1) static void
+moe_gate_up_mid_sm75_q3a4_tile16_kstream_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const char *gate_base, const char *up_base,
+        const cuda_sm75_native_q8_K *xq,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *weights, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert,
+        uint32_t write_aux, float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row_tile = warp >> 1u;
+    const uint32_t token_half = warp & 1u;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t start = tile_starts[tile];
+    const uint32_t block_row0 = blockIdx.x * 64u;
+    const uint32_t row0 = block_row0 + row_tile * 8u;
+    const uint32_t mtok = token_half * 8u + (lane >> 2u);
+    const uint32_t n0 = (lane & 3u) * 2u;
+    __shared__ cuda_sm75_native_q8_K sa[16];
+    __shared__ cuda_sm75_q3a4_tile sg[8];
+    __shared__ cuda_sm75_q3a4_tile su[8];
+    __shared__ uint32_t s_pair[16], s_tok[16], s_slot[16], s_np;
+
+    if (threadIdx.x == 0u) {
+        uint32_t np = 0u;
+        for (; np < 16u; np++) {
+            const uint32_t local = start + np;
+            if (local >= counts[expert]) break;
+            const uint32_t pair = sorted_pairs[offsets[expert] + local];
+            s_pair[np] = pair;
+            s_tok[np] = pair / n_expert;
+            s_slot[np] = pair - s_tok[np] * n_expert;
+        }
+        s_np = np;
+    }
+    __syncthreads();
+    const uint32_t np = s_np;
+
+    DS4_SM75_Q32_SLOT4_DECL(0); DS4_SM75_Q32_SLOT4_DECL(1);
+    DS4_SM75_Q32_SLOT4_DECL(2); DS4_SM75_Q32_SLOT4_DECL(3);
+    DS4_SM75_Q32_SLOT4_DECL(4); DS4_SM75_Q32_SLOT4_DECL(5);
+    DS4_SM75_Q32_SLOT4_DECL(6); DS4_SM75_Q32_SLOT4_DECL(7);
+    const uint32_t a_words = sizeof(cuda_sm75_native_q8_K) / 4u;
+    const uint32_t w_words = sizeof(cuda_sm75_q3a4_tile) / 4u;
+    const uint64_t tile_row_base =
+        (uint64_t)expert * (expert_mid_dim / 8u) + block_row0 / 8u;
+
+    for (uint32_t b = 0u; b < xq_blocks; b++) {
+        for (uint32_t i = threadIdx.x; i < 16u * a_words;
+             i += blockDim.x) {
+            const uint32_t p = i / a_words;
+            const uint32_t w = i - p * a_words;
+            ((uint32_t *)sa)[i] = p < np
+                ? ((const uint32_t *)(xq +
+                    (uint64_t)s_tok[p] * xq_blocks + b))[w]
+                : 0u;
+        }
+        for (uint32_t i = threadIdx.x; i < 8u * w_words;
+             i += blockDim.x) {
+            const uint32_t rt = i / w_words;
+            const uint32_t w = i - rt * w_words;
+            const uint64_t record = (tile_row_base + rt) * xq_blocks + b;
+            ((uint32_t *)sg)[i] =
+                ((const uint32_t *)((const cuda_sm75_q3a4_tile *)gate_base +
+                                    record))[w];
+            ((uint32_t *)su)[i] =
+                ((const uint32_t *)((const cuda_sm75_q3a4_tile *)up_base +
+                                    record))[w];
+        }
+        __syncthreads();
+        float g0, g1, u0, u1;
+        sm75_q32_ops<true>::mma_block(
+            &sg[row_tile], &sa[mtok], lane, n0, &g0, &g1);
+        sm75_q32_ops<true>::mma_block(
+            &su[row_tile], &sa[mtok], lane, n0, &u0, &u1);
+        switch (b & 7u) {
+            DS4_SM75_Q32_SLOT4_ADD(0,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(1,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(2,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(3,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(4,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(5,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(6,g0,g1,u0,u1);
+            DS4_SM75_Q32_SLOT4_ADD(7,g0,g1,u0,u1);
+        }
+        /* No warp may consume a record after another warp starts replacing
+         * the shared K stage. */
+        __syncthreads();
+    }
+
+    float gate0, gate1, up0, up1;
+    DS4_SM75_Q32_REDUCE(s0,gate0); DS4_SM75_Q32_REDUCE(s1,gate1);
+    DS4_SM75_Q32_REDUCE(s2,up0); DS4_SM75_Q32_REDUCE(s3,up1);
+    if (mtok < np) {
+#pragma unroll
+        for (uint32_t e = 0u; e < 2u; e++) {
+            const uint32_t row = row0 + n0 + e;
+            if (row >= expert_mid_dim) continue;
+            float g = e ? gate1 : gate0;
+            float u = e ? up1 : up0;
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off =
+                (uint64_t)s_pair[mtok] * expert_mid_dim + row;
+            if (write_aux) { gate_out[off] = g; up_out[off] = u; }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u *
+                weights[(uint64_t)s_tok[mtok] * n_expert + s_slot[mtok]];
+        }
+    }
+}
+
 template <uint32_t ROW_SPAN, uint32_t TILE_PAIRS>
 __global__ static void moe_down_sm75_q4_32_tile_kernel(
         float *down_out, const char *down_base,
