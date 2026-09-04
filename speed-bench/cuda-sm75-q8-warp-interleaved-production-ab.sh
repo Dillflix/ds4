@@ -20,8 +20,8 @@ PIPELINE_MB=${PIPELINE_MB:-512}
 Q8_INTERLEAVED_PRODUCTION_TARGET=${Q8_INTERLEAVED_PRODUCTION_TARGET:-t32}
 case $Q8_INTERLEAVED_PRODUCTION_TARGET in
     t32) default_interleaved_cache_mb=1024 ;;
-    attention-b|attention-ab) default_interleaved_cache_mb=1536 ;;
-    *) die "Q8_INTERLEAVED_PRODUCTION_TARGET must be t32, attention-b, or attention-ab" ;;
+    attention-b|attention-ab|native-primary) default_interleaved_cache_mb=1536 ;;
+    *) die "Q8_INTERLEAVED_PRODUCTION_TARGET must be t32, attention-b, attention-ab, or native-primary" ;;
 esac
 INTERLEAVED_CACHE_MB=${INTERLEAVED_CACHE_MB:-$default_interleaved_cache_mb}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -30,7 +30,9 @@ CTX_ALLOC=33025
 VOCAB_SIZE=129280
 LOGITS_BYTES=$((VOCAB_SIZE * 4))
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-ab ]]; then
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    output_prefix=sm75-q8-native-primary-production-ab
+elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-ab ]]; then
     output_prefix=sm75-q8-attention-ab-warp-interleaved-production-ab
 elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == attention-b ]]; then
     output_prefix=sm75-q8-attention-b-warp-interleaved-production-ab
@@ -148,6 +150,9 @@ production_env=(
 
 phase=build
 targets=(ds4-bench tests/cuda_long_context_smoke tests/cuda_sm75_q8_warp_interleaved)
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    targets+=(tests/test_engine_mgpu_placement)
+fi
 if [[ $SKIP_BUILD == 0 ]]; then
     make -B -j"$(nproc)" "${targets[@]}" CUDA_ARCH=sm_75 \
         2>&1 | tee "$OUTPUT_DIR/build.log"
@@ -174,6 +179,16 @@ fi
     }
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/interleaved-correctness.log" ||
     die "interleaved Q8 success marker missing"
+if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+    "${clean[@]}" ./tests/test_engine_mgpu_placement \
+        >"$OUTPUT_DIR/placement.log" 2>&1 || {
+            tail -n 220 "$OUTPUT_DIR/placement.log" >&2
+            die "native-primary placement regression failed"
+        }
+    grep -Eq 'test_engine_mgpu_placement: [0-9]+/[0-9]+ checks passed \(0 failed\)' \
+        "$OUTPUT_DIR/placement.log" ||
+        die "native-primary placement success marker missing"
+fi
 
 phase=manifest
 {
@@ -233,7 +248,51 @@ validate_csv() {
 
 validate_dispatch() {
     local variant=$1 log=$2
-    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        awk -v primary="$([[ $variant == interleaved ]] && printf 1 || printf 0)" '
+            /SM75 warp-interleaved Q8 summary/ {
+                seen++; calls=attn_a=a_direct=a_k128=attn_b=b_direct=b_k128=-1
+                fills=fallbacks=primary_ranges=primary_source_spans=-1
+                primary_mib=displaced_mib=stage_mib=-1
+                for (i=1; i<=NF; i++) {
+                    split($i,a,"=")
+                    if (a[1]=="calls") calls=a[2]+0
+                    if (a[1]=="attn-a-calls") attn_a=a[2]+0
+                    if (a[1]=="attn-a-direct-xq-calls") a_direct=a[2]+0
+                    if (a[1]=="attn-a-k128-calls") a_k128=a[2]+0
+                    if (a[1]=="attn-b-calls") attn_b=a[2]+0
+                    if (a[1]=="attn-b-direct-xq-calls") b_direct=a[2]+0
+                    if (a[1]=="attn-b-k128-calls") b_k128=a[2]+0
+                    if (a[1]=="fills") fills=a[2]+0
+                    if (a[1]=="fallbacks") fallbacks=a[2]+0
+                    if (a[1]=="primary-ranges") primary_ranges=a[2]+0
+                    if (a[1]=="primary-source-spans") primary_source_spans=a[2]+0
+                    if (a[1]=="primary-resident") primary_mib=a[2]+0
+                    if (a[1]=="canonical-displaced") displaced_mib=a[2]+0
+                    if (a[1]=="transient-stage-peak") stage_mib=a[2]+0
+                }
+                if (calls<=0 || attn_a<=0 || a_direct!=attn_a ||
+                    a_k128!=attn_a || attn_b<=0 || b_direct!=attn_b ||
+                    b_k128!=attn_b || fallbacks!=0) bad=1
+                if (!primary && (fills<215 || primary_ranges!=0 ||
+                                 primary_source_spans!=0 || primary_mib!=0 ||
+                                 displaced_mib!=0)) bad=1
+                if (primary && (fills!=0 || primary_ranges!=215 ||
+                                primary_source_spans!=258 ||
+                                primary_mib!=4386 ||
+                                displaced_mib!=8772 ||
+                                stage_mib<=0 || stage_mib>34)) bad=1
+            }
+            END {exit !(seen==1 && !bad)}
+        ' "$log" || return 1
+        if [[ $variant == interleaved ]]; then
+            grep -Fq 'CUDA native-primary Q8 enabled for exact T32/A/B TP shards' \
+                "$log" &&
+                ! grep -Fq 'SM75 warp-interleaved Q8 cache fill' "$log"
+        else
+            ! grep -Fq 'CUDA native-primary Q8 enabled' "$log"
+        fi
+    elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
         if [[ $variant == control ]]; then
             ! grep -Fq 'SM75 warp-interleaved Q8 summary' "$log"
         else
@@ -308,6 +367,10 @@ validate_common_log() {
     grep -Fq 'prefill indexer row split pair policy: enabled-pairs=0,1 disabled-pairs=none' \
         "$log" || return 1
     ! grep -Fq 'required but unavailable' "$log" || return 1
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        grep -Fq 'CUDA q8 fp16 benefit plan materialized 344/344 candidates' \
+            "$log" || return 1
+    fi
     if [[ $layout == mixed15 ]]; then
         grep -Fq 'SM75 Q4-32 decode gate/up mapping=tile32-mma (production default)' \
             "$log" || return 1
@@ -336,7 +399,29 @@ PY
 run_engine() {
     local model=$1 variant=$2 tokens=$3 base=$4 logits=${5:-} rc=0
     local -a candidate=() cmd
-    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        candidate=(
+            DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DECODE=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_DIRECT_XQ=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DECODE=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_DIRECT_XQ=1
+            DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_B_K128=1
+        )
+        if [[ $variant == control ]]; then
+            candidate+=(
+                DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY=0
+                "DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=$INTERLEAVED_CACHE_MB"
+            )
+        else
+            candidate+=(
+                DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY=1
+                DS4_CUDA_Q8_WARP_INTERLEAVED_CACHE_MB=0
+            )
+        fi
+    elif [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == t32 ]]; then
         if [[ $variant == control ]]; then
             candidate=(DS4_CUDA_Q8_WARP_INTERLEAVED_T32_DECODE=0)
         else
@@ -372,7 +457,8 @@ run_engine() {
         )
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
-    cmd=("${production_env[@]}" "${candidate[@]}" ./ds4-bench
+    cmd=("${production_env[@]}" "${candidate[@]}"
+        "DS4_CUDA_MEMORY_STATE_CSV=$base.memory.csv" ./ds4-bench
         --cuda --cuda-tensor-parallel --gpu-devices "$GPU_DEVICES"
         --gpu-vram "$GPU_VRAM" --model "$model" --prompt-file "$PROMPT"
         --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC"
@@ -387,9 +473,82 @@ run_engine() {
 validate_run() {
     local layout=$1 variant=$2 tokens=$3 base=$4 logits=${5:-}
     validate_gpu_health "$base" && validate_csv "$base.csv" "$tokens" &&
+        [[ -s $base.memory.csv ]] &&
         validate_common_log "$layout" "$base.log" &&
         validate_dispatch "$variant" "$base.log" || return 1
     [[ -z $logits ]] || validate_logits "$logits"
+}
+
+validate_native_memory_pair() {
+    local layout=$1
+    [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]] || return 0
+    python3 - "$layout" \
+        "$OUTPUT_DIR/runs/$layout-control.memory.csv" \
+        "$OUTPUT_DIR/runs/$layout-interleaved.memory.csv" \
+        "$OUTPUT_DIR/summary/$layout-memory.tsv" <<'PY'
+import csv, pathlib, sys
+
+layout, control_path, candidate_path, output_path = sys.argv[1:]
+required = {
+    "logical_tier", "physical_device", "free_bytes", "total_bytes",
+    "q8_fp16_cached_bytes", "selective_cache_bytes",
+    "q8_interleaved_bytes", "q8_native_primary_bytes",
+    "canonical_q8_displaced_bytes",
+}
+
+def load(path):
+    with open(path, newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != 4 or not required.issubset(rows[0]):
+        raise SystemExit(f"invalid memory-state CSV: {path}")
+    parsed = [{key: int(row[key]) for key in required} for row in rows]
+    if ({row["logical_tier"] for row in parsed} != {0, 1, 2, 3} or
+            len({row["physical_device"] for row in parsed}) != 4):
+        raise SystemExit(f"invalid four-GPU identity set: {path}")
+    return parsed
+
+control = load(control_path)
+candidate = load(candidate_path)
+mib = 1024 * 1024
+native_bytes = 4386 * mib
+displaced_bytes = 8772 * mib
+
+def total(rows, key):
+    return sum(row[key] for row in rows)
+
+checks = {
+    "control_native_zero": total(control, "q8_native_primary_bytes") == 0,
+    "candidate_native_exact":
+        total(candidate, "q8_native_primary_bytes") == native_bytes,
+    "candidate_displaced_exact":
+        total(candidate, "canonical_q8_displaced_bytes") == displaced_bytes,
+    "control_aux_exact":
+        total(control, "q8_interleaved_bytes") == native_bytes,
+    "candidate_native_is_only_interleaved":
+        total(candidate, "q8_interleaved_bytes") == native_bytes,
+    "selective_displacement_exact":
+        total(control, "selective_cache_bytes") -
+        total(candidate, "selective_cache_bytes") == displaced_bytes,
+    "f16_residency_unchanged":
+        total(control, "q8_fp16_cached_bytes") ==
+        total(candidate, "q8_fp16_cached_bytes"),
+}
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    raise SystemExit(
+        f"{layout} native-primary memory validation failed: {','.join(failed)}")
+
+fields = (
+    "free_bytes", "q8_fp16_cached_bytes", "selective_cache_bytes",
+    "q8_interleaved_bytes", "q8_native_primary_bytes",
+    "canonical_q8_displaced_bytes",
+)
+with open(output_path, "w", newline="") as handle:
+    handle.write("metric\tauxiliary-control\tnative-primary\tdelta\n")
+    for field in fields:
+        a, b = total(control, field), total(candidate, field)
+        handle.write(f"{field}\t{a}\t{b}\t{b-a}\n")
+PY
 }
 
 phase=production-ab
@@ -400,8 +559,13 @@ for i in 0 1; do
     layout=${layouts[$i]}; model=${models[$i]}
     for variant in control interleaved; do
         base="$OUTPUT_DIR/runs/$layout-$variant"
+        variant_label=$variant
+        if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+            [[ $variant == control ]] && variant_label=auxiliary-cache ||
+                variant_label=native-primary
+        fi
         printf 'Warp-interleaved Q8 %s production A/B model=%s variant=%s...\n' \
-            "$Q8_INTERLEAVED_PRODUCTION_TARGET" "$layout" "$variant"
+            "$Q8_INTERLEAVED_PRODUCTION_TARGET" "$layout" "$variant_label"
         run_engine "$model" "$variant" "$TG_TOKENS" "$base" || {
             tail -n 240 "$base.log" >&2 || true
             die "$layout $variant throughput run failed"
@@ -411,6 +575,8 @@ for i in 0 1; do
         printf '%s\t%s\t%s\t%s\n' "$layout" "$variant" "$base.csv" \
             "$base.log" >>"$OUTPUT_DIR/runs.tsv"
     done
+    validate_native_memory_pair "$layout" ||
+        die "$layout native-primary memory validation failed"
 done
 
 phase=exact-logits
@@ -442,7 +608,11 @@ phase=summarize
 {
     printf '# SM75 four-GPU warp-interleaved Q8 %s decode A/B\n\n' \
         "$Q8_INTERLEAVED_PRODUCTION_TARGET"
-    printf '| Model | Context | Control tok/s | Interleaved tok/s | Speedup |\n'
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        printf '| Model | Context | Auxiliary-cache tok/s | Native-primary tok/s | Speedup |\n'
+    else
+        printf '| Model | Context | Control tok/s | Interleaved tok/s | Speedup |\n'
+    fi
     printf '| --- | ---: | ---: | ---: | ---: |\n'
     for layout in "${layouts[@]}"; do
         for context in 512 4096 32768; do
@@ -458,6 +628,46 @@ phase=summarize
     done
     printf '\nAll %s decode logits at all three frontiers were byte-identical for both models.\n' \
         "$EXACT_TOKENS"
+    if [[ $Q8_INTERLEAVED_PRODUCTION_TARGET == native-primary ]]; then
+        python3 - "$OUTPUT_DIR" <<'PY'
+import csv, pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+print("\n## Aggregate four-GPU resident-memory comparison\n")
+print("| Model | Control selective GiB | Control Q8 aux GiB | "
+      "Candidate selective GiB | Candidate native GiB | F16 each GiB | "
+      "Control tracked GiB | Candidate tracked GiB | Tracked delta GiB | "
+      "Free-memory gain GiB |")
+print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+      "---: | ---: |")
+for layout in ("mixed15", "all43"):
+    values = {}
+    with (root / "summary" / f"{layout}-memory.tsv").open() as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            values[row["metric"]] = tuple(
+                int(row[name]) for name in
+                ("auxiliary-control", "native-primary", "delta"))
+    gib = 1024 ** 3
+    control_tracked = (values['selective_cache_bytes'][0] +
+                       values['q8_interleaved_bytes'][0] +
+                       values['q8_fp16_cached_bytes'][0])
+    candidate_tracked = (values['selective_cache_bytes'][1] +
+                         values['q8_interleaved_bytes'][1] +
+                         values['q8_fp16_cached_bytes'][1])
+    print(
+        f"| {layout} | {values['selective_cache_bytes'][0]/gib:.3f} | "
+        f"{values['q8_interleaved_bytes'][0]/gib:.3f} | "
+        f"{values['selective_cache_bytes'][1]/gib:.3f} | "
+        f"{values['q8_native_primary_bytes'][1]/gib:.3f} | "
+        f"{values['q8_fp16_cached_bytes'][1]/gib:.3f} | "
+        f"{control_tracked/gib:.3f} | {candidate_tracked/gib:.3f} | "
+        f"{(candidate_tracked-control_tracked)/gib:+.3f} | "
+        f"{values['free_bytes'][2]/gib:+.3f} |")
+print("\nThe native-primary arm must retain exactly 4,386 MiB of T32/A/B "
+      "native shards while displacing 8,772 MiB of persistent canonical "
+      "copies. The F16 cache is held constant and reported separately.")
+PY
+    fi
 } | tee "$OUTPUT_DIR/summary/summary.md"
 
 printf 'bit_exact=true\nmodels=mixed15,all43\nfrontiers=512,4096,32768\n' \

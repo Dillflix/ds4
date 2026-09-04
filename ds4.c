@@ -183,6 +183,10 @@ int ds4_gpu_device_cache_tensors(int device_id,
                                   int n_ranges) {
     (void)device_id; (void)ranges; (void)n_ranges; return 1;
 }
+int ds4_gpu_device_cache_q8_native_tensors(
+        int device_id, const ds4_q8_native_range *ranges, int n_ranges) {
+    (void)device_id; (void)ranges; (void)n_ranges; return 1;
+}
 int ds4_gpu_init_multi(const ds4_gpu_config *cfg) { (void)cfg; return -1; }
 int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id, uint64_t bytes) {
     (void)t; (void)device_id; (void)bytes; return -1;
@@ -2969,6 +2973,25 @@ static uint32_t accelerator_q8_cache_classify(ds4_str name) {
         ds4_str_contains_lit(name, ".attn_kv.weight"))
         return ACCEL_Q8_CACHE_OTHER_ATTN;
     return ACCEL_Q8_CACHE_NONE;
+}
+
+/* Exact shapes whose Q8_0 bytes can be replaced by the size-neutral SM75
+ * native-primary representation under the fixed four-GPU TP recipe.  Kept
+ * outside GPU-only compilation so the placement regression exercises the
+ * same predicate as production. */
+static bool engine_q8_native_primary_shape(
+        const ds4_tensor *t, uint32_t path_class) {
+    if (!t || t->type != DS4_TENSOR_Q8_0 || t->ndim != 2u) return false;
+    switch (path_class) {
+    case ACCEL_Q8_CACHE_T32_Q_B:
+        return t->dim[0] == 1024u && t->dim[1] == 32768u;
+    case ACCEL_Q8_CACHE_OUTPUT_A:
+        return t->dim[0] == 4096u && t->dim[1] == 8192u;
+    case ACCEL_Q8_CACHE_T256_OUTPUT_B:
+        return t->dim[0] == 8192u && t->dim[1] == 4096u;
+    default:
+        return false;
+    }
 }
 
 static uint32_t accelerator_q8_cache_layer(ds4_str name) {
@@ -58995,6 +59018,128 @@ static int engine_append_device_cache_range(
                                            t->abs_offset, t->bytes);
 }
 
+static int engine_append_q8_native_range(
+        ds4_q8_native_range **per_dev_ranges,
+        int                  *per_dev_n,
+        int                  *per_dev_cap,
+        int                   logical_tier,
+        int                   physical_device,
+        uint64_t              source_offset,
+        uint64_t              canonical_offset,
+        uint64_t              canonical_bytes,
+        uint64_t              cache_key_offset,
+        uint64_t              source_row_blocks,
+        uint64_t              source_block_start,
+        uint64_t              packed_blocks,
+        uint64_t              packed_rows) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS ||
+        ((packed_blocks == 0u) != (packed_rows == 0u))) return -1;
+    if (per_dev_n[logical_tier] >= per_dev_cap[logical_tier]) {
+        const int new_cap = per_dev_cap[logical_tier] == 0
+            ? 64 : per_dev_cap[logical_tier] * 2;
+        ds4_q8_native_range *grow = realloc(
+            per_dev_ranges[logical_tier], (size_t)new_cap * sizeof(*grow));
+        if (!grow) {
+            fprintf(stderr,
+                    "ds4: out of memory growing native Q8 range list\n");
+            return -1;
+        }
+        per_dev_ranges[logical_tier] = grow;
+        per_dev_cap[logical_tier] = new_cap;
+    }
+    ds4_q8_native_range *r =
+        &per_dev_ranges[logical_tier][per_dev_n[logical_tier]++];
+    *r = (ds4_q8_native_range){
+        .source_offset = source_offset,
+        .canonical_offset = canonical_offset,
+        .canonical_bytes = canonical_bytes,
+        .cache_key_offset = cache_key_offset,
+        .source_row_blocks = source_row_blocks,
+        .source_block_start = source_block_start,
+        .packed_blocks = packed_blocks,
+        .packed_rows = packed_rows,
+        .target_device = physical_device,
+    };
+    return 0;
+}
+
+/* Replace replicated canonical matrices with their exact production-native
+ * residency: one full home T32 matrix, two A row shards, or two B K shards.
+ * B therefore uses a strided canonical source but a contiguous native cache
+ * key on each physical device. */
+static int engine_plan_q8_native_primary_tensor(
+        const ds4_tensor      *t,
+        uint32_t               path_class,
+        int                    home_tier,
+        int                    partner_tier,
+        ds4_q8_native_range  **per_dev_ranges,
+        int                   *per_dev_n,
+        int                   *per_dev_cap) {
+    if (!engine_q8_native_primary_shape(t, path_class) ||
+        home_tier < 0 || partner_tier < 0) return 0;
+    const uint64_t full_blocks = t->dim[0] / 32u;
+    const int home_device = g_gpu[home_tier].device_id;
+    const int partner_device = g_gpu[partner_tier].device_id;
+
+    if (path_class == ACCEL_Q8_CACHE_T32_Q_B) {
+        /* Accepted production T32 dispatch consumes the full 1024x32768
+         * matrix on the home rank.  The paired rank only needs permission to
+         * stage its planned F16 slice from the mmap; it retains no second
+         * native Q8 copy. */
+        if (engine_append_q8_native_range(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device,
+                t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, full_blocks, t->dim[1]) != 0 ||
+            engine_append_q8_native_range(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                partner_tier, partner_device,
+                t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
+                0u, 0u, 0u, 0u) != 0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    if (path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B) {
+        const uint64_t half_blocks = full_blocks / 2u;
+        if ((full_blocks & 1u) != 0u) return -1;
+        if (engine_append_q8_native_range(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device,
+                t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, half_blocks, t->dim[1]) != 0 ||
+            engine_append_q8_native_range(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                partner_tier, partner_device,
+                t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, half_blocks, half_blocks, t->dim[1]) != 0) {
+            return -1;
+        }
+        return 1;
+    }
+
+    if ((t->dim[1] & 1u) != 0u) return -1;
+    const uint64_t half_rows = t->dim[1] / 2u;
+    const uint64_t half_bytes = half_rows * full_blocks * 34u;
+    if (half_bytes > t->bytes || t->bytes - half_bytes != half_bytes)
+        return -1;
+    if (engine_append_q8_native_range(
+            per_dev_ranges, per_dev_n, per_dev_cap,
+            home_tier, home_device,
+            t->abs_offset, t->abs_offset, t->bytes, t->abs_offset,
+            full_blocks, 0u, full_blocks, half_rows) != 0 ||
+        engine_append_q8_native_range(
+            per_dev_ranges, per_dev_n, per_dev_cap,
+            partner_tier, partner_device,
+            t->abs_offset + half_bytes, t->abs_offset, t->bytes,
+            t->abs_offset + half_bytes,
+            full_blocks, 0u, full_blocks, half_rows) != 0) {
+        return -1;
+    }
+    return 1;
+}
+
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 static bool engine_cuda_tp_fixed_22_21(const ds4_engine *e) {
     if (!e || e->gpu_cfg.n_gpus != 4 ||
@@ -59290,11 +59435,24 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     ds4_tensor_range *per_dev_ranges[DS4_MAX_GPUS] = {0};
     int per_dev_n[DS4_MAX_GPUS] = {0};
     int per_dev_cap[DS4_MAX_GPUS] = {0};
+    ds4_q8_native_range *per_dev_native[DS4_MAX_GPUS] = {0};
+    int per_dev_native_n[DS4_MAX_GPUS] = {0};
+    int per_dev_native_cap[DS4_MAX_GPUS] = {0};
 
     int rc = -1;
     const bool cuda_tp_decode = engine_cuda_tp_decode_requested(e);
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
     const int tp_half = cuda_tp_decode ? e->gpu_cfg.n_gpus / 2 : 0;
+    bool q8_native_primary = false;
+    bool q8_native_primary_requested = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    q8_native_primary_requested =
+        metal_graph_tp_env_flag(
+            "DS4_CUDA_Q8_WARP_INTERLEAVED_PRIMARY", false);
+    q8_native_primary = q8_native_primary_requested &&
+        cuda_tp_decode && metal_graph_cuda_tp_attn_requested() &&
+        engine_cuda_tp_fixed_22_21(e);
+#endif
     const bool cuda_tp_output =
         cuda_tp_decode && metal_graph_cuda_tp_output_requested();
     int output_tp_tiers[DS4_MAX_GPUS] = {0};
@@ -59305,6 +59463,12 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                                                     e->gpu_cfg.n_gpus,
                                                     output_tp_tiers)
         : 0;
+    if (q8_native_primary_requested && !q8_native_primary) {
+        fprintf(stderr,
+                "ds4: native-primary Q8 requires CUDA decode/attention TP, "
+                "four GPUs, and the fixed 22/21 layer split\n");
+        goto cleanup;
+    }
     if (cuda_tp_ep && !metal_graph_cuda_tp_moe_requested()) {
         fprintf(stderr,
                 "ds4: CUDA tensor parallelism requires routed MoE TP, but it is disabled\n");
@@ -59355,6 +59519,32 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             goto cleanup;
         }
         const int physical_device = g_gpu[logical_tier].device_id;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (q8_native_primary && entry >= 1 && entry <= (int)DS4_N_LAYER) {
+            if (logical_tier >= tp_half) {
+                fprintf(stderr,
+                        "ds4: native-primary Q8 requires lower-half layer homes; "
+                        "tensor %.*s is on tier %d\n",
+                        (int)t->name.len, t->name.ptr, logical_tier);
+                goto cleanup;
+            }
+            const uint32_t path_class =
+                accelerator_q8_cache_classify(t->name);
+            if (engine_q8_native_primary_shape(t, path_class)) {
+                const int planned = engine_plan_q8_native_primary_tensor(
+                    t, path_class, logical_tier, logical_tier + tp_half,
+                    per_dev_native, per_dev_native_n,
+                    per_dev_native_cap);
+                if (planned < 0) {
+                    fprintf(stderr,
+                            "ds4: invalid native-primary Q8 plan for tensor %.*s\n",
+                            (int)t->name.len, t->name.ptr);
+                    goto cleanup;
+                }
+                if (planned > 0) continue;
+            }
+        }
+#endif
         if (cuda_tp_ep && cuda_tp_output &&
             entry == output_head_entry && t == e->weights.output) {
             for (int tier = 0; tier < e->gpu_cfg.n_gpus; tier++) {
@@ -59460,11 +59650,56 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             goto cleanup;
         }
     }
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (per_dev_native_n[d] == 0) continue;
+        const int physical_device = g_gpu[d].device_id;
+        uint64_t native_bytes = 0u;
+        int source_only = 0;
+        for (int i = 0; i < per_dev_native_n[d]; ++i) {
+            const ds4_q8_native_range *r = &per_dev_native[d][i];
+            if (r->packed_blocks == 0u && r->packed_rows == 0u) {
+                source_only++;
+                continue;
+            }
+            if (r->packed_blocks > UINT64_MAX / 34u ||
+                r->packed_rows > UINT64_MAX / (r->packed_blocks * 34u) ||
+                native_bytes > UINT64_MAX -
+                    r->packed_rows * r->packed_blocks * 34u) {
+                fprintf(stderr,
+                        "ds4: native-primary Q8 byte accounting overflow\n");
+                goto cleanup;
+            }
+            native_bytes += r->packed_rows * r->packed_blocks * 34u;
+        }
+        fprintf(stderr,
+                "ds4: CUDA tier %d (device %d) native-primary Q8: "
+                "%.2f GiB in %d retained shards plus %d source-only spans\n",
+                d, physical_device,
+                (double)native_bytes / 1073741824.0,
+                per_dev_native_n[d] - source_only, source_only);
+        const int native_rc = ds4_gpu_device_cache_q8_native_tensors(
+            physical_device, per_dev_native[d], per_dev_native_n[d]);
+        if (native_rc != 0) {
+            fprintf(stderr,
+                    "ds4: native-primary Q8 install failed for tier %d "
+                    "(physical device %d) rc=%d\n",
+                    d, physical_device, native_rc);
+            goto cleanup;
+        }
+    }
+    if (q8_native_primary) {
+        fprintf(stderr,
+                "ds4: CUDA native-primary Q8 enabled for exact T32/A/B "
+                "TP shards; canonical bytes remain mmap-only\n");
+    }
     if (engine_plan_q8_f16_cache(e, cuda_tp_decode) != 0) goto cleanup;
     rc = 0;
 
 cleanup:
-    for (int d = 0; d < DS4_MAX_GPUS; d++) free(per_dev_ranges[d]);
+    for (int d = 0; d < DS4_MAX_GPUS; d++) {
+        free(per_dev_ranges[d]);
+        free(per_dev_native[d]);
+    }
     return rc;
 }
 
@@ -59723,6 +59958,35 @@ typedef struct {
 uint32_t ds4_test_q8_cache_class(const char *name) {
     ds4_str s = {name, name ? strlen(name) : 0u};
     return accelerator_q8_cache_classify(s);
+}
+
+int ds4_test_q8_native_primary_shape(
+        const char *name, uint32_t type, uint32_t ndim,
+        uint64_t dim0, uint64_t dim1) {
+    ds4_tensor t;
+    memset(&t, 0, sizeof(t));
+    t.name = (ds4_str){name, name ? strlen(name) : 0u};
+    t.type = type;
+    t.ndim = ndim;
+    t.dim[0] = dim0;
+    t.dim[1] = dim1;
+    return engine_q8_native_primary_shape(
+        &t, accelerator_q8_cache_classify(t.name)) ? 1 : 0;
+}
+
+uint64_t ds4_test_q8_native_primary_bytes_per_layer(void) {
+    const uint64_t t32 = (1024u / 32u) * 34u * 32768u;
+    const uint64_t out_a = (4096u / 32u) * 34u * 8192u;
+    const uint64_t out_b = (8192u / 32u) * 34u * 4096u;
+    return t32 + out_a + out_b;
+}
+
+uint32_t ds4_test_q8_native_primary_ranges_per_layer(void) {
+    return 5u;
+}
+
+uint32_t ds4_test_q8_native_primary_source_spans_per_layer(void) {
+    return 6u;
 }
 
 uint32_t ds4_test_q8_cache_candidate_copies(

@@ -1033,6 +1033,18 @@ typedef struct {
     int      target_device;
 } ds4_tensor_range;
 
+typedef struct {
+    uint64_t source_offset;
+    uint64_t canonical_offset;
+    uint64_t canonical_bytes;
+    uint64_t cache_key_offset;
+    uint64_t source_row_blocks;
+    uint64_t source_block_start;
+    uint64_t packed_blocks;
+    uint64_t packed_rows;
+    int      target_device;
+} ds4_q8_native_range;
+
 struct cuda_device_cache {
     void   *base;     /* device-side slab base */
     size_t  bytes;
@@ -1076,11 +1088,11 @@ struct cuda_q8_f16_range {
     int device_id;          /* physical CUDA device id; 0 in single-tier */
 };
 
-/* Diagnostic single-token Q8_0 cache.  Each entry contains the exact same
- * number of bytes as its canonical source slice, but groups each row's Q8_0
- * blocks into scale and int32 word planes.  Canonical bytes remain resident
- * because the prefill/batch kernels still consume them; a future tagged GGUF
- * layout can make this representation storage-neutral end to end. */
+/* Size-neutral Q8_0 rows grouped into scale and int32 word planes.  Auxiliary
+ * entries coexist with canonical device bytes; primary entries replace an
+ * exact TP slice and record the mmap span available for transient F16-cache
+ * materialization.  The same primary contract can later be sourced directly
+ * from tagged GGUF tensors without changing dispatch or residency. */
 struct cuda_q8_warp_interleaved_range {
     const void *host_base;
     uint64_t offset;
@@ -1089,7 +1101,17 @@ struct cuda_q8_warp_interleaved_range {
     uint64_t out_dim;
     uint64_t source_row_blocks;
     uint64_t source_block_start;
+    uint64_t canonical_offset;
+    uint64_t canonical_bytes;
     unsigned char *device_ptr;
+    int device_id;
+    int primary;
+};
+
+struct cuda_q8_native_primary_source_span {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t bytes;
     int device_id;
 };
 
@@ -1396,10 +1418,17 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_q8_warp_interleaved_range>
     g_q8_warp_interleaved_ranges;
+static std::vector<cuda_q8_native_primary_source_span>
+    g_q8_native_primary_source_spans;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static uint64_t g_q8_warp_interleaved_bytes;
+static uint64_t g_q8_warp_interleaved_primary_bytes;
+static uint64_t g_q8_warp_interleaved_primary_canonical_bytes;
+static uint64_t g_q8_warp_interleaved_primary_stage_peak_bytes;
+static uint64_t g_q8_warp_interleaved_primary_ranges;
+static uint64_t g_q8_warp_interleaved_primary_source_spans;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
@@ -1609,6 +1638,15 @@ __global__ static void dequant_q8_0_to_f32_half_rounded_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks);
+__global__ static void q8_0_warp_interleaved_pack_kernel(
+        unsigned char *dst, const unsigned char *src,
+        uint64_t source_row_blocks, uint64_t source_block_start,
+        uint64_t blocks, uint64_t out_dim);
+static int cuda_q8_warp_interleaved_primary_source_registered(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        int physical_device);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -2116,6 +2154,12 @@ static void cuda_q8_f32_cache_release_all(void) {
 static void cuda_q8_warp_interleaved_cache_release_all(void) {
     if (g_q8_warp_interleaved_ranges.empty()) {
         g_q8_warp_interleaved_bytes = 0u;
+        g_q8_warp_interleaved_primary_bytes = 0u;
+        g_q8_warp_interleaved_primary_canonical_bytes = 0u;
+        g_q8_warp_interleaved_primary_stage_peak_bytes = 0u;
+        g_q8_warp_interleaved_primary_ranges = 0u;
+        g_q8_warp_interleaved_primary_source_spans = 0u;
+        g_q8_native_primary_source_spans.clear();
         return;
     }
     int saved_device = -1;
@@ -2154,6 +2198,12 @@ static void cuda_q8_warp_interleaved_cache_release_all(void) {
     }
     g_q8_warp_interleaved_ranges.clear();
     g_q8_warp_interleaved_bytes = 0u;
+    g_q8_warp_interleaved_primary_bytes = 0u;
+    g_q8_warp_interleaved_primary_canonical_bytes = 0u;
+    g_q8_warp_interleaved_primary_stage_peak_bytes = 0u;
+    g_q8_warp_interleaved_primary_ranges = 0u;
+    g_q8_warp_interleaved_primary_source_spans = 0u;
+    g_q8_native_primary_source_spans.clear();
 }
 
 static void cuda_q8_f16_plan_reset(void) {
@@ -2956,23 +3006,36 @@ static const __half *cuda_q8_f16_ptr_impl(
      *    already contain the weight on expected_device. Use the strict
      *    lookup; on miss this is a placement bug and we hard-fail.
      */
-    const char *q8;
+    const char *q8 = NULL;
+    int q8_stage_from_host = 0;
     if (g_n_gpus <= 1) {
         q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     } else {
         void *strict_ptr = NULL;
         if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
             !strict_ptr) {
-            fprintf(stderr,
-                "ds4: q8 fp16 cache miss: source bytes not in selective cache for "
-                "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
-                (unsigned long long)offset, (unsigned long long)weight_bytes,
-                expected_device, label ? label : "?");
-            return audit_return(NULL, "native_q8", "selective_cache_miss");
+            /* Native-primary tensors deliberately omit their persistent
+             * canonical copy.  F16 cache construction may borrow the mmap
+             * through one bounded staging allocation, then immediately free
+             * it after dequantization.  Any other miss remains a placement
+             * bug rather than silently broadening host staging. */
+            if (cuda_q8_warp_interleaved_primary_source_registered(
+                    model_map, offset, weight_bytes, expected_device)) {
+                q8_stage_from_host = 1;
+            } else {
+                fprintf(stderr,
+                    "ds4: q8 fp16 cache miss: source bytes not in selective cache for "
+                    "offset=%llu bytes=%llu device=%d (label=%s); placement bug\n",
+                    (unsigned long long)offset, (unsigned long long)weight_bytes,
+                    expected_device, label ? label : "?");
+                return audit_return(NULL, "native_q8", "selective_cache_miss");
+            }
+        } else {
+            q8 = (const char *)strict_ptr;
         }
-        q8 = (const char *)strict_ptr;
     }
-    if (!q8) return audit_return(NULL, "native_q8", "source_unavailable");
+    if (!q8 && !q8_stage_from_host)
+        return audit_return(NULL, "native_q8", "source_unavailable");
 
     if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half))
         return audit_return(NULL, "native_q8", "size_overflow");
@@ -3004,11 +3067,29 @@ static const __half *cuda_q8_f16_ptr_impl(
             return audit_return(NULL, "native_q8", "set_device_failed");
         }
     }
+    unsigned char *q8_staged = NULL;
+    if (q8_stage_from_host) {
+        cudaError_t stage_err = cudaMalloc(&q8_staged, (size_t)weight_bytes);
+        if (stage_err == cudaSuccess) {
+            stage_err = cudaMemcpy(
+                q8_staged, (const char *)model_map + offset,
+                (size_t)weight_bytes, cudaMemcpyHostToDevice);
+        }
+        if (stage_err != cudaSuccess) {
+            if (q8_staged) (void)cudaFree(q8_staged);
+            (void)cudaGetLastError();
+            (void)cuda_q8_f16_restore_fill_device(prev);
+            return audit_return(NULL, "native_q8", "host_stage_failed");
+        }
+        q8 = (const char *)q8_staged;
+    }
+
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed on device %d (%.2f MiB): %s\n",
                 expected_device, (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        if (q8_staged) (void)cudaFree(q8_staged);
         if (!preserve_existing_cache_on_failure) {
             cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         } else {
@@ -3027,7 +3108,18 @@ static const __half *cuda_q8_f16_ptr_impl(
                                                           in_dim,
                                                           out_dim,
                                                           blocks);
-    if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
+    cudaError_t dequant_launch_err = cudaGetLastError();
+    if (q8_staged) {
+        /* cudaFree orders after the default-stream dequantization, making the
+         * canonical staging lifetime explicit and bounded to this fill. */
+        const cudaError_t stage_free_err = cudaFree(q8_staged);
+        if (dequant_launch_err == cudaSuccess &&
+            stage_free_err != cudaSuccess) {
+            dequant_launch_err = stage_free_err;
+        }
+        q8_staged = NULL;
+    }
+    if (!cuda_ok(dequant_launch_err, "q8 fp16 dequant launch")) {
         const cudaError_t free_err = cudaFree(dev);
         if (free_err != cudaSuccess) {
             fprintf(stderr,
@@ -5499,9 +5591,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_q8_warp_interleaved_fallbacks.load(std::memory_order_relaxed);
     if (interleaved_calls != 0u || interleaved_attn_a_calls != 0u ||
         interleaved_attn_b_calls != 0u || interleaved_fills != 0u ||
-        interleaved_fallbacks != 0u) {
+        interleaved_fallbacks != 0u ||
+        g_q8_warp_interleaved_primary_ranges != 0u) {
         fprintf(stderr,
-                "ds4: SM75 warp-interleaved Q8 summary calls=%llu attn-a-calls=%llu attn-a-direct-xq-calls=%llu attn-a-k128-calls=%llu attn-b-calls=%llu attn-b-direct-xq-calls=%llu attn-b-k128-calls=%llu fills=%llu fallbacks=%llu resident=%.2f MiB\n",
+                "ds4: SM75 warp-interleaved Q8 summary calls=%llu attn-a-calls=%llu attn-a-direct-xq-calls=%llu attn-a-k128-calls=%llu attn-b-calls=%llu attn-b-direct-xq-calls=%llu attn-b-k128-calls=%llu fills=%llu fallbacks=%llu resident=%.2f MiB primary-ranges=%llu primary-source-spans=%llu primary-resident=%.2f MiB canonical-displaced=%.2f MiB transient-stage-peak=%.2f MiB\n",
                 (unsigned long long)interleaved_calls,
                 (unsigned long long)interleaved_attn_a_calls,
                 (unsigned long long)interleaved_attn_a_direct_xq_calls,
@@ -5511,7 +5604,15 @@ extern "C" void ds4_gpu_cleanup(void) {
                 (unsigned long long)interleaved_attn_b_k128_calls,
                 (unsigned long long)interleaved_fills,
                 (unsigned long long)interleaved_fallbacks,
-                (double)g_q8_warp_interleaved_bytes / 1048576.0);
+                (double)g_q8_warp_interleaved_bytes / 1048576.0,
+                (unsigned long long)g_q8_warp_interleaved_primary_ranges,
+                (unsigned long long)
+                    g_q8_warp_interleaved_primary_source_spans,
+                (double)g_q8_warp_interleaved_primary_bytes / 1048576.0,
+                (double)g_q8_warp_interleaved_primary_canonical_bytes /
+                    1048576.0,
+                (double)g_q8_warp_interleaved_primary_stage_peak_bytes /
+                    1048576.0);
     }
     const uint64_t t32_fused_local =
         g_t32_f16_fused_local_calls.load(std::memory_order_relaxed);
@@ -7597,8 +7698,8 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
  * ========================================================================= */
 
 extern "C" int ds4_gpu_device_cache_tensors(int device_id,
-                                            const ds4_tensor_range *ranges,
-                                            int n_ranges) {
+                                             const ds4_tensor_range *ranges,
+                                             int n_ranges) {
     if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
     if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
     if (n_ranges == 0) return 0;
@@ -7744,6 +7845,172 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
 
     if (prev_device >= 0) (void)cudaSetDevice(prev_device);
     return 0;
+}
+
+/* Install exact, size-neutral SM75 Q8 shards directly from the canonical
+ * mmap.  A temporary canonical device buffer exists only while a shard is
+ * packed; the persistent allocation is the native representation alone. */
+extern "C" int ds4_gpu_device_cache_q8_native_tensors(
+        int device_id,
+        const ds4_q8_native_range *ranges,
+        int n_ranges) {
+    if (device_id < 0 || device_id >= DS4_MAX_GPUS) return 1;
+    if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
+    if (n_ranges == 0) return 0;
+    if (!g_model_host_base || g_model_registered_size == 0u) return 3;
+
+    int saved_device = -1;
+    if (cudaGetDevice(&saved_device) != cudaSuccess) saved_device = -1;
+    if (cudaSetDevice(device_id) != cudaSuccess) return 4;
+    if (!cuda_sm75_mma_ok()) {
+        if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+        return 5;
+    }
+
+    std::lock_guard<std::mutex> lock(g_q8_warp_interleaved_mutex);
+    const size_t rollback_size = g_q8_warp_interleaved_ranges.size();
+    const size_t rollback_source_size =
+        g_q8_native_primary_source_spans.size();
+    const uint64_t rollback_bytes = g_q8_warp_interleaved_bytes;
+    const uint64_t rollback_primary_bytes =
+        g_q8_warp_interleaved_primary_bytes;
+    const uint64_t rollback_primary_canonical_bytes =
+        g_q8_warp_interleaved_primary_canonical_bytes;
+    const uint64_t rollback_primary_stage_peak_bytes =
+        g_q8_warp_interleaved_primary_stage_peak_bytes;
+    const uint64_t rollback_primary_ranges =
+        g_q8_warp_interleaved_primary_ranges;
+    const uint64_t rollback_primary_source_spans =
+        g_q8_warp_interleaved_primary_source_spans;
+    int rc = 0;
+    const char *host_base = (const char *)g_model_host_base;
+
+    for (int i = 0; i < n_ranges; ++i) {
+        const ds4_q8_native_range &r = ranges[i];
+        if (r.target_device != device_id) continue;
+        if (r.canonical_bytes == 0u ||
+            r.canonical_offset > g_model_registered_size ||
+            r.canonical_bytes >
+                g_model_registered_size - r.canonical_offset ||
+            ((r.packed_blocks == 0u) != (r.packed_rows == 0u))) {
+            rc = 6;
+            break;
+        }
+        if (g_q8_warp_interleaved_primary_canonical_bytes >
+                UINT64_MAX - r.canonical_bytes) {
+            rc = 7;
+            break;
+        }
+        g_q8_native_primary_source_spans.push_back({
+            g_model_host_base, r.canonical_offset, r.canonical_bytes,
+            device_id});
+        g_q8_warp_interleaved_primary_canonical_bytes +=
+            r.canonical_bytes;
+        g_q8_warp_interleaved_primary_source_spans++;
+        if (r.packed_blocks == 0u) continue;
+
+        if (r.source_row_blocks < r.packed_blocks ||
+            r.source_block_start > r.source_row_blocks ||
+            r.packed_blocks > r.source_row_blocks - r.source_block_start ||
+            r.packed_blocks > UINT64_MAX / 34u ||
+            r.packed_rows > UINT64_MAX / (r.packed_blocks * 34u)) {
+            rc = 8;
+            break;
+        }
+        const uint64_t packed_bytes =
+            r.packed_rows * r.packed_blocks * 34u;
+        if (r.packed_rows - 1u >
+                (UINT64_MAX - r.source_block_start - r.packed_blocks) /
+                    r.source_row_blocks) {
+            rc = 9;
+            break;
+        }
+        const uint64_t source_blocks =
+            (r.packed_rows - 1u) * r.source_row_blocks +
+            r.source_block_start + r.packed_blocks;
+        if (source_blocks > UINT64_MAX / 34u) {
+            rc = 9;
+            break;
+        }
+        const uint64_t source_bytes = source_blocks * 34u;
+        if (r.source_offset > g_model_registered_size ||
+            source_bytes > g_model_registered_size - r.source_offset) {
+            rc = 10;
+            break;
+        }
+
+        unsigned char *canonical_tmp = NULL;
+        unsigned char *packed = NULL;
+        cudaError_t err = cudaMalloc(&canonical_tmp, (size_t)source_bytes);
+        if (err == cudaSuccess) {
+            err = cudaMalloc(&packed, (size_t)packed_bytes);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpy(canonical_tmp, host_base + r.source_offset,
+                             (size_t)source_bytes, cudaMemcpyHostToDevice);
+        }
+        if (err == cudaSuccess) {
+            q8_0_warp_interleaved_pack_kernel
+                <<<(unsigned)r.packed_rows, 32>>>(
+                    packed, canonical_tmp, r.source_row_blocks,
+                    r.source_block_start, r.packed_blocks, r.packed_rows);
+            err = cudaGetLastError();
+        }
+        if (err == cudaSuccess) err = cudaDeviceSynchronize();
+        if (canonical_tmp) (void)cudaFree(canonical_tmp);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: native-primary Q8 install failed device=%d "
+                    "offset=%llu bytes=%llu: %s\n",
+                    device_id, (unsigned long long)r.cache_key_offset,
+                    (unsigned long long)packed_bytes,
+                    cudaGetErrorString(err));
+            if (packed) (void)cudaFree(packed);
+            (void)cudaGetLastError();
+            rc = 11;
+            break;
+        }
+
+        g_q8_warp_interleaved_ranges.push_back({
+            g_model_host_base, r.cache_key_offset, packed_bytes,
+            r.packed_blocks * 32u, r.packed_rows,
+            r.source_row_blocks, r.source_block_start,
+            r.canonical_offset, r.canonical_bytes,
+            packed, device_id, 1});
+        g_q8_warp_interleaved_bytes += packed_bytes;
+        g_q8_warp_interleaved_primary_bytes += packed_bytes;
+        if (source_bytes > g_q8_warp_interleaved_primary_stage_peak_bytes) {
+            g_q8_warp_interleaved_primary_stage_peak_bytes = source_bytes;
+        }
+        g_q8_warp_interleaved_primary_ranges++;
+    }
+
+    if (rc != 0) {
+        while (g_q8_warp_interleaved_ranges.size() > rollback_size) {
+            cuda_q8_warp_interleaved_range &r =
+                g_q8_warp_interleaved_ranges.back();
+            (void)cudaFree(r.device_ptr);
+            g_q8_warp_interleaved_ranges.pop_back();
+        }
+        g_q8_native_primary_source_spans.resize(rollback_source_size);
+        g_q8_warp_interleaved_bytes = rollback_bytes;
+        g_q8_warp_interleaved_primary_bytes = rollback_primary_bytes;
+        g_q8_warp_interleaved_primary_canonical_bytes =
+            rollback_primary_canonical_bytes;
+        g_q8_warp_interleaved_primary_stage_peak_bytes =
+            rollback_primary_stage_peak_bytes;
+        g_q8_warp_interleaved_primary_ranges = rollback_primary_ranges;
+        g_q8_warp_interleaved_primary_source_spans =
+            rollback_primary_source_spans;
+    } else if (getenv("DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT") != NULL) {
+        fprintf(stderr,
+                "ds4: native-primary Q8 device=%d ranges=%d resident=%.2f MiB\n",
+                device_id, n_ranges,
+                (double)(g_q8_warp_interleaved_bytes - rollback_bytes) /
+                    1048576.0);
+    }
+    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    return rc;
 }
 
 /* Install support-model tensor ranges into device_id's strict cache,
@@ -9277,6 +9544,46 @@ static int cuda_q8_warp_interleaved_attention_b_target(
            cuda_sm75_mma_ok();
 }
 
+static const unsigned char *cuda_q8_warp_interleaved_primary_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t source_row_blocks,
+        uint64_t source_block_start,
+        int physical_device) {
+    std::lock_guard<std::mutex> lock(g_q8_warp_interleaved_mutex);
+    for (const cuda_q8_warp_interleaved_range &r :
+             g_q8_warp_interleaved_ranges) {
+        if (r.primary && r.host_base == model_map && r.offset == offset &&
+            r.weight_bytes == weight_bytes && r.in_dim == in_dim &&
+            r.out_dim == out_dim &&
+            r.source_row_blocks == source_row_blocks &&
+            r.source_block_start == source_block_start &&
+            r.device_id == physical_device) {
+            return r.device_ptr;
+        }
+    }
+    return NULL;
+}
+
+static int cuda_q8_warp_interleaved_primary_source_registered(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        int physical_device) {
+    std::lock_guard<std::mutex> lock(g_q8_warp_interleaved_mutex);
+    for (const cuda_q8_native_primary_source_span &r :
+             g_q8_native_primary_source_spans) {
+        if (r.host_base != model_map || r.device_id != physical_device ||
+            offset < r.offset) continue;
+        const uint64_t into = offset - r.offset;
+        if (into <= r.bytes && weight_bytes <= r.bytes - into) return 1;
+    }
+    return 0;
+}
+
 static const unsigned char *cuda_q8_warp_interleaved_ptr(
         const void *model_map,
         uint64_t offset,
@@ -9349,7 +9656,8 @@ static const unsigned char *cuda_q8_warp_interleaved_ptr(
     }
     g_q8_warp_interleaved_ranges.push_back({
         model_map, offset, weight_bytes, in_dim, out_dim,
-        source_row_blocks, source_block_start, packed, physical_device});
+        source_row_blocks, source_block_start,
+        offset, weight_bytes, packed, physical_device, 0});
     g_q8_warp_interleaved_bytes += weight_bytes;
     g_q8_warp_interleaved_fills.fetch_add(1u, std::memory_order_relaxed);
     if (getenv("DS4_CUDA_Q8_WARP_INTERLEAVED_AUDIT") != NULL) {
@@ -18613,7 +18921,9 @@ extern "C" int ds4_gpu_memory_state_write_csv(const char *path) {
     int ok = cudaGetDevice(&saved_device) == cudaSuccess &&
         fprintf(fp,
                 "logical_tier,physical_device,free_bytes,total_bytes,"
-                "q8_fp16_cached_bytes,q8_fp16_reserve_bytes\n") >= 0;
+                "q8_fp16_cached_bytes,q8_fp16_reserve_bytes,"
+                "selective_cache_bytes,q8_interleaved_bytes,"
+                "q8_native_primary_bytes,canonical_q8_displaced_bytes\n") >= 0;
     for (int tier = 0; ok && tier < g_n_gpus; tier++) {
         const int physical_device = g_gpu[tier].device_id;
         size_t free_bytes = 0u, total_bytes = 0u;
@@ -18627,12 +18937,42 @@ extern "C" int ds4_gpu_memory_state_write_csv(const char *path) {
             cuda_q8_f16_cached_bytes_on_device(physical_device);
         const uint64_t reserve_bytes =
             cuda_q8_f16_cache_reserve_bytes((uint64_t)total_bytes);
-        if (fprintf(fp, "%d,%d,%llu,%llu,%llu,%llu\n",
+        uint64_t interleaved_bytes = 0u;
+        uint64_t native_primary_bytes = 0u;
+        uint64_t canonical_displaced_bytes = 0u;
+        {
+            const std::lock_guard<std::mutex> guard(
+                g_q8_warp_interleaved_mutex);
+            for (const cuda_q8_warp_interleaved_range &r :
+                     g_q8_warp_interleaved_ranges) {
+                if (r.device_id != physical_device) continue;
+                interleaved_bytes += r.weight_bytes;
+                if (r.primary) {
+                    native_primary_bytes += r.weight_bytes;
+                }
+            }
+            for (const cuda_q8_native_primary_source_span &r :
+                     g_q8_native_primary_source_spans) {
+                if (r.device_id == physical_device) {
+                    canonical_displaced_bytes += r.bytes;
+                }
+            }
+        }
+        const uint64_t selective_cache_bytes =
+            physical_device >= 0 && physical_device < DS4_MAX_GPUS &&
+            g_dev_cache[physical_device].present
+                ? g_dev_cache[physical_device].bytes : 0u;
+        if (fprintf(fp,
+                    "%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                     tier, physical_device,
                     (unsigned long long)free_bytes,
                     (unsigned long long)total_bytes,
                     (unsigned long long)cached_bytes,
-                    (unsigned long long)reserve_bytes) < 0) {
+                    (unsigned long long)reserve_bytes,
+                    (unsigned long long)selective_cache_bytes,
+                    (unsigned long long)interleaved_bytes,
+                    (unsigned long long)native_primary_bytes,
+                    (unsigned long long)canonical_displaced_bytes) < 0) {
             ok = 0;
         }
     }
@@ -20686,8 +21026,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const int physical_device =
         (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
             ? g_gpu[logical_tier].device_id : 0;
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
-    if (!wptr) return 0;
+    const unsigned char *interleaved_primary =
+        cuda_q8_warp_interleaved_primary_ptr(
+            model_map, weight_offset, weight_bytes, in_dim, out_dim,
+            blocks, 0u, physical_device);
+    const char *wptr = interleaved_primary ? NULL :
+        cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
+                                logical_tier, "q8_0");
+    if (!wptr && !interleaved_primary) return 0;
     if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
@@ -20769,7 +21115,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 "partner_runtime_fallback");
         }
     }
-    if (g_q8_dequant_gemm_enabled && g_cublas_ready &&
+    if (wptr && g_q8_dequant_gemm_enabled && g_cublas_ready &&
         n_tok >= 128u && blocks > 32u && (in_dim & 31u) == 0u) {
         /* Streaming dequant + f16 GEMM: the exact-q8 batched kernels only
          * cover blocks <= 32 (DS4 TP shard widths); the per-token fallback
@@ -20854,8 +21200,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             }
         }
     }
-    const unsigned char *interleaved_w = NULL;
-    if (cuda_q8_warp_interleaved_target(in_dim, out_dim, n_tok)) {
+    const unsigned char *interleaved_w = interleaved_primary;
+    if (!interleaved_w &&
+        cuda_q8_warp_interleaved_target(in_dim, out_dim, n_tok)) {
         interleaved_w = cuda_q8_warp_interleaved_ptr(
             model_map, weight_offset, weight_bytes, in_dim, out_dim,
             blocks, 0u, physical_device,
@@ -20906,6 +21253,29 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
+    if (interleaved_w) {
+        unsigned char *interleaved_xq =
+            (unsigned char *)tmp + interleaved_xq_offset;
+        const dim3 pack_grid((unsigned)((blocks + 31u) / 32u),
+                             (unsigned)n_tok, 1u);
+        q8_0_xq_warp_interleaved_pack_rows_kernel<<<pack_grid, 32>>>(
+            interleaved_xq, xq, blocks, n_tok);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_q8_0 interleaved activation rows pack launch")) {
+            return 0;
+        }
+        const dim3 native_grid(((unsigned)out_dim + 7u) / 8u,
+                               (unsigned)n_tok, 1u);
+        matmul_q8_0_kslice_preq_warp8_interleaved_kernel
+            <<<native_grid, 256>>>(
+                (float *)out->ptr, interleaved_w, interleaved_xq,
+                xscale, in_dim, out_dim, blocks);
+        g_q8_warp_interleaved_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+        return cuda_ok(cudaGetLastError(),
+                       "matmul_q8_0 interleaved rows launch");
+    }
+    if (!wptr) return 0;
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;
     if (n_tok > 1u && !force_decode_warp) {
@@ -21118,15 +21488,21 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     const int physical_device =
         (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
             ? g_gpu[logical_tier].device_id : 0;
-    const unsigned char *wptr = reinterpret_cast<const unsigned char *>(
+    const uint64_t slice_weight_bytes = out_dim * slice_blocks * 34u;
+    const unsigned char *interleaved_w =
+        cuda_q8_warp_interleaved_primary_ptr(
+            model_map, weight_offset, slice_weight_bytes, in_count, out_dim,
+            full_blocks, block_start, physical_device);
+    const unsigned char *wptr = NULL;
+    if (!interleaved_w) {
+        wptr = reinterpret_cast<const unsigned char *>(
             cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
                                     logical_tier, "q8_0_kslice"));
-    if (!wptr) return 0;
+        if (!wptr) return 0;
+    }
 
-    const unsigned char *interleaved_w = NULL;
-    if (cuda_q8_warp_interleaved_attention_b_target(
+    if (!interleaved_w && cuda_q8_warp_interleaved_attention_b_target(
             block_start, slice_blocks, n_tok)) {
-        const uint64_t slice_weight_bytes = out_dim * slice_blocks * 34u;
         interleaved_w = cuda_q8_warp_interleaved_ptr(
             model_map, weight_offset, slice_weight_bytes, in_count, out_dim,
             full_blocks, block_start, physical_device, wptr);
@@ -24997,16 +25373,27 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
     const int physical_device =
         (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
             ? g_gpu[logical_tier].device_id : 0;
-    const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
+    const unsigned char *interleaved_w =
+        cuda_q8_warp_interleaved_primary_ptr(
+            model_map, a_offset, out_a_bytes, group_dim, low_dim,
+            blocks_a, 0u, physical_device);
+    const unsigned char *out_a = NULL;
+    if (!interleaved_w) {
+        out_a = reinterpret_cast<const unsigned char *>(
             cuda_resolve_weight_ptr(model_map, a_offset, out_a_bytes,
                                     logical_tier, "attn_out_a_rows"));
-    if (!out_a) return 0;
+        if (!out_a) return 0;
+    }
 
-    const int use_k128 =
-        cuda_q8_warp_interleaved_attention_a_k128_target(
-            group_dim, rank, low_dim, blocks_a, n_rows);
-    const unsigned char *interleaved_w = NULL;
-    if (cuda_q8_warp_interleaved_attention_a_target(n_rows)) {
+    const int use_k128 = interleaved_w
+        ? group_dim == 4096u && rank == 1024u && low_dim == 4096u &&
+          blocks_a == 128u &&
+          cuda_env_flag_enabled(
+              "DS4_CUDA_Q8_WARP_INTERLEAVED_ATTN_A_K128", 1)
+        : cuda_q8_warp_interleaved_attention_a_k128_target(
+              group_dim, rank, low_dim, blocks_a, n_rows);
+    if (!interleaved_w &&
+        cuda_q8_warp_interleaved_attention_a_target(n_rows)) {
         interleaved_w = cuda_q8_warp_interleaved_ptr(
             model_map, a_offset, out_a_bytes, group_dim, low_dim,
             blocks_a, 0u, physical_device, out_a);

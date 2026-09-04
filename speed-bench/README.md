@@ -5141,6 +5141,52 @@ SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-q8-attention-ab-production-ab.sh
 ```
 
+### Native-primary T32/A/B Q8 residency
+
+The interleaved T32, attention-A, and attention-B layouts are individually
+size-neutral, but the first production candidates retain each layout beside
+the replicated canonical Q8 tensor. Across 43 layers that arrangement keeps
+8,772 MiB of canonical T32/A/B bytes plus 4,386 MiB of interleaved bytes on
+the four GPUs. The auxiliary representation is therefore a validation
+mechanism, not the desired storage policy.
+
+Set `Q8_INTERLEAVED_PRODUCTION_TARGET=native-primary` to compare that complete
+auxiliary-cache arrangement with exact native-primary TP residency. T32 keeps
+one full 34 MiB native matrix on its production home rank; A is row-sharded
+and B is K-sharded into 17 MiB rank slices. The candidate therefore keeps
+exactly 4,386 MiB system-wide and omits all 8,772 MiB of persistent canonical
+GPU copies. Canonical bytes remain in the GGUF mmap and are staged only
+transiently if the independently planned F16 cache needs to be materialized.
+The largest conversion staging span is 34 MiB.
+
+The gate holds the optimized T32/A/B dispatch and F16-cache residency constant,
+requires 215 retained native shards plus 258 authorized canonical source
+spans, rejects any lazy interleaved fill or fallback in the candidate, writes
+per-device allocator state, and compares every one of 16
+decode logits at 512, 4096, and 32768 tokens for mixed15 and all43. It reports
+both total free-memory change and every relevant persistent category instead
+of treating the 1,536 MiB auxiliary cap as the memory result.
+
+```bash
+MIXED_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q4-32-Q3A4-50.gguf" \
+ALL43_MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+Q8_INTERLEAVED_PRODUCTION_TARGET=native-primary \
+INTERLEAVED_CACHE_MB=1536 TG_TOKENS=256 EXACT_TOKENS=16 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-q8-warp-interleaved-production-ab.sh
+```
+
+This runtime form deliberately validates the final persistent layout before a
+new GGUF tensor encoding is committed. A GGUF-native row-interleaved and
+K-interleaved format family can then remove startup repacking without changing
+placement, kernels, or retained VRAM. T32 uses a full row-interleaved matrix,
+A uses row-sharded row-interleaved matrices, and B uses K-sharded
+K-interleaved matrices; one ambiguous "interleaved Q8" type would not encode
+those placement semantics safely.
+
 ### SM75 width-1024 compressor projection layout diagnostic
 
 `cuda-sm75-compressor-projection-layout.sh` targets the expensive one-token

@@ -67,6 +67,12 @@ bool ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(
         uint32_t n_tokens, uint32_t n_raw);
 uint32_t ds4_test_cuda_tp_prefill_fixed_half_rows(uint32_t n_tokens);
 uint32_t ds4_test_q8_cache_class(const char *name);
+int ds4_test_q8_native_primary_shape(
+        const char *name, uint32_t type, uint32_t ndim,
+        uint64_t dim0, uint64_t dim1);
+uint64_t ds4_test_q8_native_primary_bytes_per_layer(void);
+uint32_t ds4_test_q8_native_primary_ranges_per_layer(void);
+uint32_t ds4_test_q8_native_primary_source_spans_per_layer(void);
 uint32_t ds4_test_q8_cache_candidate_copies(
         const char *name, int split_attn_heads,
         int partner_available, int sliceable);
@@ -274,6 +280,32 @@ static void test_q8_cache_benefit_order(void) {
                                     q_b, 64ull << 20) < 0,
           "balanced production policy preserves complete T256 residency");
     (void)unsetenv("DS4_CUDA_Q8_T256_PLACEMENT");
+}
+
+static void test_q8_native_primary_shapes(void) {
+    fprintf(stderr, "RUN: test_q8_native_primary_shapes\n");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_q_b.weight", 8u, 2u, 1024u, 32768u),
+          "production T32 shape is native-primary eligible");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_a.weight", 8u, 2u, 4096u, 8192u),
+          "production attention A shape is native-primary eligible");
+    CHECK(ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_b.weight", 8u, 2u, 8192u, 4096u),
+          "production attention B shape is native-primary eligible");
+    CHECK(!ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_b.weight", 8u, 2u, 4096u, 4096u),
+          "non-production attention B shape is rejected");
+    CHECK(!ds4_test_q8_native_primary_shape(
+              "blk.3.attn_output_a.weight", 1u, 2u, 4096u, 8192u),
+          "non-Q8 attention A storage is rejected");
+    CHECK(ds4_test_q8_native_primary_bytes_per_layer() ==
+              102ull * 1024ull * 1024ull,
+          "native-primary T32/A/B residency is exactly 102 MiB per layer");
+    CHECK(ds4_test_q8_native_primary_ranges_per_layer() == 5u,
+          "native-primary retains one full T32 plus two A and two B shards");
+    CHECK(ds4_test_q8_native_primary_source_spans_per_layer() == 6u,
+          "native-primary authorizes both rank sources for all three tensors");
 }
 
 static void test_q8_cache_partner_mapping(void) {
@@ -1450,6 +1482,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 int main(void) {
     test_cuda_routed_moe_quant_matrix();
     test_q8_cache_benefit_order();
+    test_q8_native_primary_shapes();
     test_q8_cache_partner_mapping();
     test_tensor_to_entry();
     test_null_config();

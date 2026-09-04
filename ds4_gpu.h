@@ -174,8 +174,32 @@ typedef struct {
     int target_device;
 } ds4_tensor_range;
 
+/* Size-neutral SM75 Q8_0 representation used by the single-token dense
+ * kernels.  The canonical tensor remains the source of truth in the mmap,
+ * while only the exact row or K shard described here is retained on the
+ * target GPU.  cache_key_offset is the offset used by dispatch; it can differ
+ * from source_offset for a K-sharded matrix because canonical rows are
+ * strided while the native shard is contiguous.  packed_blocks=packed_rows=0
+ * records an intentionally omitted canonical span used only for transient
+ * F16-cache materialization; it retains no native bytes. */
+typedef struct {
+    uint64_t source_offset;
+    uint64_t canonical_offset;
+    uint64_t canonical_bytes;
+    uint64_t cache_key_offset;
+    uint64_t source_row_blocks;
+    uint64_t source_block_start;
+    uint64_t packed_blocks;
+    uint64_t packed_rows;
+    int target_device;
+} ds4_q8_native_range;
+
 int ds4_gpu_device_cache_tensors(int device_id,
                                  const ds4_tensor_range *ranges,
+                                 int n_ranges);
+int ds4_gpu_device_cache_q8_native_tensors(
+                                 int device_id,
+                                 const ds4_q8_native_range *ranges,
                                  int n_ranges);
 int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
 int ds4_gpu_device_cache_support_tensors(int device_id,
