@@ -115,6 +115,8 @@ git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
 
 phase=production-ab
 printf 'variant,csv,log,logits,telemetry\n' >"$OUTPUT_DIR/production/runs.csv"
+attention_rows_message='CUDA prefill attention query-row split enabled: tier '
+indexer_rows_message='CUDA prefill indexer score/top-k row split enabled: tier '
 for variant in gather output; do
     output_rows=0; [[ $variant == output ]] && output_rows=1
     base="$OUTPUT_DIR/production/$variant"
@@ -156,10 +158,12 @@ for variant in gather output; do
         "$base.log" || die "$variant did not load the tagged native-Q8 model"
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$base.log" ||
         die "$variant missed a required native-GGUF execution binding"
-    grep -Fq 'tier 1 rows ' "$base.log" ||
+    grep -Fq "${attention_rows_message}1 rows " "$base.log" ||
         die "$variant did not exercise stable logical pair 1"
-    ! grep -Fq 'tier 0 rows ' "$base.log" ||
+    ! grep -Fq "${attention_rows_message}0 rows " "$base.log" ||
         die "$variant unexpectedly enabled unstable logical pair 0"
+    grep -Fq "${indexer_rows_message}0 rows " "$base.log" ||
+        die "$variant did not preserve independent pair-0 indexer splitting"
     if [[ $variant == output ]]; then
         grep -Fq 'rows retained through inverse RoPE and output A:' "$base.log" ||
             die "candidate missed distributed-output dispatch"
