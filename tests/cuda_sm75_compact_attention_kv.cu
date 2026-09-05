@@ -166,7 +166,7 @@ __device__ __forceinline__ static float decode_code_bits(
 
 __device__ __forceinline__ static int quant_code_for(float value, float scale) {
     if (!isfinite(value) || !isfinite(scale) || !(scale > 0.0f)) return -1;
-    const uint32_t sign = __float_as_uint(value) >> 31;
+    const uint32_t sign = value < 0.0f ? 1u : 0u;
     const float magnitude = fminf(fabsf(value / scale), 448.0f);
     int lo = 0;
     int hi = 126;

@@ -13099,7 +13099,10 @@ __device__ __forceinline__ static float sm75_compact_attn_decode_code(
 __device__ __forceinline__ static int sm75_compact_attn_quant_code(
         float value, float scale) {
     if (!isfinite(value) || !isfinite(scale) || !(scale > 0.0f)) return -1;
-    const uint32_t sign = __float_as_uint(value) >> 31;
+    /* Match dsv4_e4m3fn_dequant_dev exactly: finite negative values which
+     * round to zero retain a negative zero, while an input negative zero is
+     * treated as non-negative by the shipping x < 0.0f sign test. */
+    const uint32_t sign = value < 0.0f ? 1u : 0u;
     const float magnitude = fminf(fabsf(value / scale), 448.0f);
     int lo = 0;
     int hi = 126;
@@ -13167,7 +13170,12 @@ __global__ static void sm75_compact_attn_pack_kernel(
             out->code[d] = stored_code;
             const float decoded = sm75_compact_attn_decode_code(
                 stored_code, __float_as_uint(scale));
-            if (__float_as_uint(decoded) != __float_as_uint(value)) {
+            /* The packer consumes the finite pre-quantization producer row.
+             * Audit against the shipping FP8 quantizer result, not against
+             * that unquantized input. */
+            const float shipping = dsv4_e4m3fn_dequant_dev(
+                fminf(448.0f, fmaxf(-448.0f, value / scale))) * scale;
+            if (__float_as_uint(decoded) != __float_as_uint(shipping)) {
                 atomicOr(&out->status, 4u);
             }
         }

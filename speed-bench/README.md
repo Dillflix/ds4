@@ -5664,6 +5664,15 @@ One-token output correctly has zero steady tokens and zero steady throughput.
 The validator now accepts that exact case while retaining positive first-token
 latency/throughput checks; no compact arm ran in that archive either.
 
+The `20260905T234130Z` run reached the compact arm and exposed an audit bug at
+the first emitted production row. The compact packer consumes the unquantized
+F32 producer row and performs the shipping E4M3 quantization itself, but the
+embedded audit compared the decoded compact value to the unquantized input.
+It now compares against the result of the shipping E4M3 quantizer and matches
+the shipping signed-zero rule. The failure occurred before either compact
+attention consumer ran, so that archive does not distinguish hybrid from
+direct consumption.
+
 `DIAGNOSTIC_DECODE_PROFILE=1` generates two PP512 decode tokens and captures
 exactly the second in Nsight Systems for both F32 and compact caches. The first
 token primes common cross-device bounce state; excluding it prevents one-time
