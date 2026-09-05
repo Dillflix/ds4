@@ -103,12 +103,15 @@ grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/adversarial-smoke.log" ||
 grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' \
     "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "hybrid scratch exactness gate did not pass"
-grep -q '^candidate,name=hybrid-chunk256-h16-double-buffered,' \
+grep -q '^candidate,name=hybrid-chunk256-h16-default-priority,' \
     "$OUTPUT_DIR/adversarial-smoke.log" ||
-    die "hybrid chunk256 H16 smoke result is missing"
-grep -q '^candidate,name=hybrid-chunk256-h8-double-buffered,' \
+    die "hybrid chunk256 H16 default-priority smoke result is missing"
+grep -q '^candidate,name=hybrid-chunk256-h16-attention-priority,' \
     "$OUTPUT_DIR/adversarial-smoke.log" ||
-    die "hybrid chunk256 H8 smoke result is missing"
+    die "hybrid chunk256 H16 attention-priority smoke result is missing"
+grep -q '^hybrid_priority,candidate=hybrid-chunk256-h16-attention-priority,.*distinct=1$' \
+    "$OUTPUT_DIR/adversarial-smoke.log" ||
+    die "CUDA device does not expose a distinct attention stream priority"
 
 if (( RUN_SANITIZER )); then
     compute-sanitizer --tool memcheck --error-exitcode 97 \
@@ -131,12 +134,15 @@ grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/timing.log" ||
     die "one or more timed prototype outputs were not exact"
 grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' "$OUTPUT_DIR/timing.log" ||
     die "timed hybrid scratch exactness gate did not pass"
-grep -q '^candidate,name=hybrid-chunk256-h16-double-buffered,' \
+grep -q '^candidate,name=hybrid-chunk256-h16-default-priority,' \
     "$OUTPUT_DIR/timing.log" ||
-    die "timed hybrid chunk256 H16 result is missing"
-grep -q '^candidate,name=hybrid-chunk256-h8-double-buffered,' \
+    die "timed hybrid chunk256 H16 default-priority result is missing"
+grep -q '^candidate,name=hybrid-chunk256-h16-attention-priority,' \
     "$OUTPUT_DIR/timing.log" ||
-    die "timed hybrid chunk256 H8 result is missing"
+    die "timed hybrid chunk256 H16 attention-priority result is missing"
+grep -q '^hybrid_priority,candidate=hybrid-chunk256-h16-attention-priority,.*distinct=1$' \
+    "$OUTPUT_DIR/timing.log" ||
+    die "timed run did not use a distinct attention stream priority"
 
 if (( RUN_NCU )); then
     mkdir -p "$OUTPUT_DIR/ncu"

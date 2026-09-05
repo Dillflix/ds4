@@ -5525,11 +5525,12 @@ independently:
 - the hybrid pipeline retains the persistent 736-byte cache, materializes
   reusable 256-row chunks as 448 exact F16 non-RoPE values plus 64 untouched
   F32 RoPE values, and overlaps the second materialization with attention using
-  two buffers and independent CUDA streams. Exact H16 and H8 consumers are
-  measured independently: H16 minimizes repeated scratch loads, while H8 tests
-  whether its additional CTAs and lower register footprint recover more SM75
-  occupancy. Any non-RoPE value that does not round-trip through F16
-  bit-exactly sets a failure status and rejects both arms.
+  two buffers and independent CUDA streams. The retained exact H16 consumer is
+  measured with default-priority streams and with high-priority attention plus
+  low-priority materialization. This isolates whether the ready attention grid
+  is delayed behind the second materializer grid; the prior H8 arm is not
+  rerun. Any non-RoPE value that does not round-trip through F16 bit-exactly
+  sets a failure status and rejects both scheduling arms.
 
 Every accepted codec and attention result must be bit-identical to F32.
 Selected-row scratch is reported separately as transient, reusable allocation;
@@ -5541,8 +5542,8 @@ diagnostic; the existing combined launch sequence remains the authoritative
 end-to-end result. The selected consumer is paired against the ordinary F32
 consumer to expose any benefit from contiguous top-k ordering independently
 of decode cost. The hybrid arm likewise reports materialization-only and
-H8/H16 attention-only component timings, but each paired overlapped pipeline
-is the authoritative result. Its two buffers are reported as transient
+H16 attention-only component timing, but each paired scheduling pipeline is
+the authoritative result. Its two buffers are reported as transient
 storage; the F32 max/sum carry preserves the original online-softmax row order
 across both chunks. With `RUN_NCU=1`, the harness captures exactly one
 `compact_materialize_hybrid_chunk_kernel` launch and validates its 128-thread,
@@ -5558,6 +5559,13 @@ diagnostic evidence, not promotion evidence. Pack status completes
 asynchronously; a future caller must observe `PACK_OK` before committing or
 using a destination row. The reported SASS LDL/STL counts are explicitly
 whole-binary diagnostics, not a per-kernel acceptance gate.
+
+The 262144-row diagnostic selected H16 over H8: H16 reached `0.93723x` of its
+paired F32 control, while H8 reached `0.92365x`. H16 attention-only was already
+slightly faster than the paired F32 control (`1.04887 ms` versus `1.06011 ms`),
+but the complete pipeline hid only about `0.013 ms` of `0.0969 ms`
+materialization. The priority A/B therefore keeps the selected representation,
+chunk size, H16 kernel, and arithmetic fixed and changes only CUDA scheduling.
 
 ```bash
 PROFILE_GPU=0 \
