@@ -145,6 +145,29 @@ static diff_metrics compare_head_half(const float *reference,
     return total;
 }
 
+static diff_metrics compare_row_slice(const float *reference,
+                                      uint64_t reference_stride,
+                                      const float *candidate,
+                                      uint64_t candidate_stride,
+                                      uint32_t rows,
+                                      uint64_t column0,
+                                      uint64_t width) {
+    diff_metrics total = {0u, UINT64_MAX, 0.0};
+    for (uint32_t row = 0u; row < rows; row++) {
+        const uint64_t reference_offset =
+            (uint64_t)row * reference_stride + column0;
+        const uint64_t candidate_offset =
+            (uint64_t)row * candidate_stride;
+        diff_metrics d = compare_f32(reference + reference_offset,
+                                     candidate + candidate_offset, width);
+        if (d.mismatches && !total.mismatches)
+            total.first = reference_offset + d.first;
+        total.mismatches += d.mismatches;
+        if (d.max_abs > total.max_abs) total.max_abs = d.max_abs;
+    }
+    return total;
+}
+
 static void print_diff(const char *boundary, diff_metrics home,
                        diff_metrics partner) {
     printf("boundary=%s,home_mismatches=%llu,partner_mismatches=%llu,"
@@ -582,6 +605,69 @@ int main(void) {
               LOW_DIM, EMBED_DIM, &low_gather, N_TOK) &&
           sync_tier(0) && sync_tier(1),
           "production-ordered head-shard chain");
+
+    CHECK(ds4_gpu_tensor_read(&input_peer, 0u, home_host, input_bytes),
+          "scheduled input readback");
+    diff_metrics scheduled_input_diff = compare_f32(
+        input_host, home_host, input_count);
+    printf("boundary=physical-production-ordered-input-copy,mismatches=%llu,"
+           "first=%lld,max_abs=%.9g\n",
+           (unsigned long long)scheduled_input_diff.mismatches,
+           scheduled_input_diff.first == UINT64_MAX ? -1ll :
+               (long long)scheduled_input_diff.first,
+           scheduled_input_diff.max_abs);
+
+    CHECK(ds4_gpu_tensor_read(&q_ref, 0u, ref_host, q_bytes) &&
+          ds4_gpu_tensor_read(&q_home, 0u, home_host, q_bytes) &&
+          ds4_gpu_tensor_read(&q_peer, 0u, peer_host, q_bytes),
+          "scheduled q_b readback");
+    diff_metrics scheduled_q_home_diff =
+        compare_head_half(ref_host, home_host, 0u);
+    diff_metrics scheduled_q_peer_diff =
+        compare_head_half(ref_host, peer_host, SHARD_HEADS);
+    print_diff("physical-production-ordered-q-b",
+               scheduled_q_home_diff, scheduled_q_peer_diff);
+
+    CHECK(ds4_gpu_tensor_read(&heads_ref, 0u, ref_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_home, 0u, home_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_peer, 0u, peer_host, q_bytes),
+          "scheduled post-RoPE readback");
+    diff_metrics scheduled_heads_home_diff =
+        compare_head_half(ref_host, home_host, 0u);
+    diff_metrics scheduled_heads_peer_diff =
+        compare_head_half(ref_host, peer_host, SHARD_HEADS);
+    print_diff("physical-production-ordered-post-rope",
+               scheduled_heads_home_diff, scheduled_heads_peer_diff);
+
+    CHECK(ds4_gpu_tensor_read(&low_ref, 0u, low_ref_host,
+                              low_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(&low_home, 0u, low_gather_host,
+                              half_low_count * sizeof(float)),
+          "scheduled home output-A readback");
+    diff_metrics scheduled_low_home_diff = compare_row_slice(
+        low_ref_host, LOW_DIM, low_gather_host, HALF_LOW_DIM, N_TOK, 0u,
+        HALF_LOW_DIM);
+    CHECK(ds4_gpu_tensor_read(&low_peer, 0u, low_gather_host,
+                              half_low_count * sizeof(float)),
+          "scheduled peer output-A readback");
+    diff_metrics scheduled_low_peer_diff = compare_row_slice(
+        low_ref_host, LOW_DIM, low_gather_host, HALF_LOW_DIM, N_TOK,
+        HALF_LOW_DIM, HALF_LOW_DIM);
+    print_diff("physical-production-ordered-output-a-halves",
+               scheduled_low_home_diff, scheduled_low_peer_diff);
+
+    CHECK(ds4_gpu_tensor_read(&low_gather, 0u, low_gather_host,
+                              low_count * sizeof(float)),
+          "scheduled gather readback");
+    diff_metrics scheduled_gather_diff = compare_f32(
+        low_ref_host, low_gather_host, low_count);
+    printf("boundary=physical-production-ordered-output-a-gather,"
+           "mismatches=%llu,first=%lld,max_abs=%.9g\n",
+           (unsigned long long)scheduled_gather_diff.mismatches,
+           scheduled_gather_diff.first == UINT64_MAX ? -1ll :
+               (long long)scheduled_gather_diff.first,
+           scheduled_gather_diff.max_abs);
+
     CHECK(ds4_gpu_tensor_read(&output_scheduled, 0u, output_candidate_host,
                               output_bytes), "scheduled output readback");
     diff_metrics scheduled_diff = compare_f32(
@@ -592,7 +678,14 @@ int main(void) {
            scheduled_diff.first == UINT64_MAX ? -1ll :
                (long long)scheduled_diff.first,
            scheduled_diff.max_abs);
-    CHECK(!scheduled_diff.mismatches,
+    CHECK(!scheduled_input_diff.mismatches &&
+          !scheduled_q_home_diff.mismatches &&
+          !scheduled_q_peer_diff.mismatches &&
+          !scheduled_heads_home_diff.mismatches &&
+          !scheduled_heads_peer_diff.mismatches &&
+          !scheduled_low_home_diff.mismatches &&
+          !scheduled_low_peer_diff.mismatches &&
+          !scheduled_gather_diff.mismatches && !scheduled_diff.mismatches,
           "production-ordered head-shard chain diverged");
 
     printf("output_a_rank=%u\nphysical_pair_protocol=bit-exact\n"

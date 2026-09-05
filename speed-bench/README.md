@@ -5721,6 +5721,17 @@ KV mirror update path.  A failure at either boundary instead identifies the
 downstream projection or asynchronous handoff schedule before another 32K
 model run is attempted.
 
+The first production-ordered result cleared the isolated output-B projection
+but rejected the unfenced chain: all 3,670,016 final output values differed,
+with maximum absolute error 1.92179418.  This establishes an asynchronous
+ordering defect somewhere before output-B, not an output-B arithmetic or F16
+cache-layout difference.  The physical binary now reads every surviving
+intermediate only after the complete chain has finished, so observation cannot
+repair the schedule.  It reports the copied input, both q_b halves, both
+post-RoPE attention halves, both output-A halves, the gathered low-rank tensor,
+and output-B.  The first nonzero boundary localizes the missing dependency in
+one invocation.
+
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
