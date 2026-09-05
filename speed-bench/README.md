@@ -5660,3 +5660,22 @@ the single home output-B GEMM.  Pair 0 remains disabled.  The candidate cache
 plan replaces full T32/A F16 bindings with two halves; aggregate model-cache
 bytes must match control.  The harness requires byte-identical frontier logits
 and leaves `DS4_CUDA_TP_PREFILL_T32_HEADS` default-off.
+
+The first all43 run completed without a device loss and measured 400.45 versus
+391.80 prefill tok/s (1.02208x), but failed the required frontier-logit gate.
+The difference was material rather than a one-ULP tolerance question, so the
+candidate remains ineligible.  Before another model run,
+`cuda-sm75-t32-headshard-exactness.sh` reproduces the changed arithmetic shape
+on one GPU at the production 512-token, 1024x32768 q_b dimensions.  It compares
+the raw FP16 projection and final RMS/RoPE output for one 64-head GEMM versus
+two contiguous 32-head GEMMs.  A bounded legacy-cuBLAS algorithm sweep reports
+both full-versus-shard differences and differences from shipping DEFAULT; only
+an algorithm exact on both axes can advance.  The diagnostic selector is not
+read unless `DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC` is explicitly present, so
+normal engine dispatch is unchanged.
+
+```bash
+PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-headshard-exactness.sh
+```

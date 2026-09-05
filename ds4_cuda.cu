@@ -41342,6 +41342,28 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
                      "attn q_b f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
+        cublasGemmAlgo_t gemm_algo = CUBLAS_GEMM_DEFAULT;
+        const char *gemm_algo_env =
+            getenv("DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC");
+        if (gemm_algo_env && gemm_algo_env[0]) {
+            char *end = NULL;
+            const long parsed = strtol(gemm_algo_env, &end, 10);
+            /* Legacy cuBLAS algorithms are intentionally exposed only to the
+             * bounded T32 exactness diagnostic.  CUDA defines 0..23 for the
+             * ordinary family, 99 for DEFAULT_TENSOR_OP, and 100..115 for
+             * ALGO0..15_TENSOR_OP.  Keeping the selector out of the normal
+             * engine environment preserves the shipping DEFAULT dispatch. */
+            if (end == gemm_algo_env || *end != '\0' ||
+                !((parsed >= 0 && parsed <= 23) ||
+                  (parsed >= 99 && parsed <= 115))) {
+                fprintf(stderr,
+                        "ds4: invalid diagnostic T32 FP16 cuBLAS algorithm "
+                        "'%s'; using DEFAULT\n",
+                        gemm_algo_env);
+            } else {
+                gemm_algo = (cublasGemmAlgo_t)parsed;
+            }
+        }
         const cublasStatus_t st = cublasGemmEx(
             cuda_cublas_for_tier(logical_tier),
             CUBLAS_OP_T, CUBLAS_OP_N,
@@ -41351,7 +41373,7 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
             xh, CUDA_R_16F, (int)in_dim,
             &beta,
             q_half_eff->ptr, CUDA_R_16F, (int)out_dim,
-            CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            CUDA_R_32F, gemm_algo);
         if (st != CUBLAS_STATUS_SUCCESS) {
             fprintf(stderr,
                     "ds4: CUDA attn q_b f16-output cuBLAS failed on device %d: "
