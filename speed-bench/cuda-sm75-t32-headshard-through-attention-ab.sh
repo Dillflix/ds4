@@ -21,7 +21,7 @@ CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
 MATCH_PAIR1_INDEXER=${MATCH_PAIR1_INDEXER:-1}
 BOUNDARY_AUDIT_ONLY=${BOUNDARY_AUDIT_ONLY:-0}
-BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-2}
+BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-22}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-ab-$stamp}
 
@@ -247,10 +247,10 @@ for variant in "${variants[@]}"; do
         grep -Fq 'required-native=129/129' "$base.log" ||
             die "control did not retain 129 required bindings"
         if (( CTX_TOKENS > 512 )); then
-            # The zero-prefix 512-row microbatch is already divided by the
-            # outer pipeline-row path.  Only a later microbatch can reach the
-            # internal pair-1 query-row dispatcher whose one-time diagnostic
-            # is checked here.
+            # The zero-prefix 512-row microbatch uses the static-mixed path,
+            # which does not enter the internal pair-1 query-row dispatcher.
+            # Only a later nonzero-prefix microbatch can emit the one-time
+            # diagnostic checked here.
             grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
                 "$base.log" ||
                 die "control missed the established stable pair-1 row split"
@@ -396,9 +396,25 @@ for arm, files in (("control", control), ("headshard", candidate)):
     for pos in sorted({key[0] for key in expected}):
         batch = files[(pos, "headshard_audit_raw_batch")].read_bytes()
         cache = files[(pos, "headshard_audit_raw_cache")].read_bytes()
+        if len(batch) != len(cache) or len(batch) % 4:
+            raise SystemExit(
+                f"error: invalid raw source size for arm={arm} pos={pos}")
+        # store_raw_kv_batch_kernel intentionally converts each F32 source
+        # value to F16 and widens it back into the F32 raw-cache allocation.
+        # Compare against that actual storage contract instead of falsely
+        # requiring the source F32 bytes to survive unchanged.
+        rounded = bytearray(len(batch))
+        for offset in range(0, len(batch), 4):
+            value = struct.unpack_from("=f", batch, offset)[0]
+            half = struct.pack("=e", value)
+            struct.pack_into("=f", rounded, offset, struct.unpack("=e", half)[0])
+        mismatches = sum(
+            rounded[offset:offset + 4] != cache[offset:offset + 4]
+            for offset in range(0, len(cache), 4))
         lines.append(
-            f"raw_source_consistency,arm={arm},pos={pos},status=" +
-            ("bit-exact" if batch == cache else "different"))
+            f"raw_source_consistency,arm={arm},pos={pos},storage=f16-roundtrip,"
+            f"status={'exact' if mismatches == 0 else 'different'},"
+            f"bit_mismatches={mismatches}")
 
 control_logits = root / "production" / "control-logits" / \
     f"frontier_{ctx_tokens:06d}.logits.f32"

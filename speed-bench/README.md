@@ -5828,28 +5828,36 @@ then from inverse RoPE/output projection, without another broad 32K run.
 The expanded layer-22 audit confirms that both q_b head halves and the current
 KV row are bit-identical.  The first sampled difference is the attention result
 for the zero-prefix chunk; every sampled boundary in the following three
-chunks is exact.  Layer 22 is not the origin boundary, however: 22 candidate
-layers have already executed before it, and a last-row KV sample cannot expose
-a difference in any of the other 511 rows consumed by the final query.  The
-next audit therefore defaults to the first compressed layer (layer 2), accepts
-a bounded PP512 run, and captures the complete current raw batch, its raw-cache
-copy, and the complete compressed prefix.  It also reports raw-batch versus
-raw-cache consistency within each arm.  This separates inherited layer-0/1
-state, a cache/store defect, and static-mixed attention arithmetic without
-changing the production candidate.
+chunks is exact.  The earlier interpretation of layer 22 as an inherited
+boundary was incorrect.  The forced 22/21 placement assigns layers 0--21 to
+home tier 0, while the T32 head-shard selector is restricted to home tier 1;
+layer 22 is therefore the candidate's first active layer.  The subsequent
+layer-2 PP512 audit confirms this placement consequence: all fourteen sampled
+boundaries are bit-identical while final logits still differ after the later
+candidate layers execute.
+
+The layer-2 archive's raw-batch/raw-cache `different` labels were also a harness
+error rather than cache corruption.  CUDA deliberately stores each raw-cache
+element as an F32-to-F16-to-F32 round trip.  Both arms match that contract for
+all 262,144 values.  Validation now performs the same FP16 round trip and
+reports mismatch counts.  The focused PP512 audit defaults back to layer 22,
+where the complete raw batch, FP16-backed raw-cache view, and compressed prefix
+can finally distinguish cache inputs from static-mixed attention arithmetic at
+the candidate's true first active layer.
 
 The first PP512 layer-2 invocation completed the control workload and wrote all
 fourteen requested boundary files, but its post-run topology check incorrectly
 required the internal pair-1 query-row diagnostic.  A PP512 run consists only
-of the zero-prefix microbatch; that microbatch is already divided by the outer
-pipeline-row path and does not reach the later internal pair-row dispatcher.
+of the zero-prefix static-mixed microbatch, which does not enter the internal
+pair-row dispatcher.  Only a later nonzero-prefix microbatch can emit that
+diagnostic.
 The harness now requires that diagnostic only when a later microbatch exists
 (`CTX_TOKENS > 512`) and explicitly requires its absence at PP512.  This changes
 validation only; neither inference arm nor its dispatch selectors changed.
 
 ```bash
 CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
-BOUNDARY_AUDIT_LAYER=2 \
+BOUNDARY_AUDIT_LAYER=22 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
 ```
