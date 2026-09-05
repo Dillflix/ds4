@@ -5509,18 +5509,30 @@ sign/index bytes, and 64 untouched F32 RoPE values. The harness requires
 bit-identical unpack and consumer output, rejects non-finite or
 non-representable rows, checks guarded allocations under Compute Sanitizer,
 covers scale-floor, alternate-scale, upper-exponent, and signed-zero
-boundaries, records PTXAS/SASS resources, and times a paired, alternating
-production-shaped indexed-attention consumer against direct compact decode.
-Each 256-thread block owns eight heads, stages eight of the 512 selected rows
-at a time, and preserves the shipping online-softmax operation order. This
-isolates the persistent-cache representation without timing a full-cache F32
-materialization. Its compact loader uses one aligned code-word load per four
-values, half-warp scale broadcast, and exact IEEE reconstruction with a
-boundary fallback. It remains bounded diagnostic evidence, not promotion
-evidence. Pack status completes asynchronously; a future caller must observe
-`PACK_OK` before committing or using a destination row. The reported SASS
-LDL/STL counts are explicitly whole-binary diagnostics, not a per-kernel
-acceptance gate.
+boundaries, records PTXAS/SASS resources, and times paired, alternating
+production-shaped indexed-attention consumers. The F32 control and original
+direct compact decoder remain present. Four byte-exact candidates are timed
+independently:
+
+- selected-row materialization decodes the top-512 rows once into reusable
+  F32 scratch and includes both that preprocessing and the F32 consumer;
+- H16 lets one 512-thread block amortize each decoded row over sixteen heads;
+- the warp-staged arm uses two dedicated loader warps and double-buffered
+  shared memory while eight compute warps consume the prior stage;
+- the exact F16-plus-exceptions representation stores 512 inline halves plus
+  a fixed source-ordered capacity of 64 F32 exceptions, with a bitmap/prefix
+  index for O(1) direct loads. Rows exceeding that capacity fail closed.
+
+Every accepted codec and attention result must be bit-identical to F32.
+Selected-row scratch is reported separately as transient, reusable allocation;
+packing is excluded from persistent-cache consumer timing, while selected-row
+materialization is included because it recurs for every selection. The
+736-byte loader uses aligned code-word loads, half-warp scale broadcast, and
+exact IEEE reconstruction with a boundary fallback. All results remain bounded
+diagnostic evidence, not promotion evidence. Pack status completes
+asynchronously; a future caller must observe `PACK_OK` before committing or
+using a destination row. The reported SASS LDL/STL counts are explicitly
+whole-binary diagnostics, not a per-kernel acceptance gate.
 
 ```bash
 PROFILE_GPU=0 \

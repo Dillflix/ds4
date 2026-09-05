@@ -90,6 +90,8 @@ printf 'scope=whole-binary-diagnostic-not-acceptance-gate\nwhole_binary_sass_ldl
     >"$OUTPUT_DIR/adversarial-smoke.log" 2>&1
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "adversarial exactness smoke failed"
+grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/adversarial-smoke.log" ||
+    die "one or more prototype smoke outputs were not exact"
 
 if (( RUN_SANITIZER )); then
     compute-sanitizer --tool memcheck --error-exitcode 97 \
@@ -108,6 +110,8 @@ fi
     >"$OUTPUT_DIR/timing.log" 2>&1
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||
     die "timed exactness run failed"
+grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/timing.log" ||
+    die "one or more timed prototype outputs were not exact"
 
-printf 'SM75 exact compact-attention KV experiment complete: %s\n' "$OUTPUT_DIR"
-tail -n 16 "$OUTPUT_DIR/timing.log"
+printf 'SM75 exact compact-attention KV throughput prototypes complete: %s\n' "$OUTPUT_DIR"
+tail -n 45 "$OUTPUT_DIR/timing.log"
