@@ -39414,24 +39414,36 @@ static int metal_graph_prompt_logits_test(
                     free(gpu_comp_h);
                 } else if (g.attn_comp_cache_format ==
                            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) {
+                    const int comp_tier =
+                        ds4_gpu_tensor_device(g.layer_attn_comp_cache[il]);
+                    const int saved_tier = g.placement ? g.active_tier : 0;
+                    ds4_gpu_tensor *stage =
+                        comp_tier >= 0 && comp_tier < DS4_MAX_GPUS
+                            ? g.attn_comp_stage_by_tier[comp_tier]
+                            : NULL;
                     uint32_t done = 0;
-                    comp_read = true;
-                    while (done < n_comp) {
+                    comp_read = stage &&
+                        ds4_gpu_tensor_device(stage) == comp_tier &&
+                        ds4_gpu_set_current_device(comp_tier) == 0;
+                    while (comp_read && done < n_comp) {
                         uint32_t nr = n_comp - done;
                         if (nr > g.attn_comp_stage_cap) {
                             nr = g.attn_comp_stage_cap;
                         }
                         if (!ds4_gpu_attn_compact_unpack_tensor(
-                                metal_graph_attn_comp_stage(&g), 0u,
+                                stage, 0u,
                                 g.layer_attn_comp_cache[il], done, nr) ||
                             !ds4_gpu_tensor_read(
-                                metal_graph_attn_comp_stage(&g), 0,
+                                stage, 0,
                                 gpu_comp + (uint64_t)done * DS4_N_HEAD_DIM,
                                 (uint64_t)nr * DS4_N_HEAD_DIM * sizeof(float))) {
                             comp_read = false;
                             break;
                         }
                         done += nr;
+                    }
+                    if (ds4_gpu_set_current_device(saved_tier) != 0) {
+                        comp_read = false;
                     }
                 } else {
                     comp_read = ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
@@ -52780,6 +52792,51 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     return 0;
 }
 
+/* Session I/O runs outside the layer dispatch loop, so active_tier still names
+ * whichever pipeline stage ran last. Select scratch from the cache tensor's
+ * actual owner instead; compact pack/unpack kernels require both tensors and
+ * the current CUDA device to agree. */
+static int payload_select_attn_comp_stage(
+        ds4_gpu_graph *g, uint32_t il, ds4_gpu_tensor **stage_out,
+        int *saved_tier_out, char *err, size_t errlen) {
+    if (!g || il >= DS4_N_LAYER || !g->layer_attn_comp_cache[il] ||
+        !stage_out || !saved_tier_out) {
+        payload_set_err(err, errlen,
+                        "invalid compact attention cache staging request");
+        return 1;
+    }
+
+    const int layer_tier =
+        ds4_gpu_tensor_device(g->layer_attn_comp_cache[il]);
+    const int saved_tier = g->placement ? g->active_tier : 0;
+    if (layer_tier < 0 || layer_tier >= DS4_MAX_GPUS ||
+        saved_tier < 0 || saved_tier >= DS4_MAX_GPUS ||
+        !g->attn_comp_stage_by_tier[layer_tier] ||
+        ds4_gpu_tensor_device(g->attn_comp_stage_by_tier[layer_tier]) !=
+            layer_tier) {
+        payload_set_err(err, errlen,
+                        "compact attention cache staging tier is invalid");
+        return 1;
+    }
+    if (ds4_gpu_set_current_device(layer_tier) != 0) {
+        payload_set_err(err, errlen,
+                        "failed to select compact attention cache device");
+        return 1;
+    }
+
+    *stage_out = g->attn_comp_stage_by_tier[layer_tier];
+    *saved_tier_out = saved_tier;
+    return 0;
+}
+
+static int payload_restore_attn_comp_stage_device(
+        int saved_tier, char *err, size_t errlen) {
+    if (ds4_gpu_set_current_device(saved_tier) == 0) return 0;
+    payload_set_err(err, errlen,
+                    "failed to restore CUDA device after compact cache I/O");
+    return 1;
+}
+
 static int payload_write_attn_comp_cache_as_f32(
         FILE *fp, ds4_gpu_graph *g, uint32_t il, uint32_t rows,
         uint8_t *buf, size_t cap, char *err, size_t errlen) {
@@ -52797,29 +52854,41 @@ static int payload_write_attn_comp_cache_as_f32(
     }
     if (g->attn_comp_cache_format !=
             DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT ||
-        !metal_graph_attn_comp_stage(g) || g->attn_comp_stage_cap == 0u) {
+        g->attn_comp_stage_cap == 0u) {
         payload_set_err(err, errlen,
                         "unsupported compressed-attention cache format");
         return 1;
     }
+    ds4_gpu_tensor *stage = NULL;
+    int saved_tier = 0;
+    if (payload_select_attn_comp_stage(
+            g, il, &stage, &saved_tier, err, errlen) != 0) {
+        return 1;
+    }
+    int rc = 0;
     uint32_t done = 0;
     while (done < rows) {
         uint32_t n = rows - done;
         if (n > g->attn_comp_stage_cap) n = g->attn_comp_stage_cap;
         if (!ds4_gpu_attn_compact_unpack_tensor(
-                metal_graph_attn_comp_stage(g), 0u,
+                stage, 0u,
                 g->layer_attn_comp_cache[il], done, n) ||
             payload_write_tensor_span(
-                fp, metal_graph_attn_comp_stage(g), 0,
+                fp, stage, 0,
                 (uint64_t)n * DS4_N_HEAD_DIM * sizeof(float),
                 buf, cap, err, errlen) != 0) {
             payload_set_err(err, errlen,
                             "failed to expand compact attention cache");
-            return 1;
+            rc = 1;
+            break;
         }
         done += n;
     }
-    return 0;
+    if (payload_restore_attn_comp_stage_device(
+            saved_tier, err, errlen) != 0) {
+        rc = 1;
+    }
+    return rc;
 }
 
 static int payload_read_attn_comp_cache_from_f32(
@@ -52841,29 +52910,41 @@ static int payload_read_attn_comp_cache_from_f32(
     }
     if (g->attn_comp_cache_format !=
             DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT ||
-        !metal_graph_attn_comp_stage(g) || g->attn_comp_stage_cap == 0u) {
+        g->attn_comp_stage_cap == 0u) {
         payload_set_err(err, errlen,
                         "unsupported compressed-attention cache format");
         return 1;
     }
+    ds4_gpu_tensor *stage = NULL;
+    int saved_tier = 0;
+    if (payload_select_attn_comp_stage(
+            g, il, &stage, &saved_tier, err, errlen) != 0) {
+        return 1;
+    }
+    int rc = 0;
     uint32_t done = 0;
     while (done < rows) {
         uint32_t n = rows - done;
         if (n > g->attn_comp_stage_cap) n = g->attn_comp_stage_cap;
         if (payload_read_tensor_span(
-                fp, metal_graph_attn_comp_stage(g), 0,
+                fp, stage, 0,
                 (uint64_t)n * DS4_N_HEAD_DIM * sizeof(float),
                 buf, cap, remaining, err, errlen) != 0 ||
             !ds4_gpu_attn_compact_pack_tensor(
                 g->layer_attn_comp_cache[il], done,
-                metal_graph_attn_comp_stage(g), 0u, n)) {
+                stage, 0u, n)) {
             payload_set_err(err, errlen,
                             "failed to restore compact attention cache");
-            return 1;
+            rc = 1;
+            break;
         }
         done += n;
     }
-    return 0;
+    if (payload_restore_attn_comp_stage_device(
+            saved_tier, err, errlen) != 0) {
+        rc = 1;
+    }
+    return rc;
 }
 
 static int payload_write_glm_compact_span(FILE *fp, const ds4_gpu_tensor *tensor,
