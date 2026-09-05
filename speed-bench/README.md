@@ -5791,6 +5791,14 @@ frontier (`CTX_TOKENS=2048`) first to cover multi-microbatch cache/state
 evolution before returning to 32K.  `MATCH_PAIR1_INDEXER=0` reproduces the old
 asymmetric diagnostic only.
 
+The first PP2048 invocation completed the control workload at 464.10 prefill
+tok/s and emitted its frontier logits, then the harness incorrectly required a
+pair-0 indexer split.  At PP2048 the ratio-4 compressed history is exactly the
+512-row top-k width; production deliberately dispatches split score/top-k only
+when `n_comp > 512`.  Validation is now context-aware: PP2048 requires no
+pair-0 indexer dispatch, while longer frontiers still require it.  This was a
+post-run assertion failure, not a control execution failure.
+
 ```bash
 CACHE_AUDIT_ONLY=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh

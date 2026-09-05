@@ -196,8 +196,18 @@ for variant in "${variants[@]}"; do
         die "$variant missed a required native-GGUF execution binding"
     ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$base.log" ||
         die "$variant unexpectedly enabled unstable pair 0"
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$base.log" ||
-        die "$variant did not preserve pair-0 indexer splitting"
+    if (( CTX_TOKENS > 2048 )); then
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
+            "$base.log" ||
+            die "$variant did not preserve pair-0 indexer splitting"
+    else
+        # The all43 ratio-4 cache contains exactly TOP_K=512 rows at PP2048.
+        # Split score/top-k dispatch begins only when n_comp > TOP_K, so the
+        # absence of this line is the correct short-frontier control behavior.
+        ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
+            "$base.log" ||
+            die "$variant unexpectedly dispatched pair-0 indexer splitting at PP2048"
+    fi
     if [[ $variant == headshard ]]; then
         grep -Fq 'required-native=171/171' "$base.log" ||
             die "candidate did not materialize 21 pair-1 T32/A binding pairs"
