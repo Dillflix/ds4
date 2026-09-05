@@ -13112,7 +13112,6 @@ __global__ static void sm75_compact_attn_materialize_hybrid_chunk_kernel(
     const uint32_t selected = chunk_start + local_row;
     if (selected >= comp_count) return;
 
-    const uint32_t lane = threadIdx.x & 31u;
     const uint32_t source_row = (uint32_t)topk[
         (uint64_t)token * top_k + selected];
     const cuda_sm75_compact_attn_kv_row *src = compact_rows + source_row;
