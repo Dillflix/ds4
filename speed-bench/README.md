@@ -5555,6 +5555,12 @@ are reported explicitly. A parallel compute envelope is projected from the
 slower owner plus merge time before transport; it is not called an end-to-end
 speedup.
 
+Each partial-state record reserves two padding floats after `(max, sum)` so
+the 512-float numerator begins at a 16-byte boundary and every subsequent
+record preserves that alignment. The report distinguishes the 514-float
+logical payload from the 516-float aligned transfer allocation; modeled
+transport uses the latter rather than hiding the eight-byte-per-head padding.
+
 This is deliberately not the existing 32-head-per-GPU policy. A head shard
 needs every selected cache row on each GPU, which recreates the history mirror
 we are trying to remove. With authoritative row shards, each owner must instead

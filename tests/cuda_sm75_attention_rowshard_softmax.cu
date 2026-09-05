@@ -40,7 +40,9 @@ enum {
     TOP_K = 512,
     OWNER_TOP_K = TOP_K / 2,
     THREADS = 256,
-    STATE_FLOATS = HEAD_DIM + 2,
+    STATE_HEADER_FLOATS = 4,
+    STATE_LOGICAL_FLOATS = HEAD_DIM + 2,
+    STATE_FLOATS = HEAD_DIM + STATE_HEADER_FLOATS,
     GUARD_BYTES = 256,
     CANARY = 0xa5,
 };
@@ -55,6 +57,8 @@ struct __align__(32) CompactAttentionKVRow {
 static_assert(N_SCALE == 7, "compact row scale count changed");
 static_assert(sizeof(CompactAttentionKVRow) == 736,
               "compact compressed-attention row must remain 736 bytes");
+static_assert((STATE_FLOATS * sizeof(float)) % alignof(float4) == 0,
+              "partial-state records must preserve float4 alignment");
 
 struct GuardedBuffer {
     uint8_t *base;
@@ -340,7 +344,7 @@ __global__ static void owner_partial_kernel(
         state[0] = max_score;
         state[1] = sum;
     }
-    float4 *numerator = (float4 *)(state + 2u);
+    float4 *numerator = (float4 *)(state + STATE_HEADER_FLOATS);
     numerator[lane + 0u] = o0;
     numerator[lane + 32u] = o1;
     numerator[lane + 64u] = o2;
@@ -371,8 +375,8 @@ __global__ static void merge_partial_states_kernel(
     const float old_scale = expf(merged_max - final_max);
     denominator = denominator * old_scale + expf(sinks[head] - final_max);
     const float numerator =
-        (state0[state_offset + 2u + d] * scale0 +
-         state1[state_offset + 2u + d] * scale1) * old_scale;
+        (state0[state_offset + STATE_HEADER_FLOATS + d] * scale0 +
+         state1[state_offset + STATE_HEADER_FLOATS + d] * scale1) * old_scale;
     out[((uint64_t)token * N_HEAD + head) * HEAD_DIM + d] =
         denominator == 0.0f ? 0.0f : numerator / denominator;
 }
@@ -627,8 +631,10 @@ int main(int argc, char **argv) {
     const size_t owner_topk_bytes =
         (size_t)n_tokens * OWNER_TOP_K * sizeof(int32_t);
     const size_t output_bytes = query_bytes;
-    const size_t state_bytes =
+    const size_t state_storage_bytes =
         (size_t)n_tokens * N_HEAD * STATE_FLOATS * sizeof(float);
+    const size_t state_logical_bytes =
+        (size_t)n_tokens * N_HEAD * STATE_LOGICAL_FLOATS * sizeof(float);
 
     CompactAttentionKVRow *host_rows =
         (CompactAttentionKVRow *)malloc(full_bytes);
@@ -660,8 +666,10 @@ int main(int argc, char **argv) {
         guarded_alloc(owner_topk_bytes, "allocate owner0 local top-k");
     GuardedBuffer d_owner1_topk =
         guarded_alloc(owner_topk_bytes, "allocate owner1 local top-k");
-    GuardedBuffer d_state0 = guarded_alloc(state_bytes, "allocate owner0 state");
-    GuardedBuffer d_state1 = guarded_alloc(state_bytes, "allocate owner1 state");
+    GuardedBuffer d_state0 =
+        guarded_alloc(state_storage_bytes, "allocate owner0 state");
+    GuardedBuffer d_state1 =
+        guarded_alloc(state_storage_bytes, "allocate owner1 state");
     GuardedBuffer d_control = guarded_alloc(output_bytes, "allocate control output");
     GuardedBuffer d_ordered = guarded_alloc(output_bytes, "allocate ordered output");
     GuardedBuffer d_parallel = guarded_alloc(output_bytes, "allocate parallel output");
@@ -826,7 +834,8 @@ int main(int argc, char **argv) {
     const uint64_t compact_cache_bytes = full_bytes;
     const uint64_t compact_cache_256k_bytes =
         (256ull * 1024ull / 4ull) * sizeof(CompactAttentionKVRow);
-    const uint64_t state_handoff_bytes = state_bytes;
+    const uint64_t state_handoff_logical_bytes = state_logical_bytes;
+    const uint64_t state_handoff_aligned_bytes = state_storage_bytes;
     const uint64_t query_f32_bytes = query_bytes;
     const uint64_t query_f16_bytes = query_bytes / 2u;
     const uint64_t remote_selection_route_bytes = owner_topk_bytes;
@@ -868,8 +877,12 @@ int main(int argc, char **argv) {
     printf("projected_43_layer_f32_cache_256k_bytes=%llu\n",
            (unsigned long long)f32_cache_43_layer_256k_bytes);
     printf("partial_state_payload=max-sum-numerator-f32-512\n");
-    printf("remote_state_handoff_bytes=%llu\n",
-           (unsigned long long)state_handoff_bytes);
+    printf("partial_state_alignment_padding_floats_per_head=%u\n",
+           STATE_HEADER_FLOATS - 2u);
+    printf("remote_state_logical_payload_bytes=%llu\n",
+           (unsigned long long)state_handoff_logical_bytes);
+    printf("remote_state_aligned_transfer_bytes=%llu\n",
+           (unsigned long long)state_handoff_aligned_bytes);
     printf("query_replication_f32_bytes=%llu\n",
            (unsigned long long)query_f32_bytes);
     printf("query_replication_f16_bytes=%llu\n",
@@ -879,10 +892,10 @@ int main(int argc, char **argv) {
     printf("remote_selection_route_bytes=%llu\n",
            (unsigned long long)remote_selection_route_bytes);
     printf("minimum_modeled_transport_f32_query_bytes=%llu\n",
-           (unsigned long long)(state_handoff_bytes + query_f32_bytes +
+           (unsigned long long)(state_handoff_aligned_bytes + query_f32_bytes +
                                 remote_selection_route_bytes));
     printf("minimum_modeled_transport_f16_query_bytes=%llu\n",
-           (unsigned long long)(state_handoff_bytes + query_f16_bytes +
+           (unsigned long long)(state_handoff_aligned_bytes + query_f16_bytes +
                                 remote_selection_route_bytes));
     printf("ordered_local_address_bit_mismatches=%llu\n",
            (unsigned long long)ordered_mismatches);
