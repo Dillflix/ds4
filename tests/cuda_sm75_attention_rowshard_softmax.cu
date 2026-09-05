@@ -60,6 +60,18 @@ static_assert(sizeof(CompactAttentionKVRow) == 736,
 static_assert((STATE_FLOATS * sizeof(float)) % alignof(float4) == 0,
               "partial-state records must preserve float4 alignment");
 
+static void *host_alloc_aligned(
+        size_t alignment, size_t bytes, const char *what) {
+    void *data = NULL;
+    const int rc = posix_memalign(&data, alignment, bytes);
+    if (rc != 0 || !data) {
+        fprintf(stderr, "error: %s: %s\n", what,
+                rc == 0 ? "allocation returned null" : strerror(rc));
+        exit(2);
+    }
+    return data;
+}
+
 struct GuardedBuffer {
     uint8_t *base;
     uint8_t *data;
@@ -637,7 +649,9 @@ int main(int argc, char **argv) {
         (size_t)n_tokens * N_HEAD * STATE_LOGICAL_FLOATS * sizeof(float);
 
     CompactAttentionKVRow *host_rows =
-        (CompactAttentionKVRow *)malloc(full_bytes);
+        (CompactAttentionKVRow *)host_alloc_aligned(
+            alignof(CompactAttentionKVRow), full_bytes,
+            "allocate aligned host cache fixture");
     float *host_query = (float *)malloc(query_bytes);
     float *host_sinks = (float *)malloc(sink_bytes);
     int32_t *host_topk = (int32_t *)malloc(topk_bytes);
@@ -646,10 +660,15 @@ int main(int argc, char **argv) {
     float *host_control = (float *)malloc(output_bytes);
     float *host_ordered = (float *)malloc(output_bytes);
     float *host_parallel = (float *)malloc(output_bytes);
-    if (!host_rows || !host_query || !host_sinks || !host_topk ||
+    if (!host_query || !host_sinks || !host_topk ||
         !host_owner0_topk || !host_owner1_topk ||
         !host_control || !host_ordered || !host_parallel) {
         fprintf(stderr, "error: host allocation failed\n");
+        return 2;
+    }
+    if ((uintptr_t)host_rows % alignof(CompactAttentionKVRow) != 0u) {
+        fprintf(stderr, "error: host cache fixture is not %zu-byte aligned\n",
+                alignof(CompactAttentionKVRow));
         return 2;
     }
     fill_rows(host_rows, n_rows);

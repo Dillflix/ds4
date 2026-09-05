@@ -5574,8 +5574,10 @@ T32 traffic for remote query, one partial state, and the remote owner's local
 selection list. Global Top-K production/partitioning and the small replicated
 raw ring are intentionally outside this first prototype. Compute Sanitizer,
 guard canaries, exact owner-local addressing, and non-finite rejection gate a
-successful run. Physical multi-GPU validation remains required regardless of
-the bounded result.
+successful run. The over-aligned compact-row host fixture is allocated with
+the same explicit 32-byte alignment promised by its type, rather than relying
+on ordinary `malloc` alignment. Physical multi-GPU validation remains required
+regardless of the bounded result.
 
 ```bash
 PROFILE_GPU=0 \
