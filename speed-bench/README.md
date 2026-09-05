@@ -5657,6 +5657,13 @@ shared validator still required the full PP512/4096/32768 inventory. No compact
 arm ran, so that archive contains no compact-cache diagnosis. The validator
 now keys its expected frontier inventory to the requested diagnostic maximum.
 
+The follow-up `20260905T232957Z` attempt again completed both F32 frontiers,
+then exposed a second runner-only validation error: the shared validator
+required nonzero steady-decode throughput even for a one-token diagnostic.
+One-token output correctly has zero steady tokens and zero steady throughput.
+The validator now accepts that exact case while retaining positive first-token
+latency/throughput checks; no compact arm ran in that archive either.
+
 `DIAGNOSTIC_DECODE_PROFILE=1` generates two PP512 decode tokens and captures
 exactly the second in Nsight Systems for both F32 and compact caches. The first
 token primes common cross-device bounce state; excluding it prevents one-time

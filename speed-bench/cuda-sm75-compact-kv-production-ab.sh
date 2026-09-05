@@ -283,13 +283,17 @@ validate_csv() {
     [[ $ctx_max == 4096 || $ctx_max == 32768 ]] || return 1
     awk -F, -v tg="$expected_tokens" -v max="$ctx_max" '
         NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
-                       $4=="gen_tokens" && $8=="gen_steady_tps"); next}
+                       $4=="gen_tokens" && $5=="gen_tps" &&
+                       $6=="gen_first_ms" && $7=="gen_steady_tokens" &&
+                       $8=="gen_steady_tps"); next}
         NR>1 {
             rows++; ctx=$1+0
             allowed=(ctx==512 || (max>=4096 && ctx==4096) ||
                      (max>=32768 && ctx==32768))
-            if (!allowed || seen[ctx]++ ||
-                ($3+0)<=0 || $4!=tg || ($8+0)<=0) bad=1
+            steady_ok=(tg==1 ? (($7+0)==0 && ($8+0)==0) :
+                                (($7+0)>0 && ($8+0)>0))
+            if (!allowed || seen[ctx]++ || ($3+0)<=0 || $4!=tg ||
+                ($5+0)<=0 || ($6+0)<=0 || !steady_ok) bad=1
         }
         END {
             expected_rows=(max>=32768 ? 3 : 2)
