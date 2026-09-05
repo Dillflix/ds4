@@ -5527,6 +5527,12 @@ Every accepted codec and attention result must be bit-identical to F32.
 Selected-row scratch is reported separately as transient, reusable allocation;
 packing is excluded from persistent-cache consumer timing, while selected-row
 materialization is included because it recurs for every selection. The
+selected-row arm is also decomposed into materialization-only and
+already-materialized F32-consumer timings. Their sum of independent medians is
+diagnostic; the existing combined launch sequence remains the authoritative
+end-to-end result. The selected consumer is paired against the ordinary F32
+consumer to expose any benefit from contiguous top-k ordering independently
+of decode cost. The
 736-byte loader uses aligned code-word loads, half-warp scale broadcast, and
 exact IEEE reconstruction with a boundary fallback. All results remain bounded
 diagnostic evidence, not promotion evidence. Pack status completes

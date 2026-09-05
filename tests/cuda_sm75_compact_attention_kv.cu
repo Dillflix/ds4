@@ -1139,6 +1139,111 @@ static float time_one_throughput_candidate(
     return elapsed / (float)repeats;
 }
 
+static float time_one_selected_materialization(
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        float *selected_rows,
+        uint32_t n_tokens,
+        uint32_t repeats,
+        cudaEvent_t begin,
+        cudaEvent_t end) {
+    const dim3 grid(n_tokens, TOP_K, 1u);
+    cuda_die(cudaEventRecord(begin), "record materialization begin event");
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        compact_materialize_selected_kernel<<<grid, HEAD_DIM / 4u>>>(
+            compact_rows, topk, selected_rows, n_tokens);
+    }
+    cuda_die(cudaEventRecord(end), "record materialization end event");
+    cuda_die(cudaEventSynchronize(end),
+             "synchronize materialization end event");
+    float elapsed = 0.0f;
+    cuda_die(cudaEventElapsedTime(&elapsed, begin, end),
+             "materialization elapsed time");
+    return elapsed / (float)repeats;
+}
+
+/* Decompose the selected-row arm without changing it. Materialization is
+ * measured independently; the selected consumer is measured immediately
+ * after a completed materialization and paired against the ordinary F32
+ * consumer. The sum of medians is diagnostic, while the existing combined
+ * candidate remains the authoritative end-to-end measurement. */
+static void time_selected_components(
+        const float *f32_rows,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const int32_t *selected_identity,
+        const float *sinks,
+        const float *q,
+        float *selected_rows,
+        float *control_out,
+        float *selected_out,
+        uint32_t n_tokens,
+        uint32_t rounds,
+        uint32_t repeats,
+        float *materialization_median,
+        float *control_consumer_median,
+        float *selected_consumer_median,
+        float *consumer_speedup_median) {
+    float *materialization_samples =
+        (float *)malloc((size_t)rounds * sizeof(float));
+    float *control_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    float *selected_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    float *speedup_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    if (!materialization_samples || !control_samples || !selected_samples ||
+        !speedup_samples) {
+        fprintf(stderr, "error: selected component timing allocation failed\n");
+        exit(2);
+    }
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin), "create component begin event");
+    cuda_die(cudaEventCreate(&end), "create component end event");
+
+    time_one_selected_materialization(
+        compact_rows, topk, selected_rows, n_tokens, 1u, begin, end);
+    time_one_consumer(
+        0, selected_rows, compact_rows, selected_identity, sinks, q,
+        selected_out, n_tokens, 1u, begin, end);
+    cuda_die(cudaDeviceSynchronize(), "selected component warmup");
+
+    for (uint32_t round = 0; round < rounds; round++) {
+        materialization_samples[round] = time_one_selected_materialization(
+            compact_rows, topk, selected_rows, n_tokens, repeats,
+            begin, end);
+        if ((round & 1u) == 0u) {
+            control_samples[round] = time_one_consumer(
+                0, f32_rows, compact_rows, topk, sinks, q, control_out,
+                n_tokens, repeats, begin, end);
+            selected_samples[round] = time_one_consumer(
+                0, selected_rows, compact_rows, selected_identity,
+                sinks, q, selected_out, n_tokens, repeats, begin, end);
+        } else {
+            selected_samples[round] = time_one_consumer(
+                0, selected_rows, compact_rows, selected_identity,
+                sinks, q, selected_out, n_tokens, repeats, begin, end);
+            control_samples[round] = time_one_consumer(
+                0, f32_rows, compact_rows, topk, sinks, q, control_out,
+                n_tokens, repeats, begin, end);
+        }
+        speedup_samples[round] =
+            control_samples[round] / selected_samples[round];
+    }
+    qsort(materialization_samples, rounds, sizeof(float), float_compare);
+    qsort(control_samples, rounds, sizeof(float), float_compare);
+    qsort(selected_samples, rounds, sizeof(float), float_compare);
+    qsort(speedup_samples, rounds, sizeof(float), float_compare);
+    *materialization_median = materialization_samples[rounds / 2u];
+    *control_consumer_median = control_samples[rounds / 2u];
+    *selected_consumer_median = selected_samples[rounds / 2u];
+    *consumer_speedup_median = speedup_samples[rounds / 2u];
+
+    cuda_die(cudaEventDestroy(begin), "destroy component begin event");
+    cuda_die(cudaEventDestroy(end), "destroy component end event");
+    free(materialization_samples);
+    free(control_samples);
+    free(selected_samples);
+    free(speedup_samples);
+}
+
 static void time_throughput_candidate_paired(
         ThroughputCandidate candidate,
         const float *f32_rows,
@@ -1744,6 +1849,25 @@ int main(int argc, char **argv) {
             prototype_ms + candidate,
             prototype_speedup + candidate);
     }
+    float selected_materialization_ms = 0.0f;
+    float selected_control_consumer_ms = 0.0f;
+    float selected_consumer_ms = 0.0f;
+    float selected_consumer_speedup = 0.0f;
+    time_selected_components(
+        (const float *)d_rows.data,
+        (const CompactAttentionKVRow *)d_compact.data,
+        (const int32_t *)d_topk.data,
+        (const int32_t *)d_selected_identity.data,
+        (const float *)d_sinks.data,
+        (const float *)d_q.data,
+        (float *)d_selected_rows.data,
+        (float *)d_f32_out.data,
+        (float *)d_candidate_out.data,
+        n_tokens, rounds, repeats,
+        &selected_materialization_ms,
+        &selected_control_consumer_ms,
+        &selected_consumer_ms,
+        &selected_consumer_speedup);
     check_guards(&d_rows, "timed F32 rows");
     check_guards(&d_compact, "timed compact rows");
     check_guards(&d_half_exception, "timed F16-plus-exception rows");
@@ -1809,6 +1933,16 @@ int main(int argc, char **argv) {
                prototype_ms[candidate],
                prototype_speedup[candidate]);
     }
+    printf("selected_component,part=materialization,median_ms=%.9g\n",
+           selected_materialization_ms);
+    printf("selected_component,part=original-f32-consumer,median_ms=%.9g\n",
+           selected_control_consumer_ms);
+    printf("selected_component,part=materialized-f32-consumer,median_ms=%.9g,paired_speedup_median=%.9g\n",
+           selected_consumer_ms, selected_consumer_speedup);
+    printf("selected_component,part=sum-of-independent-medians,median_ms=%.9g\n",
+           selected_materialization_ms + selected_consumer_ms);
+    printf("selected_component_sum_is_diagnostic=1\n");
+    printf("selected_combined_candidate_is_authoritative=1\n");
     printf("alternate_exact_scales=%llu\n",
            (unsigned long long)alternate_scale_count);
     printf("canaries=passed\n");
