@@ -5532,7 +5532,14 @@ already-materialized F32-consumer timings. Their sum of independent medians is
 diagnostic; the existing combined launch sequence remains the authoritative
 end-to-end result. The selected consumer is paired against the ordinary F32
 consumer to expose any benefit from contiguous top-k ordering independently
-of decode cost. The
+of decode cost. With `RUN_NCU=1`, the harness captures exactly one
+`compact_materialize_selected_kernel` launch and validates its 128-thread,
+`ROWS * TOKENS`-CTA geometry. The report includes DRAM read/write traffic,
+load/store sector efficiency, L2 hit rate, integer/conversion/memory
+instruction counts when exposed by the installed Nsight version, occupancy,
+waves, eligible warps, and long-scoreboard/MIO stalls. This separates
+CTA-scheduling, compact-load, reconstruction-instruction, and output-bandwidth
+limits without profiling an attention consumer by mistake. The
 736-byte loader uses aligned code-word loads, half-warp scale broadcast, and
 exact IEEE reconstruction with a boundary fallback. All results remain bounded
 diagnostic evidence, not promotion evidence. Pack status completes
@@ -5547,6 +5554,8 @@ TOKENS=32 \
 TIMING_ROUNDS=7 \
 TIMING_REPEATS=25 \
 RUN_SANITIZER=1 \
+RUN_NCU=1 \
+NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
