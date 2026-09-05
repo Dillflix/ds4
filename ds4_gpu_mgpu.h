@@ -30,6 +30,14 @@ extern "C" {
 
 #define DS4_MAX_GPUS 16
 
+/* Persistent compressed-attention KV representation.  Keep the numeric
+ * values stable: the existing GPU ABI historically used 0/1 as an F32/F16
+ * boolean, so the exact SM75 codec is the first explicit non-boolean value. */
+#define DS4_GPU_ATTN_COMP_CACHE_F32          0u
+#define DS4_GPU_ATTN_COMP_CACHE_F16          1u
+#define DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT 2u
+#define DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES 736u
+
 /* Complete definition of the previously-opaque ds4_gpu_tensor, plus a
  * typedef so the new API prototypes below can use the bare name
  * `ds4_gpu_tensor *` in both C and C++ without forcing callers to

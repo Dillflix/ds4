@@ -5498,6 +5498,7 @@ REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
+```
 
 ### Bounded exact compact-attention KV codec
 
@@ -5554,11 +5555,13 @@ waves, eligible warps, and long-scoreboard/MIO stalls. This separates
 CTA-scheduling, compact-load, reconstruction-instruction, and output-bandwidth
 limits without profiling an attention consumer by mistake. The
 736-byte loader uses aligned code-word loads, half-warp scale broadcast, and
-exact IEEE reconstruction with a boundary fallback. All results remain bounded
-diagnostic evidence, not promotion evidence. Pack status completes
-asynchronously; a future caller must observe `PACK_OK` before committing or
-using a destination row. The reported SASS LDL/STL counts are explicitly
-whole-binary diagnostics, not a per-kernel acceptance gate.
+exact IEEE reconstruction with a boundary fallback. All results in this
+section remain bounded diagnostic evidence. The standalone packer verifies
+row status before accepting output. The production source contract is the
+already-FP8-rounded finite cache row; persistent rows retain fail-closed status
+metadata, and cold unpack/checkpoint export propagates a rejected row as NaN
+instead of silently accepting altered data. The reported SASS LDL/STL counts
+are explicitly whole-binary diagnostics, not a per-kernel acceptance gate.
 
 The 262144-row diagnostic selected H16 over H8: H16 reached `0.93723x` of its
 paired F32 control, while H8 reached `0.92365x`. H16 attention-only was already
@@ -5566,6 +5569,11 @@ slightly faster than the paired F32 control (`1.04887 ms` versus `1.06011 ms`),
 but the complete pipeline hid only about `0.013 ms` of `0.0969 ms`
 materialization. The priority A/B therefore keeps the selected representation,
 chunk size, H16 kernel, and arithmetic fixed and changes only CUDA scheduling.
+The accepted `20260905T043103Z` 256K rerun was bit-exact and sanitizer-clean;
+high-priority attention reached `0.98930x` of F32 versus `0.93886x` at default
+priority. At that context the all43 persistent cache estimate falls from
+23085449216 to 8296333312 bytes, a 64.0625% reduction (14789115904 bytes),
+while the two reusable hybrid buffers remain about 18 MiB for 32 tokens.
 
 ```bash
 PROFILE_GPU=0 \
@@ -5579,4 +5587,42 @@ NCU_USE_SUDO=1 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
+```
+
+### SM75 exact compact-attention KV production A/B
+
+`cuda-sm75-compact-kv-production-ab.sh` compares the ordinary persistent F32
+compressed-attention cache with the exact 736-byte SM75 cache on the same
+tagged-native all43 model. The candidate keeps persistent compact rows,
+materializes only selected rows into two reusable 256-row hybrid buffers
+(`448 x FP16 + 64 x FP32`), and consumes those buffers with high-priority H16
+indexed attention. Large-token prefill consumes the exact compact rows
+directly. The engine preserves F32 session/checkpoint payloads at the external
+boundary.
+
+The one-shot qualification allocates 256K context capacity while measuring
+the PP512/4096/32768 frontiers. It requires byte-identical prefill and decode
+logits, unchanged four-GPU health, at least 12000 MiB aggregate peak-VRAM
+savings, no throughput frontier below `0.95x`, the stable 22/21 pipeline and
+pair policy, and actual compact-hybrid dispatch. F32 remains the default until
+this production gate passes; `DS4_CUDA_ATTN_COMP_CACHE=sm75-compact` is the
+candidate selector and `f32` is the immediate rollback.
+
+```bash
+MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 \
+GPU_VRAM=auto \
+STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+CTX_ALLOC=262145 \
+TG_TOKENS=256 \
+EXACT_TOKENS=16 \
+TELEMETRY_INTERVAL_MS=200 \
+CASE_TIMEOUT_SECONDS=1800 \
+MIN_COMPACT_VRAM_SAVING_MIB=12000 \
+MIN_THROUGHPUT_RATIO=0.95 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-compact-kv-production-ab.sh
 ```

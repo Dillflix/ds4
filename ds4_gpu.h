@@ -1062,6 +1062,46 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Exact SM75 persistent compressed-attention cache codec.  The source of a
+ * pack is the existing already-FP8-rounded F32 cache row.  Pack tags any row
+ * that cannot be reconstructed bit-for-bit; cold unpack propagates NaNs so
+ * validation fails closed instead of accepting a changed row. */
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+static inline int ds4_gpu_attn_compact_supported(void) { return 0; }
+static inline int ds4_gpu_attn_compact_pack_tensor(
+        ds4_gpu_tensor       *dst,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src_f32,
+        uint32_t              src_row,
+        uint32_t              rows) {
+    (void)dst; (void)dst_row; (void)src_f32; (void)src_row; (void)rows;
+    return 0;
+}
+static inline int ds4_gpu_attn_compact_unpack_tensor(
+        ds4_gpu_tensor       *dst_f32,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src,
+        uint32_t              src_row,
+        uint32_t              rows) {
+    (void)dst_f32; (void)dst_row; (void)src; (void)src_row; (void)rows;
+    return 0;
+}
+#else
+int ds4_gpu_attn_compact_supported(void);
+int ds4_gpu_attn_compact_pack_tensor(
+        ds4_gpu_tensor       *dst,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src_f32,
+        uint32_t              src_row,
+        uint32_t              rows);
+int ds4_gpu_attn_compact_unpack_tensor(
+        ds4_gpu_tensor       *dst_f32,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src,
+        uint32_t              src_row,
+        uint32_t              rows);
+#endif
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,

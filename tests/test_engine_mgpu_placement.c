@@ -1363,11 +1363,13 @@ static void test_cuda_tp_decode_indexer_rows_default(void) {
 
 static void test_sm75_native_indexer_cache_accounting(void) {
     fprintf(stderr, "RUN: test_sm75_native_indexer_cache_accounting\n");
+    char *old_attn = save_env_value("DS4_CUDA_ATTN_COMP_CACHE");
     ds4_test_seed_compress_ratios();
     const int ctx = 262273;
     const uint32_t layer = 2u; /* Flash ratio-4/indexer layer. */
     const uint32_t comp_cap = (uint32_t)ctx / 4u + 2u;
     const uint32_t padded_cap = (comp_cap + 63u) & ~63u;
+    setenv("DS4_CUDA_ATTN_COMP_CACHE", "f32", 1);
     const size_t f32 = ds4_test_deepseek_per_layer_kv_bytes(
             layer, ctx, 2048u, false);
     const size_t f16 = ds4_test_deepseek_per_layer_kv_bytes(
@@ -1379,6 +1381,19 @@ static void test_sm75_native_indexer_cache_accounting(void) {
           "native F16 indexer cache reduces ratio-4 per-layer KV bytes");
     CHECK(f32 - f16 == expected_saving,
           "native F16 indexer cache planner includes exact 64-row padding");
+
+    setenv("DS4_CUDA_ATTN_COMP_CACHE", "sm75-compact", 1);
+    const size_t compact = ds4_test_deepseek_per_layer_kv_bytes(
+            layer, ctx, 2048u, false);
+    const size_t expected_attn_saving = (size_t)comp_cap *
+        (512u * sizeof(float) -
+         DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES);
+    CHECK(f32 > compact,
+          "exact compact attention cache reduces ratio-4 per-layer KV bytes");
+    CHECK(f32 - compact == expected_attn_saving,
+          "compact attention cache planner uses the exact 736-byte row ABI");
+
+    restore_env_value("DS4_CUDA_ATTN_COMP_CACHE", old_attn);
     ds4_test_clear_compress_ratios();
 }
 
