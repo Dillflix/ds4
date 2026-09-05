@@ -62845,6 +62845,14 @@ void ds4_session_free(ds4_session *s) {
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
+            /* The compact consumer owns backend-global nonblocking streams,
+             * events, and scratch. Tear them down before freeing the session
+             * tensors they were ordered against; a replacement session must
+             * not inherit dependency state from the warm-up graph. */
+            if (s->graph.attn_comp_cache_format ==
+                    DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) {
+                ds4_gpu_attn_compact_runtime_reset();
+            }
             metal_graph_free(&s->graph);
         }
     }

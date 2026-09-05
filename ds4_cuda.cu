@@ -25131,6 +25131,27 @@ static void cuda_sm75_hybrid_attn_release_one(int logical_tier) {
     memset(c, 0, sizeof(*c));
 }
 
+extern "C" void ds4_gpu_attn_compact_runtime_reset(void) {
+    int saved_device = -1;
+    (void)cudaGetDevice(&saved_device);
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        if (!g_sm75_hybrid_attn[tier].initialized) continue;
+        if (cudaSetDevice(g_gpu[tier].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        cuda_sm75_hybrid_attn_release_one(tier);
+    }
+    if (saved_device >= 0) (void)cudaSetDevice(saved_device);
+    g_current_logical_tier = -1;
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        if (g_gpu[tier].device_id == saved_device) {
+            g_current_logical_tier = tier;
+            break;
+        }
+    }
+}
+
 static int cuda_sm75_hybrid_attn_init(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
     cuda_sm75_hybrid_attn_context *c = &g_sm75_hybrid_attn[logical_tier];

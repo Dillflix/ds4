@@ -1086,6 +1086,7 @@ static inline int ds4_gpu_attn_compact_unpack_tensor(
     (void)dst_f32; (void)dst_row; (void)src; (void)src_row; (void)rows;
     return 0;
 }
+static inline void ds4_gpu_attn_compact_runtime_reset(void) {}
 #else
 int ds4_gpu_attn_compact_supported(void);
 int ds4_gpu_attn_compact_pack_tensor(
@@ -1100,6 +1101,7 @@ int ds4_gpu_attn_compact_unpack_tensor(
         const ds4_gpu_tensor *src,
         uint32_t              src_row,
         uint32_t              rows);
+void ds4_gpu_attn_compact_runtime_reset(void);
 #endif
 
 int ds4_gpu_dsv4_indexer_qat_tensor(
