@@ -6,6 +6,7 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -144,6 +145,8 @@ static_assert(sizeof(cuda_sm75_native_q8_K) == sizeof(cuda_block_q8_K),
 static_assert(sizeof(cuda_sm75_compact_attn_kv_row) ==
                   736u,
               "SM75 compact attention KV row ABI mismatch");
+static_assert(offsetof(cuda_sm75_compact_attn_kv_row, status) == 28u,
+              "SM75 compact attention KV status offset mismatch");
 static_assert(sizeof(cuda_sm75_hybrid_attn_kv_row) == 1152u,
               "SM75 hybrid attention KV row ABI mismatch");
 
@@ -24492,7 +24495,49 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
                 DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES),
         (const float *)src_f32->ptr + (uint64_t)src_row * 512u,
         rows);
-    return cuda_ok(cudaGetLastError(), "SM75 compact attention KV pack launch");
+    if (!cuda_ok(cudaGetLastError(),
+                 "SM75 compact attention KV pack launch")) {
+        return 0;
+    }
+    if (getenv("DS4_CUDA_COMPACT_ATTN_PACK_AUDIT") != NULL) {
+        uint32_t *status = (uint32_t *)malloc((size_t)rows * sizeof(*status));
+        if (!status) {
+            fprintf(stderr,
+                    "ds4: compact attention pack audit host allocation "
+                    "failed rows=%u\n",
+                    rows);
+            return 0;
+        }
+        const uint8_t *status_src = (const uint8_t *)dst->ptr +
+            (uint64_t)dst_row *
+                DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES +
+            offsetof(cuda_sm75_compact_attn_kv_row, status);
+        const cudaError_t audit_rc = cudaMemcpy2D(
+            status, sizeof(*status), status_src,
+            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES,
+            sizeof(*status), rows, cudaMemcpyDeviceToHost);
+        if (audit_rc != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: compact attention pack audit read failed "
+                    "dst-row=%u rows=%u: %s\n",
+                    dst_row, rows, cudaGetErrorString(audit_rc));
+            free(status);
+            return 0;
+        }
+        for (uint32_t row = 0; row < rows; row++) {
+            if (status[row] != 0u) {
+                fprintf(stderr,
+                        "ds4: compact attention pack audit rejected "
+                        "dst-row=%u local-row=%u status=0x%x "
+                        "(nonfinite=0x1 unrepresentable=0x2)\n",
+                        dst_row + row, row, status[row]);
+                free(status);
+                return 0;
+            }
+        }
+        free(status);
+    }
+    return 1;
 }
 extern "C" int ds4_gpu_attn_compact_unpack_tensor(
         ds4_gpu_tensor *dst_f32, uint32_t dst_row,

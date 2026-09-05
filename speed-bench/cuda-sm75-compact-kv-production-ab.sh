@@ -25,6 +25,8 @@ Optional environment:
   CASE_TIMEOUT_SECONDS=1800
   MIN_COMPACT_VRAM_SAVING_MIB=12000
   MIN_THROUGHPUT_RATIO=0.95
+  DIAGNOSTIC_PACK_AUDIT=0           1: compact PP512 exact-output run only,
+                                    with per-layer packed-row status checks
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   SKIP_BUILD=0
@@ -55,6 +57,7 @@ TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-12000}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
+DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
@@ -81,10 +84,13 @@ done
 awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
-for flag in DIAGNOSTIC_DECODE_ISOLATION SKIP_BUILD CREATE_ARCHIVE; do
+for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_DECODE_ISOLATION \
+            SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+(( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_DECODE_ISOLATION <= 1 )) ||
+    die "select at most one diagnostic mode"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
 for tool in awk cmp date env find git grep make mkdir mv nproc nvidia-smi \
@@ -306,17 +312,22 @@ validate_exact_inventory() {
 
 run_case() {
     local arm=$1 kind=$2 tokens=$3 base=$4 logits=${5:-}
+    local ctx_max=${6:-32768}
     local rc=0 telemetry="$OUTPUT_DIR/telemetry/$arm-$kind.csv"
     local format=f32
-    local -a cmd
+    local -a audit_env=() cmd
     [[ $arm == compact ]] && format=sm75-compact
+    if [[ $arm == compact && ($kind == exact || $kind == pack-audit) ]]; then
+        audit_env+=(DS4_CUDA_COMPACT_ATTN_PACK_AUDIT=1)
+    fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     start_telemetry "$telemetry"
-    cmd=("${production_env[@]}" "DS4_CUDA_ATTN_COMP_CACHE=$format"
+    cmd=("${production_env[@]}" "${audit_env[@]}"
+        "DS4_CUDA_ATTN_COMP_CACHE=$format"
         ./ds4-bench --cuda --cuda-tensor-parallel
         --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM"
         --model "$MODEL" --prompt-file "$PROMPT"
-        --ctx-start 512 --ctx-max 32768 --ctx-alloc "$CTX_ALLOC"
+        --ctx-start 512 --ctx-max "$ctx_max" --ctx-alloc "$CTX_ALLOC"
         --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
         --gen-tokens "$tokens" --csv "$base.csv")
     if [[ -n $logits ]]; then
@@ -329,8 +340,22 @@ run_case() {
     capture_gpu_health "$base.post-gpu.csv" || return 1
     [[ $rc == 0 ]] || return "$rc"
     [[ -s $telemetry && $(wc -l <"$telemetry") -ge 4 ]] || return 1
-    validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
-        validate_topology "$base.log" && validate_selector "$arm" "$base.log"
+    if [[ $ctx_max == 512 ]]; then
+        validate_health "$base" &&
+            awk -F, -v tg="$tokens" '
+                NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
+                               $4=="gen_tokens" && $8=="gen_steady_tps"); next}
+                NR==2 {row=($1==512 && ($3+0)>0 && $4==tg && ($8+0)>0)}
+                END {exit !(header && NR==2 && row)}
+            ' "$base.csv" &&
+            grep -Fq \
+                'compressed-attention cache format=sm75-compact-exact row-bytes=736' \
+                "$base.log"
+    else
+        validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
+            validate_topology "$base.log" &&
+            validate_selector "$arm" "$base.log"
+    fi
 }
 
 run_decode_isolation_case() {
@@ -385,6 +410,27 @@ run_decode_isolation_case() {
     fi
     return "$rc"
 }
+
+if [[ $DIAGNOSTIC_PACK_AUDIT == 1 ]]; then
+    phase=pack-audit
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    base="$OUTPUT_DIR/exact/compact-pack-audit"
+    logits="$OUTPUT_DIR/exact/compact-pack-audit-logits"
+    mkdir -p "$logits"
+    printf 'Compact-KV PP512 production pack audit...\n'
+    run_case compact pack-audit 1 "$base" "$logits" 512 || {
+        tail -n 240 "$base.log" >&2 || true
+        die "compact PP512 production pack audit failed"
+    }
+    [[ -s $logits/frontier_000512.logits.f32 &&
+       -s $logits/frontier_000512.decode_000001.logits.f32 ]] ||
+        die "compact PP512 production pack audit logit inventory is incomplete"
+    phase=finished
+    printf 'Compact-KV PP512 production pack audit passed: %s\n' \
+        "$OUTPUT_DIR"
+    exit 0
+fi
 
 if [[ $DIAGNOSTIC_DECODE_ISOLATION == 1 ]]; then
     phase=decode-isolation

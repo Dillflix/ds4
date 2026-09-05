@@ -5615,6 +5615,11 @@ pair policy, and actual compact-hybrid dispatch. F32 remains the default until
 this production gate passes; `DS4_CUDA_ATTN_COMP_CACHE=sm75-compact` is the
 candidate selector and `f32` is the immediate rollback.
 
+`DIAGNOSTIC_PACK_AUDIT=1` runs only the PP512 compact exact-output arm and
+checks every packed production row's embedded status before it can be consumed.
+On failure it reports the first layer, destination row, and rejection bits;
+this is a correctness-localization run, not promotion evidence.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \

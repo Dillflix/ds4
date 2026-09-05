@@ -21303,9 +21303,16 @@ static bool metal_graph_store_attn_comp_stage(
     }
     if (g->attn_comp_cache_format ==
         DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) {
-        return ds4_gpu_attn_compact_pack_tensor(
-                   g->layer_attn_comp_cache[il], first_row,
-                   metal_graph_attn_comp_stage(g), 0u, rows) != 0;
+        const bool ok = ds4_gpu_attn_compact_pack_tensor(
+                            g->layer_attn_comp_cache[il], first_row,
+                            metal_graph_attn_comp_stage(g), 0u, rows) != 0;
+        if (!ok && getenv("DS4_CUDA_COMPACT_ATTN_PACK_AUDIT") != NULL) {
+            fprintf(stderr,
+                    "ds4: compact attention pack audit failed "
+                    "layer=%u first-row=%u rows=%u\n",
+                    il, first_row, rows);
+        }
+        return ok;
     }
 
     return ds4_gpu_tensor_copy(g->layer_attn_comp_cache[il],
