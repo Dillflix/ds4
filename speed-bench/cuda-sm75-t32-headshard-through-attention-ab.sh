@@ -164,7 +164,7 @@ for variant in "${variants[@]}"; do
         variant_env+=(
             "DS4_METAL_GRAPH_DUMP_PREFIX=$boundary_dir/$variant"
             "DS4_METAL_GRAPH_DUMP_LAYER=$BOUNDARY_AUDIT_LAYER"
-            DS4_METAL_GRAPH_DUMP_NAME=headshard_audit_q_input,headshard_audit_kv_input,headshard_audit_output_b,headshard_audit_post_attention_hc,headshard_audit_layer_hc
+            DS4_METAL_GRAPH_DUMP_NAME=headshard_audit_q_input,headshard_audit_query_heads0,headshard_audit_query_heads1,headshard_audit_kv_input,headshard_audit_scores_heads0,headshard_audit_scores_heads1,headshard_audit_restored_heads0,headshard_audit_restored_heads1,headshard_audit_output_b,headshard_audit_post_attention_hc,headshard_audit_layer_hc
         )
     fi
     base="$OUTPUT_DIR/production/$variant"
@@ -303,7 +303,13 @@ root = pathlib.Path(sys.argv[1])
 layer = int(sys.argv[2])
 stages = (
     "headshard_audit_q_input",
+    "headshard_audit_query_heads0",
+    "headshard_audit_query_heads1",
     "headshard_audit_kv_input",
+    "headshard_audit_scores_heads0",
+    "headshard_audit_scores_heads1",
+    "headshard_audit_restored_heads0",
+    "headshard_audit_restored_heads1",
     "headshard_audit_output_b",
     "headshard_audit_post_attention_hc",
     "headshard_audit_layer_hc",

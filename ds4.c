@@ -17350,6 +17350,66 @@ static void metal_graph_debug_dump_tensor_last_row(
     ds4_gpu_tensor_free(row);
 }
 
+static void metal_graph_debug_dump_tensor_last_row_slice(
+        const char       *name,
+        ds4_gpu_tensor   *t,
+        uint64_t          row_f32,
+        uint32_t          rows,
+        uint64_t          col0_f32,
+        uint64_t          cols_f32,
+        uint32_t          il,
+        uint32_t          pos0) {
+    if (!t || row_f32 == 0 || rows == 0 || cols_f32 == 0 ||
+        col0_f32 > row_f32 || cols_f32 > row_f32 - col0_f32 ||
+        !metal_graph_debug_wants(name, il, pos0)) return;
+
+    const uint64_t offset =
+        ((uint64_t)(rows - 1u) * row_f32 + col0_f32) * sizeof(float);
+    ds4_gpu_tensor *slice = ds4_gpu_tensor_view(
+            t, offset, cols_f32 * sizeof(float));
+    metal_graph_debug_dump_tensor(name, slice, cols_f32, il, pos0);
+    ds4_gpu_tensor_free(slice);
+}
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static bool metal_graph_debug_dump_pair_last_row_halves(
+        const char       *name0,
+        const char       *name1,
+        ds4_gpu_tensor   *home_tensor,
+        ds4_gpu_tensor   *partner_tensor,
+        uint64_t          row_f32,
+        uint64_t          half_f32,
+        uint32_t          rows,
+        uint32_t          il,
+        uint32_t          pos0,
+        int               home,
+        int               partner) {
+    const bool wants0 = metal_graph_debug_wants(name0, il, pos0);
+    const bool wants1 = metal_graph_debug_wants(name1, il, pos0);
+    if (!wants0 && !wants1) return true;
+    if (!home_tensor || home < 0 || ds4_gpu_set_current_device(home) != 0)
+        return false;
+    if (wants0) {
+        metal_graph_debug_dump_tensor_last_row_slice(
+            name0, home_tensor, row_f32, rows, 0u, half_f32, il, pos0);
+    }
+    if (wants1 && partner_tensor) {
+        if (partner < 0 || ds4_gpu_set_current_device(partner) != 0)
+            return false;
+        metal_graph_debug_dump_tensor_last_row_slice(
+            name1, partner_tensor, row_f32, rows, half_f32, half_f32,
+            il, pos0);
+        return ds4_gpu_set_current_device(home) == 0;
+    }
+    if (wants1) {
+        metal_graph_debug_dump_tensor_last_row_slice(
+            name1, home_tensor, row_f32, rows, half_f32, half_f32,
+            il, pos0);
+    }
+    return true;
+}
+#endif
+
 static void metal_graph_debug_dump_f16_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -31217,6 +31277,16 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) {
+        const int home = g->active_tier;
+        const int partner = metal_graph_cuda_tp_partner_tier(home);
+        ok = metal_graph_debug_dump_pair_last_row_halves(
+            "headshard_audit_query_heads0",
+            "headshard_audit_query_heads1",
+            g->batch_q_by_tier[home],
+            cuda_tp_prefill_t32_heads ? g->batch_q_by_tier[partner] : NULL,
+            q_dim, q_dim / 2u, n_tokens, il, pos0, home, partner);
+    }
     ds4_gpu_q8_audit_clear_context();
 #endif
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
@@ -32551,6 +32621,19 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) {
+        const int home = g->active_tier;
+        const int partner = metal_graph_cuda_tp_partner_tier(home);
+        ok = metal_graph_debug_dump_pair_last_row_halves(
+            "headshard_audit_scores_heads0",
+            "headshard_audit_scores_heads1",
+            g->batch_heads_by_tier[home],
+            cuda_tp_prefill_heads_done ?
+                g->batch_heads_by_tier[partner] : NULL,
+            q_dim, q_dim / 2u, n_tokens, il, pos0, home, partner);
+    }
+#endif
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
@@ -32595,6 +32678,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) {
+        const int home = g->active_tier;
+        const int partner = metal_graph_cuda_tp_partner_tier(home);
+        ok = metal_graph_debug_dump_pair_last_row_halves(
+            "headshard_audit_restored_heads0",
+            "headshard_audit_restored_heads1",
+            g->batch_heads_by_tier[home],
+            cuda_tp_prefill_heads_done ?
+                g->batch_heads_by_tier[partner] : NULL,
+            q_dim, q_dim / 2u, n_tokens, il, pos0, home, partner);
+    }
+#endif
     if (ok && !cuda_tp_attn_row_output.active) {
         metal_graph_debug_dump_tensor("kqv_back", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);

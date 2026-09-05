@@ -5814,6 +5814,17 @@ deliberate evidence: if they make the final logits converge, the remaining
 defect is schedule-sensitive; if only the sampled last rows agree, the report
 states that the divergence lies in another row or after the audited layer.
 
+The corrected layer-22 PP2048 audit found bit-identical normalized q_b and
+current-KV inputs.  Its first difference is the final row of output B in the
+zero-prefix chunk (`pos=0`, RMSE 0.00064110, maximum absolute difference
+0.00276344); the sampled boundaries at positions 512, 1024, and 1536 are all
+bit-identical.  The earlier audit-name collision that accidentally selected
+the legacy `attn_out` debug path has been removed.  The audit now adds the two
+actual production head halves after q_b, after attention and before inverse
+RoPE, and after inverse RoPE.  Those boundaries distinguish live q_b
+materialization from zero-prefix static-mixed attention and its cache inputs,
+then from inverse RoPE/output projection, without another broad 32K run.
+
 ```bash
 CTX_TOKENS=2048 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
