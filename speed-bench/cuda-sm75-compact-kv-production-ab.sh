@@ -23,8 +23,9 @@ Optional environment:
   EXACT_TOKENS=16
   TELEMETRY_INTERVAL_MS=200
   CASE_TIMEOUT_SECONDS=1800
-  MIN_COMPACT_VRAM_SAVING_MIB=12000
-  MIN_THROUGHPUT_RATIO=0.95
+  MIN_COMPACT_VRAM_SAVING_MIB=auto  default: 95% of the topology-derived
+                                    production cache saving
+  MIN_THROUGHPUT_RATIO=1.0
   DIAGNOSTIC_PACK_AUDIT=0           1: F32/compact PP512 one-token exact A/B,
                                     with compact per-layer packed-row checks
   DIAGNOSTIC_PREFILL_ISOLATION=0    1: PP4096 exact F32, compact-hybrid, and
@@ -59,8 +60,8 @@ TG_TOKENS=${TG_TOKENS:-256}
 EXACT_TOKENS=${EXACT_TOKENS:-16}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
-MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-12000}
-MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
+MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-auto}
+MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-1.0}
 DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
 DIAGNOSTIC_PREFILL_ISOLATION=${DIAGNOSTIC_PREFILL_ISOLATION:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
@@ -80,13 +81,30 @@ cmp -s "$PROMPT" "$repo_dir/speed-bench/promessi_sposi.txt" ||
 [[ $GPU_DEVICES == 0,3,1,2 && $GPU_VRAM == auto && $STAGE_SPLIT == 22 ]] ||
     die "require GPU_DEVICES=0,3,1,2, GPU_VRAM=auto, STAGE_SPLIT=22"
 for value in "$CTX_ALLOC" "$TG_TOKENS" "$EXACT_TOKENS" \
-             "$TELEMETRY_INTERVAL_MS" "$CASE_TIMEOUT_SECONDS" \
-             "$MIN_COMPACT_VRAM_SAVING_MIB"; do
+             "$TELEMETRY_INTERVAL_MS" "$CASE_TIMEOUT_SECONDS"; do
     [[ $value =~ ^[1-9][0-9]*$ ]] ||
         die "positive integer required, got: $value"
 done
 (( CTX_ALLOC >= 262145 )) ||
     die "CTX_ALLOC must be at least 262145 for the 256K residency gate"
+ratio4_rows=$((CTX_ALLOC / 4 + 2))
+ratio128_rows=$((CTX_ALLOC / 128 + 2))
+# DeepSeek-V4-Flash has 21 ratio-4 and 20 ratio-128 compressed-attention
+# layers.  With the fixed 22/21 placement, pair 1 mirrors the 11 ratio-4 and
+# 10 ratio-128 late-stage layers.  Compact rows save 2048 - 736 bytes.
+expected_compact_vram_saving_mib=$((
+    1312 * (32 * ratio4_rows + 30 * ratio128_rows) / 1024 / 1024
+))
+if [[ $MIN_COMPACT_VRAM_SAVING_MIB == auto ]]; then
+    # nvidia-smi samples process residency rather than allocator accounting;
+    # retain a small sampling/alignment margin around the exact layout model.
+    MIN_COMPACT_VRAM_SAVING_MIB=$((
+        expected_compact_vram_saving_mib * 95 / 100
+    ))
+else
+    [[ $MIN_COMPACT_VRAM_SAVING_MIB =~ ^[1-9][0-9]*$ ]] ||
+        die "MIN_COMPACT_VRAM_SAVING_MIB must be auto or a positive integer"
+fi
 awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
@@ -261,17 +279,23 @@ start_telemetry() {
 }
 
 validate_csv() {
-    local csv=$1 expected_tokens=$2
-    awk -F, -v tg="$expected_tokens" '
+    local csv=$1 expected_tokens=$2 ctx_max=${3:-32768}
+    [[ $ctx_max == 4096 || $ctx_max == 32768 ]] || return 1
+    awk -F, -v tg="$expected_tokens" -v max="$ctx_max" '
         NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
                        $4=="gen_tokens" && $8=="gen_steady_tps"); next}
         NR>1 {
             rows++; ctx=$1+0
-            if ((ctx!=512 && ctx!=4096 && ctx!=32768) || seen[ctx]++ ||
+            allowed=(ctx==512 || (max>=4096 && ctx==4096) ||
+                     (max>=32768 && ctx==32768))
+            if (!allowed || seen[ctx]++ ||
                 ($3+0)<=0 || $4!=tg || ($8+0)<=0) bad=1
         }
-        END {exit !(header && rows==3 && seen[512] && seen[4096] &&
-                    seen[32768] && !bad)}
+        END {
+            expected_rows=(max>=32768 ? 3 : 2)
+            exit !(header && rows==expected_rows && seen[512] &&
+                   seen[4096] && (max<32768 || seen[32768]) && !bad)
+        }
     ' "$csv"
 }
 
@@ -389,7 +413,8 @@ run_case() {
             ' "$base.csv" &&
             validate_ctx512_selector "$arm" "$base.log"
     else
-        validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
+        validate_health "$base" &&
+            validate_csv "$base.csv" "$tokens" "$ctx_max" &&
             validate_topology "$base.log" &&
             validate_selector "$arm" "$base.log"
     fi

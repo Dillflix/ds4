@@ -5573,9 +5573,12 @@ materialization. The priority A/B therefore keeps the selected representation,
 chunk size, H16 kernel, and arithmetic fixed and changes only CUDA scheduling.
 The accepted `20260905T043103Z` 256K rerun was bit-exact and sanitizer-clean;
 high-priority attention reached `0.98930x` of F32 versus `0.93886x` at default
-priority. At that context the all43 persistent cache estimate falls from
-23085449216 to 8296333312 bytes, a 64.0625% reduction (14789115904 bytes),
-while the two reusable hybrid buffers remain about 18 MiB for 32 tokens.
+priority. The standalone fixture's deliberately synthetic all-43-layer,
+262144-rows-per-layer estimate falls from 23085449216 to 8296333312 bytes, a
+64.0625% reduction. That is not the production allocation: DeepSeek-V4-Flash
+uses 21 ratio-4 layers and 20 ratio-128 layers, so a 262145-token production
+context holds only 65538 or 2050 compressed rows per layer, respectively.
+The two reusable hybrid buffers remain about 18 MiB for 32 tokens.
 
 ```bash
 PROFILE_GPU=0 \
@@ -5620,11 +5623,16 @@ failure can be assigned to measured prefill, teardown, or session I/O.
 
 The one-shot qualification allocates 256K context capacity while measuring
 the PP512/4096/32768 frontiers. It requires byte-identical prefill and decode
-logits, unchanged four-GPU health, at least 12000 MiB aggregate peak-VRAM
-savings, no throughput frontier below `0.95x`, the stable 22/21 pipeline and
-pair policy, and actual compact-hybrid dispatch. F32 remains the default until
-this production gate passes; `DS4_CUDA_ATTN_COMP_CACHE=sm75-compact` is the
-candidate selector and `f32` is the immediate rollback.
+logits, unchanged four-GPU health, no throughput frontier below `1.0x`, the
+stable 22/21 pipeline and pair policy, and actual compact-hybrid dispatch. Its
+default aggregate VRAM floor is 95% of the production allocation model: owner
+caches for all 21 ratio-4 and 20 ratio-128 layers plus the pair-1 mirror for
+the 11 ratio-4 and 10 ratio-128 late-stage layers. At 262145 tokens this is
+approximately 2.7 GiB expected and a roughly 2.5 GiB telemetry floor, rather
+than the invalid 12 GiB extrapolation from the synthetic standalone fixture.
+F32 remains the default until this production gate passes;
+`DS4_CUDA_ATTN_COMP_CACHE=sm75-compact` is the candidate selector and `f32` is
+the immediate rollback.
 
 `DIAGNOSTIC_PACK_AUDIT=1` runs a short PP512, one-token F32/compact exact A/B
 and checks every packed compact row's embedded status before it can be
@@ -5642,6 +5650,12 @@ audit. The result records whether each PP4096 prefill output matches F32 and
 whether the two compact consumers match each other, separating a persistent
 codec failure from a hybrid-consumer failure. Divergence is a diagnostic
 result rather than a runner failure; this is not promotion evidence.
+
+The initial `20260905T231236Z` isolation attempt completed the F32 PP512 and
+PP4096 frontiers, then the runner rejected its valid two-row CSV because the
+shared validator still required the full PP512/4096/32768 inventory. No compact
+arm ran, so that archive contains no compact-cache diagnosis. The validator
+now keys its expected frontier inventory to the requested diagnostic maximum.
 
 `DIAGNOSTIC_DECODE_PROFILE=1` generates two PP512 decode tokens and captures
 exactly the second in Nsight Systems for both F32 and compact caches. The first
