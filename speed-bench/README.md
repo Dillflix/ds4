@@ -5703,9 +5703,8 @@ the synthetic Q8 model had only been registered as a host map.  Multi-GPU F16
 materialization intentionally requires an owning per-device selective-cache
 source, so that was a diagnostic setup failure rather than a q_b result.  The
 physical binary now installs production-shaped full/home-half and peer-half Q8
-source ownership for q_b, then repeats the same admission for output-A and
-sinks after changing synthetic model maps.  This prevents a second copy of the
-same setup defect from appearing at the later output-A boundary.
+source ownership for q_b and the attention-output tensors before materializing
+their F16 views.
 
 The corrected physical-pair run cleared every implemented boundary on physical
 GPUs 3/2: q_b, indexed attention against identical local KV mirrors, inverse
@@ -5723,14 +5722,17 @@ model run is attempted.
 
 The first production-ordered result cleared the isolated output-B projection
 but rejected the unfenced chain: all 3,670,016 final output values differed,
-with maximum absolute error 1.92179418.  This establishes an asynchronous
-ordering defect somewhere before output-B, not an output-B arithmetic or F16
-cache-layout difference.  The physical binary now reads every surviving
-intermediate only after the complete chain has finished, so observation cannot
-repair the schedule.  It reports the copied input, both q_b halves, both
-post-RoPE attention halves, both output-A halves, the gathered low-rank tensor,
-and output-B.  The first nonzero boundary localizes the missing dependency in
-one invocation.
+with maximum absolute error 1.92179418.  Post-completion boundary reads then
+localized the first difference to the home q_b half; the copied input and
+partner q_b half remained exact.  This exposed a fixture-only lifetime error:
+the diagnostic had registered one synthetic map for q_b, then a second for
+attention.  `ds4_gpu_set_model_map()` releases all existing Q8-to-F16
+materializations when the map changes, so the replay no longer had its home
+q_b binding.  Production uses one GGUF map and cannot take this path.  The
+fixture now places q_b, output-A, output-B, and sinks in one synthetic model,
+installs all selective ownership once, and retains those bindings across both
+the isolated checks and production-ordered replay.  Only that corrected result
+can establish or reject an asynchronous engine defect.
 
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \

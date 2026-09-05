@@ -198,7 +198,8 @@ int main(void) {
     const uint64_t q8_row_bytes = (IN_DIM / 32u) * 34u;
     const uint64_t q_b_bytes = OUT_DIM * q8_row_bytes;
     const uint64_t q_b_half_bytes = q_b_bytes / 2u;
-    const uint64_t q_model_bytes = 2u * q_b_bytes;
+    const uint64_t q_shards_offset = q_b_bytes;
+    const uint64_t q_storage_bytes = 2u * q_b_bytes;
     const uint64_t raw_count = (uint64_t)RAW_CAP * HEAD_DIM;
     const uint64_t comp_count = (uint64_t)N_COMP * HEAD_DIM;
     const uint64_t topk_count = (uint64_t)N_TOK * TOP_K;
@@ -208,14 +209,15 @@ int main(void) {
     const uint64_t a_bytes = LOW_DIM * a_row_bytes;
     const uint64_t b_row_bytes = (LOW_DIM / 32u) * 34u;
     const uint64_t b_bytes = EMBED_DIM * b_row_bytes;
-    const uint64_t b_offset = a_bytes;
+    const uint64_t a_offset = q_storage_bytes;
+    const uint64_t b_offset = a_offset + a_bytes;
     const uint64_t sinks_offset = b_offset + b_bytes;
-    const uint64_t attn_model_bytes = sinks_offset + N_HEAD * sizeof(float);
+    const uint64_t model_bytes = sinks_offset + N_HEAD * sizeof(float);
     const uint64_t output_count = (uint64_t)N_TOK * EMBED_DIM;
     const uint64_t output_bytes = output_count * sizeof(float);
     int initialized = 0, status = 1;
 
-    unsigned char *q_model = NULL, *attn_model = NULL;
+    unsigned char *model = NULL;
     float *input_host = NULL, *raw_host = NULL, *comp_host = NULL;
     int32_t *topk_host = NULL;
     float *ref_host = NULL, *home_host = NULL, *peer_host = NULL;
@@ -233,8 +235,7 @@ int main(void) {
     ds4_gpu_tensor output_ref = {0}, output_candidate = {0};
     ds4_gpu_tensor output_scheduled = {0};
 
-    q_model = (unsigned char *)malloc((size_t)q_model_bytes);
-    attn_model = (unsigned char *)calloc(1u, (size_t)attn_model_bytes);
+    model = (unsigned char *)calloc(1u, (size_t)model_bytes);
     input_host = (float *)malloc((size_t)input_bytes);
     raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
     comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
@@ -246,15 +247,15 @@ int main(void) {
     low_gather_host = (float *)malloc((size_t)low_count * sizeof(float));
     output_ref_host = (float *)malloc((size_t)output_bytes);
     output_candidate_host = (float *)malloc((size_t)output_bytes);
-    CHECK(q_model && attn_model && input_host && raw_host && comp_host &&
+    CHECK(model && input_host && raw_host && comp_host &&
           topk_host && ref_host && home_host && peer_host && low_ref_host &&
           low_gather_host && output_ref_host && output_candidate_host,
           "host allocations");
 
-    build_q8_rows(q_model, OUT_DIM, IN_DIM, 19u);
-    memcpy(q_model + q_b_bytes, q_model, (size_t)q_b_bytes);
-    build_q8_rows(attn_model, LOW_DIM, GROUP_DIM, 31u);
-    build_q8_rows(attn_model + b_offset, EMBED_DIM, LOW_DIM, 43u);
+    build_q8_rows(model, OUT_DIM, IN_DIM, 19u);
+    memcpy(model + q_shards_offset, model, (size_t)q_b_bytes);
+    build_q8_rows(model + a_offset, LOW_DIM, GROUP_DIM, 31u);
+    build_q8_rows(model + b_offset, EMBED_DIM, LOW_DIM, 43u);
     for (uint64_t i = 0u; i < input_count; i++)
         input_host[i] = (float)((int)((i * 29u + (i >> 5u) * 17u +
                               (i / IN_DIM) * 7u + 23u) % 257u) - 128) /
@@ -291,32 +292,42 @@ int main(void) {
           "bidirectional peer access required");
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
-          ds4_gpu_set_model_map(q_model, q_model_bytes), "q_b model map");
+          ds4_gpu_set_model_map(model, model_bytes), "synthetic model map");
     /* Multi-GPU F16 materialization deliberately refuses to stage arbitrary
      * host-map bytes: its source must already have the same selective-cache
-     * ownership that production placement installs.  Admit the synthetic
-     * full/home-half and peer-half sources before asking for F16 views. */
-    ds4_tensor_range q_home_sources[] = {
+     * ownership that production placement installs.  Admit every q_b and
+     * attention-output source from one persistent map, matching production's
+     * single GGUF registration and cache lifetime. */
+    ds4_tensor_range model_home_sources[] = {
         {0u, q_b_bytes, 0},
-        {q_b_bytes, q_b_half_bytes, 0},
+        {q_shards_offset, q_b_half_bytes, 0},
+        {a_offset, a_bytes, 0},
+        {b_offset, b_bytes, 0},
+        {sinks_offset, N_HEAD * sizeof(float), 0},
     };
-    ds4_tensor_range q_peer_source = {
-        q_b_bytes + q_b_half_bytes, q_b_half_bytes, 1
+    ds4_tensor_range model_peer_sources[] = {
+        {q_shards_offset + q_b_half_bytes, q_b_half_bytes, 1},
+        {a_offset + a_bytes / 2u, a_bytes / 2u, 1},
+        {sinks_offset, N_HEAD * sizeof(float), 1},
     };
     CHECK(ds4_gpu_device_cache_tensors(
-              0, q_home_sources,
-              (int)(sizeof(q_home_sources) / sizeof(q_home_sources[0]))) == 0 &&
-          ds4_gpu_device_cache_tensors(1, &q_peer_source, 1) == 0,
-          "q_b selective source caches");
+              0, model_home_sources,
+              (int)(sizeof(model_home_sources) /
+                    sizeof(model_home_sources[0]))) == 0 &&
+          ds4_gpu_device_cache_tensors(
+              1, model_peer_sources,
+              (int)(sizeof(model_peer_sources) /
+                    sizeof(model_peer_sources[0]))) == 0,
+          "synthetic model selective source caches");
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
-              q_model, q_model_bytes, 0u, q_b_bytes, IN_DIM, OUT_DIM,
+              model, model_bytes, 0u, q_b_bytes, IN_DIM, OUT_DIM,
               g_gpu[0].device_id, "attn_q_b_full") &&
           ds4_gpu_cache_q8_f16_range_on_device(
-              q_model, q_model_bytes, q_b_bytes, q_b_half_bytes,
+              model, model_bytes, q_shards_offset, q_b_half_bytes,
               IN_DIM, SHARD_OUT_DIM, g_gpu[0].device_id,
               "attn_q_b_head0") &&
           ds4_gpu_cache_q8_f16_range_on_device(
-              q_model, q_model_bytes, q_b_bytes + q_b_half_bytes,
+              model, model_bytes, q_shards_offset + q_b_half_bytes,
               q_b_half_bytes, IN_DIM, SHARD_OUT_DIM, g_gpu[1].device_id,
               "attn_q_b_head1"), "q_b device caches");
 
@@ -336,22 +347,22 @@ int main(void) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
-              &q_ref, &qh_ref, q_model, q_model_bytes, 0u, IN_DIM, OUT_DIM,
+              &q_ref, &qh_ref, model, model_bytes, 0u, IN_DIM, OUT_DIM,
               &input_home, N_TOK, N_HEAD, HEAD_DIM, N_ROT, POS0, ORIG_CTX,
               false, ROPE_BASE, ROPE_SCALE, ROPE_EXT,
               rope_attention_factor(), BETA_FAST, BETA_SLOW, EPSILON) &&
           sync_tier(0), "full q_b reference");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
-              &q_peer, &qh_peer, q_model, q_model_bytes,
-              q_b_bytes + q_b_half_bytes, IN_DIM, SHARD_OUT_DIM,
+              &q_peer, &qh_peer, model, model_bytes,
+              q_shards_offset + q_b_half_bytes, IN_DIM, SHARD_OUT_DIM,
               &input_peer, N_TOK, SHARD_HEADS, SHARD_HEADS, N_HEAD,
               HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE, ROPE_SCALE,
               ROPE_EXT, rope_attention_factor(), BETA_FAST, BETA_SLOW,
               EPSILON) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
-              &q_home, &qh_home, q_model, q_model_bytes, q_b_bytes,
+              &q_home, &qh_home, model, model_bytes, q_shards_offset,
               IN_DIM, SHARD_OUT_DIM, &input_home, N_TOK, SHARD_HEADS, 0u,
               N_HEAD, HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE,
               ROPE_SCALE, ROPE_EXT, rope_attention_factor(), BETA_FAST,
@@ -368,40 +379,21 @@ int main(void) {
     CHECK(!q_home_diff.mismatches && !q_peer_diff.mismatches,
           "physical q_b diverged");
 
-    CHECK(sync_tier(0) && sync_tier(1) &&
-          ds4_gpu_set_current_device(0) == 0 &&
-          ds4_gpu_set_model_map(attn_model, attn_model_bytes),
-          "attention model map");
-    ds4_tensor_range attn_home_sources[] = {
-        {0u, a_bytes, 0},
-        {b_offset, b_bytes, 0},
-        {sinks_offset, N_HEAD * sizeof(float), 0},
-    };
-    ds4_tensor_range attn_peer_sources[] = {
-        {a_bytes / 2u, a_bytes / 2u, 1},
-        {sinks_offset, N_HEAD * sizeof(float), 1},
-    };
-    CHECK(ds4_gpu_device_cache_tensors(
-              0, attn_home_sources,
-              (int)(sizeof(attn_home_sources) /
-                    sizeof(attn_home_sources[0]))) == 0 &&
-          ds4_gpu_device_cache_tensors(
-              1, attn_peer_sources,
-              (int)(sizeof(attn_peer_sources) /
-                    sizeof(attn_peer_sources[0]))) == 0,
-          "attention selective source caches");
+    CHECK(sync_tier(0) && sync_tier(1),
+          "pre-attention synchronization");
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
-              attn_model, attn_model_bytes, 0u, a_bytes, GROUP_DIM,
+              model, model_bytes, a_offset, a_bytes, GROUP_DIM,
               LOW_DIM, g_gpu[0].device_id, "attn_output_a_full") &&
           ds4_gpu_cache_q8_f16_range_on_device(
-              attn_model, attn_model_bytes, 0u, a_bytes / 2u, GROUP_DIM,
-              HALF_LOW_DIM, g_gpu[0].device_id, "attn_output_a_head0") &&
+              model, model_bytes, a_offset, a_bytes / 2u, GROUP_DIM,
+              HALF_LOW_DIM, g_gpu[0].device_id,
+              "attn_output_a_head0") &&
           ds4_gpu_cache_q8_f16_range_on_device(
-              attn_model, attn_model_bytes, a_bytes / 2u, a_bytes / 2u,
-              GROUP_DIM, HALF_LOW_DIM, g_gpu[1].device_id,
+              model, model_bytes, a_offset + a_bytes / 2u,
+              a_bytes / 2u, GROUP_DIM, HALF_LOW_DIM, g_gpu[1].device_id,
               "attn_output_a_head1") &&
           ds4_gpu_cache_q8_f16_range_on_device(
-              attn_model, attn_model_bytes, b_offset, b_bytes, LOW_DIM,
+              model, model_bytes, b_offset, b_bytes, LOW_DIM,
               EMBED_DIM, g_gpu[0].device_id, "attn_output_b"),
           "attention-output device caches");
     CHECK(ALLOC(raw_home, 0, raw_count * sizeof(float)) &&
@@ -433,7 +425,7 @@ int main(void) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-              &heads_ref, attn_model, attn_model_bytes, sinks_offset,
+              &heads_ref, model, model_bytes, sinks_offset,
               &q_ref, &raw_home, &comp_home, 0u, &topk_home, N_TOK, POS0,
               N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
               ATTN_RATIO, N_HEAD, HEAD_DIM) && sync_tier(0),
@@ -441,13 +433,13 @@ int main(void) {
     CHECK(ds4_gpu_tensor_wait_xdev_default(&topk_home, 1) &&
           ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
-              &heads_peer, attn_model, attn_model_bytes, sinks_offset,
+              &heads_peer, model, model_bytes, sinks_offset,
               &q_peer, &raw_peer, &comp_peer, 0u, &topk_home, N_TOK, POS0,
               N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
               ATTN_RATIO, SHARD_HEADS, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
-              &heads_home, attn_model, attn_model_bytes, sinks_offset,
+              &heads_home, model, model_bytes, sinks_offset,
               &q_home, &raw_home, &comp_home, 0u, &topk_home, N_TOK, POS0,
               N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
               ATTN_RATIO, 0u, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
@@ -490,16 +482,16 @@ int main(void) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_output_q8_batch_low_shard_tensor(
-              &low_ref, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              &low_ref, model, model_bytes, a_offset, GROUP_DIM,
               OUT_A_RANK, N_GROUP, 0u, N_GROUP, &heads_ref, N_TOK) &&
           ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attention_output_q8_batch_low_shard_tensor(
-              &low_peer, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              &low_peer, model, model_bytes, a_offset, GROUP_DIM,
               OUT_A_RANK, N_GROUP, HALF_GROUP, HALF_GROUP, &heads_peer,
               N_TOK) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_output_q8_batch_low_shard_tensor(
-              &low_home, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              &low_home, model, model_bytes, a_offset, GROUP_DIM,
               OUT_A_RANK, N_GROUP, 0u, HALF_GROUP, &heads_home, N_TOK) &&
           ds4_gpu_tensor_wait_xdev_default(&low_peer, 0) &&
           ds4_gpu_gather_pair_rows_xdev_tensor(
@@ -520,10 +512,10 @@ int main(void) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_output_q8_batch_b_tensor(
-              &output_ref, attn_model, attn_model_bytes, b_offset, LOW_DIM,
+              &output_ref, model, model_bytes, b_offset, LOW_DIM,
               EMBED_DIM, &low_ref, N_TOK) &&
           ds4_gpu_attention_output_q8_batch_b_tensor(
-              &output_candidate, attn_model, attn_model_bytes, b_offset,
+              &output_candidate, model, model_bytes, b_offset,
               LOW_DIM, EMBED_DIM, &low_gather, N_TOK) &&
           sync_tier(0), "physical output-B");
     CHECK(ds4_gpu_tensor_read(&output_ref, 0u, output_ref_host,
@@ -550,15 +542,15 @@ int main(void) {
           "scheduled input copy");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
-              &q_peer, &qh_peer, q_model, q_model_bytes,
-              q_b_bytes + q_b_half_bytes, IN_DIM, SHARD_OUT_DIM,
+              &q_peer, &qh_peer, model, model_bytes,
+              q_shards_offset + q_b_half_bytes, IN_DIM, SHARD_OUT_DIM,
               &input_peer, N_TOK, SHARD_HEADS, SHARD_HEADS, N_HEAD,
               HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE, ROPE_SCALE,
               ROPE_EXT, rope_attention_factor(), BETA_FAST, BETA_SLOW,
               EPSILON) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
-              &q_home, &qh_home, q_model, q_model_bytes, q_b_bytes,
+              &q_home, &qh_home, model, model_bytes, q_shards_offset,
               IN_DIM, SHARD_OUT_DIM, &input_home, N_TOK, SHARD_HEADS, 0u,
               N_HEAD, HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE,
               ROPE_SCALE, ROPE_EXT, rope_attention_factor(), BETA_FAST,
@@ -566,13 +558,13 @@ int main(void) {
     CHECK(ds4_gpu_tensor_wait_xdev_default(&topk_home, 1) &&
           ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
-              &heads_peer, attn_model, attn_model_bytes, sinks_offset,
+              &heads_peer, model, model_bytes, sinks_offset,
               &q_peer, &raw_peer, &comp_peer, 0u, &topk_home, N_TOK, POS0,
               N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
               ATTN_RATIO, SHARD_HEADS, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
-              &heads_home, attn_model, attn_model_bytes, sinks_offset,
+              &heads_home, model, model_bytes, sinks_offset,
               &q_home, &raw_home, &comp_home, 0u, &topk_home, N_TOK, POS0,
               N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
               ATTN_RATIO, 0u, SHARD_HEADS, N_HEAD, HEAD_DIM),
@@ -590,18 +582,18 @@ int main(void) {
           "scheduled inverse RoPE");
     CHECK(ds4_gpu_set_current_device(1) == 0 &&
           ds4_gpu_attention_output_q8_batch_low_shard_tensor(
-              &low_peer, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              &low_peer, model, model_bytes, a_offset, GROUP_DIM,
               OUT_A_RANK, N_GROUP, HALF_GROUP, HALF_GROUP, &heads_peer,
               N_TOK) &&
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_output_q8_batch_low_shard_tensor(
-              &low_home, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              &low_home, model, model_bytes, a_offset, GROUP_DIM,
               OUT_A_RANK, N_GROUP, 0u, HALF_GROUP, &heads_home, N_TOK) &&
           ds4_gpu_tensor_wait_xdev_default(&low_peer, 0) &&
           ds4_gpu_gather_pair_rows_xdev_tensor(
               &low_gather, &low_home, &low_peer, N_TOK, HALF_LOW_DIM) &&
           ds4_gpu_attention_output_q8_batch_b_tensor(
-              &output_scheduled, attn_model, attn_model_bytes, b_offset,
+              &output_scheduled, model, model_bytes, b_offset,
               LOW_DIM, EMBED_DIM, &low_gather, N_TOK) &&
           sync_tier(0) && sync_tier(1),
           "production-ordered head-shard chain");
@@ -708,6 +700,6 @@ cleanup:
     free(low_gather_host); free(low_ref_host);
     free(peer_host); free(home_host); free(ref_host);
     free(topk_host); free(comp_host); free(raw_host); free(input_host);
-    free(attn_model); free(q_model);
+    free(model);
     return status;
 }
