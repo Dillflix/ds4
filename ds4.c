@@ -28449,6 +28449,14 @@ static bool metal_graph_encode_token_raw_swa(
         !g->tp_logits_half) need_logits = false;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    const bool decode_trace = getenv("DS4_SESSION_DECODE_TRACE") != NULL;
+    if (decode_trace) {
+        fprintf(stderr,
+                "ds4: decode trace phase=begin rank=%d pos=%u token=%d "
+                "active_tier=%d raw_row=%u raw=%u\n",
+                g->tp_rank, pos, token, g->active_tier, raw_row, n_raw);
+        fflush(stderr);
+    }
     metal_graph_dspark_capture_begin(g);
 
     /* write the embedded token on the embedding tier. Single-
@@ -28473,6 +28481,13 @@ static bool metal_graph_encode_token_raw_swa(
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
     metal_graph_cuda_timeline_pop(embedding_range);
+    if (decode_trace) {
+        fprintf(stderr,
+                "ds4: decode trace phase=embedding-complete rank=%d pos=%u "
+                "ok=%d active_tier=%d\n",
+                g->tp_rank, pos, ok ? 1 : 0, g->active_tier);
+        fflush(stderr);
+    }
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -28492,6 +28507,13 @@ static bool metal_graph_encode_token_raw_swa(
                 il,
                 pos,
                 layer_tier);
+        if (decode_trace) {
+            fprintf(stderr,
+                    "ds4: decode trace phase=layer-begin rank=%d pos=%u "
+                    "layer=%u tier=%d active_tier=%d\n",
+                    g->tp_rank, pos, il, layer_tier, g->active_tier);
+            fflush(stderr);
+        }
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -28503,6 +28525,13 @@ static bool metal_graph_encode_token_raw_swa(
                                              n_raw,
                                              token);
         metal_graph_cuda_timeline_pop(layer_range);
+        if (decode_trace) {
+            fprintf(stderr,
+                    "ds4: decode trace phase=layer-encoded rank=%d pos=%u "
+                    "layer=%u ok=%d active_tier=%d\n",
+                    g->tp_rank, pos, il, ok ? 1 : 0, g->active_tier);
+            fflush(stderr);
+        }
         ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
@@ -28525,6 +28554,14 @@ static bool metal_graph_encode_token_raw_swa(
                 g->head_tier);
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         metal_graph_cuda_timeline_pop(output_range);
+    }
+    if (decode_trace) {
+        fprintf(stderr,
+                "ds4: decode trace phase=encode-complete rank=%d pos=%u "
+                "ok=%d active_tier=%d logits=%d\n",
+                g->tp_rank, pos, ok ? 1 : 0, g->active_tier,
+                need_logits ? 1 : 0);
+        fflush(stderr);
     }
     return ok;
 }

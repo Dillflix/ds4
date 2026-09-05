@@ -19,6 +19,10 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <execinfo.h>
+#include <signal.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +76,34 @@ static double bench_now_sec(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
+
+#if !defined(_WIN32)
+/* Opt-in postmortem aid for production-shaped diagnostics.  The handler is
+ * deliberately absent from ordinary runs so it cannot affect signal handling
+ * or the benchmark's hot path.  backtrace_symbols_fd() is the GNU/Linux
+ * best-effort primitive available before a debugger is attached; the signal
+ * is then re-raised with its default disposition so the usual core dump is
+ * still produced when the host is configured for one. */
+static void bench_crash_trace_handler(int signo) {
+    static const char message[] =
+        "ds4-bench: fatal host signal; native backtrace follows\n";
+    void *frames[64];
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1u);
+    const int count = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+    if (count > 0) backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    (void)signal(signo, SIG_DFL);
+    (void)raise(signo);
+}
+
+static void bench_install_crash_trace(void) {
+    if (getenv("DS4_BENCH_CRASH_TRACE") == NULL) return;
+    (void)signal(SIGSEGV, bench_crash_trace_handler);
+    (void)signal(SIGBUS, bench_crash_trace_handler);
+    (void)signal(SIGABRT, bench_crash_trace_handler);
+}
+#else
+static void bench_install_crash_trace(void) {}
+#endif
 
 typedef struct {
     const char *path;
@@ -750,6 +782,7 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    bench_install_crash_trace();
     bench_config cfg = parse_options(argc, argv);
     bench_progress_journal progress_journal = {
         .path = getenv("DS4_BENCH_PROGRESS_JOURNAL"),
@@ -1248,8 +1281,11 @@ int main(int argc, char **argv) {
 
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
+        const bool force_frontier_snapshot =
+            getenv("DS4_BENCH_FORCE_FRONTIER_SNAPSHOT") != NULL;
         bool have_snapshot = false;
-        if (need_restore_after_generation && !distributed &&
+        if ((need_restore_after_generation || force_frontier_snapshot) &&
+            !distributed &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
             const uint64_t payload_bytes = ds4_session_payload_bytes(session);
             const bool large_snapshot_forced =
@@ -1295,6 +1331,13 @@ int main(int argc, char **argv) {
             : NULL;
         int gen_token_count = 0;
         if (cfg.gen_tokens > 0) {
+            if (getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                fprintf(stderr,
+                        "ds4-bench: starting decode frontier %d tokens=%d "
+                        "session=%p\n",
+                        frontier, cfg.gen_tokens, (void *)session);
+                fflush(stderr);
+            }
             bench_progress_journal_mark(
                 &progress_journal, "decode", "frontier-start",
                 0, cfg.gen_tokens);
@@ -1305,11 +1348,24 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (i == 0 && getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                fprintf(stderr,
+                        "ds4-bench: selecting first decode token at frontier %d\n",
+                        frontier);
+                fflush(stderr);
+            }
             const int token = ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
+            }
+            if (i == 0 && getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                fprintf(stderr,
+                        "ds4-bench: selected first decode token at frontier %d "
+                        "token=%d\n",
+                        frontier, token);
+                fflush(stderr);
             }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             if (nsys_decode_tokens > 0 && !nsys_decode_capture_done &&
@@ -1335,6 +1391,12 @@ int main(int argc, char **argv) {
                     i + 1, cfg.gen_tokens);
             }
             const double token_t0 = bench_now_sec();
+            if (i == 0 && getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                fprintf(stderr,
+                        "ds4-bench: entering first decode eval at frontier %d\n",
+                        frontier);
+                fflush(stderr);
+            }
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -1345,6 +1407,12 @@ int main(int argc, char **argv) {
 #endif
                 rc = 1;
                 break;
+            }
+            if (i == 0 && getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                fprintf(stderr,
+                        "ds4-bench: completed first decode eval at frontier %d\n",
+                        frontier);
+                fflush(stderr);
             }
             const double token_t1 = bench_now_sec();
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

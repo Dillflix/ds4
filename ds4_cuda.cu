@@ -699,6 +699,7 @@ typedef struct {
 static cuda_sm75_hybrid_attn_context
     g_sm75_hybrid_attn[DS4_MAX_GPUS];
 static std::atomic<uint64_t> g_sm75_hybrid_attn_calls = 0;
+static std::atomic<uint64_t> g_sm75_compact_attn_trace_calls = 0;
 static void cuda_sm75_hybrid_attn_release_one(int logical_tier);
 
 typedef struct {
@@ -25379,6 +25380,21 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
         current_device != g_gpu[logical_tier].device_id) {
         return 0;
     }
+    const bool trace = getenv("DS4_CUDA_COMPACT_ATTN_TRACE") != NULL;
+    const uint64_t trace_call = trace
+        ? g_sm75_compact_attn_trace_calls.fetch_add(
+              1u, std::memory_order_relaxed) + 1u
+        : 0u;
+    if (trace) {
+        fprintf(stderr,
+                "ds4: compact attention trace call=%llu phase=submit "
+                "kind=indexed-hybrid tier=%d device=%d tokens=%u pos=%u "
+                "raw=%u comp=%u topk=%u window=%u ratio=%u heads=%u+%u/%u\n",
+                (unsigned long long)trace_call, logical_tier,
+                current_device, n_tokens, pos0, n_raw, n_comp, top_k,
+                window, ratio, head0, n_head_work, n_head_total);
+        fflush(stderr);
+    }
     if (!cuda_sm75_hybrid_attn_reserve(
             logical_tier, n_tokens, n_head_total)) return 0;
     cuda_sm75_hybrid_attn_context *c = &g_sm75_hybrid_attn[logical_tier];
@@ -25445,6 +25461,18 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
         !cuda_ok(cudaStreamWaitEvent(0, c->done, 0),
                  "compact attention handoff to default stream")) {
         return -1;
+    }
+    if (getenv("DS4_CUDA_COMPACT_ATTN_SYNC_TRACE") != NULL &&
+        !cuda_ok(cudaDeviceSynchronize(),
+                 "compact attention indexed trace synchronize")) {
+        return -1;
+    }
+    if (trace) {
+        fprintf(stderr,
+                "ds4: compact attention trace call=%llu phase=submitted "
+                "kind=indexed-hybrid\n",
+                (unsigned long long)trace_call);
+        fflush(stderr);
     }
     g_sm75_hybrid_attn_calls.fetch_add(1u, std::memory_order_relaxed);
     return 1;
@@ -26034,14 +26062,43 @@ static int attention_decode_batch_launch(
             g_cuda_no_window_attention) {
             return 0;
         }
+        const bool trace =
+            getenv("DS4_CUDA_COMPACT_ATTN_TRACE") != NULL;
+        const uint64_t trace_call = trace
+            ? g_sm75_compact_attn_trace_calls.fetch_add(
+                  1u, std::memory_order_relaxed) + 1u
+            : 0u;
+        if (trace) {
+            fprintf(stderr,
+                    "ds4: compact attention trace call=%llu phase=submit "
+                    "kind=mixed tier=%d device=%d tokens=%u pos=%u raw=%u "
+                    "comp=%u window=%u ratio=%u\n",
+                    (unsigned long long)trace_call, logical_tier,
+                    g_gpu[logical_tier].device_id, n_tokens, pos0, n_raw,
+                    n_comp, window, ratio);
+            fflush(stderr);
+        }
         dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<true><<<online_grid, 256>>>(
             (float *)heads->ptr, sinks, (const float *)q->ptr,
             (const float *)raw_kv->ptr, comp_kv->ptr, n_tokens, pos0,
             n_raw, raw_cap, raw_start, n_comp, window, ratio, 0, n_head,
             n_head, head_dim);
-        return cuda_ok(cudaGetLastError(),
-                       "attention compact decode batch online launch");
+        int ok = cuda_ok(cudaGetLastError(),
+                         "attention compact decode batch online launch");
+        if (ok && getenv("DS4_CUDA_COMPACT_ATTN_SYNC_TRACE") != NULL) {
+            ok = cuda_ok(cudaDeviceSynchronize(),
+                         "attention compact decode trace synchronize");
+        }
+        if (trace) {
+            fprintf(stderr,
+                    "ds4: compact attention trace call=%llu phase=%s "
+                    "kind=mixed\n",
+                    (unsigned long long)trace_call,
+                    ok ? "submitted" : "failed");
+            fflush(stderr);
+        }
+        return ok;
     }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&

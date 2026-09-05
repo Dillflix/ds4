@@ -25,6 +25,8 @@ Optional environment:
   CASE_TIMEOUT_SECONDS=1800
   MIN_COMPACT_VRAM_SAVING_MIB=12000
   MIN_THROUGHPUT_RATIO=0.95
+  DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
+                                    first without and then with snapshot
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   COMPACT_KV_PRODUCTION_AB_DIR=...
@@ -53,6 +55,7 @@ TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-12000}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
+DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 PREFILL_CHUNK=2048
@@ -78,7 +81,7 @@ done
 awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
-for flag in SKIP_BUILD CREATE_ARCHIVE; do
+for flag in DIAGNOSTIC_DECODE_ISOLATION SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -329,6 +332,84 @@ run_case() {
     validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
         validate_topology "$base.log" && validate_selector "$arm" "$base.log"
 }
+
+run_decode_isolation_case() {
+    local mode=$1 base="$OUTPUT_DIR/runs/compact-$1" rc=0
+    local telemetry="$OUTPUT_DIR/telemetry/compact-$1.csv"
+    local -a snapshot_env=() cmd
+    [[ $mode == snapshot ]] &&
+        snapshot_env+=(DS4_BENCH_FORCE_FRONTIER_SNAPSHOT=1)
+    [[ $mode == nosnapshot ]] &&
+        snapshot_env+=(DS4_BENCH_DISABLE_SNAPSHOT=1)
+
+    capture_gpu_health "$base.pre-gpu.csv" || return 1
+    start_telemetry "$telemetry"
+    cmd=("${production_env[@]}"
+        DS4_CUDA_ATTN_COMP_CACHE=sm75-compact
+        DS4_BENCH_CRASH_TRACE=1
+        DS4_SESSION_DECODE_TRACE=1
+        DS4_CUDA_COMPACT_ATTN_TRACE=1
+        DS4_CUDA_COMPACT_ATTN_SYNC_TRACE=1
+        "DS4_BENCH_PROGRESS_JOURNAL=$base.progress.csv"
+        "${snapshot_env[@]}"
+        ./ds4-bench --cuda --cuda-tensor-parallel
+        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM"
+        --model "$MODEL" --prompt-file "$PROMPT"
+        --ctx-start 512 --ctx-max 512 --ctx-alloc "$CTX_ALLOC"
+        --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
+        --gen-tokens 1 --csv "$base.csv")
+    timeout --signal=TERM --kill-after=30s "${CASE_TIMEOUT_SECONDS}s" \
+        "${cmd[@]}" >"$base.log" 2>&1 || rc=$?
+    stop_telemetry
+    capture_gpu_health "$base.post-gpu.csv" || return 1
+    printf '%s\n' "$rc" >"$base.exit-status.txt"
+
+    validate_health "$base" || return 1
+    [[ -s $telemetry && $(wc -l <"$telemetry") -ge 4 ]] || return 1
+    if [[ $rc == 0 ]]; then
+        awk -F, '
+            NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
+                           $4=="gen_tokens" && $8=="gen_steady_tps"); next}
+            NR==2 {row=($1==512 && ($3+0)>0 && $4==1)}
+            END {exit !(header && NR==2 && row)}
+        ' "$base.csv" || return 1
+        grep -Fq 'ds4-bench: completed first decode eval at frontier 512' \
+            "$base.log" || return 1
+    fi
+    if [[ $mode == snapshot ]]; then
+        grep -Fq 'ds4-bench: completed snapshot at frontier 512' \
+            "$base.log" || return 1
+    else
+        ! grep -Fq 'ds4-bench: starting snapshot at frontier 512' \
+            "$base.log" || return 1
+    fi
+    return "$rc"
+}
+
+if [[ $DIAGNOSTIC_DECODE_ISOLATION == 1 ]]; then
+    phase=decode-isolation
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    printf 'Compact-KV decode isolation arm=nosnapshot...\n'
+    nosnapshot_rc=0
+    run_decode_isolation_case nosnapshot || nosnapshot_rc=$?
+    if ! capture_gpu_health "$OUTPUT_DIR/between-isolation-arms-gpu.csv"; then
+        die "GPU health was lost after compact nosnapshot isolation arm"
+    fi
+    printf 'Compact-KV decode isolation arm=snapshot...\n'
+    snapshot_rc=0
+    run_decode_isolation_case snapshot || snapshot_rc=$?
+    printf 'mode=compact-pp512-first-token\nnosnapshot_exit_status=%s\nsnapshot_exit_status=%s\nacceptance_evidence=no\n' \
+        "$nosnapshot_rc" "$snapshot_rc" \
+        >"$OUTPUT_DIR/summary/decode-isolation.txt"
+    if [[ $nosnapshot_rc != 0 || $snapshot_rc != 0 ]]; then
+        die "compact PP512 decode isolation reproduced a failure"
+    fi
+    phase=finished
+    printf 'Compact-KV PP512 decode isolation completed without failure: %s\n' \
+        "$OUTPUT_DIR"
+    exit 0
+fi
 
 phase=production
 capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
