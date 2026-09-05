@@ -5514,7 +5514,9 @@ production-shaped indexed-attention consumer against direct compact decode.
 Each 256-thread block owns eight heads, stages eight of the 512 selected rows
 at a time, and preserves the shipping online-softmax operation order. This
 isolates the persistent-cache representation without timing a full-cache F32
-materialization. It remains bounded diagnostic evidence, not promotion
+materialization. Its compact loader uses one aligned code-word load per four
+values, half-warp scale broadcast, and exact IEEE reconstruction with a
+boundary fallback. It remains bounded diagnostic evidence, not promotion
 evidence. Pack status completes asynchronously; a future caller must observe
 `PACK_OK` before committing or using a destination row. The reported SASS
 LDL/STL counts are explicitly whole-binary diagnostics, not a per-kernel

@@ -85,6 +85,37 @@ __device__ __forceinline__ static float decode_code(uint8_t code, float scale) {
     return __uint_as_float(bits);
 }
 
+__device__ __forceinline__ static float decode_code_bits(
+        uint8_t code, uint32_t scale_bits) {
+    const uint32_t sign = (uint32_t)(code & 0x80u) << 24;
+    const uint32_t magnitude = (uint32_t)(code & 0x7fu);
+    if (magnitude == 0u) return __uint_as_float(sign);
+
+    const uint32_t scale_exp = (scale_bits >> 23) & 0xffu;
+    const uint32_t fp8_exp = magnitude >> 3;
+    const uint32_t fp8_mantissa = magnitude & 7u;
+    int32_t result_exp;
+    uint32_t result_mantissa;
+    if (fp8_exp != 0u) {
+        result_exp = (int32_t)scale_exp + (int32_t)fp8_exp - 7;
+        result_mantissa = fp8_mantissa << 20;
+    } else {
+        const uint32_t leading = 31u - (uint32_t)__clz(fp8_mantissa);
+        result_exp = (int32_t)scale_exp - 9 + (int32_t)leading;
+        result_mantissa = (fp8_mantissa << (23u - leading)) & 0x7fffffu;
+    }
+
+    /* Every ordinary attention-cache value lands here. Preserve the complete
+     * codec contract by retaining the arithmetic path for scale subnormals or
+     * results at an IEEE underflow/overflow boundary. */
+    if (scale_exp != 0u && scale_exp != 0xffu &&
+        result_exp > 0 && result_exp < 0xff) {
+        return __uint_as_float(
+            sign | ((uint32_t)result_exp << 23) | result_mantissa);
+    }
+    return decode_code(code, __uint_as_float(scale_bits));
+}
+
 __device__ __forceinline__ static int exact_code_for(float value, float scale) {
     if (!isfinite(value) || !isfinite(scale) || !(scale > 0.0f)) return -1;
     const uint32_t sign = __float_as_uint(value) >> 31;
@@ -165,7 +196,8 @@ __global__ static void compact_unpack_kernel(
     const CompactAttentionKVRow *src = compact + row;
     float *dst = rows + (uint64_t)row * HEAD_DIM;
     for (uint32_t d = tid; d < N_NOPE; d += blockDim.x) {
-        dst[d] = decode_code(src->code[d], src->scale[d / GROUP]);
+        dst[d] = decode_code_bits(
+            src->code[d], __float_as_uint(src->scale[d / GROUP]));
     }
     for (uint32_t d = tid; d < N_ROT; d += blockDim.x) {
         dst[N_NOPE + d] = src->rope_f32[d];
@@ -184,14 +216,20 @@ __device__ __forceinline__ static float attention_dot4(float4 a, float4 b) {
 }
 
 __device__ __forceinline__ static float4 compact_load_float4(
-        const CompactAttentionKVRow *row, uint32_t c4) {
+        const CompactAttentionKVRow *row, uint32_t c4, uint32_t lane) {
     const uint32_t d = c4 * 4u;
+    uint32_t scale_bits = 0u;
+    if (d < N_NOPE && (lane & 15u) == 0u) {
+        scale_bits = __float_as_uint(row->scale[d / GROUP]);
+    }
+    scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & 16u);
     if (d < N_NOPE) {
-        const float scale = row->scale[d / GROUP];
-        return make_float4(decode_code(row->code[d + 0u], scale),
-                           decode_code(row->code[d + 1u], scale),
-                           decode_code(row->code[d + 2u], scale),
-                           decode_code(row->code[d + 3u], scale));
+        const uint32_t codes = *(const uint32_t *)(row->code + d);
+        return make_float4(
+            decode_code_bits((uint8_t)(codes >> 0), scale_bits),
+            decode_code_bits((uint8_t)(codes >> 8), scale_bits),
+            decode_code_bits((uint8_t)(codes >> 16), scale_bits),
+            decode_code_bits((uint8_t)(codes >> 24), scale_bits));
     }
     const uint32_t rope = d - N_NOPE;
     return make_float4(row->rope_f32[rope + 0u],
@@ -242,7 +280,8 @@ __global__ static void indexed_attention_consumer_kernel(
             const uint32_t row = (uint32_t)topk[
                 (uint64_t)token * TOP_K + row0 + rr];
             if (COMPACT) {
-                kv_shared[off] = compact_load_float4(compact_rows + row, c4);
+                kv_shared[off] = compact_load_float4(
+                    compact_rows + row, c4, lane);
             } else {
                 const float4 *src = (const float4 *)(
                     f32_rows + (uint64_t)row * HEAD_DIM);
@@ -974,6 +1013,7 @@ int main(int argc, char **argv) {
     printf("nonfinite_policy=reject-whole-row\n");
     printf("rejected_row_commit_policy=caller-must-observe-pack-ok-before-use\n");
     printf("reference_quantizer=shipping-ds4-cuda-production-flags\n");
+    printf("compact_decoder=aligned-code32-ieee-bits-halfwarp-scale\n");
     printf("timing_scope=production-shaped-indexed-attention-paired-bounded-diagnostic\n");
     printf("rows=%u\n", n_rows);
     printf("tokens=%u\n", n_tokens);
