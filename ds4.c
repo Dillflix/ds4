@@ -15979,6 +15979,15 @@ static uint64_t metal_graph_attn_comp_row_bytes_for_format(uint32_t format) {
     return (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
 }
 
+/* F32 and F16 cache commits consume the shipping FP8-rounded staging row.
+ * The native compact packer emits those same FP8 codes and their scale itself,
+ * so quantizing its input first would discard the original scale and apply a
+ * second, non-idempotent rounding pass. */
+static bool metal_graph_attn_comp_format_producer_quantize_fp8(
+        uint32_t format) {
+    return format != DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT;
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -21278,6 +21287,12 @@ static uint32_t metal_graph_attn_comp_cache_format(
                DS4_GPU_ATTN_COMP_CACHE_DEFAULT_FORMAT;
 }
 
+static bool metal_graph_attn_comp_producer_quantize_fp8(
+        const ds4_gpu_graph *g) {
+    return metal_graph_attn_comp_format_producer_quantize_fp8(
+            metal_graph_attn_comp_cache_format(g));
+}
+
 static bool metal_graph_store_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -24349,8 +24364,12 @@ static bool metal_graph_encode_decode_layer_phase(
             if (!comp_row_view) {
                 ok = false;
             } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
-                if (ok) {
+                if (metal_graph_attn_comp_producer_quantize_fp8(g)) {
+                    ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                             comp_row_view, 1,
+                             DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                }
+                if (ok && metal_graph_attn_comp_producer_quantize_fp8(g)) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
             }
@@ -31195,7 +31214,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          DS4_N_ROT,
                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                         true,
+                                                         metal_graph_attn_comp_producer_quantize_fp8(g),
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -31233,7 +31252,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 for (uint32_t t = 0; t < n_tokens; t++) {
                     comp_counts[t] = (pos0 + t + 1u) / ratio;
                 }
-                if (n_comp != 0) {
+                if (n_comp != 0 &&
+                    metal_graph_attn_comp_producer_quantize_fp8(g)) {
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   attn_comp_target,
                                                   (uint64_t)n_comp * DS4_N_HEAD_DIM,
@@ -31289,7 +31309,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            metal_graph_attn_comp_producer_quantize_fp8(g),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -31316,7 +31336,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            metal_graph_attn_comp_producer_quantize_fp8(g),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -31350,11 +31370,14 @@ static bool metal_graph_encode_layer_attention_batch(
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
                         }
                     }
-                    metal_graph_debug_dump_tensor("KVcompress",
-                                                  attn_comp_target,
-                                                  (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
-                                                  il,
-                                                  pos0);
+                    if (metal_graph_attn_comp_producer_quantize_fp8(g)) {
+                        metal_graph_debug_dump_tensor(
+                                "KVcompress",
+                                attn_comp_target,
+                                (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
+                                il,
+                                pos0);
+                    }
                     metal_graph_debug_dump_tensor("attn_state_kv",
                                                   g->layer_attn_state_kv[il],
                                                   (uint64_t)comp_width * coff * ratio,
@@ -31408,12 +31431,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             false) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
-                        ok = comp_row_view &&
-                             ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
-                        if (ok) {
+                        ok = comp_row_view != NULL;
+                        if (ok && metal_graph_attn_comp_producer_quantize_fp8(g)) {
+                            ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                                     comp_row_view, 1,
+                                     DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                        }
+                        if (ok && metal_graph_attn_comp_producer_quantize_fp8(g)) {
                             metal_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
                                                           DS4_N_HEAD_DIM,
@@ -60720,6 +60744,10 @@ typedef struct {
     const char *name;
     uint64_t bytes;
 } ds4_test_fake_tensor;
+
+bool ds4_test_attn_comp_format_producer_quantize_fp8(uint32_t format) {
+    return metal_graph_attn_comp_format_producer_quantize_fp8(format);
+}
 
 uint32_t ds4_test_q8_cache_class(const char *name) {
     ds4_str s = {name, name ? strlen(name) : 0u};

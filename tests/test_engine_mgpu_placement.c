@@ -40,6 +40,7 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
+bool ds4_test_attn_comp_format_producer_quantize_fp8(uint32_t format);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
@@ -1397,6 +1398,19 @@ static void test_sm75_native_indexer_cache_accounting(void) {
     ds4_test_clear_compress_ratios();
 }
 
+static void test_attention_compact_single_quantization(void) {
+    fprintf(stderr, "RUN: test_attention_compact_single_quantization\n");
+    CHECK(ds4_test_attn_comp_format_producer_quantize_fp8(
+              DS4_GPU_ATTN_COMP_CACHE_F32),
+          "F32 attention cache retains producer-side FP8 rounding");
+    CHECK(ds4_test_attn_comp_format_producer_quantize_fp8(
+              DS4_GPU_ATTN_COMP_CACHE_F16),
+          "F16 attention cache retains producer-side FP8 rounding");
+    CHECK(!ds4_test_attn_comp_format_producer_quantize_fp8(
+               DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT),
+          "compact attention pack owns the sole FP8 rounding pass");
+}
+
 static void test_cuda_tp_prefill_attn_rows_shape(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_shape\n");
     CHECK(ds4_test_cuda_tp_prefill_attn_rows_shape_eligible(512, 512),
@@ -1594,6 +1608,7 @@ int main(void) {
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
     test_sm75_native_indexer_cache_accounting();
+    test_attention_compact_single_quantization();
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_attn_rows_default();

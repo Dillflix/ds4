@@ -25,8 +25,8 @@ Optional environment:
   CASE_TIMEOUT_SECONDS=1800
   MIN_COMPACT_VRAM_SAVING_MIB=12000
   MIN_THROUGHPUT_RATIO=0.95
-  DIAGNOSTIC_PACK_AUDIT=0           1: compact PP512 exact-output run only,
-                                    with per-layer packed-row status checks
+  DIAGNOSTIC_PACK_AUDIT=0           1: F32/compact PP512 one-token exact A/B,
+                                    with compact per-layer packed-row checks
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   SKIP_BUILD=0
@@ -295,6 +295,17 @@ validate_selector() {
     fi
 }
 
+validate_ctx512_selector() {
+    local arm=$1 log=$2
+    if [[ $arm == f32 ]]; then
+        grep -Fq 'compressed-attention cache format=f32 row-bytes=2048' "$log"
+    else
+        grep -Fq \
+            'compressed-attention cache format=sm75-compact-exact row-bytes=736' \
+            "$log"
+    fi
+}
+
 validate_exact_inventory() {
     local logits=$1 context token file
     for context in 512 4096 32768; do
@@ -356,9 +367,7 @@ run_case() {
                 }
                 END {exit !(header && NR==2 && row)}
             ' "$base.csv" &&
-            grep -Fq \
-                'compressed-attention cache format=sm75-compact-exact row-bytes=736' \
-                "$base.log"
+            validate_ctx512_selector "$arm" "$base.log"
     else
         validate_health "$base" && validate_csv "$base.csv" "$tokens" &&
             validate_topology "$base.log" &&
@@ -423,19 +432,27 @@ if [[ $DIAGNOSTIC_PACK_AUDIT == 1 ]]; then
     phase=pack-audit
     capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
         die "could not capture initial four-GPU health"
-    base="$OUTPUT_DIR/exact/compact-pack-audit"
-    logits="$OUTPUT_DIR/exact/compact-pack-audit-logits"
-    mkdir -p "$logits"
-    printf 'Compact-KV PP512 production pack audit...\n'
-    run_case compact pack-audit 1 "$base" "$logits" 512 || {
-        tail -n 240 "$base.log" >&2 || true
-        die "compact PP512 production pack audit failed"
-    }
-    [[ -s $logits/frontier_000512.logits.f32 &&
-       -s $logits/frontier_000512.decode_000001.logits.f32 ]] ||
-        die "compact PP512 production pack audit logit inventory is incomplete"
+    for arm in f32 compact; do
+        base="$OUTPUT_DIR/exact/$arm-pack-audit"
+        logits="$OUTPUT_DIR/exact/$arm-pack-audit-logits"
+        mkdir -p "$logits"
+        printf 'Compact-KV PP512 production pack audit arm=%s...\n' "$arm"
+        run_case "$arm" pack-audit 1 "$base" "$logits" 512 || {
+            tail -n 240 "$base.log" >&2 || true
+            die "$arm PP512 production pack audit failed"
+        }
+        [[ -s $logits/frontier_000512.logits.f32 &&
+           -s $logits/frontier_000512.decode_000001.logits.f32 ]] ||
+            die "$arm PP512 production pack audit logit inventory is incomplete"
+    done
+    for file in frontier_000512.logits.f32 \
+                frontier_000512.decode_000001.logits.f32; do
+        cmp -s "$OUTPUT_DIR/exact/f32-pack-audit-logits/$file" \
+               "$OUTPUT_DIR/exact/compact-pack-audit-logits/$file" ||
+            die "compact PP512 production pack audit diverged at $file"
+    done
     phase=finished
-    printf 'Compact-KV PP512 production pack audit passed: %s\n' \
+    printf 'Compact-KV PP512 production exact A/B pack audit passed: %s\n' \
         "$OUTPUT_DIR"
     exit 0
 fi

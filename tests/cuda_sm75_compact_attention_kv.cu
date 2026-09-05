@@ -2100,9 +2100,12 @@ int main(int argc, char **argv) {
             hybrid_attention_priority[candidate]);
     }
 
+    cuda_die(cudaMemcpy(d_rows.data, host_input, f32_bytes,
+                        cudaMemcpyHostToDevice),
+             "copy finite producer rows");
     cuda_die(cudaMemset(d_status.data, 0, status_bytes), "clear pack status");
     compact_pack_kernel<<<n_rows, THREADS>>>(
-        (const float *)ds4_gpu_tensor_contents(shipping_rows),
+        (const float *)d_rows.data,
         (CompactAttentionKVRow *)d_compact.data,
         (uint32_t *)d_status.data, n_rows);
     compact_unpack_kernel<<<n_rows, THREADS>>>(
@@ -2128,7 +2131,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: finite codec validation was degenerate\n");
         return 2;
     }
-    uint64_t alternate_scale_count = 0;
+    uint64_t single_pass_scale_count = 0;
     const float floor_scale = exp2f(ceilf(log2f(1.0e-4f / 448.0f)));
     for (uint32_t row = 0; row < n_rows; row++) {
         if (host_compact[row].reserved != 0u) {
@@ -2167,25 +2170,24 @@ int main(int argc, char **argv) {
             }
             if (row == 3u) {
                 const float original_scale = ldexpf(1.0f, (int)g - 9);
-                const float alternate_scale = original_scale * 0.5f;
                 const float rounded_boundary = host_reference[
                     (uint64_t)row * HEAD_DIM + g * GROUP];
                 if (rounded_boundary != 224.0f * original_scale ||
-                    host_compact[row].scale[g] != alternate_scale) {
+                    host_compact[row].scale[g] != original_scale) {
                     fprintf(stderr,
-                            "error: alternate exact scale was not recovered group=%u rounded=%g expected_scale=%g candidate_scale=%g\n",
+                            "error: producer scale was not retained group=%u rounded=%g expected_scale=%g candidate_scale=%g\n",
                             g, rounded_boundary,
-                            alternate_scale, host_compact[row].scale[g]);
+                            original_scale, host_compact[row].scale[g]);
                     return 2;
                 }
-                alternate_scale_count++;
+                single_pass_scale_count++;
             }
         }
     }
-    if (alternate_scale_count != N_SCALE) {
+    if (single_pass_scale_count != N_SCALE) {
         fprintf(stderr,
-                "error: alternate exact scale coverage incomplete count=%llu expected=%u\n",
-                (unsigned long long)alternate_scale_count, N_SCALE);
+                "error: single-pass producer scale coverage incomplete count=%llu expected=%u\n",
+                (unsigned long long)single_pass_scale_count, N_SCALE);
         return 2;
     }
     uint32_t rope_negative_zero_bits = 0u;
@@ -2196,10 +2198,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* A finite value that is not already on the E4M3 grid must be encoded
-     * exactly as the shipping quantizer would encode it.  This keeps pack
-     * idempotent for the ordinary already-rounded input while making the
-     * compact boundary safe for a direct finite producer. */
+    /* Exercise an isolated finite value immediately above an exact grid point
+     * and require the direct compact pack to match the shipping quantizer. */
     memcpy(host_input, host_reference, f32_bytes);
     memset(host_input, 0, N_NOPE * sizeof(float));
     host_input[0] = nextafterf(1.0f, 2.0f);
@@ -2315,9 +2315,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: attention-input shipping quantizer failed\n");
         return 2;
     }
-    cuda_die(cudaMemcpy(d_rows.data, host_reference, f32_bytes,
+    cuda_die(cudaMemcpy(d_rows.data, host_input, f32_bytes,
                         cudaMemcpyHostToDevice),
-             "copy attention reference rows");
+             "copy attention producer rows");
     cuda_die(cudaMemset(d_status.data, 0, status_bytes),
              "clear attention pack status");
     compact_pack_kernel<<<n_rows, THREADS>>>(
@@ -2744,8 +2744,8 @@ int main(int argc, char **argv) {
            selected_materialization_ms + selected_consumer_ms);
     printf("selected_component_sum_is_diagnostic=1\n");
     printf("selected_combined_candidate_is_authoritative=1\n");
-    printf("alternate_exact_scales=%llu\n",
-           (unsigned long long)alternate_scale_count);
+    printf("single_pass_producer_scales=%llu\n",
+           (unsigned long long)single_pass_scale_count);
     printf("canaries=passed\n");
     printf("harness_status=ok\n");
 

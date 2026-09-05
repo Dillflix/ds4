@@ -5558,10 +5558,12 @@ limits without profiling an attention consumer by mistake. The
 exact IEEE reconstruction with a boundary fallback. All results in this
 section remain bounded diagnostic evidence. The standalone packer verifies
 row status before accepting output. The production source contract is the
-already-FP8-rounded finite cache row; persistent rows retain fail-closed status
-metadata, and cold unpack/checkpoint export propagates a rejected row as NaN
-instead of silently accepting altered data. The reported SASS LDL/STL counts
-are explicitly whole-binary diagnostics, not a per-kernel acceptance gate.
+finite pre-quantization F32 producer row: the compact packer performs the one
+shipping E4M3 rounding pass and retains its scale and codes directly.
+Persistent rows retain fail-closed status metadata, and cold
+unpack/checkpoint export propagates a rejected row as NaN instead of silently
+accepting altered data. The reported SASS LDL/STL counts are explicitly
+whole-binary diagnostics, not a per-kernel acceptance gate.
 
 The 262144-row diagnostic selected H16 over H8: H16 reached `0.93723x` of its
 paired F32 control, while H8 reached `0.92365x`. H16 attention-only was already
@@ -5597,8 +5599,9 @@ tagged-native all43 model. The candidate keeps persistent compact rows,
 materializes only selected rows into two reusable 256-row hybrid buffers
 (`448 x FP16 + 64 x FP32`), and consumes those buffers with high-priority H16
 indexed attention. Large-token prefill consumes the exact compact rows
-directly. The engine preserves F32 session/checkpoint payloads at the external
-boundary.
+directly. Its producer bypasses the separate rounded-F32 staging quantizer;
+compact packing owns the sole shipping E4M3 quantization pass. The engine
+preserves F32 session/checkpoint payloads at the external boundary.
 
 The runner's untimed warm-up intentionally recreates the session while keeping
 the engine-owned dense-Q8 residency. Session teardown therefore synchronizes
@@ -5615,10 +5618,12 @@ pair policy, and actual compact-hybrid dispatch. F32 remains the default until
 this production gate passes; `DS4_CUDA_ATTN_COMP_CACHE=sm75-compact` is the
 candidate selector and `f32` is the immediate rollback.
 
-`DIAGNOSTIC_PACK_AUDIT=1` runs only the PP512 compact exact-output arm and
-checks every packed production row's embedded status before it can be consumed.
-On failure it reports the first layer, destination row, and rejection bits;
-this is a correctness-localization run, not promotion evidence.
+`DIAGNOSTIC_PACK_AUDIT=1` runs a short PP512, one-token F32/compact exact A/B
+and checks every packed compact row's embedded status before it can be
+consumed. Both the prefill and first-decode logits must be byte-identical. On
+failure it reports either the first divergent output or the first layer,
+destination row, and rejection bits; this is a correctness-localization run,
+not promotion evidence.
 
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \

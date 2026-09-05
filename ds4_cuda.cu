@@ -13108,12 +13108,9 @@ __global__ static void sm75_compact_attn_pack_kernel(
             fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
         if (tid == 0u) out->scale[group] = scale;
         __syncthreads();
-        /* Emit the shipping E4M3 code directly instead of attempting to
-         * reverse-map the rounded F32 value.  The input normally has already
-         * passed through fp8_kv_quantize_row(), making this operation
-         * idempotent and its decoded value bit-identical.  Applying the same
-         * quantizer here also closes the representability hole if a finite
-         * producer value reaches the pack boundary directly. */
+        /* This is the row's sole shipping E4M3 quantization pass. Retaining
+         * its chosen scale and code directly avoids trying to recover a scale
+         * from an already-rounded row and then rounding that row again. */
         const int code = sm75_compact_attn_quant_code(value, scale);
         if (code < 0) {
             atomicOr(&out->status, 2u);
