@@ -5632,6 +5632,12 @@ failure it reports either the first divergent output or the first layer,
 destination row, and rejection bits; this is a correctness-localization run,
 not promotion evidence.
 
+`DIAGNOSTIC_DECODE_PROFILE=1` captures exactly the first PP512 decode token in
+Nsight Systems for both F32 and compact caches. It emits a CUDA-kernel summary
+for each arm and requires the compact materialized exact-score path. This is a
+component-cost diagnostic, not promotion evidence; use it when the short exact
+gate passes but end-to-end first-token latency remains materially different.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \

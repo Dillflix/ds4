@@ -29,6 +29,8 @@ Optional environment:
                                     with compact per-layer packed-row checks
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
+  DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of exactly one
+                                    PP512 decode token for F32 and compact
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   COMPACT_KV_PRODUCTION_AB_DIR=...
@@ -59,6 +61,7 @@ MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-12000}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
 DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
+DIAGNOSTIC_DECODE_PROFILE=${DIAGNOSTIC_DECODE_PROFILE:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 PREFILL_CHUNK=2048
@@ -85,11 +88,13 @@ awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
 for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_DECODE_ISOLATION \
+            DIAGNOSTIC_DECODE_PROFILE \
             SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
-(( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_DECODE_ISOLATION <= 1 )) ||
+(( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_DECODE_ISOLATION +
+   DIAGNOSTIC_DECODE_PROFILE <= 1 )) ||
     die "select at most one diagnostic mode"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
@@ -97,6 +102,9 @@ for tool in awk cmp date env find git grep make mkdir mv nproc nvidia-smi \
             sort stat tail tar tee timeout tr wc; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
+if [[ $DIAGNOSTIC_DECODE_PROFILE == 1 ]]; then
+    command -v nsys >/dev/null 2>&1 || die "nsys not found"
+fi
 
 IFS=, read -r -a gpu_ids <<<"$GPU_DEVICES"
 IFS=, read -r -a required_power <<<"$REQUIRED_POWER_LIMITS_W"
@@ -122,7 +130,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{runs,exact,telemetry,summary,provenance}
+mkdir -p "$OUTPUT_DIR"/{runs,exact,telemetry,summary,provenance,nsys}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -428,6 +436,47 @@ run_decode_isolation_case() {
     return "$rc"
 }
 
+run_decode_profile_case() {
+    local arm=$1 base="$OUTPUT_DIR/nsys/$1-pp512-decode" rc=0 format=f32
+    local telemetry="$OUTPUT_DIR/telemetry/$1-decode-profile.csv"
+    local -a cmd
+    [[ $arm == compact ]] && format=sm75-compact
+
+    capture_gpu_health "$base.pre-gpu.csv" || return 1
+    start_telemetry "$telemetry"
+    cmd=("${production_env[@]}"
+        "DS4_CUDA_ATTN_COMP_CACHE=$format"
+        DS4_NSYS_CAPTURE_DECODE_SKIP=0
+        DS4_NSYS_CAPTURE_DECODE_TOKENS=1
+        nsys profile --force-overwrite=true --sample=none --cpuctxsw=none
+        --trace=cuda,nvtx,osrt,cublas --capture-range=cudaProfilerApi
+        --capture-range-end=stop --output="$base"
+        ./ds4-bench --cuda --cuda-tensor-parallel
+        --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM"
+        --model "$MODEL" --prompt-file "$PROMPT"
+        --ctx-start 512 --ctx-max 512 --ctx-alloc "$CTX_ALLOC"
+        --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
+        --gen-tokens 1 --csv "$base-benchmark.csv")
+    timeout --signal=TERM --kill-after=30s "${CASE_TIMEOUT_SECONDS}s" \
+        "${cmd[@]}" >"$base.log" 2>&1 || rc=$?
+    stop_telemetry
+    capture_gpu_health "$base.post-gpu.csv" || return 1
+    [[ $rc == 0 ]] || return "$rc"
+    validate_health "$base" || return 1
+    validate_ctx512_selector "$arm" "$base.log" || return 1
+    [[ -s $base.nsys-rep && -s $base-benchmark.csv ]] || return 1
+    nsys stats --report cuda_gpu_kern_sum --format csv "$base.nsys-rep" \
+        >"$base-cuda-gpu-kern-sum.csv" \
+        2>"$base-cuda-gpu-kern-sum.log" || return 1
+    [[ -s $base-cuda-gpu-kern-sum.csv ]] || return 1
+    nsys stats --report cuda_api_sum --format csv "$base.nsys-rep" \
+        >"$base-cuda-api-sum.csv" 2>"$base-cuda-api-sum.log" || true
+    if [[ $arm == compact ]]; then
+        grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' \
+            "$base.log" || return 1
+    fi
+}
+
 if [[ $DIAGNOSTIC_PACK_AUDIT == 1 ]]; then
     phase=pack-audit
     capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
@@ -484,6 +533,23 @@ if [[ $DIAGNOSTIC_DECODE_ISOLATION == 1 ]]; then
     phase=finished
     printf 'Compact-KV PP512 decode isolation completed without failure: %s\n' \
         "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $DIAGNOSTIC_DECODE_PROFILE == 1 ]]; then
+    phase=decode-profile
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    for arm in f32 compact; do
+        printf 'Compact-KV PP512 one-token Nsight Systems profile arm=%s...\n' \
+            "$arm"
+        run_decode_profile_case "$arm" || {
+            tail -n 240 "$OUTPUT_DIR/nsys/$arm-pp512-decode.log" >&2 || true
+            die "$arm PP512 decode profile failed"
+        }
+    done
+    phase=finished
+    printf 'Compact-KV PP512 decode profiles complete: %s\n' "$OUTPUT_DIR"
     exit 0
 fi
 
