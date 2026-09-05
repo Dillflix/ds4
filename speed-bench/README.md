@@ -5498,6 +5498,7 @@ REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 TG_TOKENS=256 EXACT_TOKENS=16 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compressor-projection-small-production-ab.sh
+```
 
 ### Bounded exact compact-attention KV codec
 
@@ -5606,4 +5607,44 @@ RUN_SANITIZER=1 \
 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-attention-rowshard-softmax.sh
+```
+
+### SM75 row-owned attention-output production A/B
+
+`cuda-sm75-attention-distributed-output-ab.sh` tests the first production
+boundary move toward a fully row-owned prefill pipeline. It retains the
+existing mirrored-KV query-row split and its stable-pair policy. The control
+returns the partner's `32768`-float attention result for each partner-owned
+token row before inverse RoPE and output A+B. The opt-in candidate keeps each
+row on its attention owner through inverse RoPE and the complete output-A
+projection, returns only the `8192`-float low-rank row, and executes output B
+once on the home GPU.
+
+At a 2048-token 50/50 split this changes the partner-to-home result transfer
+from 128 MiB to 32 MiB. It does not yet remove the equally wide home-to-partner
+query transfer; doing that requires moving row ownership before the T32 q_b
+projection. The candidate therefore reduces the large bidirectional transfer
+burden from 256 MiB to 160 MiB rather than claiming to complete the
+distributed T32 design.
+
+The tagged native-Q8 GGUF stores A as row shards, so the candidate adds a
+complete startup F16 output-A execution binding on the partner for each layer
+whose stable pair row split is enabled. Under fixed 22/21 placement and the
+current pair-0 suppression this is 21 bindings, approximately 1.31 GiB on the
+pair-1 partner. B remains home-local. No runtime model allocation, eviction,
+or residency replacement is permitted.
+
+The one-shot harness compares the existing full-head gather with this narrow
+gather at PP32768, requires byte-identical frontier logits, verifies that only
+stable logical pair 1 dispatches, records per-GPU VRAM/power telemetry, and
+rejects a candidate below the configured throughput floor. The selector is
+diagnostic-only and defaults off; set
+`DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT=0` for explicit rollback.
+
+```bash
+MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-attention-distributed-output-ab.sh
 ```

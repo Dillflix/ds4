@@ -42,6 +42,7 @@ int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_rows_output_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_indexer_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(int home_tier);
@@ -1003,6 +1004,8 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    char *old_output = save_env_value(
+        "DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT");
     char *old_pairs = save_env_value(
         "DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
     char *old_indexer = save_env_value(
@@ -1050,6 +1053,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     }
 
     unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    unsetenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT");
     unsetenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
     unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS");
     unsetenv("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS");
@@ -1066,6 +1070,14 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     CHECK(!ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(0) &&
           ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(1),
           "stable default suppresses pair 0 and keeps pair 1 row splitting");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_output_requested(),
+          "row-owned attention output remains diagnostic-only by default");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT", "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_rows_output_requested(),
+          "row-owned attention output accepts an explicit opt-in");
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_rows_output_requested(),
+          "row-owned attention output accepts an explicit rollback");
 
     CHECK(ds4_test_cuda_tp_prefill_indexer_rows_requested() &&
           ds4_test_cuda_tp_prefill_indexer_rows_pair_enabled(0) &&
@@ -1298,6 +1310,7 @@ static void test_cuda_tp_prefill_attn_rows_default(void) {
     memcpy(g_gpu_peer_ok, old_peer_ok, sizeof(old_peer_ok));
     memcpy(g_gpu_peer_gib_per_sec, old_peer_speed, sizeof(old_peer_speed));
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old);
+    restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT", old_output);
     restore_env_value("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS", old_pairs);
     restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS", old_indexer);
     restore_env_value("DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS",
