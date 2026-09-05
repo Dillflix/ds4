@@ -32729,7 +32729,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     if (ok) {
         metal_graph_debug_dump_tensor_last_row(
-                "headshard_audit_attn_output", metal_graph_batch_attn_out(g),
+                "headshard_audit_output_b", metal_graph_batch_attn_out(g),
                 DS4_N_EMBD, n_tokens, il, pos0);
     }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -32782,7 +32782,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_batch_after_attn_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
         metal_graph_debug_dump_tensor_last_row(
-                "headshard_audit_attn_hc", metal_graph_batch_after_attn_hc(g),
+                "headshard_audit_post_attention_hc", metal_graph_batch_after_attn_hc(g),
                 hc_dim, n_tokens, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
