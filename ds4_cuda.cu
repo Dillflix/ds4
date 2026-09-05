@@ -1732,6 +1732,23 @@ static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
+extern "C" int ds4_gpu_attn_compact_exact_stage_reserve(
+        int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    if (g_sm75_compact_exact_stage[logical_tier]) return 1;
+
+    float *stage = NULL;
+    int ok = 0;
+    const size_t bytes =
+        (size_t)CUDA_SM75_COMPACT_EXACT_STAGE_ROWS * 512u * sizeof(float);
+    WITH_DEVICE(g_gpu[logical_tier].device_id) {
+        ok = cuda_ok(cudaMalloc((void **)&stage, bytes),
+                     "compact exact-score materialization stage reserve");
+    }
+    if (!ok) return 0;
+    g_sm75_compact_exact_stage[logical_tier] = stage;
+    return 1;
+}
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -13182,23 +13199,15 @@ static float *cuda_sm75_compact_exact_materialize(
         rows > CUDA_SM75_COMPACT_EXACT_STAGE_ROWS) {
         return NULL;
     }
-    float **stage = &g_sm75_compact_exact_stage[logical_tier];
-    if (!*stage) {
-        const size_t bytes =
-            (size_t)CUDA_SM75_COMPACT_EXACT_STAGE_ROWS * 512u * sizeof(float);
-        if (!cuda_ok(cudaMalloc((void **)stage, bytes),
-                     "compact exact-score materialization stage")) {
-            *stage = NULL;
-            return NULL;
-        }
-    }
+    if (!ds4_gpu_attn_compact_exact_stage_reserve(logical_tier)) return NULL;
+    float *stage = g_sm75_compact_exact_stage[logical_tier];
     sm75_compact_attn_unpack_kernel<<<rows, 64>>>(
-        *stage, (const cuda_sm75_compact_attn_kv_row *)src, rows);
+        stage, (const cuda_sm75_compact_attn_kv_row *)src, rows);
     if (!cuda_ok(cudaGetLastError(),
                  "compact exact-score materialization launch")) {
         return NULL;
     }
-    return *stage;
+    return stage;
 }
 
 template <bool COMPACT>

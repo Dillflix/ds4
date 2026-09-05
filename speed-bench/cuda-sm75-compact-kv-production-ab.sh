@@ -29,7 +29,7 @@ Optional environment:
                                     with compact per-layer packed-row checks
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
-  DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of exactly one
+  DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
                                     PP512 decode token for F32 and compact
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
@@ -449,7 +449,7 @@ run_decode_profile_case() {
     cmd=("${production_env[@]}"
         "TMPDIR=$profile_tmp"
         "DS4_CUDA_ATTN_COMP_CACHE=$format"
-        DS4_NSYS_CAPTURE_DECODE_SKIP=0
+        DS4_NSYS_CAPTURE_DECODE_SKIP=1
         DS4_NSYS_CAPTURE_DECODE_TOKENS=1
         nsys profile --force-overwrite=true --sample=none --cpuctxsw=none
         --trace=cuda,nvtx,osrt,cublas --capture-range=cudaProfilerApi
@@ -459,7 +459,7 @@ run_decode_profile_case() {
         --model "$MODEL" --prompt-file "$PROMPT"
         --ctx-start 512 --ctx-max 512 --ctx-alloc "$CTX_ALLOC"
         --step-mul 8 --prefill-chunk "$PREFILL_CHUNK"
-        --gen-tokens 1 --csv "$base-benchmark.csv")
+        --gen-tokens 2 --csv "$base-benchmark.csv")
     timeout --signal=TERM --kill-after=30s "${CASE_TIMEOUT_SECONDS}s" \
         "${cmd[@]}" >"$base.log" 2>&1 || rc=$?
     stop_telemetry
@@ -473,8 +473,17 @@ run_decode_profile_case() {
         2>"$base-cuda-gpu-kern-sum.log" || return 1
     [[ -s $base-cuda-gpu-kern-sum.csv ]] || return 1
     nsys stats --report cuda_api_sum --format csv "$base.nsys-rep" \
-        >"$base-cuda-api-sum.csv" 2>"$base-cuda-api-sum.log" || true
+        >"$base-cuda-api-sum.csv" 2>"$base-cuda-api-sum.log" || return 1
+    [[ -s $base-cuda-api-sum.csv ]] || return 1
+    if grep -Eq ',cudaMalloc(Host)?$' "$base-cuda-api-sum.csv"; then
+        printf 'error: %s warmed decode capture still contains a CUDA allocation\n' \
+            "$arm" >&2
+        return 1
+    fi
     if [[ $arm == compact ]]; then
+        grep -Fq \
+            'compact exact-decode stages reserved during graph setup: tiers=2 bytes-per-tier=2097152' \
+            "$base.log" || return 1
         grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' \
             "$base.log" || return 1
     fi

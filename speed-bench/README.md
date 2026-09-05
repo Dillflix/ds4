@@ -5604,11 +5604,12 @@ compact packing owns the sole shipping E4M3 quantization pass. The engine
 preserves F32 session/checkpoint payloads at the external boundary.
 
 Single-token non-indexed decode reconstructs each compact row once into a
-reusable 2 MiB per-device F32 stage, then uses the same exact two-pass score and
-finalize kernels as the F32 cache. Score accumulation order, softmax reduction,
-source-row order, and the value accumulation chain remain identical. Direct
-compact loads and the older compact online-softmax kernel remain fallbacks when
-materialization or exact score-split is unavailable.
+reusable 2 MiB per-home-device F32 stage, then uses the same exact two-pass
+score and finalize kernels as the F32 cache. The stage is reserved during graph
+setup rather than lazily in the first decode token. Score accumulation order,
+softmax reduction, source-row order, and the value accumulation chain remain
+identical. Direct compact loads and the older compact online-softmax kernel
+remain fallbacks when materialization or exact score-split is unavailable.
 
 The runner's untimed warm-up intentionally recreates the session while keeping
 the engine-owned dense-Q8 residency. Session teardown therefore synchronizes
@@ -5632,13 +5633,17 @@ failure it reports either the first divergent output or the first layer,
 destination row, and rejection bits; this is a correctness-localization run,
 not promotion evidence.
 
-`DIAGNOSTIC_DECODE_PROFILE=1` captures exactly the first PP512 decode token in
-Nsight Systems for both F32 and compact caches. It emits a CUDA-kernel summary
-for each arm and requires the compact materialized exact-score path. This is a
-component-cost diagnostic, not promotion evidence; use it when the short exact
-gate passes but end-to-end first-token latency remains materially different.
-The harness gives Nsight Systems a private temporary directory inside the
-result tree, so it does not require writable system `/tmp/nvidia` state.
+`DIAGNOSTIC_DECODE_PROFILE=1` generates two PP512 decode tokens and captures
+exactly the second in Nsight Systems for both F32 and compact caches. The first
+token primes common cross-device bounce state; excluding it prevents one-time
+pinned-host allocator variance from being misclassified as compact-cache GPU
+cost. The diagnostic emits a CUDA-kernel summary for each arm and requires the
+compact materialized exact-score path. This is component-cost evidence, not
+promotion evidence. It rejects any `cudaMalloc` or `cudaMallocHost` inside the
+warmed capture and verifies that the two 2 MiB home-device stages were reserved
+during graph setup. The harness gives Nsight Systems a private temporary
+directory inside the result tree, so it does not require writable system
+`/tmp/nvidia` state.
 
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \

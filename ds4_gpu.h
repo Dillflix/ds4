@@ -1095,6 +1095,11 @@ static inline int ds4_gpu_attn_compact_unpack_tensor(
     (void)dst_f32; (void)dst_row; (void)src; (void)src_row; (void)rows;
     return 0;
 }
+static inline int ds4_gpu_attn_compact_exact_stage_reserve(
+        int logical_tier) {
+    (void)logical_tier;
+    return 0;
+}
 static inline void ds4_gpu_attn_compact_runtime_reset(void) {}
 #else
 int ds4_gpu_attn_compact_supported(void);
@@ -1110,6 +1115,9 @@ int ds4_gpu_attn_compact_unpack_tensor(
         const ds4_gpu_tensor *src,
         uint32_t              src_row,
         uint32_t              rows);
+/* Reserve the bounded exact-decode reconstruction stage during graph setup,
+ * so the first generated token performs no compact-cache cudaMalloc. */
+int ds4_gpu_attn_compact_exact_stage_reserve(int logical_tier);
 void ds4_gpu_attn_compact_runtime_reset(void);
 #endif
 

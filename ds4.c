@@ -18201,6 +18201,30 @@ static bool metal_graph_alloc_raw_cap(
                     ? "f16" : "f32"),
             (unsigned long long)metal_graph_attn_comp_row_bytes_for_format(
                 g->attn_comp_cache_format));
+    if (g->attn_comp_cache_format ==
+            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) {
+        bool stage_tier[DS4_MAX_GPUS] = {0};
+        uint32_t stage_count = 0u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!weights_layer_has_required(&weights->layer[il], il)) continue;
+            const int tier = placement ? placement[il + 1u] : 0;
+            if (tier < 0 || tier >= DS4_MAX_GPUS || stage_tier[tier]) continue;
+            if (!ds4_gpu_attn_compact_exact_stage_reserve(tier)) {
+                fprintf(stderr,
+                        "ds4: compact exact-decode stage reservation failed "
+                        "on logical tier %d\n",
+                        tier);
+                metal_graph_free(g);
+                return false;
+            }
+            stage_tier[tier] = true;
+            stage_count++;
+        }
+        fprintf(stderr,
+                "ds4: compact exact-decode stages reserved during graph "
+                "setup: tiers=%u bytes-per-tier=%u\n",
+                stage_count, 1024u * DS4_N_HEAD_DIM * (uint32_t)sizeof(float));
+    }
     g->index_comp_cache_f16 =
         metal_graph_cuda_sm75_indexer_native_requested(used_tier);
     g->cuda_tp_prefill_indexer_rows =
