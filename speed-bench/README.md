@@ -5677,7 +5677,10 @@ normal engine dispatch is unchanged.
 The first bounded result rejects q_b GEMM shape as the source: shipping
 `CUBLAS_GEMM_DEFAULT` produced byte-identical FP16 projection storage and
 byte-identical final FP32 query values for one 64-head call versus two 32-head
-calls.  The harness now continues from that exact query at the production
+calls.  The downstream run also produced byte-identical indexed attention,
+inverse RoPE, and output-A results, but exposed a coverage error: output-A had
+been tested at rank 512 rather than the model's production rank 1024.  The
+harness now corrects that shape and continues from that exact query at the production
 512-token indexed-attention shape.  It reports three independent boundaries:
 full 64-head attention versus two 32-head launches, full versus head-range
 inverse RoPE, and one 8-group output-A GEMM versus two 4-group GEMMs.  The
@@ -5686,8 +5689,16 @@ upstream mismatch cannot be misclassified.  The large downstream arithmetic
 check is omitted from the sanitizer smoke; the sanitizer continues to cover
 the q_b allocation and fused projection path.
 
+The same command now also runs a separate two-GPU protocol binary.  On the
+selected physical pair it compares each local half against a full home-device
+reference immediately after partner q_b, local-mirror/peer-topk indexed
+attention, inverse RoPE, and the compact 4096-wide output-A gather.  Therefore
+the next result identifies the first physical boundary instead of reducing a
+21-layer production mismatch to final logits.  Use physical GPUs 3 and 2 to
+exercise the stable logical pair 1 from `GPU_DEVICES=0,3,1,2`.
+
 ```bash
-PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
+PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-exactness.sh
 ```

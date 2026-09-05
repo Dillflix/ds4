@@ -232,6 +232,9 @@ tests/cuda_sm75_t32_decode_f16_ab.o: tests/cuda_sm75_t32_decode_f16_ab.c ds4_gpu
 tests/cuda_sm75_t32_prefill_headshard_exact.o: tests/cuda_sm75_t32_prefill_headshard_exact.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sm75_t32_prefill_headshard_exact.c
 
+tests/cuda_sm75_t32_headshard_xdev_exact.o: tests/cuda_sm75_t32_headshard_xdev_exact.c ds4_gpu.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sm75_t32_headshard_xdev_exact.c
+
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
 
@@ -291,6 +294,10 @@ tests/cuda_sm75_t32_decode_f16_ab: tests/cuda_sm75_t32_decode_f16_ab.o ds4_cuda.
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/cuda_sm75_t32_prefill_headshard_exact: tests/cuda_sm75_t32_prefill_headshard_exact.o ds4_cuda.o
+	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/cuda_sm75_t32_headshard_xdev_exact: tests/cuda_sm75_t32_headshard_xdev_exact.o ds4_cuda.o
 	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 

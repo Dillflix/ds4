@@ -29,7 +29,7 @@
 /* Production attention/output-A dimensions reached immediately after q_b. */
 #define N_GROUP 8u
 #define GROUP_DIM 4096u
-#define OUT_A_RANK 512u
+#define OUT_A_RANK 1024u
 #define LOW_DIM ((uint64_t)N_GROUP * OUT_A_RANK)
 #define HALF_GROUP (N_GROUP / 2u)
 #define HALF_LOW_DIM ((uint64_t)HALF_GROUP * OUT_A_RANK)
