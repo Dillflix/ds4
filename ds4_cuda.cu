@@ -7679,6 +7679,75 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+/* Session graphs own allocations on every logical tier, while several
+ * production paths enqueue peer copies or partner work on a device other
+ * than the one that ultimately returns the logits. Synchronizing only the
+ * current device before graph destruction does not prove that those devices
+ * have stopped referring to session-owned allocations. This teardown-only
+ * barrier establishes that lifetime boundary without serializing inference. */
+extern "C" int ds4_gpu_synchronize_all_devices(void) {
+    int saved_device = -1;
+    if (cudaGetDevice(&saved_device) != cudaSuccess) {
+        g_current_logical_tier = -1;
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    int ok = 1;
+    int synchronized_devices[DS4_MAX_GPUS];
+    int synchronized_count = 0;
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        const int device = g_gpu[tier].device_id;
+        bool duplicate = false;
+        for (int i = 0; i < synchronized_count; i++) {
+            if (synchronized_devices[i] == device) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        synchronized_devices[synchronized_count++] = device;
+
+        const cudaError_t set_err = cudaSetDevice(device);
+        if (set_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA all-device synchronize cannot select logical "
+                    "tier %d device %d: %s\n",
+                    tier, device, cudaGetErrorString(set_err));
+            (void)cudaGetLastError();
+            ok = 0;
+            continue;
+        }
+        const cudaError_t sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA all-device synchronize failed on logical "
+                    "tier %d device %d: %s\n",
+                    tier, device, cudaGetErrorString(sync_err));
+            (void)cudaGetLastError();
+            ok = 0;
+        }
+    }
+
+    const cudaError_t restore_err = cudaSetDevice(saved_device);
+    g_current_logical_tier = -1;
+    if (restore_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA all-device synchronize cannot restore device %d: "
+                "%s\n",
+                saved_device, cudaGetErrorString(restore_err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    for (int tier = 0; tier < g_n_gpus; tier++) {
+        if (g_gpu[tier].device_id == saved_device) {
+            g_current_logical_tier = tier;
+            break;
+        }
+    }
+    return ok;
+}
+
 struct ds4_gpu_timer {
     int device_id;
     cudaEvent_t start;

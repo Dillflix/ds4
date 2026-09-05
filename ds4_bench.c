@@ -1191,6 +1191,12 @@ int main(int argc, char **argv) {
         bench_progress_journal_mark(
             &progress_journal, "measured-prefill", "frontier-complete",
             frontier, frontier);
+        if (getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+            fprintf(stderr,
+                    "ds4-bench: completed measured prefill frontier %d\n",
+                    frontier);
+            fflush(stderr);
+        }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (capture_this_prefill) {
             if (!ds4_gpu_profiler_stop()) {
@@ -1258,12 +1264,25 @@ int main(int argc, char **argv) {
                     warned_large_snapshot = true;
                 }
             } else if (payload_bytes > 0) {
+                if (getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                    fprintf(stderr,
+                            "ds4-bench: starting snapshot at frontier %d "
+                            "bytes=%llu\n",
+                            frontier, (unsigned long long)payload_bytes);
+                    fflush(stderr);
+                }
                 if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                     fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                     rc = 1;
                     break;
                 }
                 have_snapshot = true;
+                if (getenv("DS4_BENCH_PHASE_TRACE") != NULL) {
+                    fprintf(stderr,
+                            "ds4-bench: completed snapshot at frontier %d\n",
+                            frontier);
+                    fflush(stderr);
+                }
             }
         }
 

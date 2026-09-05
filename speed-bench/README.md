@@ -5600,6 +5600,13 @@ indexed attention. Large-token prefill consumes the exact compact rows
 directly. The engine preserves F32 session/checkpoint payloads at the external
 boundary.
 
+The runner's untimed warm-up intentionally recreates the session while keeping
+the engine-owned dense-Q8 residency. Session teardown therefore synchronizes
+every participating CUDA device before releasing graph allocations; this is a
+teardown-only lifetime boundary, not a production inference fence. Opt-in
+phase, lifecycle, and compact snapshot traces remain enabled in this A/B so a
+failure can be assigned to measured prefill, teardown, or session I/O.
+
 The one-shot qualification allocates 256K context capacity while measuring
 the PP512/4096/32768 frontiers. It requires byte-identical prefill and decode
 logits, unchanged four-GPU health, at least 12000 MiB aggregate peak-VRAM

@@ -96,6 +96,13 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+static inline int ds4_gpu_synchronize_all_devices(void) {
+    return ds4_gpu_synchronize();
+}
+#else
+int ds4_gpu_synchronize_all_devices(void);
+#endif
 
 /* CUDA-only timing and profiler helpers. Callers must keep them behind the
  * same platform guards. */

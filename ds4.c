@@ -52867,6 +52867,15 @@ static int payload_write_attn_comp_cache_as_f32(
             g, il, &stage, &saved_tier, err, errlen) != 0) {
         return 1;
     }
+    const bool trace = getenv("DS4_SESSION_IO_TRACE") != NULL;
+    if (trace) {
+        fprintf(stderr,
+                "ds4: compact snapshot expand begin layer=%u rows=%u "
+                "cache_tier=%d restore_tier=%d\n",
+                il, rows, ds4_gpu_tensor_device(g->layer_attn_comp_cache[il]),
+                saved_tier);
+        fflush(stderr);
+    }
     int rc = 0;
     uint32_t done = 0;
     while (done < rows) {
@@ -52889,6 +52898,12 @@ static int payload_write_attn_comp_cache_as_f32(
     if (payload_restore_attn_comp_stage_device(
             saved_tier, err, errlen) != 0) {
         rc = 1;
+    }
+    if (trace) {
+        fprintf(stderr,
+                "ds4: compact snapshot expand %s layer=%u rows=%u\n",
+                rc == 0 ? "complete" : "failed", il, rows);
+        fflush(stderr);
     }
     return rc;
 }
@@ -62845,6 +62860,32 @@ void ds4_session_free(ds4_session *s) {
         if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
+            const bool lifecycle_trace =
+                getenv("DS4_SESSION_LIFECYCLE_TRACE") != NULL;
+            if (lifecycle_trace) {
+                fprintf(stderr,
+                        "ds4: session teardown begin checkpoint_valid=%s "
+                        "attn_comp_cache_format=%d\n",
+                        s->checkpoint_valid ? "yes" : "no",
+                        (int)s->graph.attn_comp_cache_format);
+                fflush(stderr);
+            }
+            /* A successful session may have queued work on partner/default
+             * streams belonging to any logical tier. The logits read proves
+             * completion only for its dependency chain on the current tier;
+             * establish an all-tier lifetime boundary before releasing graph
+             * allocations that peer work may still reference. */
+            if (ds4_gpu_synchronize_all_devices() == 0) {
+                fprintf(stderr,
+                        "ds4: warning: failed to synchronize every CUDA "
+                        "device before session teardown\n");
+            }
+            if (lifecycle_trace) {
+                fprintf(stderr,
+                        "ds4: session teardown device synchronization "
+                        "complete\n");
+                fflush(stderr);
+            }
             /* The compact consumer owns backend-global nonblocking streams,
              * events, and scratch. Tear them down before freeing the session
              * tensors they were ordered against; a replacement session must
@@ -62854,6 +62895,10 @@ void ds4_session_free(ds4_session *s) {
                 ds4_gpu_attn_compact_runtime_reset();
             }
             metal_graph_free(&s->graph);
+            if (lifecycle_trace) {
+                fprintf(stderr, "ds4: session teardown graph release complete\n");
+                fflush(stderr);
+            }
         }
     }
 #endif
