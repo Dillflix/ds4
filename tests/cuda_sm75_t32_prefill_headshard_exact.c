@@ -26,6 +26,21 @@
 #define BETA_SLOW 1.0f
 #define EPSILON 1.0e-6f
 
+/* Production attention/output-A dimensions reached immediately after q_b. */
+#define N_GROUP 8u
+#define GROUP_DIM 4096u
+#define OUT_A_RANK 512u
+#define LOW_DIM ((uint64_t)N_GROUP * OUT_A_RANK)
+#define HALF_GROUP (N_GROUP / 2u)
+#define HALF_LOW_DIM ((uint64_t)HALF_GROUP * OUT_A_RANK)
+#define RAW_CAP 2304u
+#define N_RAW 128u
+#define RAW_START 385u
+#define N_COMP 8192u
+#define TOP_K 512u
+#define ATTN_WINDOW 128u
+#define ATTN_RATIO 4u
+
 static const int algorithms[] = {
     -1,
     0, 1, 2, 3, 4, 5, 6, 7,
@@ -133,6 +148,260 @@ static float rope_attention_factor(void) {
     return 1.0f / (1.0f + 0.1f * logf(1.0f / ROPE_SCALE));
 }
 
+static void build_q8_0_rows(unsigned char *dst, uint64_t rows,
+                            uint64_t columns) {
+    const uint64_t blocks = columns / 32u;
+    for (uint64_t row = 0u; row < rows; row++) {
+        for (uint64_t block = 0u; block < blocks; block++) {
+            unsigned char *packed = dst + (row * blocks + block) * 34u;
+            const float scale =
+                (float)(1u + ((row * 11u + block * 7u) % 13u)) / 256.0f;
+            const uint16_t scale_bits = float_to_half_bits(scale);
+            packed[0] = (unsigned char)(scale_bits & 0xffu);
+            packed[1] = (unsigned char)(scale_bits >> 8u);
+            for (uint64_t lane = 0u; lane < 32u; lane++) {
+                const uint64_t column = block * 32u + lane;
+                const int value = (int)((row * 19u + column * 23u +
+                    block * 29u + (row >> 3u) * 5u + 31u) % 127u) - 63;
+                packed[2u + lane] = (unsigned char)(int8_t)value;
+            }
+        }
+    }
+}
+
+/* q_b proved exact in isolation.  Exercise the two downstream arithmetic
+ * boundaries at the same 512-token/64-head shape before another model run:
+ * one indexed-attention launch versus two 32-head launches, then one 8-group
+ * output-A GEMM versus the candidate's two 4-group GEMMs. */
+static int check_downstream_boundaries(
+        const float *query_host, ds4_gpu_tensor *query,
+        const void *previous_model, uint64_t previous_model_bytes) {
+    const uint64_t q_count = (uint64_t)N_TOK * OUT_DIM;
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t raw_count = (uint64_t)RAW_CAP * HEAD_DIM;
+    const uint64_t comp_count = (uint64_t)N_COMP * HEAD_DIM;
+    const uint64_t topk_count = (uint64_t)N_TOK * TOP_K;
+    const uint64_t low_count = (uint64_t)N_TOK * LOW_DIM;
+    const uint64_t half_low_count = (uint64_t)N_TOK * HALF_LOW_DIM;
+    const uint64_t a_blocks = GROUP_DIM / 32u;
+    const uint64_t a_bytes = LOW_DIM * a_blocks * 34u;
+    const uint64_t sinks_offset = a_bytes;
+    const uint64_t output_model_bytes = a_bytes + N_HEAD * sizeof(float);
+    unsigned char *output_model = NULL;
+    float *raw_host = NULL, *comp_host = NULL;
+    int32_t *topk_host = NULL;
+    float *attention_reference = NULL, *attention_candidate = NULL;
+    float *low_reference = NULL, *low_half0 = NULL, *low_half1 = NULL;
+    float *low_assembled = NULL;
+    ds4_gpu_tensor *raw = NULL, *comp = NULL, *topk = NULL;
+    ds4_gpu_tensor *heads_reference = NULL, *heads_candidate = NULL;
+    ds4_gpu_tensor *low_full = NULL, *low0 = NULL, *low1 = NULL;
+    int output_map_installed = 0;
+    int status = 0;
+
+    output_model = (unsigned char *)calloc(1, (size_t)output_model_bytes);
+    raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
+    comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    topk_host = (int32_t *)malloc((size_t)topk_count * sizeof(int32_t));
+    attention_reference = (float *)malloc((size_t)q_bytes);
+    attention_candidate = (float *)malloc((size_t)q_bytes);
+    low_reference = (float *)malloc((size_t)low_count * sizeof(float));
+    low_half0 = (float *)malloc((size_t)half_low_count * sizeof(float));
+    low_half1 = (float *)malloc((size_t)half_low_count * sizeof(float));
+    low_assembled = (float *)malloc((size_t)low_count * sizeof(float));
+    if (!output_model || !raw_host || !comp_host || !topk_host ||
+        !attention_reference || !attention_candidate || !low_reference ||
+        !low_half0 || !low_half1 || !low_assembled) {
+        fprintf(stderr, "error: downstream host allocation failed\n");
+        goto cleanup;
+    }
+    build_q8_0_rows(output_model, LOW_DIM, GROUP_DIM);
+    for (uint64_t i = 0u; i < raw_count; i++) {
+        const int value =
+            (int)((i * 13u + (i >> 5u) * 17u + 37u) % 257u) - 128;
+        raw_host[i] = (float)value / 2048.0f;
+    }
+    for (uint64_t i = 0u; i < comp_count; i++) {
+        const int value =
+            (int)((i * 31u + (i >> 4u) * 7u + 41u) % 263u) - 131;
+        comp_host[i] = (float)value / 2048.0f;
+    }
+    for (uint32_t token = 0u; token < N_TOK; token++) {
+        for (uint32_t k = 0u; k < TOP_K; k++) {
+            topk_host[(uint64_t)token * TOP_K + k] =
+                (int32_t)(((uint64_t)token * 131u +
+                           (uint64_t)k * 17u + 19u) % N_COMP);
+        }
+    }
+
+    if (!ds4_gpu_set_model_map(output_model, output_model_bytes)) {
+        fprintf(stderr, "error: downstream model installation failed\n");
+        goto cleanup;
+    }
+    output_map_installed = 1;
+    if (!ds4_gpu_cache_q8_f16_range(
+            output_model, output_model_bytes, 0u, a_bytes,
+            GROUP_DIM, LOW_DIM, "attn_output_a_full") ||
+        !ds4_gpu_cache_q8_f16_range(
+            output_model, output_model_bytes, 0u, a_bytes / 2u,
+            GROUP_DIM, HALF_LOW_DIM, "attn_output_a_head0") ||
+        !ds4_gpu_cache_q8_f16_range(
+            output_model, output_model_bytes, a_bytes / 2u, a_bytes / 2u,
+            GROUP_DIM, HALF_LOW_DIM, "attn_output_a_head1")) {
+        fprintf(stderr, "error: downstream output-A cache installation failed\n");
+        goto cleanup;
+    }
+
+    raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    comp = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    topk = ds4_gpu_tensor_alloc(topk_count * sizeof(int32_t));
+    heads_reference = ds4_gpu_tensor_alloc(q_bytes);
+    heads_candidate = ds4_gpu_tensor_alloc(q_bytes);
+    low_full = ds4_gpu_tensor_alloc(low_count * sizeof(float));
+    low0 = ds4_gpu_tensor_alloc(half_low_count * sizeof(float));
+    low1 = ds4_gpu_tensor_alloc(half_low_count * sizeof(float));
+    if (!raw || !comp || !topk || !heads_reference || !heads_candidate ||
+        !low_full || !low0 || !low1 ||
+        !ds4_gpu_tensor_write(query, 0u, query_host, q_bytes) ||
+        !ds4_gpu_tensor_write(raw, 0u, raw_host,
+                              raw_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(comp, 0u, comp_host,
+                              comp_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(topk, 0u, topk_host,
+                              topk_count * sizeof(int32_t))) {
+        fprintf(stderr, "error: downstream device setup failed\n");
+        goto cleanup;
+    }
+
+    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            heads_reference, output_model, output_model_bytes, sinks_offset,
+            query, raw, comp, 0u, topk, N_TOK, POS0, N_RAW, RAW_CAP,
+            RAW_START, N_COMP, TOP_K, ATTN_WINDOW, ATTN_RATIO,
+            N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+            heads_candidate, output_model, output_model_bytes, sinks_offset,
+            query, raw, comp, 0u, topk, N_TOK, POS0, N_RAW, RAW_CAP,
+            RAW_START, N_COMP, TOP_K, ATTN_WINDOW, ATTN_RATIO,
+            0u, SHARD_HEADS, N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+            heads_candidate, output_model, output_model_bytes, sinks_offset,
+            query, raw, comp, 0u, topk, N_TOK, POS0, N_RAW, RAW_CAP,
+            RAW_START, N_COMP, TOP_K, ATTN_WINDOW, ATTN_RATIO,
+            SHARD_HEADS, SHARD_HEADS, N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads_reference, 0u, attention_reference,
+                             q_bytes) ||
+        !ds4_gpu_tensor_read(heads_candidate, 0u, attention_candidate,
+                             q_bytes)) {
+        fprintf(stderr, "error: indexed-attention boundary launch failed\n");
+        goto cleanup;
+    }
+    diff_metrics attention_diff = compare_f32(
+        attention_reference, attention_candidate, q_count);
+    printf("boundary=indexed-attention-full64-vs-head32x2,"
+           "mismatches=%llu,max_abs=%.9g\n",
+           (unsigned long long)attention_diff.mismatches,
+           attention_diff.max_abs);
+
+    if (!ds4_gpu_rope_tail_tensor(
+            heads_reference, N_TOK, N_HEAD, HEAD_DIM, N_ROT, POS0,
+            ORIG_CTX, true, ROPE_BASE, ROPE_SCALE, ROPE_EXT,
+            rope_attention_factor(), BETA_FAST, BETA_SLOW) ||
+        !ds4_gpu_rope_tail_head_range_tensor(
+            heads_candidate, N_TOK, 0u, SHARD_HEADS, N_HEAD, HEAD_DIM,
+            N_ROT, POS0, ORIG_CTX, true, ROPE_BASE, ROPE_SCALE, ROPE_EXT,
+            rope_attention_factor(), BETA_FAST, BETA_SLOW) ||
+        !ds4_gpu_rope_tail_head_range_tensor(
+            heads_candidate, N_TOK, SHARD_HEADS, SHARD_HEADS, N_HEAD,
+            HEAD_DIM, N_ROT, POS0, ORIG_CTX, true, ROPE_BASE, ROPE_SCALE,
+            ROPE_EXT, rope_attention_factor(), BETA_FAST, BETA_SLOW) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads_reference, 0u, attention_reference,
+                             q_bytes) ||
+        !ds4_gpu_tensor_read(heads_candidate, 0u, attention_candidate,
+                             q_bytes)) {
+        fprintf(stderr, "error: inverse-RoPE boundary launch failed\n");
+        goto cleanup;
+    }
+    diff_metrics rope_diff = compare_f32(
+        attention_reference, attention_candidate, q_count);
+    printf("boundary=inverse-rope-full64-vs-head32x2,"
+           "mismatches=%llu,max_abs=%.9g\n",
+           (unsigned long long)rope_diff.mismatches, rope_diff.max_abs);
+
+    /* Feed the same reference heads to both output-A shapes.  This prevents
+     * an upstream mismatch from being misattributed to the 8 versus 4+4
+     * batched GEMM boundary. */
+    if (!ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+            low_full, output_model, output_model_bytes, 0u,
+            GROUP_DIM, OUT_A_RANK, N_GROUP, 0u, N_GROUP,
+            heads_reference, N_TOK) ||
+        !ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+            low0, output_model, output_model_bytes, 0u,
+            GROUP_DIM, OUT_A_RANK, N_GROUP, 0u, HALF_GROUP,
+            heads_reference, N_TOK) ||
+        !ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+            low1, output_model, output_model_bytes, 0u,
+            GROUP_DIM, OUT_A_RANK, N_GROUP, HALF_GROUP, HALF_GROUP,
+            heads_reference, N_TOK) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low_full, 0u, low_reference,
+                             low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(low0, 0u, low_half0,
+                             half_low_count * sizeof(float)) ||
+        !ds4_gpu_tensor_read(low1, 0u, low_half1,
+                             half_low_count * sizeof(float))) {
+        fprintf(stderr, "error: output-A boundary launch failed\n");
+        goto cleanup;
+    }
+    for (uint32_t token = 0u; token < N_TOK; token++) {
+        memcpy(low_assembled + (uint64_t)token * LOW_DIM,
+               low_half0 + (uint64_t)token * HALF_LOW_DIM,
+               (size_t)HALF_LOW_DIM * sizeof(float));
+        memcpy(low_assembled + (uint64_t)token * LOW_DIM + HALF_LOW_DIM,
+               low_half1 + (uint64_t)token * HALF_LOW_DIM,
+               (size_t)HALF_LOW_DIM * sizeof(float));
+    }
+    diff_metrics output_a_diff = compare_f32(
+        low_reference, low_assembled, low_count);
+    printf("boundary=output-a-groups8-vs-groups4x2,"
+           "mismatches=%llu,max_abs=%.9g\n",
+           (unsigned long long)output_a_diff.mismatches,
+           output_a_diff.max_abs);
+    printf("downstream_boundary_conclusion=%s\n",
+           attention_diff.mismatches ? "indexed-attention-diverged" :
+           rope_diff.mismatches ? "inverse-rope-diverged" :
+           output_a_diff.mismatches ? "output-a-diverged" :
+           "all-single-gpu-boundaries-bit-exact");
+    status = 1;
+
+cleanup:
+    ds4_gpu_tensor_free(low1);
+    ds4_gpu_tensor_free(low0);
+    ds4_gpu_tensor_free(low_full);
+    ds4_gpu_tensor_free(heads_candidate);
+    ds4_gpu_tensor_free(heads_reference);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    if (output_map_installed &&
+        !ds4_gpu_set_model_map(previous_model, previous_model_bytes)) {
+        fprintf(stderr, "error: failed to retire downstream model map\n");
+        status = 0;
+    }
+    free(low_assembled);
+    free(low_half1);
+    free(low_half0);
+    free(low_reference);
+    free(attention_candidate);
+    free(attention_reference);
+    free(topk_host);
+    free(comp_host);
+    free(raw_host);
+    free(output_model);
+    return status;
+}
+
 static int launch_full(ds4_gpu_tensor *output, ds4_gpu_tensor *half,
                        const unsigned char *model, uint64_t model_bytes,
                        const ds4_gpu_tensor *input, uint64_t weight_offset) {
@@ -210,7 +479,7 @@ int main(void) {
     }
 
     (void)setenv("DS4_CUDA_COPY_MODEL", "1", 1);
-    (void)setenv("DS4_CUDA_Q8_F16_CACHE_MB", "192", 1);
+    (void)setenv("DS4_CUDA_Q8_F16_CACHE_MB", "256", 1);
     (void)setenv("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", "1", 1);
     (void)setenv("DS4_CUDA_NO_TF32", "1", 1);
     (void)setenv("DS4_CUDA_T32_F16_FUSED", "1", 1);
@@ -346,8 +615,19 @@ int main(void) {
     printf("first_shipping_exact_algorithm=%d\n", exact_algorithm);
     printf("diagnostic_conclusion=%s\n",
            exact_algorithm == -2 ?
-               "no-legacy-cublas-algorithm-preserved-shipping-exactness" :
-               "fixed-cublas-algorithm-candidate-found");
+               "q-b-full-vs-shards-diverged" :
+           exact_algorithm == -1 ?
+               "shipping-default-q-b-is-bit-exact" :
+               "only-explicit-algorithm-preserved-q-b-exactness");
+    if (!getenv("DS4_T32_HEADSHARD_SANITIZER_SMOKE")) {
+        if (!check_downstream_boundaries(
+                shipping_output, full, model, model_bytes)) {
+            fprintf(stderr, "error: downstream boundary diagnostic failed\n");
+            goto cleanup;
+        }
+    } else {
+        printf("downstream_boundary_conclusion=skipped-in-sanitizer-smoke\n");
+    }
     printf("harness_status=ok\n");
     status = 0;
 

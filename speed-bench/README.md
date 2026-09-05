@@ -5674,6 +5674,18 @@ an algorithm exact on both axes can advance.  The diagnostic selector is not
 read unless `DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC` is explicitly present, so
 normal engine dispatch is unchanged.
 
+The first bounded result rejects q_b GEMM shape as the source: shipping
+`CUBLAS_GEMM_DEFAULT` produced byte-identical FP16 projection storage and
+byte-identical final FP32 query values for one 64-head call versus two 32-head
+calls.  The harness now continues from that exact query at the production
+512-token indexed-attention shape.  It reports three independent boundaries:
+full 64-head attention versus two 32-head launches, full versus head-range
+inverse RoPE, and one 8-group output-A GEMM versus two 4-group GEMMs.  The
+output-A comparison deliberately feeds identical heads to both arms so an
+upstream mismatch cannot be misclassified.  The large downstream arithmetic
+check is omitted from the sanitizer smoke; the sanitizer continues to cover
+the q_b allocation and fused projection path.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \

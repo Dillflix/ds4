@@ -98,7 +98,7 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(algorithm=|first_shipping_exact_algorithm=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(algorithm=|first_shipping_exact_algorithm=|diagnostic_conclusion=|boundary=|downstream_boundary_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/exactness.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 T32 prefill head-shard exactness diagnostic complete: %s\n' \
     "$OUTPUT_DIR"
