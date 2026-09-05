@@ -5825,8 +5825,22 @@ RoPE, and after inverse RoPE.  Those boundaries distinguish live q_b
 materialization from zero-prefix static-mixed attention and its cache inputs,
 then from inverse RoPE/output projection, without another broad 32K run.
 
+The expanded layer-22 audit confirms that both q_b head halves and the current
+KV row are bit-identical.  The first sampled difference is the attention result
+for the zero-prefix chunk; every sampled boundary in the following three
+chunks is exact.  Layer 22 is not the origin boundary, however: 22 candidate
+layers have already executed before it, and a last-row KV sample cannot expose
+a difference in any of the other 511 rows consumed by the final query.  The
+next audit therefore defaults to the first compressed layer (layer 2), accepts
+a bounded PP512 run, and captures the complete current raw batch, its raw-cache
+copy, and the complete compressed prefix.  It also reports raw-batch versus
+raw-cache consistency within each arm.  This separates inherited layer-0/1
+state, a cache/store defect, and static-mixed attention arithmetic without
+changing the production candidate.
+
 ```bash
-CTX_TOKENS=2048 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
+CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
+BOUNDARY_AUDIT_LAYER=2 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
 ```

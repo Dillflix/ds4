@@ -32437,6 +32437,31 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) batch_attention_done = true;
         }
+        /* The head-shard boundary audit must distinguish a difference inherited
+         * from an earlier layer from a difference introduced by static-mixed
+         * attention itself.  The ordinary last-row KV checkpoint cannot do
+         * that: the final query only reads its own q row, but it consumes the
+         * complete current raw window and compressed prefix.  Dump the actual
+         * zero-prefix sources, including the raw-cache copy used only by the
+         * head-shard path.  These remain strict no-ops outside the named debug
+         * audit and therefore do not affect production dispatch or residency. */
+        if (ok && zero_prefix && n_comp != 0) {
+            metal_graph_debug_dump_tensor(
+                    "headshard_audit_raw_batch",
+                    metal_graph_batch_kv(g),
+                    (uint64_t)n_tokens * DS4_N_HEAD_DIM,
+                    il, pos0);
+            metal_graph_debug_dump_tensor(
+                    "headshard_audit_raw_cache",
+                    g->layer_raw_cache[il],
+                    (uint64_t)n_tokens * DS4_N_HEAD_DIM,
+                    il, pos0);
+            metal_graph_debug_dump_tensor(
+                    "headshard_audit_comp_cache",
+                    g->layer_attn_comp_cache[il],
+                    (uint64_t)n_comp * DS4_N_HEAD_DIM,
+                    il, pos0);
+        }
         if (ok && zero_prefix && !topk_prefill_needed && n_comp != 0) {
             if (tp_row_split_attn) {
                 ok = ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(tp_heads,

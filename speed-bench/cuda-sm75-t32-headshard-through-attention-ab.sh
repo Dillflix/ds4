@@ -21,7 +21,7 @@ CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
 MATCH_PAIR1_INDEXER=${MATCH_PAIR1_INDEXER:-1}
 BOUNDARY_AUDIT_ONLY=${BOUNDARY_AUDIT_ONLY:-0}
-BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-22}
+BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-2}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-ab-$stamp}
 
@@ -39,7 +39,9 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
-(( STAGE_SPLIT == 22 && CTX_TOKENS >= 2048 &&
+min_ctx_tokens=2048
+[[ $BOUNDARY_AUDIT_ONLY == 1 ]] && min_ctx_tokens=512
+(( STAGE_SPLIT == 22 && CTX_TOKENS >= min_ctx_tokens &&
    CTX_TOKENS % 512 == 0 && CTX_ALLOC > CTX_TOKENS &&
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
@@ -164,7 +166,7 @@ for variant in "${variants[@]}"; do
         variant_env+=(
             "DS4_METAL_GRAPH_DUMP_PREFIX=$boundary_dir/$variant"
             "DS4_METAL_GRAPH_DUMP_LAYER=$BOUNDARY_AUDIT_LAYER"
-            DS4_METAL_GRAPH_DUMP_NAME=headshard_audit_q_input,headshard_audit_query_heads0,headshard_audit_query_heads1,headshard_audit_kv_input,headshard_audit_scores_heads0,headshard_audit_scores_heads1,headshard_audit_restored_heads0,headshard_audit_restored_heads1,headshard_audit_output_b,headshard_audit_post_attention_hc,headshard_audit_layer_hc
+            DS4_METAL_GRAPH_DUMP_NAME=headshard_audit_q_input,headshard_audit_query_heads0,headshard_audit_query_heads1,headshard_audit_kv_input,headshard_audit_raw_batch,headshard_audit_raw_cache,headshard_audit_comp_cache,headshard_audit_scores_heads0,headshard_audit_scores_heads1,headshard_audit_restored_heads0,headshard_audit_restored_heads1,headshard_audit_output_b,headshard_audit_post_attention_hc,headshard_audit_layer_hc
         )
     fi
     base="$OUTPUT_DIR/production/$variant"
@@ -306,6 +308,9 @@ stages = (
     "headshard_audit_query_heads0",
     "headshard_audit_query_heads1",
     "headshard_audit_kv_input",
+    "headshard_audit_raw_batch",
+    "headshard_audit_raw_cache",
+    "headshard_audit_comp_cache",
     "headshard_audit_scores_heads0",
     "headshard_audit_scores_heads1",
     "headshard_audit_restored_heads0",
@@ -375,6 +380,14 @@ for pos in sorted({key[0] for key in expected}):
             f"first_index={first_index},max_abs={max_abs:.9g},rmse={rmse:.9g}")
         if mismatches and first is None:
             first = (pos, stage)
+
+for arm, files in (("control", control), ("headshard", candidate)):
+    for pos in sorted({key[0] for key in expected}):
+        batch = files[(pos, "headshard_audit_raw_batch")].read_bytes()
+        cache = files[(pos, "headshard_audit_raw_cache")].read_bytes()
+        lines.append(
+            f"raw_source_consistency,arm={arm},pos={pos},status=" +
+            ("bit-exact" if batch == cache else "different"))
 
 control_logits = root / "production" / "control-logits" / \
     f"frontier_{ctx_tokens:06d}.logits.f32"
