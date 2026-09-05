@@ -14,10 +14,12 @@
  * rows fail closed.  The consumer A/B follows the production SM75 indexed
  * attention shape: one 256-thread block owns eight heads, cooperatively stages
  * eight selected rows at a time, and performs the existing ordered online
- * softmax. Compact decoding is included in that timing. Four additional
+ * softmax. Compact decoding is included in that timing. Five additional
  * byte-exact arms independently test selected-row materialization, 16-head
  * blocks, a two-stage warp-specialized loader, and a 1408-byte exact
- * F16-plus-exceptions row.
+ * F16-plus-exceptions row, plus double-buffered 64-row hybrid materialization
+ * into 448 exact F16 non-RoPE and 64 untouched F32 RoPE values consumed by
+ * H16 blocks.
  */
 
 #include <cuda_runtime.h>
@@ -47,6 +49,8 @@ enum {
     ROWS_PER_STAGE = 8,
     STAGED_LOADER_WARPS = 2,
     TOP_K = 512,
+    HYBRID_CHUNK_ROWS = 64,
+    HYBRID_BUFFERS = 2,
     HALF_EXCEPTION_WORDS = HEAD_DIM / 32,
     HALF_EXCEPTION_CAPACITY = N_ROT,
     GUARD_BYTES = 256,
@@ -73,6 +77,15 @@ struct __align__(32) HalfExceptionAttentionKVRow {
     float exception[HALF_EXCEPTION_CAPACITY];
 };
 
+/* Transient selected-row representation. The already-E4M3-rounded non-RoPE
+ * prefix must round-trip through F16 exactly; the untouched RoPE tail remains
+ * F32. This is double-buffered by chunk and never replaces the persistent
+ * 736-byte row. */
+struct __align__(32) HybridSelectedRow {
+    __half nope_f16[N_NOPE];
+    float rope_f32[N_ROT];
+};
+
 static_assert(N_SCALE == 7, "DeepSeek V4 Flash compact KV needs seven scales");
 static_assert(sizeof(CompactAttentionKVRow) == 736,
               "compact compressed-attention KV row must be 736 bytes");
@@ -82,6 +95,12 @@ static_assert(sizeof(HalfExceptionAttentionKVRow) == 1408,
               "F16-plus-exceptions KV row must be 1408 bytes");
 static_assert(alignof(HalfExceptionAttentionKVRow) == 32,
               "F16-plus-exceptions KV row must be 32-byte aligned");
+static_assert(sizeof(HybridSelectedRow) == 1152,
+              "hybrid selected KV row must be 1152 bytes");
+static_assert(alignof(HybridSelectedRow) == 32,
+              "hybrid selected KV row must be 32-byte aligned");
+static_assert(TOP_K % HYBRID_CHUNK_ROWS == 0,
+              "selected rows must divide evenly into pipeline chunks");
 
 enum PackStatus {
     PACK_OK = 0,
@@ -89,6 +108,7 @@ enum PackStatus {
     PACK_UNREPRESENTABLE = 2,
     PACK_BAD_SCALE = 4,
     PACK_TOO_MANY_EXCEPTIONS = 8,
+    PACK_HALF_INEXACT = 16,
 };
 
 static void cuda_die(cudaError_t err, const char *what) {
@@ -507,6 +527,195 @@ __global__ static void compact_materialize_selected_kernel(
          c4 += blockDim.x) {
         dst[c4] = compact_load_float4(compact_rows + row, c4, lane);
     }
+}
+
+/* Decode one 64-row selected chunk from the persistent 736-byte rows into a
+ * reusable exact hybrid scratch buffer.  A non-RoPE value is committed as F16
+ * only if widening it reproduces the source F32 bits.  The status word makes
+ * this a fail-closed representation change rather than an accuracy trade. */
+__global__ static void compact_materialize_hybrid_chunk_kernel(
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        HybridSelectedRow *hybrid_rows,
+        uint32_t *status,
+        uint32_t n_tokens,
+        uint32_t chunk_start) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t local_row = blockIdx.y;
+    if (token >= n_tokens || local_row >= HYBRID_CHUNK_ROWS) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t selected = chunk_start + local_row;
+    const uint32_t source_row = (uint32_t)topk[
+        (uint64_t)token * TOP_K + selected];
+    const CompactAttentionKVRow *src = compact_rows + source_row;
+    HybridSelectedRow *dst = hybrid_rows +
+        (uint64_t)token * HYBRID_CHUNK_ROWS + local_row;
+    uint32_t row_status = PACK_OK;
+
+    for (uint32_t c4 = threadIdx.x;
+         c4 < HEAD_DIM / 4u;
+         c4 += blockDim.x) {
+        const uint32_t d = c4 * 4u;
+        const float4 value = compact_load_float4(src, c4, lane);
+        if (d < N_NOPE) {
+            const __half2 h01 = __floats2half2_rn(value.x, value.y);
+            const __half2 h23 = __floats2half2_rn(value.z, value.w);
+            ((__half2 *)(dst->nope_f16 + d))[0] = h01;
+            ((__half2 *)(dst->nope_f16 + d))[1] = h23;
+            const float2 f01 = __half22float2(h01);
+            const float2 f23 = __half22float2(h23);
+            if (__float_as_uint(f01.x) != __float_as_uint(value.x) ||
+                __float_as_uint(f01.y) != __float_as_uint(value.y) ||
+                __float_as_uint(f23.x) != __float_as_uint(value.z) ||
+                __float_as_uint(f23.y) != __float_as_uint(value.w)) {
+                row_status |= PACK_HALF_INEXACT;
+            }
+        } else {
+            ((float4 *)dst->rope_f32)[c4 - N_NOPE / 4u] = value;
+        }
+    }
+    if (row_status != PACK_OK) {
+        atomicOr(status + (uint64_t)token * HYBRID_CHUNK_ROWS + local_row,
+                 row_status);
+    }
+}
+
+__device__ __forceinline__ static float4 hybrid_load_float4(
+        const HybridSelectedRow *row, uint32_t c4) {
+    const uint32_t d = c4 * 4u;
+    if (d < N_NOPE) {
+        const __half2 *src = (const __half2 *)(row->nope_f16 + d);
+        const float2 f01 = __half22float2(src[0]);
+        const float2 f23 = __half22float2(src[1]);
+        return make_float4(f01.x, f01.y, f23.x, f23.y);
+    }
+    return ((const float4 *)row->rope_f32)[c4 - N_NOPE / 4u];
+}
+
+/* Sixteen warps own sixteen heads.  Each launch consumes one 64-row hybrid
+ * chunk, preserving the production row order and carrying the exact online
+ * softmax numerator/max/sum through F32 state between chunks. */
+__global__ static void hybrid_h16_attention_chunk_kernel(
+        const HybridSelectedRow *hybrid_rows,
+        const float *sinks,
+        const float *q,
+        float *out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens,
+        uint32_t chunk_index) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    if (token >= n_tokens) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * HEADS_PER_GROUP_16 + warp;
+    const uint64_t state_index = (uint64_t)token * ATTENTION_HEADS + head;
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * (HEAD_DIM / 4u)];
+
+    const float4 *q4 = (const float4 *)(
+        q + state_index * HEAD_DIM);
+    const float4 q0 = q4[lane + 0u];
+    const float4 q1 = q4[lane + 32u];
+    const float4 q2 = q4[lane + 64u];
+    const float4 q3 = q4[lane + 96u];
+    const float score_scale = rsqrtf((float)HEAD_DIM);
+
+    float max_s = chunk_index == 0u ? -INFINITY : max_state[state_index];
+    float sum_s = chunk_index == 0u ? 0.0f : sum_state[state_index];
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+    float4 *out4 = (float4 *)(out + state_index * HEAD_DIM);
+    if (chunk_index != 0u) {
+        o0 = out4[lane + 0u];
+        o1 = out4[lane + 32u];
+        o2 = out4[lane + 64u];
+        o3 = out4[lane + 96u];
+    }
+
+    const HybridSelectedRow *token_rows = hybrid_rows +
+        (uint64_t)token * HYBRID_CHUNK_ROWS;
+    for (uint32_t row0 = 0; row0 < HYBRID_CHUNK_ROWS;
+         row0 += ROWS_PER_STAGE) {
+        for (uint32_t off = threadIdx.x;
+             off < ROWS_PER_STAGE * (HEAD_DIM / 4u);
+             off += blockDim.x) {
+            const uint32_t rr = off / (HEAD_DIM / 4u);
+            const uint32_t c4 = off % (HEAD_DIM / 4u);
+            kv_shared[off] = hybrid_load_float4(token_rows + row0 + rr, c4);
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t rr = 0; rr < ROWS_PER_STAGE; rr++) {
+            const float4 *kv4 = kv_shared + rr * (HEAD_DIM / 4u);
+            const float4 k0 = kv4[lane + 0u];
+            const float4 k1 = kv4[lane + 32u];
+            const float4 k2 = kv4[lane + 64u];
+            const float4 k3 = kv4[lane + 96u];
+            float score = attention_dot4(q0, k0) +
+                          attention_dot4(q1, k1) +
+                          attention_dot4(q2, k2) +
+                          attention_dot4(q3, k3);
+            score = attention_warp_sum(score) * score_scale;
+            score = __shfl_sync(0xffffffffu, score, 0);
+            const float new_m = fmaxf(max_s, score);
+            const float old_scale = expf(max_s - new_m);
+            const float row_scale = expf(score - new_m);
+            sum_s = sum_s * old_scale + row_scale;
+            o0.x = o0.x * old_scale + k0.x * row_scale;
+            o0.y = o0.y * old_scale + k0.y * row_scale;
+            o0.z = o0.z * old_scale + k0.z * row_scale;
+            o0.w = o0.w * old_scale + k0.w * row_scale;
+            o1.x = o1.x * old_scale + k1.x * row_scale;
+            o1.y = o1.y * old_scale + k1.y * row_scale;
+            o1.z = o1.z * old_scale + k1.z * row_scale;
+            o1.w = o1.w * old_scale + k1.w * row_scale;
+            o2.x = o2.x * old_scale + k2.x * row_scale;
+            o2.y = o2.y * old_scale + k2.y * row_scale;
+            o2.z = o2.z * old_scale + k2.z * row_scale;
+            o2.w = o2.w * old_scale + k2.w * row_scale;
+            o3.x = o3.x * old_scale + k3.x * row_scale;
+            o3.y = o3.y * old_scale + k3.y * row_scale;
+            o3.z = o3.z * old_scale + k3.z * row_scale;
+            o3.w = o3.w * old_scale + k3.w * row_scale;
+            max_s = new_m;
+        }
+        __syncthreads();
+    }
+
+    const bool final_chunk =
+        chunk_index + 1u == TOP_K / HYBRID_CHUNK_ROWS;
+    if (final_chunk) {
+        const float sink = sinks[head];
+        const float new_m = fmaxf(max_s, sink);
+        const float old_scale = expf(max_s - new_m);
+        const float sink_scale = expf(sink - new_m);
+        sum_s = sum_s * old_scale + sink_scale;
+        o0.x *= old_scale; o0.y *= old_scale;
+        o0.z *= old_scale; o0.w *= old_scale;
+        o1.x *= old_scale; o1.y *= old_scale;
+        o1.z *= old_scale; o1.w *= old_scale;
+        o2.x *= old_scale; o2.y *= old_scale;
+        o2.z *= old_scale; o2.w *= old_scale;
+        o3.x *= old_scale; o3.y *= old_scale;
+        o3.z *= old_scale; o3.w *= old_scale;
+        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s;
+        o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s;
+        o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s;
+        o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s;
+        o3.z *= inv_s; o3.w *= inv_s;
+    } else if (lane == 0u) {
+        max_state[state_index] = max_s;
+        sum_state[state_index] = sum_s;
+    }
+    out4[lane + 0u] = o0;
+    out4[lane + 32u] = o1;
+    out4[lane + 64u] = o2;
+    out4[lane + 96u] = o3;
 }
 
 __global__ static void half_exception_attention_consumer_kernel(
@@ -1320,6 +1529,310 @@ static void time_throughput_candidate_paired(
     free(paired_samples);
 }
 
+struct HybridPipelineContext {
+    cudaStream_t materialize_stream;
+    cudaStream_t attention_stream;
+    cudaEvent_t ready[HYBRID_BUFFERS];
+    cudaEvent_t reusable[HYBRID_BUFFERS];
+};
+
+static void hybrid_pipeline_init(HybridPipelineContext *pipeline) {
+    memset(pipeline, 0, sizeof(*pipeline));
+    cuda_die(cudaStreamCreateWithFlags(
+                 &pipeline->materialize_stream, cudaStreamNonBlocking),
+             "create hybrid materialization stream");
+    cuda_die(cudaStreamCreateWithFlags(
+                 &pipeline->attention_stream, cudaStreamNonBlocking),
+             "create hybrid attention stream");
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        cuda_die(cudaEventCreateWithFlags(
+                     &pipeline->ready[buffer], cudaEventDisableTiming),
+                 "create hybrid-ready event");
+        cuda_die(cudaEventCreateWithFlags(
+                     &pipeline->reusable[buffer], cudaEventDisableTiming),
+                 "create hybrid-reusable event");
+        /* Seed the reuse dependency once. Every later record is made by the
+         * consumer after it has finished reading that buffer. */
+        cuda_die(cudaEventRecord(pipeline->reusable[buffer],
+                                 pipeline->attention_stream),
+                 "seed hybrid-reusable event");
+    }
+    cuda_die(cudaStreamSynchronize(pipeline->attention_stream),
+             "synchronize hybrid pipeline initialization");
+}
+
+static void hybrid_pipeline_destroy(HybridPipelineContext *pipeline) {
+    cuda_die(cudaStreamSynchronize(pipeline->materialize_stream),
+             "synchronize hybrid materialization stream before destroy");
+    cuda_die(cudaStreamSynchronize(pipeline->attention_stream),
+             "synchronize hybrid attention stream before destroy");
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        cuda_die(cudaEventDestroy(pipeline->ready[buffer]),
+                 "destroy hybrid-ready event");
+        cuda_die(cudaEventDestroy(pipeline->reusable[buffer]),
+                 "destroy hybrid-reusable event");
+    }
+    cuda_die(cudaStreamDestroy(pipeline->materialize_stream),
+             "destroy hybrid materialization stream");
+    cuda_die(cudaStreamDestroy(pipeline->attention_stream),
+             "destroy hybrid attention stream");
+}
+
+static void launch_hybrid_pipeline(
+        HybridPipelineContext *pipeline,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
+        HybridSelectedRow *hybrid_rows[HYBRID_BUFFERS],
+        uint32_t *hybrid_status[HYBRID_BUFFERS],
+        float *out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens) {
+    const dim3 materialize_grid(n_tokens, HYBRID_CHUNK_ROWS, 1u);
+    const dim3 attention_grid(
+        n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP_16, 1u);
+    for (uint32_t chunk = 0;
+         chunk < TOP_K / HYBRID_CHUNK_ROWS;
+         chunk++) {
+        const uint32_t buffer = chunk % HYBRID_BUFFERS;
+        cuda_die(cudaStreamWaitEvent(pipeline->materialize_stream,
+                                     pipeline->reusable[buffer], 0),
+                 "wait for reusable hybrid buffer");
+        compact_materialize_hybrid_chunk_kernel
+            <<<materialize_grid, HEAD_DIM / 4u, 0,
+               pipeline->materialize_stream>>>(
+                compact_rows, topk, hybrid_rows[buffer],
+                hybrid_status[buffer], n_tokens,
+                chunk * HYBRID_CHUNK_ROWS);
+        cuda_die(cudaPeekAtLastError(),
+                 "launch hybrid materialization chunk");
+        cuda_die(cudaEventRecord(pipeline->ready[buffer],
+                                 pipeline->materialize_stream),
+                 "record hybrid-ready event");
+
+        cuda_die(cudaStreamWaitEvent(pipeline->attention_stream,
+                                     pipeline->ready[buffer], 0),
+                 "wait for ready hybrid buffer");
+        hybrid_h16_attention_chunk_kernel
+            <<<attention_grid, HEADS_PER_GROUP_16 * 32u, 0,
+               pipeline->attention_stream>>>(
+                hybrid_rows[buffer], sinks, q, out,
+                max_state, sum_state, n_tokens, chunk);
+        cuda_die(cudaPeekAtLastError(), "launch hybrid H16 chunk");
+        cuda_die(cudaEventRecord(pipeline->reusable[buffer],
+                                 pipeline->attention_stream),
+                 "record hybrid-reusable event");
+    }
+}
+
+static float time_one_hybrid_pipeline(
+        HybridPipelineContext *pipeline,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
+        HybridSelectedRow *hybrid_rows[HYBRID_BUFFERS],
+        uint32_t *hybrid_status[HYBRID_BUFFERS],
+        float *out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens,
+        uint32_t repeats) {
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin), "create hybrid begin event");
+    cuda_die(cudaEventCreate(&end), "create hybrid end event");
+    cuda_die(cudaEventRecord(begin, pipeline->materialize_stream),
+             "record hybrid begin event");
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        launch_hybrid_pipeline(
+            pipeline, compact_rows, topk, sinks, q,
+            hybrid_rows, hybrid_status, out, max_state, sum_state,
+            n_tokens);
+    }
+    cuda_die(cudaEventRecord(end, pipeline->attention_stream),
+             "record hybrid end event");
+    cuda_die(cudaEventSynchronize(end), "synchronize hybrid end event");
+    float elapsed = 0.0f;
+    cuda_die(cudaEventElapsedTime(&elapsed, begin, end),
+             "hybrid pipeline elapsed time");
+    cuda_die(cudaEventDestroy(begin), "destroy hybrid begin event");
+    cuda_die(cudaEventDestroy(end), "destroy hybrid end event");
+    return elapsed / (float)repeats;
+}
+
+static void time_hybrid_pipeline_paired(
+        HybridPipelineContext *pipeline,
+        const float *f32_rows,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
+        HybridSelectedRow *hybrid_rows[HYBRID_BUFFERS],
+        uint32_t *hybrid_status[HYBRID_BUFFERS],
+        float *control_out,
+        float *hybrid_out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens,
+        uint32_t rounds,
+        uint32_t repeats,
+        float *control_median,
+        float *hybrid_median,
+        float *paired_speedup_median) {
+    float *control_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    float *hybrid_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    float *paired_samples = (float *)malloc((size_t)rounds * sizeof(float));
+    if (!control_samples || !hybrid_samples || !paired_samples) {
+        fprintf(stderr, "error: hybrid pipeline timing allocation failed\n");
+        exit(2);
+    }
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin), "create hybrid control begin event");
+    cuda_die(cudaEventCreate(&end), "create hybrid control end event");
+    for (uint32_t warmup = 0; warmup < 3u; warmup++) {
+        time_one_hybrid_pipeline(
+            pipeline, compact_rows, topk, sinks, q,
+            hybrid_rows, hybrid_status, hybrid_out,
+            max_state, sum_state, n_tokens, 1u);
+    }
+    for (uint32_t round = 0; round < rounds; round++) {
+        if ((round & 1u) == 0u) {
+            control_samples[round] = time_one_consumer(
+                0, f32_rows, compact_rows, topk, sinks, q, control_out,
+                n_tokens, repeats, begin, end);
+            hybrid_samples[round] = time_one_hybrid_pipeline(
+                pipeline, compact_rows, topk, sinks, q,
+                hybrid_rows, hybrid_status, hybrid_out,
+                max_state, sum_state, n_tokens, repeats);
+        } else {
+            hybrid_samples[round] = time_one_hybrid_pipeline(
+                pipeline, compact_rows, topk, sinks, q,
+                hybrid_rows, hybrid_status, hybrid_out,
+                max_state, sum_state, n_tokens, repeats);
+            control_samples[round] = time_one_consumer(
+                0, f32_rows, compact_rows, topk, sinks, q, control_out,
+                n_tokens, repeats, begin, end);
+        }
+        paired_samples[round] =
+            control_samples[round] / hybrid_samples[round];
+    }
+    qsort(control_samples, rounds, sizeof(float), float_compare);
+    qsort(hybrid_samples, rounds, sizeof(float), float_compare);
+    qsort(paired_samples, rounds, sizeof(float), float_compare);
+    *control_median = control_samples[rounds / 2u];
+    *hybrid_median = hybrid_samples[rounds / 2u];
+    *paired_speedup_median = paired_samples[rounds / 2u];
+    cuda_die(cudaEventDestroy(begin), "destroy hybrid control begin event");
+    cuda_die(cudaEventDestroy(end), "destroy hybrid control end event");
+    free(control_samples);
+    free(hybrid_samples);
+    free(paired_samples);
+}
+
+static float time_hybrid_materialization_only(
+        HybridPipelineContext *pipeline,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        HybridSelectedRow *hybrid_rows,
+        uint32_t *hybrid_status,
+        uint32_t n_tokens,
+        uint32_t repeats) {
+    const dim3 grid(n_tokens, HYBRID_CHUNK_ROWS, 1u);
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin),
+             "create hybrid materialization begin event");
+    cuda_die(cudaEventCreate(&end),
+             "create hybrid materialization end event");
+    cuda_die(cudaEventRecord(begin, pipeline->materialize_stream),
+             "record hybrid materialization begin event");
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        for (uint32_t chunk = 0;
+             chunk < TOP_K / HYBRID_CHUNK_ROWS;
+             chunk++) {
+            compact_materialize_hybrid_chunk_kernel
+                <<<grid, HEAD_DIM / 4u, 0,
+                   pipeline->materialize_stream>>>(
+                    compact_rows, topk, hybrid_rows, hybrid_status,
+                    n_tokens, chunk * HYBRID_CHUNK_ROWS);
+        }
+    }
+    cuda_die(cudaPeekAtLastError(),
+             "launch hybrid materialization-only sequence");
+    cuda_die(cudaEventRecord(end, pipeline->materialize_stream),
+             "record hybrid materialization end event");
+    cuda_die(cudaEventSynchronize(end),
+             "synchronize hybrid materialization end event");
+    float elapsed = 0.0f;
+    cuda_die(cudaEventElapsedTime(&elapsed, begin, end),
+             "hybrid materialization elapsed time");
+    cuda_die(cudaEventDestroy(begin),
+             "destroy hybrid materialization begin event");
+    cuda_die(cudaEventDestroy(end),
+             "destroy hybrid materialization end event");
+    return elapsed / (float)repeats;
+}
+
+/* Measure only the eight H16 consumers. Each chunk is prepared and completed
+ * outside the timing events so the carried online-softmax state remains the
+ * same as in the overlapped path. This is a component diagnostic; the paired
+ * double-buffered result remains authoritative. */
+static float time_hybrid_attention_only(
+        HybridPipelineContext *pipeline,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
+        HybridSelectedRow *hybrid_rows,
+        uint32_t *hybrid_status,
+        float *out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens,
+        uint32_t repeats) {
+    const dim3 materialize_grid(n_tokens, HYBRID_CHUNK_ROWS, 1u);
+    const dim3 attention_grid(
+        n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP_16, 1u);
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin),
+             "create hybrid attention begin event");
+    cuda_die(cudaEventCreate(&end), "create hybrid attention end event");
+    float total_ms = 0.0f;
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        for (uint32_t chunk = 0;
+             chunk < TOP_K / HYBRID_CHUNK_ROWS;
+             chunk++) {
+            compact_materialize_hybrid_chunk_kernel
+                <<<materialize_grid, HEAD_DIM / 4u, 0,
+                   pipeline->materialize_stream>>>(
+                    compact_rows, topk, hybrid_rows, hybrid_status,
+                    n_tokens, chunk * HYBRID_CHUNK_ROWS);
+            cuda_die(cudaStreamSynchronize(pipeline->materialize_stream),
+                     "prepare hybrid attention-only chunk");
+            cuda_die(cudaEventRecord(begin, pipeline->attention_stream),
+                     "record hybrid attention begin event");
+            hybrid_h16_attention_chunk_kernel
+                <<<attention_grid, HEADS_PER_GROUP_16 * 32u, 0,
+                   pipeline->attention_stream>>>(
+                    hybrid_rows, sinks, q, out, max_state, sum_state,
+                    n_tokens, chunk);
+            cuda_die(cudaEventRecord(end, pipeline->attention_stream),
+                     "record hybrid attention end event");
+            cuda_die(cudaEventSynchronize(end),
+                     "synchronize hybrid attention end event");
+            float chunk_ms = 0.0f;
+            cuda_die(cudaEventElapsedTime(&chunk_ms, begin, end),
+                     "hybrid attention chunk elapsed time");
+            total_ms += chunk_ms;
+        }
+    }
+    cuda_die(cudaEventDestroy(begin),
+             "destroy hybrid attention begin event");
+    cuda_die(cudaEventDestroy(end), "destroy hybrid attention end event");
+    return total_ms / (float)repeats;
+}
+
 static uint32_t parse_u32(const char *text, const char *name) {
     char *end = NULL;
     const unsigned long value = strtoul(text, &end, 10);
@@ -1400,6 +1913,14 @@ int main(int argc, char **argv) {
         (uint64_t)n_tokens * TOP_K * HEAD_DIM;
     const size_t selected_bytes =
         (size_t)selected_values * sizeof(float);
+    const uint64_t hybrid_buffer_rows =
+        (uint64_t)n_tokens * HYBRID_CHUNK_ROWS;
+    const size_t hybrid_buffer_bytes =
+        (size_t)hybrid_buffer_rows * sizeof(HybridSelectedRow);
+    const size_t hybrid_status_bytes =
+        (size_t)hybrid_buffer_rows * sizeof(uint32_t);
+    const size_t hybrid_state_bytes =
+        (size_t)n_tokens * ATTENTION_HEADS * sizeof(float);
     const size_t sinks_bytes = ATTENTION_HEADS * sizeof(float);
 
     float *host_input = (float *)malloc(f32_bytes);
@@ -1413,6 +1934,8 @@ int main(int argc, char **argv) {
     float *host_compact_out = (float *)malloc(attention_bytes);
     float *host_candidate_out = (float *)malloc(attention_bytes);
     uint32_t *host_status = (uint32_t *)malloc(status_bytes);
+    uint32_t *host_hybrid_status =
+        (uint32_t *)malloc(hybrid_status_bytes);
     HalfExceptionAttentionKVRow *host_half_exception =
         (HalfExceptionAttentionKVRow *)malloc(half_exception_bytes);
     CompactAttentionKVRow *host_compact = NULL;
@@ -1421,7 +1944,8 @@ int main(int argc, char **argv) {
     if (!host_input || !host_reference || !host_unpacked || !host_q ||
         !host_sinks || !host_topk || !host_selected_identity ||
         !host_f32_out || !host_compact_out || !host_candidate_out ||
-        !host_status || !host_compact || !host_half_exception) {
+        !host_status || !host_hybrid_status || !host_compact ||
+        !host_half_exception) {
         fprintf(stderr, "error: host allocation failed\n");
         return 2;
     }
@@ -1456,6 +1980,29 @@ int main(int argc, char **argv) {
     GuardedDeviceBuffer d_compact_out = guarded_alloc(attention_bytes, "allocate compact result");
     GuardedDeviceBuffer d_candidate_out = guarded_alloc(
         attention_bytes, "allocate prototype result");
+    GuardedDeviceBuffer d_hybrid_rows[HYBRID_BUFFERS];
+    GuardedDeviceBuffer d_hybrid_status[HYBRID_BUFFERS];
+    HybridSelectedRow *hybrid_rows[HYBRID_BUFFERS];
+    uint32_t *hybrid_status[HYBRID_BUFFERS];
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        d_hybrid_rows[buffer] = guarded_alloc(
+            hybrid_buffer_bytes, "allocate hybrid selected rows");
+        d_hybrid_status[buffer] = guarded_alloc(
+            hybrid_status_bytes, "allocate hybrid status");
+        hybrid_rows[buffer] =
+            (HybridSelectedRow *)d_hybrid_rows[buffer].data;
+        hybrid_status[buffer] =
+            (uint32_t *)d_hybrid_status[buffer].data;
+        cuda_die(cudaMemset(d_hybrid_status[buffer].data, 0,
+                            hybrid_status_bytes),
+                 "clear hybrid status");
+    }
+    GuardedDeviceBuffer d_hybrid_max = guarded_alloc(
+        hybrid_state_bytes, "allocate hybrid max state");
+    GuardedDeviceBuffer d_hybrid_sum = guarded_alloc(
+        hybrid_state_bytes, "allocate hybrid sum state");
+    HybridPipelineContext hybrid_pipeline;
+    hybrid_pipeline_init(&hybrid_pipeline);
 
     cuda_die(cudaMemset(d_status.data, 0, status_bytes), "clear pack status");
     compact_pack_kernel<<<n_rows, THREADS>>>(
@@ -1800,6 +2347,38 @@ int main(int argc, char **argv) {
         }
     }
 
+    launch_hybrid_pipeline(
+        &hybrid_pipeline,
+        (const CompactAttentionKVRow *)d_compact.data,
+        (const int32_t *)d_topk.data,
+        (const float *)d_sinks.data,
+        (const float *)d_q.data,
+        hybrid_rows, hybrid_status,
+        (float *)d_candidate_out.data,
+        (float *)d_hybrid_max.data,
+        (float *)d_hybrid_sum.data,
+        n_tokens);
+    cuda_die(cudaStreamSynchronize(hybrid_pipeline.attention_stream),
+             "hybrid pipeline exactness");
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        cuda_die(cudaMemcpy(host_hybrid_status,
+                            d_hybrid_status[buffer].data,
+                            hybrid_status_bytes, cudaMemcpyDeviceToHost),
+                 "copy hybrid exactness status");
+        if (!compare_u32_zero(host_hybrid_status,
+                              (uint32_t)hybrid_buffer_rows,
+                              "hybrid F16 conversion rejected")) {
+            return 2;
+        }
+    }
+    cuda_die(cudaMemcpy(host_candidate_out, d_candidate_out.data,
+                        attention_bytes, cudaMemcpyDeviceToHost),
+             "copy hybrid pipeline result");
+    if (!compare_bits(host_f32_out, host_candidate_out, attention_values,
+                      "hybrid-h16-double-buffered")) {
+        return 2;
+    }
+
     check_guards(&d_rows, "F32 rows");
     check_guards(&d_unpacked, "unpacked rows");
     check_guards(&d_compact, "compact rows");
@@ -1814,6 +2393,12 @@ int main(int argc, char **argv) {
     check_guards(&d_f32_out, "F32 result");
     check_guards(&d_compact_out, "compact result");
     check_guards(&d_candidate_out, "prototype result");
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        check_guards(&d_hybrid_rows[buffer], "hybrid selected rows");
+        check_guards(&d_hybrid_status[buffer], "hybrid status");
+    }
+    check_guards(&d_hybrid_max, "hybrid max state");
+    check_guards(&d_hybrid_sum, "hybrid sum state");
 
     float f32_ms = 0.0f;
     float compact_ms = 0.0f;
@@ -1868,6 +2453,42 @@ int main(int argc, char **argv) {
         &selected_control_consumer_ms,
         &selected_consumer_ms,
         &selected_consumer_speedup);
+    float hybrid_control_ms = 0.0f;
+    float hybrid_pipeline_ms = 0.0f;
+    float hybrid_pipeline_speedup = 0.0f;
+    time_hybrid_pipeline_paired(
+        &hybrid_pipeline,
+        (const float *)d_rows.data,
+        (const CompactAttentionKVRow *)d_compact.data,
+        (const int32_t *)d_topk.data,
+        (const float *)d_sinks.data,
+        (const float *)d_q.data,
+        hybrid_rows, hybrid_status,
+        (float *)d_f32_out.data,
+        (float *)d_candidate_out.data,
+        (float *)d_hybrid_max.data,
+        (float *)d_hybrid_sum.data,
+        n_tokens, rounds, repeats,
+        &hybrid_control_ms,
+        &hybrid_pipeline_ms,
+        &hybrid_pipeline_speedup);
+    const float hybrid_materialization_ms =
+        time_hybrid_materialization_only(
+            &hybrid_pipeline,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            hybrid_rows[0], hybrid_status[0], n_tokens, repeats);
+    const float hybrid_attention_ms = time_hybrid_attention_only(
+        &hybrid_pipeline,
+        (const CompactAttentionKVRow *)d_compact.data,
+        (const int32_t *)d_topk.data,
+        (const float *)d_sinks.data,
+        (const float *)d_q.data,
+        hybrid_rows[0], hybrid_status[0],
+        (float *)d_candidate_out.data,
+        (float *)d_hybrid_max.data,
+        (float *)d_hybrid_sum.data,
+        n_tokens, repeats);
     check_guards(&d_rows, "timed F32 rows");
     check_guards(&d_compact, "timed compact rows");
     check_guards(&d_half_exception, "timed F16-plus-exception rows");
@@ -1880,6 +2501,13 @@ int main(int argc, char **argv) {
     check_guards(&d_f32_out, "timed F32 result");
     check_guards(&d_compact_out, "timed compact result");
     check_guards(&d_candidate_out, "timed prototype result");
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        check_guards(&d_hybrid_rows[buffer],
+                     "timed hybrid selected rows");
+        check_guards(&d_hybrid_status[buffer], "timed hybrid status");
+    }
+    check_guards(&d_hybrid_max, "timed hybrid max state");
+    check_guards(&d_hybrid_sum, "timed hybrid sum state");
 
     printf("scenario=compact-attention-kv-throughput-prototypes\n");
     printf("validation=byte-exact-nonzero-adversarial\n");
@@ -1919,6 +2547,27 @@ int main(int argc, char **argv) {
            (double)half_exception_sum / n_rows);
     printf("selected_materialization_transient_bytes=%zu\n", selected_bytes);
     printf("selected_materialization_preprocessing_included=1\n");
+    printf("hybrid_persistent_row_bytes=%zu\n",
+           sizeof(CompactAttentionKVRow));
+    printf("hybrid_selected_row_bytes=%zu\n", sizeof(HybridSelectedRow));
+    printf("hybrid_selected_row_reduction_vs_f32=%.9f\n",
+           1.0 - (double)sizeof(HybridSelectedRow) /
+                     ((double)HEAD_DIM * sizeof(float)));
+    printf("hybrid_selected_nope_f16_values=%u\n", N_NOPE);
+    printf("hybrid_selected_rope_f32_values=%u\n", N_ROT);
+    printf("hybrid_chunk_rows=%u\n", HYBRID_CHUNK_ROWS);
+    printf("hybrid_buffers=%u\n", HYBRID_BUFFERS);
+    printf("hybrid_buffer_bytes_each=%zu\n", hybrid_buffer_bytes);
+    printf("hybrid_double_buffer_bytes=%zu\n",
+           (size_t)HYBRID_BUFFERS * hybrid_buffer_bytes);
+    printf("hybrid_double_buffer_reduction_vs_full_selected_f32=%.9f\n",
+           1.0 - ((double)HYBRID_BUFFERS * hybrid_buffer_bytes) /
+                     (double)selected_bytes);
+    printf("hybrid_nonrope_f16_roundtrip_exact=1\n");
+    printf("hybrid_heads_per_block=%u\n", HEADS_PER_GROUP_16);
+    printf("hybrid_online_softmax_state_bytes=%zu\n",
+           2u * hybrid_state_bytes);
+    printf("hybrid_materialization_attention_overlap=double-buffered\n");
     printf("all_candidates_bit_exact=1\n");
     printf("f32_attention_median_ms=%.9g\n", f32_ms);
     printf("compact_attention_median_ms=%.9g\n", compact_ms);
@@ -1933,6 +2582,17 @@ int main(int argc, char **argv) {
                prototype_ms[candidate],
                prototype_speedup[candidate]);
     }
+    printf("candidate,name=hybrid-h16-double-buffered,control_median_ms=%.9g,candidate_median_ms=%.9g,paired_speedup_median=%.9g\n",
+           hybrid_control_ms, hybrid_pipeline_ms,
+           hybrid_pipeline_speedup);
+    printf("hybrid_component,part=materialization-only-full-512-row-equivalent,median_ms=%.9g\n",
+           hybrid_materialization_ms);
+    printf("hybrid_component,part=h16-attention-only-eight-chunks,median_ms=%.9g\n",
+           hybrid_attention_ms);
+    printf("hybrid_component,part=sequential-sum,median_ms=%.9g\n",
+           hybrid_materialization_ms + hybrid_attention_ms);
+    printf("hybrid_component_sequential_sum_is_diagnostic=1\n");
+    printf("hybrid_overlapped_candidate_is_authoritative=1\n");
     printf("selected_component,part=materialization,median_ms=%.9g\n",
            selected_materialization_ms);
     printf("selected_component,part=original-f32-consumer,median_ms=%.9g\n",
@@ -1962,6 +2622,13 @@ int main(int argc, char **argv) {
     cudaFree(d_f32_out.base);
     cudaFree(d_compact_out.base);
     cudaFree(d_candidate_out.base);
+    hybrid_pipeline_destroy(&hybrid_pipeline);
+    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+        cudaFree(d_hybrid_rows[buffer].base);
+        cudaFree(d_hybrid_status[buffer].base);
+    }
+    cudaFree(d_hybrid_max.base);
+    cudaFree(d_hybrid_sum.base);
     free(host_input);
     free(host_reference);
     free(host_unpacked);
@@ -1973,6 +2640,7 @@ int main(int argc, char **argv) {
     free(host_compact_out);
     free(host_candidate_out);
     free(host_status);
+    free(host_hybrid_status);
     free(host_half_exception);
     cudaFreeHost(host_compact);
     ds4_gpu_tensor_free(shipping_rows);

@@ -100,6 +100,12 @@ grep -q '^harness_status=ok$' "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "adversarial exactness smoke failed"
 grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "one or more prototype smoke outputs were not exact"
+grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' \
+    "$OUTPUT_DIR/adversarial-smoke.log" ||
+    die "hybrid scratch exactness gate did not pass"
+grep -q '^candidate,name=hybrid-h16-double-buffered,' \
+    "$OUTPUT_DIR/adversarial-smoke.log" ||
+    die "hybrid double-buffered smoke result is missing"
 
 if (( RUN_SANITIZER )); then
     compute-sanitizer --tool memcheck --error-exitcode 97 \
@@ -120,6 +126,11 @@ grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||
     die "timed exactness run failed"
 grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/timing.log" ||
     die "one or more timed prototype outputs were not exact"
+grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' "$OUTPUT_DIR/timing.log" ||
+    die "timed hybrid scratch exactness gate did not pass"
+grep -q '^candidate,name=hybrid-h16-double-buffered,' \
+    "$OUTPUT_DIR/timing.log" ||
+    die "timed hybrid double-buffered result is missing"
 
 if (( RUN_NCU )); then
     mkdir -p "$OUTPUT_DIR/ncu"
@@ -196,7 +207,7 @@ if (( RUN_NCU )); then
     fi
     printf '%s\n' "${metrics[@]}" >"$OUTPUT_DIR/ncu/metrics-selected.txt"
     metric_csv=$(IFS=,; printf '%s' "${metrics[*]}")
-    regex='compact_materialize_selected_kernel.*'
+    regex='compact_materialize_hybrid_chunk_kernel.*'
     base="$OUTPUT_DIR/ncu/materialization"
     rc=0
     env CUDA_VISIBLE_DEVICES="$PROFILE_GPU" \
@@ -221,9 +232,9 @@ if (( RUN_NCU )); then
     "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
         >"$base.csv" 2>"$base-import.log" ||
         die "could not import materialization Nsight report"
-    # The materializer visits the selected top-k set, not every persistent
-    # cache row: one CTA for each of 512 selected rows per active token.
-    expected_grid=$((512 * TOKENS))
+    # One hybrid launch owns one 64-row selected chunk. The complete top-512
+    # pipeline issues eight such launches while alternating two buffers.
+    expected_grid=$((64 * TOKENS))
     python3 speed-bench/validate-ncu-capture.py \
         "$base.csv" "$regex" 0 \
         --process cuda_sm75_compact_attention_kv \
@@ -256,4 +267,4 @@ PY
 fi
 
 printf 'SM75 exact compact-attention KV throughput prototypes complete: %s\n' "$OUTPUT_DIR"
-tail -n 45 "$OUTPUT_DIR/timing.log"
+tail -n 65 "$OUTPUT_DIR/timing.log"
