@@ -5838,6 +5838,15 @@ raw-cache consistency within each arm.  This separates inherited layer-0/1
 state, a cache/store defect, and static-mixed attention arithmetic without
 changing the production candidate.
 
+The first PP512 layer-2 invocation completed the control workload and wrote all
+fourteen requested boundary files, but its post-run topology check incorrectly
+required the internal pair-1 query-row diagnostic.  A PP512 run consists only
+of the zero-prefix microbatch; that microbatch is already divided by the outer
+pipeline-row path and does not reach the later internal pair-row dispatcher.
+The harness now requires that diagnostic only when a later microbatch exists
+(`CTX_TOKENS > 512`) and explicitly requires its absence at PP512.  This changes
+validation only; neither inference arm nor its dispatch selectors changed.
+
 ```bash
 CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=2 \

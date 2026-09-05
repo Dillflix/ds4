@@ -246,8 +246,19 @@ for variant in "${variants[@]}"; do
     else
         grep -Fq 'required-native=129/129' "$base.log" ||
             die "control did not retain 129 required bindings"
-        grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
-            die "control missed the established stable pair-1 row split"
+        if (( CTX_TOKENS > 512 )); then
+            # The zero-prefix 512-row microbatch is already divided by the
+            # outer pipeline-row path.  Only a later microbatch can reach the
+            # internal pair-1 query-row dispatcher whose one-time diagnostic
+            # is checked here.
+            grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
+                "$base.log" ||
+                die "control missed the established stable pair-1 row split"
+        else
+            ! grep -Fq 'prefill attention query-row split enabled: tier 1 ' \
+                "$base.log" ||
+                die "control unexpectedly dispatched internal pair-1 row splitting at PP512"
+        fi
         if [[ $MATCH_PAIR1_INDEXER == 1 ]]; then
             grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
                 "$base.log" ||
