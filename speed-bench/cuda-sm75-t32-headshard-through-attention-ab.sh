@@ -429,7 +429,7 @@ lines.append("first_divergence=" +
              (f"pos{first[0]}:{first[1]}" if first else "none-in-sampled-boundaries"))
 lines.append("frontier_logits=" + ("bit-exact" if logits_exact else "different"))
 if first is None and logits_exact:
-    lines.append("interpretation=dump-synchronization-made-candidate-converge")
+    lines.append("interpretation=sampled-boundaries-and-frontier-bit-exact-undumped-production-ab-required")
 elif first is None:
     lines.append("interpretation=divergence-outside-sampled-last-rows-or-after-audited-layer")
 else:
@@ -513,6 +513,7 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"control_model_cache_gib={control_cache:.2f}\n")
     f.write(f"headshard_model_cache_gib={headshard_cache:.2f}\n")
     f.write("query_input_transfer_bytes_per_pair1_layer_chunk=2097152\n")
+    f.write("current_kv_transfer_bytes_per_pair1_layer_zero_prefix=1048576\n")
     f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
     f.write("partner_low_rank_return_bytes_per_pair1_layer_chunk=8388608\n")
     f.write("pair1_indexer_policy=" +

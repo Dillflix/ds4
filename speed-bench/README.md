@@ -5869,6 +5869,26 @@ gather; at PP512 it transfers 1 MiB per candidate layer, versus the former
 production harness requires the exact-current-KV dispatch diagnostic before
 accepting a candidate result.
 
+With that correction, the layer-22 PP512 boundary run is bit-exact at every
+sampled boundary and at the final logits.  Its previous summary text attributed
+convergence to dump synchronization unconditionally; that attribution is not
+supported, because the pre-fix run diverged under the same dumps.  The summary
+now records only what the evidence proves and requires an undumped production
+A/B next.  PP2048 is the first such gate because it also exercises subsequent
+nonzero-prefix microbatches and persistent-cache reuse.
+
+The undumped PP2048 production A/B passes that gate.  Head sharding reaches
+485.61 versus 466.08 prefill tok/s (1.041903x) with byte-identical frontier
+logits.  Aggregate model-cache residency remains 10.58 GiB in both arms, and
+peak four-GPU telemetry differs by only sampling noise in aggregate.  The
+candidate redistributes about 1.3 GiB within physical pair 1, reducing its
+more-loaded member from 38,377 to 37,009 MiB while raising its partner from
+33,025 to 34,371 MiB; the system maximum remains 41,107 MiB on GPU 0.  Traffic
+reporting now includes the one-time-per-zero-prefix-layer 1 MiB current-KV
+copy separately from the per-chunk 2 MiB normalized-q input and 8 MiB
+low-rank return.  The next promotion gate is the undumped PP32768 production
+A/B, which exercises pair-0 indexer splitting and sustained cache evolution.
+
 ```bash
 CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
