@@ -103,9 +103,12 @@ grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/adversarial-smoke.log" ||
 grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' \
     "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "hybrid scratch exactness gate did not pass"
-grep -q '^candidate,name=hybrid-h16-double-buffered,' \
+grep -q '^candidate,name=hybrid-chunk256-h16-double-buffered,' \
     "$OUTPUT_DIR/adversarial-smoke.log" ||
-    die "hybrid double-buffered smoke result is missing"
+    die "hybrid chunk256 H16 smoke result is missing"
+grep -q '^candidate,name=hybrid-chunk256-h8-double-buffered,' \
+    "$OUTPUT_DIR/adversarial-smoke.log" ||
+    die "hybrid chunk256 H8 smoke result is missing"
 
 if (( RUN_SANITIZER )); then
     compute-sanitizer --tool memcheck --error-exitcode 97 \
@@ -128,9 +131,12 @@ grep -q '^all_candidates_bit_exact=1$' "$OUTPUT_DIR/timing.log" ||
     die "one or more timed prototype outputs were not exact"
 grep -q '^hybrid_nonrope_f16_roundtrip_exact=1$' "$OUTPUT_DIR/timing.log" ||
     die "timed hybrid scratch exactness gate did not pass"
-grep -q '^candidate,name=hybrid-h16-double-buffered,' \
+grep -q '^candidate,name=hybrid-chunk256-h16-double-buffered,' \
     "$OUTPUT_DIR/timing.log" ||
-    die "timed hybrid double-buffered result is missing"
+    die "timed hybrid chunk256 H16 result is missing"
+grep -q '^candidate,name=hybrid-chunk256-h8-double-buffered,' \
+    "$OUTPUT_DIR/timing.log" ||
+    die "timed hybrid chunk256 H8 result is missing"
 
 if (( RUN_NCU )); then
     mkdir -p "$OUTPUT_DIR/ncu"
@@ -232,9 +238,9 @@ if (( RUN_NCU )); then
     "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
         >"$base.csv" 2>"$base-import.log" ||
         die "could not import materialization Nsight report"
-    # One hybrid launch owns one 64-row selected chunk. The complete top-512
-    # pipeline issues eight such launches while alternating two buffers.
-    expected_grid=$((64 * TOKENS))
+    # One hybrid launch owns one 256-row selected chunk. The complete top-512
+    # pipeline issues two such launches while alternating two buffers.
+    expected_grid=$((256 * TOKENS))
     python3 speed-bench/validate-ncu-capture.py \
         "$base.csv" "$regex" 0 \
         --process cuda_sm75_compact_attention_kv \

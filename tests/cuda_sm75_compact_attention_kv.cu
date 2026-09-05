@@ -14,12 +14,12 @@
  * rows fail closed.  The consumer A/B follows the production SM75 indexed
  * attention shape: one 256-thread block owns eight heads, cooperatively stages
  * eight selected rows at a time, and performs the existing ordered online
- * softmax. Compact decoding is included in that timing. Five additional
- * byte-exact arms independently test selected-row materialization, 16-head
+ * softmax. Compact decoding is included in that timing. Additional byte-exact
+ * arms independently test selected-row materialization, 16-head
  * blocks, a two-stage warp-specialized loader, and a 1408-byte exact
- * F16-plus-exceptions row, plus double-buffered 64-row hybrid materialization
+ * F16-plus-exceptions row, plus double-buffered 256-row hybrid materialization
  * into 448 exact F16 non-RoPE and 64 untouched F32 RoPE values consumed by
- * H16 blocks.
+ * otherwise-identical H8 and H16 blocks.
  */
 
 #include <cuda_runtime.h>
@@ -49,8 +49,9 @@ enum {
     ROWS_PER_STAGE = 8,
     STAGED_LOADER_WARPS = 2,
     TOP_K = 512,
-    HYBRID_CHUNK_ROWS = 64,
+    HYBRID_CHUNK_ROWS = 256,
     HYBRID_BUFFERS = 2,
+    N_HYBRID_CANDIDATES = 2,
     HALF_EXCEPTION_WORDS = HEAD_DIM / 32,
     HALF_EXCEPTION_CAPACITY = N_ROT,
     GUARD_BYTES = 256,
@@ -529,7 +530,7 @@ __global__ static void compact_materialize_selected_kernel(
     }
 }
 
-/* Decode one 64-row selected chunk from the persistent 736-byte rows into a
+/* Decode one 256-row selected chunk from the persistent 736-byte rows into a
  * reusable exact hybrid scratch buffer.  A non-RoPE value is committed as F16
  * only if widening it reproduces the source F32 bits.  The status word makes
  * this a fail-closed representation change rather than an accuracy trade. */
@@ -592,10 +593,12 @@ __device__ __forceinline__ static float4 hybrid_load_float4(
     return ((const float4 *)row->rope_f32)[c4 - N_NOPE / 4u];
 }
 
-/* Sixteen warps own sixteen heads.  Each launch consumes one 64-row hybrid
- * chunk, preserving the production row order and carrying the exact online
- * softmax numerator/max/sum through F32 state between chunks. */
-__global__ static void hybrid_h16_attention_chunk_kernel(
+/* Each launch consumes one hybrid chunk, preserving the production row order
+ * and carrying the exact online-softmax numerator/max/sum through F32 state
+ * between chunks. H8 and H16 instantiate the same arithmetic so the bounded
+ * A/B isolates occupancy against repeated scratch reads. */
+template <uint32_t HEADS_PER_BLOCK>
+__global__ static void hybrid_attention_chunk_kernel(
         const HybridSelectedRow *hybrid_rows,
         const float *sinks,
         const float *q,
@@ -609,7 +612,7 @@ __global__ static void hybrid_h16_attention_chunk_kernel(
     if (token >= n_tokens) return;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = head_group * HEADS_PER_GROUP_16 + warp;
+    const uint32_t head = head_group * HEADS_PER_BLOCK + warp;
     const uint64_t state_index = (uint64_t)token * ATTENTION_HEADS + head;
     __shared__ float4 kv_shared[ROWS_PER_STAGE * (HEAD_DIM / 4u)];
 
@@ -1578,6 +1581,39 @@ static void hybrid_pipeline_destroy(HybridPipelineContext *pipeline) {
              "destroy hybrid attention stream");
 }
 
+static void launch_hybrid_attention_chunk(
+        cudaStream_t stream,
+        uint32_t heads_per_block,
+        const HybridSelectedRow *hybrid_rows,
+        const float *sinks,
+        const float *q,
+        float *out,
+        float *max_state,
+        float *sum_state,
+        uint32_t n_tokens,
+        uint32_t chunk) {
+    if (heads_per_block == HEADS_PER_GROUP) {
+        const dim3 grid(
+            n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP, 1u);
+        hybrid_attention_chunk_kernel<HEADS_PER_GROUP>
+            <<<grid, HEADS_PER_GROUP * 32u, 0, stream>>>(
+                hybrid_rows, sinks, q, out, max_state, sum_state,
+                n_tokens, chunk);
+    } else if (heads_per_block == HEADS_PER_GROUP_16) {
+        const dim3 grid(
+            n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP_16, 1u);
+        hybrid_attention_chunk_kernel<HEADS_PER_GROUP_16>
+            <<<grid, HEADS_PER_GROUP_16 * 32u, 0, stream>>>(
+                hybrid_rows, sinks, q, out, max_state, sum_state,
+                n_tokens, chunk);
+    } else {
+        fprintf(stderr, "error: invalid hybrid heads per block: %u\n",
+                heads_per_block);
+        exit(2);
+    }
+    cuda_die(cudaPeekAtLastError(), "launch hybrid attention chunk");
+}
+
 static void launch_hybrid_pipeline(
         HybridPipelineContext *pipeline,
         const CompactAttentionKVRow *compact_rows,
@@ -1589,10 +1625,9 @@ static void launch_hybrid_pipeline(
         float *out,
         float *max_state,
         float *sum_state,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t heads_per_block) {
     const dim3 materialize_grid(n_tokens, HYBRID_CHUNK_ROWS, 1u);
-    const dim3 attention_grid(
-        n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP_16, 1u);
     for (uint32_t chunk = 0;
          chunk < TOP_K / HYBRID_CHUNK_ROWS;
          chunk++) {
@@ -1615,16 +1650,24 @@ static void launch_hybrid_pipeline(
         cuda_die(cudaStreamWaitEvent(pipeline->attention_stream,
                                      pipeline->ready[buffer], 0),
                  "wait for ready hybrid buffer");
-        hybrid_h16_attention_chunk_kernel
-            <<<attention_grid, HEADS_PER_GROUP_16 * 32u, 0,
-               pipeline->attention_stream>>>(
-                hybrid_rows[buffer], sinks, q, out,
-                max_state, sum_state, n_tokens, chunk);
-        cuda_die(cudaPeekAtLastError(), "launch hybrid H16 chunk");
+        launch_hybrid_attention_chunk(
+            pipeline->attention_stream, heads_per_block,
+            hybrid_rows[buffer], sinks, q, out,
+            max_state, sum_state, n_tokens, chunk);
         cuda_die(cudaEventRecord(pipeline->reusable[buffer],
                                  pipeline->attention_stream),
                  "record hybrid-reusable event");
     }
+}
+
+static const char *hybrid_candidate_name(uint32_t heads_per_block) {
+    if (heads_per_block == HEADS_PER_GROUP_16) {
+        return "hybrid-chunk256-h16-double-buffered";
+    }
+    if (heads_per_block == HEADS_PER_GROUP) {
+        return "hybrid-chunk256-h8-double-buffered";
+    }
+    return "hybrid-invalid";
 }
 
 static float time_one_hybrid_pipeline(
@@ -1639,7 +1682,8 @@ static float time_one_hybrid_pipeline(
         float *max_state,
         float *sum_state,
         uint32_t n_tokens,
-        uint32_t repeats) {
+        uint32_t repeats,
+        uint32_t heads_per_block) {
     cudaEvent_t begin, end;
     cuda_die(cudaEventCreate(&begin), "create hybrid begin event");
     cuda_die(cudaEventCreate(&end), "create hybrid end event");
@@ -1649,7 +1693,7 @@ static float time_one_hybrid_pipeline(
         launch_hybrid_pipeline(
             pipeline, compact_rows, topk, sinks, q,
             hybrid_rows, hybrid_status, out, max_state, sum_state,
-            n_tokens);
+            n_tokens, heads_per_block);
     }
     cuda_die(cudaEventRecord(end, pipeline->attention_stream),
              "record hybrid end event");
@@ -1678,6 +1722,7 @@ static void time_hybrid_pipeline_paired(
         uint32_t n_tokens,
         uint32_t rounds,
         uint32_t repeats,
+        uint32_t heads_per_block,
         float *control_median,
         float *hybrid_median,
         float *paired_speedup_median) {
@@ -1695,7 +1740,7 @@ static void time_hybrid_pipeline_paired(
         time_one_hybrid_pipeline(
             pipeline, compact_rows, topk, sinks, q,
             hybrid_rows, hybrid_status, hybrid_out,
-            max_state, sum_state, n_tokens, 1u);
+            max_state, sum_state, n_tokens, 1u, heads_per_block);
     }
     for (uint32_t round = 0; round < rounds; round++) {
         if ((round & 1u) == 0u) {
@@ -1705,12 +1750,14 @@ static void time_hybrid_pipeline_paired(
             hybrid_samples[round] = time_one_hybrid_pipeline(
                 pipeline, compact_rows, topk, sinks, q,
                 hybrid_rows, hybrid_status, hybrid_out,
-                max_state, sum_state, n_tokens, repeats);
+                max_state, sum_state, n_tokens, repeats,
+                heads_per_block);
         } else {
             hybrid_samples[round] = time_one_hybrid_pipeline(
                 pipeline, compact_rows, topk, sinks, q,
                 hybrid_rows, hybrid_status, hybrid_out,
-                max_state, sum_state, n_tokens, repeats);
+                max_state, sum_state, n_tokens, repeats,
+                heads_per_block);
             control_samples[round] = time_one_consumer(
                 0, f32_rows, compact_rows, topk, sinks, q, control_out,
                 n_tokens, repeats, begin, end);
@@ -1774,10 +1821,10 @@ static float time_hybrid_materialization_only(
     return elapsed / (float)repeats;
 }
 
-/* Measure only the eight H16 consumers. Each chunk is prepared and completed
- * outside the timing events so the carried online-softmax state remains the
- * same as in the overlapped path. This is a component diagnostic; the paired
- * double-buffered result remains authoritative. */
+/* Measure only the two H8 or H16 consumers. Each chunk is prepared and
+ * completed outside the timing events so the carried online-softmax state
+ * remains the same as in the overlapped path. This is a component diagnostic;
+ * the paired double-buffered result remains authoritative. */
 static float time_hybrid_attention_only(
         HybridPipelineContext *pipeline,
         const CompactAttentionKVRow *compact_rows,
@@ -1790,10 +1837,9 @@ static float time_hybrid_attention_only(
         float *max_state,
         float *sum_state,
         uint32_t n_tokens,
-        uint32_t repeats) {
+        uint32_t repeats,
+        uint32_t heads_per_block) {
     const dim3 materialize_grid(n_tokens, HYBRID_CHUNK_ROWS, 1u);
-    const dim3 attention_grid(
-        n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP_16, 1u);
     cudaEvent_t begin, end;
     cuda_die(cudaEventCreate(&begin),
              "create hybrid attention begin event");
@@ -1812,11 +1858,10 @@ static float time_hybrid_attention_only(
                      "prepare hybrid attention-only chunk");
             cuda_die(cudaEventRecord(begin, pipeline->attention_stream),
                      "record hybrid attention begin event");
-            hybrid_h16_attention_chunk_kernel
-                <<<attention_grid, HEADS_PER_GROUP_16 * 32u, 0,
-                   pipeline->attention_stream>>>(
-                    hybrid_rows, sinks, q, out, max_state, sum_state,
-                    n_tokens, chunk);
+            launch_hybrid_attention_chunk(
+                pipeline->attention_stream, heads_per_block,
+                hybrid_rows, sinks, q, out, max_state, sum_state,
+                n_tokens, chunk);
             cuda_die(cudaEventRecord(end, pipeline->attention_stream),
                      "record hybrid attention end event");
             cuda_die(cudaEventSynchronize(end),
@@ -2347,36 +2392,44 @@ int main(int argc, char **argv) {
         }
     }
 
-    launch_hybrid_pipeline(
-        &hybrid_pipeline,
-        (const CompactAttentionKVRow *)d_compact.data,
-        (const int32_t *)d_topk.data,
-        (const float *)d_sinks.data,
-        (const float *)d_q.data,
-        hybrid_rows, hybrid_status,
-        (float *)d_candidate_out.data,
-        (float *)d_hybrid_max.data,
-        (float *)d_hybrid_sum.data,
-        n_tokens);
-    cuda_die(cudaStreamSynchronize(hybrid_pipeline.attention_stream),
-             "hybrid pipeline exactness");
-    for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
-        cuda_die(cudaMemcpy(host_hybrid_status,
-                            d_hybrid_status[buffer].data,
-                            hybrid_status_bytes, cudaMemcpyDeviceToHost),
-                 "copy hybrid exactness status");
-        if (!compare_u32_zero(host_hybrid_status,
-                              (uint32_t)hybrid_buffer_rows,
-                              "hybrid F16 conversion rejected")) {
+    const uint32_t hybrid_heads[N_HYBRID_CANDIDATES] = {
+        HEADS_PER_GROUP_16, HEADS_PER_GROUP,
+    };
+    for (uint32_t candidate = 0;
+         candidate < N_HYBRID_CANDIDATES;
+         candidate++) {
+        launch_hybrid_pipeline(
+            &hybrid_pipeline,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            (const float *)d_sinks.data,
+            (const float *)d_q.data,
+            hybrid_rows, hybrid_status,
+            (float *)d_candidate_out.data,
+            (float *)d_hybrid_max.data,
+            (float *)d_hybrid_sum.data,
+            n_tokens, hybrid_heads[candidate]);
+        cuda_die(cudaStreamSynchronize(hybrid_pipeline.attention_stream),
+                 "hybrid pipeline exactness");
+        for (uint32_t buffer = 0; buffer < HYBRID_BUFFERS; buffer++) {
+            cuda_die(cudaMemcpy(host_hybrid_status,
+                                d_hybrid_status[buffer].data,
+                                hybrid_status_bytes, cudaMemcpyDeviceToHost),
+                     "copy hybrid exactness status");
+            if (!compare_u32_zero(host_hybrid_status,
+                                  (uint32_t)hybrid_buffer_rows,
+                                  "hybrid F16 conversion rejected")) {
+                return 2;
+            }
+        }
+        cuda_die(cudaMemcpy(host_candidate_out, d_candidate_out.data,
+                            attention_bytes, cudaMemcpyDeviceToHost),
+                 "copy hybrid pipeline result");
+        if (!compare_bits(
+                host_f32_out, host_candidate_out, attention_values,
+                hybrid_candidate_name(hybrid_heads[candidate]))) {
             return 2;
         }
-    }
-    cuda_die(cudaMemcpy(host_candidate_out, d_candidate_out.data,
-                        attention_bytes, cudaMemcpyDeviceToHost),
-             "copy hybrid pipeline result");
-    if (!compare_bits(host_f32_out, host_candidate_out, attention_values,
-                      "hybrid-h16-double-buffered")) {
-        return 2;
     }
 
     check_guards(&d_rows, "F32 rows");
@@ -2453,42 +2506,51 @@ int main(int argc, char **argv) {
         &selected_control_consumer_ms,
         &selected_consumer_ms,
         &selected_consumer_speedup);
-    float hybrid_control_ms = 0.0f;
-    float hybrid_pipeline_ms = 0.0f;
-    float hybrid_pipeline_speedup = 0.0f;
-    time_hybrid_pipeline_paired(
-        &hybrid_pipeline,
-        (const float *)d_rows.data,
-        (const CompactAttentionKVRow *)d_compact.data,
-        (const int32_t *)d_topk.data,
-        (const float *)d_sinks.data,
-        (const float *)d_q.data,
-        hybrid_rows, hybrid_status,
-        (float *)d_f32_out.data,
-        (float *)d_candidate_out.data,
-        (float *)d_hybrid_max.data,
-        (float *)d_hybrid_sum.data,
-        n_tokens, rounds, repeats,
-        &hybrid_control_ms,
-        &hybrid_pipeline_ms,
-        &hybrid_pipeline_speedup);
+    float hybrid_control_ms[N_HYBRID_CANDIDATES] = {};
+    float hybrid_pipeline_ms[N_HYBRID_CANDIDATES] = {};
+    float hybrid_pipeline_speedup[N_HYBRID_CANDIDATES] = {};
+    float hybrid_attention_ms[N_HYBRID_CANDIDATES] = {};
+    for (uint32_t candidate = 0;
+         candidate < N_HYBRID_CANDIDATES;
+         candidate++) {
+        time_hybrid_pipeline_paired(
+            &hybrid_pipeline,
+            (const float *)d_rows.data,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            (const float *)d_sinks.data,
+            (const float *)d_q.data,
+            hybrid_rows, hybrid_status,
+            (float *)d_f32_out.data,
+            (float *)d_candidate_out.data,
+            (float *)d_hybrid_max.data,
+            (float *)d_hybrid_sum.data,
+            n_tokens, rounds, repeats, hybrid_heads[candidate],
+            hybrid_control_ms + candidate,
+            hybrid_pipeline_ms + candidate,
+            hybrid_pipeline_speedup + candidate);
+    }
     const float hybrid_materialization_ms =
         time_hybrid_materialization_only(
             &hybrid_pipeline,
             (const CompactAttentionKVRow *)d_compact.data,
             (const int32_t *)d_topk.data,
             hybrid_rows[0], hybrid_status[0], n_tokens, repeats);
-    const float hybrid_attention_ms = time_hybrid_attention_only(
-        &hybrid_pipeline,
-        (const CompactAttentionKVRow *)d_compact.data,
-        (const int32_t *)d_topk.data,
-        (const float *)d_sinks.data,
-        (const float *)d_q.data,
-        hybrid_rows[0], hybrid_status[0],
-        (float *)d_candidate_out.data,
-        (float *)d_hybrid_max.data,
-        (float *)d_hybrid_sum.data,
-        n_tokens, repeats);
+    for (uint32_t candidate = 0;
+         candidate < N_HYBRID_CANDIDATES;
+         candidate++) {
+        hybrid_attention_ms[candidate] = time_hybrid_attention_only(
+            &hybrid_pipeline,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            (const float *)d_sinks.data,
+            (const float *)d_q.data,
+            hybrid_rows[0], hybrid_status[0],
+            (float *)d_candidate_out.data,
+            (float *)d_hybrid_max.data,
+            (float *)d_hybrid_sum.data,
+            n_tokens, repeats, hybrid_heads[candidate]);
+    }
     check_guards(&d_rows, "timed F32 rows");
     check_guards(&d_compact, "timed compact rows");
     check_guards(&d_half_exception, "timed F16-plus-exception rows");
@@ -2564,7 +2626,8 @@ int main(int argc, char **argv) {
            1.0 - ((double)HYBRID_BUFFERS * hybrid_buffer_bytes) /
                      (double)selected_bytes);
     printf("hybrid_nonrope_f16_roundtrip_exact=1\n");
-    printf("hybrid_heads_per_block=%u\n", HEADS_PER_GROUP_16);
+    printf("hybrid_heads_per_block_candidates=%u,%u\n",
+           HEADS_PER_GROUP_16, HEADS_PER_GROUP);
     printf("hybrid_online_softmax_state_bytes=%zu\n",
            2u * hybrid_state_bytes);
     printf("hybrid_materialization_attention_overlap=double-buffered\n");
@@ -2582,15 +2645,22 @@ int main(int argc, char **argv) {
                prototype_ms[candidate],
                prototype_speedup[candidate]);
     }
-    printf("candidate,name=hybrid-h16-double-buffered,control_median_ms=%.9g,candidate_median_ms=%.9g,paired_speedup_median=%.9g\n",
-           hybrid_control_ms, hybrid_pipeline_ms,
-           hybrid_pipeline_speedup);
     printf("hybrid_component,part=materialization-only-full-512-row-equivalent,median_ms=%.9g\n",
            hybrid_materialization_ms);
-    printf("hybrid_component,part=h16-attention-only-eight-chunks,median_ms=%.9g\n",
-           hybrid_attention_ms);
-    printf("hybrid_component,part=sequential-sum,median_ms=%.9g\n",
-           hybrid_materialization_ms + hybrid_attention_ms);
+    for (uint32_t candidate = 0;
+         candidate < N_HYBRID_CANDIDATES;
+         candidate++) {
+        printf("candidate,name=%s,control_median_ms=%.9g,candidate_median_ms=%.9g,paired_speedup_median=%.9g\n",
+               hybrid_candidate_name(hybrid_heads[candidate]),
+               hybrid_control_ms[candidate],
+               hybrid_pipeline_ms[candidate],
+               hybrid_pipeline_speedup[candidate]);
+        printf("hybrid_component,heads_per_block=%u,part=attention-only-two-chunks,median_ms=%.9g\n",
+               hybrid_heads[candidate], hybrid_attention_ms[candidate]);
+        printf("hybrid_component,heads_per_block=%u,part=sequential-sum,median_ms=%.9g\n",
+               hybrid_heads[candidate],
+               hybrid_materialization_ms + hybrid_attention_ms[candidate]);
+    }
     printf("hybrid_component_sequential_sum_is_diagnostic=1\n");
     printf("hybrid_overlapped_candidate_is_authoritative=1\n");
     printf("selected_component,part=materialization,median_ms=%.9g\n",

@@ -5511,7 +5511,7 @@ non-representable rows, checks guarded allocations under Compute Sanitizer,
 covers scale-floor, alternate-scale, upper-exponent, and signed-zero
 boundaries, records PTXAS/SASS resources, and times paired, alternating
 production-shaped indexed-attention consumers. The F32 control and original
-direct compact decoder remain present. Five byte-exact candidates are timed
+direct compact decoder remain present. Byte-exact candidates are timed
 independently:
 
 - selected-row materialization decodes the top-512 rows once into reusable
@@ -5523,11 +5523,13 @@ independently:
   a fixed source-ordered capacity of 64 F32 exceptions, with a bitmap/prefix
   index for O(1) direct loads. Rows exceeding that capacity fail closed;
 - the hybrid pipeline retains the persistent 736-byte cache, materializes
-  reusable 64-row chunks as 448 exact F16 non-RoPE values plus 64 untouched
-  F32 RoPE values, consumes each chunk with H16 blocks, and overlaps the next
-  materialization with attention using two buffers and independent CUDA
-  streams. Any non-RoPE value that does not round-trip through F16 bit-exactly
-  sets a failure status and rejects the arm.
+  reusable 256-row chunks as 448 exact F16 non-RoPE values plus 64 untouched
+  F32 RoPE values, and overlaps the second materialization with attention using
+  two buffers and independent CUDA streams. Exact H16 and H8 consumers are
+  measured independently: H16 minimizes repeated scratch loads, while H8 tests
+  whether its additional CTAs and lower register footprint recover more SM75
+  occupancy. Any non-RoPE value that does not round-trip through F16
+  bit-exactly sets a failure status and rejects both arms.
 
 Every accepted codec and attention result must be bit-identical to F32.
 Selected-row scratch is reported separately as transient, reusable allocation;
@@ -5539,12 +5541,12 @@ diagnostic; the existing combined launch sequence remains the authoritative
 end-to-end result. The selected consumer is paired against the ordinary F32
 consumer to expose any benefit from contiguous top-k ordering independently
 of decode cost. The hybrid arm likewise reports materialization-only and
-H16-attention-only component timings, but its paired overlapped pipeline is
-the authoritative result. Its two buffers are reported as transient storage;
-the F32 max/sum carry preserves the original online-softmax row order across
-all eight chunks. With `RUN_NCU=1`, the harness captures exactly one
+H8/H16 attention-only component timings, but each paired overlapped pipeline
+is the authoritative result. Its two buffers are reported as transient
+storage; the F32 max/sum carry preserves the original online-softmax row order
+across both chunks. With `RUN_NCU=1`, the harness captures exactly one
 `compact_materialize_hybrid_chunk_kernel` launch and validates its 128-thread,
-`64 selected rows * TOKENS`-CTA geometry. The report includes DRAM read/write traffic,
+`256 selected rows * TOKENS`-CTA geometry. The report includes DRAM read/write traffic,
 load/store sector efficiency, L2 hit rate, integer/conversion/memory
 instruction counts when exposed by the installed Nsight version, occupancy,
 waves, eligible warps, and long-scoreboard/MIO stalls. This separates
