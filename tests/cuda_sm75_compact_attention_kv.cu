@@ -11,7 +11,10 @@
  *
  * The packer consumes the existing rounded F32 representation and accepts a
  * row only when unpacking is bit-identical.  Non-finite and non-representable
- * rows fail closed.  The consumer A/B includes compact decoding in its timing.
+ * rows fail closed.  The consumer A/B follows the production SM75 indexed
+ * attention shape: one 256-thread block owns eight heads, cooperatively stages
+ * eight selected rows at a time, and performs the existing ordered online
+ * softmax.  Compact decoding is included in that timing.
  */
 
 #include <cuda_runtime.h>
@@ -33,6 +36,11 @@ enum {
     GROUP = 64,
     N_SCALE = N_NOPE / GROUP,
     THREADS = 64,
+    ATTENTION_THREADS = 256,
+    ATTENTION_HEADS = 64,
+    HEADS_PER_GROUP = 8,
+    ROWS_PER_STAGE = 8,
+    TOP_K = 512,
     GUARD_BYTES = 256,
     CANARY = 0xa5,
 };
@@ -164,32 +172,153 @@ __global__ static void compact_unpack_kernel(
     }
 }
 
-__global__ static void f32_consumer_kernel(
-        const float *rows, float *out, uint32_t n_rows) {
-    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= HEAD_DIM) return;
-    float acc = 0.0f;
-    for (uint32_t row = 0; row < n_rows; row++) {
-        const float weight = (float)((row & 15u) + 1u) * 0.0009765625f;
-        acc = __fmaf_rn(rows[(uint64_t)row * HEAD_DIM + d], weight, acc);
+__device__ __forceinline__ static float attention_warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
     }
-    out[d] = acc;
+    return value;
 }
 
-__global__ static void compact_consumer_kernel(
-        const CompactAttentionKVRow *rows, float *out, uint32_t n_rows) {
-    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= HEAD_DIM) return;
-    float acc = 0.0f;
-    for (uint32_t row = 0; row < n_rows; row++) {
-        const CompactAttentionKVRow *src = rows + row;
-        const float value = d < N_NOPE
-            ? decode_code(src->code[d], src->scale[d / GROUP])
-            : src->rope_f32[d - N_NOPE];
-        const float weight = (float)((row & 15u) + 1u) * 0.0009765625f;
-        acc = __fmaf_rn(value, weight, acc);
+__device__ __forceinline__ static float attention_dot4(float4 a, float4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+__device__ __forceinline__ static float4 compact_load_float4(
+        const CompactAttentionKVRow *row, uint32_t c4) {
+    const uint32_t d = c4 * 4u;
+    if (d < N_NOPE) {
+        const float scale = row->scale[d / GROUP];
+        return make_float4(decode_code(row->code[d + 0u], scale),
+                           decode_code(row->code[d + 1u], scale),
+                           decode_code(row->code[d + 2u], scale),
+                           decode_code(row->code[d + 3u], scale));
     }
-    out[d] = acc;
+    const uint32_t rope = d - N_NOPE;
+    return make_float4(row->rope_f32[rope + 0u],
+                       row->rope_f32[rope + 1u],
+                       row->rope_f32[rope + 2u],
+                       row->rope_f32[rope + 3u]);
+}
+
+template <bool COMPACT>
+__global__ static void indexed_attention_consumer_kernel(
+        const float *f32_rows,
+        const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
+        float *out,
+        uint32_t n_tokens) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    if (token >= n_tokens) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
+
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * (HEAD_DIM / 4u)];
+
+    const float4 *q4 = (const float4 *)(
+        q + ((uint64_t)token * ATTENTION_HEADS + head) * HEAD_DIM);
+    const float4 q0 = q4[lane + 0u];
+    const float4 q1 = q4[lane + 32u];
+    const float4 q2 = q4[lane + 64u];
+    const float4 q3 = q4[lane + 96u];
+    const float score_scale = rsqrtf((float)HEAD_DIM);
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0;
+    float4 o2 = o0;
+    float4 o3 = o0;
+
+    for (uint32_t row0 = 0; row0 < TOP_K; row0 += ROWS_PER_STAGE) {
+        for (uint32_t off = threadIdx.x;
+             off < ROWS_PER_STAGE * (HEAD_DIM / 4u);
+             off += blockDim.x) {
+            const uint32_t rr = off / (HEAD_DIM / 4u);
+            const uint32_t c4 = off % (HEAD_DIM / 4u);
+            const uint32_t row = (uint32_t)topk[
+                (uint64_t)token * TOP_K + row0 + rr];
+            if (COMPACT) {
+                kv_shared[off] = compact_load_float4(compact_rows + row, c4);
+            } else {
+                const float4 *src = (const float4 *)(
+                    f32_rows + (uint64_t)row * HEAD_DIM);
+                kv_shared[off] = src[c4];
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t rr = 0; rr < ROWS_PER_STAGE; rr++) {
+            const float4 *kv4 = kv_shared + rr * (HEAD_DIM / 4u);
+            const float4 k0 = kv4[lane + 0u];
+            const float4 k1 = kv4[lane + 32u];
+            const float4 k2 = kv4[lane + 64u];
+            const float4 k3 = kv4[lane + 96u];
+            float score = attention_dot4(q0, k0) +
+                          attention_dot4(q1, k1) +
+                          attention_dot4(q2, k2) +
+                          attention_dot4(q3, k3);
+            score = attention_warp_sum(score) * score_scale;
+            score = __shfl_sync(0xffffffffu, score, 0);
+
+            const float new_m = fmaxf(max_s, score);
+            const float old_scale = expf(max_s - new_m);
+            const float row_scale = expf(score - new_m);
+            sum_s = sum_s * old_scale + row_scale;
+            o0.x = o0.x * old_scale + k0.x * row_scale;
+            o0.y = o0.y * old_scale + k0.y * row_scale;
+            o0.z = o0.z * old_scale + k0.z * row_scale;
+            o0.w = o0.w * old_scale + k0.w * row_scale;
+            o1.x = o1.x * old_scale + k1.x * row_scale;
+            o1.y = o1.y * old_scale + k1.y * row_scale;
+            o1.z = o1.z * old_scale + k1.z * row_scale;
+            o1.w = o1.w * old_scale + k1.w * row_scale;
+            o2.x = o2.x * old_scale + k2.x * row_scale;
+            o2.y = o2.y * old_scale + k2.y * row_scale;
+            o2.z = o2.z * old_scale + k2.z * row_scale;
+            o2.w = o2.w * old_scale + k2.w * row_scale;
+            o3.x = o3.x * old_scale + k3.x * row_scale;
+            o3.y = o3.y * old_scale + k3.y * row_scale;
+            o3.z = o3.z * old_scale + k3.z * row_scale;
+            o3.w = o3.w * old_scale + k3.w * row_scale;
+            max_s = new_m;
+        }
+        __syncthreads();
+    }
+
+    const float sink = sinks[head];
+    const float new_m = fmaxf(max_s, sink);
+    const float old_scale = expf(max_s - new_m);
+    const float sink_scale = expf(sink - new_m);
+    sum_s = sum_s * old_scale + sink_scale;
+    o0.x *= old_scale; o0.y *= old_scale;
+    o0.z *= old_scale; o0.w *= old_scale;
+    o1.x *= old_scale; o1.y *= old_scale;
+    o1.z *= old_scale; o1.w *= old_scale;
+    o2.x *= old_scale; o2.y *= old_scale;
+    o2.z *= old_scale; o2.w *= old_scale;
+    o3.x *= old_scale; o3.y *= old_scale;
+    o3.z *= old_scale; o3.w *= old_scale;
+    const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+    o0.x *= inv_s; o0.y *= inv_s;
+    o0.z *= inv_s; o0.w *= inv_s;
+    o1.x *= inv_s; o1.y *= inv_s;
+    o1.z *= inv_s; o1.w *= inv_s;
+    o2.x *= inv_s; o2.y *= inv_s;
+    o2.z *= inv_s; o2.w *= inv_s;
+    o3.x *= inv_s; o3.y *= inv_s;
+    o3.z *= inv_s; o3.w *= inv_s;
+
+    float4 *out4 = (float4 *)(
+        out + ((uint64_t)token * ATTENTION_HEADS + head) * HEAD_DIM);
+    out4[lane + 0u] = o0;
+    out4[lane + 32u] = o1;
+    out4[lane + 64u] = o2;
+    out4[lane + 96u] = o3;
 }
 
 static uint32_t rng_state = 0x6d2b79f5u;
@@ -270,6 +399,38 @@ static void fill_finite_input(float *rows, uint32_t n_rows) {
             const float original_scale = ldexpf(1.0f, (int)g - 9);
             row[g * GROUP] = 225.0f * original_scale;
             row[g * GROUP + 1u] = -225.0f * original_scale;
+        }
+    }
+}
+
+static void fill_attention_input(float *rows, uint32_t n_rows) {
+    for (uint32_t row = 0; row < n_rows; row++) {
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            rows[(uint64_t)row * HEAD_DIM + d] = signed_unit() * 0.5f;
+        }
+    }
+}
+
+static void fill_attention_metadata(float *q, float *sinks, int32_t *topk,
+                                    uint32_t n_rows, uint32_t n_tokens) {
+    for (uint64_t i = 0;
+         i < (uint64_t)n_tokens * ATTENTION_HEADS * HEAD_DIM; i++) {
+        q[i] = signed_unit() * 0.125f;
+    }
+    for (uint32_t head = 0; head < ATTENTION_HEADS; head++) {
+        sinks[head] = -0.25f + (float)(head & 7u) * 0.03125f;
+    }
+    /* One selected row per ordered bin gives each token a sorted, unique,
+     * distributed 512-row set without manufacturing a contiguous cache hit. */
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t i = 0; i < TOP_K; i++) {
+            const uint32_t lo = (uint32_t)((uint64_t)i * n_rows / TOP_K);
+            const uint32_t hi = (uint32_t)((uint64_t)(i + 1u) * n_rows / TOP_K);
+            const uint32_t width = hi - lo;
+            const uint32_t jitter = width > 1u
+                ? (token * 131u + i * 17u) % width
+                : 0u;
+            topk[(uint64_t)token * TOP_K + i] = (int32_t)(lo + jitter);
         }
     }
 }
@@ -356,17 +517,23 @@ static float time_one_consumer(
         int compact_variant,
         const float *f32_rows,
         const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
         float *out,
-        uint32_t n_rows,
+        uint32_t n_tokens,
         uint32_t repeats,
         cudaEvent_t begin,
         cudaEvent_t end) {
+    const dim3 grid(n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP, 1u);
     cuda_die(cudaEventRecord(begin), "record begin event");
     for (uint32_t repeat = 0; repeat < repeats; repeat++) {
         if (compact_variant) {
-            compact_consumer_kernel<<<2, 256>>>(compact_rows, out, n_rows);
+            indexed_attention_consumer_kernel<true><<<grid, ATTENTION_THREADS>>>(
+                f32_rows, compact_rows, topk, sinks, q, out, n_tokens);
         } else {
-            f32_consumer_kernel<<<2, 256>>>(f32_rows, out, n_rows);
+            indexed_attention_consumer_kernel<false><<<grid, ATTENTION_THREADS>>>(
+                f32_rows, compact_rows, topk, sinks, q, out, n_tokens);
         }
     }
     cuda_die(cudaEventRecord(end), "record end event");
@@ -379,9 +546,12 @@ static float time_one_consumer(
 static void time_consumers_paired(
         const float *f32_rows,
         const CompactAttentionKVRow *compact_rows,
+        const int32_t *topk,
+        const float *sinks,
+        const float *q,
         float *f32_out,
         float *compact_out,
-        uint32_t n_rows,
+        uint32_t n_tokens,
         uint32_t rounds,
         uint32_t repeats,
         float *f32_median,
@@ -399,27 +569,30 @@ static void time_consumers_paired(
     cuda_die(cudaEventCreate(&begin), "create begin event");
     cuda_die(cudaEventCreate(&end), "create end event");
 
+    const dim3 grid(n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP, 1u);
     for (uint32_t warmup = 0; warmup < 3u; warmup++) {
-        f32_consumer_kernel<<<2, 256>>>(f32_rows, f32_out, n_rows);
-        compact_consumer_kernel<<<2, 256>>>(compact_rows, compact_out, n_rows);
+        indexed_attention_consumer_kernel<false><<<grid, ATTENTION_THREADS>>>(
+            f32_rows, compact_rows, topk, sinks, q, f32_out, n_tokens);
+        indexed_attention_consumer_kernel<true><<<grid, ATTENTION_THREADS>>>(
+            f32_rows, compact_rows, topk, sinks, q, compact_out, n_tokens);
     }
     cuda_die(cudaDeviceSynchronize(), "consumer warmup");
 
     for (uint32_t round = 0; round < rounds; round++) {
         if ((round & 1u) == 0u) {
             f32_samples[round] = time_one_consumer(
-                0, f32_rows, compact_rows, f32_out, n_rows, repeats,
-                begin, end);
+                0, f32_rows, compact_rows, topk, sinks, q, f32_out,
+                n_tokens, repeats, begin, end);
             compact_samples[round] = time_one_consumer(
-                1, f32_rows, compact_rows, compact_out, n_rows, repeats,
-                begin, end);
+                1, f32_rows, compact_rows, topk, sinks, q, compact_out,
+                n_tokens, repeats, begin, end);
         } else {
             compact_samples[round] = time_one_consumer(
-                1, f32_rows, compact_rows, compact_out, n_rows, repeats,
-                begin, end);
+                1, f32_rows, compact_rows, topk, sinks, q, compact_out,
+                n_tokens, repeats, begin, end);
             f32_samples[round] = time_one_consumer(
-                0, f32_rows, compact_rows, f32_out, n_rows, repeats,
-                begin, end);
+                0, f32_rows, compact_rows, topk, sinks, q, f32_out,
+                n_tokens, repeats, begin, end);
         }
         paired_samples[round] = f32_samples[round] / compact_samples[round];
     }
@@ -459,6 +632,7 @@ static uint32_t parse_device(const char *text) {
 int main(int argc, char **argv) {
     uint32_t device = 0;
     uint32_t n_rows = 8192;
+    uint32_t n_tokens = 32;
     uint32_t rounds = 7;
     uint32_t repeats = 25;
     for (int i = 1; i < argc; i++) {
@@ -466,19 +640,23 @@ int main(int argc, char **argv) {
             device = parse_device(argv[++i]);
         } else if (!strcmp(argv[i], "--rows") && i + 1 < argc) {
             n_rows = parse_u32(argv[++i], "rows");
+        } else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) {
+            n_tokens = parse_u32(argv[++i], "tokens");
         } else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) {
             rounds = parse_u32(argv[++i], "rounds");
         } else if (!strcmp(argv[i], "--repeats") && i + 1 < argc) {
             repeats = parse_u32(argv[++i], "repeats");
         } else {
             fprintf(stderr,
-                    "usage: %s [--device INDEX] [--rows N] [--rounds N] [--repeats N]\n",
+                    "usage: %s [--device INDEX] [--rows N] [--tokens N] [--rounds N] [--repeats N]\n",
                     argv[0]);
             return 2;
         }
     }
-    if (n_rows < 4u) {
-        fprintf(stderr, "error: at least four rows are required for boundary coverage\n");
+    if (n_rows < TOP_K) {
+        fprintf(stderr,
+                "error: at least %u rows are required for production top-k coverage\n",
+                TOP_K);
         return 2;
     }
     ds4_gpu_config config;
@@ -495,15 +673,28 @@ int main(int argc, char **argv) {
     const size_t f32_bytes = (size_t)values * sizeof(float);
     const size_t compact_bytes = (size_t)n_rows * sizeof(CompactAttentionKVRow);
     const size_t status_bytes = (size_t)n_rows * sizeof(uint32_t);
+    const uint64_t attention_values =
+        (uint64_t)n_tokens * ATTENTION_HEADS * HEAD_DIM;
+    const size_t attention_bytes =
+        (size_t)attention_values * sizeof(float);
+    const size_t topk_bytes =
+        (size_t)n_tokens * TOP_K * sizeof(int32_t);
+    const size_t sinks_bytes = ATTENTION_HEADS * sizeof(float);
 
     float *host_input = (float *)malloc(f32_bytes);
     float *host_reference = (float *)malloc(f32_bytes);
     float *host_unpacked = (float *)malloc(f32_bytes);
+    float *host_q = (float *)malloc(attention_bytes);
+    float *host_sinks = (float *)malloc(sinks_bytes);
+    int32_t *host_topk = (int32_t *)malloc(topk_bytes);
+    float *host_f32_out = (float *)malloc(attention_bytes);
+    float *host_compact_out = (float *)malloc(attention_bytes);
     uint32_t *host_status = (uint32_t *)malloc(status_bytes);
     CompactAttentionKVRow *host_compact = NULL;
     cuda_die(cudaMallocHost((void **)&host_compact, compact_bytes),
              "allocate host compact rows");
-    if (!host_input || !host_reference || !host_unpacked ||
+    if (!host_input || !host_reference || !host_unpacked || !host_q ||
+        !host_sinks || !host_topk || !host_f32_out || !host_compact_out ||
         !host_status || !host_compact) {
         fprintf(stderr, "error: host allocation failed\n");
         return 2;
@@ -524,8 +715,11 @@ int main(int argc, char **argv) {
     GuardedDeviceBuffer d_unpacked = guarded_alloc(f32_bytes, "allocate unpack rows");
     GuardedDeviceBuffer d_compact = guarded_alloc(compact_bytes, "allocate compact rows");
     GuardedDeviceBuffer d_status = guarded_alloc(status_bytes, "allocate status");
-    GuardedDeviceBuffer d_f32_out = guarded_alloc(HEAD_DIM * sizeof(float), "allocate F32 result");
-    GuardedDeviceBuffer d_compact_out = guarded_alloc(HEAD_DIM * sizeof(float), "allocate compact result");
+    GuardedDeviceBuffer d_q = guarded_alloc(attention_bytes, "allocate attention query");
+    GuardedDeviceBuffer d_sinks = guarded_alloc(sinks_bytes, "allocate attention sinks");
+    GuardedDeviceBuffer d_topk = guarded_alloc(topk_bytes, "allocate attention top-k");
+    GuardedDeviceBuffer d_f32_out = guarded_alloc(attention_bytes, "allocate F32 result");
+    GuardedDeviceBuffer d_compact_out = guarded_alloc(attention_bytes, "allocate compact result");
 
     cuda_die(cudaMemset(d_status.data, 0, status_bytes), "clear pack status");
     compact_pack_kernel<<<n_rows, THREADS>>>(
@@ -667,30 +861,82 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* Restore the accepted compact rows before measuring consumers. */
-    cuda_die(cudaMemcpy(d_rows.data, host_reference, f32_bytes, cudaMemcpyHostToDevice),
-             "restore reference rows");
-    cuda_die(cudaMemcpy(d_compact.data, host_compact, compact_bytes, cudaMemcpyHostToDevice),
-             "restore compact rows");
-    f32_consumer_kernel<<<2, 256>>>(
-        (const float *)d_rows.data, (float *)d_f32_out.data, n_rows);
-    compact_consumer_kernel<<<2, 256>>>(
-        (const CompactAttentionKVRow *)d_compact.data,
-        (float *)d_compact_out.data, n_rows);
-    cuda_die(cudaDeviceSynchronize(), "consumer exactness kernels");
-    float host_f32_out[HEAD_DIM];
-    float host_compact_out[HEAD_DIM];
-    cuda_die(cudaMemcpy(host_f32_out, d_f32_out.data, sizeof(host_f32_out),
-                        cudaMemcpyDeviceToHost), "copy F32 consumer result");
-    cuda_die(cudaMemcpy(host_compact_out, d_compact_out.data,
-                        sizeof(host_compact_out), cudaMemcpyDeviceToHost),
-             "copy compact consumer result");
-    if (!compare_bits(host_f32_out, host_compact_out, HEAD_DIM,
-                      "consumer exactness")) {
+    /* Use bounded finite values for the attention-shaped A/B.  The adversarial
+     * rows above validate the codec boundary but intentionally include values
+     * that are not representative attention scores. */
+    fill_attention_input(host_input, n_rows);
+    if (!ds4_gpu_tensor_write(shipping_rows, 0, host_input, f32_bytes) ||
+        !ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+            shipping_rows, n_rows, HEAD_DIM, N_ROT) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(shipping_rows, 0, host_reference, f32_bytes)) {
+        fprintf(stderr, "error: attention-input shipping quantizer failed\n");
         return 2;
     }
-    if (!has_finite_nonzero(host_f32_out, HEAD_DIM)) {
-        fprintf(stderr, "error: consumer validation was degenerate\n");
+    cuda_die(cudaMemcpy(d_rows.data, host_reference, f32_bytes,
+                        cudaMemcpyHostToDevice),
+             "copy attention reference rows");
+    cuda_die(cudaMemset(d_status.data, 0, status_bytes),
+             "clear attention pack status");
+    compact_pack_kernel<<<n_rows, THREADS>>>(
+        (const float *)d_rows.data,
+        (CompactAttentionKVRow *)d_compact.data,
+        (uint32_t *)d_status.data, n_rows);
+    compact_unpack_kernel<<<n_rows, THREADS>>>(
+        (const CompactAttentionKVRow *)d_compact.data,
+        (float *)d_unpacked.data, n_rows);
+    cuda_die(cudaDeviceSynchronize(), "attention codec validation kernels");
+    cuda_die(cudaMemcpy(host_status, d_status.data, status_bytes,
+                        cudaMemcpyDeviceToHost),
+             "copy attention pack status");
+    cuda_die(cudaMemcpy(host_unpacked, d_unpacked.data, f32_bytes,
+                        cudaMemcpyDeviceToHost),
+             "copy attention unpacked rows");
+    if (!compare_u32_zero(host_status, n_rows, "attention pack rejected") ||
+        !compare_bits(host_reference, host_unpacked, values,
+                      "attention codec exactness")) {
+        return 2;
+    }
+
+    fill_attention_metadata(host_q, host_sinks, host_topk, n_rows, n_tokens);
+    cuda_die(cudaMemcpy(d_q.data, host_q, attention_bytes,
+                        cudaMemcpyHostToDevice), "copy attention query");
+    cuda_die(cudaMemcpy(d_sinks.data, host_sinks, sinks_bytes,
+                        cudaMemcpyHostToDevice), "copy attention sinks");
+    cuda_die(cudaMemcpy(d_topk.data, host_topk, topk_bytes,
+                        cudaMemcpyHostToDevice), "copy attention top-k");
+
+    const dim3 attention_grid(
+        n_tokens, ATTENTION_HEADS / HEADS_PER_GROUP, 1u);
+    indexed_attention_consumer_kernel<false>
+        <<<attention_grid, ATTENTION_THREADS>>>(
+            (const float *)d_rows.data,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            (const float *)d_sinks.data,
+            (const float *)d_q.data,
+            (float *)d_f32_out.data, n_tokens);
+    indexed_attention_consumer_kernel<true>
+        <<<attention_grid, ATTENTION_THREADS>>>(
+            (const float *)d_rows.data,
+            (const CompactAttentionKVRow *)d_compact.data,
+            (const int32_t *)d_topk.data,
+            (const float *)d_sinks.data,
+            (const float *)d_q.data,
+            (float *)d_compact_out.data, n_tokens);
+    cuda_die(cudaDeviceSynchronize(), "attention consumer exactness kernels");
+    cuda_die(cudaMemcpy(host_f32_out, d_f32_out.data, attention_bytes,
+                        cudaMemcpyDeviceToHost),
+             "copy F32 attention result");
+    cuda_die(cudaMemcpy(host_compact_out, d_compact_out.data, attention_bytes,
+                        cudaMemcpyDeviceToHost),
+             "copy compact attention result");
+    if (!compare_bits(host_f32_out, host_compact_out, attention_values,
+                      "attention consumer exactness")) {
+        return 2;
+    }
+    if (!has_finite_nonzero(host_f32_out, attention_values)) {
+        fprintf(stderr, "error: attention consumer validation was degenerate\n");
         return 2;
     }
 
@@ -698,6 +944,9 @@ int main(int argc, char **argv) {
     check_guards(&d_unpacked, "unpacked rows");
     check_guards(&d_compact, "compact rows");
     check_guards(&d_status, "pack status");
+    check_guards(&d_q, "attention query");
+    check_guards(&d_sinks, "attention sinks");
+    check_guards(&d_topk, "attention top-k");
     check_guards(&d_f32_out, "F32 result");
     check_guards(&d_compact_out, "compact result");
 
@@ -707,20 +956,31 @@ int main(int argc, char **argv) {
     time_consumers_paired(
         (const float *)d_rows.data,
         (const CompactAttentionKVRow *)d_compact.data,
+        (const int32_t *)d_topk.data,
+        (const float *)d_sinks.data,
+        (const float *)d_q.data,
         (float *)d_f32_out.data, (float *)d_compact_out.data,
-        n_rows, rounds, repeats, &f32_ms, &compact_ms, &paired_speedup);
+        n_tokens, rounds, repeats, &f32_ms, &compact_ms, &paired_speedup);
     check_guards(&d_rows, "timed F32 rows");
     check_guards(&d_compact, "timed compact rows");
+    check_guards(&d_q, "timed attention query");
+    check_guards(&d_sinks, "timed attention sinks");
+    check_guards(&d_topk, "timed attention top-k");
     check_guards(&d_f32_out, "timed F32 result");
     check_guards(&d_compact_out, "timed compact result");
 
-    printf("scenario=compact-attention-kv-codec\n");
+    printf("scenario=compact-attention-kv-native-consumer\n");
     printf("validation=byte-exact-nonzero-adversarial\n");
     printf("nonfinite_policy=reject-whole-row\n");
     printf("rejected_row_commit_policy=caller-must-observe-pack-ok-before-use\n");
     printf("reference_quantizer=shipping-ds4-cuda-production-flags\n");
-    printf("timing_scope=paired-alternating-bounded-diagnostic-not-promotion-evidence\n");
+    printf("timing_scope=production-shaped-indexed-attention-paired-bounded-diagnostic\n");
     printf("rows=%u\n", n_rows);
+    printf("tokens=%u\n", n_tokens);
+    printf("attention_heads=%u\n", ATTENTION_HEADS);
+    printf("heads_per_block=%u\n", HEADS_PER_GROUP);
+    printf("selected_rows_per_token=%u\n", TOP_K);
+    printf("rows_per_shared_stage=%u\n", ROWS_PER_STAGE);
     printf("head_dim=%u\n", HEAD_DIM);
     printf("n_rot=%u\n", N_ROT);
     printf("f32_row_bytes=%zu\n", (size_t)HEAD_DIM * sizeof(float));
@@ -728,10 +988,10 @@ int main(int argc, char **argv) {
     printf("storage_reduction=%.9f\n",
            1.0 - (double)sizeof(CompactAttentionKVRow) /
                      ((double)HEAD_DIM * sizeof(float)));
-    printf("f32_consumer_median_ms=%.9g\n", f32_ms);
-    printf("compact_consumer_median_ms=%.9g\n", compact_ms);
-    printf("compact_consumer_speedup=%.9g\n", f32_ms / compact_ms);
-    printf("paired_consumer_speedup_median=%.9g\n", paired_speedup);
+    printf("f32_attention_median_ms=%.9g\n", f32_ms);
+    printf("compact_attention_median_ms=%.9g\n", compact_ms);
+    printf("compact_attention_speedup=%.9g\n", f32_ms / compact_ms);
+    printf("paired_attention_speedup_median=%.9g\n", paired_speedup);
     printf("alternate_exact_scales=%llu\n",
            (unsigned long long)alternate_scale_count);
     printf("canaries=passed\n");
@@ -741,11 +1001,19 @@ int main(int argc, char **argv) {
     cudaFree(d_unpacked.base);
     cudaFree(d_compact.base);
     cudaFree(d_status.base);
+    cudaFree(d_q.base);
+    cudaFree(d_sinks.base);
+    cudaFree(d_topk.base);
     cudaFree(d_f32_out.base);
     cudaFree(d_compact_out.base);
     free(host_input);
     free(host_reference);
     free(host_unpacked);
+    free(host_q);
+    free(host_sinks);
+    free(host_topk);
+    free(host_f32_out);
+    free(host_compact_out);
     free(host_status);
     cudaFreeHost(host_compact);
     ds4_gpu_tensor_free(shipping_rows);

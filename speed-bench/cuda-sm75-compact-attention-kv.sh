@@ -8,6 +8,7 @@ die() {
 
 PROFILE_GPU=${PROFILE_GPU:-0}
 ROWS=${ROWS:-8192}
+TOKENS=${TOKENS:-32}
 TIMING_ROUNDS=${TIMING_ROUNDS:-7}
 TIMING_REPEATS=${TIMING_REPEATS:-25}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
@@ -15,14 +16,14 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
 
-for value in "$PROFILE_GPU" "$ROWS" "$TIMING_ROUNDS" "$TIMING_REPEATS"; do
+for value in "$PROFILE_GPU" "$ROWS" "$TOKENS" "$TIMING_ROUNDS" "$TIMING_REPEATS"; do
     [[ $value =~ ^[0-9]+$ ]] || die "numeric settings must be nonnegative integers"
 done
 for value in "$RUN_SANITIZER" "$SKIP_BUILD" "$CREATE_ARCHIVE"; do
     [[ $value == 0 || $value == 1 ]] || die "boolean settings must be 0 or 1"
 done
-(( ROWS > 0 && TIMING_ROUNDS > 0 && TIMING_REPEATS > 0 )) ||
-    die "ROWS, TIMING_ROUNDS, and TIMING_REPEATS must be positive"
+(( ROWS >= 512 && TOKENS > 0 && TIMING_ROUNDS > 0 && TIMING_REPEATS > 0 )) ||
+    die "ROWS must be at least 512; TOKENS, TIMING_ROUNDS, and TIMING_REPEATS must be positive"
 [[ $CUDA_ARCH == sm_75 ]] || die "this experiment requires CUDA_ARCH=sm_75"
 
 for tool in make cuobjdump nvidia-smi; do
@@ -85,14 +86,14 @@ printf 'scope=whole-binary-diagnostic-not-acceptance-gate\nwhole_binary_sass_ldl
     "$(grep -Ec '(^|[[:space:]])STL([.[:space:]]|$)' "$OUTPUT_DIR/sass.txt" || true)" \
     >"$OUTPUT_DIR/local-traffic.txt"
 
-"./$target" --device "$PROFILE_GPU" --rows 257 --rounds 1 --repeats 1 \
+"./$target" --device "$PROFILE_GPU" --rows 769 --tokens 2 --rounds 1 --repeats 1 \
     >"$OUTPUT_DIR/adversarial-smoke.log" 2>&1
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/adversarial-smoke.log" ||
     die "adversarial exactness smoke failed"
 
 if (( RUN_SANITIZER )); then
     compute-sanitizer --tool memcheck --error-exitcode 97 \
-        "./$target" --device "$PROFILE_GPU" --rows 257 --rounds 1 --repeats 1 \
+        "./$target" --device "$PROFILE_GPU" --rows 769 --tokens 2 --rounds 1 --repeats 1 \
         >"$OUTPUT_DIR/memcheck.log" 2>&1 || {
             tail -n 200 "$OUTPUT_DIR/memcheck.log" >&2
             die "compute-sanitizer failed"
@@ -102,6 +103,7 @@ else
 fi
 
 "./$target" --device "$PROFILE_GPU" --rows "$ROWS" \
+    --tokens "$TOKENS" \
     --rounds "$TIMING_ROUNDS" --repeats "$TIMING_REPEATS" \
     >"$OUTPUT_DIR/timing.log" 2>&1
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||

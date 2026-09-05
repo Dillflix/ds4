@@ -5510,16 +5510,20 @@ bit-identical unpack and consumer output, rejects non-finite or
 non-representable rows, checks guarded allocations under Compute Sanitizer,
 covers scale-floor, alternate-scale, upper-exponent, and signed-zero
 boundaries, records PTXAS/SASS resources, and times a paired, alternating
-full-row F32 consumer against compact decode plus consume. This bounded
-synthetic timing is diagnostic, not promotion evidence. Pack status completes
-asynchronously; a future caller must observe `PACK_OK` before committing or
-using a destination row. The reported SASS
+production-shaped indexed-attention consumer against direct compact decode.
+Each 256-thread block owns eight heads, stages eight of the 512 selected rows
+at a time, and preserves the shipping online-softmax operation order. This
+isolates the persistent-cache representation without timing a full-cache F32
+materialization. It remains bounded diagnostic evidence, not promotion
+evidence. Pack status completes asynchronously; a future caller must observe
+`PACK_OK` before committing or using a destination row. The reported SASS
 LDL/STL counts are explicitly whole-binary diagnostics, not a per-kernel
 acceptance gate.
 
 ```bash
 PROFILE_GPU=0 \
 ROWS=8192 \
+TOKENS=32 \
 TIMING_ROUNDS=7 \
 TIMING_REPEATS=25 \
 RUN_SANITIZER=1 \
