@@ -5539,9 +5539,12 @@ bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
 `cuda-sm75-attention-rowshard-softmax.sh` is an independent, bounded protocol
 experiment; it does not alter engine allocation or dispatch. The control reads
 one complete 736-byte-row compact cache. The candidate stores those same rows
-exactly once in two separately guarded contiguous owner allocations. Its Top-K
-fixture alternates owners on every selected row, preventing a falsely easy
-single-boundary ordering case.
+exactly once in two separately guarded even/odd row-striped owner allocations.
+Every emitted row therefore alternates owners as the context grows; a
+contiguous half split would leave one GPU idle until the cache crossed its
+midpoint and is not a valid production design. The Top-K fixture alternates
+owners on every selected row, preventing a falsely easy single-boundary
+ordering case.
 
 The harness distinguishes two materially different claims. An ordered local-
 address arm follows the original Top-K sequence and chooses the relevant local
@@ -5557,10 +5560,14 @@ speedup.
 
 Setting `PEER_GPU` enables a bounded physical-pair arm. The home and peer own
 one compact row shard each and execute their partials concurrently. Its timing
-includes the F32 query copy, routed remote Top-K list, both partial kernels,
-the aligned F32 partial-state return, and the home merge. The ordinary control
-and single-device protocol arms remain in the same invocation, making clear
-whether real transport preserves or consumes the compute-only opportunity.
+includes a stable device-side partition of the global Top-K list into even/odd
+owner-local indices, the F32 query copy, a worst-case-capacity remote route and
+its exact row count, both partial kernels, the aligned F32 partial-state
+return, and the home merge. The stable partition preserves global Top-K order
+within each owner, while per-token counts handle arbitrary—not assumed 50/50—
+selection distributions. The ordinary control and single-device protocol arms
+remain in the same invocation, making clear whether real transport preserves
+or consumes the compute-only opportunity.
 
 Each partial-state record reserves two padding floats after `(max, sum)` so
 the 512-float numerator begins at a 16-byte boundary and every subsequent

@@ -3,7 +3,10 @@
  *
  * Production is not modified.  The control owns one complete compact cache.
  * The candidate owns the same rows exactly once across two separately guarded
- * allocations.  Selected rows deliberately alternate between owners so an
+ * even/odd row-striped allocations.  Striping keeps a growing cache balanced
+ * from its first rows instead of leaving the second owner idle until a
+ * contiguous midpoint is reached. Selected rows deliberately alternate
+ * between owners so an
  * implementation cannot accidentally rely on one contiguous Top-K phase.
  *
  * Two candidate semantics are tested:
@@ -220,6 +223,7 @@ __global__ static void ordered_attention_kernel(
         const float *query,
         float *out,
         uint32_t n_tokens) {
+    (void)owner1_base;
     const uint32_t token = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
@@ -248,9 +252,9 @@ __global__ static void ordered_attention_kernel(
                 (uint32_t)topk[(uint64_t)token * TOP_K + row0 + rr];
             const CompactAttentionKVRow *row;
             if (OWNER_LOCAL) {
-                row = global_row < owner1_base
-                    ? owner0_rows + global_row
-                    : owner1_rows + (global_row - owner1_base);
+                row = (global_row & 1u)
+                    ? owner1_rows + global_row / 2u
+                    : owner0_rows + global_row / 2u;
             } else {
                 row = full_rows + global_row;
             }
@@ -295,9 +299,12 @@ __global__ static void ordered_attention_kernel(
     dst[lane + 96u] = o3;
 }
 
+template <uint32_t FIXED_ROWS>
 __global__ static void owner_partial_kernel(
         const CompactAttentionKVRow *local_rows,
         const int32_t *local_topk,
+        const uint32_t *local_counts,
+        uint32_t local_stride,
         const float *query,
         float *states,
         uint32_t n_tokens) {
@@ -319,17 +326,18 @@ __global__ static void owner_partial_kernel(
     float4 o0 = make_float4(0, 0, 0, 0);
     float4 o1 = o0, o2 = o0, o3 = o0;
     const float score_scale = rsqrtf((float)HEAD_DIM);
+    const uint32_t local_count = FIXED_ROWS ? FIXED_ROWS : local_counts[token];
 
-    for (uint32_t row0 = 0; row0 < OWNER_TOP_K;
+    for (uint32_t row0 = 0; row0 < local_count;
          row0 += ROWS_PER_STAGE) {
-        const uint32_t nr = OWNER_TOP_K - row0 < ROWS_PER_STAGE
-            ? OWNER_TOP_K - row0 : ROWS_PER_STAGE;
+        const uint32_t nr = local_count - row0 < ROWS_PER_STAGE
+            ? local_count - row0 : ROWS_PER_STAGE;
         for (uint32_t off = threadIdx.x;
              off < nr * (HEAD_DIM / 4u); off += blockDim.x) {
             const uint32_t rr = off / (HEAD_DIM / 4u);
             const uint32_t c4 = off % (HEAD_DIM / 4u);
             staged[off] = compact_load_float4(
-                local_rows + local_topk[(uint64_t)token * OWNER_TOP_K +
+                local_rows + local_topk[(uint64_t)token * local_stride +
                                         row0 + rr],
                 c4, threadIdx.x & 31u);
         }
@@ -432,22 +440,26 @@ static void launch_arm(
                 topk, sinks, query, out, n_tokens);
             break;
         case ARM_OWNER0:
-            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
-                owner0_rows, owner0_topk, query, state0, n_tokens);
+            owner_partial_kernel<OWNER_TOP_K><<<attention_grid, THREADS, 0, stream>>>(
+                owner0_rows, owner0_topk, NULL, TOP_K,
+                query, state0, n_tokens);
             break;
         case ARM_OWNER1:
-            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
-                owner1_rows, owner1_topk, query, state1, n_tokens);
+            owner_partial_kernel<OWNER_TOP_K><<<attention_grid, THREADS, 0, stream>>>(
+                owner1_rows, owner1_topk, NULL, TOP_K,
+                query, state1, n_tokens);
             break;
         case ARM_MERGE:
             merge_partial_states_kernel<<<merge_grid, HEAD_DIM, 0, stream>>>(
                 state0, state1, sinks, out, n_tokens);
             break;
         case ARM_PARALLEL_SEQUENTIAL:
-            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
-                owner0_rows, owner0_topk, query, state0, n_tokens);
-            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
-                owner1_rows, owner1_topk, query, state1, n_tokens);
+            owner_partial_kernel<OWNER_TOP_K><<<attention_grid, THREADS, 0, stream>>>(
+                owner0_rows, owner0_topk, NULL, TOP_K,
+                query, state0, n_tokens);
+            owner_partial_kernel<OWNER_TOP_K><<<attention_grid, THREADS, 0, stream>>>(
+                owner1_rows, owner1_topk, NULL, TOP_K,
+                query, state1, n_tokens);
             merge_partial_states_kernel<<<merge_grid, HEAD_DIM, 0, stream>>>(
                 state0, state1, sinks, out, n_tokens);
             break;
@@ -530,15 +542,48 @@ static float median_arm(
     return median;
 }
 
+/* Stable device-side route construction for the physical protocol. One
+ * thread per token preserves global Top-K order within each owner; atomics
+ * would make floating-point association nondeterministic. */
+__global__ static void partition_even_odd_topk_kernel(
+        const int32_t *global_topk,
+        int32_t *owner0_topk,
+        int32_t *owner1_topk,
+        uint32_t *owner0_counts,
+        uint32_t *owner1_counts,
+        uint32_t n_tokens) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens || threadIdx.x != 0u) return;
+    uint32_t count0 = 0u;
+    uint32_t count1 = 0u;
+    for (uint32_t i = 0; i < TOP_K; i++) {
+        const uint32_t global_row =
+            (uint32_t)global_topk[(uint64_t)token * TOP_K + i];
+        if (global_row & 1u) {
+            owner1_topk[(uint64_t)token * TOP_K + count1++] =
+                (int32_t)(global_row / 2u);
+        } else {
+            owner0_topk[(uint64_t)token * TOP_K + count0++] =
+                (int32_t)(global_row / 2u);
+        }
+    }
+    owner0_counts[token] = count0;
+    owner1_counts[token] = count1;
+}
+
 struct PhysicalProtocol {
     uint32_t home_device;
     uint32_t peer_device;
     uint32_t n_tokens;
     const CompactAttentionKVRow *home_owner0_rows;
     const CompactAttentionKVRow *peer_owner1_rows;
-    const int32_t *home_owner0_topk;
-    const int32_t *home_owner1_topk;
+    const int32_t *home_global_topk;
+    int32_t *home_owner0_topk;
+    int32_t *home_owner1_topk;
     int32_t *peer_owner1_topk;
+    uint32_t *home_owner0_counts;
+    uint32_t *home_owner1_counts;
+    uint32_t *peer_owner1_counts;
     const float *home_query;
     float *peer_query;
     const float *home_sinks;
@@ -548,9 +593,11 @@ struct PhysicalProtocol {
     float *home_output;
     size_t query_bytes;
     size_t owner_topk_bytes;
+    size_t owner_count_bytes;
     size_t state_storage_bytes;
     cudaStream_t home_stream;
     cudaStream_t peer_stream;
+    cudaEvent_t route_ready;
 };
 
 static void enable_peer_direction(uint32_t source, uint32_t destination) {
@@ -584,8 +631,23 @@ static float time_physical_protocol(
              "record physical begin event");
 
     for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        partition_even_odd_topk_kernel<<<
+            protocol->n_tokens, 1u, 0, protocol->home_stream>>>(
+                protocol->home_global_topk,
+                protocol->home_owner0_topk,
+                protocol->home_owner1_topk,
+                protocol->home_owner0_counts,
+                protocol->home_owner1_counts,
+                protocol->n_tokens);
+        cuda_die(cudaGetLastError(), "partition physical Top-K by owner");
+        cuda_die(cudaEventRecord(protocol->route_ready, protocol->home_stream),
+                 "record physical route ready");
+
         cuda_die(cudaSetDevice((int)protocol->peer_device),
                  "select physical peer device");
+        cuda_die(cudaStreamWaitEvent(
+                     protocol->peer_stream, protocol->route_ready, 0u),
+                 "wait for physical route");
         cuda_die(cudaMemcpyPeerAsync(
                      protocol->peer_query, (int)protocol->peer_device,
                      protocol->home_query, (int)protocol->home_device,
@@ -598,19 +660,38 @@ static float time_physical_protocol(
                      (int)protocol->home_device,
                      protocol->owner_topk_bytes, protocol->peer_stream),
                  "transfer physical peer selection route");
-        launch_arm(
-            ARM_OWNER1, NULL, NULL, protocol->peer_owner1_rows, 0u,
-            NULL, NULL, protocol->peer_owner1_topk, NULL,
-            protocol->peer_query, NULL, protocol->peer_state1, NULL,
-            protocol->n_tokens, protocol->peer_stream);
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->peer_owner1_counts,
+                     (int)protocol->peer_device,
+                     protocol->home_owner1_counts,
+                     (int)protocol->home_device,
+                     protocol->owner_count_bytes, protocol->peer_stream),
+                 "transfer physical peer route counts");
+        const dim3 attention_grid(
+            protocol->n_tokens, N_HEAD / HEADS_PER_BLOCK, 1u);
+        owner_partial_kernel<0u><<<
+            attention_grid, THREADS, 0, protocol->peer_stream>>>(
+                protocol->peer_owner1_rows,
+                protocol->peer_owner1_topk,
+                protocol->peer_owner1_counts,
+                TOP_K,
+                protocol->peer_query,
+                protocol->peer_state1,
+                protocol->n_tokens);
+        cuda_die(cudaGetLastError(), "launch physical peer partial");
 
         cuda_die(cudaSetDevice((int)protocol->home_device),
                  "select physical home device");
-        launch_arm(
-            ARM_OWNER0, NULL, protocol->home_owner0_rows, NULL, 0u,
-            NULL, protocol->home_owner0_topk, NULL, NULL,
-            protocol->home_query, protocol->home_state0, NULL, NULL,
-            protocol->n_tokens, protocol->home_stream);
+        owner_partial_kernel<0u><<<
+            attention_grid, THREADS, 0, protocol->home_stream>>>(
+                protocol->home_owner0_rows,
+                protocol->home_owner0_topk,
+                protocol->home_owner0_counts,
+                TOP_K,
+                protocol->home_query,
+                protocol->home_state0,
+                protocol->n_tokens);
+        cuda_die(cudaGetLastError(), "launch physical home partial");
 
         cuda_die(cudaSetDevice((int)protocol->peer_device),
                  "select physical peer device");
@@ -696,8 +777,8 @@ static void fill_metadata(
         float *query, float *sinks, int32_t *topk,
         int32_t *owner0_topk, int32_t *owner1_topk,
         uint32_t n_rows, uint32_t n_tokens) {
-    const uint32_t owner1_base = n_rows / 2u;
-    const uint32_t owner1_count = n_rows - owner1_base;
+    const uint32_t owner0_count = (n_rows + 1u) / 2u;
+    const uint32_t owner1_count = n_rows / 2u;
     for (uint32_t head = 0; head < N_HEAD; head++) {
         sinks[head] = -0.5f + (float)(head % 9u) * 0.03125f;
     }
@@ -711,15 +792,15 @@ static void fill_metadata(
         for (uint32_t i = 0; i < TOP_K; i++) {
             const uint32_t local = i / 2u;
             const uint32_t row = (i & 1u)
-                ? owner1_base + (token * 19u + local) % owner1_count
-                : (token * 17u + local) % owner1_base;
+                ? 2u * ((token * 19u + local) % owner1_count) + 1u
+                : 2u * ((token * 17u + local) % owner0_count);
             topk[(uint64_t)token * TOP_K + i] = (int32_t)row;
             if (i & 1u) {
-                owner1_topk[(uint64_t)token * OWNER_TOP_K + local] =
-                    (int32_t)(row - owner1_base);
+                owner1_topk[(uint64_t)token * TOP_K + local] =
+                    (int32_t)(row / 2u);
             } else {
-                owner0_topk[(uint64_t)token * OWNER_TOP_K + local] =
-                    (int32_t)row;
+                owner0_topk[(uint64_t)token * TOP_K + local] =
+                    (int32_t)(row / 2u);
             }
         }
     }
@@ -769,8 +850,8 @@ int main(int argc, char **argv) {
     }
 
     const uint32_t owner1_base = n_rows / 2u;
-    const uint32_t owner0_count = owner1_base;
-    const uint32_t owner1_count = n_rows - owner1_base;
+    const uint32_t owner0_count = (n_rows + 1u) / 2u;
+    const uint32_t owner1_count = n_rows / 2u;
     const size_t full_bytes =
         (size_t)n_rows * sizeof(CompactAttentionKVRow);
     const size_t owner0_bytes =
@@ -782,7 +863,10 @@ int main(int argc, char **argv) {
     const size_t sink_bytes = N_HEAD * sizeof(float);
     const size_t topk_bytes = (size_t)n_tokens * TOP_K * sizeof(int32_t);
     const size_t owner_topk_bytes =
+        (size_t)n_tokens * TOP_K * sizeof(int32_t);
+    const size_t owner_topk_logical_bytes =
         (size_t)n_tokens * OWNER_TOP_K * sizeof(int32_t);
+    const size_t owner_count_bytes = (size_t)n_tokens * sizeof(uint32_t);
     const size_t output_bytes = query_bytes;
     const size_t state_storage_bytes =
         (size_t)n_tokens * N_HEAD * STATE_FLOATS * sizeof(float);
@@ -793,6 +877,14 @@ int main(int argc, char **argv) {
         (CompactAttentionKVRow *)host_alloc_aligned(
             alignof(CompactAttentionKVRow), full_bytes,
             "allocate aligned host cache fixture");
+    CompactAttentionKVRow *host_owner0_rows =
+        (CompactAttentionKVRow *)host_alloc_aligned(
+            alignof(CompactAttentionKVRow), owner0_bytes,
+            "allocate aligned owner0 cache fixture");
+    CompactAttentionKVRow *host_owner1_rows =
+        (CompactAttentionKVRow *)host_alloc_aligned(
+            alignof(CompactAttentionKVRow), owner1_bytes,
+            "allocate aligned owner1 cache fixture");
     float *host_query = (float *)malloc(query_bytes);
     float *host_sinks = (float *)malloc(sink_bytes);
     int32_t *host_topk = (int32_t *)malloc(topk_bytes);
@@ -826,6 +918,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     fill_rows(host_rows, n_rows);
+    for (uint32_t row = 0; row < n_rows; row++) {
+        if (row & 1u) host_owner1_rows[row / 2u] = host_rows[row];
+        else host_owner0_rows[row / 2u] = host_rows[row];
+    }
     fill_metadata(host_query, host_sinks, host_topk,
                   host_owner0_topk, host_owner1_topk, n_rows, n_tokens);
 
@@ -839,6 +935,10 @@ int main(int argc, char **argv) {
         guarded_alloc(owner_topk_bytes, "allocate owner0 local top-k");
     GuardedBuffer d_owner1_topk =
         guarded_alloc(owner_topk_bytes, "allocate owner1 local top-k");
+    GuardedBuffer d_owner0_counts =
+        guarded_alloc(owner_count_bytes, "allocate owner0 route counts");
+    GuardedBuffer d_owner1_counts =
+        guarded_alloc(owner_count_bytes, "allocate owner1 route counts");
     GuardedBuffer d_state0 =
         guarded_alloc(state_storage_bytes, "allocate owner0 state");
     GuardedBuffer d_state1 =
@@ -849,15 +949,17 @@ int main(int argc, char **argv) {
     GuardedBuffer d_peer_owner1 = {};
     GuardedBuffer d_peer_query = {};
     GuardedBuffer d_peer_owner1_topk = {};
+    GuardedBuffer d_peer_owner1_counts = {};
     GuardedBuffer d_peer_state1 = {};
     cudaStream_t home_physical_stream = 0;
     cudaStream_t peer_physical_stream = 0;
+    cudaEvent_t physical_route_ready = 0;
 
     cuda_die(cudaMemcpy(d_full.data, host_rows, full_bytes, cudaMemcpyHostToDevice),
              "copy control cache");
-    cuda_die(cudaMemcpy(d_owner0.data, host_rows, owner0_bytes, cudaMemcpyHostToDevice),
+    cuda_die(cudaMemcpy(d_owner0.data, host_owner0_rows, owner0_bytes, cudaMemcpyHostToDevice),
              "copy owner0 cache");
-    cuda_die(cudaMemcpy(d_owner1.data, host_rows + owner1_base,
+    cuda_die(cudaMemcpy(d_owner1.data, host_owner1_rows,
                         owner1_bytes, cudaMemcpyHostToDevice),
              "copy owner1 cache");
     cuda_die(cudaMemcpy(d_query.data, host_query, query_bytes, cudaMemcpyHostToDevice),
@@ -885,9 +987,11 @@ int main(int argc, char **argv) {
             guarded_alloc(query_bytes, "allocate physical peer query");
         d_peer_owner1_topk = guarded_alloc(
             owner_topk_bytes, "allocate physical peer selection route");
+        d_peer_owner1_counts = guarded_alloc(
+            owner_count_bytes, "allocate physical peer route counts");
         d_peer_state1 = guarded_alloc(
             state_storage_bytes, "allocate physical peer state");
-        cuda_die(cudaMemcpy(d_peer_owner1.data, host_rows + owner1_base,
+        cuda_die(cudaMemcpy(d_peer_owner1.data, host_owner1_rows,
                             owner1_bytes, cudaMemcpyHostToDevice),
                  "copy physical peer cache");
         cuda_die(cudaStreamCreateWithFlags(
@@ -895,6 +999,9 @@ int main(int argc, char **argv) {
                  "create physical peer stream");
         cuda_die(cudaSetDevice((int)device),
                  "restore home after physical allocations");
+        cuda_die(cudaEventCreateWithFlags(
+                     &physical_route_ready, cudaEventDisableTiming),
+                 "create physical route event");
     }
 
     const CompactAttentionKVRow *full =
@@ -972,12 +1079,14 @@ int main(int argc, char **argv) {
 
     GuardedBuffer *buffers[] = {
         &d_full, &d_owner0, &d_owner1, &d_query, &d_sinks, &d_topk,
-        &d_owner0_topk, &d_owner1_topk, &d_state0, &d_state1,
+        &d_owner0_topk, &d_owner1_topk, &d_owner0_counts, &d_owner1_counts,
+        &d_state0, &d_state1,
         &d_control, &d_ordered, &d_parallel,
     };
     const char *buffer_names[] = {
         "control cache", "owner0 cache", "owner1 cache", "query", "sinks",
-        "top-k", "owner0 local top-k", "owner1 local top-k", "owner0 state",
+        "top-k", "owner0 local top-k", "owner1 local top-k",
+        "owner0 route counts", "owner1 route counts", "owner0 state",
         "owner1 state", "control output", "ordered output", "parallel output",
     };
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
@@ -1043,10 +1152,17 @@ int main(int argc, char **argv) {
         protocol.home_owner0_rows = owner0;
         protocol.peer_owner1_rows =
             (const CompactAttentionKVRow *)d_peer_owner1.data;
-        protocol.home_owner0_topk = owner0_topk;
-        protocol.home_owner1_topk = owner1_topk;
+        protocol.home_global_topk = topk;
+        protocol.home_owner0_topk = (int32_t *)d_owner0_topk.data;
+        protocol.home_owner1_topk = (int32_t *)d_owner1_topk.data;
         protocol.peer_owner1_topk =
             (int32_t *)d_peer_owner1_topk.data;
+        protocol.home_owner0_counts =
+            (uint32_t *)d_owner0_counts.data;
+        protocol.home_owner1_counts =
+            (uint32_t *)d_owner1_counts.data;
+        protocol.peer_owner1_counts =
+            (uint32_t *)d_peer_owner1_counts.data;
         protocol.home_query = query;
         protocol.peer_query = (float *)d_peer_query.data;
         protocol.home_sinks = sinks;
@@ -1056,9 +1172,11 @@ int main(int argc, char **argv) {
         protocol.home_output = (float *)d_parallel.data;
         protocol.query_bytes = query_bytes;
         protocol.owner_topk_bytes = owner_topk_bytes;
+        protocol.owner_count_bytes = owner_count_bytes;
         protocol.state_storage_bytes = state_storage_bytes;
         protocol.home_stream = home_physical_stream;
         protocol.peer_stream = peer_physical_stream;
+        protocol.route_ready = physical_route_ready;
 
         time_physical_protocol(&protocol, 1u);
         physical_protocol_ms = median_physical_protocol(
@@ -1099,11 +1217,12 @@ int main(int argc, char **argv) {
                  "select peer for physical guard validation");
         GuardedBuffer *peer_buffers[] = {
             &d_peer_owner1, &d_peer_query,
-            &d_peer_owner1_topk, &d_peer_state1,
+            &d_peer_owner1_topk, &d_peer_owner1_counts, &d_peer_state1,
         };
         const char *peer_buffer_names[] = {
             "physical peer cache", "physical peer query",
-            "physical peer selection route", "physical peer state",
+            "physical peer selection route", "physical peer route counts",
+            "physical peer state",
         };
         for (uint32_t i = 0;
              i < sizeof(peer_buffers) / sizeof(peer_buffers[0]); i++) {
@@ -1120,7 +1239,9 @@ int main(int argc, char **argv) {
     const uint64_t state_handoff_aligned_bytes = state_storage_bytes;
     const uint64_t query_f32_bytes = query_bytes;
     const uint64_t query_f16_bytes = query_bytes / 2u;
-    const uint64_t remote_selection_route_bytes = owner_topk_bytes;
+    const uint64_t remote_selection_route_bytes = owner_topk_logical_bytes;
+    const uint64_t remote_selection_route_storage_bytes =
+        owner_topk_bytes + owner_count_bytes;
     const uint64_t all_owner_selection_bytes = topk_bytes;
     const uint64_t compact_cache_43_layer_256k_bytes =
         compact_cache_256k_bytes * 43ull;
@@ -1143,10 +1264,13 @@ int main(int argc, char **argv) {
         printf("peer_device=%u\n", peer_device);
         printf("peer_device_name=%s\n", peer_properties.name);
         printf("physical_protocol_query_wire=f32\n");
-        printf("physical_protocol_timing=inclusive-query-route-partials-state-merge\n");
+        printf("physical_protocol_timing=inclusive-device-route-partition-query-route-partials-state-merge\n");
     }
-    printf("cache_ownership=two-separately-guarded-contiguous-row-shards\n");
-    printf("selection_scope=prepartitioned-global-topk-compute-excluded\n");
+    printf("cache_ownership=two-separately-guarded-even-odd-row-shards\n");
+    printf("cache_growth_balance=every-emitted-row-alternates-owner\n");
+    printf("selection_scope=%s\n", physical_pair
+        ? "global-topk-device-partition-included-topk-compute-excluded"
+        : "prepartitioned-global-topk-compute-excluded");
     printf("raw_ring_scope=excluded-must-remain-small-and-explicitly-replicated\n");
     printf("harness_control_copy_excluded_from_production_accounting=1\n");
     printf("n_rows=%u\n", n_rows);
@@ -1194,12 +1318,14 @@ int main(int argc, char **argv) {
            (unsigned long long)all_owner_selection_bytes);
     printf("remote_selection_route_bytes=%llu\n",
            (unsigned long long)remote_selection_route_bytes);
+    printf("remote_selection_route_transfer_bytes=%llu\n",
+           (unsigned long long)remote_selection_route_storage_bytes);
     printf("minimum_modeled_transport_f32_query_bytes=%llu\n",
            (unsigned long long)(state_handoff_aligned_bytes + query_f32_bytes +
-                                remote_selection_route_bytes));
+                                remote_selection_route_storage_bytes));
     printf("minimum_modeled_transport_f16_query_bytes=%llu\n",
            (unsigned long long)(state_handoff_aligned_bytes + query_f16_bytes +
-                                remote_selection_route_bytes));
+                                remote_selection_route_storage_bytes));
     printf("ordered_local_address_bit_mismatches=%llu\n",
            (unsigned long long)ordered_mismatches);
     printf("control_nonfinite=%llu\n",
@@ -1254,16 +1380,21 @@ int main(int argc, char **argv) {
         cudaFree(d_peer_owner1.base);
         cudaFree(d_peer_query.base);
         cudaFree(d_peer_owner1_topk.base);
+        cudaFree(d_peer_owner1_counts.base);
         cudaFree(d_peer_state1.base);
         cuda_die(cudaSetDevice((int)device),
                  "select home for physical cleanup");
         cuda_die(cudaStreamDestroy(home_physical_stream),
                  "destroy physical home stream");
+        cuda_die(cudaEventDestroy(physical_route_ready),
+                 "destroy physical route event");
     }
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
         cudaFree(buffers[i]->base);
     }
     free(host_rows);
+    free(host_owner0_rows);
+    free(host_owner1_rows);
     free(host_query);
     free(host_sinks);
     free(host_topk);
