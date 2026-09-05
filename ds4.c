@@ -15619,6 +15619,17 @@ static bool cuda_tp_prefill_attn_heads_env_enabled(void) {
 #endif
 }
 
+/* This selector is also queried by the CPU-only placement tests, so keep its
+ * environment parsing outside the DS4_NO_GPU implementation block. */
+static bool cuda_tp_prefill_attn_rows_output_env_enabled(void) {
+#if defined(__APPLE__)
+    return false;
+#else
+    const char *env = getenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT");
+    return env && env[0] && strcmp(env, "0") != 0;
+#endif
+}
+
 static bool cuda_tp_prefill_attn_rows_default_qualified(void) {
 #if defined(__APPLE__)
     return false;
@@ -17806,12 +17817,7 @@ static bool metal_graph_cuda_tp_prefill_attn_output_requested(void) {
  * remains off until four-GPU exactness,
  * throughput and fault evidence are accepted. */
 static bool metal_graph_cuda_tp_prefill_attn_rows_output_requested(void) {
-#if defined(__APPLE__)
-    return false;
-#else
-    return metal_graph_tp_env_flag(
-            "DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT", false);
-#endif
+    return cuda_tp_prefill_attn_rows_output_env_enabled();
 }
 
 static bool metal_graph_cuda_prefill_pipeline_requested(const ds4_gpu_graph *g) {
@@ -60827,7 +60833,7 @@ bool ds4_test_cuda_tp_prefill_attn_rows_requested(void) {
 }
 
 bool ds4_test_cuda_tp_prefill_attn_rows_output_requested(void) {
-    return metal_graph_cuda_tp_prefill_attn_rows_output_requested();
+    return cuda_tp_prefill_attn_rows_output_env_enabled();
 }
 
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier) {
