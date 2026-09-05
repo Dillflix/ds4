@@ -13049,26 +13049,32 @@ __device__ __forceinline__ static float sm75_compact_attn_decode_code(
     return __uint_as_float(bits);
 }
 
-__device__ __forceinline__ static int sm75_compact_attn_exact_code(
+__device__ __forceinline__ static int sm75_compact_attn_quant_code(
         float value, float scale) {
     if (!isfinite(value) || !isfinite(scale) || !(scale > 0.0f)) return -1;
     const uint32_t sign = __float_as_uint(value) >> 31;
-    const uint32_t magnitude_bits = __float_as_uint(value) & 0x7fffffffu;
+    const float magnitude = fminf(fabsf(value / scale), 448.0f);
     int lo = 0;
     int hi = 126;
     while (lo < hi) {
         const int mid = (lo + hi + 1) >> 1;
-        const float candidate = dsv4_e4m3fn_value_dev(mid) * scale;
-        if ((__float_as_uint(candidate) & 0x7fffffffu) <= magnitude_bits) {
+        if (dsv4_e4m3fn_value_dev(mid) <= magnitude) {
             lo = mid;
         } else {
             hi = mid - 1;
         }
     }
     int code = lo;
-    if ((__float_as_uint(dsv4_e4m3fn_value_dev(code) * scale) &
-         0x7fffffffu) != magnitude_bits) {
-        return -1;
+    if (code < 126) {
+        const float lower_distance =
+            fabsf(magnitude - dsv4_e4m3fn_value_dev(code));
+        const float upper_distance =
+            fabsf(magnitude - dsv4_e4m3fn_value_dev(code + 1));
+        if (upper_distance < lower_distance ||
+            (upper_distance == lower_distance &&
+             (((code + 1) & 1) == 0) && ((code & 1) != 0)))) {
+            code++;
+        }
     }
     return code | (int)(sign << 7);
 }
@@ -13102,7 +13108,13 @@ __global__ static void sm75_compact_attn_pack_kernel(
             fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
         if (tid == 0u) out->scale[group] = scale;
         __syncthreads();
-        const int code = sm75_compact_attn_exact_code(value, scale);
+        /* Emit the shipping E4M3 code directly instead of attempting to
+         * reverse-map the rounded F32 value.  The input normally has already
+         * passed through fp8_kv_quantize_row(), making this operation
+         * idempotent and its decoded value bit-identical.  Applying the same
+         * quantizer here also closes the representability hole if a finite
+         * producer value reaches the pack boundary directly. */
+        const int code = sm75_compact_attn_quant_code(value, scale);
         if (code < 0) {
             atomicOr(&out->status, 2u);
             out->code[d] = 0u;
@@ -24529,7 +24541,7 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
                 fprintf(stderr,
                         "ds4: compact attention pack audit rejected "
                         "dst-row=%u local-row=%u status=0x%x "
-                        "(nonfinite=0x1 unrepresentable=0x2)\n",
+                        "(nonfinite=0x1 encoding-failure=0x2)\n",
                         dst_row + row, row, status[row]);
                 free(status);
                 return 0;

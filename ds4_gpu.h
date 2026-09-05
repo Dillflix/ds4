@@ -1069,10 +1069,12 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Exact SM75 persistent compressed-attention cache codec.  The source of a
- * pack is the existing already-FP8-rounded F32 cache row.  Pack tags any row
- * that cannot be reconstructed bit-for-bit; cold unpack propagates NaNs so
- * validation fails closed instead of accepting a changed row. */
+/* Exact SM75 persistent compressed-attention cache codec.  Pack applies the
+ * shipping E4M3 quantizer while emitting its native codes.  This is
+ * idempotent for the ordinary already-FP8-rounded F32 source and reconstructs
+ * that cache row bit-for-bit; finite direct producer values receive the same
+ * rounding as the shipping F32 path.  Invalid rows remain tagged so cold
+ * unpack propagates NaNs and validation fails closed. */
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
 static inline int ds4_gpu_attn_compact_supported(void) { return 0; }
 static inline int ds4_gpu_attn_compact_pack_tensor(

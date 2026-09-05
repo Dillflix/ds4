@@ -107,7 +107,7 @@ static_assert(TOP_K % HYBRID_CHUNK_ROWS == 0,
 enum PackStatus {
     PACK_OK = 0,
     PACK_NONFINITE = 1,
-    PACK_UNREPRESENTABLE = 2,
+    PACK_ENCODING_FAILURE = 2,
     PACK_BAD_SCALE = 4,
     PACK_TOO_MANY_EXCEPTIONS = 8,
     PACK_HALF_INEXACT = 16,
@@ -164,17 +164,33 @@ __device__ __forceinline__ static float decode_code_bits(
     return decode_code(code, __uint_as_float(scale_bits));
 }
 
-__device__ __forceinline__ static int exact_code_for(float value, float scale) {
+__device__ __forceinline__ static int quant_code_for(float value, float scale) {
     if (!isfinite(value) || !isfinite(scale) || !(scale > 0.0f)) return -1;
     const uint32_t sign = __float_as_uint(value) >> 31;
-    const uint32_t magnitude_bits = __float_as_uint(value) & 0x7fffffffu;
-    for (uint32_t i = 0; i <= 126u; i++) {
-        const float reconstructed = e4m3fn_value(i) * scale;
-        if (__float_as_uint(reconstructed) == magnitude_bits) {
-            return (int)(i | (sign << 7));
+    const float magnitude = fminf(fabsf(value / scale), 448.0f);
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (e4m3fn_value((uint32_t)mid) <= magnitude) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
     }
-    return -1;
+    int code = lo;
+    if (code < 126) {
+        const float lower_distance =
+            fabsf(magnitude - e4m3fn_value((uint32_t)code));
+        const float upper_distance =
+            fabsf(magnitude - e4m3fn_value((uint32_t)code + 1u));
+        if (upper_distance < lower_distance ||
+            (upper_distance == lower_distance &&
+             (((code + 1) & 1) == 0) && ((code & 1) != 0))) {
+            code++;
+        }
+    }
+    return code | (int)(sign << 7);
 }
 
 __global__ static void compact_pack_kernel(
@@ -215,9 +231,9 @@ __global__ static void compact_pack_kernel(
             }
         }
         __syncthreads();
-        const int code = exact_code_for(v, scale);
+        const int code = quant_code_for(v, scale);
         if (code < 0) {
-            atomicOr(status + row, (uint32_t)PACK_UNREPRESENTABLE);
+            atomicOr(status + row, (uint32_t)PACK_ENCODING_FAILURE);
             dst->code[d] = 0x7fu;
         } else {
             dst->code[d] = (uint8_t)code;
@@ -2180,23 +2196,40 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* A finite but non-E4M3-grid value must not be rounded a second time. */
+    /* A finite value that is not already on the E4M3 grid must be encoded
+     * exactly as the shipping quantizer would encode it.  This keeps pack
+     * idempotent for the ordinary already-rounded input while making the
+     * compact boundary safe for a direct finite producer. */
     memcpy(host_input, host_reference, f32_bytes);
     memset(host_input, 0, N_NOPE * sizeof(float));
     host_input[0] = nextafterf(1.0f, 2.0f);
     cuda_die(cudaMemcpy(d_rows.data, host_input, f32_bytes, cudaMemcpyHostToDevice),
-             "copy nonrepresentable input");
+             "copy arbitrary finite input");
     cuda_die(cudaMemset(d_status.data, 0, status_bytes),
-             "clear nonrepresentable status");
+             "clear arbitrary finite status");
     compact_pack_kernel<<<n_rows, THREADS>>>(
         (const float *)d_rows.data,
         (CompactAttentionKVRow *)d_compact.data,
         (uint32_t *)d_status.data, n_rows);
-    cuda_die(cudaDeviceSynchronize(), "nonrepresentable pack rejection");
+    compact_unpack_kernel<<<n_rows, THREADS>>>(
+        (const CompactAttentionKVRow *)d_compact.data,
+        (float *)d_unpacked.data, n_rows);
+    cuda_die(cudaDeviceSynchronize(), "arbitrary finite compact pack");
     cuda_die(cudaMemcpy(host_status, d_status.data, status_bytes,
-                        cudaMemcpyDeviceToHost), "copy nonrepresentable status");
-    if ((host_status[0] & PACK_UNREPRESENTABLE) == 0u) {
-        fprintf(stderr, "error: finite non-E4M3 row was not rejected\n");
+                        cudaMemcpyDeviceToHost), "copy arbitrary finite status");
+    cuda_die(cudaMemcpy(host_unpacked, d_unpacked.data, f32_bytes,
+                        cudaMemcpyDeviceToHost), "copy arbitrary finite unpack");
+    if (!ds4_gpu_tensor_write(shipping_rows, 0, host_input, f32_bytes) ||
+        !ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+            shipping_rows, n_rows, HEAD_DIM, N_ROT) ||
+        !ds4_gpu_tensor_read(shipping_rows, 0, host_input, f32_bytes)) {
+        fprintf(stderr, "error: arbitrary finite shipping quantization failed\n");
+        return 2;
+    }
+    if (!compare_u32_zero(host_status, n_rows,
+                          "arbitrary finite pack rejected") ||
+        !compare_bits(host_input, host_unpacked, values,
+                      "arbitrary finite pack versus shipping quantizer")) {
         return 2;
     }
 
