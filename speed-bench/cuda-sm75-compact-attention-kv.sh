@@ -139,6 +139,11 @@ if (( RUN_NCU )); then
         smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio
         smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio
         sm__warps_active.avg.pct_of_peak_sustained_active
+    )
+    # Nsight 2026.3 exposes launch metadata in captures but may omit it from
+    # --query-metrics. Request it directly rather than falsely rejecting the
+    # installed profiler during discovery.
+    launch_metrics=(
         launch__registers_per_thread
         launch__block_size
         launch__grid_size
@@ -176,7 +181,7 @@ if (( RUN_NCU )); then
             grep -Fxq -- "$metric" "$available_names" ||
                 die "required Nsight metric is unavailable: $metric"
         done
-        metrics=()
+        metrics=("${launch_metrics[@]}")
         : >"$OUTPUT_DIR/ncu/metrics-unavailable.txt"
         for metric in "${desired_metrics[@]}"; do
             if grep -Fxq -- "$metric" "$available_names"; then
@@ -187,7 +192,7 @@ if (( RUN_NCU )); then
         done
     else
         printf 'warning: metric discovery failed; requesting the required set only\n' >&2
-        metrics=("${required_metrics[@]}")
+        metrics=("${launch_metrics[@]}" "${required_metrics[@]}")
     fi
     printf '%s\n' "${metrics[@]}" >"$OUTPUT_DIR/ncu/metrics-selected.txt"
     metric_csv=$(IFS=,; printf '%s' "${metrics[*]}")
