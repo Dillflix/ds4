@@ -25495,7 +25495,12 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    /* The graph-wide format also reaches layers which do not own a
+     * compressed cache (n_comp == 0).  Only select a compact consumer when
+     * there are compressed rows; otherwise comp_kv is legitimately NULL and
+     * this is the ordinary raw-only attention path. */
     const bool compact =
+        n_comp != 0u &&
         comp_kv_f16 == DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT;
     const uint64_t comp_row_bytes =
         cuda_attention_comp_cache_row_bytes(comp_kv_f16, head_dim);
@@ -26036,6 +26041,7 @@ static int attention_decode_batch_launch(
         uint32_t                n_head,
         uint32_t                head_dim) {
     const bool compact =
+        n_comp != 0u &&
         comp_kv_f16 == DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT;
     const uint64_t comp_row_bytes =
         cuda_attention_comp_cache_row_bytes(comp_kv_f16, head_dim);
@@ -26274,6 +26280,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_shard_tensor(
         uint32_t head0, uint32_t n_head_work, uint32_t n_head_total,
         uint32_t head_dim) {
     const bool compact =
+        n_comp != 0u &&
         comp_kv_f16 == DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT;
     const uint64_t comp_row_bytes =
         cuda_attention_comp_cache_row_bytes(comp_kv_f16, head_dim);
@@ -26567,6 +26574,7 @@ static int attention_prefill_mixed_launch(
         uint32_t                n_head,
         uint32_t                head_dim) {
     const bool compact =
+        n_comp != 0u &&
         comp_kv_format == DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT;
     const uint64_t comp_row_bytes =
         cuda_attention_comp_cache_row_bytes(comp_kv_format, head_dim);

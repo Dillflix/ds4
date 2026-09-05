@@ -88,7 +88,8 @@ static void bench_crash_trace_handler(int signo) {
     static const char message[] =
         "ds4-bench: fatal host signal; native backtrace follows\n";
     void *frames[64];
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1u);
+    const ssize_t written = write(STDERR_FILENO, message, sizeof(message) - 1u);
+    (void)written;
     const int count = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
     if (count > 0) backtrace_symbols_fd(frames, count, STDERR_FILENO);
     (void)signal(signo, SIG_DFL);
