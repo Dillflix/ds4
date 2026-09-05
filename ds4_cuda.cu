@@ -13072,7 +13072,7 @@ __device__ __forceinline__ static int sm75_compact_attn_quant_code(
             fabsf(magnitude - dsv4_e4m3fn_value_dev(code + 1));
         if (upper_distance < lower_distance ||
             (upper_distance == lower_distance &&
-             (((code + 1) & 1) == 0) && ((code & 1) != 0)))) {
+             (((code + 1) & 1) == 0) && ((code & 1) != 0))) {
             code++;
         }
     }
