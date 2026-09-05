@@ -19,6 +19,7 @@ TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
+MATCH_PAIR1_INDEXER=${MATCH_PAIR1_INDEXER:-1}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-ab-$stamp}
 
@@ -29,7 +30,8 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
-            "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY"; do
+            "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY" \
+            "MATCH_PAIR1_INDEXER:$MATCH_PAIR1_INDEXER"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -37,7 +39,8 @@ done
    CTX_TOKENS % 512 == 0 && CTX_ALLOC > CTX_TOKENS &&
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
-for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY; do
+for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
+            MATCH_PAIR1_INDEXER; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
@@ -110,7 +113,8 @@ phase=manifest
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$CTX_TOKENS"
-    printf 'cache_audit_only=%s\n' "$CACHE_AUDIT_ONLY"
+    printf 'cache_audit_only=%s\nmatch_pair1_indexer=%s\n' \
+        "$CACHE_AUDIT_ONLY" "$MATCH_PAIR1_INDEXER"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
     printf '\ntopology:\n'
@@ -126,16 +130,21 @@ if [[ $CACHE_AUDIT_ONLY == 1 ]]; then variants=(headshard); fi
 for variant in "${variants[@]}"; do
     enable=0; [[ $variant == headshard ]] && enable=1
     variant_env=()
-    if [[ $variant == headshard ]]; then
-        # The first production head-shard run also changed pair 1 from
-        # partner-local top-k ownership to a gather-home/peer-read route.  The
-        # corrected physical fixture proves q_b through output-B exact when
-        # both devices receive identical top-k indices, so remove that second
-        # topology change here while retaining live raw/compressed KV mirrors.
-        # This makes the next result a direct discriminator: exact logits
-        # implicate the pair-1 indexer split/gather interaction; a mismatch
-        # moves the audit to live cache/state inputs absent from the fixture.
+    # The earlier production comparison changed two independent axes: the
+    # attention decomposition and pair-1 indexer ownership.  Match the indexer
+    # policy across both arms by default so the logit gate attributes any
+    # difference only to row-split versus head-shard attention.  The old
+    # asymmetric cut remains available solely to reproduce its evidence.
+    if [[ $MATCH_PAIR1_INDEXER == 1 ]]; then
         variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
+    fi
+    if [[ $variant == headshard ]]; then
+        # Preserve the earlier asymmetric isolation only when explicitly
+        # requested.  In the default matched mode the common block above has
+        # already disabled pair-1 indexer splitting for both arms.
+        if [[ $MATCH_PAIR1_INDEXER == 0 ]]; then
+            variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
+        fi
         if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
             variant_env+=(DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT=1)
         fi
@@ -209,8 +218,18 @@ for variant in "${variants[@]}"; do
             die "control did not retain 129 required bindings"
         grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
             die "control missed the established stable pair-1 row split"
-        grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$base.log" ||
-            die "control did not preserve pair-1 indexer splitting"
+        if [[ $MATCH_PAIR1_INDEXER == 1 ]]; then
+            grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
+                "$base.log" ||
+                die "control did not match the candidate's pair-1 indexer policy"
+            ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                "$base.log" ||
+                die "control unexpectedly split pair-1 indexer/top-k"
+        else
+            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                "$base.log" ||
+                die "control did not preserve pair-1 indexer splitting"
+        fi
         ! grep -Fq 'CUDA prefill T32 head shard enabled:' "$base.log" ||
             die "control unexpectedly dispatched T32 head sharding"
     fi
@@ -261,10 +280,12 @@ for file in "${control_files[@]}"; do
 done
 
 phase=summary
-python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" <<'PY'
+python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
+    "$MATCH_PAIR1_INDEXER" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
+matched_indexer = bool(int(sys.argv[3]))
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -317,7 +338,9 @@ with (root / "summary.txt").open("w") as f:
     f.write("query_input_transfer_bytes_per_pair1_layer_chunk=2097152\n")
     f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
     f.write("partner_low_rank_return_bytes_per_pair1_layer_chunk=8388608\n")
-    f.write("candidate_pair1_indexer=home-full\n")
+    f.write("pair1_indexer_policy=" +
+            ("matched-home-full" if matched_indexer else
+             "control-split-candidate-home-full") + "\n")
     f.write("logits=bit-exact\n")
     for gpu in sorted(set(cm) | set(hm)):
         f.write(f"gpu{gpu}_control_max_vram_mib={cm.get(gpu, 0):.0f}\n")

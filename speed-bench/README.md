@@ -5778,6 +5778,19 @@ full 64-head reference with 32/32 physical shards for both missing modes before
 continuing through the established indexed q_b-to-output-B chain.  This is the
 next bounded discriminator; it does not repeat the 32K production run.
 
+That expanded physical run is bit-exact for raw-only, static-mixed, and indexed
+attention, as well as q_b, inverse RoPE, both output projections, and the
+production-ordered unfenced protocol; Compute Sanitizer reports zero errors.
+This excludes every isolated arithmetic and transfer boundary exercised by the
+candidate.  The earlier full-model A/B still compared a split pair-1 indexer in
+the control against a home-full indexer in the candidate, so final logits could
+not identify the attention change alone.  The production harness now defaults
+`MATCH_PAIR1_INDEXER=1`, disabling pair-1 indexer splitting in both arms while
+retaining pair-0 indexer splitting.  Run the smallest existing production
+frontier (`CTX_TOKENS=2048`) first to cover multi-microbatch cache/state
+evolution before returning to 32K.  `MATCH_PAIR1_INDEXER=0` reproduces the old
+asymmetric diagnostic only.
+
 ```bash
 CACHE_AUDIT_ONLY=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
