@@ -114,7 +114,7 @@ fi
 phase=summary
 grep -E '^(algorithm=|first_shipping_exact_algorithm=|diagnostic_conclusion=|boundary=|downstream_boundary_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/exactness.log" >"$OUTPUT_DIR/summary.txt"
-grep -E '^(boundary=|output_a_rank=|physical_pair_protocol=|harness_status=)' \
+grep -E '^(boundary=|output_a_rank=|physical_pair_protocol=|production_ordered_protocol=|harness_status=)' \
     "$OUTPUT_DIR/physical-pair-exactness.log" >>"$OUTPUT_DIR/summary.txt"
 printf 'SM75 T32 prefill head-shard exactness diagnostic complete: %s\n' \
     "$OUTPUT_DIR"

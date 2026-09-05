@@ -5707,6 +5707,20 @@ source ownership for q_b, then repeats the same admission for output-A and
 sinks after changing synthetic model maps.  This prevents a second copy of the
 same setup defect from appearing at the later output-A boundary.
 
+The corrected physical-pair run cleared every implemented boundary on physical
+GPUs 3/2: q_b, indexed attention against identical local KV mirrors, inverse
+RoPE, and the rank-1024 output-A peer gather were all byte-identical to the
+full home-device reference.  This rules out an inherent arithmetic difference
+from contiguous head sharding through the gather.  The binary now extends that
+same run through the 8192x7168 output-B projection and then repeats the complete
+q_b-to-output-B candidate in production queue order, without the diagnostic
+host synchronizations between stages.  An exact output-B boundary followed by
+an exact production-ordered boundary isolates the remaining full-model failure
+to state not synthesized by this fixture, principally the live raw/compressed
+KV mirror update path.  A failure at either boundary instead identifies the
+downstream projection or asynchronous handoff schedule before another 32K
+model run is attempted.
+
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \

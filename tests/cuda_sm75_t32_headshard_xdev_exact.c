@@ -1,7 +1,8 @@
 /* Bounded two-GPU exactness audit for the production T32 head-shard protocol.
- * It checks the first four physical boundaries independently: copied input and
- * partner q_b, local-KV/peer-topk indexed attention, inverse RoPE, and the
- * compact output-A peer gather. This is diagnostic-only. */
+ * It checks copied input and partner q_b, local-KV/peer-topk indexed attention,
+ * inverse RoPE, the compact output-A peer gather, output-B, and finally the
+ * complete production-ordered chain without intermediate fences. This is
+ * diagnostic-only. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -34,6 +35,7 @@
 #define OUT_A_RANK 1024u
 #define LOW_DIM ((uint64_t)N_GROUP * OUT_A_RANK)
 #define HALF_LOW_DIM ((uint64_t)HALF_GROUP * OUT_A_RANK)
+#define EMBED_DIM 7168u
 #define RAW_CAP 2304u
 #define N_RAW 128u
 #define RAW_START 385u
@@ -181,8 +183,13 @@ int main(void) {
     const uint64_t half_low_count = (uint64_t)N_TOK * HALF_LOW_DIM;
     const uint64_t a_row_bytes = (GROUP_DIM / 32u) * 34u;
     const uint64_t a_bytes = LOW_DIM * a_row_bytes;
-    const uint64_t sinks_offset = a_bytes;
-    const uint64_t attn_model_bytes = a_bytes + N_HEAD * sizeof(float);
+    const uint64_t b_row_bytes = (LOW_DIM / 32u) * 34u;
+    const uint64_t b_bytes = EMBED_DIM * b_row_bytes;
+    const uint64_t b_offset = a_bytes;
+    const uint64_t sinks_offset = b_offset + b_bytes;
+    const uint64_t attn_model_bytes = sinks_offset + N_HEAD * sizeof(float);
+    const uint64_t output_count = (uint64_t)N_TOK * EMBED_DIM;
+    const uint64_t output_bytes = output_count * sizeof(float);
     int initialized = 0, status = 1;
 
     unsigned char *q_model = NULL, *attn_model = NULL;
@@ -190,6 +197,7 @@ int main(void) {
     int32_t *topk_host = NULL;
     float *ref_host = NULL, *home_host = NULL, *peer_host = NULL;
     float *low_ref_host = NULL, *low_gather_host = NULL;
+    float *output_ref_host = NULL, *output_candidate_host = NULL;
 
     ds4_gpu_tensor input_home = {0}, input_peer = {0};
     ds4_gpu_tensor q_ref = {0}, q_home = {0}, q_peer = {0};
@@ -199,6 +207,8 @@ int main(void) {
     ds4_gpu_tensor heads_ref = {0}, heads_home = {0}, heads_peer = {0};
     ds4_gpu_tensor low_ref = {0}, low_home = {0}, low_peer = {0};
     ds4_gpu_tensor low_gather = {0};
+    ds4_gpu_tensor output_ref = {0}, output_candidate = {0};
+    ds4_gpu_tensor output_scheduled = {0};
 
     q_model = (unsigned char *)malloc((size_t)q_model_bytes);
     attn_model = (unsigned char *)calloc(1u, (size_t)attn_model_bytes);
@@ -211,13 +221,17 @@ int main(void) {
     peer_host = (float *)malloc((size_t)q_bytes);
     low_ref_host = (float *)malloc((size_t)low_count * sizeof(float));
     low_gather_host = (float *)malloc((size_t)low_count * sizeof(float));
+    output_ref_host = (float *)malloc((size_t)output_bytes);
+    output_candidate_host = (float *)malloc((size_t)output_bytes);
     CHECK(q_model && attn_model && input_host && raw_host && comp_host &&
           topk_host && ref_host && home_host && peer_host && low_ref_host &&
-          low_gather_host, "host allocations");
+          low_gather_host && output_ref_host && output_candidate_host,
+          "host allocations");
 
     build_q8_rows(q_model, OUT_DIM, IN_DIM, 19u);
     memcpy(q_model + q_b_bytes, q_model, (size_t)q_b_bytes);
     build_q8_rows(attn_model, LOW_DIM, GROUP_DIM, 31u);
+    build_q8_rows(attn_model + b_offset, EMBED_DIM, LOW_DIM, 43u);
     for (uint64_t i = 0u; i < input_count; i++)
         input_host[i] = (float)((int)((i * 29u + (i >> 5u) * 17u +
                               (i / IN_DIM) * 7u + 23u) % 257u) - 128) /
@@ -337,6 +351,7 @@ int main(void) {
           "attention model map");
     ds4_tensor_range attn_home_sources[] = {
         {0u, a_bytes, 0},
+        {b_offset, b_bytes, 0},
         {sinks_offset, N_HEAD * sizeof(float), 0},
     };
     ds4_tensor_range attn_peer_sources[] = {
@@ -361,7 +376,11 @@ int main(void) {
           ds4_gpu_cache_q8_f16_range_on_device(
               attn_model, attn_model_bytes, a_bytes / 2u, a_bytes / 2u,
               GROUP_DIM, HALF_LOW_DIM, g_gpu[1].device_id,
-              "attn_output_a_head1"), "output-A device caches");
+              "attn_output_a_head1") &&
+          ds4_gpu_cache_q8_f16_range_on_device(
+              attn_model, attn_model_bytes, b_offset, b_bytes, LOW_DIM,
+              EMBED_DIM, g_gpu[0].device_id, "attn_output_b"),
+          "attention-output device caches");
     CHECK(ALLOC(raw_home, 0, raw_count * sizeof(float)) &&
           ALLOC(raw_peer, 1, raw_count * sizeof(float)) &&
           ALLOC(comp_home, 0, comp_count * sizeof(float)) &&
@@ -372,7 +391,10 @@ int main(void) {
           ALLOC(low_ref, 0, low_count * sizeof(float)) &&
           ALLOC(low_home, 0, half_low_count * sizeof(float)) &&
           ALLOC(low_peer, 1, half_low_count * sizeof(float)) &&
-          ALLOC(low_gather, 0, low_count * sizeof(float)),
+          ALLOC(low_gather, 0, low_count * sizeof(float)) &&
+          ALLOC(output_ref, 0, output_bytes) &&
+          ALLOC(output_candidate, 0, output_bytes) &&
+          ALLOC(output_scheduled, 0, output_bytes),
           "downstream device allocations");
     CHECK(ds4_gpu_tensor_write(&raw_home, 0u, raw_host,
                                raw_count * sizeof(float)) &&
@@ -473,12 +495,114 @@ int main(void) {
            low_diff.max_abs);
     CHECK(!low_diff.mismatches, "physical output-A gather diverged");
 
+    CHECK(ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_output_q8_batch_b_tensor(
+              &output_ref, attn_model, attn_model_bytes, b_offset, LOW_DIM,
+              EMBED_DIM, &low_ref, N_TOK) &&
+          ds4_gpu_attention_output_q8_batch_b_tensor(
+              &output_candidate, attn_model, attn_model_bytes, b_offset,
+              LOW_DIM, EMBED_DIM, &low_gather, N_TOK) &&
+          sync_tier(0), "physical output-B");
+    CHECK(ds4_gpu_tensor_read(&output_ref, 0u, output_ref_host,
+                              output_bytes) &&
+          ds4_gpu_tensor_read(&output_candidate, 0u, output_candidate_host,
+                              output_bytes), "output-B readback");
+    diff_metrics output_b_diff = compare_f32(
+        output_ref_host, output_candidate_host, output_count);
+    printf("boundary=physical-output-b,mismatches=%llu,first=%lld,"
+           "max_abs=%.9g\n",
+           (unsigned long long)output_b_diff.mismatches,
+           output_b_diff.first == UINT64_MAX ? -1ll :
+               (long long)output_b_diff.first,
+           output_b_diff.max_abs);
+    CHECK(!output_b_diff.mismatches, "physical output-B diverged");
+
+    /* Repeat the candidate exactly as production orders it: no host-side
+     * synchronization between q_b, attention, inverse RoPE, output-A, peer
+     * gather, and output-B.  Only the explicit cross-device dependencies that
+     * production uses are present. */
+    CHECK(ds4_gpu_tensor_wait_xdev_default(&input_peer, 0) &&
+          ds4_gpu_tensor_copy_xdev_default(&input_peer, &input_home,
+                                           input_bytes),
+          "scheduled input copy");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
+              &q_peer, &qh_peer, q_model, q_model_bytes,
+              q_b_bytes + q_b_half_bytes, IN_DIM, SHARD_OUT_DIM,
+              &input_peer, N_TOK, SHARD_HEADS, SHARD_HEADS, N_HEAD,
+              HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE, ROPE_SCALE,
+              ROPE_EXT, rope_attention_factor(), BETA_FAST, BETA_SLOW,
+              EPSILON) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
+              &q_home, &qh_home, q_model, q_model_bytes, q_b_bytes,
+              IN_DIM, SHARD_OUT_DIM, &input_home, N_TOK, SHARD_HEADS, 0u,
+              N_HEAD, HEAD_DIM, N_ROT, POS0, ORIG_CTX, false, ROPE_BASE,
+              ROPE_SCALE, ROPE_EXT, rope_attention_factor(), BETA_FAST,
+              BETA_SLOW, EPSILON), "scheduled q_b shards");
+    CHECK(ds4_gpu_tensor_wait_xdev_default(&topk_home, 1) &&
+          ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+              &heads_peer, attn_model, attn_model_bytes, sinks_offset,
+              &q_peer, &raw_peer, &comp_peer, 0u, &topk_home, N_TOK, POS0,
+              N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
+              ATTN_RATIO, SHARD_HEADS, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
+              &heads_home, attn_model, attn_model_bytes, sinks_offset,
+              &q_home, &raw_home, &comp_home, 0u, &topk_home, N_TOK, POS0,
+              N_RAW, RAW_CAP, RAW_START, N_COMP, TOP_K, ATTN_WINDOW,
+              ATTN_RATIO, 0u, SHARD_HEADS, N_HEAD, HEAD_DIM),
+          "scheduled attention shards");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_rope_tail_head_range_tensor(
+              &heads_peer, N_TOK, SHARD_HEADS, SHARD_HEADS, N_HEAD,
+              HEAD_DIM, N_ROT, POS0, ORIG_CTX, true, ROPE_BASE, ROPE_SCALE,
+              ROPE_EXT, rope_attention_factor(), BETA_FAST, BETA_SLOW) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_rope_tail_head_range_tensor(
+              &heads_home, N_TOK, 0u, SHARD_HEADS, N_HEAD, HEAD_DIM, N_ROT,
+              POS0, ORIG_CTX, true, ROPE_BASE, ROPE_SCALE, ROPE_EXT,
+              rope_attention_factor(), BETA_FAST, BETA_SLOW),
+          "scheduled inverse RoPE");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+              &low_peer, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              OUT_A_RANK, N_GROUP, HALF_GROUP, HALF_GROUP, &heads_peer,
+              N_TOK) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_output_q8_batch_low_shard_tensor(
+              &low_home, attn_model, attn_model_bytes, 0u, GROUP_DIM,
+              OUT_A_RANK, N_GROUP, 0u, HALF_GROUP, &heads_home, N_TOK) &&
+          ds4_gpu_tensor_wait_xdev_default(&low_peer, 0) &&
+          ds4_gpu_gather_pair_rows_xdev_tensor(
+              &low_gather, &low_home, &low_peer, N_TOK, HALF_LOW_DIM) &&
+          ds4_gpu_attention_output_q8_batch_b_tensor(
+              &output_scheduled, attn_model, attn_model_bytes, b_offset,
+              LOW_DIM, EMBED_DIM, &low_gather, N_TOK) &&
+          sync_tier(0) && sync_tier(1),
+          "production-ordered head-shard chain");
+    CHECK(ds4_gpu_tensor_read(&output_scheduled, 0u, output_candidate_host,
+                              output_bytes), "scheduled output readback");
+    diff_metrics scheduled_diff = compare_f32(
+        output_ref_host, output_candidate_host, output_count);
+    printf("boundary=physical-production-ordered-output-b,mismatches=%llu,"
+           "first=%lld,max_abs=%.9g\n",
+           (unsigned long long)scheduled_diff.mismatches,
+           scheduled_diff.first == UINT64_MAX ? -1ll :
+               (long long)scheduled_diff.first,
+           scheduled_diff.max_abs);
+    CHECK(!scheduled_diff.mismatches,
+          "production-ordered head-shard chain diverged");
+
     printf("output_a_rank=%u\nphysical_pair_protocol=bit-exact\n"
-           "harness_status=ok\n", OUT_A_RANK);
+           "production_ordered_protocol=bit-exact\nharness_status=ok\n",
+           OUT_A_RANK);
     status = 0;
 
 cleanup:
 #define FREE(t) ds4_gpu_tensor_free_in_place(&(t))
+    FREE(output_scheduled); FREE(output_candidate); FREE(output_ref);
     FREE(low_gather); FREE(low_peer); FREE(low_home); FREE(low_ref);
     FREE(heads_peer); FREE(heads_home); FREE(heads_ref);
     FREE(topk_home); FREE(comp_peer); FREE(comp_home);
@@ -487,6 +611,7 @@ cleanup:
     FREE(q_peer); FREE(q_home); FREE(q_ref);
     FREE(input_peer); FREE(input_home);
     if (initialized) ds4_gpu_cleanup();
+    free(output_candidate_host); free(output_ref_host);
     free(low_gather_host); free(low_ref_host);
     free(peer_host); free(home_host); free(ref_host);
     free(topk_host); free(comp_host); free(raw_host); free(input_host);
