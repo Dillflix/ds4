@@ -344,8 +344,16 @@ run_case() {
         validate_health "$base" &&
             awk -F, -v tg="$tokens" '
                 NR==1 {header=($1=="ctx_tokens" && $3=="prefill_tps" &&
-                               $4=="gen_tokens" && $8=="gen_steady_tps"); next}
-                NR==2 {row=($1==512 && ($3+0)>0 && $4==tg && ($8+0)>0)}
+                               $4=="gen_tokens" && $5=="gen_tps" &&
+                               $6=="gen_first_ms" &&
+                               $7=="gen_steady_tokens" &&
+                               $8=="gen_steady_tps"); next}
+                NR==2 {
+                    row=($1==512 && ($3+0)>0 && $4==tg &&
+                         ($5+0)>0 && ($6+0)>0 &&
+                         (tg==1 ? (($7+0)==0 && ($8+0)==0) :
+                                  (($7+0)>0 && ($8+0)>0)))
+                }
                 END {exit !(header && NR==2 && row)}
             ' "$base.csv" &&
             grep -Fq \
