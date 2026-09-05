@@ -20,6 +20,8 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
 MATCH_PAIR1_INDEXER=${MATCH_PAIR1_INDEXER:-1}
+BOUNDARY_AUDIT_ONLY=${BOUNDARY_AUDIT_ONLY:-0}
+BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-22}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-ab-$stamp}
 
@@ -31,7 +33,9 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
             "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY" \
-            "MATCH_PAIR1_INDEXER:$MATCH_PAIR1_INDEXER"; do
+            "MATCH_PAIR1_INDEXER:$MATCH_PAIR1_INDEXER" \
+            "BOUNDARY_AUDIT_ONLY:$BOUNDARY_AUDIT_ONLY" \
+            "BOUNDARY_AUDIT_LAYER:$BOUNDARY_AUDIT_LAYER"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -40,10 +44,13 @@ done
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
 for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
-            MATCH_PAIR1_INDEXER; do
+            MATCH_PAIR1_INDEXER BOUNDARY_AUDIT_ONLY; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
+(( CACHE_AUDIT_ONLY + BOUNDARY_AUDIT_ONLY <= 1 )) ||
+    die "CACHE_AUDIT_ONLY and BOUNDARY_AUDIT_ONLY are mutually exclusive"
+(( BOUNDARY_AUDIT_LAYER < 43 )) || die "BOUNDARY_AUDIT_LAYER must be below 43"
 [[ $MIN_THROUGHPUT_RATIO =~ ^[0-9]+([.][0-9]+)?$ ]] ||
     die "MIN_THROUGHPUT_RATIO must be numeric"
 for tool in awk cmp date env find git grep make mkdir nproc nvidia-smi \
@@ -115,6 +122,8 @@ phase=manifest
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$CTX_TOKENS"
     printf 'cache_audit_only=%s\nmatch_pair1_indexer=%s\n' \
         "$CACHE_AUDIT_ONLY" "$MATCH_PAIR1_INDEXER"
+    printf 'boundary_audit_only=%s\nboundary_audit_layer=%s\n' \
+        "$BOUNDARY_AUDIT_ONLY" "$BOUNDARY_AUDIT_LAYER"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
     printf '\ntopology:\n'
@@ -148,6 +157,15 @@ for variant in "${variants[@]}"; do
         if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
             variant_env+=(DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT=1)
         fi
+    fi
+    if [[ $BOUNDARY_AUDIT_ONLY == 1 ]]; then
+        boundary_dir="$OUTPUT_DIR/production/$variant-boundaries"
+        mkdir -p "$boundary_dir"
+        variant_env+=(
+            "DS4_METAL_GRAPH_DUMP_PREFIX=$boundary_dir/$variant"
+            "DS4_METAL_GRAPH_DUMP_LAYER=$BOUNDARY_AUDIT_LAYER"
+            DS4_METAL_GRAPH_DUMP_NAME=headshard_audit_q_input,headshard_audit_kv_input,headshard_audit_attn_output,headshard_audit_attn_hc,headshard_audit_layer_hc
+        )
     fi
     base="$OUTPUT_DIR/production/$variant"
     logits="$base-logits"
@@ -273,6 +291,107 @@ PY
     cat "$OUTPUT_DIR/summary.txt"
     phase=complete
     printf 'SM75 T32 head-shard cache audit complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $BOUNDARY_AUDIT_ONLY == 1 ]]; then
+    phase=boundary-audit-summary
+    python3 - "$OUTPUT_DIR" "$BOUNDARY_AUDIT_LAYER" <<'PY'
+import math, pathlib, re, struct, sys
+
+root = pathlib.Path(sys.argv[1])
+layer = int(sys.argv[2])
+stages = (
+    "headshard_audit_q_input",
+    "headshard_audit_kv_input",
+    "headshard_audit_attn_output",
+    "headshard_audit_attn_hc",
+    "headshard_audit_layer_hc",
+)
+
+def inventory(arm):
+    base = root / "production" / f"{arm}-boundaries"
+    result = {}
+    pattern = re.compile(
+        rf"{arm}_(headshard_audit_[^-]+)-{layer}_pos(\d+)\.bin$")
+    for path in base.glob("*.bin"):
+        match = pattern.fullmatch(path.name)
+        if match:
+            result[(int(match.group(2)), match.group(1))] = path
+    return result
+
+control = inventory("control")
+candidate = inventory("headshard")
+ctx_tokens = int(next(
+    line.split("=", 1)[1]
+    for line in (root / "manifest.txt").read_text().splitlines()
+    if line.startswith("ctx_tokens=")))
+expected = {
+    (pos, stage)
+    for pos in range(0, ctx_tokens, 512)
+    for stage in stages
+}
+if set(control) != expected or set(candidate) != expected:
+    missing_control = sorted(expected - set(control))
+    missing_candidate = sorted(expected - set(candidate))
+    raise SystemExit(
+        "error: incomplete boundary inventory: "
+        f"control_missing={missing_control} headshard_missing={missing_candidate}")
+
+lines = [f"boundary_audit_layer={layer}"]
+first = None
+for pos in sorted({key[0] for key in expected}):
+    for stage in stages:
+        key = (pos, stage)
+        a = control[key].read_bytes()
+        b = candidate[key].read_bytes()
+        if len(a) != len(b) or len(a) % 4:
+            raise SystemExit(f"error: invalid boundary size for pos={pos} stage={stage}")
+        af = struct.unpack(f"={len(a)//4}f", a)
+        bf = struct.unpack(f"={len(b)//4}f", b)
+        mismatches = 0
+        max_abs = 0.0
+        sum_sq = 0.0
+        first_index = -1
+        for i, (x, y) in enumerate(zip(af, bf)):
+            if a[4*i:4*i+4] != b[4*i:4*i+4]:
+                mismatches += 1
+                if first_index < 0:
+                    first_index = i
+            delta = abs(float(y) - float(x))
+            max_abs = max(max_abs, delta)
+            sum_sq += delta * delta
+        rmse = math.sqrt(sum_sq / len(af)) if af else 0.0
+        status = "exact" if mismatches == 0 else "different"
+        lines.append(
+            f"boundary,pos={pos},stage={stage},values={len(af)},"
+            f"status={status},bit_mismatches={mismatches},"
+            f"first_index={first_index},max_abs={max_abs:.9g},rmse={rmse:.9g}")
+        if mismatches and first is None:
+            first = (pos, stage)
+
+control_logits = root / "production" / "control-logits" / \
+    f"frontier_{ctx_tokens:06d}.logits.f32"
+candidate_logits = root / "production" / "headshard-logits" / \
+    f"frontier_{ctx_tokens:06d}.logits.f32"
+if not control_logits.is_file() or not candidate_logits.is_file():
+    raise SystemExit("error: boundary audit omitted frontier logits")
+logits_exact = control_logits.read_bytes() == candidate_logits.read_bytes()
+lines.append("first_divergence=" +
+             (f"pos{first[0]}:{first[1]}" if first else "none-in-sampled-boundaries"))
+lines.append("frontier_logits=" + ("bit-exact" if logits_exact else "different"))
+if first is None and logits_exact:
+    lines.append("interpretation=dump-synchronization-made-candidate-converge")
+elif first is None:
+    lines.append("interpretation=divergence-outside-sampled-last-rows-or-after-audited-layer")
+else:
+    lines.append("interpretation=first-sampled-production-boundary-identified")
+summary = "\n".join(lines) + "\n"
+(root / "boundary-summary.txt").write_text(summary)
+print(summary, end="")
+PY
+    phase=complete
+    printf 'SM75 T32 head-shard boundary audit complete: %s\n' "$OUTPUT_DIR"
     exit 0
 fi
 

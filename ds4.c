@@ -17326,6 +17326,30 @@ static void metal_graph_debug_dump_tensor(
     }
 }
 
+/* Production prefill boundary audits need enough state to identify the first
+ * divergent stage without writing a complete 512-row activation for every
+ * checkpoint.  Keep this as an ordinary graph-dump hook: it is a no-op unless
+ * the requested name/layer/position matches, and selects the last row only.
+ * The synchronization semantics deliberately match the existing dump helper
+ * so an audit can also expose an ordering-sensitive failure by making the
+ * final logits converge. */
+static void metal_graph_debug_dump_tensor_last_row(
+        const char       *name,
+        ds4_gpu_tensor   *t,
+        uint64_t          row_f32,
+        uint32_t          rows,
+        uint32_t          il,
+        uint32_t          pos0) {
+    if (!t || row_f32 == 0 || rows == 0 ||
+        !metal_graph_debug_wants(name, il, pos0)) return;
+
+    const uint64_t offset = (uint64_t)(rows - 1u) * row_f32 * sizeof(float);
+    ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+            t, offset, row_f32 * sizeof(float));
+    metal_graph_debug_dump_tensor(name, row, row_f32, il, pos0);
+    ds4_gpu_tensor_free(row);
+}
+
 static void metal_graph_debug_dump_f16_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -31019,6 +31043,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora_norm", metal_graph_batch_qr_norm(g),
                                       (uint64_t)n_tokens * q_rank, il, pos0);
+        metal_graph_debug_dump_tensor_last_row(
+                "headshard_audit_q_input", metal_graph_batch_qr_norm(g),
+                q_rank, n_tokens, il, pos0);
     }
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", metal_graph_batch_kv(g),
@@ -31246,6 +31273,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", metal_graph_batch_kv(g),
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+        metal_graph_debug_dump_tensor_last_row(
+                "headshard_audit_kv_input", metal_graph_batch_kv(g),
+                DS4_N_HEAD_DIM, n_tokens, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
     /*
@@ -32697,6 +32727,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
         }
     }
+    if (ok) {
+        metal_graph_debug_dump_tensor_last_row(
+                "headshard_audit_attn_output", metal_graph_batch_attn_out(g),
+                DS4_N_EMBD, n_tokens, il, pos0);
+    }
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     ds4_gpu_q8_audit_clear_context();
 #endif
@@ -32746,6 +32781,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_batch_after_attn_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
+        metal_graph_debug_dump_tensor_last_row(
+                "headshard_audit_attn_hc", metal_graph_batch_after_attn_hc(g),
+                hc_dim, n_tokens, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_attn_out);
@@ -33399,6 +33437,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_batch_next_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
+        metal_graph_debug_dump_tensor_last_row(
+                "headshard_audit_layer_hc", metal_graph_batch_next_hc(g),
+                hc_dim, n_tokens, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_ffn_x);

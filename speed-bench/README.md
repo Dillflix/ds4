@@ -5799,6 +5799,27 @@ when `n_comp > 512`.  Validation is now context-aware: PP2048 requires no
 pair-0 indexer dispatch, while longer frontiers still require it.  This was a
 post-run assertion failure, not a control execution failure.
 
+The corrected PP2048 comparison completed both arms and reproduced a material
+output difference: all 129,280 logits changed (RMSE 0.18945, maximum absolute
+difference 0.98782), while head sharding measured 479.71 versus 461.99 prefill
+tok/s (1.03836x).  This is not a tolerance issue.  Set
+`BOUNDARY_AUDIT_ONLY=1` for the next discriminator.  It preserves the complete
+PP2048 two-arm workload and matched indexer policy, but dumps only the final
+token row at layer 22 for every 512-token microbatch.  The five ordered
+boundaries are the common normalized q_b input, current quantized KV row,
+assembled attention output after output B, post-attention HC state, and
+post-FFN layer HC state.  The runner reports the first differing sampled
+boundary and the final-logit status.  The dump synchronizations are also
+deliberate evidence: if they make the final logits converge, the remaining
+defect is schedule-sensitive; if only the sampled last rows agree, the report
+states that the divergence lies in another row or after the audited layer.
+
+```bash
+CTX_TOKENS=2048 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
+```
+
 ```bash
 CACHE_AUDIT_ONLY=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
