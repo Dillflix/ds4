@@ -29190,6 +29190,52 @@ static bool metal_graph_cuda_tp_prefill_heads_active(
 #endif
 }
 
+/* Zero-prefix static-mixed attention consumes the current F32 batch directly
+ * on the ordinary full-head path.  The persistent raw cache is deliberately
+ * F16-rounded, so substituting its widened rows changes the attention input
+ * even when the cache mirror itself is exact.  Give the partner the same
+ * current-batch source once per layer; this is a narrow KV copy, not the old
+ * T32 query-result gather. */
+static bool metal_graph_cuda_tp_prefill_attention_sync_current_kv(
+        ds4_gpu_graph *g, uint32_t n_tokens) {
+#if defined(__APPLE__) || defined(DS4_NO_GPU) || defined(DS4_ROCM_BUILD)
+    (void)g; (void)n_tokens;
+    return false;
+#else
+    if (!g || n_tokens == 0u) return false;
+    const int home = g->active_tier;
+    const int partner = metal_graph_cuda_tp_partner_tier(home);
+    if (home < 0 || partner < 0 ||
+        !g->batch_kv_by_tier[home] ||
+        !g->batch_kv_by_tier[partner]) return false;
+
+    const uint64_t bytes =
+        (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
+    if (g->batch_kv_by_tier[home]->bytes < bytes ||
+        g->batch_kv_by_tier[partner]->bytes < bytes) return false;
+
+    const bool ok =
+        ds4_gpu_tensor_wait_xdev_default(
+            g->batch_kv_by_tier[partner], home) != 0 &&
+        ds4_gpu_tensor_copy_xdev_default(
+            g->batch_kv_by_tier[partner],
+            g->batch_kv_by_tier[home], bytes) != 0;
+    if (ok) {
+        static uint32_t logged_home_mask = 0u;
+        const uint32_t bit = 1u << (uint32_t)home;
+        if ((logged_home_mask & bit) == 0u) {
+            logged_home_mask |= bit;
+            fprintf(stderr,
+                    "ds4: CUDA prefill T32 head shard exact current-KV "
+                    "mirror enabled: home=%d partner=%d bytes=%llu "
+                    "storage=f32-current-batch\n",
+                    home, partner, (unsigned long long)bytes);
+        }
+    }
+    return ok;
+#endif
+}
+
 static bool metal_graph_cuda_tp_prefill_attention_launch(
         ds4_gpu_graph *g, const ds4_model *model,
         const ds4_layer_weights *layer, uint32_t il,
@@ -29247,7 +29293,9 @@ static bool metal_graph_cuda_tp_prefill_attention_launch(
         const ds4_gpu_tensor *tier_raw = raw_kv;
         const ds4_gpu_tensor *tier_comp = comp_kv;
         if (local_head_shards && pass == 0) {
-            if (raw_kv == g->layer_raw_cache[il]) {
+            if (raw_kv == g->batch_kv_by_tier[home]) {
+                tier_raw = g->batch_kv_by_tier[partner];
+            } else if (raw_kv == g->layer_raw_cache[il]) {
                 tier_raw = g->layer_raw_cache_tp[il];
             }
             if (comp_kv == g->layer_attn_comp_cache[il]) {
@@ -32481,13 +32529,22 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                                  DS4_N_HEAD,
                                                                                  DS4_N_HEAD_DIM) != 0;
             } else if (cuda_tp_prefill_heads) {
-                ok = metal_graph_cuda_tp_prefill_attention_launch(
-                        g, model, layer, il,
-                        DS4_CUDA_PREFILL_ATTN_STATIC_MIXED,
-                        g->layer_raw_cache[il],
-                        g->layer_attn_comp_cache[il], NULL,
-                        n_tokens, pos0, n_tokens, n_tokens, 0u, n_comp,
-                        0u, g->raw_window, ratio);
+                const ds4_gpu_tensor *head_shard_raw =
+                    g->layer_raw_cache[il];
+                if (cuda_tp_prefill_t32_heads) {
+                    ok = metal_graph_cuda_tp_prefill_attention_sync_current_kv(
+                            g, n_tokens);
+                    head_shard_raw = metal_graph_batch_kv(g);
+                }
+                if (ok) {
+                    ok = metal_graph_cuda_tp_prefill_attention_launch(
+                            g, model, layer, il,
+                            DS4_CUDA_PREFILL_ATTN_STATIC_MIXED,
+                            head_shard_raw,
+                            g->layer_attn_comp_cache[il], NULL,
+                            n_tokens, pos0, n_tokens, n_tokens, 0u, n_comp,
+                            0u, g->raw_window, ratio);
+                }
                 if (ok) cuda_tp_prefill_heads_done = true;
             } else {
                 ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(metal_graph_batch_heads(g),

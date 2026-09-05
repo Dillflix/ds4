@@ -5855,6 +5855,20 @@ The harness now requires that diagnostic only when a later microbatch exists
 (`CTX_TOKENS > 512`) and explicitly requires its absence at PP512.  This changes
 validation only; neither inference arm nor its dispatch selectors changed.
 
+The corrected layer-22 PP512 audit locates the first real arithmetic boundary.
+Both T32 q_b head halves, the current KV batch, the F16-rounded raw-cache image,
+and the compact prefix are exact across arms.  The first difference appears in
+static-mixed attention itself.  This is caused by an input-source mismatch:
+the ordinary path consumes the current F32 KV batch, while the head-sharded
+path substituted the persistent raw cache, whose rows are deliberately stored
+through an F32-to-F16-to-F32 round trip.  The candidate now copies the exact
+current F32 KV batch once into the partner's existing batch workspace for the
+zero-prefix static-mixed launch.  This adds no VRAM residency and no query
+gather; at PP512 it transfers 1 MiB per candidate layer, versus the former
+32 MiB half-query result transfer avoided by the head-shard design.  The
+production harness requires the exact-current-KV dispatch diagnostic before
+accepting a candidate result.
+
 ```bash
 CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
