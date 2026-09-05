@@ -3093,6 +3093,108 @@ static int check_compact_decode_zero_compressed_rows(void) {
     return rc;
 }
 
+static int check_compact_decode_nonzero_exact(void) {
+    const uint32_t n_head = 8u;
+    const uint32_t head_dim = 512u;
+    const uint32_t n_rot = 64u;
+    const uint32_t n_raw = 16u;
+    const uint32_t n_comp = 128u;
+    const uint64_t head_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)n_raw * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t compact_bytes =
+        (uint64_t)n_comp * DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES;
+    float *sinks = (float *)malloc((size_t)n_head * sizeof(float));
+    float *q_host = (float *)malloc((size_t)head_count * sizeof(float));
+    float *raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
+    float *comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    float *control_host = (float *)malloc((size_t)head_count * sizeof(float));
+    float *compact_host = (float *)malloc((size_t)head_count * sizeof(float));
+    if (!sinks || !q_host || !raw_host || !comp_host ||
+        !control_host || !compact_host) {
+        free(compact_host); free(control_host); free(comp_host);
+        free(raw_host); free(q_host); free(sinks);
+        return 1;
+    }
+    for (uint32_t h = 0; h < n_head; h++) {
+        sinks[h] = (float)((int)(h % 5u) - 2) * 0.03125f;
+    }
+    for (uint64_t i = 0; i < head_count; i++) {
+        q_host[i] = (float)((int)(i % 37u) - 18) * 0.00390625f;
+    }
+    for (uint64_t i = 0; i < raw_count; i++) {
+        raw_host[i] = (float)((int)(i % 41u) - 20) * 0.0078125f;
+    }
+    for (uint64_t i = 0; i < comp_count; i++) {
+        comp_host[i] = (float)((int)(i % 53u) - 26) * 0.005859375f;
+    }
+
+    ds4_gpu_tensor *control = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp_source = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *comp_f32 = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *comp_compact = ds4_gpu_tensor_alloc(compact_bytes);
+    int rc = 1;
+    if (control && candidate && q && raw && comp_source && comp_f32 &&
+        comp_compact &&
+        ds4_gpu_tensor_write(q, 0, q_host, head_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp_source, 0, comp_host,
+                             comp_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp_f32, 0, comp_host,
+                             comp_count * sizeof(float)) &&
+        ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+            comp_f32, n_comp, head_dim, n_rot) &&
+        ds4_gpu_attn_compact_pack_tensor(
+            comp_compact, 0, comp_source, 0, n_comp) &&
+        ds4_gpu_set_model_map(sinks, n_head * sizeof(float)) &&
+        ds4_gpu_attention_decode_heads_tensor(
+            control, sinks, n_head * sizeof(float), 0, q, raw,
+            n_raw, n_raw, 0, comp_f32, DS4_GPU_ATTN_COMP_CACHE_F32,
+            n_comp, NULL, 0, n_head, head_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(control, 0, control_host,
+                            head_count * sizeof(float)) &&
+        ds4_gpu_attention_decode_heads_tensor(
+            candidate, sinks, n_head * sizeof(float), 0, q, raw,
+            n_raw, n_raw, 0, comp_compact,
+            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT,
+            n_comp, NULL, 0, n_head, head_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(candidate, 0, compact_host,
+                            head_count * sizeof(float))) {
+        if (memcmp(control_host, compact_host,
+                   (size_t)head_count * sizeof(float)) == 0) {
+            fprintf(stderr,
+                    "cuda-regression: compact nonzero decode follows exact "
+                    "F32 score/finalize order\n");
+            rc = 0;
+        } else {
+            uint64_t first = 0;
+            while (first < head_count &&
+                   memcmp(control_host + first, compact_host + first,
+                          sizeof(float)) == 0) first++;
+            fprintf(stderr,
+                    "compact nonzero decode differs from exact F32 control "
+                    "at %llu\n", (unsigned long long)first);
+        }
+    }
+
+    if (!retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(comp_compact);
+    ds4_gpu_tensor_free(comp_f32);
+    ds4_gpu_tensor_free(comp_source);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(control);
+    free(compact_host); free(control_host); free(comp_host);
+    free(raw_host); free(q_host); free(sinks);
+    return rc;
+}
+
 static int check_prefill_attention_head_shards(void) {
     const uint32_t n_tokens = 128;
     const uint32_t n_head = 64;
@@ -3414,6 +3516,7 @@ int main(void) {
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_compact_decode_zero_compressed_rows() != 0) rc = 1;
+    if (check_compact_decode_nonzero_exact() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
     if (check_sm75_indexed_attention_heads8_exact() != 0) rc = 1;
     ds4_gpu_cleanup();

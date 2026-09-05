@@ -5603,6 +5603,12 @@ directly. Its producer bypasses the separate rounded-F32 staging quantizer;
 compact packing owns the sole shipping E4M3 quantization pass. The engine
 preserves F32 session/checkpoint payloads at the external boundary.
 
+Single-token non-indexed decode uses compact-aware variants of the same exact
+two-pass score and finalize kernels as the F32 cache. Only compressed-row loads
+change: score accumulation order, softmax reduction, source-row order, and the
+value accumulation chain remain identical. The older compact online-softmax
+kernel is retained only as a fallback when exact score-split is unavailable.
+
 The runner's untimed warm-up intentionally recreates the session while keeping
 the engine-owned dense-Q8 residency. Session teardown therefore synchronizes
 every participating CUDA device before releasing graph allocations; this is a

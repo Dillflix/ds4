@@ -702,6 +702,7 @@ typedef struct {
 static cuda_sm75_hybrid_attn_context
     g_sm75_hybrid_attn[DS4_MAX_GPUS];
 static std::atomic<uint64_t> g_sm75_hybrid_attn_calls = 0;
+static std::atomic<uint64_t> g_sm75_compact_exact_score_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_attn_trace_calls = 0;
 static void cuda_sm75_hybrid_attn_release_one(int logical_tier);
 
@@ -5905,6 +5906,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     const uint64_t hybrid_attention_calls =
         g_sm75_hybrid_attn_calls.load(std::memory_order_relaxed);
+    const uint64_t compact_exact_score_calls =
+        g_sm75_compact_exact_score_calls.load(std::memory_order_relaxed);
+    if (compact_exact_score_calls != 0u) {
+        fprintf(stderr,
+                "ds4: SM75 compact exact score split summary: calls=%llu\n",
+                (unsigned long long)compact_exact_score_calls);
+    }
     if (hybrid_attention_calls != 0u) {
         fprintf(stderr,
                 "ds4: SM75 compact attention hybrid summary: calls=%llu "
@@ -6117,6 +6125,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_sm75_hybrid_attn_calls.store(0u, std::memory_order_relaxed);
+    g_sm75_compact_exact_score_calls.store(0u, std::memory_order_relaxed);
     g_n_gpus = 0;
     g_cublas_ready = 0;
 
@@ -13170,6 +13179,20 @@ __device__ __forceinline__ static float4 attention_comp_load_float4(
             src->code[d + 3u], __float_as_uint(src->scale[(d + 3u) / 64u])));
 }
 
+template <bool COMPACT>
+__device__ __forceinline__ static float attention_comp_load_scalar(
+        const void *base, uint32_t row, uint32_t d, uint32_t row_stride) {
+    if (!COMPACT) {
+        return ((const float *)base)[(uint64_t)row * row_stride + d];
+    }
+    const cuda_sm75_compact_attn_kv_row *src =
+        (const cuda_sm75_compact_attn_kv_row *)base + row;
+    if (src->status != 0u) return NAN;
+    if (d >= 448u) return src->rope_f32[d - 448u];
+    return sm75_compact_attn_decode_code(
+        src->code[d], __float_as_uint(src->scale[d / 64u]));
+}
+
 __global__ static void sm75_compact_attn_materialize_hybrid_chunk_kernel(
         const cuda_sm75_compact_attn_kv_row *compact_rows,
         const int32_t *topk,
@@ -13836,11 +13859,12 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+template <bool COMPACT>
 __global__ static void attention_decode_score_split_scores_kernel(
         float *score_out,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t pos0,
@@ -13907,9 +13931,11 @@ __global__ static void attention_decode_score_split_scores_kernel(
             const uint32_t cidx = g - raw_count;
             const float add = use_comp_mask ? comp_mask[(uint64_t)cidx] : 0.0f;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)cidx * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += qh[d] * attention_comp_load_scalar<COMPACT>(
+                        comp_kv, cidx, d, head_dim);
+                }
                 s = dot * scale + add;
             }
         }
@@ -14025,11 +14051,12 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
 #define DS4_SCORE_TILE_ROWS_SMALL 8u
 #define DS4_SCORE_TILE_STRIDE 516u /* 512 + 4 floats: 16B-aligned rows, banks shifted by 4 */
 
+template <bool COMPACT>
 __global__ static void attention_decode_score_split_scores_tile512_kernel(
         float *score_out,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t pos0,
@@ -14119,15 +14146,16 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
             if (g >= n_score) continue;
             const bool visible = g < raw_count || sh_add[r] > -1.0e20f;
             if (!visible) continue;
-            const float4 *src;
+            float4 v;
             if (g < raw_count) {
                 const uint32_t raw_row = (raw_start + raw_first_idx + g) % raw_cap;
-                src = (const float4 *)(raw_kv + (uint64_t)raw_row * 512u);
+                const float4 *src =
+                    (const float4 *)(raw_kv + (uint64_t)raw_row * 512u);
+                v = src[dd];
             } else {
                 const uint32_t cidx = g - raw_count;
-                src = (const float4 *)(comp_kv + (uint64_t)cidx * 512u);
+                v = attention_comp_load_float4<COMPACT>(comp_kv, cidx, dd);
             }
-            const float4 v = src[dd];
             float *dst = sh_kv + r * DS4_SCORE_TILE_STRIDE + dd * 4u;
             dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
         }
@@ -14588,12 +14616,13 @@ __global__ static void attention_decode_score_split_scores_vec4_plain_kernel(
     }
 }
 
+template <bool COMPACT>
 __global__ static void attention_decode_score_split_finalize_kernel(
         float *heads,
         const float *sinks,
         const float *score_in,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         uint32_t pos0,
         uint32_t n_raw,
         uint32_t raw_cap,
@@ -14699,8 +14728,8 @@ __global__ static void attention_decode_score_split_finalize_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             const float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc += kv[d] * s;
+            acc += attention_comp_load_scalar<COMPACT>(
+                comp_kv, c, d, head_dim) * s;
         }
         oh[d] = acc / denom;
     } else if (head_dim == 512u && blockDim.x == 256u) {
@@ -14716,9 +14745,10 @@ __global__ static void attention_decode_score_split_finalize_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             const float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            acc0 += attention_comp_load_scalar<COMPACT>(
+                comp_kv, c, d0, head_dim) * s;
+            acc1 += attention_comp_load_scalar<COMPACT>(
+                comp_kv, c, d1, head_dim) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -14729,7 +14759,9 @@ __global__ static void attention_decode_score_split_finalize_kernel(
                 acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
             }
             for (uint32_t c = 0; c < visible_comp; c++) {
-                acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+                acc += attention_comp_load_scalar<COMPACT>(
+                           comp_kv, c, d, head_dim) *
+                       scores[raw_count + c];
             }
             oh[d] = acc / denom;
         }
@@ -15188,7 +15220,8 @@ static int attention_decode_score_split_graph_launch(
     };
     cudaKernelNodeParams score_params;
     memset(&score_params, 0, sizeof(score_params));
-    score_params.func = (void *)attention_decode_score_split_scores_kernel;
+    score_params.func =
+        (void *)attention_decode_score_split_scores_kernel<false>;
     score_params.gridDim = score_grid;
     score_params.blockDim = score_block;
     score_params.sharedMemBytes = 0;
@@ -15201,7 +15234,8 @@ static int attention_decode_score_split_graph_launch(
     };
     cudaKernelNodeParams final_params;
     memset(&final_params, 0, sizeof(final_params));
-    final_params.func = (void *)attention_decode_score_split_finalize_kernel;
+    final_params.func =
+        (void *)attention_decode_score_split_finalize_kernel<false>;
     final_params.gridDim = final_grid;
     final_params.blockDim = final_block;
     final_params.sharedMemBytes = 0;
@@ -15310,7 +15344,7 @@ static int attention_decode_score_split_launch(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t pos0,
@@ -15323,6 +15357,7 @@ static int attention_decode_score_split_launch(
         uint32_t n_head,
         uint32_t head_dim,
         uint32_t final_threads,
+        bool compact,
         const cuda_attention_inv_rope_params *inv_rope) {
     if (cuda_env_flag_enabled("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE", 0)) return 0;
     const int explicit_exact =
@@ -15384,6 +15419,7 @@ static int attention_decode_score_split_launch(
     if (S > n_score) S = n_score;
     if (S <= 1u) return 0;
     const bool graph_inv_rope =
+        !compact &&
         g_cuda_exact_score_split_fuse_inv_rope &&
         inv_rope &&
         head_dim == 512u &&
@@ -15397,29 +15433,34 @@ static int attention_decode_score_split_launch(
                                                score_count * sizeof(float),
                                                "attention exact score split");
     if (!scores) return 0;
-    const bool use_ldg_scores = g_cuda_exact_score_split_ldg;
+    const bool use_ldg_scores = !compact && g_cuda_exact_score_split_ldg;
     const bool use_vec4_plain_scores =
+        !compact &&
         !use_ldg_scores &&
         g_cuda_exact_score_split_vec4_plain &&
         head_dim == 512u;
     const bool use_vec4_scores =
+        !compact &&
         !use_ldg_scores &&
         !use_vec4_plain_scores &&
         (g_cuda_exact_score_split_vec4 || g_decode_score_vec4) &&
         head_dim == 512u;
     const bool use_dim2_finalize =
+        !compact &&
         g_cuda_exact_score_split_dim2 &&
         head_dim == 512u &&
         final_threads >= 512u &&
         !graph_inv_rope;
-    if ((g_cuda_exact_score_split_graph || graph_inv_rope) &&
+    if (!compact &&
+        (g_cuda_exact_score_split_graph || graph_inv_rope) &&
         !use_dim2_finalize &&
         !use_ldg_scores &&
         !use_vec4_plain_scores &&
         !use_vec4_scores)
     {
         int rc = attention_decode_score_split_graph_launch(
-            logical_tier, heads, sinks, scores, q, raw_kv, comp_kv, comp_mask,
+            logical_tier, heads, sinks, scores, q, raw_kv,
+            (const float *)comp_kv, comp_mask,
             use_comp_mask, pos0, n_raw, raw_cap, raw_start, n_comp, window,
             ratio, n_head, head_dim, final_threads, S,
             graph_inv_rope ? inv_rope : NULL);
@@ -15442,67 +15483,95 @@ static int attention_decode_score_split_launch(
     if (tile_candidate && logical_tier >= 0 && logical_tier < DS4_MAX_GPUS) {
         /* cudaFuncSetAttribute() applies to the current device only. Cache
          * the selected 16- or 8-row layout per logical tier. */
-        static int tile_prepared[DS4_MAX_GPUS] = {0};
-        static uint32_t tile_rows_ready[DS4_MAX_GPUS] = {0};
-        static size_t tile_shmem_ready[DS4_MAX_GPUS] = {0};
-        if (!tile_prepared[logical_tier]) {
-            tile_rows_ready[logical_tier] = attention_score_tile_prepare(
-                (const void *)attention_decode_score_split_scores_tile512_kernel,
-                "attention exact-score", &tile_shmem_ready[logical_tier]);
-            tile_prepared[logical_tier] = 1;
+        static int tile_prepared[2][DS4_MAX_GPUS] = {{0}};
+        static uint32_t tile_rows_ready[2][DS4_MAX_GPUS] = {{0}};
+        static size_t tile_shmem_ready[2][DS4_MAX_GPUS] = {{0}};
+        const uint32_t format = compact ? 1u : 0u;
+        if (!tile_prepared[format][logical_tier]) {
+            const void *kernel = compact
+                ? (const void *)attention_decode_score_split_scores_tile512_kernel<true>
+                : (const void *)attention_decode_score_split_scores_tile512_kernel<false>;
+            tile_rows_ready[format][logical_tier] = attention_score_tile_prepare(
+                kernel, compact ? "attention compact exact-score" : "attention exact-score",
+                &tile_shmem_ready[format][logical_tier]);
+            tile_prepared[format][logical_tier] = 1;
         }
-        tile_rows = tile_rows_ready[logical_tier];
-        tile_shmem = tile_shmem_ready[logical_tier];
+        tile_rows = tile_rows_ready[format][logical_tier];
+        tile_shmem = tile_shmem_ready[format][logical_tier];
     }
     if (tile_candidate && tile_rows != 0u) {
         dim3 tile_grid((n_score + tile_rows - 1u) / tile_rows,
                        (n_head + DS4_SCORE_TILE_HEADS - 1u) / DS4_SCORE_TILE_HEADS,
                        1);
         const uint32_t tile_threads = DS4_SCORE_TILE_HEADS * tile_rows;
-        attention_decode_score_split_scores_tile512_kernel
-            <<<tile_grid, tile_threads, tile_shmem>>>(
-                scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim, tile_rows);
+        if (compact) {
+            attention_decode_score_split_scores_tile512_kernel<true>
+                <<<tile_grid, tile_threads, tile_shmem>>>(
+                    scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim, tile_rows);
+        } else {
+            attention_decode_score_split_scores_tile512_kernel<false>
+                <<<tile_grid, tile_threads, tile_shmem>>>(
+                    scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim, tile_rows);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention exact score split tile launch")) return -1;
     } else {
     dim3 score_grid(1, n_head, S);
     if (use_ldg_scores) {
         attention_decode_score_split_scores_ldg_kernel<<<score_grid, 256>>>(
-                scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                scores, q, raw_kv, (const float *)comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim, S);
     } else if (use_vec4_plain_scores) {
         attention_decode_score_split_scores_vec4_plain_kernel<<<score_grid, 256>>>(
-                scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                scores, q, raw_kv, (const float *)comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, S);
     } else if (use_vec4_scores) {
         attention_decode_score_split_scores_vec4_kernel<<<score_grid, 256>>>(
-                scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                scores, q, raw_kv, (const float *)comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, S);
     } else {
-        attention_decode_score_split_scores_kernel<<<score_grid, 256>>>(
-                scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim, S);
+        if (compact) {
+            attention_decode_score_split_scores_kernel<true><<<score_grid, 256>>>(
+                    scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim, S);
+        } else {
+            attention_decode_score_split_scores_kernel<false><<<score_grid, 256>>>(
+                    scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim, S);
+        }
     }
     if (!cuda_ok(cudaGetLastError(), "attention exact score split scores launch")) return -1;
     }
     if (use_dim2_finalize) {
         dim3 final_grid(2, n_head, 1);
         attention_decode_score_split_finalize_dim2_kernel<<<final_grid, 256>>>(
-                heads, sinks, scores, raw_kv, comp_kv,
+                heads, sinks, scores, raw_kv, (const float *)comp_kv,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention exact score split dim2 finalize launch")) return -1;
     } else {
         dim3 final_grid(1, n_head, 1);
-        attention_decode_score_split_finalize_kernel<<<final_grid, final_threads>>>(
-                heads, sinks, scores, raw_kv, comp_kv,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim);
+        if (compact) {
+            attention_decode_score_split_finalize_kernel<true>
+                <<<final_grid, final_threads>>>(
+                    heads, sinks, scores, raw_kv, comp_kv,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim);
+        } else {
+            attention_decode_score_split_finalize_kernel<false>
+                <<<final_grid, final_threads>>>(
+                    heads, sinks, scores, raw_kv, comp_kv,
+                    pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                    n_head, head_dim);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention exact score split finalize launch")) return -1;
     }
     return 1;
@@ -25193,7 +25262,7 @@ static int attention_decode_splitkv_launch(
         float *denom = (float *)((char *)tmp + denom_offset);
         float *partials = (float *)((char *)tmp + partial_offset);
         dim3 score_grid(1, n_head, S);
-        attention_decode_score_split_scores_kernel<<<score_grid, 256>>>(
+        attention_decode_score_split_scores_kernel<false><<<score_grid, 256>>>(
                 scores, q, raw_kv, comp_kv, comp_mask, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
                 n_head, head_dim, S);
@@ -25575,6 +25644,27 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
     if (compact) {
+        const uint32_t score_lanes =
+            g_cuda_decode_score4 ? 4u : (g_cuda_decode_score8 ? 8u : 0u);
+        const uint32_t threads =
+            head_dim == 512u && score_lanes == 0u &&
+            !g_cuda_no_decode_value512 ? 512u : 256u;
+        if (cuda_attention_score_buffer_fits(n_comp)) {
+            int score_split_rc = attention_decode_score_split_launch(
+                    logical_tier, (float *)heads->ptr, sinks,
+                    (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    comp_kv->ptr,
+                    use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
+                    0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
+                    n_head, head_dim, threads, true, NULL);
+            if (score_split_rc == 1) {
+                g_sm75_compact_exact_score_calls.fetch_add(
+                    1u, std::memory_order_relaxed);
+                return cuda_ok(cudaGetLastError(),
+                               "attention compact exact score split launch");
+            }
+            if (score_split_rc < 0) return 0;
+        }
         if (use_mask || head_dim != 512u || g_cuda_no_window_attention) {
             return 0;
         }
@@ -25650,7 +25740,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
             use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
             0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
-            n_head, head_dim, threads, NULL);
+            n_head, head_dim, threads, false, NULL);
     if (score_split_rc == 1) {
         return cuda_ok(cudaGetLastError(), "attention exact score split launch");
     }
@@ -25770,7 +25860,7 @@ extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
             n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
             use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
             0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
-            n_head, head_dim, threads, &rope);
+            n_head, head_dim, threads, false, &rope);
     if (score_split_rc == 1) {
         if (fused_inv_rope) *fused_inv_rope = 1;
         return cuda_ok(cudaGetLastError(),
@@ -26244,7 +26334,7 @@ static int attention_decode_batch_launch(
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                 use_comp_mask ? (const float *)comp_mask->ptr : NULL, use_comp_mask,
                 pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
-                n_head, head_dim, threads, NULL);
+                n_head, head_dim, threads, false, NULL);
         if (score_split_rc == 1) {
             return cuda_ok(cudaGetLastError(), "attention exact score split batch launch");
         }

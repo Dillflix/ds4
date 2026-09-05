@@ -444,6 +444,11 @@ if [[ $DIAGNOSTIC_PACK_AUDIT == 1 ]]; then
         [[ -s $logits/frontier_000512.logits.f32 &&
            -s $logits/frontier_000512.decode_000001.logits.f32 ]] ||
             die "$arm PP512 production pack audit logit inventory is incomplete"
+        if [[ $arm == compact ]]; then
+            grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]*' \
+                "$base.log" ||
+                die "compact PP512 production pack audit missed exact score-split dispatch"
+        fi
     done
     for file in frontier_000512.logits.f32 \
                 frontier_000512.decode_000001.logits.f32; do
