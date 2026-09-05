@@ -542,9 +542,10 @@ static float median_arm(
     return median;
 }
 
-/* Stable device-side route construction for the physical protocol. One
- * thread per token preserves global Top-K order within each owner; atomics
- * would make floating-point association nondeterministic. */
+/* Stable device-side route construction for the physical protocol. One block
+ * owns each token. Ballots derive lane-local positions and thread zero derives
+ * warp bases, preserving global Top-K order within each owner without the
+ * serial 512-row loop or nondeterministic atomics. */
 __global__ static void partition_even_odd_topk_kernel(
         const int32_t *global_topk,
         int32_t *owner0_topk,
@@ -553,22 +554,75 @@ __global__ static void partition_even_odd_topk_kernel(
         uint32_t *owner1_counts,
         uint32_t n_tokens) {
     const uint32_t token = blockIdx.x;
-    if (token >= n_tokens || threadIdx.x != 0u) return;
-    uint32_t count0 = 0u;
-    uint32_t count1 = 0u;
-    for (uint32_t i = 0; i < TOP_K; i++) {
-        const uint32_t global_row =
-            (uint32_t)global_topk[(uint64_t)token * TOP_K + i];
-        if (global_row & 1u) {
-            owner1_topk[(uint64_t)token * TOP_K + count1++] =
-                (int32_t)(global_row / 2u);
-        } else {
-            owner0_topk[(uint64_t)token * TOP_K + count0++] =
-                (int32_t)(global_row / 2u);
-        }
+    if (token >= n_tokens) return;
+
+    constexpr uint32_t WARPS = THREADS / 32u;
+    __shared__ uint32_t warp_base0[WARPS];
+    __shared__ uint32_t warp_base1[WARPS];
+    __shared__ uint32_t warp_count0[WARPS];
+    __shared__ uint32_t warp_count1[WARPS];
+    __shared__ uint32_t total0;
+    __shared__ uint32_t total1;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane_lower = lane == 0u
+        ? 0u : (0xffffffffu >> (32u - lane));
+    if (tid == 0u) {
+        total0 = 0u;
+        total1 = 0u;
     }
-    owner0_counts[token] = count0;
-    owner1_counts[token] = count1;
+    __syncthreads();
+
+    for (uint32_t base = 0u; base < TOP_K; base += THREADS) {
+        const uint32_t i = base + tid;
+        const bool active = i < TOP_K;
+        const uint32_t global_row = active
+            ? (uint32_t)global_topk[(uint64_t)token * TOP_K + i]
+            : 0u;
+        const uint32_t active_mask = __ballot_sync(0xffffffffu, active);
+        const uint32_t owner1_mask = __ballot_sync(
+            active_mask, active && ((global_row & 1u) != 0u));
+        const uint32_t owner0_mask = active_mask & ~owner1_mask;
+        const uint32_t local0 = __popc(owner0_mask & lane_lower);
+        const uint32_t local1 = __popc(owner1_mask & lane_lower);
+
+        if (lane == 0u) {
+            warp_count0[warp] = __popc(owner0_mask);
+            warp_count1[warp] = __popc(owner1_mask);
+        }
+        __syncthreads();
+        if (tid == 0u) {
+            uint32_t next0 = total0;
+            uint32_t next1 = total1;
+            for (uint32_t w = 0u; w < WARPS; w++) {
+                warp_base0[w] = next0;
+                warp_base1[w] = next1;
+                next0 += warp_count0[w];
+                next1 += warp_count1[w];
+            }
+            total0 = next0;
+            total1 = next1;
+        }
+        __syncthreads();
+
+        if (active) {
+            const int32_t local_row = (int32_t)(global_row / 2u);
+            if (global_row & 1u) {
+                owner1_topk[(uint64_t)token * TOP_K +
+                            warp_base1[warp] + local1] = local_row;
+            } else {
+                owner0_topk[(uint64_t)token * TOP_K +
+                            warp_base0[warp] + local0] = local_row;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        owner0_counts[token] = total0;
+        owner1_counts[token] = total1;
+    }
 }
 
 struct PhysicalProtocol {
@@ -632,7 +686,7 @@ static float time_physical_protocol(
 
     for (uint32_t repeat = 0; repeat < repeats; repeat++) {
         partition_even_odd_topk_kernel<<<
-            protocol->n_tokens, 1u, 0, protocol->home_stream>>>(
+            protocol->n_tokens, THREADS, 0, protocol->home_stream>>>(
                 protocol->home_global_topk,
                 protocol->home_owner0_topk,
                 protocol->home_owner1_topk,

@@ -5560,14 +5560,15 @@ speedup.
 
 Setting `PEER_GPU` enables a bounded physical-pair arm. The home and peer own
 one compact row shard each and execute their partials concurrently. Its timing
-includes a stable device-side partition of the global Top-K list into even/odd
-owner-local indices, the F32 query copy, a worst-case-capacity remote route and
-its exact row count, both partial kernels, the aligned F32 partial-state
-return, and the home merge. The stable partition preserves global Top-K order
-within each owner, while per-token counts handle arbitrary—not assumed 50/50—
-selection distributions. The ordinary control and single-device protocol arms
-remain in the same invocation, making clear whether real transport preserves
-or consumes the compute-only opportunity.
+includes a stable warp-parallel device-side partition of the global Top-K list
+into even/odd owner-local indices, the F32 query copy, a worst-case-capacity
+remote route and its exact row count, both partial kernels, the aligned F32
+partial-state return, and the home merge. Ballot-derived lane positions and
+warp bases preserve global Top-K order within each owner without serializing
+all 512 entries through one CUDA thread; per-token counts handle arbitrary—not
+assumed 50/50—selection distributions. The ordinary control and single-device
+protocol arms remain in the same invocation, making clear whether real
+transport preserves or consumes the compute-only opportunity.
 
 Each partial-state record reserves two padding floats after `(max, sum)` so
 the 512-float numerator begins at a 16-byte boundary and every subsequent
