@@ -5767,6 +5767,17 @@ and is read at teardown.  This separates corrupt/stale live KV mirroring from
 the already-exact q_b-through-output-B fixture without repeating the control
 run.
 
+The all43 audit checked 3,129 live mirror spans covering 1,599,078,400 bytes
+without one mismatch.  Raw/compressed KV copy contents and their ordinary
+destination-stream visibility are therefore excluded.  The remaining gap in
+the otherwise exact physical fixture is the early prompt regime: it previously
+tested only indexed mixed attention at the mature 32K shape, while production
+also reaches raw-only attention and static mixed attention before compressed
+history exceeds top-k.  The physical-pair exactness binary now compares the
+full 64-head reference with 32/32 physical shards for both missing modes before
+continuing through the established indexed q_b-to-output-B chain.  This is the
+next bounded discriminator; it does not repeat the 32K production run.
+
 ```bash
 CACHE_AUDIT_ONLY=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh

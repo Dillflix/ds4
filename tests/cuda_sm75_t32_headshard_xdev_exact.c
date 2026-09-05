@@ -1,7 +1,8 @@
 /* Bounded two-GPU exactness audit for the production T32 head-shard protocol.
- * It checks copied input and partner q_b, local-KV/peer-topk indexed attention,
- * inverse RoPE, the compact output-A peer gather, output-B, and finally the
- * complete production-ordered chain without intermediate fences. This is
+ * It checks copied input and partner q_b, all three batched attention modes
+ * reached by a real prompt (raw, static mixed, and indexed mixed), inverse
+ * RoPE, the compact output-A peer gather, output-B, and finally the complete
+ * production-ordered indexed chain without intermediate fences. This is
  * diagnostic-only. */
 
 #include "ds4_gpu.h"
@@ -40,6 +41,7 @@
 #define N_RAW 128u
 #define RAW_START 385u
 #define N_COMP 8192u
+#define STATIC_N_COMP (N_TOK / ATTN_RATIO)
 #define TOP_K 512u
 #define ATTN_WINDOW 128u
 #define ATTN_RATIO 4u
@@ -422,6 +424,69 @@ int main(void) {
           ds4_gpu_tensor_write(&topk_home, 0u, topk_host,
                                topk_count * sizeof(int32_t)),
           "downstream input writes");
+
+    /* A production prompt reaches raw-only attention before any compressed
+     * rows exist, then static mixed attention while the compressed history is
+     * no larger than top-k.  The earlier physical fixture began at the mature
+     * indexed frontier and therefore could not exclude either early mode. */
+    CHECK(ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_prefill_raw_heads_tensor(
+              &heads_ref, model, model_bytes, sinks_offset,
+              &q_ref, &raw_home, N_TOK, ATTN_WINDOW, N_HEAD, HEAD_DIM) &&
+          sync_tier(0), "full raw attention reference");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+              &heads_peer, model, model_bytes, sinks_offset,
+              &q_peer, &raw_peer, N_TOK, ATTN_WINDOW,
+              SHARD_HEADS, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_prefill_raw_heads_shard_tensor(
+              &heads_home, model, model_bytes, sinks_offset,
+              &q_home, &raw_home, N_TOK, ATTN_WINDOW,
+              0u, SHARD_HEADS, N_HEAD, HEAD_DIM) &&
+          sync_tier(0) && sync_tier(1), "physical raw attention shards");
+    CHECK(ds4_gpu_tensor_read(&heads_ref, 0u, ref_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_home, 0u, home_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_peer, 0u, peer_host, q_bytes),
+          "raw attention readback");
+    diff_metrics raw_home_diff = compare_head_half(ref_host, home_host, 0u);
+    diff_metrics raw_peer_diff = compare_head_half(ref_host, peer_host,
+                                                   SHARD_HEADS);
+    print_diff("physical-raw-attention", raw_home_diff, raw_peer_diff);
+    CHECK(!raw_home_diff.mismatches && !raw_peer_diff.mismatches,
+          "physical raw attention diverged");
+
+    CHECK(ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              &heads_ref, model, model_bytes, sinks_offset,
+              &q_ref, &raw_home, &comp_home, 0u, N_TOK, STATIC_N_COMP,
+              ATTN_WINDOW, ATTN_RATIO, N_HEAD, HEAD_DIM) &&
+          sync_tier(0), "full static mixed attention reference");
+    CHECK(ds4_gpu_set_current_device(1) == 0 &&
+          ds4_gpu_attention_prefill_static_mixed_heads_shard_tensor(
+              &heads_peer, model, model_bytes, sinks_offset,
+              &q_peer, &raw_peer, &comp_peer, 0u, N_TOK, STATIC_N_COMP,
+              ATTN_WINDOW, ATTN_RATIO, SHARD_HEADS, SHARD_HEADS,
+              N_HEAD, HEAD_DIM) &&
+          ds4_gpu_set_current_device(0) == 0 &&
+          ds4_gpu_attention_prefill_static_mixed_heads_shard_tensor(
+              &heads_home, model, model_bytes, sinks_offset,
+              &q_home, &raw_home, &comp_home, 0u, N_TOK, STATIC_N_COMP,
+              ATTN_WINDOW, ATTN_RATIO, 0u, SHARD_HEADS,
+              N_HEAD, HEAD_DIM) &&
+          sync_tier(0) && sync_tier(1),
+          "physical static mixed attention shards");
+    CHECK(ds4_gpu_tensor_read(&heads_ref, 0u, ref_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_home, 0u, home_host, q_bytes) &&
+          ds4_gpu_tensor_read(&heads_peer, 0u, peer_host, q_bytes),
+          "static mixed attention readback");
+    diff_metrics static_home_diff = compare_head_half(ref_host, home_host, 0u);
+    diff_metrics static_peer_diff = compare_head_half(ref_host, peer_host,
+                                                      SHARD_HEADS);
+    print_diff("physical-static-mixed-attention",
+               static_home_diff, static_peer_diff);
+    CHECK(!static_home_diff.mismatches && !static_peer_diff.mismatches,
+          "physical static mixed attention diverged");
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
