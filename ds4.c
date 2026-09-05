@@ -39424,7 +39424,7 @@ static int metal_graph_prompt_logits_test(
                     uint32_t done = 0;
                     comp_read = stage &&
                         ds4_gpu_tensor_device(stage) == comp_tier &&
-                        ds4_gpu_set_current_device(comp_tier) == 0;
+                        ds4_gpu_set_current_device_fenced(comp_tier) == 0;
                     while (comp_read && done < n_comp) {
                         uint32_t nr = n_comp - done;
                         if (nr > g.attn_comp_stage_cap) {
@@ -39442,7 +39442,7 @@ static int metal_graph_prompt_logits_test(
                         }
                         done += nr;
                     }
-                    if (ds4_gpu_set_current_device(saved_tier) != 0) {
+                    if (ds4_gpu_set_current_device_fenced(saved_tier) != 0) {
                         comp_read = false;
                     }
                 } else {
@@ -52818,7 +52818,9 @@ static int payload_select_attn_comp_stage(
                         "compact attention cache staging tier is invalid");
         return 1;
     }
-    if (ds4_gpu_set_current_device(layer_tier) != 0) {
+    /* The plain setter can trust a stale cached tier after WITH_DEVICE tensor
+     * I/O. The fenced form resolves the actual CUDA device before switching. */
+    if (ds4_gpu_set_current_device_fenced(layer_tier) != 0) {
         payload_set_err(err, errlen,
                         "failed to select compact attention cache device");
         return 1;
@@ -52831,7 +52833,7 @@ static int payload_select_attn_comp_stage(
 
 static int payload_restore_attn_comp_stage_device(
         int saved_tier, char *err, size_t errlen) {
-    if (ds4_gpu_set_current_device(saved_tier) == 0) return 0;
+    if (ds4_gpu_set_current_device_fenced(saved_tier) == 0) return 0;
     payload_set_err(err, errlen,
                     "failed to restore CUDA device after compact cache I/O");
     return 1;
