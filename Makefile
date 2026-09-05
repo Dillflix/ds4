@@ -308,6 +308,10 @@ tests/cuda_sm75_compressor_projection_layout: tests/cuda_sm75_compressor_project
 	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
 
+tests/cuda_sm75_attention_rowshard_softmax: tests/cuda_sm75_attention_rowshard_softmax.cu
+	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -Xptxas -v -o $@ $< $(CUDA_LDLIBS)
+
 tests/cuda_sm75_compact_attention_kv: tests/cuda_sm75_compact_attention_kv.cu ds4_cuda.o
 	@test "$(CUDA_ARCH)" = "sm_75" || { echo "error: $@ requires CUDA_ARCH=sm_75" >&2; exit 1; }
 	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -I. -Xptxas -v -o $@ $^ $(CUDA_LDLIBS)

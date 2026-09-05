@@ -5533,3 +5533,52 @@ SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
 ```
+
+### SM75 row-sharded compact-attention softmax prototype
+
+`cuda-sm75-attention-rowshard-softmax.sh` is an independent, bounded protocol
+experiment; it does not alter engine allocation or dispatch. The control reads
+one complete 736-byte-row compact cache. The candidate stores those same rows
+exactly once in two separately guarded contiguous owner allocations. Its Top-K
+fixture alternates owners on every selected row, preventing a falsely easy
+single-boundary ordering case.
+
+The harness distinguishes two materially different claims. An ordered local-
+address arm follows the original Top-K sequence and chooses the relevant local
+allocation for each row; it must be bit-identical to the full-cache control,
+but does not claim a realizable parallel schedule. The distributed candidate
+prepartitions Top-K into owner-local row lists, has both owners independently
+compute `(max, sum, numerator[512])` for all 64 heads, and merges the two
+online-softmax states plus the learned sink. That changes floating-point
+association, so bit mismatches, maximum absolute error, and relative L2 error
+are reported explicitly. A parallel compute envelope is projected from the
+slower owner plus merge time before transport; it is not called an end-to-end
+speedup.
+
+This is deliberately not the existing 32-head-per-GPU policy. A head shard
+needs every selected cache row on each GPU, which recreates the history mirror
+we are trying to remove. With authoritative row shards, each owner must instead
+evaluate all 64 heads over its local rows; only the compact softmax state is
+returned to the sink. The experiment therefore tests the no-mirror topology,
+not another spelling of the current head split.
+
+The accounting reports one authoritative cache, half-shard residency per GPU,
+the projected all-43-layer footprint at 256K context, and the minimum modeled
+T32 traffic for remote query, one partial state, and the remote owner's local
+selection list. Global Top-K production/partitioning and the small replicated
+raw ring are intentionally outside this first prototype. Compute Sanitizer,
+guard canaries, exact owner-local addressing, and non-finite rejection gate a
+successful run. Physical multi-GPU validation remains required regardless of
+the bounded result.
+
+```bash
+PROFILE_GPU=0 \
+ROWS=8192 \
+TOKENS=32 \
+TIMING_ROUNDS=9 \
+TIMING_REPEATS=25 \
+RUN_SANITIZER=1 \
+SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-attention-rowshard-softmax.sh
+```
