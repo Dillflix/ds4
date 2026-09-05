@@ -255,6 +255,22 @@ int main(void) {
 
     CHECK(ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_set_model_map(q_model, q_model_bytes), "q_b model map");
+    /* Multi-GPU F16 materialization deliberately refuses to stage arbitrary
+     * host-map bytes: its source must already have the same selective-cache
+     * ownership that production placement installs.  Admit the synthetic
+     * full/home-half and peer-half sources before asking for F16 views. */
+    ds4_tensor_range q_home_sources[] = {
+        {0u, q_b_bytes, 0},
+        {q_b_bytes, q_b_half_bytes, 0},
+    };
+    ds4_tensor_range q_peer_source = {
+        q_b_bytes + q_b_half_bytes, q_b_half_bytes, 1
+    };
+    CHECK(ds4_gpu_device_cache_tensors(
+              0, q_home_sources,
+              (int)(sizeof(q_home_sources) / sizeof(q_home_sources[0]))) == 0 &&
+          ds4_gpu_device_cache_tensors(1, &q_peer_source, 1) == 0,
+          "q_b selective source caches");
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
               q_model, q_model_bytes, 0u, q_b_bytes, IN_DIM, OUT_DIM,
               g_gpu[0].device_id, "attn_q_b_full") &&
@@ -319,11 +335,23 @@ int main(void) {
           ds4_gpu_set_current_device(0) == 0 &&
           ds4_gpu_set_model_map(attn_model, attn_model_bytes),
           "attention model map");
-    ds4_tensor_range sink_home = {sinks_offset, N_HEAD * sizeof(float), 0};
-    ds4_tensor_range sink_peer = {sinks_offset, N_HEAD * sizeof(float), 1};
-    CHECK(ds4_gpu_device_cache_tensors(0, &sink_home, 1u) == 0 &&
-          ds4_gpu_device_cache_tensors(1, &sink_peer, 1u) == 0,
-          "attention sinks on both devices");
+    ds4_tensor_range attn_home_sources[] = {
+        {0u, a_bytes, 0},
+        {sinks_offset, N_HEAD * sizeof(float), 0},
+    };
+    ds4_tensor_range attn_peer_sources[] = {
+        {a_bytes / 2u, a_bytes / 2u, 1},
+        {sinks_offset, N_HEAD * sizeof(float), 1},
+    };
+    CHECK(ds4_gpu_device_cache_tensors(
+              0, attn_home_sources,
+              (int)(sizeof(attn_home_sources) /
+                    sizeof(attn_home_sources[0]))) == 0 &&
+          ds4_gpu_device_cache_tensors(
+              1, attn_peer_sources,
+              (int)(sizeof(attn_peer_sources) /
+                    sizeof(attn_peer_sources[0]))) == 0,
+          "attention selective source caches");
     CHECK(ds4_gpu_cache_q8_f16_range_on_device(
               attn_model, attn_model_bytes, 0u, a_bytes, GROUP_DIM,
               LOW_DIM, g_gpu[0].device_id, "attn_output_a_full") &&

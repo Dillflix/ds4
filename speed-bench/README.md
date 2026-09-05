@@ -5697,6 +5697,16 @@ the next result identifies the first physical boundary instead of reducing a
 21-layer production mismatch to final logits.  Use physical GPUs 3 and 2 to
 exercise the stable logical pair 1 from `GPU_DEVICES=0,3,1,2`.
 
+The first physical-pair invocation validated the selected 3/2 device identities,
+bidirectional peer access, and link bandwidth, but stopped before q_b dispatch:
+the synthetic Q8 model had only been registered as a host map.  Multi-GPU F16
+materialization intentionally requires an owning per-device selective-cache
+source, so that was a diagnostic setup failure rather than a q_b result.  The
+physical binary now installs production-shaped full/home-half and peer-half Q8
+source ownership for q_b, then repeats the same admission for output-A and
+sinks after changing synthetic model maps.  This prevents a second copy of the
+same setup defect from appearing at the later output-A boundary.
+
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
