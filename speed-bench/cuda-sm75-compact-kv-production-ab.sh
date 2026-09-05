@@ -439,12 +439,15 @@ run_decode_isolation_case() {
 run_decode_profile_case() {
     local arm=$1 base="$OUTPUT_DIR/nsys/$1-pp512-decode" rc=0 format=f32
     local telemetry="$OUTPUT_DIR/telemetry/$1-decode-profile.csv"
+    local profile_tmp="$OUTPUT_DIR/nsys/tmp-$1"
     local -a cmd
     [[ $arm == compact ]] && format=sm75-compact
+    mkdir -p "$profile_tmp"
 
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     start_telemetry "$telemetry"
     cmd=("${production_env[@]}"
+        "TMPDIR=$profile_tmp"
         "DS4_CUDA_ATTN_COMP_CACHE=$format"
         DS4_NSYS_CAPTURE_DECODE_SKIP=0
         DS4_NSYS_CAPTURE_DECODE_TOKENS=1

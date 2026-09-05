@@ -5637,6 +5637,8 @@ Nsight Systems for both F32 and compact caches. It emits a CUDA-kernel summary
 for each arm and requires the compact materialized exact-score path. This is a
 component-cost diagnostic, not promotion evidence; use it when the short exact
 gate passes but end-to-end first-token latency remains materially different.
+The harness gives Nsight Systems a private temporary directory inside the
+result tree, so it does not require writable system `/tmp/nvidia` state.
 
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
