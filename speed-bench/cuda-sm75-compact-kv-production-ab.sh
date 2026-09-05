@@ -27,6 +27,8 @@ Optional environment:
   MIN_THROUGHPUT_RATIO=0.95
   DIAGNOSTIC_PACK_AUDIT=0           1: F32/compact PP512 one-token exact A/B,
                                     with compact per-layer packed-row checks
+  DIAGNOSTIC_PREFILL_ISOLATION=0    1: PP4096 exact F32, compact-hybrid, and
+                                    compact-direct three-arm comparison
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
@@ -60,6 +62,7 @@ CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-12000}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.95}
 DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
+DIAGNOSTIC_PREFILL_ISOLATION=${DIAGNOSTIC_PREFILL_ISOLATION:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 DIAGNOSTIC_DECODE_PROFILE=${DIAGNOSTIC_DECODE_PROFILE:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -87,13 +90,15 @@ done
 awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
-for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_DECODE_ISOLATION \
+for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
+            DIAGNOSTIC_DECODE_ISOLATION \
             DIAGNOSTIC_DECODE_PROFILE \
             SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
-(( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_DECODE_ISOLATION +
+(( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_PREFILL_ISOLATION +
+   DIAGNOSTIC_DECODE_ISOLATION +
    DIAGNOSTIC_DECODE_PROFILE <= 1 )) ||
     die "select at most one diagnostic mode"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
@@ -295,6 +300,10 @@ validate_selector() {
     if [[ $arm == f32 ]]; then
         grep -Fq 'compressed-attention cache format=f32 row-bytes=2048' "$log" &&
             ! grep -Fq 'compact attention hybrid summary:' "$log"
+    elif [[ $arm == compact-direct ]]; then
+        grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
+            ! grep -Fq 'compact attention hybrid summary:' "$log" &&
+            ! grep -Fq 'requested compressed-attention cache format' "$log"
     else
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
             grep -Eq 'SM75 compact attention hybrid summary: calls=[1-9][0-9]* ' "$log" &&
@@ -335,9 +344,12 @@ run_case() {
     local rc=0 telemetry="$OUTPUT_DIR/telemetry/$arm-$kind.csv"
     local format=f32
     local -a audit_env=() cmd
-    [[ $arm == compact ]] && format=sm75-compact
-    if [[ $arm == compact && ($kind == exact || $kind == pack-audit) ]]; then
+    [[ $arm == compact* ]] && format=sm75-compact
+    if [[ $arm == compact* && ($kind == exact || $kind == pack-audit) ]]; then
         audit_env+=(DS4_CUDA_COMPACT_ATTN_PACK_AUDIT=1)
+    fi
+    if [[ $arm == compact-direct ]]; then
+        audit_env+=(DS4_CUDA_NO_ATTN_COMPACT_HYBRID=1)
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     start_telemetry "$telemetry"
@@ -520,6 +532,57 @@ if [[ $DIAGNOSTIC_PACK_AUDIT == 1 ]]; then
     phase=finished
     printf 'Compact-KV PP512 production exact A/B pack audit passed: %s\n' \
         "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
+    phase=prefill-isolation
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    for arm in f32 compact compact-direct; do
+        base="$OUTPUT_DIR/exact/$arm-prefill-isolation"
+        logits="$base-logits"
+        mkdir -p "$logits"
+        printf 'Compact-KV PP4096 prefill isolation arm=%s...\n' "$arm"
+        run_case "$arm" exact 1 "$base" "$logits" 4096 || {
+            tail -n 240 "$base.log" >&2 || true
+            die "$arm PP4096 prefill isolation run failed"
+        }
+        [[ -s $logits/frontier_000512.logits.f32 &&
+           -s $logits/frontier_004096.logits.f32 ]] ||
+            die "$arm PP4096 prefill isolation inventory is incomplete"
+    done
+    for arm in compact compact-direct; do
+        cmp -s \
+            "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_000512.logits.f32" \
+            "$OUTPUT_DIR/exact/$arm-prefill-isolation-logits/frontier_000512.logits.f32" ||
+            die "$arm diverged before historical compact rows were consumed"
+    done
+    hybrid_exact=false
+    direct_exact=false
+    arms_equal=false
+    cmp -s \
+        "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_004096.logits.f32" \
+        "$OUTPUT_DIR/exact/compact-prefill-isolation-logits/frontier_004096.logits.f32" &&
+        hybrid_exact=true
+    cmp -s \
+        "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_004096.logits.f32" \
+        "$OUTPUT_DIR/exact/compact-direct-prefill-isolation-logits/frontier_004096.logits.f32" &&
+        direct_exact=true
+    cmp -s \
+        "$OUTPUT_DIR/exact/compact-prefill-isolation-logits/frontier_004096.logits.f32" \
+        "$OUTPUT_DIR/exact/compact-direct-prefill-isolation-logits/frontier_004096.logits.f32" &&
+        arms_equal=true
+    {
+        printf 'mode=pp4096-prefill-three-arm\n'
+        printf 'pack_roundtrip_audit=passed\n'
+        printf 'hybrid_vs_f32_bit_exact=%s\n' "$hybrid_exact"
+        printf 'direct_vs_f32_bit_exact=%s\n' "$direct_exact"
+        printf 'hybrid_vs_direct_bit_exact=%s\n' "$arms_equal"
+        printf 'acceptance_evidence=no\n'
+    } | tee "$OUTPUT_DIR/summary/prefill-isolation.txt"
+    phase=finished
+    printf 'Compact-KV PP4096 prefill isolation complete: %s\n' "$OUTPUT_DIR"
     exit 0
 fi
 

@@ -5628,10 +5628,20 @@ candidate selector and `f32` is the immediate rollback.
 
 `DIAGNOSTIC_PACK_AUDIT=1` runs a short PP512, one-token F32/compact exact A/B
 and checks every packed compact row's embedded status before it can be
-consumed. Both the prefill and first-decode logits must be byte-identical. On
-failure it reports either the first divergent output or the first layer,
-destination row, and rejection bits; this is a correctness-localization run,
-not promotion evidence.
+consumed. The embedded status now includes a bitwise pack/decode round-trip
+check against the already-rounded F32 producer row, in addition to nonfinite
+and encoding checks. Both the prefill and first-decode logits must be
+byte-identical. On failure it reports either the first divergent output or the
+first layer, destination row, and rejection bits; this is a
+correctness-localization run, not promotion evidence.
+
+`DIAGNOSTIC_PREFILL_ISOLATION=1` runs PP512 and PP4096 with three exact arms:
+F32, compact with the selected-row hybrid consumer, and compact with that
+consumer disabled. All compact arms enable the strengthened per-row round-trip
+audit. The result records whether each PP4096 prefill output matches F32 and
+whether the two compact consumers match each other, separating a persistent
+codec failure from a hybrid-consumer failure. Divergence is a diagnostic
+result rather than a runner failure; this is not promotion evidence.
 
 `DIAGNOSTIC_DECODE_PROFILE=1` generates two PP512 decode tokens and captures
 exactly the second in Nsight Systems for both F32 and compact caches. The first

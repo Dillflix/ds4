@@ -13163,7 +13163,13 @@ __global__ static void sm75_compact_attn_pack_kernel(
             atomicOr(&out->status, 2u);
             out->code[d] = 0u;
         } else {
-            out->code[d] = (uint8_t)code;
+            const uint8_t stored_code = (uint8_t)code;
+            out->code[d] = stored_code;
+            const float decoded = sm75_compact_attn_decode_code(
+                stored_code, __float_as_uint(scale));
+            if (__float_as_uint(decoded) != __float_as_uint(value)) {
+                atomicOr(&out->status, 4u);
+            }
         }
         __syncthreads();
     }
@@ -24662,7 +24668,8 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
                 fprintf(stderr,
                         "ds4: compact attention pack audit rejected "
                         "dst-row=%u local-row=%u status=0x%x "
-                        "(nonfinite=0x1 encoding-failure=0x2)\n",
+                        "(nonfinite=0x1 encoding-failure=0x2 "
+                        "roundtrip-mismatch=0x4)\n",
                         dst_row + row, row, status[row]);
                 free(status);
                 return 0;
