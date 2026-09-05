@@ -120,6 +120,18 @@ phase=production-ab
 printf 'variant,csv,log,logits,telemetry\n' >"$OUTPUT_DIR/production/runs.csv"
 for variant in control headshard; do
     enable=0; [[ $variant == headshard ]] && enable=1
+    variant_env=()
+    if [[ $variant == headshard ]]; then
+        # The first production head-shard run also changed pair 1 from
+        # partner-local top-k ownership to a gather-home/peer-read route.  The
+        # corrected physical fixture proves q_b through output-B exact when
+        # both devices receive identical top-k indices, so remove that second
+        # topology change here while retaining live raw/compressed KV mirrors.
+        # This makes the next result a direct discriminator: exact logits
+        # implicate the pair-1 indexer split/gather interaction; a mismatch
+        # moves the audit to live cache/state inputs absent from the fixture.
+        variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
+    fi
     base="$OUTPUT_DIR/production/$variant"
     logits="$base-logits"
     telemetry="$base-telemetry.csv"
@@ -140,6 +152,7 @@ for variant in control headshard; do
         DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
         "DS4_CUDA_TP_PREFILL_T32_HEADS=$enable" \
         DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT=0 \
+        "${variant_env[@]}" \
         ./ds4-bench --cuda --cuda-tensor-parallel \
             --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
             --model "$MODEL" --prompt-file "$PROMPT" \
@@ -177,8 +190,12 @@ for variant in control headshard; do
             "$base.log" || die "candidate missed local T32 head-shard dispatch"
         grep -Fq 'query=local-T32-head-shards KV=local-mirrors' "$base.log" ||
             die "candidate attention did not consume local query/KV"
-        grep -Fq 'selected-mode=gather-home' "$base.log" ||
-            die "candidate did not assemble the full top-k list for both head shards"
+        grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
+            "$base.log" ||
+            die "candidate did not disable pair-1 indexer splitting"
+        ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+            "$base.log" ||
+            die "candidate unexpectedly split pair-1 indexer/top-k"
         ! grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
             die "candidate fell back to pair-1 query-row splitting"
     else
@@ -263,6 +280,7 @@ with (root / "summary.txt").open("w") as f:
     f.write("query_input_transfer_bytes_per_pair1_layer_chunk=2097152\n")
     f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
     f.write("partner_low_rank_return_bytes_per_pair1_layer_chunk=8388608\n")
+    f.write("candidate_pair1_indexer=home-full\n")
     f.write("logits=bit-exact\n")
     for gpu in sorted(set(cm) | set(hm)):
         f.write(f"gpu{gpu}_control_max_vram_mib={cm.get(gpu, 0):.0f}\n")

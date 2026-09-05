@@ -5734,6 +5734,21 @@ installs all selective ownership once, and retains those bindings across both
 the isolated checks and production-ordered replay.  Only that corrected result
 can establish or reject an asynchronous engine defect.
 
+The corrected persistent-map run is bit-exact across every physical and
+production-ordered boundary on the stable GPU3/GPU2 pair.  It also passes
+Compute Sanitizer.  This rules out q_b arithmetic, local-head attention,
+inverse RoPE, split output-A, the compact gather, output-B, and their unfenced
+default-stream schedule.  The original full-model A/B changed one additional
+input that the fixture intentionally held constant: pair 1 indexer selection
+changed from partner-local halves to gather-home plus a partner peer read.  The
+next production A/B therefore forces only the head-shard arm's pair-1 indexer
+back to one full home-local execution.  Live raw/compressed KV mirroring and
+the complete T32-through-output-B candidate remain enabled.  Exact logits
+identify the prior pair-1 indexer split/gather interaction as the defect; a
+remaining mismatch advances the audit to live cache/state inputs absent from
+the fixture, led by the attention-cache mirror/update path.  This is a
+diagnostic cut, not a proposed production rollback.
+
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
