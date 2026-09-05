@@ -5648,3 +5648,15 @@ GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-attention-distributed-output-ab.sh
 ```
+# Stable-pair T32 head-shard through attention
+
+`cuda-sm75-t32-headshard-through-attention-ab.sh` is the opt-in all43 native-Q8
+production A/B for replacing pair-1 attention token-row splitting with a
+32/32-head pipeline that begins at q_b.  It copies only the normalized
+1024-wide q_b input to the partner, projects contiguous T32 head halves into
+local full-stride query scratch, consumes pair-1-local KV mirrors, retains the
+existing 4/4-group output-A split, and gathers one 4096-wide low-rank half for
+the single home output-B GEMM.  Pair 0 remains disabled.  The candidate cache
+plan replaces full T32/A F16 bindings with two halves; aggregate model-cache
+bytes must match control.  The harness requires byte-identical frontier logits
+and leaves `DS4_CUDA_TP_PREFILL_T32_HEADS` default-off.

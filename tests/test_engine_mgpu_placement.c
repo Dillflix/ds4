@@ -41,6 +41,8 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
 int ds4_test_tensor_to_entry(const char *name, int name_len);
 bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
+bool ds4_test_cuda_tp_prefill_t32_heads_requested(void);
+bool ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_output_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
@@ -1001,6 +1003,29 @@ static void test_cuda_tp_prefill_attn_heads_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_HEADS", old);
 }
 
+static void test_cuda_tp_prefill_t32_heads_default(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_prefill_t32_heads_default\n");
+    char *old = save_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS");
+
+    unsetenv("DS4_CUDA_TP_PREFILL_T32_HEADS");
+    CHECK(!ds4_test_cuda_tp_prefill_t32_heads_requested(),
+          "T32 head-sharded prefill is experimental and default-off");
+
+    setenv("DS4_CUDA_TP_PREFILL_T32_HEADS", "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_t32_heads_requested(),
+          "T32 head-sharded prefill accepts an explicit opt-in");
+    CHECK(!ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(0),
+          "T32 head-sharded prefill excludes unstable pair 0");
+    CHECK(ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(1),
+          "T32 head-sharded prefill admits stable pair 1");
+
+    setenv("DS4_CUDA_TP_PREFILL_T32_HEADS", "0", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(1),
+          "T32 head-sharded prefill explicit zero disables pair 1");
+
+    restore_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS", old);
+}
+
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
@@ -1594,6 +1619,7 @@ int main(void) {
     test_sm75_native_indexer_cache_accounting();
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
+    test_cuda_tp_prefill_t32_heads_default();
     test_cuda_tp_prefill_attn_rows_default();
     test_cuda_tp_decode_indexer_rows_default();
     test_cuda_tp_prefill_attn_rows_shape();

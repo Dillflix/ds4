@@ -12503,6 +12503,8 @@ __global__ static void head_rms_norm_rope_tail_from_half_kernel(
         const __half *x,
         uint32_t n_tok,
         uint32_t n_head,
+        uint32_t head0,
+        uint32_t n_head_total,
         uint32_t head_dim,
         uint32_t n_rot,
         uint32_t pos0,
@@ -12518,8 +12520,10 @@ __global__ static void head_rms_norm_rope_tail_from_half_kernel(
     const uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
     const uint32_t t = row / n_head;
+    const uint32_t local_head = row - t * n_head;
     const __half *xr = x + (uint64_t)row * head_dim;
-    float *orow = out + (uint64_t)row * head_dim;
+    float *orow = out +
+        ((uint64_t)t * n_head_total + head0 + local_head) * head_dim;
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         const float v = __half2float(xr[i]);
@@ -41238,11 +41242,12 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
     return 0;
 }
 
-extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
         ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
-        uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_tok, uint32_t n_head, uint32_t head0,
+        uint32_t n_head_total, uint32_t head_dim,
         uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
         float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow, float eps) {
@@ -41254,25 +41259,30 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
      * cached-F16 projection/output path without wiring it into the engine. */
     const bool decode_probe =
         n_tok == 1u && in_dim == 1024u && out_dim == 16384u &&
-        n_head == 32u && head_dim == 512u && n_rot == 64u &&
+        n_head == 32u && head0 == 0u && n_head_total == n_head &&
+        head_dim == 512u && n_rot == 64u &&
         decode_probe_env && decode_probe_env[0] &&
         strcmp(decode_probe_env, "0") != 0;
     if ((fused_env && fused_env[0] && strcmp(fused_env, "0") == 0) ||
         getenv("DS4_CUDA_NO_T32_F16_FUSED") != NULL ||
         !g_cublas_ready || !out || !x || !model_map ||
         n_tok == 0u || (n_tok == 1u && !decode_probe) ||
-        n_head == 0u || head_dim == 0u ||
+        n_head == 0u || n_head_total == 0u || head_dim == 0u ||
         in_dim == 0u || out_dim == 0u ||
         in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
         n_rot > head_dim || (n_rot & 1u) != 0u ||
+        head0 > n_head_total || n_head > n_head_total - head0 ||
         out_dim != (uint64_t)n_head * head_dim ||
         (uint64_t)n_tok * n_head > UINT32_MAX ||
         (uint64_t)n_tok > UINT64_MAX / in_dim ||
         (uint64_t)n_tok * in_dim > UINT64_MAX / sizeof(float) ||
-        (uint64_t)n_tok > UINT64_MAX / out_dim ||
-        (uint64_t)n_tok * out_dim > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tok > UINT64_MAX /
+            ((uint64_t)n_head_total * head_dim) ||
+        (uint64_t)n_tok * n_head_total * head_dim >
+            UINT64_MAX / sizeof(float) ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
+        out->bytes < (uint64_t)n_tok * n_head_total * head_dim *
+            sizeof(float)) {
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out);
@@ -41390,7 +41400,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     const uint32_t postprocess_rows = (uint32_t)((uint64_t)n_tok * n_head);
     head_rms_norm_rope_tail_from_half_kernel<<<postprocess_rows, 256>>>(
         (float *)out->ptr, (const __half *)q_half_eff->ptr,
-        n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+        n_tok, n_head, head0, n_head_total, head_dim, n_rot, pos0, n_ctx_orig,
         inverse ? 1 : 0, freq_base, freq_scale, ext_factor,
         attn_factor, beta_fast, beta_slow, eps);
     if (!cuda_ok(cudaGetLastError(),
@@ -41403,6 +41413,37 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
             1u, std::memory_order_relaxed);
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow, float eps) {
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
+        out, q_half, model_map, model_size, weight_offset, in_dim, out_dim, x,
+        n_tok, n_head, 0u, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+        inverse, freq_base, freq_scale, ext_factor, attn_factor, beta_fast,
+        beta_slow, eps);
+}
+
+extern "C" int ds4_gpu_attn_q_b_f16_head_shard_rms_rope_tail_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *q_half,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint32_t n_tok, uint32_t n_head, uint32_t head0,
+        uint32_t n_head_total, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow, float eps) {
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
+        out, q_half, model_map, model_size, weight_offset, in_dim, out_dim, x,
+        n_tok, n_head, head0, n_head_total, head_dim, n_rot, pos0,
+        n_ctx_orig, inverse, freq_base, freq_scale, ext_factor, attn_factor,
+        beta_fast, beta_slow, eps);
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
