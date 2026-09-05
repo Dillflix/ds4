@@ -5576,12 +5576,23 @@ record preserves that alignment. The report distinguishes the 514-float
 logical payload from the 516-float aligned transfer allocation; modeled
 transport uses the latter rather than hiding the eight-byte-per-head padding.
 
-This is deliberately not the existing 32-head-per-GPU policy. A head shard
-needs every selected cache row on each GPU, which recreates the history mirror
-we are trying to remove. With authoritative row shards, each owner must instead
-evaluate all 64 heads over its local rows; only the compact softmax state is
-returned to the sink. The experiment therefore tests the no-mirror topology,
-not another spelling of the current head split.
+The physical run also measures an exact 32-head-per-GPU comparator without
+recreating a history mirror. Both GPUs retain only their authoritative
+even/odd compact-cache shard; each 32-head kernel reads its local rows locally
+and the opposite parity directly through the peer mapping while following the
+original global Top-K order. The inclusive timing packs and transfers only the
+peer query half, transfers the global Top-K list, runs both head shards, returns
+the peer output half, and scatters it into the full result. It reports explicit
+transfer bytes separately from modeled direct peer cache reads and requires a
+bit-identical result. This directly tests whether the 64% smaller compact row
+can make the formerly slower peer-read head split viable while retaining the
+single-copy, half-per-GPU cache footprint.
+
+The partial-state arm remains the lower-traffic, numerically reassociated
+alternative: each row owner evaluates all 64 heads and returns one compact
+softmax state. Reporting both arms in one physical-pair run makes the choice
+explicit: exact head sharding with extra peer cache traffic versus faster
+row-shard merging with measured floating-point drift.
 
 The accounting reports one authoritative cache, half-shard residency per GPU,
 the projected all-43-layer footprint at 256K context, the actual 22/21 pipeline

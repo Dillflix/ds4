@@ -212,7 +212,10 @@ __device__ __forceinline__ static void online_update(
     *max_score = next_max;
 }
 
-template <bool OWNER_LOCAL>
+template <bool OWNER_LOCAL,
+          uint32_t HEAD_BASE = 0u,
+          uint32_t HEAD_COUNT = N_HEAD,
+          bool COMPACT_IO = false>
 __global__ static void ordered_attention_kernel(
         const CompactAttentionKVRow *full_rows,
         const CompactAttentionKVRow *owner0_rows,
@@ -227,12 +230,15 @@ __global__ static void ordered_attention_kernel(
     const uint32_t token = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head = blockIdx.y * HEADS_PER_BLOCK + warp;
-    if (token >= n_tokens || head >= N_HEAD) return;
+    const uint32_t local_head = blockIdx.y * HEADS_PER_BLOCK + warp;
+    const uint32_t head = HEAD_BASE + local_head;
+    if (token >= n_tokens || local_head >= HEAD_COUNT || head >= N_HEAD) return;
 
     __shared__ float4 staged[ROWS_PER_STAGE * (HEAD_DIM / 4u)];
+    const uint32_t io_head = COMPACT_IO ? local_head : head;
+    const uint32_t io_head_count = COMPACT_IO ? HEAD_COUNT : N_HEAD;
     const float4 *q4 = (const float4 *)(
-        query + ((uint64_t)token * N_HEAD + head) * HEAD_DIM);
+        query + ((uint64_t)token * io_head_count + io_head) * HEAD_DIM);
     const float4 q0 = q4[lane + 0u];
     const float4 q1 = q4[lane + 32u];
     const float4 q2 = q4[lane + 64u];
@@ -292,7 +298,7 @@ __global__ static void ordered_attention_kernel(
     o3.x *= old_scale * inv_sum; o3.y *= old_scale * inv_sum;
     o3.z *= old_scale * inv_sum; o3.w *= old_scale * inv_sum;
     float4 *dst = (float4 *)(out +
-        ((uint64_t)token * N_HEAD + head) * HEAD_DIM);
+        ((uint64_t)token * io_head_count + io_head) * HEAD_DIM);
     dst[lane + 0u] = o0;
     dst[lane + 32u] = o1;
     dst[lane + 64u] = o2;
@@ -542,6 +548,39 @@ static float median_arm(
     return median;
 }
 
+__global__ static void pack_head_half_kernel(
+        const float *full, float *half, uint32_t n_tokens,
+        uint32_t head_base) {
+    const uint64_t values =
+        (uint64_t)n_tokens * (N_HEAD / 2u) * HEAD_DIM;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < values; i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t d = (uint32_t)(i % HEAD_DIM);
+        const uint64_t th = i / HEAD_DIM;
+        const uint32_t local_head = (uint32_t)(th % (N_HEAD / 2u));
+        const uint32_t token = (uint32_t)(th / (N_HEAD / 2u));
+        half[i] = full[
+            ((uint64_t)token * N_HEAD + head_base + local_head) *
+            HEAD_DIM + d];
+    }
+}
+
+__global__ static void scatter_head_half_kernel(
+        const float *half, float *full, uint32_t n_tokens,
+        uint32_t head_base) {
+    const uint64_t values =
+        (uint64_t)n_tokens * (N_HEAD / 2u) * HEAD_DIM;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < values; i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t d = (uint32_t)(i % HEAD_DIM);
+        const uint64_t th = i / HEAD_DIM;
+        const uint32_t local_head = (uint32_t)(th % (N_HEAD / 2u));
+        const uint32_t token = (uint32_t)(th / (N_HEAD / 2u));
+        full[((uint64_t)token * N_HEAD + head_base + local_head) *
+             HEAD_DIM + d] = half[i];
+    }
+}
+
 /* Stable device-side route construction for the physical protocol. One block
  * owns each token. Ballots derive lane-local positions and thread zero derives
  * warp bases, preserving global Top-K order within each owner without the
@@ -640,12 +679,19 @@ struct PhysicalProtocol {
     uint32_t *peer_owner1_counts;
     const float *home_query;
     float *peer_query;
+    float *home_query_half;
+    float *peer_query_half;
     const float *home_sinks;
     float *home_state0;
     float *home_state1;
     float *peer_state1;
     float *home_output;
+    float *home_exact_output;
+    float *home_output_half;
+    float *peer_output_half;
     size_t query_bytes;
+    size_t half_query_bytes;
+    size_t topk_bytes;
     size_t owner_topk_bytes;
     size_t owner_count_bytes;
     size_t state_storage_bytes;
@@ -797,6 +843,144 @@ static float median_physical_protocol(
     return median;
 }
 
+/* Exact alternative to partial-state merging. Each GPU evaluates 32 heads in
+ * the original global Top-K order. The two cache allocations remain disjoint:
+ * local rows are loaded locally and the opposite parity is read directly over
+ * the peer mapping. Only the peer head-half query/result and global Top-K list
+ * are copied. This deliberately includes query packing and result scattering. */
+static float time_physical_exact_headshard(
+        const PhysicalProtocol *protocol, uint32_t repeats) {
+    constexpr uint32_t HALF_HEADS = N_HEAD / 2u;
+    const uint64_t half_values =
+        (uint64_t)protocol->n_tokens * HALF_HEADS * HEAD_DIM;
+    const uint32_t copy_blocks =
+        (uint32_t)((half_values + THREADS - 1u) / THREADS);
+    const dim3 half_grid(protocol->n_tokens,
+                         HALF_HEADS / HEADS_PER_BLOCK, 1u);
+
+    cuda_die(cudaSetDevice((int)protocol->home_device),
+             "select exact-headshard home device");
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin), "create exact-headshard begin event");
+    cuda_die(cudaEventCreate(&end), "create exact-headshard end event");
+    cuda_die(cudaEventRecord(begin, protocol->home_stream),
+             "record exact-headshard begin event");
+
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        pack_head_half_kernel<<<copy_blocks, THREADS, 0,
+                                protocol->home_stream>>>(
+            protocol->home_query, protocol->home_query_half,
+            protocol->n_tokens, HALF_HEADS);
+        cuda_die(cudaGetLastError(), "pack exact-headshard peer query");
+        cuda_die(cudaEventRecord(protocol->route_ready,
+                                 protocol->home_stream),
+                 "record exact-headshard inputs ready");
+
+        cuda_die(cudaSetDevice((int)protocol->peer_device),
+                 "select exact-headshard peer device");
+        cuda_die(cudaStreamWaitEvent(protocol->peer_stream,
+                                     protocol->route_ready, 0u),
+                 "wait for exact-headshard inputs");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->peer_query_half,
+                     (int)protocol->peer_device,
+                     protocol->home_query_half,
+                     (int)protocol->home_device,
+                     protocol->half_query_bytes,
+                     protocol->peer_stream),
+                 "transfer exact-headshard peer query");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->peer_owner1_topk,
+                     (int)protocol->peer_device,
+                     protocol->home_global_topk,
+                     (int)protocol->home_device,
+                     protocol->topk_bytes,
+                     protocol->peer_stream),
+                 "transfer exact-headshard global Top-K");
+        ordered_attention_kernel<true, HALF_HEADS, HALF_HEADS, true><<<
+            half_grid, THREADS, 0, protocol->peer_stream>>>(
+                NULL,
+                protocol->home_owner0_rows,
+                protocol->peer_owner1_rows,
+                0u,
+                protocol->peer_owner1_topk,
+                protocol->home_sinks,
+                protocol->peer_query_half,
+                protocol->peer_output_half,
+                protocol->n_tokens);
+        cuda_die(cudaGetLastError(), "launch exact-headshard peer heads");
+
+        cuda_die(cudaSetDevice((int)protocol->home_device),
+                 "select exact-headshard home device");
+        ordered_attention_kernel<true, 0u, HALF_HEADS, false><<<
+            half_grid, THREADS, 0, protocol->home_stream>>>(
+                NULL,
+                protocol->home_owner0_rows,
+                protocol->peer_owner1_rows,
+                0u,
+                protocol->home_global_topk,
+                protocol->home_sinks,
+                protocol->home_query,
+                protocol->home_exact_output,
+                protocol->n_tokens);
+        cuda_die(cudaGetLastError(), "launch exact-headshard home heads");
+
+        cuda_die(cudaSetDevice((int)protocol->peer_device),
+                 "select exact-headshard peer completion");
+        cuda_die(cudaStreamSynchronize(protocol->peer_stream),
+                 "synchronize exact-headshard peer heads");
+
+        cuda_die(cudaSetDevice((int)protocol->home_device),
+                 "select exact-headshard home result");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->home_output_half,
+                     (int)protocol->home_device,
+                     protocol->peer_output_half,
+                     (int)protocol->peer_device,
+                     protocol->half_query_bytes,
+                     protocol->home_stream),
+                 "transfer exact-headshard peer result");
+        scatter_head_half_kernel<<<copy_blocks, THREADS, 0,
+                                   protocol->home_stream>>>(
+            protocol->home_output_half,
+            protocol->home_exact_output,
+            protocol->n_tokens, HALF_HEADS);
+        cuda_die(cudaGetLastError(), "scatter exact-headshard peer result");
+        cuda_die(cudaStreamSynchronize(protocol->home_stream),
+                 "synchronize exact-headshard result");
+    }
+
+    cuda_die(cudaEventRecord(end, protocol->home_stream),
+             "record exact-headshard end event");
+    cuda_die(cudaEventSynchronize(end),
+             "synchronize exact-headshard end event");
+    float elapsed = 0.0f;
+    cuda_die(cudaEventElapsedTime(&elapsed, begin, end),
+             "measure exact-headshard time");
+    cuda_die(cudaEventDestroy(begin),
+             "destroy exact-headshard begin event");
+    cuda_die(cudaEventDestroy(end),
+             "destroy exact-headshard end event");
+    return elapsed / (float)repeats;
+}
+
+static float median_physical_exact_headshard(
+        const PhysicalProtocol *protocol,
+        uint32_t rounds, uint32_t repeats) {
+    float *samples = (float *)malloc((size_t)rounds * sizeof(float));
+    if (!samples) {
+        fprintf(stderr, "error: exact-headshard timing allocation failed\n");
+        exit(2);
+    }
+    for (uint32_t round = 0; round < rounds; round++) {
+        samples[round] = time_physical_exact_headshard(protocol, repeats);
+    }
+    qsort(samples, rounds, sizeof(float), float_compare);
+    const float median = samples[rounds / 2u];
+    free(samples);
+    return median;
+}
+
 static uint32_t parse_u32(const char *text, const char *name) {
     char *end = NULL;
     const unsigned long value = strtoul(text, &end, 10);
@@ -914,6 +1098,7 @@ int main(int argc, char **argv) {
         (size_t)owner1_count * sizeof(CompactAttentionKVRow);
     const size_t query_bytes =
         (size_t)n_tokens * N_HEAD * HEAD_DIM * sizeof(float);
+    const size_t half_query_bytes = query_bytes / 2u;
     const size_t sink_bytes = N_HEAD * sizeof(float);
     const size_t topk_bytes = (size_t)n_tokens * TOP_K * sizeof(int32_t);
     const size_t owner_topk_bytes =
@@ -947,9 +1132,10 @@ int main(int argc, char **argv) {
     float *host_control = (float *)malloc(output_bytes);
     float *host_ordered = (float *)malloc(output_bytes);
     float *host_parallel = (float *)malloc(output_bytes);
+    float *host_exact = (float *)malloc(output_bytes);
     if (!host_query || !host_sinks || !host_topk ||
         !host_owner0_topk || !host_owner1_topk ||
-        !host_control || !host_ordered || !host_parallel) {
+        !host_control || !host_ordered || !host_parallel || !host_exact) {
         fprintf(stderr, "error: host allocation failed\n");
         return 2;
     }
@@ -1000,8 +1186,14 @@ int main(int argc, char **argv) {
     GuardedBuffer d_control = guarded_alloc(output_bytes, "allocate control output");
     GuardedBuffer d_ordered = guarded_alloc(output_bytes, "allocate ordered output");
     GuardedBuffer d_parallel = guarded_alloc(output_bytes, "allocate parallel output");
+    GuardedBuffer d_exact = guarded_alloc(output_bytes,
+                                           "allocate exact head-shard output");
+    GuardedBuffer d_home_query_half = {};
+    GuardedBuffer d_home_output_half = {};
     GuardedBuffer d_peer_owner1 = {};
     GuardedBuffer d_peer_query = {};
+    GuardedBuffer d_peer_query_half = {};
+    GuardedBuffer d_peer_output_half = {};
     GuardedBuffer d_peer_owner1_topk = {};
     GuardedBuffer d_peer_owner1_counts = {};
     GuardedBuffer d_peer_state1 = {};
@@ -1030,6 +1222,10 @@ int main(int argc, char **argv) {
              "copy owner1 local top-k");
 
     if (physical_pair) {
+        d_home_query_half = guarded_alloc(
+            half_query_bytes, "allocate exact head-shard packed query");
+        d_home_output_half = guarded_alloc(
+            half_query_bytes, "allocate exact head-shard returned output");
         cuda_die(cudaStreamCreateWithFlags(
                      &home_physical_stream, cudaStreamNonBlocking),
                  "create physical home stream");
@@ -1039,6 +1235,10 @@ int main(int argc, char **argv) {
             guarded_alloc(owner1_bytes, "allocate physical peer cache");
         d_peer_query =
             guarded_alloc(query_bytes, "allocate physical peer query");
+        d_peer_query_half = guarded_alloc(
+            half_query_bytes, "allocate exact head-shard peer query");
+        d_peer_output_half = guarded_alloc(
+            half_query_bytes, "allocate exact head-shard peer output");
         d_peer_owner1_topk = guarded_alloc(
             owner_topk_bytes, "allocate physical peer selection route");
         d_peer_owner1_counts = guarded_alloc(
@@ -1135,13 +1335,14 @@ int main(int argc, char **argv) {
         &d_full, &d_owner0, &d_owner1, &d_query, &d_sinks, &d_topk,
         &d_owner0_topk, &d_owner1_topk, &d_owner0_counts, &d_owner1_counts,
         &d_state0, &d_state1,
-        &d_control, &d_ordered, &d_parallel,
+        &d_control, &d_ordered, &d_parallel, &d_exact,
     };
     const char *buffer_names[] = {
         "control cache", "owner0 cache", "owner1 cache", "query", "sinks",
         "top-k", "owner0 local top-k", "owner1 local top-k",
         "owner0 route counts", "owner1 route counts", "owner0 state",
         "owner1 state", "control output", "ordered output", "parallel output",
+        "exact head-shard output",
     };
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
         if (!check_guard(buffers[i], buffer_names[i])) return 1;
@@ -1198,6 +1399,9 @@ int main(int argc, char **argv) {
     uint64_t physical_nonfinite = 0u;
     float physical_max_abs = 0.0f;
     double physical_squared_error = 0.0;
+    float exact_headshard_ms = 0.0f;
+    uint64_t exact_headshard_mismatches = 0u;
+    uint64_t exact_headshard_nonfinite = 0u;
     if (physical_pair) {
         PhysicalProtocol protocol = {};
         protocol.home_device = device;
@@ -1219,12 +1423,19 @@ int main(int argc, char **argv) {
             (uint32_t *)d_peer_owner1_counts.data;
         protocol.home_query = query;
         protocol.peer_query = (float *)d_peer_query.data;
+        protocol.home_query_half = (float *)d_home_query_half.data;
+        protocol.peer_query_half = (float *)d_peer_query_half.data;
         protocol.home_sinks = sinks;
         protocol.home_state0 = state0;
         protocol.home_state1 = state1;
         protocol.peer_state1 = (float *)d_peer_state1.data;
         protocol.home_output = (float *)d_parallel.data;
+        protocol.home_exact_output = (float *)d_exact.data;
+        protocol.home_output_half = (float *)d_home_output_half.data;
+        protocol.peer_output_half = (float *)d_peer_output_half.data;
         protocol.query_bytes = query_bytes;
+        protocol.half_query_bytes = half_query_bytes;
+        protocol.topk_bytes = topk_bytes;
         protocol.owner_topk_bytes = owner_topk_bytes;
         protocol.owner_count_bytes = owner_count_bytes;
         protocol.state_storage_bytes = state_storage_bytes;
@@ -1261,6 +1472,32 @@ int main(int argc, char **argv) {
                     (unsigned long long)physical_nonfinite);
             return 1;
         }
+
+        time_physical_exact_headshard(&protocol, 1u);
+        exact_headshard_ms = median_physical_exact_headshard(
+            &protocol, rounds, repeats);
+        cuda_die(cudaSetDevice((int)device),
+                 "select home for exact-headshard output copy");
+        cuda_die(cudaMemcpy(host_exact, d_exact.data, output_bytes,
+                            cudaMemcpyDeviceToHost),
+                 "copy exact-headshard output");
+        for (uint64_t i = 0; i < output_values; i++) {
+            uint32_t reference_bits, exact_bits;
+            memcpy(&reference_bits, host_control + i,
+                   sizeof(reference_bits));
+            memcpy(&exact_bits, host_exact + i, sizeof(exact_bits));
+            exact_headshard_mismatches += reference_bits != exact_bits;
+            exact_headshard_nonfinite += !isfinite(host_exact[i]);
+        }
+        if (exact_headshard_mismatches != 0u ||
+            exact_headshard_nonfinite != 0u) {
+            fprintf(stderr,
+                    "error: exact head shard failed validation: "
+                    "mismatches=%llu nonfinite=%llu\n",
+                    (unsigned long long)exact_headshard_mismatches,
+                    (unsigned long long)exact_headshard_nonfinite);
+            return 1;
+        }
     }
 
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
@@ -1271,10 +1508,12 @@ int main(int argc, char **argv) {
                  "select peer for physical guard validation");
         GuardedBuffer *peer_buffers[] = {
             &d_peer_owner1, &d_peer_query,
+            &d_peer_query_half, &d_peer_output_half,
             &d_peer_owner1_topk, &d_peer_owner1_counts, &d_peer_state1,
         };
         const char *peer_buffer_names[] = {
             "physical peer cache", "physical peer query",
+            "exact head-shard peer query", "exact head-shard peer output",
             "physical peer selection route", "physical peer route counts",
             "physical peer state",
         };
@@ -1284,6 +1523,10 @@ int main(int argc, char **argv) {
         }
         cuda_die(cudaSetDevice((int)device),
                  "restore home after physical guard validation");
+        if (!check_guard(&d_home_query_half,
+                         "exact head-shard packed query") ||
+            !check_guard(&d_home_output_half,
+                         "exact head-shard returned output")) return 1;
     }
 
     const uint64_t compact_cache_bytes = full_bytes;
@@ -1297,6 +1540,11 @@ int main(int argc, char **argv) {
     const uint64_t remote_selection_route_storage_bytes =
         owner_topk_bytes + owner_count_bytes;
     const uint64_t all_owner_selection_bytes = topk_bytes;
+    const uint64_t exact_headshard_explicit_transfer_bytes =
+        (uint64_t)half_query_bytes * 2ull + topk_bytes;
+    const uint64_t exact_headshard_modeled_peer_cache_read_bytes =
+        2ull * (N_HEAD / 2u / HEADS_PER_BLOCK) * n_tokens *
+        (TOP_K / 2u) * sizeof(CompactAttentionKVRow);
     const uint64_t compact_cache_43_layer_256k_bytes =
         compact_cache_256k_bytes * 43ull;
     const uint64_t compact_half_shard_43_layer_256k_bytes =
@@ -1319,6 +1567,8 @@ int main(int argc, char **argv) {
         printf("peer_device_name=%s\n", peer_properties.name);
         printf("physical_protocol_query_wire=f32\n");
         printf("physical_protocol_timing=inclusive-device-route-partition-query-route-partials-state-merge\n");
+        printf("exact_headshard_timing=inclusive-query-pack-query-topk-transfer-two-head-shards-result-return-scatter\n");
+        printf("exact_headshard_remote_cache_access=direct-peer-read-opposite-even-odd-shard\n");
     }
     printf("cache_ownership=two-separately-guarded-even-odd-row-shards\n");
     printf("cache_growth_balance=every-emitted-row-alternates-owner\n");
@@ -1380,6 +1630,13 @@ int main(int argc, char **argv) {
     printf("minimum_modeled_transport_f16_query_bytes=%llu\n",
            (unsigned long long)(state_handoff_aligned_bytes + query_f16_bytes +
                                 remote_selection_route_storage_bytes));
+    printf("exact_headshard_explicit_transfer_bytes=%llu\n",
+           (unsigned long long)exact_headshard_explicit_transfer_bytes);
+    printf("exact_headshard_modeled_peer_cache_read_bytes=%llu\n",
+           (unsigned long long)exact_headshard_modeled_peer_cache_read_bytes);
+    printf("exact_headshard_modeled_total_link_bytes=%llu\n",
+           (unsigned long long)(exact_headshard_explicit_transfer_bytes +
+                                exact_headshard_modeled_peer_cache_read_bytes));
     printf("ordered_local_address_bit_mismatches=%llu\n",
            (unsigned long long)ordered_mismatches);
     printf("control_nonfinite=%llu\n",
@@ -1417,10 +1674,21 @@ int main(int argc, char **argv) {
         printf("physical_pair_relative_l2=%.9g\n",
                reference_squared == 0.0 ? 0.0 :
                sqrt(physical_squared_error / reference_squared));
+        printf("physical_exact_headshard_median_ms=%.9g\n",
+               exact_headshard_ms);
+        printf("physical_exact_headshard_speedup=%.9g\n",
+               control_ms / exact_headshard_ms);
+        printf("physical_exact_headshard_bit_mismatches=%llu\n",
+               (unsigned long long)exact_headshard_mismatches);
+        printf("physical_exact_headshard_nonfinite=%llu\n",
+               (unsigned long long)exact_headshard_nonfinite);
     }
     printf("ordered_address_exactness_eligible=1\n");
     printf("parallel_exactness_eligible=%u\n",
            parallel_mismatches == 0u ? 1u : 0u);
+    printf("physical_exact_headshard_exactness_eligible=%u\n",
+           physical_pair && exact_headshard_mismatches == 0u &&
+                   exact_headshard_nonfinite == 0u ? 1u : 0u);
     printf("physical_multi_gpu_validation_completed=%u\n",
            physical_pair ? 1u : 0u);
     printf("production_integration_eligible=0\n");
@@ -1433,6 +1701,8 @@ int main(int argc, char **argv) {
                  "destroy physical peer stream");
         cudaFree(d_peer_owner1.base);
         cudaFree(d_peer_query.base);
+        cudaFree(d_peer_query_half.base);
+        cudaFree(d_peer_output_half.base);
         cudaFree(d_peer_owner1_topk.base);
         cudaFree(d_peer_owner1_counts.base);
         cudaFree(d_peer_state1.base);
@@ -1442,6 +1712,8 @@ int main(int argc, char **argv) {
                  "destroy physical home stream");
         cuda_die(cudaEventDestroy(physical_route_ready),
                  "destroy physical route event");
+        cudaFree(d_home_query_half.base);
+        cudaFree(d_home_output_half.base);
     }
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
         cudaFree(buffers[i]->base);
@@ -1457,5 +1729,6 @@ int main(int argc, char **argv) {
     free(host_control);
     free(host_ordered);
     free(host_parallel);
+    free(host_exact);
     return 0;
 }

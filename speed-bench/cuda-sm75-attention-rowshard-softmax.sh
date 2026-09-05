@@ -121,9 +121,17 @@ fi
 "./$target" "${timing_args[@]}" >"$OUTPUT_DIR/timing.log" 2>&1
 grep -q '^ordered_local_address_bit_mismatches=0$' "$OUTPUT_DIR/timing.log" ||
     die "timed owner-local addressing was not exact"
+if [[ -n $PEER_GPU ]]; then
+    grep -q '^physical_exact_headshard_bit_mismatches=0$' \
+        "$OUTPUT_DIR/timing.log" ||
+        die "physical exact head-shard peer-read arm was not exact"
+    grep -q '^physical_exact_headshard_exactness_eligible=1$' \
+        "$OUTPUT_DIR/timing.log" ||
+        die "physical exact head-shard peer-read arm was ineligible"
+fi
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||
     die "timed row-shard experiment failed"
 
 printf 'SM75 row-sharded compact-attention softmax prototype complete: %s\n' \
     "$OUTPUT_DIR"
-tail -n 40 "$OUTPUT_DIR/timing.log"
+tail -n 60 "$OUTPUT_DIR/timing.log"
