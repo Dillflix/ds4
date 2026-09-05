@@ -5749,6 +5749,29 @@ remaining mismatch advances the audit to live cache/state inputs absent from
 the fixture, led by the attention-cache mirror/update path.  This is a
 diagnostic cut, not a proposed production rollback.
 
+That production cut completed both arms before an obsolete harness assertion
+stopped post-processing.  Pair-1 indexer splitting was in fact disabled in the
+head-shard log as intended.  The candidate still produced materially different
+logits and was slightly slower (387.08 versus 393.14 prefill tok/s, 0.98459x),
+so the indexer split/gather route is not the source of the divergence.  The
+harness now scopes the pair-1 indexer assertion to the control arm.
+
+`CACHE_AUDIT_ONLY=1` is the next narrow diagnostic.  It runs only the head-shard
+production arm and enables a stream-ordered raw/compressed-KV mirror audit.  On
+the home default stream, each source span is copied to a bounded diagnostic
+snapshot before the ordinary peer transfer.  After the normal copy-completion
+wait, a destination-default-stream kernel compares the mirror byte-for-byte
+against that immutable snapshot.  No host synchronization occurs in the
+workload.  A small device record retains only the first mismatching span/byte
+and is read at teardown.  This separates corrupt/stale live KV mirroring from
+the already-exact q_b-through-output-B fixture without repeating the control
+run.
+
+```bash
+CACHE_AUDIT_ONLY=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh
+```
+
 ```bash
 PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \

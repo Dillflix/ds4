@@ -18,6 +18,7 @@ MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.90}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-ab-$stamp}
 
@@ -27,7 +28,8 @@ OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-a
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
-            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE"; do
+            "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
+            "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
 done
@@ -35,7 +37,7 @@ done
    CTX_TOKENS % 512 == 0 && CTX_ALLOC > CTX_TOKENS &&
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
-for flag in SKIP_BUILD CREATE_ARCHIVE; do
+for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
@@ -108,6 +110,7 @@ phase=manifest
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$CTX_TOKENS"
+    printf 'cache_audit_only=%s\n' "$CACHE_AUDIT_ONLY"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
     printf '\ntopology:\n'
@@ -118,7 +121,9 @@ git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
 
 phase=production-ab
 printf 'variant,csv,log,logits,telemetry\n' >"$OUTPUT_DIR/production/runs.csv"
-for variant in control headshard; do
+variants=(control headshard)
+if [[ $CACHE_AUDIT_ONLY == 1 ]]; then variants=(headshard); fi
+for variant in "${variants[@]}"; do
     enable=0; [[ $variant == headshard ]] && enable=1
     variant_env=()
     if [[ $variant == headshard ]]; then
@@ -131,6 +136,9 @@ for variant in control headshard; do
         # implicate the pair-1 indexer split/gather interaction; a mismatch
         # moves the audit to live cache/state inputs absent from the fixture.
         variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
+        if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
+            variant_env+=(DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT=1)
+        fi
     fi
     base="$OUTPUT_DIR/production/$variant"
     logits="$base-logits"
@@ -181,8 +189,6 @@ for variant in control headshard; do
         die "$variant unexpectedly enabled unstable pair 0"
     grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' "$base.log" ||
         die "$variant did not preserve pair-0 indexer splitting"
-    grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$base.log" ||
-        die "$variant did not preserve pair-1 indexer splitting"
     if [[ $variant == headshard ]]; then
         grep -Fq 'required-native=171/171' "$base.log" ||
             die "candidate did not materialize 21 pair-1 T32/A binding pairs"
@@ -203,12 +209,43 @@ for variant in control headshard; do
             die "control did not retain 129 required bindings"
         grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
             die "control missed the established stable pair-1 row split"
+        grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' "$base.log" ||
+            die "control did not preserve pair-1 indexer splitting"
         ! grep -Fq 'CUDA prefill T32 head shard enabled:' "$base.log" ||
             die "control unexpectedly dispatched T32 head sharding"
     fi
     printf '%s,%s,%s,%s,%s\n' "$variant" "$base.csv" "$base.log" \
         "$logits" "$telemetry" >>"$OUTPUT_DIR/production/runs.csv"
 done
+
+if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
+    phase=cache-audit-summary
+    audit_line=$(grep -F 'CUDA T32 head-shard cache mirror audit:' \
+        "$OUTPUT_DIR/production/headshard.log" | tail -n 1 || true)
+    [[ -n $audit_line ]] || die "candidate omitted cache-mirror audit result"
+    [[ $audit_line != *read-failed* ]] || die "cache-mirror audit read failed"
+    printf '%s\n' "$audit_line" >"$OUTPUT_DIR/cache-audit.txt"
+    python3 - "$audit_line" >"$OUTPUT_DIR/summary.txt" <<'PY'
+import re, sys
+line = sys.argv[1]
+fields = dict(re.findall(r"([a-z_]+)=([^ ]+)", line))
+for required in ("checks", "bytes", "mismatch"):
+    if required not in fields:
+        raise SystemExit(f"error: cache audit omitted {required}")
+print("mode=headshard-cache-audit-only")
+print(f"cache_mirror_checks={fields['checks']}")
+print(f"cache_mirror_bytes={fields['bytes']}")
+print(f"cache_mirror_mismatch={fields['mismatch']}")
+if fields["mismatch"] == "1":
+    for name in ("kind", "layer", "row", "byte", "source",
+                 "destination", "source_tier", "destination_tier"):
+        print(f"first_mismatch_{name}={fields.get(name, 'missing')}")
+PY
+    cat "$OUTPUT_DIR/summary.txt"
+    phase=complete
+    printf 'SM75 T32 head-shard cache audit complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
 
 phase=exactness
 mapfile -t control_files < <(find "$OUTPUT_DIR/production/control-logits" \

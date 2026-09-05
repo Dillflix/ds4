@@ -16269,6 +16269,8 @@ typedef struct {
     bool cuda_tp_prefill_attn_output;
     bool cuda_tp_prefill_attn_heads;
     bool cuda_tp_prefill_t32_heads;
+    bool cuda_tp_t32_headshard_cache_audit;
+    bool cuda_tp_t32_headshard_cache_audit_reported;
     bool cuda_tp_prefill_attn_rows;
     bool cuda_tp_prefill_indexer_rows;
     bool cuda_tp_decode_indexer_rows;
@@ -16770,8 +16772,12 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
+static void metal_graph_cuda_t32_headshard_cache_audit_report(
+        ds4_gpu_graph *g);
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    metal_graph_cuda_t32_headshard_cache_audit_report(g);
     /* free every Class P slot across all DS4_MAX_GPUS tier
      * slots. Unallocated slots are NULL and ds4_gpu_tensor_free(NULL) is a
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
@@ -18196,6 +18202,40 @@ static bool metal_graph_alloc_raw_cap(
                 "index-pair-mask=0x%x\n",
                 g->cuda_tp_attn_cache_dup_pair_mask,
                 g->cuda_tp_index_cache_dup_pair_mask);
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+        g->cuda_tp_t32_headshard_cache_audit =
+            g->cuda_tp_prefill_t32_heads &&
+            getenv("DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT") != NULL;
+        if (g->cuda_tp_t32_headshard_cache_audit) {
+            const int partner = metal_graph_cuda_tp_partner_tier(1);
+            uint64_t snapshot_bytes =
+                (uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const uint64_t bytes =
+                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                    (DS4_GPU_ATTN_COMP_CACHE_F16
+                        ? sizeof(uint16_t) : sizeof(float));
+                if (bytes > snapshot_bytes) snapshot_bytes = bytes;
+            }
+            if (partner < 0 ||
+                !g_gpu_peer_ok[partner][1] ||
+                !ds4_gpu_xdev_exact_audit_reset(
+                    1, partner, snapshot_bytes)) {
+                fprintf(stderr,
+                        "ds4: CUDA T32 head-shard cache mirror audit "
+                        "requires reverse peer access from pair-1 partner\n");
+                g->cuda_tp_t32_headshard_cache_audit = false;
+                metal_graph_free(g);
+                return false;
+            }
+            fprintf(stderr,
+                    "ds4: CUDA T32 head-shard cache mirror audit enabled: "
+                    "source_tier=1 destination_tier=%d ordering=destination-default "
+                    "host_sync=none retention=first-mismatch "
+                    "source_snapshot_bytes=%llu\n",
+                    partner, (unsigned long long)snapshot_bytes);
+        }
+#endif
     }
     const char *prefill_attn_disabled_pairs =
         getenv("DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS");
@@ -21344,6 +21384,41 @@ typedef enum {
     DS4_CUDA_TP_ATTN_CACHE_INDEX = 2,
 } ds4_cuda_tp_attn_cache_kind;
 
+static void metal_graph_cuda_t32_headshard_cache_audit_report(
+        ds4_gpu_graph *g) {
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    if (!g || !g->cuda_tp_t32_headshard_cache_audit ||
+        g->cuda_tp_t32_headshard_cache_audit_reported) return;
+    const int partner = metal_graph_cuda_tp_partner_tier(1);
+    ds4_gpu_xdev_exact_audit audit = {0};
+    g->cuda_tp_t32_headshard_cache_audit_reported = true;
+    if (partner >= 0 && ds4_gpu_xdev_exact_audit_read(partner, &audit)) {
+        const char *kind = !audit.mismatch ? "none" :
+            (audit.kind == DS4_CUDA_TP_ATTN_CACHE_RAW
+            ? "raw" : (audit.kind == DS4_CUDA_TP_ATTN_CACHE_COMP
+                ? "attn-comp" : "unknown"));
+        fprintf(stderr,
+                "ds4: CUDA T32 head-shard cache mirror audit: "
+                "checks=%llu bytes=%llu mismatch=%u kind=%s layer=%u "
+                "row=%u byte=%llu source=%u destination=%u "
+                "source_tier=%u destination_tier=%u\n",
+                (unsigned long long)audit.checks_scheduled,
+                (unsigned long long)audit.bytes_scheduled,
+                audit.mismatch, kind, audit.layer, audit.row0,
+                (unsigned long long)audit.byte_in_span,
+                audit.source_byte, audit.destination_byte,
+                audit.source_tier, audit.destination_tier);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA T32 head-shard cache mirror audit: "
+                "read-failed destination_tier=%d\n", partner);
+    }
+    fflush(stderr);
+#else
+    (void)g;
+#endif
+}
+
 static bool metal_graph_cuda_tp_attn_cache_copy_row(
         ds4_gpu_tensor       *dst_base,
         const ds4_gpu_tensor *src_base,
@@ -21898,12 +21973,21 @@ static bool metal_graph_cuda_tp_attn_cache_copy_row(
     const bool views_ok = dst && src && src_tier >= 0;
     const bool ready_ok = views_ok &&
         ds4_gpu_tensor_wait_xdev_default(dst, src_tier) != 0;
-    const bool copy_ok = ready_ok &&
+    const bool audit = ready_ok &&
+        kind != DS4_CUDA_TP_ATTN_CACHE_INDEX &&
+        cuda_tp_prefill_t32_heads_pair_enabled(src_tier) &&
+        getenv("DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT") != NULL;
+    const bool snapshot_ok = !audit || ds4_gpu_xdev_exact_audit_snapshot(
+        src, dst_tier, bytes) != 0;
+    const bool copy_ok = ready_ok && snapshot_ok &&
         (host_bounce
              ? ds4_gpu_tensor_copy_xdev_default_host_bounce(
                    dst, src, bytes) != 0
              : ds4_gpu_tensor_copy_xdev_default(dst, src, bytes) != 0);
-    const bool ok = copy_ok;
+    const bool audit_ok = !audit ||
+        (copy_ok && ds4_gpu_xdev_exact_audit_compare(
+            dst, src, bytes, (uint32_t)kind, layer, row0) != 0);
+    const bool ok = copy_ok && audit_ok;
     if (!ok && host_bounce) {
         const char *class_name = kind == DS4_CUDA_TP_ATTN_CACHE_RAW
             ? "cache-raw"

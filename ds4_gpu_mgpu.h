@@ -236,6 +236,44 @@ int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
 int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier);
 int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int dst_tier);
 
+/* Opt-in T32 head-shard cache-mirror audit.  The comparison kernel runs on
+ * the destination default stream after the normal copy-completion wait and
+ * peer-reads the source bytes.  It never synchronizes the host and retains
+ * only the first mismatch seen in stream order.  reset/read are setup and
+ * teardown operations respectively. */
+typedef struct {
+    uint32_t mismatch;
+    uint32_t kind;
+    uint32_t layer;
+    uint32_t row0;
+    uint64_t byte_in_span;
+    uint32_t source_byte;
+    uint32_t destination_byte;
+    uint32_t source_tier;
+    uint32_t destination_tier;
+    uint64_t checks_scheduled;
+    uint64_t bytes_scheduled;
+} ds4_gpu_xdev_exact_audit;
+
+int ds4_gpu_xdev_exact_audit_reset(
+        int      source_tier,
+        int      destination_tier,
+        uint64_t snapshot_bytes);
+int ds4_gpu_xdev_exact_audit_snapshot(
+        const ds4_gpu_tensor *source,
+        int                   destination_tier,
+        uint64_t              bytes);
+int ds4_gpu_xdev_exact_audit_compare(
+        const ds4_gpu_tensor *destination,
+        const ds4_gpu_tensor *source,
+        uint64_t              bytes,
+        uint32_t              kind,
+        uint32_t              layer,
+        uint32_t              row0);
+int ds4_gpu_xdev_exact_audit_read(
+        int                       destination_tier,
+        ds4_gpu_xdev_exact_audit *result);
+
 /* Cross-device float add used by CUDA tensor-parallel reductions.
  * See ds4_gpu.h for the full contract. */
 int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor       *out,

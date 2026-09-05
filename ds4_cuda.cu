@@ -161,6 +161,8 @@ static int g_decode_score_vec4;
 static int g_xdev_sync_debug;
 static int g_xdev_force_cuda_peer;
 static int g_xdev_force_host_bounce;
+static void *g_xdev_exact_audit_snapshot[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static uint64_t g_xdev_exact_audit_snapshot_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static int g_cuda_disable_qkv_rms_fused;
 static int g_cuda_no_window_attention;
 static int g_cuda_decode_heads8_online;
@@ -6027,6 +6029,13 @@ extern "C" void ds4_gpu_cleanup(void) {
             c->scratch = NULL;
             c->scratch_bytes = 0;
         }
+        for (int j = 0; j < DS4_MAX_GPUS; j++) {
+            if (g_xdev_exact_audit_snapshot[i][j]) {
+                (void)cudaFree(g_xdev_exact_audit_snapshot[i][j]);
+                g_xdev_exact_audit_snapshot[i][j] = NULL;
+                g_xdev_exact_audit_snapshot_bytes[i][j] = 0u;
+            }
+        }
     }
     for (int i = 0; i < DS4_MAX_GPUS; i++) {
         for (int j = 0; j < DS4_MAX_GPUS; j++) {
@@ -7150,6 +7159,201 @@ extern "C" int ds4_gpu_tensor_wait_xdev_default(
                          (cudaEvent_t)g_gpu[sd].boundary_event,
                          0),
                      "default xdev wait destination wait");
+    }
+    return ok;
+}
+
+/* One record exists in each CUDA device module instance.  The diagnostic is
+ * deliberately destination-owned: every comparison is submitted after the
+ * destination's normal copy-completion wait, so it observes exactly what the
+ * following attention kernel can observe without adding a host boundary. */
+__device__ static ds4_gpu_xdev_exact_audit g_xdev_exact_audit;
+static_assert(sizeof(ds4_gpu_xdev_exact_audit) == 56u,
+              "xdev audit record ABI changed");
+
+typedef union {
+    uint4 value;
+    unsigned char byte[16];
+} xdev_exact_audit_vec;
+
+__global__ static void xdev_exact_audit_kernel(
+        const unsigned char *destination,
+        const unsigned char *source,
+        uint64_t             bytes,
+        uint32_t             kind,
+        uint32_t             layer,
+        uint32_t             row0,
+        uint32_t             source_tier,
+        uint32_t             destination_tier) {
+    const uint64_t thread =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    if (thread == 0u) {
+        atomicAdd((unsigned long long *)&g_xdev_exact_audit.checks_scheduled,
+                  1ull);
+        atomicAdd((unsigned long long *)&g_xdev_exact_audit.bytes_scheduled,
+                  (unsigned long long)bytes);
+    }
+    if (g_xdev_exact_audit.mismatch != 0u) return;
+
+    const uint64_t vectors = bytes / sizeof(uint4);
+    for (uint64_t i = thread; i < vectors; i += stride) {
+        xdev_exact_audit_vec source_vec;
+        xdev_exact_audit_vec destination_vec;
+        source_vec.value = ((const uint4 *)source)[i];
+        destination_vec.value = ((const uint4 *)destination)[i];
+        if (source_vec.value.x == destination_vec.value.x &&
+            source_vec.value.y == destination_vec.value.y &&
+            source_vec.value.z == destination_vec.value.z &&
+            source_vec.value.w == destination_vec.value.w) continue;
+        for (uint32_t j = 0u; j < sizeof(uint4); j++) {
+            const uint32_t source_byte = source_vec.byte[j];
+            const uint32_t destination_byte = destination_vec.byte[j];
+            if (source_byte == destination_byte) continue;
+            if (atomicCAS(&g_xdev_exact_audit.mismatch, 0u, 1u) == 0u) {
+                g_xdev_exact_audit.kind = kind;
+                g_xdev_exact_audit.layer = layer;
+                g_xdev_exact_audit.row0 = row0;
+                g_xdev_exact_audit.byte_in_span =
+                    i * sizeof(uint4) + j;
+                g_xdev_exact_audit.source_byte = source_byte;
+                g_xdev_exact_audit.destination_byte = destination_byte;
+                g_xdev_exact_audit.source_tier = source_tier;
+                g_xdev_exact_audit.destination_tier = destination_tier;
+            }
+            return;
+        }
+    }
+    const uint64_t vector_bytes = vectors * sizeof(uint4);
+    for (uint64_t i = vector_bytes + thread; i < bytes; i += stride) {
+        const uint32_t source_byte = source[i];
+        const uint32_t destination_byte = destination[i];
+        if (source_byte == destination_byte) continue;
+        if (atomicCAS(&g_xdev_exact_audit.mismatch, 0u, 1u) == 0u) {
+            g_xdev_exact_audit.kind = kind;
+            g_xdev_exact_audit.layer = layer;
+            g_xdev_exact_audit.row0 = row0;
+            g_xdev_exact_audit.byte_in_span = i;
+            g_xdev_exact_audit.source_byte = source_byte;
+            g_xdev_exact_audit.destination_byte = destination_byte;
+            g_xdev_exact_audit.source_tier = source_tier;
+            g_xdev_exact_audit.destination_tier = destination_tier;
+        }
+        return;
+    }
+}
+
+extern "C" int ds4_gpu_xdev_exact_audit_reset(
+        int      source_tier,
+        int      destination_tier,
+        uint64_t snapshot_bytes) {
+    if (source_tier < 0 || source_tier >= g_n_gpus ||
+        destination_tier < 0 || destination_tier >= g_n_gpus ||
+        source_tier == destination_tier || snapshot_bytes == 0u ||
+        !g_gpu_peer_ok[destination_tier][source_tier]) return 0;
+    if (g_xdev_exact_audit_snapshot_bytes[source_tier][destination_tier] <
+        snapshot_bytes) {
+        int alloc_ok = 0;
+        WITH_DEVICE(g_gpu[source_tier].device_id) {
+            if (g_xdev_exact_audit_snapshot[source_tier][destination_tier]) {
+                (void)cudaFree(
+                    g_xdev_exact_audit_snapshot[source_tier][destination_tier]);
+                g_xdev_exact_audit_snapshot[source_tier][destination_tier] = NULL;
+                g_xdev_exact_audit_snapshot_bytes[source_tier][destination_tier] = 0u;
+            }
+            alloc_ok = cuda_ok(cudaMalloc(
+                    &g_xdev_exact_audit_snapshot[source_tier][destination_tier],
+                    (size_t)snapshot_bytes),
+                "xdev exact audit snapshot alloc");
+            if (alloc_ok) {
+                g_xdev_exact_audit_snapshot_bytes[source_tier][destination_tier] =
+                    snapshot_bytes;
+            }
+        }
+        if (!alloc_ok) return 0;
+    }
+    ds4_gpu_xdev_exact_audit zero = {};
+    int ok = 0;
+    WITH_DEVICE(g_gpu[destination_tier].device_id) {
+        ok = cuda_ok(cudaMemcpyToSymbol(
+                         g_xdev_exact_audit, &zero, sizeof(zero), 0,
+                         cudaMemcpyHostToDevice),
+                     "xdev exact audit reset");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_xdev_exact_audit_snapshot(
+        const ds4_gpu_tensor *source,
+        int                   destination_tier,
+        uint64_t              bytes) {
+    if (!source || bytes == 0u || bytes > source->bytes) return 0;
+    const int source_tier = ds4_tensor_device_idx(source);
+    if (source_tier < 0 || source_tier >= g_n_gpus ||
+        destination_tier < 0 || destination_tier >= g_n_gpus ||
+        !g_xdev_exact_audit_snapshot[source_tier][destination_tier] ||
+        bytes > g_xdev_exact_audit_snapshot_bytes[source_tier][destination_tier]) {
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[source_tier].device_id) {
+        ok = cuda_ok(cudaMemcpyAsync(
+                         g_xdev_exact_audit_snapshot[source_tier][destination_tier],
+                         source->ptr, (size_t)bytes,
+                         cudaMemcpyDeviceToDevice, 0),
+                     "xdev exact audit snapshot copy");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_xdev_exact_audit_compare(
+        const ds4_gpu_tensor *destination,
+        const ds4_gpu_tensor *source,
+        uint64_t              bytes,
+        uint32_t              kind,
+        uint32_t              layer,
+        uint32_t              row0) {
+    if (!destination || !source || bytes == 0u ||
+        bytes > destination->bytes || bytes > source->bytes) return 0;
+    const int source_tier = ds4_tensor_device_idx(source);
+    const int destination_tier = ds4_tensor_device_idx(destination);
+    if (source_tier < 0 || source_tier >= g_n_gpus ||
+        destination_tier < 0 || destination_tier >= g_n_gpus ||
+        source_tier == destination_tier ||
+        !g_gpu_peer_ok[destination_tier][source_tier]) return 0;
+    const void *snapshot =
+        g_xdev_exact_audit_snapshot[source_tier][destination_tier];
+    if (!snapshot ||
+        bytes > g_xdev_exact_audit_snapshot_bytes[source_tier][destination_tier]) {
+        return 0;
+    }
+    const uint64_t vectors = (bytes + sizeof(uint4) - 1u) / sizeof(uint4);
+    const uint64_t blocks64 = (vectors + 255u) / 256u;
+    const unsigned blocks = (unsigned)(blocks64 > 256u ? 256u : blocks64);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[destination_tier].device_id) {
+        xdev_exact_audit_kernel<<<blocks, 256, 0, 0>>>(
+                (const unsigned char *)destination->ptr,
+                (const unsigned char *)snapshot,
+                bytes, kind, layer, row0,
+                (uint32_t)source_tier, (uint32_t)destination_tier);
+        ok = cuda_ok(cudaGetLastError(), "xdev exact audit launch");
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_xdev_exact_audit_read(
+        int                       destination_tier,
+        ds4_gpu_xdev_exact_audit *result) {
+    if (destination_tier < 0 || destination_tier >= g_n_gpus || !result) {
+        return 0;
+    }
+    int ok = 0;
+    WITH_DEVICE(g_gpu[destination_tier].device_id) {
+        ok = cuda_ok(cudaMemcpyFromSymbol(
+                         result, g_xdev_exact_audit, sizeof(*result), 0,
+                         cudaMemcpyDeviceToHost),
+                     "xdev exact audit read");
     }
     return ok;
 }
