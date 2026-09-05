@@ -7,6 +7,7 @@ die() {
 }
 
 PROFILE_GPU=${PROFILE_GPU:-0}
+PEER_GPU=${PEER_GPU:-}
 ROWS=${ROWS:-8192}
 TOKENS=${TOKENS:-32}
 TIMING_ROUNDS=${TIMING_ROUNDS:-9}
@@ -20,6 +21,11 @@ for value in "$PROFILE_GPU" "$ROWS" "$TOKENS" \
              "$TIMING_ROUNDS" "$TIMING_REPEATS"; do
     [[ $value =~ ^[0-9]+$ ]] || die "numeric settings must be nonnegative integers"
 done
+if [[ -n $PEER_GPU ]]; then
+    [[ $PEER_GPU =~ ^[0-9]+$ ]] || die "PEER_GPU must be a nonnegative integer"
+    [[ $PEER_GPU != "$PROFILE_GPU" ]] ||
+        die "PEER_GPU must differ from PROFILE_GPU"
+fi
 for value in "$RUN_SANITIZER" "$SKIP_BUILD" "$CREATE_ARCHIVE"; do
     [[ $value == 0 || $value == 1 ]] || die "boolean settings must be 0 or 1"
 done
@@ -64,7 +70,11 @@ trap 'exit 143' TERM
 
 git rev-parse HEAD >"$OUTPUT_DIR/git-head.txt"
 git status --short >"$OUTPUT_DIR/git-status.txt"
+nvidia-smi topo -m >"$OUTPUT_DIR/topology.txt"
 nvidia-smi -i "$PROFILE_GPU" -q >"$OUTPUT_DIR/nvidia-smi-q.txt"
+if [[ -n $PEER_GPU ]]; then
+    nvidia-smi -i "$PEER_GPU" -q >>"$OUTPUT_DIR/nvidia-smi-q.txt"
+fi
 
 if (( ! SKIP_BUILD )); then
     make -B -j"$(nproc)" "$target" CUDA_ARCH="$CUDA_ARCH" \
@@ -98,9 +108,17 @@ else
     printf 'skipped explicitly: RUN_SANITIZER=0\n' >"$OUTPUT_DIR/memcheck.log"
 fi
 
-"./$target" --device "$PROFILE_GPU" --rows "$ROWS" --tokens "$TOKENS" \
-    --rounds "$TIMING_ROUNDS" --repeats "$TIMING_REPEATS" \
-    >"$OUTPUT_DIR/timing.log" 2>&1
+timing_args=(
+    --device "$PROFILE_GPU"
+    --rows "$ROWS"
+    --tokens "$TOKENS"
+    --rounds "$TIMING_ROUNDS"
+    --repeats "$TIMING_REPEATS"
+)
+if [[ -n $PEER_GPU ]]; then
+    timing_args+=(--peer-device "$PEER_GPU")
+fi
+"./$target" "${timing_args[@]}" >"$OUTPUT_DIR/timing.log" 2>&1
 grep -q '^ordered_local_address_bit_mismatches=0$' "$OUTPUT_DIR/timing.log" ||
     die "timed owner-local addressing was not exact"
 grep -q '^harness_status=ok$' "$OUTPUT_DIR/timing.log" ||

@@ -5555,6 +5555,13 @@ are reported explicitly. A parallel compute envelope is projected from the
 slower owner plus merge time before transport; it is not called an end-to-end
 speedup.
 
+Setting `PEER_GPU` enables a bounded physical-pair arm. The home and peer own
+one compact row shard each and execute their partials concurrently. Its timing
+includes the F32 query copy, routed remote Top-K list, both partial kernels,
+the aligned F32 partial-state return, and the home merge. The ordinary control
+and single-device protocol arms remain in the same invocation, making clear
+whether real transport preserves or consumes the compute-only opportunity.
+
 Each partial-state record reserves two padding floats after `(max, sum)` so
 the 512-float numerator begins at a 16-byte boundary and every subsequent
 record preserves that alignment. The report distinguishes the 514-float
@@ -5569,10 +5576,11 @@ returned to the sink. The experiment therefore tests the no-mirror topology,
 not another spelling of the current head split.
 
 The accounting reports one authoritative cache, half-shard residency per GPU,
-the projected all-43-layer footprint at 256K context, and the minimum modeled
-T32 traffic for remote query, one partial state, and the remote owner's local
-selection list. Global Top-K production/partitioning and the small replicated
-raw ring are intentionally outside this first prototype. Compute Sanitizer,
+the projected all-43-layer footprint at 256K context, the actual 22/21 pipeline
+stage footprints, and the minimum modeled T32 traffic for remote query, one
+partial state, and the remote owner's local selection list. Global Top-K
+production/partitioning and the small replicated raw ring are intentionally
+outside this first prototype. Compute Sanitizer,
 guard canaries, exact owner-local addressing, and non-finite rejection gate a
 successful run. The over-aligned compact-row host fixture is allocated with
 the same explicit 32-byte alignment promised by its type, rather than relying
@@ -5581,6 +5589,7 @@ regardless of the bounded result.
 
 ```bash
 PROFILE_GPU=0 \
+PEER_GPU=1 \
 ROWS=8192 \
 TOKENS=32 \
 TIMING_ROUNDS=9 \

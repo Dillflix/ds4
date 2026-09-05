@@ -416,38 +416,39 @@ static void launch_arm(
         float *state0,
         float *state1,
         float *out,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        cudaStream_t stream = 0) {
     const dim3 attention_grid(n_tokens, N_HEAD / HEADS_PER_BLOCK, 1u);
     const dim3 merge_grid(n_tokens, N_HEAD, 1u);
     switch (arm) {
         case ARM_CONTROL:
-            ordered_attention_kernel<false><<<attention_grid, THREADS>>>(
+            ordered_attention_kernel<false><<<attention_grid, THREADS, 0, stream>>>(
                 full_rows, owner0_rows, owner1_rows, owner1_base,
                 topk, sinks, query, out, n_tokens);
             break;
         case ARM_ORDERED_LOCAL:
-            ordered_attention_kernel<true><<<attention_grid, THREADS>>>(
+            ordered_attention_kernel<true><<<attention_grid, THREADS, 0, stream>>>(
                 full_rows, owner0_rows, owner1_rows, owner1_base,
                 topk, sinks, query, out, n_tokens);
             break;
         case ARM_OWNER0:
-            owner_partial_kernel<<<attention_grid, THREADS>>>(
+            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
                 owner0_rows, owner0_topk, query, state0, n_tokens);
             break;
         case ARM_OWNER1:
-            owner_partial_kernel<<<attention_grid, THREADS>>>(
+            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
                 owner1_rows, owner1_topk, query, state1, n_tokens);
             break;
         case ARM_MERGE:
-            merge_partial_states_kernel<<<merge_grid, HEAD_DIM>>>(
+            merge_partial_states_kernel<<<merge_grid, HEAD_DIM, 0, stream>>>(
                 state0, state1, sinks, out, n_tokens);
             break;
         case ARM_PARALLEL_SEQUENTIAL:
-            owner_partial_kernel<<<attention_grid, THREADS>>>(
+            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
                 owner0_rows, owner0_topk, query, state0, n_tokens);
-            owner_partial_kernel<<<attention_grid, THREADS>>>(
+            owner_partial_kernel<<<attention_grid, THREADS, 0, stream>>>(
                 owner1_rows, owner1_topk, query, state1, n_tokens);
-            merge_partial_states_kernel<<<merge_grid, HEAD_DIM>>>(
+            merge_partial_states_kernel<<<merge_grid, HEAD_DIM, 0, stream>>>(
                 state0, state1, sinks, out, n_tokens);
             break;
     }
@@ -529,6 +530,138 @@ static float median_arm(
     return median;
 }
 
+struct PhysicalProtocol {
+    uint32_t home_device;
+    uint32_t peer_device;
+    uint32_t n_tokens;
+    const CompactAttentionKVRow *home_owner0_rows;
+    const CompactAttentionKVRow *peer_owner1_rows;
+    const int32_t *home_owner0_topk;
+    const int32_t *home_owner1_topk;
+    int32_t *peer_owner1_topk;
+    const float *home_query;
+    float *peer_query;
+    const float *home_sinks;
+    float *home_state0;
+    float *home_state1;
+    float *peer_state1;
+    float *home_output;
+    size_t query_bytes;
+    size_t owner_topk_bytes;
+    size_t state_storage_bytes;
+    cudaStream_t home_stream;
+    cudaStream_t peer_stream;
+};
+
+static void enable_peer_direction(uint32_t source, uint32_t destination) {
+    int can_access = 0;
+    cuda_die(cudaDeviceCanAccessPeer(
+                 &can_access, (int)source, (int)destination),
+             "query peer access");
+    if (!can_access) {
+        fprintf(stderr, "error: CUDA device %u cannot access device %u\n",
+                source, destination);
+        exit(2);
+    }
+    cuda_die(cudaSetDevice((int)source), "select peer-access source");
+    const cudaError_t err =
+        cudaDeviceEnablePeerAccess((int)destination, 0u);
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+    } else {
+        cuda_die(err, "enable peer access");
+    }
+}
+
+static float time_physical_protocol(
+        const PhysicalProtocol *protocol, uint32_t repeats) {
+    cuda_die(cudaSetDevice((int)protocol->home_device),
+             "select physical home device");
+    cudaEvent_t begin, end;
+    cuda_die(cudaEventCreate(&begin), "create physical begin event");
+    cuda_die(cudaEventCreate(&end), "create physical end event");
+    cuda_die(cudaEventRecord(begin, protocol->home_stream),
+             "record physical begin event");
+
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        cuda_die(cudaSetDevice((int)protocol->peer_device),
+                 "select physical peer device");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->peer_query, (int)protocol->peer_device,
+                     protocol->home_query, (int)protocol->home_device,
+                     protocol->query_bytes, protocol->peer_stream),
+                 "transfer physical peer query");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->peer_owner1_topk,
+                     (int)protocol->peer_device,
+                     protocol->home_owner1_topk,
+                     (int)protocol->home_device,
+                     protocol->owner_topk_bytes, protocol->peer_stream),
+                 "transfer physical peer selection route");
+        launch_arm(
+            ARM_OWNER1, NULL, NULL, protocol->peer_owner1_rows, 0u,
+            NULL, NULL, protocol->peer_owner1_topk, NULL,
+            protocol->peer_query, NULL, protocol->peer_state1, NULL,
+            protocol->n_tokens, protocol->peer_stream);
+
+        cuda_die(cudaSetDevice((int)protocol->home_device),
+                 "select physical home device");
+        launch_arm(
+            ARM_OWNER0, NULL, protocol->home_owner0_rows, NULL, 0u,
+            NULL, protocol->home_owner0_topk, NULL, NULL,
+            protocol->home_query, protocol->home_state0, NULL, NULL,
+            protocol->n_tokens, protocol->home_stream);
+
+        cuda_die(cudaSetDevice((int)protocol->peer_device),
+                 "select physical peer device");
+        cuda_die(cudaStreamSynchronize(protocol->peer_stream),
+                 "synchronize physical peer partial");
+
+        cuda_die(cudaSetDevice((int)protocol->home_device),
+                 "select physical home device");
+        cuda_die(cudaMemcpyPeerAsync(
+                     protocol->home_state1, (int)protocol->home_device,
+                     protocol->peer_state1, (int)protocol->peer_device,
+                     protocol->state_storage_bytes, protocol->home_stream),
+                 "transfer physical peer partial state");
+        launch_arm(
+            ARM_MERGE, NULL, NULL, NULL, 0u, NULL, NULL, NULL,
+            protocol->home_sinks, NULL,
+            protocol->home_state0, protocol->home_state1,
+            protocol->home_output, protocol->n_tokens,
+            protocol->home_stream);
+        cuda_die(cudaStreamSynchronize(protocol->home_stream),
+                 "synchronize physical merged output");
+    }
+
+    cuda_die(cudaEventRecord(end, protocol->home_stream),
+             "record physical end event");
+    cuda_die(cudaEventSynchronize(end), "synchronize physical end event");
+    float elapsed = 0.0f;
+    cuda_die(cudaEventElapsedTime(&elapsed, begin, end),
+             "measure physical protocol time");
+    cuda_die(cudaEventDestroy(begin), "destroy physical begin event");
+    cuda_die(cudaEventDestroy(end), "destroy physical end event");
+    return elapsed / (float)repeats;
+}
+
+static float median_physical_protocol(
+        const PhysicalProtocol *protocol,
+        uint32_t rounds, uint32_t repeats) {
+    float *samples = (float *)malloc((size_t)rounds * sizeof(float));
+    if (!samples) {
+        fprintf(stderr, "error: physical timing allocation failed\n");
+        exit(2);
+    }
+    for (uint32_t round = 0; round < rounds; round++) {
+        samples[round] = time_physical_protocol(protocol, repeats);
+    }
+    qsort(samples, rounds, sizeof(float), float_compare);
+    const float median = samples[rounds / 2u];
+    free(samples);
+    return median;
+}
+
 static uint32_t parse_u32(const char *text, const char *name) {
     char *end = NULL;
     const unsigned long value = strtoul(text, &end, 10);
@@ -594,6 +727,7 @@ static void fill_metadata(
 
 int main(int argc, char **argv) {
     uint32_t device = 0u;
+    uint32_t peer_device = UINT32_MAX;
     uint32_t n_rows = 8192u;
     uint32_t n_tokens = 32u;
     uint32_t rounds = 9u;
@@ -604,6 +738,8 @@ int main(int argc, char **argv) {
             return 2;
         }
         if (!strcmp(argv[i], "--device")) device = parse_u32(argv[++i], "device");
+        else if (!strcmp(argv[i], "--peer-device"))
+            peer_device = parse_u32(argv[++i], "peer device");
         else if (!strcmp(argv[i], "--rows")) n_rows = parse_u32(argv[++i], "rows");
         else if (!strcmp(argv[i], "--tokens")) n_tokens = parse_u32(argv[++i], "tokens");
         else if (!strcmp(argv[i], "--rounds")) rounds = parse_u32(argv[++i], "rounds");
@@ -617,6 +753,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: rows >= 512 and positive tokens/rounds/repeats required\n");
         return 2;
     }
+    if (peer_device == device) {
+        fprintf(stderr, "error: peer device must differ from home device\n");
+        return 2;
+    }
+    const bool physical_pair = peer_device != UINT32_MAX;
     cuda_die(cudaSetDevice((int)device), "select CUDA device");
     cudaDeviceProp properties = {};
     cuda_die(cudaGetDeviceProperties(&properties, (int)device),
@@ -666,6 +807,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: host allocation failed\n");
         return 2;
     }
+    cudaDeviceProp peer_properties = {};
+    if (physical_pair) {
+        cuda_die(cudaGetDeviceProperties(&peer_properties, (int)peer_device),
+                 "query peer CUDA device properties");
+        if (peer_properties.major != 7 || peer_properties.minor != 5) {
+            fprintf(stderr, "error: peer device %u is sm_%d%d, expected sm_75\n",
+                    peer_device, peer_properties.major, peer_properties.minor);
+            return 2;
+        }
+        enable_peer_direction(device, peer_device);
+        enable_peer_direction(peer_device, device);
+        cuda_die(cudaSetDevice((int)device), "restore home CUDA device");
+    }
     if ((uintptr_t)host_rows % alignof(CompactAttentionKVRow) != 0u) {
         fprintf(stderr, "error: host cache fixture is not %zu-byte aligned\n",
                 alignof(CompactAttentionKVRow));
@@ -692,6 +846,12 @@ int main(int argc, char **argv) {
     GuardedBuffer d_control = guarded_alloc(output_bytes, "allocate control output");
     GuardedBuffer d_ordered = guarded_alloc(output_bytes, "allocate ordered output");
     GuardedBuffer d_parallel = guarded_alloc(output_bytes, "allocate parallel output");
+    GuardedBuffer d_peer_owner1 = {};
+    GuardedBuffer d_peer_query = {};
+    GuardedBuffer d_peer_owner1_topk = {};
+    GuardedBuffer d_peer_state1 = {};
+    cudaStream_t home_physical_stream = 0;
+    cudaStream_t peer_physical_stream = 0;
 
     cuda_die(cudaMemcpy(d_full.data, host_rows, full_bytes, cudaMemcpyHostToDevice),
              "copy control cache");
@@ -712,6 +872,30 @@ int main(int argc, char **argv) {
     cuda_die(cudaMemcpy(d_owner1_topk.data, host_owner1_topk,
                         owner_topk_bytes, cudaMemcpyHostToDevice),
              "copy owner1 local top-k");
+
+    if (physical_pair) {
+        cuda_die(cudaStreamCreateWithFlags(
+                     &home_physical_stream, cudaStreamNonBlocking),
+                 "create physical home stream");
+        cuda_die(cudaSetDevice((int)peer_device),
+                 "select peer for physical allocations");
+        d_peer_owner1 =
+            guarded_alloc(owner1_bytes, "allocate physical peer cache");
+        d_peer_query =
+            guarded_alloc(query_bytes, "allocate physical peer query");
+        d_peer_owner1_topk = guarded_alloc(
+            owner_topk_bytes, "allocate physical peer selection route");
+        d_peer_state1 = guarded_alloc(
+            state_storage_bytes, "allocate physical peer state");
+        cuda_die(cudaMemcpy(d_peer_owner1.data, host_rows + owner1_base,
+                            owner1_bytes, cudaMemcpyHostToDevice),
+                 "copy physical peer cache");
+        cuda_die(cudaStreamCreateWithFlags(
+                     &peer_physical_stream, cudaStreamNonBlocking),
+                 "create physical peer stream");
+        cuda_die(cudaSetDevice((int)device),
+                 "restore home after physical allocations");
+    }
 
     const CompactAttentionKVRow *full =
         (const CompactAttentionKVRow *)d_full.data;
@@ -846,8 +1030,87 @@ int main(int argc, char **argv) {
     const float projected_envelope_ms =
         fmaxf(owner0_ms, owner1_ms) + merge_ms;
 
+    float physical_protocol_ms = 0.0f;
+    uint64_t physical_mismatches = 0u;
+    uint64_t physical_nonfinite = 0u;
+    float physical_max_abs = 0.0f;
+    double physical_squared_error = 0.0;
+    if (physical_pair) {
+        PhysicalProtocol protocol = {};
+        protocol.home_device = device;
+        protocol.peer_device = peer_device;
+        protocol.n_tokens = n_tokens;
+        protocol.home_owner0_rows = owner0;
+        protocol.peer_owner1_rows =
+            (const CompactAttentionKVRow *)d_peer_owner1.data;
+        protocol.home_owner0_topk = owner0_topk;
+        protocol.home_owner1_topk = owner1_topk;
+        protocol.peer_owner1_topk =
+            (int32_t *)d_peer_owner1_topk.data;
+        protocol.home_query = query;
+        protocol.peer_query = (float *)d_peer_query.data;
+        protocol.home_sinks = sinks;
+        protocol.home_state0 = state0;
+        protocol.home_state1 = state1;
+        protocol.peer_state1 = (float *)d_peer_state1.data;
+        protocol.home_output = (float *)d_parallel.data;
+        protocol.query_bytes = query_bytes;
+        protocol.owner_topk_bytes = owner_topk_bytes;
+        protocol.state_storage_bytes = state_storage_bytes;
+        protocol.home_stream = home_physical_stream;
+        protocol.peer_stream = peer_physical_stream;
+
+        time_physical_protocol(&protocol, 1u);
+        physical_protocol_ms = median_physical_protocol(
+            &protocol, rounds, repeats);
+        cuda_die(cudaSetDevice((int)device),
+                 "select home for physical output copy");
+        cuda_die(cudaMemcpy(host_parallel, d_parallel.data, output_bytes,
+                            cudaMemcpyDeviceToHost),
+                 "copy physical protocol output");
+        for (uint64_t i = 0; i < output_values; i++) {
+            uint32_t reference_bits, physical_bits;
+            memcpy(&reference_bits, host_control + i,
+                   sizeof(reference_bits));
+            memcpy(&physical_bits, host_parallel + i,
+                   sizeof(physical_bits));
+            physical_mismatches += reference_bits != physical_bits;
+            physical_nonfinite += !isfinite(host_parallel[i]);
+            const double error =
+                (double)host_parallel[i] - (double)host_control[i];
+            physical_squared_error += error * error;
+            const float abs_error =
+                fabsf(host_parallel[i] - host_control[i]);
+            if (abs_error > physical_max_abs) physical_max_abs = abs_error;
+        }
+        if (physical_nonfinite != 0u) {
+            fprintf(stderr,
+                    "error: physical protocol produced %llu non-finite values\n",
+                    (unsigned long long)physical_nonfinite);
+            return 1;
+        }
+    }
+
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
         if (!check_guard(buffers[i], buffer_names[i])) return 1;
+    }
+    if (physical_pair) {
+        cuda_die(cudaSetDevice((int)peer_device),
+                 "select peer for physical guard validation");
+        GuardedBuffer *peer_buffers[] = {
+            &d_peer_owner1, &d_peer_query,
+            &d_peer_owner1_topk, &d_peer_state1,
+        };
+        const char *peer_buffer_names[] = {
+            "physical peer cache", "physical peer query",
+            "physical peer selection route", "physical peer state",
+        };
+        for (uint32_t i = 0;
+             i < sizeof(peer_buffers) / sizeof(peer_buffers[0]); i++) {
+            if (!check_guard(peer_buffers[i], peer_buffer_names[i])) return 1;
+        }
+        cuda_die(cudaSetDevice((int)device),
+                 "restore home after physical guard validation");
     }
 
     const uint64_t compact_cache_bytes = full_bytes;
@@ -863,14 +1126,27 @@ int main(int argc, char **argv) {
         compact_cache_256k_bytes * 43ull;
     const uint64_t compact_half_shard_43_layer_256k_bytes =
         compact_cache_43_layer_256k_bytes / 2ull;
+    const uint64_t compact_stage22_cache_256k_bytes =
+        compact_cache_256k_bytes * 22ull;
+    const uint64_t compact_stage21_cache_256k_bytes =
+        compact_cache_256k_bytes * 21ull;
     const uint64_t f32_cache_43_layer_256k_bytes =
         (256ull * 1024ull / 4ull) * HEAD_DIM * sizeof(float) * 43ull;
     printf("scenario=sm75-attention-rowshard-softmax\n");
-    printf("scope=independent-single-gpu-protocol-emulation-not-production-dispatch\n");
+    printf("scope=%s\n", physical_pair
+        ? "independent-physical-pair-protocol-not-production-dispatch"
+        : "independent-single-gpu-protocol-emulation-not-production-dispatch");
     printf("device=%u\n", device);
     printf("device_name=%s\n", properties.name);
+    printf("physical_pair_enabled=%u\n", physical_pair ? 1u : 0u);
+    if (physical_pair) {
+        printf("peer_device=%u\n", peer_device);
+        printf("peer_device_name=%s\n", peer_properties.name);
+        printf("physical_protocol_query_wire=f32\n");
+        printf("physical_protocol_timing=inclusive-query-route-partials-state-merge\n");
+    }
     printf("cache_ownership=two-separately-guarded-contiguous-row-shards\n");
-    printf("selection_scope=prepartitioned-global-topk-routing-cost-excluded\n");
+    printf("selection_scope=prepartitioned-global-topk-compute-excluded\n");
     printf("raw_ring_scope=excluded-must-remain-small-and-explicitly-replicated\n");
     printf("harness_control_copy_excluded_from_production_accounting=1\n");
     printf("n_rows=%u\n", n_rows);
@@ -893,6 +1169,14 @@ int main(int argc, char **argv) {
            (unsigned long long)compact_cache_43_layer_256k_bytes);
     printf("projected_per_gpu_43_layer_half_shard_256k_bytes=%llu\n",
            (unsigned long long)compact_half_shard_43_layer_256k_bytes);
+    printf("projected_stage22_authoritative_cache_256k_bytes=%llu\n",
+           (unsigned long long)compact_stage22_cache_256k_bytes);
+    printf("projected_stage22_per_gpu_half_shard_256k_bytes=%llu\n",
+           (unsigned long long)(compact_stage22_cache_256k_bytes / 2ull));
+    printf("projected_stage21_authoritative_cache_256k_bytes=%llu\n",
+           (unsigned long long)compact_stage21_cache_256k_bytes);
+    printf("projected_stage21_per_gpu_half_shard_256k_bytes=%llu\n",
+           (unsigned long long)(compact_stage21_cache_256k_bytes / 2ull));
     printf("projected_43_layer_f32_cache_256k_bytes=%llu\n",
            (unsigned long long)f32_cache_43_layer_256k_bytes);
     printf("partial_state_payload=max-sum-numerator-f32-512\n");
@@ -940,13 +1224,42 @@ int main(int argc, char **argv) {
            projected_envelope_ms);
     printf("parallel_projected_compute_speedup_before_transport=%.9g\n",
            control_ms / projected_envelope_ms);
+    if (physical_pair) {
+        printf("physical_pair_protocol_median_ms=%.9g\n",
+               physical_protocol_ms);
+        printf("physical_pair_protocol_speedup=%.9g\n",
+               control_ms / physical_protocol_ms);
+        printf("physical_pair_bit_mismatches=%llu\n",
+               (unsigned long long)physical_mismatches);
+        printf("physical_pair_nonfinite=%llu\n",
+               (unsigned long long)physical_nonfinite);
+        printf("physical_pair_max_abs=%.9g\n", physical_max_abs);
+        printf("physical_pair_relative_l2=%.9g\n",
+               reference_squared == 0.0 ? 0.0 :
+               sqrt(physical_squared_error / reference_squared));
+    }
     printf("ordered_address_exactness_eligible=1\n");
     printf("parallel_exactness_eligible=%u\n",
            parallel_mismatches == 0u ? 1u : 0u);
-    printf("physical_multi_gpu_validation_required=1\n");
+    printf("physical_multi_gpu_validation_completed=%u\n",
+           physical_pair ? 1u : 0u);
     printf("production_integration_eligible=0\n");
     printf("harness_status=ok\n");
 
+    if (physical_pair) {
+        cuda_die(cudaSetDevice((int)peer_device),
+                 "select peer for physical cleanup");
+        cuda_die(cudaStreamDestroy(peer_physical_stream),
+                 "destroy physical peer stream");
+        cudaFree(d_peer_owner1.base);
+        cudaFree(d_peer_query.base);
+        cudaFree(d_peer_owner1_topk.base);
+        cudaFree(d_peer_state1.base);
+        cuda_die(cudaSetDevice((int)device),
+                 "select home for physical cleanup");
+        cuda_die(cudaStreamDestroy(home_physical_stream),
+                 "destroy physical home stream");
+    }
     for (uint32_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
         cudaFree(buffers[i]->base);
     }
