@@ -221,7 +221,9 @@ if (( RUN_NCU )); then
     "$ncu_bin" --config-file off --import "$base.ncu-rep" --csv --page raw \
         >"$base.csv" 2>"$base-import.log" ||
         die "could not import materialization Nsight report"
-    expected_grid=$((ROWS * TOKENS))
+    # The materializer visits the selected top-k set, not every persistent
+    # cache row: one CTA for each of 512 selected rows per active token.
+    expected_grid=$((512 * TOKENS))
     python3 speed-bench/validate-ncu-capture.py \
         "$base.csv" "$regex" 0 \
         --process cuda_sm75_compact_attention_kv \

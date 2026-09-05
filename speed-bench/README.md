@@ -5534,7 +5534,7 @@ end-to-end result. The selected consumer is paired against the ordinary F32
 consumer to expose any benefit from contiguous top-k ordering independently
 of decode cost. With `RUN_NCU=1`, the harness captures exactly one
 `compact_materialize_selected_kernel` launch and validates its 128-thread,
-`ROWS * TOKENS`-CTA geometry. The report includes DRAM read/write traffic,
+`512 selected rows * TOKENS`-CTA geometry. The report includes DRAM read/write traffic,
 load/store sector efficiency, L2 hit rate, integer/conversion/memory
 instruction counts when exposed by the installed Nsight version, occupancy,
 waves, eligible warps, and long-scoreboard/MIO stalls. This separates
