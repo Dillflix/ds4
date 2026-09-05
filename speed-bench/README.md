@@ -5603,11 +5603,12 @@ directly. Its producer bypasses the separate rounded-F32 staging quantizer;
 compact packing owns the sole shipping E4M3 quantization pass. The engine
 preserves F32 session/checkpoint payloads at the external boundary.
 
-Single-token non-indexed decode uses compact-aware variants of the same exact
-two-pass score and finalize kernels as the F32 cache. Only compressed-row loads
-change: score accumulation order, softmax reduction, source-row order, and the
-value accumulation chain remain identical. The older compact online-softmax
-kernel is retained only as a fallback when exact score-split is unavailable.
+Single-token non-indexed decode reconstructs each compact row once into a
+reusable 2 MiB per-device F32 stage, then uses the same exact two-pass score and
+finalize kernels as the F32 cache. Score accumulation order, softmax reduction,
+source-row order, and the value accumulation chain remain identical. Direct
+compact loads and the older compact online-softmax kernel remain fallbacks when
+materialization or exact score-split is unavailable.
 
 The runner's untimed warm-up intentionally recreates the session while keeping
 the engine-owned dense-Q8 residency. Session teardown therefore synchronizes

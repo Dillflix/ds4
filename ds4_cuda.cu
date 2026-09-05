@@ -681,6 +681,7 @@ enum {
     CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS = 256u,
     CUDA_SM75_HYBRID_ATTN_BUFFERS = 2u,
     CUDA_SM75_HYBRID_ATTN_MAX_TOKENS = 32u,
+    CUDA_SM75_COMPACT_EXACT_STAGE_ROWS = 1024u,
 };
 
 typedef struct {
@@ -701,10 +702,20 @@ typedef struct {
 
 static cuda_sm75_hybrid_attn_context
     g_sm75_hybrid_attn[DS4_MAX_GPUS];
+static float *g_sm75_compact_exact_stage[DS4_MAX_GPUS] = {NULL};
 static std::atomic<uint64_t> g_sm75_hybrid_attn_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_exact_score_calls = 0;
+static std::atomic<uint64_t> g_sm75_compact_exact_materialized_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_attn_trace_calls = 0;
 static void cuda_sm75_hybrid_attn_release_one(int logical_tier);
+
+static void cuda_sm75_compact_exact_stage_release_one(int logical_tier) {
+    if (logical_tier < 0 || logical_tier >= DS4_MAX_GPUS) return;
+    if (g_sm75_compact_exact_stage[logical_tier]) {
+        (void)cudaFree(g_sm75_compact_exact_stage[logical_tier]);
+        g_sm75_compact_exact_stage[logical_tier] = NULL;
+    }
+}
 
 typedef struct {
     uint32_t sequence;
@@ -5908,10 +5919,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_sm75_hybrid_attn_calls.load(std::memory_order_relaxed);
     const uint64_t compact_exact_score_calls =
         g_sm75_compact_exact_score_calls.load(std::memory_order_relaxed);
+    const uint64_t compact_exact_materialized_calls =
+        g_sm75_compact_exact_materialized_calls.load(
+            std::memory_order_relaxed);
     if (compact_exact_score_calls != 0u) {
         fprintf(stderr,
-                "ds4: SM75 compact exact score split summary: calls=%llu\n",
-                (unsigned long long)compact_exact_score_calls);
+                "ds4: SM75 compact exact score split summary: calls=%llu "
+                "materialized=%llu stage-bytes-per-device=%u\n",
+                (unsigned long long)compact_exact_score_calls,
+                (unsigned long long)compact_exact_materialized_calls,
+                CUDA_SM75_COMPACT_EXACT_STAGE_ROWS * 512u *
+                    (uint32_t)sizeof(float));
     }
     if (hybrid_attention_calls != 0u) {
         fprintf(stderr,
@@ -6091,6 +6109,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         ds4_gpu_ctx *c = &g_gpu[i];
         (void)cudaSetDevice(c->device_id);
         cuda_sm75_hybrid_attn_release_one(i);
+        cuda_sm75_compact_exact_stage_release_one(i);
         attention_decode_score_split_graph_destroy_one(i);
         routed_moe_decode_graph_destroy_one(i);
         routed_moe_decode_q32_graph_destroy_one(i);
@@ -6126,6 +6145,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     g_sm75_hybrid_attn_calls.store(0u, std::memory_order_relaxed);
     g_sm75_compact_exact_score_calls.store(0u, std::memory_order_relaxed);
+    g_sm75_compact_exact_materialized_calls.store(
+        0u, std::memory_order_relaxed);
     g_n_gpus = 0;
     g_cublas_ready = 0;
 
@@ -13153,6 +13174,31 @@ __global__ static void sm75_compact_attn_unpack_kernel(
     for (uint32_t d = tid; d < 64u; d += blockDim.x) {
         out[448u + d] = rejected ? NAN : in->rope_f32[d];
     }
+}
+
+static float *cuda_sm75_compact_exact_materialize(
+        int logical_tier, const void *src, uint32_t rows) {
+    if (logical_tier < 0 || logical_tier >= g_n_gpus || !src || rows == 0u ||
+        rows > CUDA_SM75_COMPACT_EXACT_STAGE_ROWS) {
+        return NULL;
+    }
+    float **stage = &g_sm75_compact_exact_stage[logical_tier];
+    if (!*stage) {
+        const size_t bytes =
+            (size_t)CUDA_SM75_COMPACT_EXACT_STAGE_ROWS * 512u * sizeof(float);
+        if (!cuda_ok(cudaMalloc((void **)stage, bytes),
+                     "compact exact-score materialization stage")) {
+            *stage = NULL;
+            return NULL;
+        }
+    }
+    sm75_compact_attn_unpack_kernel<<<rows, 64>>>(
+        *stage, (const cuda_sm75_compact_attn_kv_row *)src, rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "compact exact-score materialization launch")) {
+        return NULL;
+    }
+    return *stage;
 }
 
 template <bool COMPACT>
@@ -25650,16 +25696,22 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             head_dim == 512u && score_lanes == 0u &&
             !g_cuda_no_decode_value512 ? 512u : 256u;
         if (cuda_attention_score_buffer_fits(n_comp)) {
+            const float *materialized = cuda_sm75_compact_exact_materialize(
+                logical_tier, comp_kv->ptr, n_comp);
             int score_split_rc = attention_decode_score_split_launch(
                     logical_tier, (float *)heads->ptr, sinks,
                     (const float *)q->ptr, (const float *)raw_kv->ptr,
-                    comp_kv->ptr,
+                    materialized ? (const void *)materialized : comp_kv->ptr,
                     use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
                     0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
-                    n_head, head_dim, threads, true, NULL);
+                    n_head, head_dim, threads, materialized == NULL, NULL);
             if (score_split_rc == 1) {
                 g_sm75_compact_exact_score_calls.fetch_add(
                     1u, std::memory_order_relaxed);
+                if (materialized) {
+                    g_sm75_compact_exact_materialized_calls.fetch_add(
+                        1u, std::memory_order_relaxed);
+                }
                 return cuda_ok(cudaGetLastError(),
                                "attention compact exact score split launch");
             }
