@@ -5663,13 +5663,17 @@ gathered.  The zero-prefix path separately reports its exact 512x512 F32
 current-KV mirror (1 MiB); that transfer is not repeated for every later
 microbatch.
 
-The candidate has a distinct selector,
-`DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=1`.  The control leaves it
-unset.  The harness fixes `GPU_DEVICES=0,3,1,2`, validates bidirectional NVLink
-between physical GPUs 3 and 2, and refuses any pair-0 token-row or legacy
-attention-row dispatch in either arm.  Pair 0 is not an option in this script.
-The candidate must also avoid the legacy pair-1 expanded-query path and emit
-the exact per-dispatch traffic contract above.
+The candidate has a distinct selector.  The default
+`CANDIDATE_TOKEN_ROW_PAIRS=1` maps to
+`DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=1`; the control always
+leaves the token-row selector unset.  An explicit
+`CANDIDATE_TOKEN_ROW_PAIRS=0,1` is the risky pair-0 qualification arm: it keeps
+control on the known-safe topology, enables token rows on both pairs only in
+the candidate, and validates bidirectional NVLink for physical GPU0/GPU1 as
+well as GPU3/GPU2.  Both forms keep the older pair-0 attention-row splitter
+disabled.  The candidate must avoid every selected pair's legacy expanded-query
+path, retain partner-local row-split indexer output, and emit the exact
+per-dispatch traffic contract above.
 
 Acceptance requires byte-identical frontier logits, unchanged four-GPU
 identity and power-limit snapshots before and after both arms, no Xid/lost-GPU
@@ -5702,8 +5706,9 @@ stable-pair exactness and traffic result, not the historical maximum-throughput
 configuration.  That gate passed, so native-stream now accepts 512--2048-row
 outer chunks while retaining the hard 512-row internal microbatch and 256-row
 per-owner runtime gates.  The next qualification is PP4096 with 2048-row outer
-chunks, followed by PP32768.  Risky pair-0 testing remains a separate
-candidate-only experiment.
+chunks, followed by PP32768.  The separate candidate-only pair-0 qualification
+starts at PP4096 and must not be advanced to PP32768 unless exactness, dispatch,
+VRAM, throughput, health, and kernel-log gates all pass.
 
 The full-F16 candidate subsequently passed at PP2048 (495.32 versus 468.09
 tok/s, 1.05817x) and PP32768 (401.95 versus 393.68 tok/s, 1.02101x), with
@@ -5718,6 +5723,18 @@ The grouped int8x4 expansion subsequently produced 482.33 versus 463.35 tok/s
 (1.04096x) with byte-identical logits and the same cache, aggregate VRAM, and
 transfer results.  Pair 0 remains disabled in both workloads.
 
+With 2048-row outer chunks, two PP4096 repetitions measured 541.88 versus
+537.77 tok/s (1.00764x) and 531.15 versus 526.92 tok/s (1.00803x).  The PP32768
+qualification then measured 456.36 versus 462.28 tok/s (0.98719x).  All three
+runs retained byte-identical logits, 3.94 GiB less persistent F16 model cache,
+and about 1.74 GiB lower sampled aggregate VRAM.  The 32K result is therefore a
+valid exactness/memory result but not a throughput promotion result.  It
+indicates that repeated full-matrix Q8-to-F16 expansion can erase pair 1's
+row-ownership gain at long context.  Direct native-Q8/Tensor-Core consumption
+remains the mechanism investigation for removing that cost; the next topology
+qualification is nevertheless the already-planned candidate-only pair-0 run,
+not a pivot to a persistent hybrid F16 cache.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
@@ -5725,6 +5742,20 @@ GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 CTX_TOKENS=4096 PREFILL_CHUNK=2048 \
 TOKEN_ROW_WEIGHT_MODE=native-stream \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-attention-exactness.sh
+```
+
+Candidate-only pair-0 plus pair-1 qualification (control remains token-row
+off on both pairs):
+
+```bash
+MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+CTX_TOKENS=4096 PREFILL_CHUNK=2048 \
+TOKEN_ROW_WEIGHT_MODE=native-stream CANDIDATE_TOKEN_ROW_PAIRS=0,1 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-attention-exactness.sh
 ```

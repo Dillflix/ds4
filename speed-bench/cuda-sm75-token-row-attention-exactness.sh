@@ -16,6 +16,7 @@ CTX_ALLOC=${CTX_ALLOC:-$((CTX_TOKENS + 1))}
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
 PIPELINE_MB=512
 TOKEN_ROW_WEIGHT_MODE=${TOKEN_ROW_WEIGHT_MODE:-native-stream}
+CANDIDATE_TOKEN_ROW_PAIRS=${CANDIDATE_TOKEN_ROW_PAIRS:-1}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.90}
@@ -49,6 +50,25 @@ OUTPUT_DIR=${TOKEN_ROW_ATTN_EXACTNESS_DIR:-$repo_dir/sm75-token-row-attention-ex
 [[ $TOKEN_ROW_WEIGHT_MODE == f16 ||
    $TOKEN_ROW_WEIGHT_MODE == native-stream ]] ||
     die "TOKEN_ROW_WEIGHT_MODE must be f16 or native-stream"
+case "$CANDIDATE_TOKEN_ROW_PAIRS" in
+    1)
+        candidate_pair_mask=0x2
+        candidate_layer_count=21
+        candidate_owner_count=2
+        candidate_pair_description=logical1-physical-gpu3-gpu2
+        required_topology_pairs=('GPU3 GPU2')
+        ;;
+    0,1)
+        candidate_pair_mask=0x3
+        candidate_layer_count=43
+        candidate_owner_count=4
+        candidate_pair_description=logical0-physical-gpu0-gpu1,logical1-physical-gpu3-gpu2
+        required_topology_pairs=('GPU0 GPU1' 'GPU3 GPU2')
+        ;;
+    *)
+        die "CANDIDATE_TOKEN_ROW_PAIRS must be 1 or 0,1; control always leaves token rows disabled"
+        ;;
+esac
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
             "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
@@ -178,7 +198,7 @@ fi
 
 phase=topology
 nvidia-smi topo -m >"$OUTPUT_DIR/provenance/topology.txt"
-for pair in 'GPU3 GPU2'; do
+for pair in "${required_topology_pairs[@]}"; do
     read -r first second <<<"$pair"
     forward=$(awk -v from="$first" -v to="$second" '
         !h {for(i=1;i<=NF;i++) if($i==to)c=i+1; if(c){h=1;next}}
@@ -188,6 +208,16 @@ for pair in 'GPU3 GPU2'; do
         h && $1==from {print $c;exit}' "$OUTPUT_DIR/provenance/topology.txt")
     [[ $forward =~ ^NV[0-9]+$ && $reverse =~ ^NV[0-9]+$ ]] ||
         die "$first<->$second is not bidirectional NVLink: ${forward:-missing}/${reverse:-missing}"
+done
+for gpu in 0 1 2 3; do
+    {
+        printf 'gpu=%s\n' "$gpu"
+        timeout 20s nvidia-smi -q -i "$gpu" | awk '
+            /BAR1 Memory Usage/ { found = 1; print; next }
+            found && /Total/ { print; exit }
+        '
+    } >>"$OUTPUT_DIR/provenance/bar1-before.txt" ||
+        die "could not capture GPU $gpu BAR1 inventory"
 done
 capture_gpu_health "$OUTPUT_DIR/health/initial-gpu.csv" ||
     die "could not capture initial four-GPU health"
@@ -216,7 +246,13 @@ phase=manifest
         "$GPU_DEVICES"
     printf 'ctx_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_microbatch=%s\n' \
         "$CTX_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 'control_token_row_pairs=off\ncandidate_token_row_pairs=1\npair0_attention=off-both-arms\n'
+    printf 'control_token_row_pairs=off\ncandidate_token_row_pairs=%s\n' \
+        "$CANDIDATE_TOKEN_ROW_PAIRS"
+    if [[ $CANDIDATE_TOKEN_ROW_PAIRS == 0,1 ]]; then
+        printf 'pair0_attention=off-control-on-candidate-token-row-only\n'
+    else
+        printf 'pair0_attention=off-both-arms\n'
+    fi
     printf 'candidate_token_row_weight_mode=%s\n' "$TOKEN_ROW_WEIGHT_MODE"
     printf 'candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n'
     printf 'minimum_throughput_ratio=%s\nmax_model_cache_increase_gib=%s\n' \
@@ -244,8 +280,9 @@ for variant in control token-row; do
     mkdir -p "$logits"
     variant_env=()
     if [[ $variant == token-row ]]; then
-        # Deliberately pair 1 only. Pair 0 is never passed to the selector.
-        variant_env+=(DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=1)
+        # Control never receives this selector.  Pair 0 is reachable only by
+        # the explicit candidate-only 0,1 experiment value validated above.
+        variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=$CANDIDATE_TOKEN_ROW_PAIRS")
         variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE=$TOKEN_ROW_WEIGHT_MODE")
     fi
     capture_gpu_health "$base.pre-gpu.csv" ||
@@ -266,6 +303,7 @@ for variant in control token-row; do
         DS4_CUDA_TP_PREFILL_T32_HEADS=0 \
         DS4_CUDA_TP_PREFILL_ATTN_ROWS_OUTPUT=0 \
         DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0 \
+        DS4_CUDA_TP_PREFILL_INDEXER_ROWS_PAIRS=0,1 \
         "${variant_env[@]}" \
         ./ds4-bench --cuda --cuda-tensor-parallel \
             --gpu-devices "$GPU_DEVICES" --gpu-vram "$GPU_VRAM" \
@@ -301,14 +339,22 @@ for variant in control token-row; do
         grep -Fq 'tagged SM75 dense-Q8 GGUF installed through ordinary single-owner residency' \
             "$base.log" || die "$variant did not load the tagged native-Q8 model"
     fi
-    grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2' "$base.log" ||
-        die "$variant did not keep attention cache visibility on stable pair 1 only"
+    expected_cache_mask=0x2
+    [[ $variant == token-row ]] && expected_cache_mask=$candidate_pair_mask
+    grep -Fq "CUDA TP cache mirror policy: attention-pair-mask=$expected_cache_mask" "$base.log" ||
+        die "$variant did not use the required attention cache mirror mask $expected_cache_mask"
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$base.log" ||
         die "$variant missed a required native-GGUF execution binding"
     ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$base.log" ||
         die "$variant unexpectedly enabled the unstable legacy pair-0 splitter"
-    ! grep -Eq 'CUDA prefill attention token-row pipeline .*home=0([[:space:]]|$)' "$base.log" ||
-        die "$variant unexpectedly enabled the token-row pipeline on pair 0"
+    if [[ $variant == control || $CANDIDATE_TOKEN_ROW_PAIRS == 1 ]]; then
+        ! grep -Eq 'CUDA prefill attention token-row pipeline .*home=0([[:space:]]|$)' "$base.log" ||
+            die "$variant unexpectedly enabled the token-row pipeline on pair 0"
+    fi
+    for home in 0 1; do
+        grep -Fq "prefill indexer score/top-k row split enabled: tier $home " "$base.log" ||
+            die "$variant missed the established pair-$home indexer split"
+    done
 
     if [[ $variant == control ]]; then
         grep -Fq 'token-row-pair-mask=0x0 token-row-weight-mode=f16 token-row-required=0/0/0 token-row-native-stream=0/0/0' \
@@ -326,38 +372,46 @@ for variant in control token-row; do
         expected_output_bytes=$(((PIPELINE_MB / 2) * 4096 * 4))
         expected_current_kv_bytes=$((PIPELINE_MB * 512 * 4))
         if [[ $TOKEN_ROW_WEIGHT_MODE == native-stream ]]; then
-            grep -Fq 'token-row-pair-mask=0x2 token-row-weight-mode=native-stream token-row-required=0/0/0 token-row-native-stream=21/21/21' \
-                "$base.log" || die "candidate did not retain all 21 pair-1 q_b/A/B native-stream sources"
+            grep -Fq "token-row-pair-mask=$candidate_pair_mask token-row-weight-mode=native-stream token-row-required=0/0/0 token-row-native-stream=$candidate_layer_count/$candidate_layer_count/$candidate_layer_count" \
+                "$base.log" || die "candidate did not retain every selected q_b/A/B native-stream source"
             grep -Fq 'token-row native-stream workspace reserved at startup: 96 MiB per selected pair member; runtime growth disabled' \
                 "$base.log" || die "candidate did not pre-reserve bounded native-stream workspace"
             for stage in attn_q_b attn_output_a attn_output_b; do
-                [[ $(grep -Fc "token-row native-stream dispatch stage=$stage " "$base.log") == 2 ]] ||
-                    die "candidate did not native-stream $stage on both pair members"
+                [[ $(grep -Fc "token-row native-stream dispatch stage=$stage " "$base.log") == "$candidate_owner_count" ]] ||
+                    die "candidate did not native-stream $stage on every selected pair member"
             done
-            [[ $(grep -Fc 'dequant=group-int8x4' "$base.log") == 6 ]] ||
+            [[ $(grep -Fc 'dequant=group-int8x4' "$base.log") == $((3 * candidate_owner_count)) ]] ||
                 die "candidate did not use grouped int8x4 native-stream dequant for all pair-local projections"
             ! grep -Eq 'token-row native-stream dispatch .*peer-weight-read=[1-9]' "$base.log" ||
                 die "candidate performed a forbidden peer weight read"
         else
-            grep -Fq 'token-row-pair-mask=0x2 token-row-weight-mode=f16 token-row-required=21/21/21 token-row-native-stream=0/0/0' \
-                "$base.log" || die "candidate did not materialize all 21 pair-1 q_b/A/B F16 execution bindings"
+            grep -Fq "token-row-pair-mask=$candidate_pair_mask token-row-weight-mode=f16 token-row-required=$candidate_layer_count/$candidate_layer_count/$candidate_layer_count token-row-native-stream=0/0/0" \
+                "$base.log" || die "candidate did not materialize every selected q_b/A/B F16 execution binding"
         fi
-        grep -Fq "CUDA prefill attention token-row pipeline enabled: home=1 partner=3 q-input-copy-bytes=$expected_input_bytes query-gather-bytes=0 output-return-bytes=$expected_output_bytes rows=256/256" \
-            "$base.log" || die "candidate omitted or changed the bounded token-row transfer contract"
-        grep -Fq 'CUDA prefill attention token-row pipeline attention enabled: home=1 partner=3 rows=256/256 query=local-token-rows KV=local-mirrors output=local-A+B' \
-            "$base.log" || die "candidate did not keep q_b through attention A+B row-local"
-        grep -Fq "CUDA prefill attention token-row pipeline output enabled: home=1 partner=3 rows=256/256 output-return-bytes=$expected_output_bytes result=full-N_EMBD-rows" \
-            "$base.log" || die "candidate did not complete local output B and return only final N_EMBD rows"
-        [[ $(grep -Fc 'SM75 row-owned attention output B selected:' "$base.log") == 2 ]] ||
-            die "candidate did not select exact output-B algorithm on both pair members"
-        grep -Fq 'logical=1 physical=3 algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256' \
-            "$base.log" || die "candidate missed exact output-B on the home pair member"
-        grep -Fq 'logical=3 physical=2 algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256' \
-            "$base.log" || die "candidate missed exact output-B on the partner pair member"
-        grep -Fq "exact current-KV mirror enabled: home=1 partner=3 bytes=$expected_current_kv_bytes storage=f32-current-batch" \
-            "$base.log" || die "candidate did not expose its exact zero-prefix current-KV transfer"
-        ! grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
-            die "candidate fell back to the legacy pair-1 expanded-query path"
+        selected_pair_specs=('1:3:3:2')
+        [[ $CANDIDATE_TOKEN_ROW_PAIRS == 0,1 ]] &&
+            selected_pair_specs=('0:2:0:1' '1:3:3:2')
+        for spec in "${selected_pair_specs[@]}"; do
+            IFS=: read -r home partner home_physical partner_physical <<<"$spec"
+            grep -Fq "CUDA prefill attention token-row pipeline enabled: home=$home partner=$partner q-input-copy-bytes=$expected_input_bytes query-gather-bytes=0 output-return-bytes=$expected_output_bytes rows=256/256" \
+                "$base.log" || die "candidate omitted or changed the pair-$home token-row transfer contract"
+            grep -Fq "CUDA prefill attention token-row pipeline attention enabled: home=$home partner=$partner rows=256/256 query=local-token-rows KV=local-mirrors output=local-A+B" \
+                "$base.log" || die "candidate did not keep pair-$home q_b through attention A+B row-local"
+            grep -Fq "CUDA prefill attention token-row pipeline output enabled: home=$home partner=$partner rows=256/256 output-return-bytes=$expected_output_bytes result=full-N_EMBD-rows" \
+                "$base.log" || die "candidate did not complete pair-$home local output B"
+            grep -Fq "logical=$home physical=$home_physical algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256" \
+                "$base.log" || die "candidate missed exact output-B on pair-$home home"
+            grep -Fq "logical=$partner physical=$partner_physical algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256" \
+                "$base.log" || die "candidate missed exact output-B on pair-$home partner"
+            grep -Fq "exact current-KV mirror enabled: home=$home partner=$partner bytes=$expected_current_kv_bytes storage=f32-current-batch" \
+                "$base.log" || die "candidate did not expose pair-$home exact zero-prefix current-KV transfer"
+            grep -Eq "prefill indexer score/top-k row split enabled: tier $home .*selected-mode=partner-local" \
+                "$base.log" || die "candidate did not retain partner-local pair-$home indexer ownership"
+            ! grep -Fq "prefill attention query-row split enabled: tier $home " "$base.log" ||
+                die "candidate fell back to the legacy pair-$home expanded-query path"
+        done
+        [[ $(grep -Fc 'SM75 row-owned attention output B selected:' "$base.log") == "$candidate_owner_count" ]] ||
+            die "candidate did not select exact output-B on every selected pair member"
         ! grep -Eq 'CUDA prefill attention token-row pipeline enabled: .*query-gather-bytes=[1-9][0-9]*' \
             "$base.log" || die "candidate performed a forbidden expanded-query gather"
         grep -E 'CUDA prefill attention token-row pipeline (enabled|attention enabled|output enabled):|exact current-KV mirror enabled:' \
@@ -387,7 +441,9 @@ python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
     "$MAX_MODEL_CACHE_INCREASE_GIB" "$MAX_PER_GPU_VRAM_INCREASE_MIB" \
     "$MAX_AGGREGATE_VRAM_INCREASE_MIB" "$MIN_CANDIDATE_FREE_VRAM_MIB" \
     "$PIPELINE_MB" "$TOKEN_ROW_WEIGHT_MODE" \
-    "$MIN_MODEL_CACHE_SAVING_GIB" "$MIN_AGGREGATE_VRAM_SAVING_MIB" <<'PY'
+    "$MIN_MODEL_CACHE_SAVING_GIB" "$MIN_AGGREGATE_VRAM_SAVING_MIB" \
+    "$CANDIDATE_TOKEN_ROW_PAIRS" "$candidate_layer_count" \
+    "$candidate_pair_description" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
@@ -399,6 +455,9 @@ microbatch = int(sys.argv[7])
 weight_mode = sys.argv[8]
 min_cache_saving = float(sys.argv[9])
 min_aggregate_saving = float(sys.argv[10])
+candidate_pairs = sys.argv[11]
+candidate_layers = int(sys.argv[12])
+candidate_pair_description = sys.argv[13]
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -491,13 +550,17 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"model_cache_increase_gib={cache_growth:.2f}\n")
     f.write(f"model_cache_saving_gib={-cache_growth:.2f}\n")
     f.write(f"token_row_weight_mode={weight_mode}\n")
-    f.write(f"q_input_transfer_bytes_per_pair1_layer_microbatch={q_input}\n")
-    f.write(f"current_kv_transfer_bytes_per_pair1_layer_zero_prefix={current_kv}\n")
-    f.write("expanded_query_gather_bytes_per_pair1_layer_microbatch=0\n")
-    f.write(f"final_output_return_bytes_per_pair1_layer_microbatch={output_return}\n")
-    f.write(f"steady_token_row_payload_bytes_per_pair1_layer_microbatch={q_input + output_return}\n")
-    f.write("pair0_attention=off-both-arms\n")
-    f.write("candidate_pair=logical1-physical-gpu3-gpu2\n")
+    f.write(f"candidate_token_row_pairs={candidate_pairs}\n")
+    f.write(f"candidate_token_row_layers={candidate_layers}\n")
+    f.write(f"q_input_transfer_bytes_per_selected_layer_microbatch={q_input}\n")
+    f.write(f"current_kv_transfer_bytes_per_selected_layer_zero_prefix={current_kv}\n")
+    f.write("expanded_query_gather_bytes_per_selected_layer_microbatch=0\n")
+    f.write(f"final_output_return_bytes_per_selected_layer_microbatch={output_return}\n")
+    f.write(f"steady_token_row_payload_bytes_per_selected_layer_microbatch={q_input + output_return}\n")
+    f.write(f"steady_token_row_payload_bytes_all_selected_layers_per_microbatch={(q_input + output_return) * candidate_layers}\n")
+    f.write("pair0_attention=" +
+            ("off-control-on-candidate-token-row-only" if "0" in candidate_pairs.split(",") else "off-both-arms") + "\n")
+    f.write(f"candidate_pair={candidate_pair_description}\n")
     f.write("candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n")
     f.write("logits=bit-exact\n")
     f.write(f"candidate_aggregate_vram_increase_mib={aggregate_growth:.0f}\n")
