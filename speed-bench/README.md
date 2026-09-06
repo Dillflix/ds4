@@ -5724,6 +5724,13 @@ an algorithm exact on both axes can advance.  The diagnostic selector is not
 read unless `DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC` is explicitly present, so
 normal engine dispatch is unchanged.
 
+When one or more algorithms pass all three output-B exactness comparisons, the
+same diagnostic times shipping DEFAULT and every exact algorithm at both 512
+rows and one 256-row owner extent.  It reports the fastest exact 256-row choice
+and the projected parallel B-kernel envelope relative to shipping 512-row B.
+This is a bounded kernel decision, not production promotion evidence; the
+selected algorithm must still pass the four-GPU row-owned A/B.
+
 The first bounded result rejects q_b GEMM shape as the source: shipping
 `CUBLAS_GEMM_DEFAULT` produced byte-identical FP16 projection storage and
 byte-identical final FP32 query values for one 64-head call versus two 32-head

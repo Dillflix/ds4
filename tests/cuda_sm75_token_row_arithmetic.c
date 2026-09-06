@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Bounded single-GPU diagnostic for the arithmetic shape change made by the
  * token-row prototype.  Production dispatch is not modified: every boundary
@@ -172,6 +173,95 @@ static int launch_output(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
     return ds4_gpu_attention_output_q8_batch_tensor(
         out, low, NULL, NULL, model, model_bytes, out_a_offset, out_b_offset,
         GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads, n_tokens);
+}
+
+static int compare_double(const void *a, const void *b) {
+    const double lhs = *(const double *)a;
+    const double rhs = *(const double *)b;
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static double monotonic_seconds(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return -1.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1.0e-9;
+}
+
+static uint32_t positive_env_u32(const char *name, uint32_t fallback,
+                                 uint32_t maximum) {
+    const char *text = getenv(name);
+    if (!text || !text[0]) return fallback;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed == 0ul || parsed > maximum) {
+        fprintf(stderr, "error: %s must be an integer in [1,%u]\n",
+                name, maximum);
+        return 0u;
+    }
+    return (uint32_t)parsed;
+}
+
+static void select_b_algorithm(int algorithm) {
+    if (algorithm < 0) {
+        (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
+        return;
+    }
+    char text[32];
+    snprintf(text, sizeof(text), "%d", algorithm);
+    (void)setenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC", text, 1);
+}
+
+static int time_output_b(double *median_ms, ds4_gpu_tensor *out,
+                         const unsigned char *model, uint64_t model_bytes,
+                         uint64_t out_b_offset, const ds4_gpu_tensor *low,
+                         uint32_t n_tokens, int algorithm, uint32_t rounds,
+                         uint32_t repeats, uint32_t warmups) {
+    double *samples = (double *)malloc((size_t)rounds * sizeof(*samples));
+    if (!samples) return 0;
+    select_b_algorithm(algorithm);
+    for (uint32_t i = 0u; i < warmups; i++) {
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+                low, n_tokens)) {
+            free(samples);
+            return 0;
+        }
+    }
+    if (!ds4_gpu_synchronize()) {
+        free(samples);
+        return 0;
+    }
+    for (uint32_t round = 0u; round < rounds; round++) {
+        const double begin = monotonic_seconds();
+        if (begin < 0.0) {
+            free(samples);
+            return 0;
+        }
+        for (uint32_t repeat = 0u; repeat < repeats; repeat++) {
+            if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                    out, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+                    low, n_tokens)) {
+                free(samples);
+                return 0;
+            }
+        }
+        if (!ds4_gpu_synchronize()) {
+            free(samples);
+            return 0;
+        }
+        const double end = monotonic_seconds();
+        if (end < begin) {
+            free(samples);
+            return 0;
+        }
+        samples[round] = (end - begin) * 1000.0 / (double)repeats;
+    }
+    qsort(samples, rounds, sizeof(*samples), compare_double);
+    *median_ms = (rounds & 1u)
+        ? samples[rounds / 2u]
+        : 0.5 * (samples[rounds / 2u - 1u] + samples[rounds / 2u]);
+    free(samples);
+    return 1;
 }
 
 int main(void) {
@@ -566,6 +656,8 @@ int main(void) {
                 out_count, out_b_split_chain_diff);
 
     int exact_b_algorithm = -1;
+    int exact_b_algorithms[sizeof(b_algorithms) / sizeof(b_algorithms[0])];
+    size_t exact_b_algorithm_count = 0u;
     for (size_t ai = 0u;
          ai < sizeof(b_algorithms) / sizeof(b_algorithms[0]); ai++) {
         const int algorithm = b_algorithms[ai];
@@ -616,8 +708,9 @@ int main(void) {
                shipping_vs_split.max_abs);
         if (full_vs_split.mismatches == 0u &&
             shipping_vs_full.mismatches == 0u &&
-            shipping_vs_split.mismatches == 0u && exact_b_algorithm < 0) {
-            exact_b_algorithm = algorithm;
+            shipping_vs_split.mismatches == 0u) {
+            if (exact_b_algorithm < 0) exact_b_algorithm = algorithm;
+            exact_b_algorithms[exact_b_algorithm_count++] = algorithm;
         }
     }
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
@@ -626,6 +719,67 @@ int main(void) {
            exact_b_algorithm < 0 ?
                "no-legacy-algorithm-preserved-shipping-output" :
                "explicit-algorithm-preserved-shipping-output");
+
+    const uint32_t timing_rounds = positive_env_u32(
+        "B_TIMING_ROUNDS", 7u, 99u);
+    const uint32_t timing_repeats = positive_env_u32(
+        "B_TIMING_REPEATS", 10u, 1000u);
+    const uint32_t timing_warmups = positive_env_u32(
+        "B_TIMING_WARMUPS", 3u, 100u);
+    if (!timing_rounds || !timing_repeats || !timing_warmups) goto cleanup;
+    printf("b_timing_scope=bounded-host-wall-clock-batched-launches\n"
+           "b_timing_rounds=%u\nb_timing_repeats=%u\n"
+           "b_timing_warmups=%u\n",
+           timing_rounds, timing_repeats, timing_warmups);
+    double shipping_full_ms = 0.0, shipping_half_ms = 0.0;
+    if (!time_output_b(&shipping_full_ms, out_full, model, model_bytes,
+                       out_b_offset, low_full, N_TOK, -1, timing_rounds,
+                       timing_repeats, timing_warmups) ||
+        !time_output_b(&shipping_half_ms, out0, model, model_bytes,
+                       out_b_offset, low_ref0, HALF_TOK, -1, timing_rounds,
+                       timing_repeats, timing_warmups)) {
+        fprintf(stderr, "error: shipping output-B timing failed\n");
+        goto cleanup;
+    }
+    printf("b_timing=shipping-default,rows=%u,median_ms=%.9g\n",
+           N_TOK, shipping_full_ms);
+    printf("b_timing=shipping-default,rows=%u,median_ms=%.9g\n",
+           HALF_TOK, shipping_half_ms);
+
+    int fastest_exact_b_algorithm = -1;
+    double fastest_exact_b_half_ms = HUGE_VAL;
+    for (size_t i = 0u; i < exact_b_algorithm_count; i++) {
+        const int algorithm = exact_b_algorithms[i];
+        double full_ms = 0.0, half_ms = 0.0;
+        if (!time_output_b(&full_ms, out_full, model, model_bytes,
+                           out_b_offset, low_full, N_TOK, algorithm,
+                           timing_rounds, timing_repeats, timing_warmups) ||
+            !time_output_b(&half_ms, out0, model, model_bytes,
+                           out_b_offset, low_ref0, HALF_TOK, algorithm,
+                           timing_rounds, timing_repeats, timing_warmups)) {
+            fprintf(stderr, "error: exact output-B algorithm %d timing failed\n",
+                    algorithm);
+            goto cleanup;
+        }
+        printf("b_timing=explicit,algorithm=%d,rows=%u,median_ms=%.9g,"
+               "shipping_full_over_arm=%.9g\n",
+               algorithm, N_TOK, full_ms, shipping_full_ms / full_ms);
+        printf("b_timing=explicit,algorithm=%d,rows=%u,median_ms=%.9g,"
+               "shipping_full_over_parallel_half_envelope=%.9g\n",
+               algorithm, HALF_TOK, half_ms, shipping_full_ms / half_ms);
+        if (half_ms < fastest_exact_b_half_ms) {
+            fastest_exact_b_algorithm = algorithm;
+            fastest_exact_b_half_ms = half_ms;
+        }
+    }
+    select_b_algorithm(-1);
+    printf("fastest_shipping_exact_b_algorithm=%d\n",
+           fastest_exact_b_algorithm);
+    printf("fastest_shipping_exact_b_half_median_ms=%.9g\n",
+           fastest_exact_b_half_ms);
+    printf("fastest_shipping_exact_b_projected_parallel_speedup=%.9g\n",
+           fastest_exact_b_algorithm < 0 ? 0.0 :
+               shipping_full_ms / fastest_exact_b_half_ms);
 
     /* Keep the original structured B-only fixture as a control.  Its exactness
      * is not sufficient to clear B for arbitrary A-produced inputs. */

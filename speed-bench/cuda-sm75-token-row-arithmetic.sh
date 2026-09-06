@@ -11,6 +11,9 @@ PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+B_TIMING_ROUNDS=${B_TIMING_ROUNDS:-7}
+B_TIMING_REPEATS=${B_TIMING_REPEATS:-10}
+B_TIMING_WARMUPS=${B_TIMING_WARMUPS:-3}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${TOKEN_ROW_ARITHMETIC_DIR:-$repo_dir/sm75-token-row-arithmetic-$stamp}
 target=tests/cuda_sm75_token_row_arithmetic
@@ -20,6 +23,10 @@ target=tests/cuda_sm75_token_row_arithmetic
 for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
+done
+for value_name in B_TIMING_ROUNDS B_TIMING_REPEATS B_TIMING_WARMUPS; do
+    value=${!value_name}
+    [[ $value =~ ^[1-9][0-9]*$ ]] || die "$value_name must be a positive integer"
 done
 for tool in cat date env git grep make mkdir nproc nvidia-smi tail tar; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
@@ -82,7 +89,10 @@ while IFS='=' read -r name _; do
         clean_env+=(-u "$name")
     fi
 done < <(env)
-clean_env+=(CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$PROFILE_GPU")
+clean_env+=(CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$PROFILE_GPU"
+    B_TIMING_ROUNDS="$B_TIMING_ROUNDS"
+    B_TIMING_REPEATS="$B_TIMING_REPEATS"
+    B_TIMING_WARMUPS="$B_TIMING_WARMUPS")
 
 phase=diagnostic
 "${clean_env[@]}" "./$target" >"$OUTPUT_DIR/diagnostic.log" 2>&1 || {
@@ -107,6 +117,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"
