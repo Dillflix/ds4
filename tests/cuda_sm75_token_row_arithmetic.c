@@ -498,21 +498,23 @@ int main(void) {
         reference, candidate, q_count);
     report_diff("q-b-control-persistent-vs-internal-row-scratch256x2", "f32",
                 q_count, q_scratch_diff);
-    if (getenv("DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE")) {
-        printf("boundary=static-mixed-attention-shipping-vs-full-range512,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=static-mixed-attention-full-range512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=inverse-rope-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-a-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-a-plus-b-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-b-from-identical-actual-a-low-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-a-to-b-chain-reference,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-b-structured-control-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
+    if (getenv("DS4_TOKEN_ROW_ARITHMETIC_STOP_AFTER_Q_B") ||
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE")) {
+        printf("diagnostic_scope=q-b-only\n");
+        printf("boundary=static-mixed-attention-shipping-vs-full-range512,status=skipped-by-q-b-scope\n");
+        printf("boundary=static-mixed-attention-full-range512-vs-row256x2,status=skipped-by-q-b-scope\n");
+        printf("boundary=inverse-rope-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
+        printf("boundary=output-a-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
+        printf("boundary=output-a-plus-b-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
+        printf("boundary=output-b-from-identical-actual-a-low-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
+        printf("boundary=output-a-to-b-chain-reference,status=skipped-by-q-b-scope\n");
+        printf("boundary=output-b-structured-control-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
         printf("diagnostic_conclusion=%s\n",
                qh_diff.mismatches ? "first-divergence-q-b-f16-projection" :
                q_diff.mismatches ? "first-divergence-q-b-postprocess" :
                q_scratch_diff.mismatches ?
                    "first-divergence-q-b-internal-scratch-shape" :
-               "q-b-boundaries-bit-exact-sanitizer-smoke");
+               "q-b-boundaries-bit-exact");
         printf("harness_status=ok\n");
         status = 0;
         goto cleanup;

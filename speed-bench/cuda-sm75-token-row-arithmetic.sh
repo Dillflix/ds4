@@ -11,6 +11,8 @@ PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
+CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-600}
 B_TIMING_ROUNDS=${B_TIMING_ROUNDS:-7}
 B_TIMING_REPEATS=${B_TIMING_REPEATS:-10}
 B_TIMING_WARMUPS=${B_TIMING_WARMUPS:-3}
@@ -20,6 +22,10 @@ target=tests/cuda_sm75_token_row_arithmetic
 
 [[ $CUDA_ARCH == sm_75 ]] || die "CUDA_ARCH must be sm_75"
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be an integer"
+[[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == full ]] ||
+    die "DIAGNOSTIC_SCOPE must be q-b or full"
+[[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
+    die "CASE_TIMEOUT_SECONDS must be a positive integer"
 for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -28,7 +34,7 @@ for value_name in B_TIMING_ROUNDS B_TIMING_REPEATS B_TIMING_WARMUPS; do
     value=${!value_name}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$value_name must be a positive integer"
 done
-for tool in cat date env git grep make mkdir nproc nvidia-smi tail tar; do
+for tool in cat date env git grep journalctl make mkdir nproc nvidia-smi sudo tail tar timeout; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
 if (( RUN_SANITIZER )); then
@@ -37,7 +43,7 @@ if (( RUN_SANITIZER )); then
 fi
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/provenance"
+mkdir -p "$OUTPUT_DIR/provenance" "$OUTPUT_DIR/health"
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=build
@@ -76,6 +82,8 @@ phase=manifest
         "$(git branch --show-current)"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
+    printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\n' \
+        "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS"
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -93,25 +101,74 @@ clean_env+=(CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$PROFILE_GPU"
     B_TIMING_ROUNDS="$B_TIMING_ROUNDS"
     B_TIMING_REPEATS="$B_TIMING_REPEATS"
     B_TIMING_WARMUPS="$B_TIMING_WARMUPS")
+if [[ $DIAGNOSTIC_SCOPE == q-b ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_STOP_AFTER_Q_B=1)
+fi
+
+capture_gpu_health() {
+    local output=$1
+    timeout 20s nvidia-smi -i "$PROFILE_GPU" \
+        --query-gpu=index,pci.bus_id,uuid,memory.used,memory.free,power.limit \
+        --format=csv,noheader,nounits >"$output" 2>&1
+}
+
+capture_kernel_since() {
+    local since=$1
+    local output=$2
+    if sudo -n true >/dev/null 2>&1; then
+        sudo -n journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
+    else
+        journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
+    fi
+}
+
+capture_gpu_health "$OUTPUT_DIR/health/pre-gpu.csv" ||
+    die "could not capture pre-run GPU health"
+arm_start=$(date --iso-8601=seconds)
 
 phase=diagnostic
-"${clean_env[@]}" "./$target" >"$OUTPUT_DIR/diagnostic.log" 2>&1 || {
+set +e
+timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
+    "${clean_env[@]}" "./$target" >"$OUTPUT_DIR/diagnostic.log" 2>&1
+diagnostic_status=$?
+set -e
+capture_kernel_since "$arm_start" "$OUTPUT_DIR/health/kernel.log"
+capture_gpu_health "$OUTPUT_DIR/health/post-gpu.csv" || {
+    tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
+    die "post-run GPU health unavailable after diagnostic status $diagnostic_status"
+}
+! grep -Eiq 'NVRM: Xid|GPU has fallen off|GPU Unavailable|Critical Xid' \
+    "$OUTPUT_DIR/diagnostic.log" "$OUTPUT_DIR/health/kernel.log" || {
         tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
-        die "token-row arithmetic diagnostic failed to complete"
+        die "GPU fault recorded during token-row arithmetic diagnostic"
     }
+if (( diagnostic_status != 0 )); then
+    tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
+    die "token-row arithmetic diagnostic failed with status $diagnostic_status"
+fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/diagnostic.log" ||
     die "diagnostic omitted success marker"
 cat "$OUTPUT_DIR/diagnostic.log"
 
 if (( RUN_SANITIZER )); then
     phase=sanitizer
+    sanitizer_start=$(date --iso-8601=seconds)
     "${clean_env[@]}" \
         DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE=1 \
+        timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
         compute-sanitizer --tool memcheck --error-exitcode=99 \
         "./$target" >"$OUTPUT_DIR/sanitizer.log" 2>&1 || {
             tail -n 240 "$OUTPUT_DIR/sanitizer.log" >&2
             die "Compute Sanitizer failed"
         }
+    capture_kernel_since "$sanitizer_start" \
+        "$OUTPUT_DIR/health/sanitizer-kernel.log"
+    capture_gpu_health "$OUTPUT_DIR/health/post-sanitizer-gpu.csv" ||
+        die "post-sanitizer GPU health unavailable"
+    ! grep -Eiq 'NVRM: Xid|GPU has fallen off|GPU Unavailable|Critical Xid' \
+        "$OUTPUT_DIR/sanitizer.log" \
+        "$OUTPUT_DIR/health/sanitizer-kernel.log" ||
+        die "GPU fault recorded during Compute Sanitizer"
     grep -Fq 'ERROR SUMMARY: 0 errors' "$OUTPUT_DIR/sanitizer.log" ||
         die "Compute Sanitizer omitted a clean summary"
 fi

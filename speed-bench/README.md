@@ -6108,6 +6108,14 @@ evidence, not harness failures; setup and runtime errors remain fatal.  Compute 
 q_b row-view and NULL/scratch boundary as a reduced memory-safety smoke; the
 ordinary run covers every listed arithmetic boundary at full shape.
 
+`DIAGNOSTIC_SCOPE=q-b` stops the ordinary arm immediately after those three
+q_b boundaries.  Use that scope for physical-device isolation: it does not
+enter attention output B's exhaustive legacy-cuBLAS algorithm sweep.  The
+runner bounds both the ordinary and sanitizer processes, captures pre/post GPU
+identity and memory health, and saves kernel messages since the arm began so a
+CUDA-context failure cannot be mistaken for a PCIe Xid.  `full` remains the
+default for the arithmetic/exactness investigation.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6139,5 +6147,13 @@ disabling the F16 cache, and normal dispatch remains DEFAULT.
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+For the local-only GPU1 q_b isolation rung:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=q-b \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
