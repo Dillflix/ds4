@@ -562,6 +562,13 @@ int main(void) {
     diff_metrics native_q_diff = {0u, UINT64_MAX, 0.0, 0.0};
     diff_metrics native_scratch_diff = {0u, UINT64_MAX, 0.0, 0.0};
     if (native_q_b_diagnostic) {
+        /* Keep the canonical control cache installed above, but prevent the
+         * lazy cache path from treating the independently packed native range
+         * as canonical Q8_0 and admitting a new FP16 entry before the native
+         * source lookup runs.  Production gets this lookup-only behavior from
+         * its finalized cache plan; the bounded single-GPU harness has no
+         * startup planner, so make that boundary explicit here. */
+        (void)setenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE", "1", 1);
         (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE",
                      "native-stream", 1);
         (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS",
@@ -981,6 +988,7 @@ int main(void) {
     status = 0;
 
 cleanup:
+    (void)unsetenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
     (void)unsetenv("DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
