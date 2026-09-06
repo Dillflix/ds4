@@ -385,6 +385,7 @@ validate_selector() {
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
             grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' "$log" &&
             grep -Eq 'SM75 compact indexed exact summary: calls=[1-9][0-9]* ' "$log" &&
+            grep -Eq 'SM75 compact attention hybrid summary: calls=[1-9][0-9]* dense-calls=[1-9][0-9]* indexed-calls=[1-9][0-9]* token-tiles=[1-9][0-9]* max-tokens-per-tile=32 ' "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log" &&
             ! grep -Fq 'compact attention hybrid scratch allocation failed' "$log"
     fi

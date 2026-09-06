@@ -5599,12 +5599,21 @@ bash ./speed-bench/cuda-sm75-compact-attention-kv.sh
 `cuda-sm75-compact-kv-production-ab.sh` compares the ordinary persistent F32
 compressed-attention cache with the exact 736-byte SM75 cache on the same
 tagged-native all43 model. The candidate keeps persistent compact rows,
-materializes only selected rows into two reusable 256-row hybrid buffers
+materializes each bounded row chunk into two reusable 256-row hybrid buffers
 (`448 x FP16 + 64 x FP32`), and consumes those buffers with high-priority H16
-indexed attention. Large-token prefill consumes the exact compact rows
-directly. Its producer bypasses the separate rounded-F32 staging quantizer;
-compact packing owns the sole shipping E4M3 quantization pass. The engine
-preserves F32 session/checkpoint payloads at the external boundary.
+attention. Production continuation prefill is internally divided into at most
+32-token tiles. Dense attention materializes identity-ordered rows while its
+compressed history is at most 1024 rows; sparse attention materializes its
+ordered top-512 selection after that boundary. The row buffers remain fixed at
+`32 * 256 * 1152 = 9,437,184` bytes each, or 18 MiB for both, independent of
+prompt and allocated-context length. F32 max/sum state is also bounded by the
+32-token tile. The two streams overlap materialization of one row chunk with
+H16 consumption of the preceding chunk and safely reuse each buffer through
+events. Token tiling retains the original batch's raw-ring origin, so splitting
+the launch does not change which historical raw rows each token observes. Its
+producer bypasses the separate rounded-F32 staging quantizer; compact packing
+owns the sole shipping E4M3 quantization pass. The engine preserves F32
+session/checkpoint payloads at the external boundary.
 
 Single-token non-indexed decode reconstructs each compact row once into a
 reusable 2 MiB per-home-device F32 stage, then uses the same exact two-pass
@@ -5624,7 +5633,10 @@ failure can be assigned to measured prefill, teardown, or session I/O.
 The one-shot qualification allocates 256K context capacity while measuring
 the PP512/4096/32768 frontiers. It requires byte-identical prefill and decode
 logits, unchanged four-GPU health, no throughput frontier below `1.0x`, the
-stable 22/21 pipeline and pair policy, and actual compact-hybrid dispatch. Its
+stable 22/21 pipeline and pair policy, and nonzero dense and indexed tiled
+compact-hybrid dispatch. The CUDA long-context smoke separately covers a
+65-token `32/32/1` dense continuation and indexed selection against the
+shipping F32 consumers. Its
 default aggregate VRAM floor is 95% of the production allocation model: owner
 caches for all 21 ratio-4 and 20 ratio-128 layers plus the pair-1 mirror for
 the 11 ratio-4 and 10 ratio-128 late-stage layers. At 262145 tokens this is

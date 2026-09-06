@@ -681,7 +681,7 @@ double      g_gpu_peer_gib_per_sec[DS4_MAX_GPUS][DS4_MAX_GPUS];
 enum {
     CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS = 256u,
     CUDA_SM75_HYBRID_ATTN_BUFFERS = 2u,
-    CUDA_SM75_HYBRID_ATTN_MAX_TOKENS = 32u,
+    CUDA_SM75_HYBRID_ATTN_TOKEN_TILE = 32u,
     CUDA_SM75_COMPACT_EXACT_STAGE_ROWS = 1024u,
 };
 
@@ -705,6 +705,9 @@ static cuda_sm75_hybrid_attn_context
     g_sm75_hybrid_attn[DS4_MAX_GPUS];
 static float *g_sm75_compact_exact_stage[DS4_MAX_GPUS] = {NULL};
 static std::atomic<uint64_t> g_sm75_hybrid_attn_calls = 0;
+static std::atomic<uint64_t> g_sm75_hybrid_attn_token_tiles = 0;
+static std::atomic<uint64_t> g_sm75_hybrid_attn_dense_calls = 0;
+static std::atomic<uint64_t> g_sm75_hybrid_attn_indexed_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_exact_score_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_exact_materialized_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_indexed_exact_calls = 0;
@@ -5940,6 +5943,12 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     const uint64_t hybrid_attention_calls =
         g_sm75_hybrid_attn_calls.load(std::memory_order_relaxed);
+    const uint64_t hybrid_attention_token_tiles =
+        g_sm75_hybrid_attn_token_tiles.load(std::memory_order_relaxed);
+    const uint64_t hybrid_attention_dense_calls =
+        g_sm75_hybrid_attn_dense_calls.load(std::memory_order_relaxed);
+    const uint64_t hybrid_attention_indexed_calls =
+        g_sm75_hybrid_attn_indexed_calls.load(std::memory_order_relaxed);
     const uint64_t compact_exact_score_calls =
         g_sm75_compact_exact_score_calls.load(std::memory_order_relaxed);
     const uint64_t compact_exact_materialized_calls =
@@ -5977,9 +5986,15 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (hybrid_attention_calls != 0u) {
         fprintf(stderr,
                 "ds4: SM75 compact attention hybrid summary: calls=%llu "
+                "dense-calls=%llu indexed-calls=%llu token-tiles=%llu "
+                "max-tokens-per-tile=%u "
                 "persistent-row-bytes=736 transient-row-bytes=1152 "
                 "chunk-rows=256 buffers=2 heads-per-block=16\n",
-                (unsigned long long)hybrid_attention_calls);
+                (unsigned long long)hybrid_attention_calls,
+                (unsigned long long)hybrid_attention_dense_calls,
+                (unsigned long long)hybrid_attention_indexed_calls,
+                (unsigned long long)hybrid_attention_token_tiles,
+                CUDA_SM75_HYBRID_ATTN_TOKEN_TILE);
     }
     const uint64_t compressor_staged_256 =
         g_cuda_compressor_projection_staged_calls[0].load(
@@ -6187,6 +6202,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_sm75_hybrid_attn_calls.store(0u, std::memory_order_relaxed);
+    g_sm75_hybrid_attn_token_tiles.store(0u, std::memory_order_relaxed);
+    g_sm75_hybrid_attn_dense_calls.store(0u, std::memory_order_relaxed);
+    g_sm75_hybrid_attn_indexed_calls.store(0u, std::memory_order_relaxed);
     g_sm75_compact_exact_score_calls.store(0u, std::memory_order_relaxed);
     g_sm75_compact_exact_materialized_calls.store(
         0u, std::memory_order_relaxed);
@@ -13499,8 +13517,9 @@ __global__ static void sm75_compact_attn_materialize_hybrid_chunk_kernel(
     const uint32_t selected = chunk_start + local_row;
     if (selected >= comp_count) return;
 
-    const uint32_t source_row = (uint32_t)topk[
-        (uint64_t)token * top_k + selected];
+    const uint32_t source_row = topk
+        ? (uint32_t)topk[(uint64_t)token * top_k + selected]
+        : selected;
     const cuda_sm75_compact_attn_kv_row *src = compact_rows + source_row;
     cuda_sm75_hybrid_attn_kv_row *dst = hybrid_rows +
         (uint64_t)token * CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS + local_row;
@@ -16853,7 +16872,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
-/* Production indexed-attention consumer for the compact persistent cache.
+/* Production dense/indexed attention consumer for the compact persistent cache.
  * Chunk zero consumes the ordinary raw window first, then the first selected
  * compact chunk.  Later launches resume the exact F32 online-softmax state,
  * so row order and arithmetic agree with the existing H16 online kernel.
@@ -16877,6 +16896,7 @@ __global__ static void attention_indexed_compact_hybrid_chunk_kernel(
         uint32_t n_raw,
         uint32_t raw_cap,
         uint32_t raw_start,
+        uint32_t raw_first_pos,
         uint32_t n_comp,
         uint32_t top_k,
         uint32_t window,
@@ -16919,10 +16939,9 @@ __global__ static void attention_indexed_compact_hybrid_chunk_kernel(
         raw_count_s = 0u;
         raw_first_idx_s = 0u;
         if (chunk_start == 0u && n_raw != 0u) {
-            const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
-            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
-            if (qpos >= first_raw_pos) {
-                uint32_t lo = first_raw_pos;
+            const uint32_t raw_last_pos = raw_first_pos + n_raw - 1u;
+            if (qpos >= raw_first_pos) {
+                uint32_t lo = raw_first_pos;
                 if (window != 0u && qpos + 1u > window) {
                     const uint32_t wlo = qpos + 1u - window;
                     if (wlo > lo) lo = wlo;
@@ -16930,7 +16949,7 @@ __global__ static void attention_indexed_compact_hybrid_chunk_kernel(
                 const uint32_t hi = qpos < raw_last_pos
                     ? qpos : raw_last_pos;
                 if (hi >= lo) {
-                    raw_first_idx_s = lo - first_raw_pos;
+                    raw_first_idx_s = lo - raw_first_pos;
                     raw_count_s = hi - lo + 1u;
                     if (raw_count_s > 256u) raw_count_s = 256u;
                 }
@@ -16996,8 +17015,9 @@ __global__ static void attention_indexed_compact_hybrid_chunk_kernel(
                         c4);
                 } else if ((status & 3u) == 0u) {
                     const uint32_t selected = chunk_start + local_row;
-                    const uint32_t source_row = (uint32_t)topk[
-                        (uint64_t)token * top_k + selected];
+                    const uint32_t source_row = topk
+                        ? (uint32_t)topk[(uint64_t)token * top_k + selected]
+                        : selected;
                     kv_shared[off] = attention_comp_load_float4<true>(
                         compact_kv, source_row, c4);
                 } else {
@@ -25948,7 +25968,7 @@ static int cuda_sm75_compact_indexed_exact_launch(
 /* Returns 1 when launched, 0 when the caller should use the direct compact
  * kernel, and -1 after any submission error (unsafe to submit a fallback into
  * the partially constructed dependency chain). */
-static int cuda_sm75_hybrid_indexed_attention_launch(
+static int cuda_sm75_hybrid_attention_launch(
         int logical_tier,
         float *heads,
         const float *sinks,
@@ -25968,16 +25988,22 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
         uint32_t head0,
         uint32_t n_head_work,
         uint32_t n_head_total) {
+    const bool indexed = topk != NULL;
     if (!cuda_sm75_mma_ok() ||
         getenv("DS4_CUDA_NO_ATTN_COMPACT_HYBRID") != NULL ||
-        !heads || !sinks || !q || !raw_kv || !comp_kv || !topk ||
-        n_tokens == 0u || n_tokens > CUDA_SM75_HYBRID_ATTN_MAX_TOKENS ||
-        n_raw == 0u || raw_cap < n_raw ||
+        !heads || !sinks || !q || !raw_kv || !comp_kv ||
+        n_tokens == 0u || n_raw == 0u || raw_cap < n_raw ||
         raw_start >= raw_cap || n_comp == 0u || top_k == 0u ||
-        top_k > 512u || ratio == 0u || n_head_work == 0u ||
+        (indexed ? top_k > 512u
+                 : (top_k != n_comp ||
+                    top_k > CUDA_SM75_COMPACT_EXACT_STAGE_ROWS)) ||
+        ratio == 0u || n_head_work == 0u ||
         head0 > n_head_total || n_head_work > n_head_total - head0) {
         return 0;
     }
+    const uint64_t batch_end = (uint64_t)pos0 + n_tokens;
+    if (batch_end < n_raw || batch_end > UINT32_MAX) return 0;
+    const uint32_t raw_first_pos = (uint32_t)batch_end - n_raw;
     int current_device = -1;
     if (logical_tier < 0 || logical_tier >= g_n_gpus ||
         cudaGetDevice(&current_device) != cudaSuccess ||
@@ -25992,15 +26018,18 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
     if (trace) {
         fprintf(stderr,
                 "ds4: compact attention trace call=%llu phase=submit "
-                "kind=indexed-hybrid tier=%d device=%d tokens=%u pos=%u "
+                "kind=%s-hybrid tier=%d device=%d tokens=%u pos=%u "
                 "raw=%u comp=%u topk=%u window=%u ratio=%u heads=%u+%u/%u\n",
-                (unsigned long long)trace_call, logical_tier,
+                (unsigned long long)trace_call,
+                indexed ? "indexed" : "dense", logical_tier,
                 current_device, n_tokens, pos0, n_raw, n_comp, top_k,
                 window, ratio, head0, n_head_work, n_head_total);
         fflush(stderr);
     }
+    const uint32_t token_capacity = min(
+        n_tokens, (uint32_t)CUDA_SM75_HYBRID_ATTN_TOKEN_TILE);
     if (!cuda_sm75_hybrid_attn_reserve(
-            logical_tier, n_tokens, n_head_total)) return 0;
+            logical_tier, token_capacity, n_head_total)) return 0;
     cuda_sm75_hybrid_attn_context *c = &g_sm75_hybrid_attn[logical_tier];
     if (!cuda_ok(cudaEventRecord(c->entry, 0),
                  "compact attention record producer boundary") ||
@@ -26012,53 +26041,68 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
     const uint32_t chunks =
         (top_k + CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS - 1u) /
         CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS;
-    const size_t status_bytes = (size_t)n_tokens *
-        CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS * sizeof(uint32_t);
-    for (uint32_t chunk = 0u; chunk < chunks; chunk++) {
-        const uint32_t bi = chunk % CUDA_SM75_HYBRID_ATTN_BUFFERS;
-        const uint32_t chunk_start =
-            chunk * CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS;
-        if (!cuda_ok(cudaStreamWaitEvent(
-                         c->materialize_stream, c->reusable[bi], 0),
-                     "compact attention wait reusable buffer") ||
-            !cuda_ok(cudaMemsetAsync(c->status[bi], 0, status_bytes,
-                                     c->materialize_stream),
-                     "compact attention clear row status")) {
-            return -1;
+    const uint64_t token_vector_stride = (uint64_t)n_head_total * 512u;
+    uint64_t submitted_tiles = 0u;
+    for (uint32_t tile_start = 0u; tile_start < n_tokens;) {
+        const uint32_t tile_tokens = min(
+            (uint32_t)CUDA_SM75_HYBRID_ATTN_TOKEN_TILE,
+            n_tokens - tile_start);
+        const uint32_t tile_pos0 = pos0 + tile_start;
+        float *tile_heads = heads + (uint64_t)tile_start * token_vector_stride;
+        const float *tile_q = q + (uint64_t)tile_start * token_vector_stride;
+        const int32_t *tile_topk = indexed
+            ? topk + (uint64_t)tile_start * top_k : NULL;
+        const size_t status_bytes = (size_t)tile_tokens *
+            CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS * sizeof(uint32_t);
+        for (uint32_t chunk = 0u; chunk < chunks; chunk++) {
+            const uint32_t bi = chunk % CUDA_SM75_HYBRID_ATTN_BUFFERS;
+            const uint32_t chunk_start =
+                chunk * CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS;
+            if (!cuda_ok(cudaStreamWaitEvent(
+                             c->materialize_stream, c->reusable[bi], 0),
+                         "compact attention wait reusable buffer") ||
+                !cuda_ok(cudaMemsetAsync(c->status[bi], 0, status_bytes,
+                                         c->materialize_stream),
+                         "compact attention clear row status")) {
+                return -1;
+            }
+            dim3 materialize_grid(
+                tile_tokens, CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS, 1u);
+            sm75_compact_attn_materialize_hybrid_chunk_kernel
+                <<<materialize_grid, 128, 0, c->materialize_stream>>>(
+                    (const cuda_sm75_compact_attn_kv_row *)comp_kv,
+                    tile_topk, c->row[bi], c->status[bi], tile_tokens,
+                    tile_pos0, n_comp, top_k, ratio, chunk_start);
+            if (!cuda_ok(cudaPeekAtLastError(),
+                         "compact attention materialize launch") ||
+                !cuda_ok(cudaEventRecord(
+                             c->ready[bi], c->materialize_stream),
+                         "compact attention record ready buffer") ||
+                !cuda_ok(cudaStreamWaitEvent(
+                             c->attention_stream, c->ready[bi], 0),
+                         "compact attention wait ready buffer")) {
+                return -1;
+            }
+            dim3 attention_grid(
+                tile_tokens, (n_head_work + 15u) / 16u, 1u);
+            attention_indexed_compact_hybrid_chunk_kernel<16>
+                <<<attention_grid, 512, 0, c->attention_stream>>>(
+                    tile_heads, sinks, tile_q, raw_kv,
+                    (const cuda_sm75_compact_attn_kv_row *)comp_kv,
+                    tile_topk, c->row[bi], c->status[bi], c->max_state,
+                    c->sum_state, tile_tokens, tile_pos0, n_raw, raw_cap,
+                    raw_start, raw_first_pos, n_comp, top_k, window, ratio,
+                    chunk_start, head0, n_head_work, n_head_total);
+            if (!cuda_ok(cudaPeekAtLastError(),
+                         "compact attention hybrid consumer launch") ||
+                !cuda_ok(cudaEventRecord(
+                             c->reusable[bi], c->attention_stream),
+                         "compact attention record reusable buffer")) {
+                return -1;
+            }
         }
-        dim3 materialize_grid(
-            n_tokens, CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS, 1u);
-        sm75_compact_attn_materialize_hybrid_chunk_kernel
-            <<<materialize_grid, 128, 0, c->materialize_stream>>>(
-                (const cuda_sm75_compact_attn_kv_row *)comp_kv, topk,
-                c->row[bi], c->status[bi], n_tokens, pos0, n_comp, top_k,
-                ratio, chunk_start);
-        if (!cuda_ok(cudaPeekAtLastError(),
-                     "compact attention materialize launch") ||
-            !cuda_ok(cudaEventRecord(
-                         c->ready[bi], c->materialize_stream),
-                     "compact attention record ready buffer") ||
-            !cuda_ok(cudaStreamWaitEvent(
-                         c->attention_stream, c->ready[bi], 0),
-                     "compact attention wait ready buffer")) {
-            return -1;
-        }
-        dim3 attention_grid(n_tokens, (n_head_work + 15u) / 16u, 1u);
-        attention_indexed_compact_hybrid_chunk_kernel<16>
-            <<<attention_grid, 512, 0, c->attention_stream>>>(
-                heads, sinks, q, raw_kv,
-                (const cuda_sm75_compact_attn_kv_row *)comp_kv, topk,
-                c->row[bi], c->status[bi], c->max_state, c->sum_state,
-                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
-                window, ratio, chunk_start, head0, n_head_work,
-                n_head_total);
-        if (!cuda_ok(cudaPeekAtLastError(),
-                     "compact attention hybrid consumer launch") ||
-            !cuda_ok(cudaEventRecord(
-                         c->reusable[bi], c->attention_stream),
-                     "compact attention record reusable buffer")) {
-            return -1;
-        }
+        submitted_tiles++;
+        tile_start += tile_tokens;
     }
     if (!cuda_ok(cudaEventRecord(c->done, c->attention_stream),
                  "compact attention record completion") ||
@@ -26068,17 +26112,27 @@ static int cuda_sm75_hybrid_indexed_attention_launch(
     }
     if (getenv("DS4_CUDA_COMPACT_ATTN_SYNC_TRACE") != NULL &&
         !cuda_ok(cudaDeviceSynchronize(),
-                 "compact attention indexed trace synchronize")) {
+                 "compact attention hybrid trace synchronize")) {
         return -1;
     }
     if (trace) {
         fprintf(stderr,
                 "ds4: compact attention trace call=%llu phase=submitted "
-                "kind=indexed-hybrid\n",
-                (unsigned long long)trace_call);
+                "kind=%s-hybrid\n",
+                (unsigned long long)trace_call,
+                indexed ? "indexed" : "dense");
         fflush(stderr);
     }
     g_sm75_hybrid_attn_calls.fetch_add(1u, std::memory_order_relaxed);
+    g_sm75_hybrid_attn_token_tiles.fetch_add(
+        submitted_tiles, std::memory_order_relaxed);
+    if (indexed) {
+        g_sm75_hybrid_attn_indexed_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        g_sm75_hybrid_attn_dense_calls.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     return 1;
 }
 
@@ -26704,6 +26758,15 @@ static int attention_decode_batch_launch(
             g_cuda_no_window_attention) {
             return 0;
         }
+        if (n_tokens > 1u && n_comp <= CUDA_SM75_COMPACT_EXACT_STAGE_ROWS) {
+            const int hybrid_rc = cuda_sm75_hybrid_attention_launch(
+                logical_tier, (float *)heads->ptr, sinks,
+                (const float *)q->ptr, (const float *)raw_kv->ptr,
+                comp_ptr, NULL, n_tokens, pos0, n_raw, raw_cap, raw_start,
+                n_comp, n_comp, window, ratio, 0u, n_head, n_head);
+            if (hybrid_rc > 0) return 1;
+            if (hybrid_rc < 0) return 0;
+        }
         const bool trace =
             getenv("DS4_CUDA_COMPACT_ATTN_TRACE") != NULL;
         const uint64_t trace_call = trace
@@ -26944,6 +27007,17 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_shard_tensor(
             model_map, sinks_offset, (uint64_t)n_head_total * sizeof(float),
             logical_tier, "attn_sinks_shard");
     if (!sinks) return 0;
+    if (compact_consumer &&
+        n_comp <= CUDA_SM75_COMPACT_EXACT_STAGE_ROWS) {
+        const int hybrid_rc = cuda_sm75_hybrid_attention_launch(
+            logical_tier, (float *)heads->ptr, sinks,
+            (const float *)q->ptr, (const float *)raw_kv->ptr,
+            comp_ptr, NULL, n_tokens, pos0, n_raw, raw_cap, raw_start,
+            n_comp, n_comp, window, ratio, head0, n_head_work,
+            n_head_total);
+        if (hybrid_rc > 0) return 1;
+        if (hybrid_rc < 0) return 0;
+    }
     dim3 grid(n_tokens, (n_head_work + 7u) / 8u, 1u);
     if (compact_consumer) {
         attention_decode_mixed_heads8_online_kernel<true><<<grid, 256>>>(
@@ -27034,7 +27108,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return 0;
     }
     if (compact_consumer) {
-        const int hybrid_rc = cuda_sm75_hybrid_indexed_attention_launch(
+        const int hybrid_rc = cuda_sm75_hybrid_attention_launch(
             logical_tier, (float *)heads->ptr, sinks,
             (const float *)q->ptr, (const float *)raw_kv->ptr,
             comp_ptr, topk_ptr, n_tokens, pos0, n_raw, raw_cap,
@@ -27174,7 +27248,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_shard_tensor(
         topk_ptr = sorted;
     }
     if (compact_consumer) {
-        const int hybrid_rc = cuda_sm75_hybrid_indexed_attention_launch(
+        const int hybrid_rc = cuda_sm75_hybrid_attention_launch(
             logical_tier, (float *)heads->ptr, sinks,
             (const float *)q->ptr, (const float *)raw_kv->ptr,
             comp_ptr, topk_ptr, n_tokens, pos0, n_raw, raw_cap,
