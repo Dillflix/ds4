@@ -5648,6 +5648,56 @@ GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-attention-distributed-output-ab.sh
 ```
+
+### Stable-pair token-row-through-attention exactness A/B
+
+`cuda-sm75-token-row-attention-exactness.sh` is the first fail-closed
+production-shape gate for the TP-style token-row pipeline.  It starts row
+ownership before q_b: for each 512-row internal pipeline microbatch the home
+keeps 256 normalized 1024-wide rows and copies the other 256 rows (1 MiB) to
+the stable pair-1 partner.  Both owners then execute q_b, attention, inverse
+RoPE, output A, and output B over their own token rows.  Only the partner's
+256x4096 final output rows (4 MiB) return home.  The steady per-layer link
+payload is therefore 5 MiB, and the 32768-wide expanded query is never
+gathered.  The zero-prefix path separately reports its exact 512x512 F32
+current-KV mirror (1 MiB); that transfer is not repeated for every later
+microbatch.
+
+The candidate has a distinct selector,
+`DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=1`.  The control leaves it
+unset.  The harness fixes `GPU_DEVICES=0,3,1,2`, validates bidirectional NVLink
+between physical GPUs 3 and 2, and refuses any pair-0 token-row or legacy
+attention-row dispatch in either arm.  Pair 0 is not an option in this script.
+The candidate must also avoid the legacy pair-1 expanded-query path and emit
+the exact per-dispatch traffic contract above.
+
+Acceptance requires byte-identical frontier logits, unchanged four-GPU
+identity and power-limit snapshots before and after both arms, no Xid/lost-GPU
+evidence, complete four-GPU VRAM telemetry, and throughput at or above the
+configured floor.  VRAM is a first-class gate rather than an informational
+column: by default the bounded implementation may grow the model cache by at
+most 4.5 GiB, any one GPU by at most 5 GiB, aggregate sampled peak residency by
+at most 5 GiB, and must retain at least 2 GiB free on every GPU.  These bounds
+permit the first full-execution-binding proof; they do not qualify that extra
+cache as a production design.  A final native-GGUF/direct-native execution
+path should remove the transient F16 duplication before promotion.
+
+The initial gate deliberately uses PP2048 with 512-row outer chunks.  It is a
+stable-pair exactness and traffic result, not the historical maximum-throughput
+configuration.  Only after it passes should the same harness advance to
+PP4096/2048-row outer chunks and then PP32768.  Risky pair-0 testing remains a
+separate candidate-only experiment.
+
+```bash
+MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
+PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
+GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
+REQUIRED_POWER_LIMITS_W=250,260,250,250 \
+CTX_TOKENS=2048 PREFILL_CHUNK=512 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-attention-exactness.sh
+```
+
 # Stable-pair T32 head-shard through attention
 
 `cuda-sm75-t32-headshard-through-attention-ab.sh` is the opt-in all43 native-Q8

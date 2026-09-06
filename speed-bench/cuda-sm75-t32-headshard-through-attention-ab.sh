@@ -275,7 +275,7 @@ for variant in "${variants[@]}"; do
             die "candidate did not materialize 21 pair-1 T32/A binding pairs"
         grep -Fq "CUDA prefill T32 head shard enabled: home=1 partner=3 input-copy-bytes=$expected_q_input_bytes query-gather-bytes=0 heads=32/32" \
             "$base.log" || die "candidate missed local T32 head-shard dispatch"
-        grep -Fq "CUDA prefill T32 head shard exact current-KV mirror enabled: home=1 partner=3 bytes=$expected_current_kv_bytes storage=f32-current-batch" \
+        grep -Fq "exact current-KV mirror enabled: home=1 partner=3 bytes=$expected_current_kv_bytes storage=f32-current-batch" \
             "$base.log" || die "candidate did not mirror the exact zero-prefix current KV batch"
         grep -Fq 'query=local-T32-head-shards KV=local-mirrors' "$base.log" ||
             die "candidate attention did not consume local query/KV"

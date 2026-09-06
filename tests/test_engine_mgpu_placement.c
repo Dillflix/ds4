@@ -43,6 +43,9 @@ bool ds4_test_cuda_prefill_pipeline_q8_cache_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_t32_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_token_rows_requested(void);
+bool ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(int home_tier);
+int ds4_test_cuda_tp_prefill_attn_pair_mode(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_output_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_pair_enabled(int home_tier);
@@ -1026,6 +1029,128 @@ static void test_cuda_tp_prefill_t32_heads_default(void) {
     restore_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS", old);
 }
 
+static void test_cuda_tp_prefill_attn_token_rows_selector(void) {
+    fprintf(stderr,
+            "RUN: test_cuda_tp_prefill_attn_token_rows_selector\n");
+    const char *name =
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS";
+    char *old = save_env_value(name);
+    char *old_attn_rows =
+        save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
+    char *old_t32_heads =
+        save_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS");
+
+    unsetenv(name);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_requested(),
+          "token-row attention pipeline is default-off");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "default-off token-row pipeline selects neither logical pair");
+
+    setenv(name, "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_requested(),
+          "token-row attention pipeline accepts pair 0 opt-in");
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "pair 0 token-row opt-in does not expose pair 1");
+
+    setenv(name, "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_requested(),
+          "token-row attention pipeline accepts pair 1 opt-in");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "pair 1 token-row opt-in does not expose pair 0");
+
+    setenv(name, "0,1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_requested(),
+          "token-row attention pipeline accepts both-pair opt-in");
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "both-pair token-row opt-in selects exactly pairs 0 and 1");
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(2),
+          "token-row attention pipeline rejects unsupported pair numbers");
+
+    setenv(name, "2", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_requested() &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(2),
+          "unsupported token-row pair lists fail closed");
+
+    const char *malformed[] = {
+        "0,", ",0", "0,,1", "0,0", "0 1", "x", "1,0x"
+    };
+    for (size_t i = 0;
+         i < sizeof(malformed) / sizeof(malformed[0]);
+         i++) {
+        setenv(name, malformed[i], 1);
+        CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_requested() &&
+              !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+              !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+              "malformed token-row pair lists fail closed");
+    }
+
+    /* The new graph cut owns its own pair selector.  Legacy query-row and
+     * T32 head-shard switches must not implicitly enable it or broaden its
+     * selected pair. */
+    unsetenv(name);
+    setenv("DS4_CUDA_TP_PREFILL_ATTN_ROWS", "1", 1);
+    setenv("DS4_CUDA_TP_PREFILL_T32_HEADS", "1", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_requested() &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "legacy row/head selectors cannot enable the token-row pipeline");
+
+    setenv(name, "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(0) &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(1),
+          "legacy selectors cannot broaden the token-row pair mask");
+
+    enum {
+        TEST_ATTN_PAIR_LEGACY_ROWS = 1,
+        TEST_ATTN_PAIR_T32_HEADS = 2,
+        TEST_ATTN_PAIR_TOKEN_ROWS = 3,
+    };
+    unsetenv(name);
+    CHECK(ds4_test_cuda_tp_prefill_attn_pair_mode(0) ==
+              TEST_ATTN_PAIR_LEGACY_ROWS &&
+          ds4_test_cuda_tp_prefill_attn_pair_mode(1) ==
+              TEST_ATTN_PAIR_T32_HEADS,
+          "T32 headshard precedes legacy rows only on its selected pair");
+
+    setenv(name, "0", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_pair_mode(0) ==
+              TEST_ATTN_PAIR_TOKEN_ROWS &&
+          ds4_test_cuda_tp_prefill_attn_pair_mode(1) ==
+              TEST_ATTN_PAIR_T32_HEADS,
+          "token rows supersede legacy rows only on selected pair 0");
+
+    setenv(name, "1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_pair_mode(0) ==
+              TEST_ATTN_PAIR_LEGACY_ROWS &&
+          ds4_test_cuda_tp_prefill_attn_pair_mode(1) ==
+              TEST_ATTN_PAIR_TOKEN_ROWS,
+          "token rows supersede T32 headshard only on selected pair 1");
+
+    setenv(name, "0,1", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_pair_mode(0) ==
+              TEST_ATTN_PAIR_TOKEN_ROWS &&
+          ds4_test_cuda_tp_prefill_attn_pair_mode(1) ==
+              TEST_ATTN_PAIR_TOKEN_ROWS,
+          "both-pair token rows supersede both legacy ownership paths");
+
+    setenv(name, "0,", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_pair_mode(0) ==
+              TEST_ATTN_PAIR_LEGACY_ROWS &&
+          ds4_test_cuda_tp_prefill_attn_pair_mode(1) ==
+              TEST_ATTN_PAIR_T32_HEADS,
+          "malformed token rows fail closed before ownership precedence");
+
+    restore_env_value(name, old);
+    restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old_attn_rows);
+    restore_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS", old_t32_heads);
+}
+
 static void test_cuda_tp_prefill_attn_rows_default(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_attn_rows_default\n");
     char *old = save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
@@ -1620,6 +1745,7 @@ int main(void) {
     test_cuda_prefill_pipeline_q8_cache_default();
     test_cuda_tp_prefill_attn_heads_default();
     test_cuda_tp_prefill_t32_heads_default();
+    test_cuda_tp_prefill_attn_token_rows_selector();
     test_cuda_tp_prefill_attn_rows_default();
     test_cuda_tp_decode_indexer_rows_default();
     test_cuda_tp_prefill_attn_rows_shape();
