@@ -22143,6 +22143,27 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
+            cublasGemmAlgo_t gemm_algo = CUBLAS_GEMM_DEFAULT;
+            int diagnostic_algo = 0;
+            const char *gemm_algo_env = label &&
+                    strcmp(label, "attn_output_b") == 0
+                ? getenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC")
+                : NULL;
+            if (gemm_algo_env && gemm_algo_env[0]) {
+                char *end = NULL;
+                const long parsed = strtol(gemm_algo_env, &end, 10);
+                if (end == gemm_algo_env || *end != '\0' ||
+                    !((parsed >= 0 && parsed <= 23) ||
+                      (parsed >= 99 && parsed <= 115))) {
+                    fprintf(stderr,
+                            "ds4: invalid diagnostic attention-output B "
+                            "FP16 cuBLAS algorithm '%s'; using DEFAULT\n",
+                            gemm_algo_env);
+                } else {
+                    gemm_algo = (cublasGemmAlgo_t)parsed;
+                    diagnostic_algo = 1;
+                }
+            }
             cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
                                              CUBLAS_OP_T,
                                              CUBLAS_OP_N,
@@ -22161,12 +22182,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              CUDA_R_32F,
                                              (int)out_dim,
                                              CUDA_R_32F,
-                                             CUBLAS_GEMM_DEFAULT);
+                                             gemm_algo);
             if (st == CUBLAS_STATUS_SUCCESS) {
                 cuda_q8_f16_binding_mark_used(
                     model_map, weight_offset, weight_bytes, in_dim, out_dim,
                     physical_device, physical_device);
                 return 1;
+            }
+            if (diagnostic_algo) {
+                fprintf(stderr,
+                        "ds4: diagnostic attention-output B FP16 cuBLAS "
+                        "algorithm %ld unsupported for tokens=%llu: status %d\n",
+                        (long)gemm_algo, (unsigned long long)n_tok, (int)st);
+                return 0;
             }
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
             cuda_q8_f16_cache_disable_after_failure("cuBLAS f16 matmul failure",

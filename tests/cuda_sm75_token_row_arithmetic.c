@@ -33,6 +33,15 @@
 #define BETA_SLOW 1.0f
 #define EPSILON 1.0e-6f
 
+static const int b_algorithms[] = {
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23,
+    99,
+    100, 101, 102, 103, 104, 105, 106, 107,
+    108, 109, 110, 111, 112, 113, 114, 115,
+};
+
 typedef struct {
     uint64_t mismatches;
     uint64_t first;
@@ -198,6 +207,7 @@ int main(void) {
     float *input_host = NULL, *reference = NULL, *candidate = NULL;
     float *actual_low_host = NULL;
     float *combined_full_host = NULL, *combined_split_host = NULL;
+    float *shipping_b_host = NULL;
     float *raw_host = NULL, *comp_host = NULL;
     uint16_t *reference_half = NULL, *candidate_half = NULL;
     ds4_gpu_tensor *input = NULL, *q_full = NULL, *q_split = NULL;
@@ -234,6 +244,7 @@ int main(void) {
     actual_low_host = reference + low_count;
     combined_full_host = reference + 2u * low_count;
     combined_split_host = candidate + 2u * low_count;
+    shipping_b_host = reference + 2u * low_count + out_count;
 
     build_q8_rows(model, Q_DIM, IN_DIM, 17u);
     for (uint32_t h = 0u; h < N_HEAD; h++) {
@@ -271,6 +282,7 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_NO_CUBLAS_ATTENTION");
     (void)unsetenv("DS4_CUDA_NO_WINDOW_ATTENTION");
     (void)unsetenv("DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA initialization failed\n");
@@ -545,12 +557,75 @@ int main(void) {
         combined_full_host, reference, out_count);
     const diff_metrics out_b_split_chain_diff = compare_f32(
         combined_split_host, candidate, out_count);
+    memcpy(shipping_b_host, reference, (size_t)out_bytes);
     report_diff("output-b-from-identical-actual-a-low-full512-vs-row256x2",
                 "f32", out_count, out_b_actual_diff);
     report_diff("output-a-plus-b-full512-vs-synchronized-b-full512", "f32",
                 out_count, out_b_full_chain_diff);
     report_diff("output-a-plus-b-row256x2-vs-synchronized-b-row256x2", "f32",
                 out_count, out_b_split_chain_diff);
+
+    int exact_b_algorithm = -1;
+    for (size_t ai = 0u;
+         ai < sizeof(b_algorithms) / sizeof(b_algorithms[0]); ai++) {
+        const int algorithm = b_algorithms[ai];
+        char text[32];
+        snprintf(text, sizeof(text), "%d", algorithm);
+        (void)setenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC",
+                     text, 1);
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out_full, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+                low_full, N_TOK)) {
+            printf("b_algorithm=%d,status=full-unsupported\n", algorithm);
+            continue;
+        }
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out0, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+                low_ref0, HALF_TOK) ||
+            !ds4_gpu_attention_output_q8_batch_b_tensor(
+                out1, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+                low_ref1, HALF_TOK)) {
+            printf("b_algorithm=%d,status=row256-unsupported\n", algorithm);
+            continue;
+        }
+        if (!ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(out_full, 0u, reference, out_bytes) ||
+            !ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
+            fprintf(stderr, "error: B algorithm %d readback failed\n",
+                    algorithm);
+            goto cleanup;
+        }
+        const diff_metrics full_vs_split = compare_f32(
+            reference, candidate, out_count);
+        const diff_metrics shipping_vs_full = compare_f32(
+            shipping_b_host, reference, out_count);
+        const diff_metrics shipping_vs_split = compare_f32(
+            shipping_b_host, candidate, out_count);
+        printf("b_algorithm=%d,status=ok,full_vs_row256x2_mismatches=%llu,"
+               "full_vs_row256x2_max_abs=%.9g,"
+               "shipping_vs_full_mismatches=%llu,"
+               "shipping_vs_full_max_abs=%.9g,"
+               "shipping_vs_row256x2_mismatches=%llu,"
+               "shipping_vs_row256x2_max_abs=%.9g\n",
+               algorithm,
+               (unsigned long long)full_vs_split.mismatches,
+               full_vs_split.max_abs,
+               (unsigned long long)shipping_vs_full.mismatches,
+               shipping_vs_full.max_abs,
+               (unsigned long long)shipping_vs_split.mismatches,
+               shipping_vs_split.max_abs);
+        if (full_vs_split.mismatches == 0u &&
+            shipping_vs_full.mismatches == 0u &&
+            shipping_vs_split.mismatches == 0u && exact_b_algorithm < 0) {
+            exact_b_algorithm = algorithm;
+        }
+    }
+    (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
+    printf("first_shipping_exact_b_algorithm=%d\n", exact_b_algorithm);
+    printf("b_algorithm_conclusion=%s\n",
+           exact_b_algorithm < 0 ?
+               "no-legacy-algorithm-preserved-shipping-output" :
+               "explicit-algorithm-preserved-shipping-output");
 
     /* Keep the original structured B-only fixture as a control.  Its exactness
      * is not sufficient to clear B for arbitrary A-produced inputs. */
@@ -603,6 +678,7 @@ int main(void) {
     status = 0;
 
 cleanup:
+    (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     ds4_gpu_tensor_free(low_ref1);
     ds4_gpu_tensor_free(low_ref0);
     ds4_gpu_tensor_free(out1);

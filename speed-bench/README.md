@@ -6049,6 +6049,16 @@ diagnostic therefore also snapshots the real, exact A result; synchronizes and
 feeds that result identically to full-512 and ordered-256x2 B calls; and compares
 each original composed arm against its synchronized B reference.
 
+That refined run proves the composed calls are correctly ordered: both the
+full-512 and row-256x2 A+B outputs match their corresponding synchronized B
+references.  B fed from the identical real A output nevertheless reproduces
+the original 2,092,992 mismatches exactly, localizing the defect to B's changed
+row extent.  The harness now sweeps the legacy cuBLAS algorithm family for the
+FP16-backed B projection.  An algorithm qualifies only when full-512 equals
+row-256x2 and both equal shipping DEFAULT full-512 bit-for-bit.  This selector
+is diagnostic-only; invalid or unsupported choices fail closed without
+disabling the F16 cache, and normal dispatch remains DEFAULT.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
