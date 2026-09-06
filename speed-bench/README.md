@@ -5697,11 +5697,13 @@ q_b/A/B matrices and owner extents above 256 rows fail closed.  This first
 qualification is consequently fixed to the established 256-row owner half of
 a 512-row internal microbatch.
 
-The initial gate deliberately uses PP2048 with 512-row outer chunks.  It is a
+The initial gate deliberately used PP2048 with 512-row outer chunks.  It was a
 stable-pair exactness and traffic result, not the historical maximum-throughput
-configuration.  Only after it passes should the same harness advance to
-PP4096/2048-row outer chunks and then PP32768.  Risky pair-0 testing remains a
-separate candidate-only experiment.
+configuration.  That gate passed, so native-stream now accepts 512--2048-row
+outer chunks while retaining the hard 512-row internal microbatch and 256-row
+per-owner runtime gates.  The next qualification is PP4096 with 2048-row outer
+chunks, followed by PP32768.  Risky pair-0 testing remains a separate
+candidate-only experiment.
 
 The full-F16 candidate subsequently passed at PP2048 (495.32 versus 468.09
 tok/s, 1.05817x) and PP32768 (401.95 versus 393.68 tok/s, 1.02101x), with
@@ -5711,16 +5713,17 @@ versus 10.58 GiB in control, with about 4.0 GiB added to GPU 2.  Those results
 qualify row ownership and arithmetic, not the duplicated residency.  The
 first native-stream run passed exactness, stability, and VRAM gates at PP2048:
 10.58 to 6.64 GiB persistent model cache and 1.74 GiB lower aggregate peak
-VRAM.  Its 465.38 versus 470.19 tok/s result exposed the scalar expansion
-kernel as the remaining cost, so the grouped int8x4 expansion above is the
-direct performance follow-up.  Pair 0 remains disabled in both workloads.
+VRAM.  Its scalar expansion initially produced 465.38 versus 470.19 tok/s.
+The grouped int8x4 expansion subsequently produced 482.33 versus 463.35 tok/s
+(1.04096x) with byte-identical logits and the same cache, aggregate VRAM, and
+transfer results.  Pair 0 remains disabled in both workloads.
 
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
-CTX_TOKENS=2048 PREFILL_CHUNK=512 \
+CTX_TOKENS=4096 PREFILL_CHUNK=2048 \
 TOKEN_ROW_WEIGHT_MODE=native-stream \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-attention-exactness.sh

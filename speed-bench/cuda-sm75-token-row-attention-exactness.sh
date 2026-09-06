@@ -49,9 +49,6 @@ OUTPUT_DIR=${TOKEN_ROW_ATTN_EXACTNESS_DIR:-$repo_dir/sm75-token-row-attention-ex
 [[ $TOKEN_ROW_WEIGHT_MODE == f16 ||
    $TOKEN_ROW_WEIGHT_MODE == native-stream ]] ||
     die "TOKEN_ROW_WEIGHT_MODE must be f16 or native-stream"
-if [[ $TOKEN_ROW_WEIGHT_MODE == native-stream && $PREFILL_CHUNK != 512 ]]; then
-    die "native-stream is qualified only for PREFILL_CHUNK=512"
-fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
             "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
