@@ -5991,3 +5991,36 @@ PROFILE_GPU=3 PEER_GPU=2 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-exactness.sh
 ```
+
+### Token-row arithmetic boundary diagnostic
+
+`cuda-sm75-token-row-arithmetic.sh` is a bounded single-GPU diagnostic for
+the production zero-prefix 512-row microbatch versus two ordered 256-row calls.
+It does
+not alter production dispatch.  With identical synthetic inputs and cached
+Q8-to-F16 weights, whose successful materialization is a hard setup gate, it
+reports bit mismatches independently at q_b's FP16
+projection and RMS/RoPE output, static-mixed attention, inverse RoPE, output
+A's low-rank result, the combined A+B result, and an isolated output-B GEMM.
+The static-mixed comparison models the first zero-prefix chunk, where the
+control uses one full 512-row launch and token-row ownership uses two
+rectangular 256-row launches over the same full KV batch.
+The q_b check includes both explicit FP16-output tensors and the current
+internal token-row candidate's NULL/scratch form.  Arithmetic mismatches are evidence, not harness
+failures; setup and runtime errors remain fatal.  Compute Sanitizer reruns the
+q_b row-view and NULL/scratch boundary as a reduced memory-safety smoke; the
+ordinary run covers every listed arithmetic boundary at full shape.
+
+This diagnostic follows the first stable-pair production gate.  That run
+completed without a device loss and measured 465.03 versus 493.82 prefill
+tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
+per-layer traffic contract and avoiding the expanded-query gather.  It was
+rejected because the PP2048 frontier logits were not byte-identical.  The
+candidate's 14.52 GiB execution-binding plan versus 10.58 GiB for control is
+also prototype overhead, not an accepted production residency design.
+
+```bash
+PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
+CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
