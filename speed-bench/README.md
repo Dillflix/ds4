@@ -5784,12 +5784,14 @@ production-ordered unfenced protocol; Compute Sanitizer reports zero errors.
 This excludes every isolated arithmetic and transfer boundary exercised by the
 candidate.  The earlier full-model A/B still compared a split pair-1 indexer in
 the control against a home-full indexer in the candidate, so final logits could
-not identify the attention change alone.  The production harness now defaults
-`MATCH_PAIR1_INDEXER=1`, disabling pair-1 indexer splitting in both arms while
-retaining pair-0 indexer splitting.  Run the smallest existing production
-frontier (`CTX_TOKENS=2048`) first to cover multi-microbatch cache/state
-evolution before returning to 32K.  `MATCH_PAIR1_INDEXER=0` reproduces the old
-asymmetric diagnostic only.
+not identify the attention change alone.  Exactness isolation therefore first
+disabled pair-1 indexer splitting in both arms while retaining pair-0 indexer
+splitting.  That isolation is now complete: the undumped PP2048 matched-policy
+run is bit-exact, so production defaults to `PAIR1_INDEXER_SPLIT=1` in both
+arms.  The ordinary control keeps its partner-local selected rows; the
+head-shard candidate gathers only the partner's compact selected-index rows
+home, then both head shards consume that authoritative list.  Set
+`PAIR1_INDEXER_SPLIT=0` only to reproduce the matched home-full diagnostic.
 
 The first PP2048 invocation completed the control workload at 464.10 prefill
 tok/s and emitted its frontier logits, then the harness incorrectly required a
@@ -5901,7 +5903,7 @@ for that diagnostic shape.  Before the 32K promotion run, use PP4096 with a
 zero-prefix and subsequent compressed-history microbatches.
 
 ```bash
-CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
+CTX_TOKENS=512 PAIR1_INDEXER_SPLIT=0 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-t32-headshard-through-attention-ab.sh

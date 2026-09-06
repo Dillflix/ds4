@@ -20,7 +20,7 @@ TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
-MATCH_PAIR1_INDEXER=${MATCH_PAIR1_INDEXER:-1}
+PAIR1_INDEXER_SPLIT=${PAIR1_INDEXER_SPLIT:-1}
 BOUNDARY_AUDIT_ONLY=${BOUNDARY_AUDIT_ONLY:-0}
 BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-22}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -35,7 +35,7 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
             "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY" \
-            "MATCH_PAIR1_INDEXER:$MATCH_PAIR1_INDEXER" \
+            "PAIR1_INDEXER_SPLIT:$PAIR1_INDEXER_SPLIT" \
             "BOUNDARY_AUDIT_ONLY:$BOUNDARY_AUDIT_ONLY" \
             "BOUNDARY_AUDIT_LAYER:$BOUNDARY_AUDIT_LAYER"; do
     name=${item%%:*}; value=${item#*:}
@@ -50,7 +50,7 @@ min_ctx_tokens=2048
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
 for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
-            MATCH_PAIR1_INDEXER BOUNDARY_AUDIT_ONLY; do
+            PAIR1_INDEXER_SPLIT BOUNDARY_AUDIT_ONLY; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
@@ -129,8 +129,8 @@ phase=manifest
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nprefill_chunk=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
         "$CTX_TOKENS" "$PREFILL_CHUNK"
-    printf 'cache_audit_only=%s\nmatch_pair1_indexer=%s\n' \
-        "$CACHE_AUDIT_ONLY" "$MATCH_PAIR1_INDEXER"
+    printf 'cache_audit_only=%s\npair1_indexer_split=%s\n' \
+        "$CACHE_AUDIT_ONLY" "$PAIR1_INDEXER_SPLIT"
     printf 'boundary_audit_only=%s\nboundary_audit_layer=%s\n' \
         "$BOUNDARY_AUDIT_ONLY" "$BOUNDARY_AUDIT_LAYER"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
@@ -148,21 +148,15 @@ if [[ $CACHE_AUDIT_ONLY == 1 ]]; then variants=(headshard); fi
 for variant in "${variants[@]}"; do
     enable=0; [[ $variant == headshard ]] && enable=1
     variant_env=()
-    # The earlier production comparison changed two independent axes: the
-    # attention decomposition and pair-1 indexer ownership.  Match the indexer
-    # policy across both arms by default so the logit gate attributes any
-    # difference only to row-split versus head-shard attention.  The old
-    # asymmetric cut remains available solely to reproduce its evidence.
-    if [[ $MATCH_PAIR1_INDEXER == 1 ]]; then
+    # Exactness isolation is complete. Production now splits pair-1 indexer
+    # score/top-k in both arms. The candidate gathers only the partner's
+    # compact selected-index rows home before head-sharded attention consumes
+    # the authoritative list; it does not restore the old full query gather.
+    # PAIR1_INDEXER_SPLIT=0 remains a matched home-full diagnostic control.
+    if [[ $PAIR1_INDEXER_SPLIT == 0 ]]; then
         variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
     fi
     if [[ $variant == headshard ]]; then
-        # Preserve the earlier asymmetric isolation only when explicitly
-        # requested.  In the default matched mode the common block above has
-        # already disabled pair-1 indexer splitting for both arms.
-        if [[ $MATCH_PAIR1_INDEXER == 0 ]]; then
-            variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
-        fi
         if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
             variant_env+=(DS4_CUDA_T32_HEADSHARD_CACHE_AUDIT=1)
         fi
@@ -246,12 +240,18 @@ for variant in "${variants[@]}"; do
             "$base.log" || die "candidate did not mirror the exact zero-prefix current KV batch"
         grep -Fq 'query=local-T32-head-shards KV=local-mirrors' "$base.log" ||
             die "candidate attention did not consume local query/KV"
-        grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
-            "$base.log" ||
-            die "candidate did not disable pair-1 indexer splitting"
-        ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
-            "$base.log" ||
-            die "candidate unexpectedly split pair-1 indexer/top-k"
+        if [[ $PAIR1_INDEXER_SPLIT == 1 && $CTX_TOKENS -gt 2048 ]]; then
+            grep -Eq 'prefill indexer score/top-k row split enabled: tier 1 .*selected-mode=gather-home' \
+                "$base.log" ||
+                die "candidate did not split pair-1 indexer and gather its selected rows home"
+        elif [[ $PAIR1_INDEXER_SPLIT == 0 ]]; then
+            grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
+                "$base.log" ||
+                die "candidate did not select the pair-1 home-full diagnostic"
+            ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+                "$base.log" ||
+                die "candidate unexpectedly split pair-1 indexer/top-k"
+        fi
         ! grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
             die "candidate fell back to pair-1 query-row splitting"
     else
@@ -270,17 +270,17 @@ for variant in "${variants[@]}"; do
                 "$base.log" ||
                 die "control unexpectedly dispatched internal pair-1 row splitting at PP512"
         fi
-        if [[ $MATCH_PAIR1_INDEXER == 1 ]]; then
+        if [[ $PAIR1_INDEXER_SPLIT == 0 ]]; then
             grep -Fq 'CUDA prefill indexer row split pair policy: enabled-pairs=automatic disabled-pairs=1' \
                 "$base.log" ||
-                die "control did not match the candidate's pair-1 indexer policy"
+                die "control did not select the pair-1 home-full diagnostic"
             ! grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
                 "$base.log" ||
                 die "control unexpectedly split pair-1 indexer/top-k"
-        else
-            grep -Fq 'prefill indexer score/top-k row split enabled: tier 1 ' \
+        elif (( CTX_TOKENS > 2048 )); then
+            grep -Eq 'prefill indexer score/top-k row split enabled: tier 1 .*selected-mode=partner-local' \
                 "$base.log" ||
-                die "control did not preserve pair-1 indexer splitting"
+                die "control did not split pair-1 indexer with partner-local selections"
         fi
         ! grep -Fq 'CUDA prefill T32 head shard enabled:' "$base.log" ||
             die "control unexpectedly dispatched T32 head sharding"
@@ -467,11 +467,11 @@ done
 
 phase=summary
 python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
-    "$MATCH_PAIR1_INDEXER" "$PREFILL_CHUNK" <<'PY'
+    "$PAIR1_INDEXER_SPLIT" "$PREFILL_CHUNK" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
-matched_indexer = bool(int(sys.argv[3]))
+pair1_indexer_split = bool(int(sys.argv[3]))
 prefill_chunk = int(sys.argv[4])
 
 def csv_row(name):
@@ -528,8 +528,8 @@ with (root / "summary.txt").open("w") as f:
     f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
     f.write(f"partner_low_rank_return_bytes_per_pair1_layer_chunk={prefill_chunk * 4096 * 4}\n")
     f.write("pair1_indexer_policy=" +
-            ("matched-home-full" if matched_indexer else
-             "control-split-candidate-home-full") + "\n")
+            ("matched-split" if pair1_indexer_split else
+             "matched-home-full-diagnostic") + "\n")
     f.write("logits=bit-exact\n")
     for gpu in sorted(set(cm) | set(hm)):
         f.write(f"gpu{gpu}_control_max_vram_mib={cm.get(gpu, 0):.0f}\n")
