@@ -201,6 +201,7 @@ phase=manifest
     printf 'ctx_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_microbatch=%s\n' \
         "$CTX_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 'control_token_row_pairs=off\ncandidate_token_row_pairs=1\npair0_attention=off-both-arms\n'
+    printf 'candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n'
     printf 'minimum_throughput_ratio=%s\nmax_model_cache_increase_gib=%s\n' \
         "$MIN_THROUGHPUT_RATIO" "$MAX_MODEL_CACHE_INCREASE_GIB"
     printf 'max_per_gpu_vram_increase_mib=%s\nmax_aggregate_vram_increase_mib=%s\n' \
@@ -288,6 +289,8 @@ for variant in control token-row; do
             "$base.log" || die "control did not retain the ordinary token-row binding inventory"
         ! grep -Fq 'CUDA prefill attention token-row pipeline enabled:' "$base.log" ||
             die "control unexpectedly enabled the token-row candidate"
+        ! grep -Fq 'SM75 row-owned attention output B selected:' "$base.log" ||
+            die "control unexpectedly selected the candidate output-B algorithm"
         if (( CTX_TOKENS > PREFILL_CHUNK )); then
             grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
                 die "control missed the established stable pair-1 path"
@@ -304,6 +307,12 @@ for variant in control token-row; do
             "$base.log" || die "candidate did not keep q_b through attention A+B row-local"
         grep -Fq "CUDA prefill attention token-row pipeline output enabled: home=1 partner=3 rows=256/256 output-return-bytes=$expected_output_bytes result=full-N_EMBD-rows" \
             "$base.log" || die "candidate did not complete local output B and return only final N_EMBD rows"
+        [[ $(grep -Fc 'SM75 row-owned attention output B selected:' "$base.log") == 2 ]] ||
+            die "candidate did not select exact output-B algorithm on both pair members"
+        grep -Fq 'logical=1 physical=3 algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256' \
+            "$base.log" || die "candidate missed exact output-B on the home pair member"
+        grep -Fq 'logical=3 physical=2 algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=256' \
+            "$base.log" || die "candidate missed exact output-B on the partner pair member"
         grep -Fq "exact current-KV mirror enabled: home=1 partner=3 bytes=$expected_current_kv_bytes storage=f32-current-batch" \
             "$base.log" || die "candidate did not expose its exact zero-prefix current-KV transfer"
         ! grep -Fq 'prefill attention query-row split enabled: tier 1 ' "$base.log" ||
@@ -434,6 +443,7 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"steady_token_row_payload_bytes_per_pair1_layer_microbatch={q_input + output_return}\n")
     f.write("pair0_attention=off-both-arms\n")
     f.write("candidate_pair=logical1-physical-gpu3-gpu2\n")
+    f.write("candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n")
     f.write("logits=bit-exact\n")
     f.write(f"candidate_aggregate_vram_increase_mib={aggregate_growth:.0f}\n")
     f.write(f"candidate_min_free_vram_mib={candidate_min_free:.0f}\n")

@@ -31207,7 +31207,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_output_launch(
                      DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
         }
         if (ok) {
-            ok = ds4_gpu_attention_output_q8_batch_tensor(
+            ok = ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
                      partner_out, partner_low,
                      g->batch_group_tmp_by_tier[partner],
                      g->batch_low_tmp_by_tier[partner],
@@ -31227,7 +31227,7 @@ static bool metal_graph_cuda_tp_prefill_attention_rows_output_launch(
                      DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
         }
         if (ok) {
-            ok = ds4_gpu_attention_output_q8_batch_tensor(
+            ok = ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
                      home_out, home_low,
                      g->batch_group_tmp_by_tier[home],
                      g->batch_low_tmp_by_tier[home],

@@ -22093,7 +22093,12 @@ static int cuda_q8_f16_partner_matmul(
         in_dim, out_dim, n_tok, home_tier, home_device, label, 0);
 }
 
-static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_q8_0_tensor_labeled_algo(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, const char *label,
+        cublasGemmAlgo_t forced_gemm_algo,
+        int forced_gemm_algo_active) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
@@ -22105,10 +22110,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const int physical_device =
         (g_n_gpus > 1 && logical_tier >= 0 && logical_tier < g_n_gpus)
             ? g_gpu[logical_tier].device_id : 0;
+    if (forced_gemm_algo_active &&
+        (!g_cublas_ready || n_tok <= 1u ||
+         logical_tier < 0 || logical_tier >= g_n_gpus ||
+         g_gpu[logical_tier].compute_major != 7 ||
+         g_gpu[logical_tier].compute_minor != 5 ||
+         !label || strcmp(label, "attn_output_b") != 0)) {
+        fprintf(stderr,
+                "ds4: required row-owned attention output-B FP16 algorithm "
+                "is only valid for attn_output_b on SM75\n");
+        return 0;
+    }
     const unsigned char *interleaved_primary = NULL;
     const char *wptr = NULL;
     if (g_cublas_ready && n_tok > 1) {
-        const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
+        const float *w_f32 = forced_gemm_algo_active ? NULL :
+            cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim,
+                            out_dim, physical_device, label);
         if (w_f32) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -22143,9 +22161,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasGemmAlgo_t gemm_algo = CUBLAS_GEMM_DEFAULT;
-            int diagnostic_algo = 0;
-            const char *gemm_algo_env = label &&
+            cublasGemmAlgo_t gemm_algo = forced_gemm_algo_active
+                ? forced_gemm_algo : CUBLAS_GEMM_DEFAULT;
+            int explicit_algo = forced_gemm_algo_active;
+            const char *gemm_algo_env = !forced_gemm_algo_active && label &&
                     strcmp(label, "attn_output_b") == 0
                 ? getenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC")
                 : NULL;
@@ -22161,7 +22180,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                             gemm_algo_env);
                 } else {
                     gemm_algo = (cublasGemmAlgo_t)parsed;
-                    diagnostic_algo = 1;
+                    explicit_algo = 1;
                 }
             }
             cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(logical_tier),
@@ -22189,9 +22208,9 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     physical_device, physical_device);
                 return 1;
             }
-            if (diagnostic_algo) {
+            if (explicit_algo) {
                 fprintf(stderr,
-                        "ds4: diagnostic attention-output B FP16 cuBLAS "
+                        "ds4: explicit attention-output B FP16 cuBLAS "
                         "algorithm %ld unsupported for tokens=%llu: status %d\n",
                         (long)gemm_algo, (unsigned long long)n_tok, (int)st);
                 return 0;
@@ -22203,6 +22222,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
              * model's required binding can lack a complete native matrix on
              * this device; its registered-source guard below then fails
              * closed instead of reinterpreting a shard or staging mid-run. */
+        }
+        if (forced_gemm_algo_active) {
+            fprintf(stderr,
+                    "ds4: required row-owned attention output-B FP16 binding "
+                    "is unavailable on physical device %d\n",
+                    physical_device);
+            return 0;
         }
         if (!w_f16 && partner_binding) {
             const int partner_rc = cuda_q8_f16_partner_matmul(
@@ -22507,6 +22533,15 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                                      in_dim, out_dim, n_tok, blocks,
                                                      use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
+}
+
+static int cuda_matmul_q8_0_tensor_labeled(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+    return cuda_matmul_q8_0_tensor_labeled_algo(
+            out, model_map, model_size, weight_offset, in_dim, out_dim,
+            x, n_tok, label, CUBLAS_GEMM_DEFAULT, 0);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -26071,7 +26106,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
         uint32_t n_groups_total, uint32_t group0, uint32_t group_cnt,
         const ds4_gpu_tensor *heads, uint32_t n_rows);
 
-extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+static int cuda_attention_output_q8_batch_tensor_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -26085,7 +26120,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        int                     row_owned_exact_b) {
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
@@ -26276,15 +26312,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
     /* Do not pre-resolve canonical B.  The generic dispatcher selects the
      * resident native-primary or F16 binding before its canonical fallback. */
-    int ok = cuda_matmul_q8_0_tensor_labeled(out,
-                                             model_map,
-                                             model_size,
-                                             out_b_offset,
-                                             low_dim,
-                                             out_dim,
-                                             low,
-                                             n_tokens,
-                                             "attn_output_b");
+    int ok = row_owned_exact_b
+        ? cuda_matmul_q8_0_tensor_labeled_algo(
+              out, model_map, model_size, out_b_offset, low_dim, out_dim,
+              low, n_tokens, "attn_output_b",
+              CUBLAS_GEMM_ALGO3_TENSOR_OP, 1)
+        : cuda_matmul_q8_0_tensor_labeled(
+              out, model_map, model_size, out_b_offset, low_dim, out_dim,
+              low, n_tokens, "attn_output_b");
     if (prof_ev[2]) {
         (void)cudaEventRecord(prof_ev[2], 0);
         if (cudaEventSynchronize(prof_ev[2]) == cudaSuccess) {
@@ -26305,6 +26340,56 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     ms_total);
         }
         for (uint32_t i = 0; i < 3u; i++) (void)cudaEventDestroy(prof_ev[i]);
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        ds4_gpu_tensor *group_tmp, ds4_gpu_tensor *low_tmp,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+        uint64_t out_dim, const ds4_gpu_tensor *heads,
+        uint32_t n_tokens) {
+    return cuda_attention_output_q8_batch_tensor_impl(
+            out, low, group_tmp, low_tmp, model_map, model_size,
+            out_a_offset, out_b_offset, group_dim, rank, n_groups,
+            out_dim, heads, n_tokens, 0);
+}
+
+extern "C" int ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        ds4_gpu_tensor *group_tmp, ds4_gpu_tensor *low_tmp,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+        uint64_t out_dim, const ds4_gpu_tensor *heads,
+        uint32_t n_tokens) {
+    /* The exactness and timing gate covers the production row-owner extent
+     * only.  Other shapes fail closed until independently qualified. */
+    if (n_tokens != 256u || group_dim != 4096u || rank != 1024u ||
+        n_groups != 8u || out_dim != 4096u) return 0;
+    const int ok = cuda_attention_output_q8_batch_tensor_impl(
+            out, low, group_tmp, low_tmp, model_map, model_size,
+            out_a_offset, out_b_offset, group_dim, rank, n_groups,
+            out_dim, heads, n_tokens, 1);
+    if (ok) {
+        const int logical_tier = ds4_tensor_device_idx(out);
+        const int physical_device = logical_tier >= 0 && logical_tier < g_n_gpus
+            ? g_gpu[logical_tier].device_id : -1;
+        static std::atomic<uint32_t> logged_tier_mask{0u};
+        const uint32_t tier_bit = logical_tier >= 0 && logical_tier < 32
+            ? 1u << (uint32_t)logical_tier : 0u;
+        if (tier_bit != 0u &&
+            (logged_tier_mask.fetch_or(
+                 tier_bit, std::memory_order_relaxed) & tier_bit) == 0u) {
+            fprintf(stderr,
+                    "ds4: SM75 row-owned attention output B selected: "
+                    "logical=%d physical=%d "
+                    "algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP rows=%u\n",
+                    logical_tier, physical_device, n_tokens);
+        }
     }
     return ok;
 }

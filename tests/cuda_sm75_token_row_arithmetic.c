@@ -781,6 +781,41 @@ int main(void) {
            fastest_exact_b_algorithm < 0 ? 0.0 :
                shipping_full_ms / fastest_exact_b_half_ms);
 
+    /* Exercise the dedicated production-candidate entry point itself.  Its
+     * two calls must reproduce both the already-exact A result and shipping
+     * DEFAULT's full-row A+B result; testing only the diagnostic environment
+     * selector would not prove that the graph-facing helper is wired safely. */
+    if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+            out0, low0, NULL, NULL, model, model_bytes, out_a_offset,
+            out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref0,
+            HALF_TOK) ||
+        !ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+            out1, low1, NULL, NULL, model, model_bytes, out_a_offset,
+            out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref1,
+            HALF_TOK) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(low_split, 0u, candidate, low_bytes)) {
+        fprintf(stderr, "error: dedicated row-owned output helper failed\n");
+        goto cleanup;
+    }
+    const diff_metrics row_owned_low_diff = compare_f32(
+        actual_low_host, candidate, low_count);
+    report_diff("output-a-shipping-full512-vs-row-owned-algo3-256x2",
+                "f32", low_count, row_owned_low_diff);
+    if (!ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
+        fprintf(stderr, "error: dedicated row-owned output readback failed\n");
+        goto cleanup;
+    }
+    const diff_metrics row_owned_output_diff = compare_f32(
+        shipping_b_host, candidate, out_count);
+    report_diff("output-a-plus-b-shipping-full512-vs-row-owned-algo3-256x2",
+                "f32", out_count, row_owned_output_diff);
+    if (row_owned_low_diff.mismatches || row_owned_output_diff.mismatches) {
+        fprintf(stderr,
+                "error: dedicated row-owned output helper failed exactness\n");
+        goto cleanup;
+    }
+
     /* Keep the original structured B-only fixture as a control.  Its exactness
      * is not sufficient to clear B for arbitrary A-produced inputs. */
     for (uint64_t i = 0u; i < low_count; i++) {
@@ -820,6 +855,10 @@ int main(void) {
                "first-divergence-static-attention-row-extent" :
            rope_diff.mismatches ? "first-divergence-inverse-rope" :
            out_a_diff.mismatches ? "first-divergence-output-a" :
+           row_owned_low_diff.mismatches ?
+               "dedicated-row-owned-helper-diverged-at-output-a" :
+           row_owned_output_diff.mismatches ?
+               "dedicated-row-owned-helper-diverged-at-output-b" :
            out_b_full_chain_diff.mismatches || out_b_split_chain_diff.mismatches ?
                "first-divergence-output-a-to-b-dependency" :
            out_b_actual_diff.mismatches ?

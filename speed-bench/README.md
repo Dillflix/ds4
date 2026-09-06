@@ -5731,6 +5731,14 @@ and the projected parallel B-kernel envelope relative to shipping 512-row B.
 This is a bounded kernel decision, not production promotion evidence; the
 selected algorithm must still pass the four-GPU row-owned A/B.
 
+The measured exact candidates selected `CUBLAS_GEMM_ALGO3_TENSOR_OP`: its
+256-row median was 0.690 ms versus 0.876 ms for shipping DEFAULT at 512 rows,
+a 1.270x projected parallel output-B envelope.  The stable-pair token-row
+candidate calls a dedicated SM75 helper which requires the local FP16 B
+binding, the production 4096x8192x256 shape, and this symbolic algorithm.  It
+fails closed for every unqualified shape.  The control arm and all other GEMMs
+continue to use shipping DEFAULT.
+
 The first bounded result rejects q_b GEMM shape as the source: shipping
 `CUBLAS_GEMM_DEFAULT` produced byte-identical FP16 projection storage and
 byte-identical final FP32 query values for one 64-head call versus two 32-head
