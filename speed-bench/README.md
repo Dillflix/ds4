@@ -5682,14 +5682,28 @@ commit-audit selector validation now recognizes its exact-score route and its
 summary also reports within-arm owner/mirror parity.
 
 `DIAGNOSTIC_STAGE_AUDIT=1` follows that boundary without changing the selected
-multi-GPU kernels. It runs F32 and compact through PP4096 and, only at layer 6
-position 512, dumps the attention-normalized input, final Q, rounded raw KV,
-completed attention projection, and post-attention recurrent state. These use
-distinct diagnostic names that are not consulted by the production dispatch
-gates. The summary reports byte parity at every stage and the first divergent
-stage, separating an upstream layer-input difference from attention-cache
-consumption or its output projection. As with the commit audit, dump
+multi-GPU kernels. It runs F32, direct compact, and compact with diagnostic F32
+materialization through PP4096. Only at layer 6 position 512, it dumps the
+attention-normalized input, final Q, rounded raw KV, raw attention heads,
+post-inverse-RoPE heads, completed attention projection, and post-attention
+recurrent state. These use distinct diagnostic names that are not consulted by
+the production dispatch gates. The two heads payloads contain token row 12,
+which is the first row that differed in the completed projection; the
+row-independent projection means this is the causal input row while avoiding
+two extra 64-MiB payloads per arm. The summary compares both compact arms with
+F32 and with each other at every stage, reporting each first divergent stage.
+This separates compact reconstruction/attention arithmetic from inverse RoPE
+and the attention-output projection. As with the commit audit, dump
 synchronization makes this correctness-localization evidence only.
+
+The `20260906T052717Z` two-arm stage audit localized the continuation defect
+further. Layer-6 input, Q, and the newly appended rounded raw KV were
+byte-identical at position 512, while the completed attention projection and
+recurrent output differed. Therefore the first semantic change is inside the
+attention-consumption-to-output-projection interval, not in an upstream layer,
+Q construction, raw-KV append, compact owner commit, or peer mirror. The
+three-arm audit now adds the two missing boundaries around inverse RoPE and the
+materialized-F32 control needed to assign that interval precisely.
 
 The `20260906T002649Z` run completed the corrected continuation isolation: 516
 measured materializations covering 1024 staged rows were observed. Direct

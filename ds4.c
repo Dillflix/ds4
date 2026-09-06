@@ -32415,6 +32415,17 @@ static bool metal_graph_encode_layer_attention_batch(
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
 
     if (ok) {
+        if (n_tokens > 12u &&
+            metal_graph_debug_wants("ckv_stage_heads", il, pos0)) {
+            ds4_gpu_tensor *stage_heads = metal_graph_tensor_row_range_view(
+                    metal_graph_batch_heads(g), 12u, 1u, q_dim);
+            if (stage_heads) {
+                metal_graph_debug_dump_tensor("ckv_stage_heads",
+                                              stage_heads, q_dim,
+                                              il, pos0);
+            }
+            ds4_gpu_tensor_free(stage_heads);
+        }
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
@@ -32452,6 +32463,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
+        if (n_tokens > 12u &&
+            metal_graph_debug_wants("ckv_stage_unrope", il, pos0)) {
+            ds4_gpu_tensor *stage_unrope = metal_graph_tensor_row_range_view(
+                    metal_graph_batch_heads(g), 12u, 1u, q_dim);
+            if (stage_unrope) {
+                metal_graph_debug_dump_tensor("ckv_stage_unrope",
+                                              stage_unrope, q_dim,
+                                              il, pos0);
+            }
+            ds4_gpu_tensor_free(stage_unrope);
+        }
         metal_graph_debug_dump_tensor("kqv_back", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }

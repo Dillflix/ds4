@@ -33,8 +33,8 @@ Optional environment:
                                     three-arm comparison
   DIAGNOSTIC_COMMIT_AUDIT=0         1: PP4096 F32/compact committed owner-row
                                     and partner-mirror binary comparison
-  DIAGNOSTIC_STAGE_AUDIT=0          1: PP4096 F32/compact layer-6 pos-512
-                                    attention-stage binary comparison
+  DIAGNOSTIC_STAGE_AUDIT=0          1: PP4096 F32/direct/materialized layer-6
+                                    pos-512 attention-stage binary comparison
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
@@ -420,7 +420,7 @@ run_case() {
         mkdir -p "$OUTPUT_DIR/checkpoints/$arm"
         audit_env+=(
             "DS4_METAL_GRAPH_DUMP_PREFIX=$OUTPUT_DIR/checkpoints/$arm/checkpoint"
-            DS4_METAL_GRAPH_DUMP_NAME=ckv_stage_input,ckv_stage_query,ckv_stage_raw,ckv_stage_projected,ckv_stage_recurrent
+            DS4_METAL_GRAPH_DUMP_NAME=ckv_stage_input,ckv_stage_query,ckv_stage_raw,ckv_stage_heads,ckv_stage_unrope,ckv_stage_projected,ckv_stage_recurrent
             DS4_METAL_GRAPH_DUMP_LAYER=6
             DS4_METAL_GRAPH_DUMP_POS=512
         )
@@ -753,7 +753,7 @@ if [[ $DIAGNOSTIC_STAGE_AUDIT == 1 ]]; then
     phase=stage-audit
     capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
         die "could not capture initial four-GPU health"
-    for arm in f32 compact; do
+    for arm in f32 compact compact-materialized; do
         base="$OUTPUT_DIR/exact/$arm-stage-audit"
         printf 'Compact-KV PP4096 attention-stage audit arm=%s...\n' "$arm"
         run_case "$arm" stage-audit 1 "$base" "" 4096 || {
@@ -762,25 +762,45 @@ if [[ $DIAGNOSTIC_STAGE_AUDIT == 1 ]]; then
         }
     done
 
-    stage_first=none
     {
-        printf 'mode=pp4096-layer6-pos512-attention-stage\n'
+        printf 'mode=pp4096-layer6-pos512-attention-stage-three-arm\n'
         printf 'dispatch_preserved_by_distinct_dump_names=true\n'
-        for stage in input query raw projected recurrent; do
-            file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
-            f32_file="$OUTPUT_DIR/checkpoints/f32/$file"
-            compact_file="$OUTPUT_DIR/checkpoints/compact/$file"
-            [[ -s $f32_file && -s $compact_file ]] ||
-                die "missing stage-audit payload: $file"
-            exact=false
-            if cmp -s "$f32_file" "$compact_file"; then
-                exact=true
-            elif [[ $stage_first == none ]]; then
-                stage_first=$stage
-            fi
-            printf 'stage_%s_bit_exact=%s\n' "$stage" "$exact"
+        printf 'attention_heads_dump_token_row=12\n'
+        for arm in compact compact-materialized; do
+            stage_first=none
+            for stage in input query raw heads unrope projected recurrent; do
+                file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
+                f32_file="$OUTPUT_DIR/checkpoints/f32/$file"
+                candidate_file="$OUTPUT_DIR/checkpoints/$arm/$file"
+                [[ -s $f32_file && -s $candidate_file ]] ||
+                    die "missing stage-audit payload: $arm/$file"
+                exact=false
+                if cmp -s "$f32_file" "$candidate_file"; then
+                    exact=true
+                elif [[ $stage_first == none ]]; then
+                    stage_first=$stage
+                fi
+                printf '%s_stage_%s_bit_exact=%s\n' \
+                    "$arm" "$stage" "$exact"
+            done
+            printf '%s_first_divergent_stage=%s\n' "$arm" "$stage_first"
         done
-        printf 'first_divergent_stage=%s\n' "$stage_first"
+        direct_materialized_first=none
+        for stage in input query raw heads unrope projected recurrent; do
+            file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
+            direct_file="$OUTPUT_DIR/checkpoints/compact/$file"
+            materialized_file="$OUTPUT_DIR/checkpoints/compact-materialized/$file"
+            exact=false
+            if cmp -s "$direct_file" "$materialized_file"; then
+                exact=true
+            elif [[ $direct_materialized_first == none ]]; then
+                direct_materialized_first=$stage
+            fi
+            printf 'direct_vs_materialized_stage_%s_bit_exact=%s\n' \
+                "$stage" "$exact"
+        done
+        printf 'direct_vs_materialized_first_divergent_stage=%s\n' \
+            "$direct_materialized_first"
         printf 'acceptance_evidence=no\n'
     } | tee "$OUTPUT_DIR/summary/stage-audit.txt"
     phase=finished
