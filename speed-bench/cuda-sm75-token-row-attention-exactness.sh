@@ -337,6 +337,8 @@ for variant in control token-row; do
                 [[ $(grep -Fc "token-row native-stream dispatch stage=$stage " "$base.log") == 2 ]] ||
                     die "candidate did not native-stream $stage on both pair members"
             done
+            [[ $(grep -Fc 'dequant=group-int8x4' "$base.log") == 6 ]] ||
+                die "candidate did not use grouped int8x4 native-stream dequant for all pair-local projections"
             ! grep -Eq 'token-row native-stream dispatch .*peer-weight-read=[1-9]' "$base.log" ||
                 die "candidate performed a forbidden peer weight read"
         else

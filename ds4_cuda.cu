@@ -1692,6 +1692,13 @@ __global__ static void dequant_q8_0_native_to_f16_kernel(
         uint64_t out_dim,
         uint64_t blocks,
         uint32_t source_layout);
+__global__ static void dequant_q8_0_native_group_to_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t source_layout);
 __global__ static void dequant_q8_0_to_f32_kernel(
         float *out,
         const unsigned char *w,
@@ -10527,11 +10534,47 @@ static const unsigned char *cuda_token_rows_native_stream_source(
         fprintf(stderr,
                 "ds4: token-row native-stream dispatch stage=%s tier=%d "
                 "device=%d layout=%u resident-q8=%.2f MiB "
-                "persistent-f16=0 peer-weight-read=0\n",
+                "persistent-f16=0 peer-weight-read=0 "
+                "dequant=group-int8x4\n",
                 stage ? stage : "projection", logical_tier, physical_device,
                 (unsigned)layout, (double)weight_bytes / 1048576.0);
     }
     return source;
+}
+
+static bool cuda_token_rows_native_stream_dequant(
+        __half *out, const unsigned char *source,
+        uint64_t in_dim, uint64_t out_dim, uint64_t blocks,
+        uint32_t source_layout, const char *stage) {
+    const bool layout_ok =
+        source_layout == DS4_Q8_NATIVE_LAYOUT_ROW_WARP32 ||
+        source_layout == DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32;
+    if (!out || !source || !layout_ok || in_dim == 0u ||
+        (in_dim & 1023u) != 0u || blocks != in_dim / 32u ||
+        (source_layout == DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32 &&
+         (blocks & 63u) != 0u) ||
+        out_dim > UINT32_MAX / (blocks / 32u)) {
+        fprintf(stderr,
+                "ds4: token-row native-stream grouped dequant rejected "
+                "stage=%s in=%llu out=%llu blocks=%llu layout=%u\n",
+                stage ? stage : "projection",
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)blocks, (unsigned)source_layout);
+        return false;
+    }
+    const uint64_t grid_x = out_dim * (blocks / 32u);
+    dequant_q8_0_native_group_to_f16_kernel
+        <<<(unsigned)grid_x, 256>>>(
+            out, source, in_dim, out_dim, blocks, source_layout);
+    const cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) return true;
+    fprintf(stderr,
+            "ds4: token-row native-stream grouped dequant launch failed "
+            "stage=%s in=%llu out=%llu blocks=%llu: %s\n",
+            stage ? stage : "projection",
+            (unsigned long long)in_dim, (unsigned long long)out_dim,
+            (unsigned long long)blocks, cudaGetErrorString(err));
+    return false;
 }
 
 static const unsigned char *cuda_q8_warp_interleaved_ptr(
@@ -12240,6 +12283,75 @@ __global__ static void dequant_q8_0_native_to_f16_kernel(
     const int8_t q = *(const int8_t *)(
         plane + 64u + (word * 32u + lane) * 4u + byte);
     out[gid] = __hmul(scale, __float2half((float)q));
+}
+
+/* The tagged native layout stores one 1024-weight group as 32 FP16 scales
+ * followed by eight coalesced 32-lane words.  Native-stream expands exactly
+ * one such group per block.  The first phase loads packed int8x4 words in
+ * native order and transposes them through a padded shared tile; the second
+ * phase emits canonical row order.  Each element still uses the reference
+ * scalar half conversion/multiply. */
+__global__ static void dequant_q8_0_native_group_to_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t source_layout) {
+    if (blocks == 0u || (blocks & 31u) != 0u ||
+        (source_layout != DS4_Q8_NATIVE_LAYOUT_ROW_WARP32 &&
+         source_layout != DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32) ||
+        (source_layout == DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32 &&
+         (blocks & 63u) != 0u)) return;
+
+    const uint64_t groups = blocks / 32u;
+    const uint64_t group_linear = (uint64_t)blockIdx.x;
+    const uint64_t row = group_linear / groups;
+    if (row >= out_dim) return;
+    const uint64_t canonical_group = group_linear - row * groups;
+
+    uint64_t shard = 0u;
+    uint64_t local_group = canonical_group;
+    uint64_t groups_per_source_row = groups;
+    if (source_layout == DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32) {
+        groups_per_source_row = groups / 2u;
+        shard = canonical_group / groups_per_source_row;
+        local_group = canonical_group - shard * groups_per_source_row;
+    }
+
+    const uint64_t source_row_bytes = groups_per_source_row * 1088u;
+    const uint64_t source_shard_bytes = out_dim * source_row_bytes;
+    const unsigned char *plane = w + shard * source_shard_bytes +
+        row * source_row_bytes + local_group * 1088u;
+
+    __shared__ __half scales[32];
+    __shared__ uint32_t packed_q[32][9];
+    const uint32_t source_lane = threadIdx.x & 31u;
+    const uint32_t source_word = threadIdx.x >> 5u;
+    if (threadIdx.x < 32u) {
+        scales[threadIdx.x] =
+            *(const __half *)(plane + (uint64_t)threadIdx.x * 2u);
+    }
+    packed_q[source_lane][source_word] = *(const uint32_t *)(
+        plane + 64u + ((uint64_t)source_word * 32u + source_lane) * 4u);
+    __syncthreads();
+
+    const uint32_t lane = threadIdx.x >> 3u;
+    const uint32_t word = threadIdx.x & 7u;
+    const __half scale = scales[lane];
+    union {
+        uint32_t packed;
+        int8_t q[4];
+    } values;
+    values.packed = packed_q[lane][word];
+
+    const uint64_t output_base = row * in_dim +
+        canonical_group * 1024u + (uint64_t)threadIdx.x * 4u;
+#pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        out[output_base + j] =
+            __hmul(scale, __float2half((float)values.q[j]));
+    }
 }
 
 __global__ static void dequant_q8_0_to_f32_kernel(
@@ -22339,13 +22451,9 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
             const __half *w_f16_eff = w_f16;
             if (native_source) {
                 __half *transient_w_f16 = (__half *)scratch;
-                const uint64_t wh_count = in_dim * out_dim;
-                dequant_q8_0_native_to_f16_kernel
-                    <<<(wh_count + 255u) / 256u, 256>>>(
+                if (!cuda_token_rows_native_stream_dequant(
                         transient_w_f16, native_source, in_dim, out_dim,
-                        blocks, native_source_layout);
-                if (!cuda_ok(cudaGetLastError(),
-                             "attention output b native-stream dequant launch")) {
+                        blocks, native_source_layout, "attn_output_b")) {
                     return 0;
                 }
                 w_f16_eff = transient_w_f16;
@@ -26417,13 +26525,9 @@ static int cuda_attention_output_q8_batch_tensor_impl(
         const __half *out_a_f16_eff = out_a_f16;
         if (out_a_native) {
             __half *transient_w_f16 = (__half *)tmp;
-            const uint64_t wh_count = group_dim * low_dim;
-            dequant_q8_0_native_to_f16_kernel
-                <<<(wh_count + 255u) / 256u, 256>>>(
+            if (!cuda_token_rows_native_stream_dequant(
                     transient_w_f16, out_a_native, group_dim, low_dim,
-                    blocks_a, out_a_native_layout);
-            if (!cuda_ok(cudaGetLastError(),
-                         "attention output a native-stream dequant launch")) {
+                    blocks_a, out_a_native_layout, "attn_output_a")) {
                 return 0;
             }
             out_a_f16_eff = transient_w_f16;
@@ -42074,13 +42178,9 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
         const __half *w_f16_eff = w_f16;
         if (native_source) {
             transient_w_f16 = (__half *)scratch;
-            const uint64_t wh_count = in_dim * out_dim;
-            dequant_q8_0_native_to_f16_kernel
-                <<<(wh_count + 255u) / 256u, 256>>>(
+            if (!cuda_token_rows_native_stream_dequant(
                     transient_w_f16, native_source, in_dim, out_dim,
-                    blocks, native_source_layout);
-            if (!cuda_ok(cudaGetLastError(),
-                         "attn q_b native-stream dequant launch")) return 0;
+                    blocks, native_source_layout, "attn_q_b")) return 0;
             w_f16_eff = transient_w_f16;
         }
         f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(

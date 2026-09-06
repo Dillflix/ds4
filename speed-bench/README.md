@@ -5688,7 +5688,10 @@ path.  It installs no persistent F16 binding for those 21 pair-1 layers and
 performs no peer weight reads or runtime cache replacement.  Each owner
 dequantizes only the current projection into a 96 MiB scratch arena reserved
 before prefill, then runs the same cuBLAS algorithm and accumulation/output
-types as the exact F16 proof.  The arena is reused serially by q_b, A, and B;
+types as the exact F16 proof.  The native layout is expanded one 1024-weight
+group per 256-thread block with coalesced packed-int8x4 loads; each element
+still uses the reference scalar FP16 conversion and multiply so the resulting
+matrix remains byte-identical.  The arena is reused serially by q_b, A, and B;
 runtime growth is forbidden.  Projection shapes other than the production
 q_b/A/B matrices and owner extents above 256 rows fail closed.  This first
 qualification is consequently fixed to the established 256-row owner half of
@@ -5706,8 +5709,11 @@ byte-identical logits and the fixed 5 MiB steady per-layer transfer contract.
 It also confirmed the expected prototype cost: 14.52 GiB of F16 model cache
 versus 10.58 GiB in control, with about 4.0 GiB added to GPU 2.  Those results
 qualify row ownership and arithmetic, not the duplicated residency.  The
-native-stream arm is the direct low-VRAM follow-up and keeps pair 0 disabled in
-both workloads.
+first native-stream run passed exactness, stability, and VRAM gates at PP2048:
+10.58 to 6.64 GiB persistent model cache and 1.74 GiB lower aggregate peak
+VRAM.  Its 465.38 versus 470.19 tok/s result exposed the scalar expansion
+kernel as the remaining cost, so the grouped int8x4 expansion above is the
+direct performance follow-up.  Pair 0 remains disabled in both workloads.
 
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
