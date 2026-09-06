@@ -22,8 +22,9 @@ target=tests/cuda_sm75_token_row_arithmetic
 
 [[ $CUDA_ARCH == sm_75 ]] || die "CUDA_ARCH must be sm_75"
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be an integer"
-[[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b or full"
+[[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == q-b-native ||
+   $DIAGNOSTIC_SCOPE == full ]] ||
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
@@ -101,8 +102,11 @@ clean_env+=(CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$PROFILE_GPU"
     B_TIMING_ROUNDS="$B_TIMING_ROUNDS"
     B_TIMING_REPEATS="$B_TIMING_REPEATS"
     B_TIMING_WARMUPS="$B_TIMING_WARMUPS")
-if [[ $DIAGNOSTIC_SCOPE == q-b ]]; then
+if [[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == q-b-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_STOP_AFTER_Q_B=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == q-b-native ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B=1)
 fi
 
 capture_gpu_health() {
@@ -148,6 +152,17 @@ if (( diagnostic_status != 0 )); then
 fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/diagnostic.log" ||
     die "diagnostic omitted success marker"
+if [[ $DIAGNOSTIC_SCOPE == q-b-native ]]; then
+    grep -Fq 'ds4: token-row native-stream dispatch stage=attn_q_b' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native q_b scope missed the production native-stream dispatch"
+    for checkpoint in q-b-native-dequant q-b-activation-f32-to-f16 \
+        q-b-cublas-gemm q-b-head-rms-rope; do
+        grep -Fq "stage=$checkpoint device=0 status=no error" \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "native q_b scope missed clean $checkpoint checkpoint"
+    done
+fi
 cat "$OUTPUT_DIR/diagnostic.log"
 
 if (( RUN_SANITIZER )); then
@@ -174,6 +189,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: local native-stream checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

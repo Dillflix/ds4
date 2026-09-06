@@ -3526,9 +3526,24 @@ static bool cuda_token_rows_native_stream_mode(void) {
     return mode && strcmp(mode, "native-stream") == 0;
 }
 
+static bool cuda_token_rows_native_stream_local_diagnostic(void) {
+    const char *value = getenv(
+        "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
 static bool cuda_token_rows_native_stream_tier_enabled(int logical_tier) {
-    if (!cuda_token_rows_native_stream_mode() || g_n_gpus != 4 ||
-        logical_tier < 0 || logical_tier >= g_n_gpus) return false;
+    if (!cuda_token_rows_native_stream_mode() || logical_tier < 0 ||
+        logical_tier >= g_n_gpus) return false;
+    /* The production selector remains four-GPU-only.  This explicit
+     * single-GPU exception lets the bounded arithmetic harness isolate the
+     * tagged native-Q8 expansion and GEMM without peer mappings, transfers,
+     * attention, or another CUDA context. */
+    if (g_n_gpus == 1 &&
+        cuda_token_rows_native_stream_local_diagnostic()) {
+        return logical_tier == 0;
+    }
+    if (g_n_gpus != 4) return false;
     const int pair = logical_tier < g_n_gpus / 2
         ? logical_tier : logical_tier - g_n_gpus / 2;
     return cuda_env_pair_list_contains(
@@ -3559,6 +3574,15 @@ static bool cuda_token_rows_native_stream_rows_qualified(
  * instead of growing/replacing a live CUDA arena inside prefill. */
 static void *cuda_token_rows_native_stream_scratch(
         int logical_tier, uint64_t bytes, const char *what) {
+    if (g_n_gpus == 1 && logical_tier == 0 &&
+        cuda_token_rows_native_stream_local_diagnostic()) {
+        const uint64_t workspace_bytes =
+            (uint64_t)CUDA_TOKEN_ROWS_NATIVE_STREAM_WORKSPACE_MIB * 1048576u;
+        if (bytes > workspace_bytes) return NULL;
+        return cuda_tmp_alloc_on(
+            logical_tier, workspace_bytes,
+            "local token-row native-stream diagnostic workspace");
+    }
     if (!cuda_token_rows_native_stream_tier_enabled(logical_tier) ||
         logical_tier < 0 || logical_tier >= g_n_gpus ||
         !g_gpu[logical_tier].scratch ||
@@ -3574,6 +3598,21 @@ static void *cuda_token_rows_native_stream_scratch(
         return NULL;
     }
     return g_gpu[logical_tier].scratch;
+}
+
+static bool cuda_token_rows_native_stream_local_checkpoint(
+        const char *stage, int physical_device) {
+    if (g_n_gpus != 1 ||
+        !cuda_token_rows_native_stream_local_diagnostic()) return true;
+    const cudaError_t err = cudaDeviceSynchronize();
+    fprintf(stderr,
+            "ds4: local native-stream checkpoint stage=%s device=%d "
+            "status=%s\n",
+            stage ? stage : "?", physical_device,
+            cudaGetErrorString(err));
+    if (err == cudaSuccess) return true;
+    (void)cudaGetLastError();
+    return false;
 }
 
 /* Materialize one consumer's weight on its validated partner.  Return 1 on
@@ -42181,12 +42220,17 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
             if (!cuda_token_rows_native_stream_dequant(
                     transient_w_f16, native_source, in_dim, out_dim,
                     blocks, native_source_layout, "attn_q_b")) return 0;
+            if (!cuda_token_rows_native_stream_local_checkpoint(
+                    "q-b-native-dequant", physical_device)) return 0;
             w_f16_eff = transient_w_f16;
         }
         f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
             xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(),
                      "attn q_b f16 activation convert launch")) return 0;
+        if (native_source &&
+            !cuda_token_rows_native_stream_local_checkpoint(
+                "q-b-activation-f32-to-f16", physical_device)) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasGemmAlgo_t gemm_algo = CUBLAS_GEMM_DEFAULT;
@@ -42228,6 +42272,9 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
                     physical_device, (int)st);
             return 0;
         }
+        if (native_source &&
+            !cuda_token_rows_native_stream_local_checkpoint(
+                "q-b-cublas-gemm", physical_device)) return 0;
         if (!native_source) {
             cuda_q8_f16_binding_mark_used(
                 model_map, weight_offset, weight_bytes, in_dim, out_dim,
@@ -42276,6 +42323,9 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
         attn_factor, beta_fast, beta_slow, eps);
     if (!cuda_ok(cudaGetLastError(),
                  "attn q_b f16-output head RMS/RoPE launch")) return 0;
+    if (native_source &&
+        !cuda_token_rows_native_stream_local_checkpoint(
+            "q-b-head-rms-rope", physical_device)) return 0;
     if (partner_projected) {
         g_t32_f16_fused_partner_calls.fetch_add(
             1u, std::memory_order_relaxed);

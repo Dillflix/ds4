@@ -6116,6 +6116,16 @@ identity and memory health, and saves kernel messages since the arm began so a
 CUDA-context failure cannot be mistaken for a PCIe Xid.  `full` remains the
 default for the arithmetic/exactness investigation.
 
+`DIAGNOSTIC_SCOPE=q-b-native` adds one narrower rung after the cached-F16
+control.  It installs a size-neutral row-warp32 Q8 source in ordinary local
+device residency, expands it with the production group-int8x4 kernel into the
+fixed 96 MiB transient workspace, and runs the same N=256 Q_B GEMM and
+postprocess with both explicit and internal FP16-output scratch.  The CUDA
+backend synchronizes and reports checkpoints after native dequantization,
+activation conversion, GEMM, and RMS/RoPE only in this single-GPU diagnostic.
+There are no peer mappings, peer transfers, attention kernels, or secondary
+CUDA contexts in this scope.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6154,6 +6164,15 @@ For the local-only GPU1 q_b isolation rung:
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=q-b \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After that control is clean, isolate the tagged native-Q8 expansion and the
+same local GPU1 Q_B arithmetic:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=q-b-native \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```

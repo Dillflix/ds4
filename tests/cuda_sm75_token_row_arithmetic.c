@@ -107,6 +107,32 @@ static void build_q8_rows(unsigned char *dst, uint64_t rows,
     }
 }
 
+/* Match the tagged GGUF row-warp32 encoding exactly: for each 32-block
+ * group, store 32 scales followed by eight lane-major int8x4 word planes. */
+static void pack_q8_rows_warp32(unsigned char *dst,
+                                const unsigned char *src,
+                                uint64_t rows, uint64_t columns) {
+    const uint64_t blocks = columns / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    for (uint64_t row = 0u; row < rows; row++) {
+        const unsigned char *src_row = src + row * row_bytes;
+        unsigned char *dst_row = dst + row * row_bytes;
+        for (uint64_t group = 0u; group < blocks / 32u; group++) {
+            const unsigned char *src_group = src_row + group * 1088u;
+            unsigned char *dst_group = dst_row + group * 1088u;
+            for (uint64_t lane = 0u; lane < 32u; lane++) {
+                const unsigned char *block = src_group + lane * 34u;
+                dst_group[2u * lane] = block[0];
+                dst_group[2u * lane + 1u] = block[1];
+                for (uint64_t word = 0u; word < 8u; word++) {
+                    memcpy(dst_group + 64u + (word * 32u + lane) * 4u,
+                           block + 2u + word * 4u, 4u);
+                }
+            }
+        }
+    }
+}
+
 static diff_metrics compare_f32(const float *reference,
                                 const float *candidate, uint64_t count) {
     diff_metrics result = {0u, UINT64_MAX, 0.0, 0.0};
@@ -265,6 +291,8 @@ static int time_output_b(double *median_ms, ds4_gpu_tensor *out,
 }
 
 int main(void) {
+    const int native_q_b_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B") != NULL;
     const uint64_t q_b_bytes = Q_DIM * (IN_DIM / 32u) * 34u;
     const uint64_t sinks_offset = q_b_bytes;
     const uint64_t sinks_bytes = N_HEAD * sizeof(float);
@@ -272,7 +300,9 @@ int main(void) {
     const uint64_t out_a_bytes = LOW_DIM * (GROUP_DIM / 32u) * 34u;
     const uint64_t out_b_offset = out_a_offset + out_a_bytes;
     const uint64_t out_b_bytes = OUT_DIM * (LOW_DIM / 32u) * 34u;
-    const uint64_t model_bytes = out_b_offset + out_b_bytes;
+    const uint64_t native_q_b_offset = out_b_offset + out_b_bytes;
+    const uint64_t model_bytes = native_q_b_offset +
+        (native_q_b_diagnostic ? q_b_bytes : 0u);
     const uint64_t input_count = (uint64_t)N_TOK * IN_DIM;
     const uint64_t q_count = (uint64_t)N_TOK * Q_DIM;
     const uint64_t heads_count = q_count;
@@ -337,6 +367,10 @@ int main(void) {
     shipping_b_host = reference + 2u * low_count + out_count;
 
     build_q8_rows(model, Q_DIM, IN_DIM, 17u);
+    if (native_q_b_diagnostic) {
+        pack_q8_rows_warp32(
+            model + native_q_b_offset, model, Q_DIM, IN_DIM);
+    }
     for (uint32_t h = 0u; h < N_HEAD; h++) {
         const float sink = (float)((int)(h % 11u) - 5) / 32.0f;
         memcpy(model + sinks_offset + (uint64_t)h * sizeof(float),
@@ -373,6 +407,15 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_NO_WINDOW_ATTENTION");
     (void)unsetenv("DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
+    if (native_q_b_diagnostic) {
+        (void)setenv(
+            "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
+    } else {
+        (void)unsetenv(
+            "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
+    }
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA initialization failed\n");
@@ -391,6 +434,23 @@ int main(void) {
             LOW_DIM, OUT_DIM, 0, "attn_output_b")) {
         fprintf(stderr, "error: model/cache installation failed\n");
         goto cleanup;
+    }
+    if (native_q_b_diagnostic) {
+        const ds4_tensor_range native_source = {
+            native_q_b_offset, q_b_bytes, 0};
+        const ds4_q8_native_range native_range = {
+            native_q_b_offset, q_b_bytes,
+            native_q_b_offset, q_b_bytes,
+            native_q_b_offset, IN_DIM / 32u, 0u,
+            IN_DIM / 32u, Q_DIM,
+            DS4_Q8_NATIVE_LAYOUT_ROW_WARP32, 1, 0};
+        if (ds4_gpu_device_cache_tensors(0, &native_source, 1) != 0 ||
+            ds4_gpu_device_cache_q8_native_tensors(
+                0, &native_range, 1) != 0) {
+            fprintf(stderr,
+                    "error: native q_b source installation failed\n");
+            goto cleanup;
+        }
     }
 
     input = ds4_gpu_tensor_alloc(input_bytes);
@@ -498,9 +558,51 @@ int main(void) {
         reference, candidate, q_count);
     report_diff("q-b-control-persistent-vs-internal-row-scratch256x2", "f32",
                 q_count, q_scratch_diff);
+    diff_metrics native_qh_diff = {0u, UINT64_MAX, 0.0, 0.0};
+    diff_metrics native_q_diff = {0u, UINT64_MAX, 0.0, 0.0};
+    diff_metrics native_scratch_diff = {0u, UINT64_MAX, 0.0, 0.0};
+    if (native_q_b_diagnostic) {
+        (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE",
+                     "native-stream", 1);
+        (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS",
+                     "0", 1);
+        if (!launch_q_b(q0, qh0, model, model_bytes, native_q_b_offset,
+                        input0, HALF_TOK, POS0) ||
+            !launch_q_b(q1, qh1, model, model_bytes, native_q_b_offset,
+                        input1, HALF_TOK, POS0 + HALF_TOK) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(
+                qh_split, 0u, candidate_half, q_half_bytes) ||
+            !ds4_gpu_tensor_read(q_split, 0u, candidate, q_bytes)) {
+            fprintf(stderr, "error: native-stream q_b runtime failed\n");
+            goto cleanup;
+        }
+        native_qh_diff = compare_u16(
+            reference_half, candidate_half, q_count);
+        native_q_diff = compare_f32(reference, candidate, q_count);
+        report_diff("q-b-native-f16-control-vs-row256x2", "f16", q_count,
+                    native_qh_diff);
+        report_diff("q-b-native-rms-rope-control-vs-row256x2", "f32",
+                    q_count, native_q_diff);
+
+        if (!launch_q_b(q0, NULL, model, model_bytes, native_q_b_offset,
+                        input0, HALF_TOK, POS0) ||
+            !launch_q_b(q1, NULL, model, model_bytes, native_q_b_offset,
+                        input1, HALF_TOK, POS0 + HALF_TOK) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(q_split, 0u, candidate, q_bytes)) {
+            fprintf(stderr,
+                    "error: native-stream internal q_b scratch failed\n");
+            goto cleanup;
+        }
+        native_scratch_diff = compare_f32(reference, candidate, q_count);
+        report_diff("q-b-native-control-vs-internal-scratch256x2", "f32",
+                    q_count, native_scratch_diff);
+    }
     if (getenv("DS4_TOKEN_ROW_ARITHMETIC_STOP_AFTER_Q_B") ||
         getenv("DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE")) {
-        printf("diagnostic_scope=q-b-only\n");
+        printf("diagnostic_scope=%s\n",
+               native_q_b_diagnostic ? "q-b-native-only" : "q-b-only");
         printf("boundary=static-mixed-attention-shipping-vs-full-range512,status=skipped-by-q-b-scope\n");
         printf("boundary=static-mixed-attention-full-range512-vs-row256x2,status=skipped-by-q-b-scope\n");
         printf("boundary=inverse-rope-full512-vs-row256x2,status=skipped-by-q-b-scope\n");
@@ -514,6 +616,12 @@ int main(void) {
                q_diff.mismatches ? "first-divergence-q-b-postprocess" :
                q_scratch_diff.mismatches ?
                    "first-divergence-q-b-internal-scratch-shape" :
+               native_qh_diff.mismatches ?
+                   "first-divergence-q-b-native-f16-projection" :
+               native_q_diff.mismatches ?
+                   "first-divergence-q-b-native-postprocess" :
+               native_scratch_diff.mismatches ?
+                   "first-divergence-q-b-native-internal-scratch" :
                "q-b-boundaries-bit-exact");
         printf("harness_status=ok\n");
         status = 0;
@@ -873,6 +981,9 @@ int main(void) {
     status = 0;
 
 cleanup:
+    (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
+    (void)unsetenv("DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     ds4_gpu_tensor_free(low_ref1);
     ds4_gpu_tensor_free(low_ref0);
