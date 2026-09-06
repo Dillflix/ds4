@@ -13219,6 +13219,98 @@ __global__ static void sm75_compact_attn_pack_kernel(
     }
 }
 
+__device__ __forceinline__ static int
+sm75_compact_attn_encode_rounded_code(float value, float scale) {
+    const uint32_t bits = __float_as_uint(value);
+    if ((bits << 1u) == 0u) {
+        /* The producer quantizer creates signed zero from finite negative
+         * values, and the stable F32 checkpoint preserves that sign bit. */
+        return (bits >> 24u) & 0x80u;
+    }
+    const int code = sm75_compact_attn_quant_code(value, scale);
+    if (code < 0) return -1;
+    const float decoded = sm75_compact_attn_decode_code(
+        (uint8_t)code, __float_as_uint(scale));
+    return __float_as_uint(decoded) == bits ? code : -1;
+}
+
+/* Encode an already shipping-rounded checkpoint row without applying the
+ * producer quantizer again. If S was the producer's power-of-two scale, its
+ * rounded maximum lies in [224*S, 448*S]. Therefore the exact lower-bound
+ * scale inferred from that maximum is either S or S/2; testing it and the
+ * next power of two recovers an exact common representation. Integer-exponent
+ * comparisons avoid the fast log2f boundary which made snapshot restore
+ * non-idempotent at values such as max=1.75. */
+__global__ static void sm75_compact_attn_encode_rounded_kernel(
+        cuda_sm75_compact_attn_kv_row *dst,
+        const float *src,
+        uint32_t rows) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= rows) return;
+    __shared__ float reduction[64];
+    __shared__ uint32_t candidate_invalid;
+    __shared__ int selected;
+    cuda_sm75_compact_attn_kv_row *out = dst + row;
+    const float *in = src + (uint64_t)row * 512u;
+    if (tid == 0u) out->status = 0u;
+    __syncthreads();
+
+    for (uint32_t group = 0; group < 7u; group++) {
+        const uint32_t d = group * 64u + tid;
+        const float value = in[d];
+        reduction[tid] = isfinite(value) ? fabsf(value) : 0.0f;
+        if (!isfinite(value)) atomicOr(&out->status, 1u);
+        __syncthreads();
+        for (uint32_t stride = 32u; stride != 0u; stride >>= 1u) {
+            if (tid < stride) {
+                reduction[tid] = fmaxf(
+                    reduction[tid], reduction[tid + stride]);
+            }
+            __syncthreads();
+        }
+
+        const float bounded_max = fmaxf(reduction[0], 1.0e-4f);
+        int base_exp = ilogbf(bounded_max) - 8;
+        if (bounded_max > ldexpf(448.0f, base_exp)) base_exp++;
+        if (tid == 0u) selected = -1;
+        __syncthreads();
+
+        for (int delta = 0; delta <= 1; delta++) {
+            if (tid == 0u) candidate_invalid = 0u;
+            __syncthreads();
+            const float scale = ldexpf(1.0f, base_exp + delta);
+            const int code =
+                sm75_compact_attn_encode_rounded_code(value, scale);
+            if (code < 0) atomicOr(&candidate_invalid, 1u);
+            __syncthreads();
+            if (candidate_invalid == 0u) {
+                if (tid == 0u) {
+                    out->scale[group] = scale;
+                    selected = delta;
+                }
+                out->code[d] = (uint8_t)code;
+            }
+            __syncthreads();
+            if (selected >= 0) break;
+        }
+        if (selected < 0) {
+            out->code[d] = 0u;
+            if (tid == 0u) {
+                atomicOr(&out->status, 16u);
+            }
+        }
+        __syncthreads();
+    }
+    for (uint32_t d = tid; d < 64u; d += blockDim.x) {
+        const float value = in[448u + d];
+        if (!isfinite(value)) {
+            atomicOr(&out->status, 1u);
+        }
+        out->rope_f32[d] = value;
+    }
+}
+
 __global__ static void sm75_compact_attn_unpack_kernel(
         float *dst,
         const cuda_sm75_compact_attn_kv_row *src,
@@ -24840,6 +24932,62 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
         }
         free(status);
     }
+    return 1;
+}
+extern "C" int ds4_gpu_attn_compact_encode_rounded_tensor(
+        ds4_gpu_tensor *dst, uint32_t dst_row,
+        const ds4_gpu_tensor *src_f32, uint32_t src_row, uint32_t rows) {
+    if (!dst || !src_f32 || rows == 0u ||
+        ds4_tensor_device_idx(dst) != ds4_tensor_device_idx(src_f32) ||
+        dst->bytes < ((uint64_t)dst_row + rows) *
+                         DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES ||
+        src_f32->bytes < ((uint64_t)src_row + rows) * 512u * sizeof(float) ||
+        !cuda_sm75_mma_ok()) {
+        return 0;
+    }
+    sm75_compact_attn_encode_rounded_kernel<<<rows, 64>>>(
+        (cuda_sm75_compact_attn_kv_row *)((uint8_t *)dst->ptr +
+            (uint64_t)dst_row *
+                DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES),
+        (const float *)src_f32->ptr + (uint64_t)src_row * 512u,
+        rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "SM75 compact attention rounded encode launch")) {
+        return 0;
+    }
+    uint32_t *status = (uint32_t *)malloc((size_t)rows * sizeof(*status));
+    if (!status) {
+        fprintf(stderr,
+                "ds4: compact attention rounded encoder host allocation "
+                "failed rows=%u\n", rows);
+        return 0;
+    }
+    const uint8_t *status_src = (const uint8_t *)dst->ptr +
+        (uint64_t)dst_row *
+            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES +
+        offsetof(cuda_sm75_compact_attn_kv_row, status);
+    const cudaError_t rc = cudaMemcpy2D(
+        status, sizeof(*status), status_src,
+        DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES,
+        sizeof(*status), rows, cudaMemcpyDeviceToHost);
+    if (rc != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: compact attention rounded encoder result failed: %s\n",
+                cudaGetErrorString(rc));
+        free(status);
+        return 0;
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        if (status[row] != 0u) {
+            fprintf(stderr,
+                    "ds4: compact attention rounded encoder rejected "
+                    "dst-row=%u local-row=%u status=0x%x\n",
+                    dst_row + row, row, status[row]);
+            free(status);
+            return 0;
+        }
+    }
+    free(status);
     return 1;
 }
 extern "C" int ds4_gpu_attn_compact_unpack_tensor(

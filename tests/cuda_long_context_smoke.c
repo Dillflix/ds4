@@ -3195,6 +3195,78 @@ static int check_compact_decode_nonzero_exact(void) {
     return rc;
 }
 
+static int check_compact_snapshot_reencode_exact(void) {
+    const uint32_t rows = 2u;
+    const uint64_t count = (uint64_t)rows * 512u;
+    const uint64_t compact_bytes =
+        (uint64_t)rows * DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES;
+    float *rounded = (float *)calloc((size_t)count, sizeof(float));
+    float *restored = (float *)malloc((size_t)count * sizeof(float));
+    if (!rounded || !restored) {
+        free(restored);
+        free(rounded);
+        return 1;
+    }
+
+    /* This is the production snapshot failure from layer 6, row 39. The
+     * rounded maximum is exactly 448 * 2^-8, and fast log2f can select 2^-7
+     * when producer packing is incorrectly applied a second time. */
+    rounded[0] = 1.75f;
+    rounded[46] = -2.288818359375e-05f;
+    rounded[63] = -0.0f;
+    for (uint32_t d = 64u; d < 448u; d++) {
+        const int value = (int)(d % 15u) - 7;
+        rounded[d] = (float)value * 0.0001220703125f;
+    }
+    for (uint32_t d = 448u; d < 512u; d++) {
+        rounded[d] = (float)((int)d - 480) * 0.00390625f;
+    }
+    for (uint32_t d = 0; d < 512u; d++) {
+        rounded[512u + d] = rounded[d];
+    }
+    rounded[512u + 1u] = 0.0f;
+    rounded[512u + 2u] = -0.0f;
+
+    ds4_gpu_tensor *source = ds4_gpu_tensor_alloc(count * sizeof(float));
+    ds4_gpu_tensor *compact = ds4_gpu_tensor_alloc(compact_bytes);
+    ds4_gpu_tensor *expanded = ds4_gpu_tensor_alloc(count * sizeof(float));
+    int rc = 1;
+    if (source && compact && expanded &&
+        ds4_gpu_tensor_write(
+            source, 0u, rounded, count * sizeof(float)) &&
+        ds4_gpu_attn_compact_encode_rounded_tensor(
+            compact, 0u, source, 0u, rows) &&
+        ds4_gpu_attn_compact_unpack_tensor(
+            expanded, 0u, compact, 0u, rows) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(
+            expanded, 0u, restored, count * sizeof(float))) {
+        if (memcmp(rounded, restored, (size_t)count * sizeof(float)) == 0) {
+            fprintf(stderr,
+                    "cuda-regression: compact snapshot rounded-F32 "
+                    "re-encode is bit-exact\n");
+            rc = 0;
+        } else {
+            uint64_t first = 0u;
+            while (first < count &&
+                   memcmp(rounded + first, restored + first,
+                          sizeof(float)) == 0) {
+                first++;
+            }
+            fprintf(stderr,
+                    "compact snapshot rounded-F32 re-encode differs at "
+                    "%llu\n", (unsigned long long)first);
+        }
+    }
+
+    ds4_gpu_tensor_free(expanded);
+    ds4_gpu_tensor_free(compact);
+    ds4_gpu_tensor_free(source);
+    free(restored);
+    free(rounded);
+    return rc;
+}
+
 static int check_prefill_attention_head_shards(void) {
     const uint32_t n_tokens = 128;
     const uint32_t n_head = 64;
@@ -3517,6 +3589,7 @@ int main(void) {
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_compact_decode_zero_compressed_rows() != 0) rc = 1;
     if (check_compact_decode_nonzero_exact() != 0) rc = 1;
+    if (check_compact_snapshot_reencode_exact() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
     if (check_sm75_indexed_attention_heads8_exact() != 0) rc = 1;
     ds4_gpu_cleanup();

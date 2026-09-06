@@ -1088,6 +1088,15 @@ static inline int ds4_gpu_attn_compact_pack_tensor(
     (void)dst; (void)dst_row; (void)src_f32; (void)src_row; (void)rows;
     return 0;
 }
+static inline int ds4_gpu_attn_compact_encode_rounded_tensor(
+        ds4_gpu_tensor       *dst,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src_f32,
+        uint32_t              src_row,
+        uint32_t              rows) {
+    (void)dst; (void)dst_row; (void)src_f32; (void)src_row; (void)rows;
+    return 0;
+}
 static inline int ds4_gpu_attn_compact_unpack_tensor(
         ds4_gpu_tensor       *dst_f32,
         uint32_t              dst_row,
@@ -1106,6 +1115,15 @@ static inline void ds4_gpu_attn_compact_runtime_reset(void) {}
 #else
 int ds4_gpu_attn_compact_supported(void);
 int ds4_gpu_attn_compact_pack_tensor(
+        ds4_gpu_tensor       *dst,
+        uint32_t              dst_row,
+        const ds4_gpu_tensor *src_f32,
+        uint32_t              src_row,
+        uint32_t              rows);
+/* Encode F32 rows which have already passed through the shipping E4M3
+ * quantizer, as used by the stable F32 checkpoint payload. Unlike the live
+ * producer packer, this operation must not round its input a second time. */
+int ds4_gpu_attn_compact_encode_rounded_tensor(
         ds4_gpu_tensor       *dst,
         uint32_t              dst_row,
         const ds4_gpu_tensor *src_f32,

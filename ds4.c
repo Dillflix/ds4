@@ -53236,7 +53236,7 @@ static int payload_read_attn_comp_cache_from_f32(
                 fp, stage, 0,
                 (uint64_t)n * DS4_N_HEAD_DIM * sizeof(float),
                 buf, cap, remaining, err, errlen) != 0 ||
-            !ds4_gpu_attn_compact_pack_tensor(
+            !ds4_gpu_attn_compact_encode_rounded_tensor(
                 g->layer_attn_comp_cache[il], done,
                 stage, 0u, n)) {
             payload_set_err(err, errlen,

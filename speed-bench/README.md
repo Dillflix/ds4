@@ -5717,6 +5717,21 @@ and an F32 expansion of every compressed-cache row immediately before the
 layer-6 attention launch. Comparing those read-boundary payloads distinguishes
 snapshot/restore or cache mutation from a dispatch/parameter discrepancy.
 
+The `20260906T060312Z` read-boundary audit found identical complete raw rings
+but one changed value among the 256 expanded compressed rows: layer-6 row 39,
+column 46 was `-2.288818359375e-05` in F32 and
+`-3.0517578125e-05` after compact restore. The earlier commit audit proves the
+same row and column were still byte-identical when first committed. Snapshot
+serialization expands the compact cache into the stable, already-rounded F32
+payload, but restore had passed those values through the live producer packer,
+applying E4M3 quantization a second time. The restored group's `1.75` maximum
+also lies exactly on a power-of-two scale boundary, exposing the fast-math
+`log2f` ambiguity. Restore now uses a separate rounded-F32 encoder: it derives
+candidate scale exponents with exact comparisons, accepts only a scale that
+reconstructs every input bit, preserves signed zero, and fails closed if no
+exact representation exists. Live cache commits continue to use the one-pass
+producer packer.
+
 The `20260906T002649Z` run completed the corrected continuation isolation: 516
 measured materializations covering 1024 staged rows were observed. Direct
 compact and materialized-F32 prefill were byte-identical to each other but not
