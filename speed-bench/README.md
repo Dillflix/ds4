@@ -5818,6 +5818,14 @@ summary.  This directly covers the historical PP4096 token-four transition
 without paying for a PP32768 production run; it is correctness-localization,
 not promotion evidence.
 
+The `20260906T170157Z` diagnostic completed both arms and produced byte-identical
+F32 and compact payloads for all ten frontier/decode checkpoints, including
+PP4096 decode token four.  The compact run reported 21 exact selected-row
+indexed calls with no persistent-extra allocation.  The runner then rejected
+that valid run because its generic selector gate still required the obsolete
+hybrid-consumer summary; the indexed-decode mode now validates the exact-score
+and exact-indexed summaries that it actually requests.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \

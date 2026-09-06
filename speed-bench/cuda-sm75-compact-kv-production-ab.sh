@@ -371,6 +371,11 @@ validate_selector() {
             grep -Fq 'SM75 compact prefill diagnostic selected: materialized-F32 ordinary consumer' "$log" &&
             validate_materialized_prefill_summary "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log"
+    elif [[ $DIAGNOSTIC_INDEXED_DECODE == 1 ]]; then
+        grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
+            grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' "$log" &&
+            grep -Eq 'SM75 compact indexed exact summary: calls=[1-9][0-9]* ' "$log" &&
+            ! grep -Fq 'requested compressed-attention cache format' "$log"
     elif [[ $kind == commit-audit || $kind == stage-audit ||
             $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
