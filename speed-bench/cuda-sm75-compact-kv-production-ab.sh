@@ -28,8 +28,9 @@ Optional environment:
   MIN_THROUGHPUT_RATIO=1.0
   DIAGNOSTIC_PACK_AUDIT=0           1: F32/compact PP512 one-token exact A/B,
                                     with compact per-layer packed-row checks
-  DIAGNOSTIC_PREFILL_ISOLATION=0    1: PP4096 exact F32, compact-hybrid, and
-                                    compact-direct three-arm comparison
+  DIAGNOSTIC_PREFILL_ISOLATION=0    1: PP4096 exact F32, direct compact
+                                    prefill, and compact-storage/F32-consumer
+                                    three-arm comparison
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
@@ -328,9 +329,13 @@ validate_selector() {
     if [[ $arm == f32 ]]; then
         grep -Fq 'compressed-attention cache format=f32 row-bytes=2048' "$log" &&
             ! grep -Fq 'compact attention hybrid summary:' "$log"
-    elif [[ $arm == compact-direct ]]; then
+    elif [[ $arm == compact-materialized ]]; then
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
-            ! grep -Fq 'compact attention hybrid summary:' "$log" &&
+            grep -Fq 'SM75 compact prefill diagnostic selected: materialized-F32 ordinary consumer' "$log" &&
+            ! grep -Fq 'requested compressed-attention cache format' "$log"
+    elif [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
+        grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
+            grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log"
     else
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
@@ -376,8 +381,8 @@ run_case() {
     if [[ $arm == compact* && ($kind == exact || $kind == pack-audit) ]]; then
         audit_env+=(DS4_CUDA_COMPACT_ATTN_PACK_AUDIT=1)
     fi
-    if [[ $arm == compact-direct ]]; then
-        audit_env+=(DS4_CUDA_NO_ATTN_COMPACT_HYBRID=1)
+    if [[ $arm == compact-materialized ]]; then
+        audit_env+=(DS4_CUDA_COMPACT_ATTN_PREFILL_MATERIALIZE=1)
     fi
     capture_gpu_health "$base.pre-gpu.csv" || return 1
     start_telemetry "$telemetry"
@@ -568,7 +573,7 @@ if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
     phase=prefill-isolation
     capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
         die "could not capture initial four-GPU health"
-    for arm in f32 compact compact-direct; do
+    for arm in f32 compact compact-materialized; do
         base="$OUTPUT_DIR/exact/$arm-prefill-isolation"
         logits="$base-logits"
         mkdir -p "$logits"
@@ -581,33 +586,33 @@ if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
            -s $logits/frontier_004096.logits.f32 ]] ||
             die "$arm PP4096 prefill isolation inventory is incomplete"
     done
-    for arm in compact compact-direct; do
+    for arm in compact compact-materialized; do
         cmp -s \
             "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_000512.logits.f32" \
             "$OUTPUT_DIR/exact/$arm-prefill-isolation-logits/frontier_000512.logits.f32" ||
             die "$arm diverged before historical compact rows were consumed"
     done
-    hybrid_exact=false
-    direct_exact=false
+    compact_exact=false
+    materialized_exact=false
     arms_equal=false
     cmp -s \
         "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_004096.logits.f32" \
         "$OUTPUT_DIR/exact/compact-prefill-isolation-logits/frontier_004096.logits.f32" &&
-        hybrid_exact=true
+        compact_exact=true
     cmp -s \
         "$OUTPUT_DIR/exact/f32-prefill-isolation-logits/frontier_004096.logits.f32" \
-        "$OUTPUT_DIR/exact/compact-direct-prefill-isolation-logits/frontier_004096.logits.f32" &&
-        direct_exact=true
+        "$OUTPUT_DIR/exact/compact-materialized-prefill-isolation-logits/frontier_004096.logits.f32" &&
+        materialized_exact=true
     cmp -s \
         "$OUTPUT_DIR/exact/compact-prefill-isolation-logits/frontier_004096.logits.f32" \
-        "$OUTPUT_DIR/exact/compact-direct-prefill-isolation-logits/frontier_004096.logits.f32" &&
+        "$OUTPUT_DIR/exact/compact-materialized-prefill-isolation-logits/frontier_004096.logits.f32" &&
         arms_equal=true
     {
         printf 'mode=pp4096-prefill-three-arm\n'
         printf 'pack_roundtrip_audit=passed\n'
-        printf 'hybrid_vs_f32_bit_exact=%s\n' "$hybrid_exact"
-        printf 'direct_vs_f32_bit_exact=%s\n' "$direct_exact"
-        printf 'hybrid_vs_direct_bit_exact=%s\n' "$arms_equal"
+        printf 'direct_compact_prefill_vs_f32_bit_exact=%s\n' "$compact_exact"
+        printf 'materialized_prefill_vs_f32_bit_exact=%s\n' "$materialized_exact"
+        printf 'direct_compact_vs_materialized_prefill_bit_exact=%s\n' "$arms_equal"
         printf 'acceptance_evidence=no\n'
     } | tee "$OUTPUT_DIR/summary/prefill-isolation.txt"
     phase=finished

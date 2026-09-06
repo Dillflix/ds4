@@ -5644,12 +5644,22 @@ first layer, destination row, and rejection bits; this is a
 correctness-localization run, not promotion evidence.
 
 `DIAGNOSTIC_PREFILL_ISOLATION=1` runs PP512 and PP4096 with three exact arms:
-F32, compact with the selected-row hybrid consumer, and compact with that
-consumer disabled. All compact arms enable the strengthened per-row round-trip
-audit. The result records whether each PP4096 prefill output matches F32 and
-whether the two compact consumers match each other, separating a persistent
-codec failure from a hybrid-consumer failure. Divergence is a diagnostic
-result rather than a runner failure; this is not promotion evidence.
+F32, the ordinary compact prefill consumers, and compact persistent storage
+materialized into the existing bounded F32 stage before the ordinary F32
+prefill consumers. All compact arms enable the strengthened per-row round-trip
+audit. This separates compact storage/packing from compact-prefill consumption;
+the earlier `compact-direct` arm was invalid because its selector disabled only
+the at-most-32-token hybrid indexed kernel and could not affect PP4096 prefill.
+Divergence is a diagnostic result rather than a runner failure; this is not
+promotion evidence.
+
+The `20260905T235143Z` run proved that F32 and compact are bit-identical through
+PP512, while both the PP4096 frontier logits and its first decode logits differ.
+All 82 compact exact-score calls materialized successfully and GPU health was
+unchanged. The runner then rejected the completed compact arm because it
+incorrectly required a hybrid-decode summary from the prefill-isolation route;
+the selector gate and the third arm are corrected by the materialized-F32
+prefill isolation above.
 
 The initial `20260905T231236Z` isolation attempt completed the F32 PP512 and
 PP4096 frontiers, then the runner rejected its valid two-row CSV because the
