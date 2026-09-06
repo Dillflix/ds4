@@ -13,6 +13,7 @@ GPU_VRAM=${GPU_VRAM:-auto}
 STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_TOKENS=${CTX_TOKENS:-32768}
 CTX_ALLOC=${CTX_ALLOC:-$((CTX_TOKENS + 1))}
+PREFILL_CHUNK=${PREFILL_CHUNK:-512}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.90}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
@@ -29,7 +30,8 @@ OUTPUT_DIR=${T32_HEADSHARD_ATTN_AB_DIR:-$repo_dir/sm75-t32-headshard-attention-a
     die "MODEL must name the tagged all43 SM75 native-Q8 GGUF"
 [[ -f $PROMPT ]] || die "prompt not found: $PROMPT"
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
-            "CTX_ALLOC:$CTX_ALLOC" "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
+            "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
+            "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
             "TELEMETRY_INTERVAL_MS:$TELEMETRY_INTERVAL_MS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
             "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY" \
@@ -42,7 +44,9 @@ done
 min_ctx_tokens=2048
 [[ $BOUNDARY_AUDIT_ONLY == 1 ]] && min_ctx_tokens=512
 (( STAGE_SPLIT == 22 && CTX_TOKENS >= min_ctx_tokens &&
-   CTX_TOKENS % 512 == 0 && CTX_ALLOC > CTX_TOKENS &&
+   PREFILL_CHUNK >= 512 && PREFILL_CHUNK <= 2048 &&
+   PREFILL_CHUNK % 512 == 0 && CTX_TOKENS % PREFILL_CHUNK == 0 &&
+   CTX_ALLOC > CTX_TOKENS &&
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
 for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
@@ -52,6 +56,8 @@ for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
 done
 (( CACHE_AUDIT_ONLY + BOUNDARY_AUDIT_ONLY <= 1 )) ||
     die "CACHE_AUDIT_ONLY and BOUNDARY_AUDIT_ONLY are mutually exclusive"
+(( BOUNDARY_AUDIT_ONLY == 0 || PREFILL_CHUNK == 512 )) ||
+    die "BOUNDARY_AUDIT_ONLY currently requires PREFILL_CHUNK=512"
 (( BOUNDARY_AUDIT_LAYER < 43 )) || die "BOUNDARY_AUDIT_LAYER must be below 43"
 [[ $MIN_THROUGHPUT_RATIO =~ ^[0-9]+([.][0-9]+)?$ ]] ||
     die "MIN_THROUGHPUT_RATIO must be numeric"
@@ -120,8 +126,9 @@ phase=manifest
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\n' \
-        "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" "$CTX_TOKENS"
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nprefill_chunk=%s\n' \
+        "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
+        "$CTX_TOKENS" "$PREFILL_CHUNK"
     printf 'cache_audit_only=%s\nmatch_pair1_indexer=%s\n' \
         "$CACHE_AUDIT_ONLY" "$MATCH_PAIR1_INDEXER"
     printf 'boundary_audit_only=%s\nboundary_audit_layer=%s\n' \
@@ -195,7 +202,7 @@ for variant in "${variants[@]}"; do
             --model "$MODEL" --prompt-file "$PROMPT" \
             --ctx-start "$CTX_TOKENS" --ctx-max "$CTX_TOKENS" \
             --ctx-alloc "$CTX_ALLOC" --step-mul 2 \
-            --prefill-chunk 512 --gen-tokens 0 --csv "$base.csv" \
+            --prefill-chunk "$PREFILL_CHUNK" --gen-tokens 0 --csv "$base.csv" \
             --dump-frontier-logits-dir "$logits" \
             >"$base.log" 2>&1
     status=$?
@@ -229,11 +236,13 @@ for variant in "${variants[@]}"; do
             die "$variant unexpectedly dispatched pair-0 indexer splitting at PP2048"
     fi
     if [[ $variant == headshard ]]; then
+        expected_q_input_bytes=$((PREFILL_CHUNK * 1024 * 4))
+        expected_current_kv_bytes=$((PREFILL_CHUNK * 512 * 4))
         grep -Fq 'required-native=171/171' "$base.log" ||
             die "candidate did not materialize 21 pair-1 T32/A binding pairs"
-        grep -Fq 'CUDA prefill T32 head shard enabled: home=1 partner=3 input-copy-bytes=2097152 query-gather-bytes=0 heads=32/32' \
+        grep -Fq "CUDA prefill T32 head shard enabled: home=1 partner=3 input-copy-bytes=$expected_q_input_bytes query-gather-bytes=0 heads=32/32" \
             "$base.log" || die "candidate missed local T32 head-shard dispatch"
-        grep -Fq 'CUDA prefill T32 head shard exact current-KV mirror enabled: home=1 partner=3 bytes=1048576 storage=f32-current-batch' \
+        grep -Fq "CUDA prefill T32 head shard exact current-KV mirror enabled: home=1 partner=3 bytes=$expected_current_kv_bytes storage=f32-current-batch" \
             "$base.log" || die "candidate did not mirror the exact zero-prefix current KV batch"
         grep -Fq 'query=local-T32-head-shards KV=local-mirrors' "$base.log" ||
             die "candidate attention did not consume local query/KV"
@@ -248,8 +257,8 @@ for variant in "${variants[@]}"; do
     else
         grep -Fq 'required-native=129/129' "$base.log" ||
             die "control did not retain 129 required bindings"
-        if (( CTX_TOKENS > 512 )); then
-            # The zero-prefix 512-row microbatch uses the static-mixed path,
+        if (( CTX_TOKENS > PREFILL_CHUNK )); then
+            # The zero-prefix first microbatch uses the static-mixed path,
             # which does not enter the internal pair-1 query-row dispatcher.
             # Only a later nonzero-prefix microbatch can emit the one-time
             # diagnostic checked here.
@@ -458,11 +467,12 @@ done
 
 phase=summary
 python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
-    "$MATCH_PAIR1_INDEXER" <<'PY'
+    "$MATCH_PAIR1_INDEXER" "$PREFILL_CHUNK" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
 matched_indexer = bool(int(sys.argv[3]))
+prefill_chunk = int(sys.argv[4])
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -512,10 +522,11 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"headshard_over_control={ratio:.6f}\n")
     f.write(f"control_model_cache_gib={control_cache:.2f}\n")
     f.write(f"headshard_model_cache_gib={headshard_cache:.2f}\n")
-    f.write("query_input_transfer_bytes_per_pair1_layer_chunk=2097152\n")
-    f.write("current_kv_transfer_bytes_per_pair1_layer_zero_prefix=1048576\n")
+    f.write(f"prefill_chunk={prefill_chunk}\n")
+    f.write(f"query_input_transfer_bytes_per_pair1_layer_chunk={prefill_chunk * 1024 * 4}\n")
+    f.write(f"current_kv_transfer_bytes_per_pair1_layer_zero_prefix={prefill_chunk * 512 * 4}\n")
     f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
-    f.write("partner_low_rank_return_bytes_per_pair1_layer_chunk=8388608\n")
+    f.write(f"partner_low_rank_return_bytes_per_pair1_layer_chunk={prefill_chunk * 4096 * 4}\n")
     f.write("pair1_indexer_policy=" +
             ("matched-home-full" if matched_indexer else
              "control-split-candidate-home-full") + "\n")

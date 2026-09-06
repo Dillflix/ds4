@@ -5889,6 +5889,17 @@ copy separately from the per-chunk 2 MiB normalized-q input and 8 MiB
 low-rank return.  The next promotion gate is the undumped PP32768 production
 A/B, which exercises pair-0 indexer splitting and sustained cache evolution.
 
+That PP2048 result used the harness's original fixed 512-token prefill chunk;
+it is therefore not directly comparable with the historical 612.43 tok/s
+high-water, which used a 2048-token chunk on the mixed15 model at PP32768 with
+both attention and indexer pairs split.  The harness now exposes
+`PREFILL_CHUNK` (512, 1024, or 2048) and records it in both the manifest and
+summary.  Its transfer assertions scale with the selected chunk.  Boundary
+audits remain fixed at 512 because their sampled-position protocol was built
+for that diagnostic shape.  Before the 32K promotion run, use PP4096 with a
+2048-token chunk to verify the production chunk shape across both the
+zero-prefix and subsequent compressed-history microbatches.
+
 ```bash
 CTX_TOKENS=512 MATCH_PAIR1_INDEXER=1 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
