@@ -5636,12 +5636,13 @@ the immediate rollback.
 
 `DIAGNOSTIC_PACK_AUDIT=1` runs a short PP512, one-token F32/compact exact A/B
 and checks every packed compact row's embedded status before it can be
-consumed. The embedded status now includes a bitwise pack/decode round-trip
-check against the already-rounded F32 producer row, in addition to nonfinite
-and encoding checks. Both the prefill and first-decode logits must be
-byte-identical. On failure it reports either the first divergent output or the
-first layer, destination row, and rejection bits; this is a
-correctness-localization run, not promotion evidence.
+consumed. In addition to the packer's internal code/decode check, a separate
+kernel copies the same pre-quantization producer row to shared memory, invokes
+the actual shipping FP8 row quantizer, and bit-compares all 512 values with the
+decoded persistent compact row. Both the prefill and first-decode logits must
+be byte-identical. On failure it reports the first layer, destination/source
+row, column, and both bit patterns; this is a correctness-localization run, not
+promotion evidence.
 
 `DIAGNOSTIC_PREFILL_ISOLATION=1` runs PP512 and PP4096 with three exact arms:
 F32, the ordinary compact prefill consumers, and compact persistent storage
@@ -5655,6 +5656,15 @@ from compact-prefill consumption; the earlier `compact-direct` arm was invalid
 because its selector disabled only the at-most-32-token hybrid indexed kernel
 and could not affect PP4096 prefill. Divergence is a diagnostic result rather
 than a runner failure; this is not promotion evidence.
+
+The `20260906T002649Z` run completed the corrected continuation isolation: 516
+measured materializations covering 1024 staged rows were observed. Direct
+compact and materialized-F32 prefill were byte-identical to each other but not
+to F32 at PP4096, while PP512 still matched. This exonerates every compact
+prefill attention consumer exercised by the run. The strengthened pack audit
+now distinguishes a compact codec discrepancy from an earlier
+producer/placement discrepancy by comparing each commit with the actual
+shipping quantizer.
 
 The `20260906T000607Z` run did not complete that isolation. Its materialized
 marker came from the untimed zero-history warm-up, while the measured PP4096

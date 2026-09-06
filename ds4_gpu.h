@@ -1073,8 +1073,10 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
  * finite, pre-quantization F32 producer row and applies the shipping E4M3
  * quantizer once while emitting its native codes. Decoding therefore matches
  * the shipping rounded-F32 cache row bit-for-bit without a second scale/round
- * pass. Invalid rows remain tagged so cold unpack propagates NaNs and
- * validation fails closed. */
+ * pass. DS4_CUDA_COMPACT_ATTN_PACK_AUDIT additionally runs the actual shipping
+ * row quantizer on a shared-memory copy and compares every committed bit.
+ * Invalid rows remain tagged so cold unpack propagates NaNs and validation
+ * fails closed. */
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
 static inline int ds4_gpu_attn_compact_supported(void) { return 0; }
 static inline int ds4_gpu_attn_compact_pack_tensor(

@@ -626,6 +626,7 @@ if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
     {
         printf 'mode=pp4096-prefill-three-arm\n'
         printf 'pack_roundtrip_audit=passed\n'
+        printf 'pack_vs_shipping_quantizer_audit=passed\n'
         printf 'direct_compact_prefill_vs_f32_bit_exact=%s\n' "$compact_exact"
         printf 'materialized_prefill_vs_f32_bit_exact=%s\n' "$materialized_exact"
         printf 'direct_compact_vs_materialized_prefill_bit_exact=%s\n' "$arms_equal"

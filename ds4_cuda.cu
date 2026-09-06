@@ -13085,6 +13085,18 @@ __global__ static void fp8_kv_quantize_kernel(
             x + (uint64_t)row * head_dim, head_dim, n_rot, scratch);
 }
 
+typedef struct {
+    unsigned long long key;
+    uint32_t expected_bits;
+    uint32_t compact_bits;
+} cuda_sm75_compact_attn_shipping_mismatch;
+
+/* One instance exists in each CUDA device context.  The production packer
+ * never touches it; the synchronous diagnostic audit resets and reads it
+ * around one bounded pack launch. */
+__device__ static cuda_sm75_compact_attn_shipping_mismatch
+    g_sm75_compact_attn_shipping_mismatch;
+
 __device__ __forceinline__ static float sm75_compact_attn_decode_code(
         uint8_t code, uint32_t scale_bits) {
     const uint32_t sign = (uint32_t)(code & 0x80u) << 24;
@@ -13223,6 +13235,52 @@ __global__ static void sm75_compact_attn_unpack_kernel(
     }
     for (uint32_t d = tid; d < 64u; d += blockDim.x) {
         out[448u + d] = rejected ? NAN : in->rope_f32[d];
+    }
+}
+
+/* Differential audit against the actual shipping row quantizer, rather than
+ * against a duplicate expression inside the compact packer.  The complete
+ * source row is copied to shared memory so fp8_kv_quantize_row can run without
+ * changing its const staging input.  A successful comparison proves that the
+ * persistent compact row decodes to exactly the value the ordinary F32 cache
+ * would have committed for this same producer row. */
+__global__ static void sm75_compact_attn_compare_shipping_kernel(
+        cuda_sm75_compact_attn_kv_row *compact,
+        const float *src,
+        uint32_t rows) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= rows) return;
+
+    __shared__ float shipping_row[512];
+    __shared__ float reduction[64];
+    for (uint32_t d = tid; d < 512u; d += blockDim.x) {
+        shipping_row[d] = src[(uint64_t)row * 512u + d];
+    }
+    __syncthreads();
+    fp8_kv_quantize_row(shipping_row, 512u, 64u, reduction);
+
+    cuda_sm75_compact_attn_kv_row *packed = compact + row;
+    for (uint32_t d = tid; d < 512u; d += blockDim.x) {
+        const float decoded = d < 448u
+            ? sm75_compact_attn_decode_code(
+                  packed->code[d],
+                  __float_as_uint(packed->scale[d / 64u]))
+            : packed->rope_f32[d - 448u];
+        const uint32_t expected_bits = __float_as_uint(shipping_row[d]);
+        const uint32_t compact_bits = __float_as_uint(decoded);
+        if (expected_bits != compact_bits) {
+            atomicOr(&packed->status, 8u);
+            const unsigned long long key =
+                ((unsigned long long)row << 32) | d;
+            if (atomicCAS(&g_sm75_compact_attn_shipping_mismatch.key,
+                          ~0ull, key) == ~0ull) {
+                g_sm75_compact_attn_shipping_mismatch.expected_bits =
+                    expected_bits;
+                g_sm75_compact_attn_shipping_mismatch.compact_bits =
+                    compact_bits;
+            }
+        }
     }
 }
 
@@ -24697,6 +24755,29 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
         return 0;
     }
     if (getenv("DS4_CUDA_COMPACT_ATTN_PACK_AUDIT") != NULL) {
+        const cuda_sm75_compact_attn_shipping_mismatch empty = {
+            ~0ull, 0u, 0u
+        };
+        cudaError_t audit_rc = cudaMemcpyToSymbol(
+            g_sm75_compact_attn_shipping_mismatch,
+            &empty, sizeof(empty), 0, cudaMemcpyHostToDevice);
+        if (audit_rc != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: compact attention shipping audit reset failed "
+                    "dst-row=%u rows=%u: %s\n",
+                    dst_row, rows, cudaGetErrorString(audit_rc));
+            return 0;
+        }
+        sm75_compact_attn_compare_shipping_kernel<<<rows, 64>>>(
+            (cuda_sm75_compact_attn_kv_row *)((uint8_t *)dst->ptr +
+                (uint64_t)dst_row *
+                    DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES),
+            (const float *)src_f32->ptr + (uint64_t)src_row * 512u,
+            rows);
+        if (!cuda_ok(cudaGetLastError(),
+                     "SM75 compact attention shipping audit launch")) {
+            return 0;
+        }
         uint32_t *status = (uint32_t *)malloc((size_t)rows * sizeof(*status));
         if (!status) {
             fprintf(stderr,
@@ -24709,7 +24790,7 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
             (uint64_t)dst_row *
                 DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES +
             offsetof(cuda_sm75_compact_attn_kv_row, status);
-        const cudaError_t audit_rc = cudaMemcpy2D(
+        audit_rc = cudaMemcpy2D(
             status, sizeof(*status), status_src,
             DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES,
             sizeof(*status), rows, cudaMemcpyDeviceToHost);
@@ -24723,11 +24804,35 @@ extern "C" int ds4_gpu_attn_compact_pack_tensor(
         }
         for (uint32_t row = 0; row < rows; row++) {
             if (status[row] != 0u) {
+                if ((status[row] & 8u) != 0u) {
+                    cuda_sm75_compact_attn_shipping_mismatch mismatch = {};
+                    audit_rc = cudaMemcpyFromSymbol(
+                        &mismatch,
+                        g_sm75_compact_attn_shipping_mismatch,
+                        sizeof(mismatch), 0, cudaMemcpyDeviceToHost);
+                    if (audit_rc == cudaSuccess && mismatch.key != ~0ull) {
+                        fprintf(stderr,
+                                "ds4: compact attention shipping mismatch "
+                                "dst-row=%u src-row=%u local-row=%u col=%u "
+                                "shipping=0x%08x compact=0x%08x\n",
+                                dst_row + (uint32_t)(mismatch.key >> 32),
+                                src_row + (uint32_t)(mismatch.key >> 32),
+                                (uint32_t)(mismatch.key >> 32),
+                                (uint32_t)mismatch.key,
+                                mismatch.expected_bits,
+                                mismatch.compact_bits);
+                    } else if (audit_rc != cudaSuccess) {
+                        fprintf(stderr,
+                                "ds4: compact attention shipping mismatch "
+                                "detail read failed: %s\n",
+                                cudaGetErrorString(audit_rc));
+                    }
+                }
                 fprintf(stderr,
                         "ds4: compact attention pack audit rejected "
                         "dst-row=%u local-row=%u status=0x%x "
                         "(nonfinite=0x1 encoding-failure=0x2 "
-                        "roundtrip-mismatch=0x4)\n",
+                        "roundtrip-mismatch=0x4 shipping-mismatch=0x8)\n",
                         dst_row + row, row, status[row]);
                 free(status);
                 return 0;
