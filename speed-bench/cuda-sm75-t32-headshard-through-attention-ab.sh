@@ -22,6 +22,7 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CACHE_AUDIT_ONLY=${CACHE_AUDIT_ONLY:-0}
 PAIR1_INDEXER_SPLIT=${PAIR1_INDEXER_SPLIT:-1}
+PAIR0_ATTN_REFERENCE=${PAIR0_ATTN_REFERENCE:-0}
 BOUNDARY_AUDIT_ONLY=${BOUNDARY_AUDIT_ONLY:-0}
 BOUNDARY_AUDIT_LAYER=${BOUNDARY_AUDIT_LAYER:-22}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -37,6 +38,7 @@ for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "SKIP_BUILD:$SKIP_BUILD" "CREATE_ARCHIVE:$CREATE_ARCHIVE" \
             "CACHE_AUDIT_ONLY:$CACHE_AUDIT_ONLY" \
             "PAIR1_INDEXER_SPLIT:$PAIR1_INDEXER_SPLIT" \
+            "PAIR0_ATTN_REFERENCE:$PAIR0_ATTN_REFERENCE" \
             "BOUNDARY_AUDIT_ONLY:$BOUNDARY_AUDIT_ONLY" \
             "BOUNDARY_AUDIT_LAYER:$BOUNDARY_AUDIT_LAYER"; do
     name=${item%%:*}; value=${item#*:}
@@ -51,12 +53,17 @@ min_ctx_tokens=2048
    CASE_TIMEOUT_SECONDS >= 60 && TELEMETRY_INTERVAL_MS >= 50 )) ||
     die "invalid benchmark bounds"
 for flag in SKIP_BUILD CREATE_ARCHIVE CACHE_AUDIT_ONLY \
-            PAIR1_INDEXER_SPLIT BOUNDARY_AUDIT_ONLY; do
+            PAIR1_INDEXER_SPLIT PAIR0_ATTN_REFERENCE \
+            BOUNDARY_AUDIT_ONLY; do
     value=${!flag}; [[ $value == 0 || $value == 1 ]] ||
         die "$flag must be 0 or 1"
 done
 (( CACHE_AUDIT_ONLY + BOUNDARY_AUDIT_ONLY <= 1 )) ||
     die "CACHE_AUDIT_ONLY and BOUNDARY_AUDIT_ONLY are mutually exclusive"
+(( PAIR0_ATTN_REFERENCE == 0 ||
+   (CACHE_AUDIT_ONLY == 0 && BOUNDARY_AUDIT_ONLY == 0 &&
+    CTX_TOKENS == 4096 && PREFILL_CHUNK == 2048) )) ||
+    die "PAIR0_ATTN_REFERENCE=1 is restricted to the undumped PP4096/PREFILL_CHUNK=2048 reference A/B"
 (( BOUNDARY_AUDIT_ONLY == 0 || PREFILL_CHUNK == 512 )) ||
     die "BOUNDARY_AUDIT_ONLY currently requires PREFILL_CHUNK=512"
 (( BOUNDARY_AUDIT_LAYER < 43 )) || die "BOUNDARY_AUDIT_LAYER must be below 43"
@@ -130,8 +137,9 @@ phase=manifest
     printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nprefill_chunk=%s\npipeline_microbatch=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
         "$CTX_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
-    printf 'cache_audit_only=%s\npair1_indexer_split=%s\n' \
-        "$CACHE_AUDIT_ONLY" "$PAIR1_INDEXER_SPLIT"
+    printf 'cache_audit_only=%s\npair1_indexer_split=%s\npair0_attn_reference=%s\n' \
+        "$CACHE_AUDIT_ONLY" "$PAIR1_INDEXER_SPLIT" \
+        "$PAIR0_ATTN_REFERENCE"
     printf 'boundary_audit_only=%s\nboundary_audit_layer=%s\n' \
         "$BOUNDARY_AUDIT_ONLY" "$BOUNDARY_AUDIT_LAYER"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
@@ -156,6 +164,21 @@ for variant in "${variants[@]}"; do
     # PAIR1_INDEXER_SPLIT=0 remains a matched home-full diagnostic control.
     if [[ $PAIR1_INDEXER_SPLIT == 0 ]]; then
         variant_env+=(DS4_CUDA_NO_TP_PREFILL_INDEXER_ROWS_PAIRS=1)
+    fi
+    if [[ $PAIR0_ATTN_REFERENCE == 1 ]]; then
+        if [[ $variant == headshard ]]; then
+            # Deliberately risky reference arm: enable the established
+            # internal query-row path only on pair 0.  Pair 1 remains on the
+            # T32 head-shard path and is excluded from the older row splitter.
+            variant_env+=(
+                DS4_CUDA_TP_PREFILL_ATTN_ROWS=1
+                DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=1
+            )
+        else
+            # Pin the control to the accepted production policy even though
+            # the engine's automatic default currently excludes pair 0.
+            variant_env+=(DS4_CUDA_NO_TP_PREFILL_ATTN_ROWS_PAIRS=0)
+        fi
     fi
     if [[ $variant == headshard ]]; then
         if [[ $CACHE_AUDIT_ONLY == 1 ]]; then
@@ -212,12 +235,24 @@ for variant in "${variants[@]}"; do
         die "$variant missed fixed 22/21 dense placement"
     grep -Fq 'tagged SM75 dense-Q8 GGUF installed through ordinary single-owner residency' \
         "$base.log" || die "$variant did not load the tagged native-Q8 model"
-    grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2' "$base.log" ||
-        die "$variant did not keep attention KV mirrors pair-1-only"
+    expected_attention_mask=0x2
+    if [[ $PAIR0_ATTN_REFERENCE == 1 && $variant == headshard ]]; then
+        expected_attention_mask=0x3
+    fi
+    grep -Fq "CUDA TP cache mirror policy: attention-pair-mask=$expected_attention_mask" \
+        "$base.log" ||
+        die "$variant did not select expected attention cache mask $expected_attention_mask"
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$base.log" ||
         die "$variant missed a required native-GGUF execution binding"
-    ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' "$base.log" ||
-        die "$variant unexpectedly enabled unstable pair 0"
+    if [[ $PAIR0_ATTN_REFERENCE == 1 && $variant == headshard ]]; then
+        grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+            "$base.log" ||
+            die "candidate missed explicitly requested pair-0 attention split"
+    else
+        ! grep -Fq 'prefill attention query-row split enabled: tier 0 ' \
+            "$base.log" ||
+            die "$variant unexpectedly enabled unstable pair 0"
+    fi
     if (( CTX_TOKENS > 2048 )); then
         grep -Fq 'prefill indexer score/top-k row split enabled: tier 0 ' \
             "$base.log" ||
@@ -471,13 +506,15 @@ done
 
 phase=summary
 python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
-    "$PAIR1_INDEXER_SPLIT" "$PREFILL_CHUNK" "$PIPELINE_MB" <<'PY'
+    "$PAIR1_INDEXER_SPLIT" "$PREFILL_CHUNK" "$PIPELINE_MB" \
+    "$PAIR0_ATTN_REFERENCE" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
 pair1_indexer_split = bool(int(sys.argv[3]))
 prefill_chunk = int(sys.argv[4])
 pipeline_microbatch = int(sys.argv[5])
+pair0_attn_reference = bool(int(sys.argv[6]))
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -536,6 +573,9 @@ with (root / "summary.txt").open("w") as f:
     f.write("pair1_indexer_policy=" +
             ("matched-split" if pair1_indexer_split else
              "matched-home-full-diagnostic") + "\n")
+    f.write("pair0_attention_policy=" +
+            ("control-off-candidate-on-reference" if pair0_attn_reference else
+             "off-both-arms-production") + "\n")
     f.write("logits=bit-exact\n")
     for gpu in sorted(set(cm) | set(hm)):
         f.write(f"gpu{gpu}_control_max_vram_mib={cm.get(gpu, 0):.0f}\n")

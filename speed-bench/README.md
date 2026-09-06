@@ -5913,6 +5913,17 @@ head sharding moved about 1.3 GiB from GPU 3 to GPU 2, with respective peaks of
 38,687 and 36,019 MiB.  This qualifies the integrated topology for the next
 undumped PP32768 production A/B.
 
+For reference only, `PAIR0_ATTN_REFERENCE=1` repeats that bounded PP4096 shape
+with the accepted control pinned to pair-0 attention splitting off and only the
+head-shard candidate opting into the older pair-0 attention-row path.  Pair-0
+indexer splitting remains enabled in both arms, and pair 1 retains its matched
+indexer split.  The runner requires the control attention-cache mask to remain
+`0x2`, the candidate mask to become `0x3`, and a candidate-only tier-0
+attention-row dispatch.  This mode is intentionally restricted to
+`CTX_TOKENS=4096`, `PREFILL_CHUNK=2048`, and an undumped production A/B; it is
+diagnostic evidence for the old internal-pair machinery, not a promotion gate
+for the rank-local row-owned design.
+
 ```bash
 CTX_TOKENS=512 PAIR1_INDEXER_SPLIT=0 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
