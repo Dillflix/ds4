@@ -3615,6 +3615,21 @@ static bool cuda_token_rows_native_stream_local_checkpoint(
     return false;
 }
 
+static bool cuda_output_b_local_diagnostic_checkpoint(
+        const char *stage, int physical_device) {
+    const char *enabled = getenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
+    if (g_n_gpus != 1 || !enabled || !enabled[0] ||
+        strcmp(enabled, "0") == 0) return true;
+    const cudaError_t err = cudaDeviceSynchronize();
+    fprintf(stderr,
+            "ds4: local output-B checkpoint stage=%s device=%d status=%s\n",
+            stage ? stage : "?", physical_device, cudaGetErrorString(err));
+    fflush(stderr);
+    if (err == cudaSuccess) return true;
+    (void)cudaGetLastError();
+    return false;
+}
+
 /* Materialize one consumer's weight on its validated partner.  Return 1 on
  * admission, 0 for an ordinary capacity/policy miss, and -1 when CUDA state
  * is no longer safe for a native fallback.  Forced T256 placement calls this
@@ -22499,6 +22514,8 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
             }
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+            if (!cuda_output_b_local_diagnostic_checkpoint(
+                    "activation-f32-to-f16", physical_device)) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cublasGemmAlgo_t gemm_algo = forced_gemm_algo_active
@@ -22543,6 +22560,8 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
                                              CUDA_R_32F,
                                              gemm_algo);
             if (st == CUBLAS_STATUS_SUCCESS) {
+                if (!cuda_output_b_local_diagnostic_checkpoint(
+                        "cublas-gemm", physical_device)) return 0;
                 if (!native_source) {
                     cuda_q8_f16_binding_mark_used(
                         model_map, weight_offset, weight_bytes, in_dim, out_dim,

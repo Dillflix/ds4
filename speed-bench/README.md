@@ -6126,6 +6126,16 @@ activation conversion, GEMM, and RMS/RoPE only in this single-GPU diagnostic.
 There are no peer mappings, peer transfers, attention kernels, or secondary
 CUDA contexts in this scope.
 
+`DIAGNOSTIC_SCOPE=output-b-canonical` is the first downstream GPU1 isolation
+rung.  It does not run q_b, attention, output A, the legacy algorithm sweep,
+or timing loops.  It installs only the canonical output-B FP16 binding, writes
+a deterministic 256-row low-rank input, and performs exactly one algorithm-3
+output-B projection between guarded allocations.  The backend synchronizes
+immediately after activation conversion and GEMM; the runner then verifies
+both canaries, finite/nonzero output, Compute Sanitizer, GPU identity, and
+kernel health.  This deliberately distinguishes an intrinsically unsafe
+row-owned B launch from cumulative corruption in the former full diagnostic.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6173,6 +6183,15 @@ same local GPU1 Q_B arithmetic:
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=q-b-native \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After q_b-native is clean, isolate one canonical output-B launch.  This is a
+GPU-health experiment: do not combine it with an all-pairs production run.
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-b-canonical \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```

@@ -33,6 +33,7 @@
 #define BETA_FAST 32.0f
 #define BETA_SLOW 1.0f
 #define EPSILON 1.0e-6f
+#define OUTPUT_B_PROBE_GUARD_BYTES 4096u
 
 static const int b_algorithms[] = {
     0, 1, 2, 3, 4, 5, 6, 7,
@@ -290,9 +291,113 @@ static int time_output_b(double *median_ms, ds4_gpu_tensor *out,
     return 1;
 }
 
+static int run_output_b_canonical_single_launch(
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t out_b_offset) {
+    const uint64_t low_count = (uint64_t)HALF_TOK * LOW_DIM;
+    const uint64_t low_bytes = low_count * sizeof(float);
+    const uint64_t out_count = (uint64_t)HALF_TOK * OUT_DIM;
+    const uint64_t out_bytes = out_count * sizeof(float);
+    const uint64_t guarded_bytes =
+        OUTPUT_B_PROBE_GUARD_BYTES + out_bytes + OUTPUT_B_PROBE_GUARD_BYTES;
+    float *low_host = NULL;
+    unsigned char *guarded_host = NULL;
+    ds4_gpu_tensor *low = NULL;
+    ds4_gpu_tensor *guarded = NULL;
+    ds4_gpu_tensor *out = NULL;
+    int status = 0;
+
+    low_host = (float *)malloc((size_t)low_bytes);
+    guarded_host = (unsigned char *)malloc((size_t)guarded_bytes);
+    if (!low_host || !guarded_host) {
+        fprintf(stderr, "error: output-B probe host allocation failed\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0u; i < low_count; i++) {
+        const int value =
+            (int)((i * 43u + (i >> 6u) * 17u + 61u) % 509u) - 254;
+        low_host[i] = (float)value / 4096.0f;
+    }
+    memset(guarded_host, 0xa5, (size_t)guarded_bytes);
+
+    low = ds4_gpu_tensor_alloc(low_bytes);
+    guarded = ds4_gpu_tensor_alloc(guarded_bytes);
+    out = guarded ? ds4_gpu_tensor_view(
+        guarded, OUTPUT_B_PROBE_GUARD_BYTES, out_bytes) : NULL;
+    if (!low || !guarded || !out ||
+        !ds4_gpu_tensor_write(low, 0u, low_host, low_bytes) ||
+        !ds4_gpu_tensor_write(guarded, 0u, guarded_host, guarded_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: output-B probe setup failed\n");
+        goto cleanup;
+    }
+
+    printf("diagnostic_scope=output-b-canonical-single-launch\n"
+           "n_tokens=%u\ninput_dim=%llu\noutput_dim=%u\n"
+           "algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n"
+           "projection_launches=1\npeer_access=none\n"
+           "native_stream=off\n",
+           HALF_TOK, (unsigned long long)LOW_DIM, OUT_DIM);
+    fflush(stdout);
+
+    select_b_algorithm(3);
+    if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+            out, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+            low, HALF_TOK) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(guarded, 0u, guarded_host, guarded_bytes)) {
+        fprintf(stderr,
+                "error: canonical output-B single-launch probe failed\n");
+        goto cleanup;
+    }
+
+    uint64_t prefix_mismatches = 0u;
+    uint64_t suffix_mismatches = 0u;
+    for (uint64_t i = 0u; i < OUTPUT_B_PROBE_GUARD_BYTES; i++) {
+        prefix_mismatches += guarded_host[i] != 0xa5u;
+        suffix_mismatches +=
+            guarded_host[OUTPUT_B_PROBE_GUARD_BYTES + out_bytes + i] !=
+            0xa5u;
+    }
+    const float *output = (const float *)(
+        guarded_host + OUTPUT_B_PROBE_GUARD_BYTES);
+    uint64_t finite = 0u;
+    uint64_t nonzero = 0u;
+    for (uint64_t i = 0u; i < out_count; i++) {
+        finite += isfinite(output[i]) != 0;
+        nonzero += output[i] != 0.0f;
+    }
+    printf("canary_prefix_mismatches=%llu\n"
+           "canary_suffix_mismatches=%llu\n"
+           "output_finite=%llu\noutput_nonzero=%llu\n",
+           (unsigned long long)prefix_mismatches,
+           (unsigned long long)suffix_mismatches,
+           (unsigned long long)finite,
+           (unsigned long long)nonzero);
+    if (prefix_mismatches || suffix_mismatches || finite != out_count ||
+        nonzero != out_count) {
+        fprintf(stderr, "error: output-B probe validation failed\n");
+        goto cleanup;
+    }
+    printf("diagnostic_conclusion=canonical-output-b-single-launch-clean\n"
+           "harness_status=ok\n");
+    status = 1;
+
+cleanup:
+    select_b_algorithm(-1);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(guarded);
+    ds4_gpu_tensor_free(low);
+    free(guarded_host);
+    free(low_host);
+    return status;
+}
+
 int main(void) {
     const int native_q_b_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B") != NULL;
+    const int output_b_canonical_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL") != NULL;
     const uint64_t q_b_bytes = Q_DIM * (IN_DIM / 32u) * 34u;
     const uint64_t sinks_offset = q_b_bytes;
     const uint64_t sinks_bytes = N_HEAD * sizeof(float);
@@ -416,6 +521,11 @@ int main(void) {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
     }
+    if (output_b_canonical_diagnostic) {
+        (void)setenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC", "1", 1);
+    } else {
+        (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
+    }
 
     if (!ds4_gpu_init()) {
         fprintf(stderr, "error: CUDA initialization failed\n");
@@ -423,12 +533,13 @@ int main(void) {
     }
     initialized = 1;
     if (!ds4_gpu_set_model_map(model, model_bytes) ||
-        !ds4_gpu_cache_q8_f16_range_on_device(
-            model, model_bytes, 0u, q_b_bytes, IN_DIM, Q_DIM, 0,
-            "attn_q_b") ||
-        !ds4_gpu_cache_q8_f16_range_on_device(
-            model, model_bytes, out_a_offset, out_a_bytes,
-            GROUP_DIM, LOW_DIM, 0, "attn_output_a") ||
+        (!output_b_canonical_diagnostic &&
+         (!ds4_gpu_cache_q8_f16_range_on_device(
+              model, model_bytes, 0u, q_b_bytes, IN_DIM, Q_DIM, 0,
+              "attn_q_b") ||
+          !ds4_gpu_cache_q8_f16_range_on_device(
+              model, model_bytes, out_a_offset, out_a_bytes,
+              GROUP_DIM, LOW_DIM, 0, "attn_output_a"))) ||
         !ds4_gpu_cache_q8_f16_range_on_device(
             model, model_bytes, out_b_offset, out_b_bytes,
             LOW_DIM, OUT_DIM, 0, "attn_output_b")) {
@@ -451,6 +562,15 @@ int main(void) {
                     "error: native q_b source installation failed\n");
             goto cleanup;
         }
+    }
+    if (output_b_canonical_diagnostic) {
+        if (!ds4_gpu_synchronize() ||
+            !run_output_b_canonical_single_launch(
+                model, model_bytes, out_b_offset)) {
+            goto cleanup;
+        }
+        status = 0;
+        goto cleanup;
     }
 
     input = ds4_gpu_tensor_alloc(input_bytes);
@@ -992,6 +1112,7 @@ cleanup:
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
     (void)unsetenv("DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     ds4_gpu_tensor_free(low_ref1);
     ds4_gpu_tensor_free(low_ref0);
