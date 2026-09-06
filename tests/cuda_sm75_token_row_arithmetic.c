@@ -196,6 +196,8 @@ int main(void) {
 
     unsigned char *model = NULL;
     float *input_host = NULL, *reference = NULL, *candidate = NULL;
+    float *actual_low_host = NULL;
+    float *combined_full_host = NULL, *combined_split_host = NULL;
     float *raw_host = NULL, *comp_host = NULL;
     uint16_t *reference_half = NULL, *candidate_half = NULL;
     ds4_gpu_tensor *input = NULL, *q_full = NULL, *q_split = NULL;
@@ -227,6 +229,11 @@ int main(void) {
         fprintf(stderr, "error: host allocation failed\n");
         goto cleanup;
     }
+    /* q_count is four times low_count, leaving room in the comparison slabs
+     * for one real A output and one combined-output snapshot per arm. */
+    actual_low_host = reference + low_count;
+    combined_full_host = reference + 2u * low_count;
+    combined_split_host = candidate + 2u * low_count;
 
     build_q8_rows(model, Q_DIM, IN_DIM, 17u);
     for (uint32_t h = 0u; h < N_HEAD; h++) {
@@ -394,7 +401,10 @@ int main(void) {
         printf("boundary=static-mixed-attention-full-range512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
         printf("boundary=inverse-rope-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
         printf("boundary=output-a-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
-        printf("boundary=output-b-isolated-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
+        printf("boundary=output-a-plus-b-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
+        printf("boundary=output-b-from-identical-actual-a-low-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
+        printf("boundary=output-a-to-b-chain-reference,status=skipped-in-sanitizer-smoke\n");
+        printf("boundary=output-b-structured-control-full512-vs-row256x2,status=skipped-in-sanitizer-smoke\n");
         printf("diagnostic_conclusion=%s\n",
                qh_diff.mismatches ? "first-divergence-q-b-f16-projection" :
                q_diff.mismatches ? "first-divergence-q-b-postprocess" :
@@ -493,6 +503,7 @@ int main(void) {
         reference, candidate, low_count);
     report_diff("output-a-full512-vs-row256x2", "f32", low_count,
                 out_a_diff);
+    memcpy(actual_low_host, reference, (size_t)low_bytes);
 
     if (!ds4_gpu_tensor_read(out_full, 0u, reference, out_bytes) ||
         !ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
@@ -503,14 +514,52 @@ int main(void) {
         reference, candidate, out_count);
     report_diff("output-a-plus-b-full512-vs-row256x2", "f32", out_count,
                 out_b_diff);
+    memcpy(combined_full_host, reference, (size_t)out_bytes);
+    memcpy(combined_split_host, candidate, (size_t)out_bytes);
 
-    /* B-only isolation: deterministic identical low rows remove output A
-     * entirely, so any difference here is solely the B GEMM's N dimension. */
+    /* Re-run B only after the exact A result has been synchronized and copied
+     * identically into both low tensors.  This distinguishes row-count-sensitive
+     * B arithmetic from an A-producer/B-consumer ordering defect in the wrapper.
+     * The two additional comparisons identify which composed arm, if either,
+     * differs from its synchronized B reference. */
+    if (!ds4_gpu_tensor_write(low_full, 0u, actual_low_host, low_bytes) ||
+        !ds4_gpu_tensor_write(low_split, 0u, actual_low_host, low_bytes) ||
+        !ds4_gpu_attention_output_q8_batch_b_tensor(
+            out_full, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+            low_full, N_TOK) ||
+        !ds4_gpu_attention_output_q8_batch_b_tensor(
+            out0, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+            low_ref0, HALF_TOK) ||
+        !ds4_gpu_attention_output_q8_batch_b_tensor(
+            out1, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+            low_ref1, HALF_TOK) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(out_full, 0u, reference, out_bytes) ||
+        !ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
+        fprintf(stderr, "error: actual-A-low output-B boundary runtime failed\n");
+        goto cleanup;
+    }
+    const diff_metrics out_b_actual_diff = compare_f32(
+        reference, candidate, out_count);
+    const diff_metrics out_b_full_chain_diff = compare_f32(
+        combined_full_host, reference, out_count);
+    const diff_metrics out_b_split_chain_diff = compare_f32(
+        combined_split_host, candidate, out_count);
+    report_diff("output-b-from-identical-actual-a-low-full512-vs-row256x2",
+                "f32", out_count, out_b_actual_diff);
+    report_diff("output-a-plus-b-full512-vs-synchronized-b-full512", "f32",
+                out_count, out_b_full_chain_diff);
+    report_diff("output-a-plus-b-row256x2-vs-synchronized-b-row256x2", "f32",
+                out_count, out_b_split_chain_diff);
+
+    /* Keep the original structured B-only fixture as a control.  Its exactness
+     * is not sufficient to clear B for arbitrary A-produced inputs. */
     for (uint64_t i = 0u; i < low_count; i++) {
         const int value = (int)((i * 43u + (i >> 6u) * 17u + 61u) % 509u) - 254;
-        reference[i] = (float)value / 4096.0f;
+        actual_low_host[i] = (float)value / 4096.0f;
     }
-    if (!ds4_gpu_tensor_write(low_full, 0u, reference, low_bytes) ||
+    if (!ds4_gpu_tensor_write(low_full, 0u, actual_low_host, low_bytes) ||
+        !ds4_gpu_tensor_write(low_split, 0u, actual_low_host, low_bytes) ||
         !ds4_gpu_attention_output_q8_batch_b_tensor(
             out_full, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
             low_full, N_TOK) ||
@@ -528,8 +577,8 @@ int main(void) {
     }
     const diff_metrics out_b_isolated_diff = compare_f32(
         reference, candidate, out_count);
-    report_diff("output-b-isolated-full512-vs-row256x2", "f32", out_count,
-                out_b_isolated_diff);
+    report_diff("output-b-structured-control-full512-vs-row256x2", "f32",
+                out_count, out_b_isolated_diff);
 
     printf("diagnostic_conclusion=%s\n",
            qh_diff.mismatches ? "first-divergence-q-b-f16-projection" :
@@ -542,8 +591,13 @@ int main(void) {
                "first-divergence-static-attention-row-extent" :
            rope_diff.mismatches ? "first-divergence-inverse-rope" :
            out_a_diff.mismatches ? "first-divergence-output-a" :
-           out_b_isolated_diff.mismatches ? "first-divergence-output-b" :
+           out_b_full_chain_diff.mismatches || out_b_split_chain_diff.mismatches ?
+               "first-divergence-output-a-to-b-dependency" :
+           out_b_actual_diff.mismatches ?
+               "first-divergence-output-b-row-extent" :
            out_b_diff.mismatches ? "combined-output-diverged-only" :
+           out_b_isolated_diff.mismatches ?
+               "structured-output-b-control-diverged" :
            "all-tested-row-arithmetic-boundaries-bit-exact");
     printf("harness_status=ok\n");
     status = 0;

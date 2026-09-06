@@ -6039,6 +6039,16 @@ rejected because the PP2048 frontier logits were not byte-identical.  The
 candidate's 14.52 GiB execution-binding plan versus 10.58 GiB for control is
 also prototype overhead, not an accepted production residency design.
 
+The first arithmetic run cleared q_b, static-mixed attention, inverse RoPE,
+output A, and a structured B-only fixture bit-for-bit.  Only the combined A+B
+result differed: 2,092,992 of 2,097,152 values, with a maximum absolute error
+of 0.00144195557.  That localizes the production failure to the A-to-B
+composition, but the structured B input was too regular to distinguish a
+producer/consumer ordering defect from row-count-sensitive B arithmetic.  The
+diagnostic therefore also snapshots the real, exact A result; synchronizes and
+feeds that result identically to full-512 and ordered-256x2 B calls; and compares
+each original composed arm against its synchronized B reference.
+
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
