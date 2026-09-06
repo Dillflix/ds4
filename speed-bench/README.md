@@ -5792,6 +5792,32 @@ during graph setup. The harness gives Nsight Systems a private temporary
 directory inside the result tree, so it does not require writable system
 `/tmp/nvidia` state.
 
+The `20260906T064714Z` full A/B proves that restored compact state remains
+exact through the PP4096 frontier and its first three generated tokens.  The
+first difference is decode token four, exactly when `(position + 1) / 4`
+increases the compressed-row count from 1024 to 1025 and dispatch switches to
+sparse indexed attention.  At PP32768, where that threshold is already
+crossed, the first decode token differs.  Live compact packing was independently
+checked against the shipping quantizer in both exact arms, so this boundary
+assigns the remaining correctness defect to the single-token compact indexed
+consumer, not packing, snapshot restore, raw-ring state, or prefill.
+
+Single-token compact indexed attention now materializes only its at-most-512
+selected rows into the first half of the already-reserved 2 MiB exact-decode
+stage.  It maps the selected indices to the same stable slots and invokes the
+shipping indexed kernel, preserving its score, reduction, and value
+accumulation order.  The remapped 2 KiB index list occupies otherwise-unused
+space in the second half of that stage.  Consequently the correction adds no
+persistent allocation and its transient work is independent of context length.
+Batch/prefill compact attention remains on the existing hybrid consumer.
+
+`DIAGNOSTIC_INDEXED_DECODE=1` runs only the F32 and compact arms through PP512
+and PP4096 with four generated tokens per frontier.  It byte-compares all ten
+frontier/decode payloads and requires a nonzero exact selected-row dispatch
+summary.  This directly covers the historical PP4096 token-four transition
+without paying for a PP32768 production run; it is correctness-localization,
+not promotion evidence.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \

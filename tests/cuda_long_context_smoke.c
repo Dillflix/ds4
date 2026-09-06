@@ -3195,6 +3195,114 @@ static int check_compact_decode_nonzero_exact(void) {
     return rc;
 }
 
+static int check_compact_indexed_single_token_exact(void) {
+    const uint32_t n_tokens = 1u, pos0 = 4099u;
+    const uint32_t n_head = 8u, head_dim = 512u, n_rot = 64u;
+    const uint32_t n_raw = 128u, raw_cap = 160u, raw_start = 17u;
+    const uint32_t n_comp = 1025u, top_k = 512u;
+    const uint32_t window = 128u, ratio = 4u;
+    const uint64_t head_count = (uint64_t)n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t compact_bytes =
+        (uint64_t)n_comp * DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT_ROW_BYTES;
+    float *sinks = (float *)malloc((size_t)n_head * sizeof(float));
+    float *q_host = (float *)malloc((size_t)head_count * sizeof(float));
+    float *raw_host = (float *)malloc((size_t)raw_count * sizeof(float));
+    float *comp_host = (float *)malloc((size_t)comp_count * sizeof(float));
+    int32_t *topk_host = (int32_t *)malloc((size_t)top_k * sizeof(int32_t));
+    float *control_host = (float *)malloc((size_t)head_count * sizeof(float));
+    float *compact_host = (float *)malloc((size_t)head_count * sizeof(float));
+    if (!sinks || !q_host || !raw_host || !comp_host || !topk_host ||
+        !control_host || !compact_host) {
+        free(compact_host); free(control_host); free(topk_host); free(comp_host);
+        free(raw_host); free(q_host); free(sinks);
+        return 1;
+    }
+    for (uint32_t h = 0; h < n_head; h++)
+        sinks[h] = (float)((int)(h % 7u) - 3) * 0.015625f;
+    for (uint64_t i = 0; i < head_count; i++)
+        q_host[i] = (float)((int)(i * 17u % 61u) - 30) * 0.001953125f;
+    for (uint64_t i = 0; i < raw_count; i++)
+        raw_host[i] = (float)((int)(i * 23u % 67u) - 33) * 0.00390625f;
+    for (uint64_t i = 0; i < comp_count; i++)
+        comp_host[i] = (float)((int)(i * 29u % 71u) - 35) * 0.0029296875f;
+    for (uint32_t k = 0; k < top_k; k++) {
+        topk_host[k] = k % 29u == 0u
+            ? -1 : (int32_t)((k * 47u + 13u) % n_comp);
+    }
+
+    ds4_gpu_tensor *control = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(head_count * sizeof(float));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_count * sizeof(float));
+    ds4_gpu_tensor *comp_source = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *comp_f32 = ds4_gpu_tensor_alloc(comp_count * sizeof(float));
+    ds4_gpu_tensor *comp_compact = ds4_gpu_tensor_alloc(compact_bytes);
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(top_k * sizeof(int32_t));
+    int rc = 1;
+    if (control && candidate && q && raw && comp_source && comp_f32 &&
+        comp_compact && topk &&
+        ds4_gpu_tensor_write(q, 0, q_host, head_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(raw, 0, raw_host, raw_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp_source, 0, comp_host,
+                             comp_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(comp_f32, 0, comp_host,
+                             comp_count * sizeof(float)) &&
+        ds4_gpu_tensor_write(topk, 0, topk_host,
+                             top_k * sizeof(int32_t)) &&
+        ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+            comp_f32, n_comp, head_dim, n_rot) &&
+        ds4_gpu_attn_compact_pack_tensor(
+            comp_compact, 0, comp_source, 0, n_comp) &&
+        ds4_gpu_set_model_map(sinks, n_head * sizeof(float)) &&
+        ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            control, sinks, n_head * sizeof(float), 0u, q, raw, comp_f32,
+            DS4_GPU_ATTN_COMP_CACHE_F32, topk, n_tokens, pos0, n_raw,
+            raw_cap, raw_start, n_comp, top_k, window, ratio,
+            n_head, head_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(control, 0, control_host,
+                            head_count * sizeof(float)) &&
+        ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            candidate, sinks, n_head * sizeof(float), 0u, q, raw,
+            comp_compact, DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT, topk,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head, head_dim) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(candidate, 0, compact_host,
+                            head_count * sizeof(float))) {
+        if (memcmp(control_host, compact_host,
+                   (size_t)head_count * sizeof(float)) == 0) {
+            fprintf(stderr,
+                    "cuda-regression: compact indexed single-token selected "
+                    "rows preserve shipping attention order exactly\n");
+            rc = 0;
+        } else {
+            uint64_t first = 0u;
+            while (first < head_count &&
+                   memcmp(control_host + first, compact_host + first,
+                          sizeof(float)) == 0) first++;
+            fprintf(stderr,
+                    "compact indexed single-token output differs from "
+                    "shipping F32 at %llu\n", (unsigned long long)first);
+        }
+    }
+
+    if (sinks && !retire_temporary_model_map()) rc = 1;
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp_compact);
+    ds4_gpu_tensor_free(comp_f32);
+    ds4_gpu_tensor_free(comp_source);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(control);
+    free(compact_host); free(control_host); free(topk_host); free(comp_host);
+    free(raw_host); free(q_host); free(sinks);
+    return rc;
+}
+
 static int check_compact_snapshot_reencode_exact(void) {
     const uint32_t rows = 2u;
     const uint64_t count = (uint64_t)rows * 512u;
@@ -3589,6 +3697,7 @@ int main(void) {
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     if (check_compact_decode_zero_compressed_rows() != 0) rc = 1;
     if (check_compact_decode_nonzero_exact() != 0) rc = 1;
+    if (check_compact_indexed_single_token_exact() != 0) rc = 1;
     if (check_compact_snapshot_reencode_exact() != 0) rc = 1;
     if (check_prefill_attention_head_shards() != 0) rc = 1;
     if (check_sm75_indexed_attention_heads8_exact() != 0) rc = 1;

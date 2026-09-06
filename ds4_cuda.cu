@@ -707,6 +707,7 @@ static float *g_sm75_compact_exact_stage[DS4_MAX_GPUS] = {NULL};
 static std::atomic<uint64_t> g_sm75_hybrid_attn_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_exact_score_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_exact_materialized_calls = 0;
+static std::atomic<uint64_t> g_sm75_compact_indexed_exact_calls = 0;
 static std::atomic<uint64_t> g_sm75_compact_prefill_materialized_calls = 0;
 static std::atomic<bool> g_sm75_compact_prefill_materialized_logged = false;
 static std::atomic<uint64_t> g_sm75_compact_attn_trace_calls = 0;
@@ -5953,6 +5954,16 @@ extern "C" void ds4_gpu_cleanup(void) {
                 CUDA_SM75_COMPACT_EXACT_STAGE_ROWS * 512u *
                     (uint32_t)sizeof(float));
     }
+    const uint64_t compact_indexed_exact_calls =
+        g_sm75_compact_indexed_exact_calls.load(
+            std::memory_order_relaxed);
+    if (compact_indexed_exact_calls != 0u) {
+        fprintf(stderr,
+                "ds4: SM75 compact indexed exact summary: calls=%llu "
+                "selected-rows=512 selected-bytes=1048576 "
+                "persistent-extra-bytes=0\n",
+                (unsigned long long)compact_indexed_exact_calls);
+    }
     const uint64_t compact_prefill_materialized_calls =
         g_sm75_compact_prefill_materialized_calls.load(
             std::memory_order_relaxed);
@@ -6178,6 +6189,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_sm75_hybrid_attn_calls.store(0u, std::memory_order_relaxed);
     g_sm75_compact_exact_score_calls.store(0u, std::memory_order_relaxed);
     g_sm75_compact_exact_materialized_calls.store(
+        0u, std::memory_order_relaxed);
+    g_sm75_compact_indexed_exact_calls.store(
         0u, std::memory_order_relaxed);
     g_sm75_compact_prefill_materialized_calls.store(
         0u, std::memory_order_relaxed);
@@ -13518,6 +13531,43 @@ __global__ static void sm75_compact_attn_materialize_hybrid_chunk_kernel(
                      (uint64_t)token * CUDA_SM75_HYBRID_ATTN_CHUNK_ROWS +
                      local_row,
                  row_status);
+    }
+}
+
+/* Single-token indexed attention must retain the shipping kernel's score,
+ * reduction, and value-accumulation order. Materialize only its selected
+ * compact rows into the first half of the already-reserved 1024-row exact
+ * stage. The remapped index list lives in the unused second half, so this path
+ * adds no persistent allocation and remains independent of context length.
+ * Invalid selections stay in their original slots as -1, preserving the
+ * stable filtering order used by attention_indexed_mixed_kernel. */
+__global__ static void sm75_compact_attn_materialize_selected_f32_kernel(
+        const cuda_sm75_compact_attn_kv_row *compact_rows,
+        const int32_t *topk,
+        float *selected_rows,
+        int32_t *selected_topk,
+        uint32_t pos0,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t ratio) {
+    const uint32_t selected = blockIdx.x;
+    if (selected >= top_k) return;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (pos0 + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    const int32_t source = topk[selected];
+    const bool valid = source >= 0 && (uint32_t)source < visible_comp;
+    if (threadIdx.x == 0u) {
+        selected_topk[selected] = valid ? (int32_t)selected : -1;
+    }
+    if (!valid) return;
+
+    for (uint32_t c4 = threadIdx.x; c4 < 128u; c4 += blockDim.x) {
+        ((float4 *)selected_rows)[(uint64_t)selected * 128u + c4] =
+            attention_comp_load_float4<true>(
+                compact_rows, (uint32_t)source, c4);
     }
 }
 
@@ -25837,6 +25887,64 @@ static int cuda_sm75_hybrid_attn_reserve(
     return 1;
 }
 
+/* Returns 1 when the exact selected-row path was launched, 0 when its strict
+ * preconditions are not satisfied, and -1 after a submission error. */
+static int cuda_sm75_compact_indexed_exact_launch(
+        int logical_tier,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const void *comp_kv,
+        const int32_t *topk,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    if (!cuda_sm75_mma_ok() || !heads || !sinks || !q || !raw_kv ||
+        !comp_kv || !topk || n_raw == 0u || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_comp == 0u || top_k == 0u ||
+        top_k > 512u || ratio == 0u || n_head == 0u || head_dim != 512u ||
+        logical_tier < 0 || logical_tier >= g_n_gpus) {
+        return 0;
+    }
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess ||
+        current_device != g_gpu[logical_tier].device_id) {
+        return 0;
+    }
+    if (!ds4_gpu_attn_compact_exact_stage_reserve(logical_tier)) return 0;
+    float *selected_rows = g_sm75_compact_exact_stage[logical_tier];
+    int32_t *selected_topk = (int32_t *)(selected_rows +
+        (uint64_t)512u * 512u);
+    sm75_compact_attn_materialize_selected_f32_kernel<<<top_k, 128>>>(
+        (const cuda_sm75_compact_attn_kv_row *)comp_kv, topk,
+        selected_rows, selected_topk, pos0, n_comp, top_k, ratio);
+    if (!cuda_ok(cudaPeekAtLastError(),
+                 "compact indexed selected-row materialization launch")) {
+        return -1;
+    }
+
+    const dim3 grid(1u, n_head, 1u);
+    attention_indexed_mixed_kernel<<<grid, 256>>>(
+        heads, sinks, q, raw_kv, selected_rows, selected_topk,
+        1u, pos0, n_raw, raw_cap, raw_start,
+        top_k, top_k, window, 0u, n_head, head_dim);
+    if (!cuda_ok(cudaPeekAtLastError(),
+                 "compact indexed shipping-order consumer launch")) {
+        return -1;
+    }
+    g_sm75_compact_indexed_exact_calls.fetch_add(
+        1u, std::memory_order_relaxed);
+    return 1;
+}
+
 /* Returns 1 when launched, 0 when the caller should use the direct compact
  * kernel, and -1 after any submission error (unsafe to submit a fallback into
  * the partially constructed dependency chain). */
@@ -26912,6 +27020,18 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
+    }
+    if (compact_consumer && n_tokens == 1u) {
+        const int exact_rc = cuda_sm75_compact_indexed_exact_launch(
+            logical_tier, (float *)heads->ptr, sinks,
+            (const float *)q->ptr, (const float *)raw_kv->ptr,
+            comp_ptr, topk_ptr, pos0, n_raw, raw_cap, raw_start,
+            n_comp, top_k, window, ratio, n_head, head_dim);
+        if (exact_rc > 0) return 1;
+        /* Direct compact consumers change the shipping reduction order. A
+         * single-token compact request therefore fails closed if the exact
+         * selected-row bridge cannot be submitted. */
+        return 0;
     }
     if (compact_consumer) {
         const int hybrid_rc = cuda_sm75_hybrid_indexed_attention_launch(

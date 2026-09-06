@@ -39,6 +39,8 @@ Optional environment:
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
                                     PP512 decode token for F32 and compact
+  DIAGNOSTIC_INDEXED_DECODE=0       1: PP512/PP4096 four-token exact A/B at
+                                    the sparse-indexed decode boundary
   SKIP_BUILD=0
   CREATE_ARCHIVE=1
   COMPACT_KV_PRODUCTION_AB_DIR=...
@@ -73,6 +75,7 @@ DIAGNOSTIC_COMMIT_AUDIT=${DIAGNOSTIC_COMMIT_AUDIT:-0}
 DIAGNOSTIC_STAGE_AUDIT=${DIAGNOSTIC_STAGE_AUDIT:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 DIAGNOSTIC_DECODE_PROFILE=${DIAGNOSTIC_DECODE_PROFILE:-0}
+DIAGNOSTIC_INDEXED_DECODE=${DIAGNOSTIC_INDEXED_DECODE:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 PREFILL_CHUNK=2048
@@ -120,6 +123,7 @@ for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
             DIAGNOSTIC_STAGE_AUDIT \
             DIAGNOSTIC_DECODE_ISOLATION \
             DIAGNOSTIC_DECODE_PROFILE \
+            DIAGNOSTIC_INDEXED_DECODE \
             SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -128,7 +132,8 @@ done
    DIAGNOSTIC_COMMIT_AUDIT +
    DIAGNOSTIC_STAGE_AUDIT +
    DIAGNOSTIC_DECODE_ISOLATION +
-   DIAGNOSTIC_DECODE_PROFILE <= 1 )) ||
+   DIAGNOSTIC_DECODE_PROFILE +
+   DIAGNOSTIC_INDEXED_DECODE <= 1 )) ||
     die "select at most one diagnostic mode"
 [[ -z ${CUDA_VISIBLE_DEVICES:-} ]] ||
     die "CUDA_VISIBLE_DEVICES must be unset so physical GPU IDs remain stable"
@@ -224,9 +229,11 @@ production_env=(
 phase=build
 if [[ $SKIP_BUILD == 0 ]]; then
     make -j"$(nproc)" ds4-bench tests/test_engine_mgpu_placement \
+        tests/cuda_long_context_smoke \
         CUDA_ARCH=sm_75 2>&1 | tee "$OUTPUT_DIR/build.log"
 else
-    make -q ds4-bench tests/test_engine_mgpu_placement CUDA_ARCH=sm_75 ||
+    make -q ds4-bench tests/test_engine_mgpu_placement \
+        tests/cuda_long_context_smoke CUDA_ARCH=sm_75 ||
         die "SKIP_BUILD=1 found stale production binaries"
 fi
 "${clean[@]}" DS4_CUDA_ATTN_COMP_CACHE=sm75-compact \
@@ -234,6 +241,11 @@ fi
     >"$OUTPUT_DIR/placement-test.log" 2>&1 || {
         tail -n 200 "$OUTPUT_DIR/placement-test.log" >&2 || true
         die "compact-cache placement/accounting regression failed"
+    }
+"${clean[@]}" ./tests/cuda_long_context_smoke \
+    >"$OUTPUT_DIR/cuda-long-context-smoke.log" 2>&1 || {
+        tail -n 240 "$OUTPUT_DIR/cuda-long-context-smoke.log" >&2 || true
+        die "compact-cache CUDA long-context regression failed"
     }
 
 phase=manifest
@@ -848,6 +860,55 @@ if [[ $DIAGNOSTIC_DECODE_PROFILE == 1 ]]; then
     done
     phase=finished
     printf 'Compact-KV PP512 decode profiles complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $DIAGNOSTIC_INDEXED_DECODE == 1 ]]; then
+    phase=indexed-decode
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    for arm in f32 compact; do
+        base="$OUTPUT_DIR/exact/$arm-indexed-decode"
+        logits="$base-logits"
+        mkdir -p "$logits"
+        printf 'Compact-KV PP4096 sparse-indexed decode exactness arm=%s...\n' \
+            "$arm"
+        run_case "$arm" exact 4 "$base" "$logits" 4096 || {
+            tail -n 240 "$base.log" >&2 || true
+            die "$arm PP4096 sparse-indexed decode run failed"
+        }
+    done
+    expected="$OUTPUT_DIR/exact/indexed-decode-expected-files.txt"
+    find "$OUTPUT_DIR/exact/f32-indexed-decode-logits" -maxdepth 1 \
+        -type f -name '*.f32' -printf '%f\n' | sort >"$expected"
+    find "$OUTPUT_DIR/exact/compact-indexed-decode-logits" -maxdepth 1 \
+        -type f -name '*.f32' -printf '%f\n' | sort \
+        >"$OUTPUT_DIR/exact/indexed-decode-compact-files.txt"
+    [[ $(wc -l <"$expected") == 10 ]] ||
+        die "F32 indexed-decode diagnostic inventory is incomplete"
+    cmp -s "$expected" \
+        "$OUTPUT_DIR/exact/indexed-decode-compact-files.txt" ||
+        die "F32 and compact indexed-decode inventories differ"
+    while IFS= read -r file; do
+        cmp -s "$OUTPUT_DIR/exact/f32-indexed-decode-logits/$file" \
+               "$OUTPUT_DIR/exact/compact-indexed-decode-logits/$file" ||
+            die "compact indexed-decode path diverged at $file"
+    done <"$expected"
+    grep -Eq \
+        'SM75 compact indexed exact summary: calls=[1-9][0-9]* ' \
+        "$OUTPUT_DIR/exact/compact-indexed-decode.log" ||
+        die "compact diagnostic missed the exact selected-row indexed path"
+    {
+        printf 'mode=pp4096-sparse-indexed-decode-boundary\n'
+        printf 'frontiers=512,4096\n'
+        printf 'decode_tokens_per_frontier=4\n'
+        printf 'bit_exact=true\n'
+        printf 'persistent_extra_bytes=0\n'
+        printf 'acceptance_evidence=no\n'
+    } | tee "$OUTPUT_DIR/summary/indexed-decode.txt"
+    phase=finished
+    printf 'Compact-KV sparse-indexed decode exactness passed: %s\n' \
+        "$OUTPUT_DIR"
     exit 0
 fi
 
