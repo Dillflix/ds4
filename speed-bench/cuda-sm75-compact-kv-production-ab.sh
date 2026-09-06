@@ -33,6 +33,8 @@ Optional environment:
                                     three-arm comparison
   DIAGNOSTIC_COMMIT_AUDIT=0         1: PP4096 F32/compact committed owner-row
                                     and partner-mirror binary comparison
+  DIAGNOSTIC_STAGE_AUDIT=0          1: PP4096 F32/compact layer-6 pos-512
+                                    attention-stage binary comparison
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
@@ -68,6 +70,7 @@ MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-1.0}
 DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
 DIAGNOSTIC_PREFILL_ISOLATION=${DIAGNOSTIC_PREFILL_ISOLATION:-0}
 DIAGNOSTIC_COMMIT_AUDIT=${DIAGNOSTIC_COMMIT_AUDIT:-0}
+DIAGNOSTIC_STAGE_AUDIT=${DIAGNOSTIC_STAGE_AUDIT:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 DIAGNOSTIC_DECODE_PROFILE=${DIAGNOSTIC_DECODE_PROFILE:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -114,6 +117,7 @@ awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
 for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
             DIAGNOSTIC_COMMIT_AUDIT \
+            DIAGNOSTIC_STAGE_AUDIT \
             DIAGNOSTIC_DECODE_ISOLATION \
             DIAGNOSTIC_DECODE_PROFILE \
             SKIP_BUILD CREATE_ARCHIVE; do
@@ -122,6 +126,7 @@ for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
 done
 (( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_PREFILL_ISOLATION +
    DIAGNOSTIC_COMMIT_AUDIT +
+   DIAGNOSTIC_STAGE_AUDIT +
    DIAGNOSTIC_DECODE_ISOLATION +
    DIAGNOSTIC_DECODE_PROFILE <= 1 )) ||
     die "select at most one diagnostic mode"
@@ -345,7 +350,7 @@ validate_materialized_prefill_summary() {
 }
 
 validate_selector() {
-    local arm=$1 log=$2
+    local arm=$1 log=$2 kind=${3:-production}
     if [[ $arm == f32 ]]; then
         grep -Fq 'compressed-attention cache format=f32 row-bytes=2048' "$log" &&
             ! grep -Fq 'compact attention hybrid summary:' "$log"
@@ -354,7 +359,8 @@ validate_selector() {
             grep -Fq 'SM75 compact prefill diagnostic selected: materialized-F32 ordinary consumer' "$log" &&
             validate_materialized_prefill_summary "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log"
-    elif [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
+    elif [[ $kind == commit-audit || $kind == stage-audit ||
+            $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
             grep -Eq 'SM75 compact exact score split summary: calls=[1-9][0-9]* materialized=[1-9][0-9]*' "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log"
@@ -410,6 +416,15 @@ run_case() {
             DS4_METAL_GRAPH_DUMP_NAME=attn_comp_commit_owner,attn_comp_commit_mirror
         )
     fi
+    if [[ $kind == stage-audit ]]; then
+        mkdir -p "$OUTPUT_DIR/checkpoints/$arm"
+        audit_env+=(
+            "DS4_METAL_GRAPH_DUMP_PREFIX=$OUTPUT_DIR/checkpoints/$arm/checkpoint"
+            DS4_METAL_GRAPH_DUMP_NAME=ckv_stage_input,ckv_stage_query,ckv_stage_raw,ckv_stage_projected,ckv_stage_recurrent
+            DS4_METAL_GRAPH_DUMP_LAYER=6
+            DS4_METAL_GRAPH_DUMP_POS=512
+        )
+    fi
     if [[ $arm == compact-materialized ]]; then
         audit_env+=(DS4_CUDA_COMPACT_ATTN_PREFILL_MATERIALIZE=1)
     fi
@@ -454,7 +469,7 @@ run_case() {
         validate_health "$base" &&
             validate_csv "$base.csv" "$tokens" "$ctx_max" &&
             validate_topology "$base.log" &&
-            validate_selector "$arm" "$base.log"
+            validate_selector "$arm" "$base.log" "$kind"
     fi
 }
 
@@ -700,15 +715,76 @@ if [[ $DIAGNOSTIC_COMMIT_AUDIT == 1 ]]; then
         printf '%s_first_difference=%s\n' "$class" "$first"
     }
 
+    compare_owner_mirror_arm() {
+        local arm=$1 dir="$OUTPUT_DIR/checkpoints/$arm"
+        local pairs=0 exact=true first=none owner mirror
+        while IFS= read -r owner; do
+            mirror=${owner/_owner-/_mirror-}
+            [[ -f $dir/$mirror ]] || continue
+            pairs=$((pairs + 1))
+            if ! cmp -s "$dir/$owner" "$dir/$mirror"; then
+                exact=false
+                [[ $first != none ]] || first=$owner
+            fi
+        done < <(find "$dir" -maxdepth 1 -type f \
+            -name 'checkpoint_attn_comp_commit_owner-*.bin' \
+            -printf '%f\n' | sort -V)
+        printf '%s_owner_mirror_pairs=%s\n' "$arm" "$pairs"
+        printf '%s_owner_mirror_bit_exact=%s\n' "$arm" "$exact"
+        printf '%s_owner_mirror_first_difference=%s\n' "$arm" "$first"
+    }
+
     {
         printf 'mode=pp4096-committed-row-boundary\n'
         printf 'representation=shipping-rounded-f32\n'
         compare_commit_class owner
         compare_commit_class mirror
+        compare_owner_mirror_arm f32
+        compare_owner_mirror_arm compact
         printf 'acceptance_evidence=no\n'
     } | tee "$OUTPUT_DIR/summary/commit-audit.txt"
     phase=finished
     printf 'Compact-KV PP4096 committed-row boundary audit complete: %s\n' \
+        "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $DIAGNOSTIC_STAGE_AUDIT == 1 ]]; then
+    phase=stage-audit
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    for arm in f32 compact; do
+        base="$OUTPUT_DIR/exact/$arm-stage-audit"
+        printf 'Compact-KV PP4096 attention-stage audit arm=%s...\n' "$arm"
+        run_case "$arm" stage-audit 1 "$base" "" 4096 || {
+            tail -n 240 "$base.log" >&2 || true
+            die "$arm PP4096 attention-stage audit run failed"
+        }
+    done
+
+    stage_first=none
+    {
+        printf 'mode=pp4096-layer6-pos512-attention-stage\n'
+        printf 'dispatch_preserved_by_distinct_dump_names=true\n'
+        for stage in input query raw projected recurrent; do
+            file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
+            f32_file="$OUTPUT_DIR/checkpoints/f32/$file"
+            compact_file="$OUTPUT_DIR/checkpoints/compact/$file"
+            [[ -s $f32_file && -s $compact_file ]] ||
+                die "missing stage-audit payload: $file"
+            exact=false
+            if cmp -s "$f32_file" "$compact_file"; then
+                exact=true
+            elif [[ $stage_first == none ]]; then
+                stage_first=$stage
+            fi
+            printf 'stage_%s_bit_exact=%s\n' "$stage" "$exact"
+        done
+        printf 'first_divergent_stage=%s\n' "$stage_first"
+        printf 'acceptance_evidence=no\n'
+    } | tee "$OUTPUT_DIR/summary/stage-audit.txt"
+    phase=finished
+    printf 'Compact-KV PP4096 layer-6 attention-stage audit complete: %s\n' \
         "$OUTPUT_DIR"
     exit 0
 fi

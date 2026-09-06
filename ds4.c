@@ -30898,6 +30898,13 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", metal_graph_batch_attn_norm(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+        /* The compact-KV stage audit uses distinct dump names so enabling it
+         * does not trip any of the production-path debug gates keyed to the
+         * ordinary tensor names. */
+        metal_graph_debug_dump_tensor("ckv_stage_input",
+                                      metal_graph_batch_attn_norm(g),
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
@@ -31071,6 +31078,12 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_q8_audit_clear_context();
 #endif
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
+    if (ok) {
+        metal_graph_debug_dump_tensor("ckv_stage_query",
+                                      metal_graph_batch_q(g),
+                                      (uint64_t)n_tokens * q_dim,
+                                      il, pos0);
+    }
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -31124,6 +31137,10 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", metal_graph_batch_kv(g),
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+        metal_graph_debug_dump_tensor("ckv_stage_raw",
+                                      metal_graph_batch_kv(g),
+                                      (uint64_t)n_tokens * DS4_N_HEAD_DIM,
+                                      il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
     /*
@@ -32594,6 +32611,12 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (!ok) fprintf(stderr, "ds4: TP prefill attention row gate failed (layer %u)\n", il);
     }
+    if (ok) {
+        metal_graph_debug_dump_tensor("ckv_stage_projected",
+                                      metal_graph_batch_attn_out(g),
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il, pos0);
+    }
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, metal_graph_batch_attn_out(g), il, n_tokens);
     }
@@ -32615,6 +32638,10 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_batch_after_attn_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
+        metal_graph_debug_dump_tensor("ckv_stage_recurrent",
+                                      metal_graph_batch_after_attn_hc(g),
+                                      (uint64_t)n_tokens * hc_dim,
+                                      il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_attn_out);

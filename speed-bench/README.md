@@ -5668,6 +5668,29 @@ or owner commit); matching owners with a mirror mismatch assigns it to mirror
 placement/copy/order. The dump synchronization and files are diagnostic-only,
 so this mode is not timing or promotion evidence.
 
+The `20260906T012235Z` commit audit completed both CUDA arms and wrote all 496
+checkpoints per arm before a runner-only selector gate incorrectly demanded a
+production hybrid summary. Direct comparison of those payloads found identical
+inventories, 328 owner commits and 168 mirrors per arm. All 168 owner-to-mirror
+pairs are byte-identical within both F32 and compact, excluding the peer mirror
+copy and its ordering. Across arms, every layer's first commit is identical;
+the first difference is the owner commit for ratio-128 layer 7 at compressed
+row 4, produced by the second 512-token chunk. Thus the first semantic change
+occurs while processing layer 6 at continuation position 512, before layer 7's
+producer, and later owner/mirror differences are propagated values. The
+commit-audit selector validation now recognizes its exact-score route and its
+summary also reports within-arm owner/mirror parity.
+
+`DIAGNOSTIC_STAGE_AUDIT=1` follows that boundary without changing the selected
+multi-GPU kernels. It runs F32 and compact through PP4096 and, only at layer 6
+position 512, dumps the attention-normalized input, final Q, rounded raw KV,
+completed attention projection, and post-attention recurrent state. These use
+distinct diagnostic names that are not consulted by the production dispatch
+gates. The summary reports byte parity at every stage and the first divergent
+stage, separating an upstream layer-input difference from attention-cache
+consumption or its output projection. As with the commit audit, dump
+synchronization makes this correctness-localization evidence only.
+
 The `20260906T002649Z` run completed the corrected continuation isolation: 516
 measured materializations covering 1024 staged rows were observed. Direct
 compact and materialized-F32 prefill were byte-identical to each other but not
