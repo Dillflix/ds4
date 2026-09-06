@@ -5646,12 +5646,24 @@ correctness-localization run, not promotion evidence.
 `DIAGNOSTIC_PREFILL_ISOLATION=1` runs PP512 and PP4096 with three exact arms:
 F32, the ordinary compact prefill consumers, and compact persistent storage
 materialized into the existing bounded F32 stage before the ordinary F32
-prefill consumers. All compact arms enable the strengthened per-row round-trip
-audit. This separates compact storage/packing from compact-prefill consumption;
-the earlier `compact-direct` arm was invalid because its selector disabled only
-the at-most-32-token hybrid indexed kernel and could not affect PP4096 prefill.
-Divergence is a diagnostic result rather than a runner failure; this is not
-promotion evidence.
+prefill consumers. Materialization covers static, indexed, decode-mixed
+continuation, and their head-sharded entry points. The runner requires a
+nonzero post-warm-up materialization summary, so a marker emitted only by the
+untimed warm-up cannot validate the third arm. All compact arms enable the
+strengthened per-row round-trip audit. This separates compact storage/packing
+from compact-prefill consumption; the earlier `compact-direct` arm was invalid
+because its selector disabled only the at-most-32-token hybrid indexed kernel
+and could not affect PP4096 prefill. Divergence is a diagnostic result rather
+than a runner failure; this is not promotion evidence.
+
+The `20260906T000607Z` run did not complete that isolation. Its materialized
+marker came from the untimed zero-history warm-up, while the measured PP4096
+continuation entered decode-mixed and head-sharded wrappers that still selected
+the direct compact consumer. Consequently the two compact arms were
+bit-identical by construction; that result cannot assign the divergence to the
+producer. Those wrappers now use the same diagnostic source selector as the
+static and indexed paths, and teardown reports the measured materialization
+call count.
 
 The `20260905T235143Z` run proved that F32 and compact are bit-identical through
 PP512, while both the PP4096 frontier logits and its first decode logits differ.

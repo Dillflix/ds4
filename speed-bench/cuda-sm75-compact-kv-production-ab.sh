@@ -324,6 +324,21 @@ validate_topology() {
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$log" || return 1
 }
 
+validate_materialized_prefill_summary() {
+    local log=$1
+    awk '
+        /SM75 compact prefill materialization summary:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^calls=/) {
+                    sub(/^calls=/, "", $i)
+                    last_calls = $i + 0
+                }
+            }
+        }
+        END {exit !(last_calls > 0)}
+    ' "$log"
+}
+
 validate_selector() {
     local arm=$1 log=$2
     if [[ $arm == f32 ]]; then
@@ -332,6 +347,7 @@ validate_selector() {
     elif [[ $arm == compact-materialized ]]; then
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
             grep -Fq 'SM75 compact prefill diagnostic selected: materialized-F32 ordinary consumer' "$log" &&
+            validate_materialized_prefill_summary "$log" &&
             ! grep -Fq 'requested compressed-attention cache format' "$log"
     elif [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
         grep -Fq 'compressed-attention cache format=sm75-compact-exact row-bytes=736' "$log" &&
@@ -613,6 +629,7 @@ if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
         printf 'direct_compact_prefill_vs_f32_bit_exact=%s\n' "$compact_exact"
         printf 'materialized_prefill_vs_f32_bit_exact=%s\n' "$materialized_exact"
         printf 'direct_compact_vs_materialized_prefill_bit_exact=%s\n' "$arms_equal"
+        printf 'continuation_prefill_materialization=validated-by-nonzero-summary\n'
         printf 'acceptance_evidence=no\n'
     } | tee "$OUTPUT_DIR/summary/prefill-isolation.txt"
     phase=finished
