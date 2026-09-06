@@ -5675,12 +5675,24 @@ Acceptance requires byte-identical frontier logits, unchanged four-GPU
 identity and power-limit snapshots before and after both arms, no Xid/lost-GPU
 evidence, complete four-GPU VRAM telemetry, and throughput at or above the
 configured floor.  VRAM is a first-class gate rather than an informational
-column: by default the bounded implementation may grow the model cache by at
-most 4.5 GiB, any one GPU by at most 5 GiB, aggregate sampled peak residency by
-at most 5 GiB, and must retain at least 2 GiB free on every GPU.  These bounds
-permit the first full-execution-binding proof; they do not qualify that extra
-cache as a production design.  A final native-GGUF/direct-native execution
-path should remove the transient F16 duplication before promotion.
+column.  The qualified `TOKEN_ROW_WEIGHT_MODE=f16` rollback retains the first
+full-execution-binding proof and its permissive 4.5 GiB cache-growth bound.
+The default `TOKEN_ROW_WEIGHT_MODE=native-stream` instead requires at least
+3.5 GiB less persistent F16 model cache and 1 GiB lower sampled aggregate VRAM
+than control, permits at most 2 GiB growth on the newly populated partner GPU,
+and must retain at least 2 GiB free on every GPU.
+
+Native-stream installs complete tagged native-Q8 q_b/A/B sources locally on
+both members of the selected pair through the ordinary startup selective-cache
+path.  It installs no persistent F16 binding for those 21 pair-1 layers and
+performs no peer weight reads or runtime cache replacement.  Each owner
+dequantizes only the current projection into a 96 MiB scratch arena reserved
+before prefill, then runs the same cuBLAS algorithm and accumulation/output
+types as the exact F16 proof.  The arena is reused serially by q_b, A, and B;
+runtime growth is forbidden.  Projection shapes other than the production
+q_b/A/B matrices and owner extents above 256 rows fail closed.  This first
+qualification is consequently fixed to the established 256-row owner half of
+a 512-row internal microbatch.
 
 The initial gate deliberately uses PP2048 with 512-row outer chunks.  It is a
 stable-pair exactness and traffic result, not the historical maximum-throughput
@@ -5688,12 +5700,22 @@ configuration.  Only after it passes should the same harness advance to
 PP4096/2048-row outer chunks and then PP32768.  Risky pair-0 testing remains a
 separate candidate-only experiment.
 
+The full-F16 candidate subsequently passed at PP2048 (495.32 versus 468.09
+tok/s, 1.05817x) and PP32768 (401.95 versus 393.68 tok/s, 1.02101x), with
+byte-identical logits and the fixed 5 MiB steady per-layer transfer contract.
+It also confirmed the expected prototype cost: 14.52 GiB of F16 model cache
+versus 10.58 GiB in control, with about 4.0 GiB added to GPU 2.  Those results
+qualify row ownership and arithmetic, not the duplicated residency.  The
+native-stream arm is the direct low-VRAM follow-up and keeps pair 0 disabled in
+both workloads.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
 GPU_DEVICES=0,3,1,2 GPU_VRAM=auto STAGE_SPLIT=22 \
 REQUIRED_POWER_LIMITS_W=250,260,250,250 \
 CTX_TOKENS=2048 PREFILL_CHUNK=512 \
+TOKEN_ROW_WEIGHT_MODE=native-stream \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-attention-exactness.sh
 ```

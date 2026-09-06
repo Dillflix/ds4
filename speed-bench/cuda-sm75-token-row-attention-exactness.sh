@@ -15,12 +15,23 @@ CTX_TOKENS=${CTX_TOKENS:-2048}
 CTX_ALLOC=${CTX_ALLOC:-$((CTX_TOKENS + 1))}
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
 PIPELINE_MB=512
+TOKEN_ROW_WEIGHT_MODE=${TOKEN_ROW_WEIGHT_MODE:-native-stream}
 REQUIRED_POWER_LIMITS_W=${REQUIRED_POWER_LIMITS_W:-250,260,250,250}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.90}
-MAX_MODEL_CACHE_INCREASE_GIB=${MAX_MODEL_CACHE_INCREASE_GIB:-4.50}
-MAX_PER_GPU_VRAM_INCREASE_MIB=${MAX_PER_GPU_VRAM_INCREASE_MIB:-5120}
-MAX_AGGREGATE_VRAM_INCREASE_MIB=${MAX_AGGREGATE_VRAM_INCREASE_MIB:-5120}
+if [[ $TOKEN_ROW_WEIGHT_MODE == native-stream ]]; then
+    MAX_MODEL_CACHE_INCREASE_GIB=${MAX_MODEL_CACHE_INCREASE_GIB:-0}
+    MAX_PER_GPU_VRAM_INCREASE_MIB=${MAX_PER_GPU_VRAM_INCREASE_MIB:-2048}
+    MAX_AGGREGATE_VRAM_INCREASE_MIB=${MAX_AGGREGATE_VRAM_INCREASE_MIB:-0}
+    MIN_MODEL_CACHE_SAVING_GIB=${MIN_MODEL_CACHE_SAVING_GIB:-3.50}
+    MIN_AGGREGATE_VRAM_SAVING_MIB=${MIN_AGGREGATE_VRAM_SAVING_MIB:-1024}
+else
+    MAX_MODEL_CACHE_INCREASE_GIB=${MAX_MODEL_CACHE_INCREASE_GIB:-4.50}
+    MAX_PER_GPU_VRAM_INCREASE_MIB=${MAX_PER_GPU_VRAM_INCREASE_MIB:-5120}
+    MAX_AGGREGATE_VRAM_INCREASE_MIB=${MAX_AGGREGATE_VRAM_INCREASE_MIB:-5120}
+    MIN_MODEL_CACHE_SAVING_GIB=${MIN_MODEL_CACHE_SAVING_GIB:-0}
+    MIN_AGGREGATE_VRAM_SAVING_MIB=${MIN_AGGREGATE_VRAM_SAVING_MIB:-0}
+fi
 MIN_CANDIDATE_FREE_VRAM_MIB=${MIN_CANDIDATE_FREE_VRAM_MIB:-2048}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -35,6 +46,12 @@ OUTPUT_DIR=${TOKEN_ROW_ATTN_EXACTNESS_DIR:-$repo_dir/sm75-token-row-attention-ex
     die "GPU_DEVICES must be 0,3,1,2 so logical pair 1 is stable physical GPU3/GPU2"
 [[ $REQUIRED_POWER_LIMITS_W == 250,260,250,250 ]] ||
     die "REQUIRED_POWER_LIMITS_W must be 250,260,250,250"
+[[ $TOKEN_ROW_WEIGHT_MODE == f16 ||
+   $TOKEN_ROW_WEIGHT_MODE == native-stream ]] ||
+    die "TOKEN_ROW_WEIGHT_MODE must be f16 or native-stream"
+if [[ $TOKEN_ROW_WEIGHT_MODE == native-stream && $PREFILL_CHUNK != 512 ]]; then
+    die "native-stream is qualified only for PREFILL_CHUNK=512"
+fi
 for item in "STAGE_SPLIT:$STAGE_SPLIT" "CTX_TOKENS:$CTX_TOKENS" \
             "CTX_ALLOC:$CTX_ALLOC" "PREFILL_CHUNK:$PREFILL_CHUNK" \
             "CASE_TIMEOUT_SECONDS:$CASE_TIMEOUT_SECONDS" \
@@ -56,7 +73,9 @@ done
 for item in "MIN_THROUGHPUT_RATIO:$MIN_THROUGHPUT_RATIO" \
             "MAX_MODEL_CACHE_INCREASE_GIB:$MAX_MODEL_CACHE_INCREASE_GIB" \
             "MAX_PER_GPU_VRAM_INCREASE_MIB:$MAX_PER_GPU_VRAM_INCREASE_MIB" \
-            "MAX_AGGREGATE_VRAM_INCREASE_MIB:$MAX_AGGREGATE_VRAM_INCREASE_MIB"; do
+            "MAX_AGGREGATE_VRAM_INCREASE_MIB:$MAX_AGGREGATE_VRAM_INCREASE_MIB" \
+            "MIN_MODEL_CACHE_SAVING_GIB:$MIN_MODEL_CACHE_SAVING_GIB" \
+            "MIN_AGGREGATE_VRAM_SAVING_MIB:$MIN_AGGREGATE_VRAM_SAVING_MIB"; do
     name=${item%%:*}; value=${item#*:}
     [[ $value =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$name must be numeric"
 done
@@ -201,11 +220,14 @@ phase=manifest
     printf 'ctx_tokens=%s\nctx_alloc=%s\nprefill_chunk=%s\npipeline_microbatch=%s\n' \
         "$CTX_TOKENS" "$CTX_ALLOC" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 'control_token_row_pairs=off\ncandidate_token_row_pairs=1\npair0_attention=off-both-arms\n'
+    printf 'candidate_token_row_weight_mode=%s\n' "$TOKEN_ROW_WEIGHT_MODE"
     printf 'candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n'
     printf 'minimum_throughput_ratio=%s\nmax_model_cache_increase_gib=%s\n' \
         "$MIN_THROUGHPUT_RATIO" "$MAX_MODEL_CACHE_INCREASE_GIB"
     printf 'max_per_gpu_vram_increase_mib=%s\nmax_aggregate_vram_increase_mib=%s\n' \
         "$MAX_PER_GPU_VRAM_INCREASE_MIB" "$MAX_AGGREGATE_VRAM_INCREASE_MIB"
+    printf 'min_model_cache_saving_gib=%s\nmin_aggregate_vram_saving_mib=%s\n' \
+        "$MIN_MODEL_CACHE_SAVING_GIB" "$MIN_AGGREGATE_VRAM_SAVING_MIB"
     printf 'min_candidate_free_vram_mib=%s\nrequired_power_limits_w=%s\n' \
         "$MIN_CANDIDATE_FREE_VRAM_MIB" "$REQUIRED_POWER_LIMITS_W"
     cat "$OUTPUT_DIR/health/initial-gpu.csv"
@@ -227,6 +249,7 @@ for variant in control token-row; do
     if [[ $variant == token-row ]]; then
         # Deliberately pair 1 only. Pair 0 is never passed to the selector.
         variant_env+=(DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS=1)
+        variant_env+=("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE=$TOKEN_ROW_WEIGHT_MODE")
     fi
     capture_gpu_health "$base.pre-gpu.csv" ||
         die "$variant pre-run GPU health failed"
@@ -273,8 +296,14 @@ for variant in control token-row; do
     [[ -s $base.csv ]] || die "$variant omitted benchmark CSV"
     grep -Fq 'dense-placement=stage-aware-fixed-22-21' "$base.log" ||
         die "$variant missed fixed 22/21 dense placement"
-    grep -Fq 'tagged SM75 dense-Q8 GGUF installed through ordinary single-owner residency' \
-        "$base.log" || die "$variant did not load the tagged native-Q8 model"
+    if [[ $variant == token-row &&
+          $TOKEN_ROW_WEIGHT_MODE == native-stream ]]; then
+        grep -Fq 'tagged SM75 dense-Q8 GGUF installed through ordinary startup selective residency; selected token-row pair q_b/A/B sources are complete and local on both owners; runtime replacement and peer weight reads disabled' \
+            "$base.log" || die "$variant did not install pair-local tagged-Q8 sources"
+    else
+        grep -Fq 'tagged SM75 dense-Q8 GGUF installed through ordinary single-owner residency' \
+            "$base.log" || die "$variant did not load the tagged native-Q8 model"
+    fi
     grep -Fq 'CUDA TP cache mirror policy: attention-pair-mask=0x2' "$base.log" ||
         die "$variant did not keep attention cache visibility on stable pair 1 only"
     ! grep -Fq 'required native-GGUF execution binding unavailable' "$base.log" ||
@@ -285,7 +314,7 @@ for variant in control token-row; do
         die "$variant unexpectedly enabled the token-row pipeline on pair 0"
 
     if [[ $variant == control ]]; then
-        grep -Fq 'token-row-pair-mask=0x0 token-row-required=0/0/0' \
+        grep -Fq 'token-row-pair-mask=0x0 token-row-weight-mode=f16 token-row-required=0/0/0 token-row-native-stream=0/0/0' \
             "$base.log" || die "control did not retain the ordinary token-row binding inventory"
         ! grep -Fq 'CUDA prefill attention token-row pipeline enabled:' "$base.log" ||
             die "control unexpectedly enabled the token-row candidate"
@@ -299,8 +328,21 @@ for variant in control token-row; do
         expected_input_bytes=$(((PIPELINE_MB / 2) * 1024 * 4))
         expected_output_bytes=$(((PIPELINE_MB / 2) * 4096 * 4))
         expected_current_kv_bytes=$((PIPELINE_MB * 512 * 4))
-        grep -Fq 'token-row-pair-mask=0x2 token-row-required=21/21/21' \
-            "$base.log" || die "candidate did not materialize all 21 pair-1 q_b/A/B execution bindings"
+        if [[ $TOKEN_ROW_WEIGHT_MODE == native-stream ]]; then
+            grep -Fq 'token-row-pair-mask=0x2 token-row-weight-mode=native-stream token-row-required=0/0/0 token-row-native-stream=21/21/21' \
+                "$base.log" || die "candidate did not retain all 21 pair-1 q_b/A/B native-stream sources"
+            grep -Fq 'token-row native-stream workspace reserved at startup: 96 MiB per selected pair member; runtime growth disabled' \
+                "$base.log" || die "candidate did not pre-reserve bounded native-stream workspace"
+            for stage in attn_q_b attn_output_a attn_output_b; do
+                [[ $(grep -Fc "token-row native-stream dispatch stage=$stage " "$base.log") == 2 ]] ||
+                    die "candidate did not native-stream $stage on both pair members"
+            done
+            ! grep -Eq 'token-row native-stream dispatch .*peer-weight-read=[1-9]' "$base.log" ||
+                die "candidate performed a forbidden peer weight read"
+        else
+            grep -Fq 'token-row-pair-mask=0x2 token-row-weight-mode=f16 token-row-required=21/21/21 token-row-native-stream=0/0/0' \
+                "$base.log" || die "candidate did not materialize all 21 pair-1 q_b/A/B F16 execution bindings"
+        fi
         grep -Fq "CUDA prefill attention token-row pipeline enabled: home=1 partner=3 q-input-copy-bytes=$expected_input_bytes query-gather-bytes=0 output-return-bytes=$expected_output_bytes rows=256/256" \
             "$base.log" || die "candidate omitted or changed the bounded token-row transfer contract"
         grep -Fq 'CUDA prefill attention token-row pipeline attention enabled: home=1 partner=3 rows=256/256 query=local-token-rows KV=local-mirrors output=local-A+B' \
@@ -345,7 +387,8 @@ phase=summary
 python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
     "$MAX_MODEL_CACHE_INCREASE_GIB" "$MAX_PER_GPU_VRAM_INCREASE_MIB" \
     "$MAX_AGGREGATE_VRAM_INCREASE_MIB" "$MIN_CANDIDATE_FREE_VRAM_MIB" \
-    "$PIPELINE_MB" <<'PY'
+    "$PIPELINE_MB" "$TOKEN_ROW_WEIGHT_MODE" \
+    "$MIN_MODEL_CACHE_SAVING_GIB" "$MIN_AGGREGATE_VRAM_SAVING_MIB" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
@@ -354,6 +397,9 @@ max_per_gpu_growth = float(sys.argv[4])
 max_aggregate_growth = float(sys.argv[5])
 min_candidate_free = float(sys.argv[6])
 microbatch = int(sys.argv[7])
+weight_mode = sys.argv[8]
+min_cache_saving = float(sys.argv[9])
+min_aggregate_saving = float(sys.argv[10])
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -421,6 +467,14 @@ if aggregate_growth > max_aggregate_growth + 1e-9:
     raise SystemExit(
         f"error: candidate aggregate VRAM growth {aggregate_growth:.0f} MiB "
         f"exceeds {max_aggregate_growth:.0f} MiB")
+if -cache_growth < min_cache_saving - 1e-9:
+    raise SystemExit(
+        f"error: candidate model-cache saving {-cache_growth:.2f} GiB "
+        f"is below {min_cache_saving:.2f} GiB")
+if -aggregate_growth < min_aggregate_saving - 1e-9:
+    raise SystemExit(
+        f"error: candidate aggregate VRAM saving {-aggregate_growth:.0f} MiB "
+        f"is below {min_aggregate_saving:.0f} MiB")
 if candidate_min_free < min_candidate_free - 1e-9:
     raise SystemExit(
         f"error: candidate minimum free VRAM {candidate_min_free:.0f} MiB "
@@ -436,6 +490,8 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"control_model_cache_gib={control_cache:.2f}\n")
     f.write(f"token_row_model_cache_gib={candidate_cache:.2f}\n")
     f.write(f"model_cache_increase_gib={cache_growth:.2f}\n")
+    f.write(f"model_cache_saving_gib={-cache_growth:.2f}\n")
+    f.write(f"token_row_weight_mode={weight_mode}\n")
     f.write(f"q_input_transfer_bytes_per_pair1_layer_microbatch={q_input}\n")
     f.write(f"current_kv_transfer_bytes_per_pair1_layer_zero_prefix={current_kv}\n")
     f.write("expanded_query_gather_bytes_per_pair1_layer_microbatch=0\n")
@@ -446,6 +502,7 @@ with (root / "summary.txt").open("w") as f:
     f.write("candidate_output_b_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n")
     f.write("logits=bit-exact\n")
     f.write(f"candidate_aggregate_vram_increase_mib={aggregate_growth:.0f}\n")
+    f.write(f"candidate_aggregate_vram_saving_mib={-aggregate_growth:.0f}\n")
     f.write(f"candidate_min_free_vram_mib={candidate_min_free:.0f}\n")
     for gpu in range(4):
         f.write(f"gpu{gpu}_control_max_vram_mib={control_used[gpu]:.0f}\n")

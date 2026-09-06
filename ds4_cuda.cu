@@ -3513,6 +3513,62 @@ static bool cuda_env_pair_list_contains(const char *name, int pair) {
     return false;
 }
 
+static bool cuda_token_rows_native_stream_mode(void) {
+    const char *mode = getenv(
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    return mode && strcmp(mode, "native-stream") == 0;
+}
+
+static bool cuda_token_rows_native_stream_tier_enabled(int logical_tier) {
+    if (!cuda_token_rows_native_stream_mode() || g_n_gpus != 4 ||
+        logical_tier < 0 || logical_tier >= g_n_gpus) return false;
+    const int pair = logical_tier < g_n_gpus / 2
+        ? logical_tier : logical_tier - g_n_gpus / 2;
+    return cuda_env_pair_list_contains(
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS", pair);
+}
+
+enum { CUDA_TOKEN_ROWS_NATIVE_STREAM_WORKSPACE_MIB = 96 };
+enum { CUDA_TOKEN_ROWS_NATIVE_STREAM_MAX_ROWS = 256 };
+
+static bool cuda_token_rows_native_stream_rows_qualified(
+        int logical_tier, uint64_t n_rows, const char *stage) {
+    if (!cuda_token_rows_native_stream_tier_enabled(logical_tier)) return true;
+    if (n_rows != 0u &&
+        n_rows <= (uint64_t)CUDA_TOKEN_ROWS_NATIVE_STREAM_MAX_ROWS) {
+        return true;
+    }
+    fprintf(stderr,
+            "ds4: token-row native-stream row extent is unqualified "
+            "stage=%s tier=%d rows=%llu maximum=%u\n",
+            stage ? stage : "projection", logical_tier,
+            (unsigned long long)n_rows,
+            (unsigned)CUDA_TOKEN_ROWS_NATIVE_STREAM_MAX_ROWS);
+    return false;
+}
+
+/* Native-stream is deliberately allocation-free after startup.  A future
+ * larger token-row microbatch must first raise and re-qualify the reservation
+ * instead of growing/replacing a live CUDA arena inside prefill. */
+static void *cuda_token_rows_native_stream_scratch(
+        int logical_tier, uint64_t bytes, const char *what) {
+    if (!cuda_token_rows_native_stream_tier_enabled(logical_tier) ||
+        logical_tier < 0 || logical_tier >= g_n_gpus ||
+        !g_gpu[logical_tier].scratch ||
+        bytes > (uint64_t)g_gpu[logical_tier].scratch_bytes) {
+        fprintf(stderr,
+                "ds4: token-row native-stream scratch is unavailable or too "
+                "small on tier %d for %s: need=%.2f MiB reserved=%.2f MiB\n",
+                logical_tier, what ? what : "projection",
+                (double)bytes / 1048576.0,
+                logical_tier >= 0 && logical_tier < g_n_gpus
+                    ? (double)g_gpu[logical_tier].scratch_bytes / 1048576.0
+                    : 0.0);
+        return NULL;
+    }
+    return g_gpu[logical_tier].scratch;
+}
+
 /* Materialize one consumer's weight on its validated partner.  Return 1 on
  * admission, 0 for an ordinary capacity/policy miss, and -1 when CUDA state
  * is no longer safe for a native fallback.  Forced T256 placement calls this
@@ -9081,8 +9137,35 @@ extern "C" int ds4_gpu_q8_f16_plan_materialize_and_validate(void) {
     if (!g_q8_f16_plan_materialized && !g_q8_f16_plan_materializing) {
         cuda_q8_f16_plan_materialize();
     }
-    return g_q8_f16_plan_materialized &&
-           !g_q8_f16_plan_required_failed;
+    if (!g_q8_f16_plan_materialized || g_q8_f16_plan_required_failed) {
+        return 0;
+    }
+    if (cuda_token_rows_native_stream_mode()) {
+        const uint64_t workspace_bytes =
+            (uint64_t)CUDA_TOKEN_ROWS_NATIVE_STREAM_WORKSPACE_MIB * 1048576u;
+        for (int tier = 0; tier < g_n_gpus; tier++) {
+            if (!cuda_token_rows_native_stream_tier_enabled(tier)) continue;
+            if (!cuda_tmp_alloc_on(
+                    tier, workspace_bytes,
+                    "token-row native-stream startup workspace")) {
+                fprintf(stderr,
+                        "ds4: failed to reserve token-row native-stream "
+                        "workspace on tier %d\n", tier);
+                return 0;
+            }
+        }
+        static std::atomic<int> logged(0);
+        int expected = 0;
+        if (logged.compare_exchange_strong(
+                expected, 1, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                    "ds4: token-row native-stream workspace reserved at "
+                    "startup: %u MiB per selected pair member; runtime "
+                    "growth disabled\n",
+                    (unsigned)CUDA_TOKEN_ROWS_NATIVE_STREAM_WORKSPACE_MIB);
+        }
+    }
+    return 1;
 }
 
 extern "C" uint64_t ds4_gpu_q8_f16_partner_offload_count(void) {
@@ -10383,6 +10466,72 @@ static int cuda_q8_warp_interleaved_primary_source_registered(
         if (into <= r.bytes && weight_bytes <= r.bytes - into) return 1;
     }
     return 0;
+}
+
+static const unsigned char *cuda_token_rows_native_stream_source(
+        const void *model_map, uint64_t offset, uint64_t weight_bytes,
+        uint64_t in_dim, uint64_t out_dim, uint64_t blocks,
+        int logical_tier, int physical_device, const char *stage,
+        uint32_t *source_layout) {
+    if (source_layout) *source_layout = DS4_Q8_NATIVE_LAYOUT_NONE;
+    if (!cuda_token_rows_native_stream_tier_enabled(logical_tier) ||
+        !model_map || !source_layout || blocks == 0u ||
+        (blocks & 31u) != 0u) return NULL;
+
+    const bool q_b_shape = stage && strcmp(stage, "attn_q_b") == 0 &&
+        in_dim == 1024u && out_dim == 32768u;
+    const bool out_a_shape = stage && strcmp(stage, "attn_output_a") == 0 &&
+        in_dim == 4096u && out_dim == 8192u;
+    const bool out_b_shape = stage && strcmp(stage, "attn_output_b") == 0 &&
+        in_dim == 8192u && out_dim == 4096u;
+    if (!q_b_shape && !out_a_shape && !out_b_shape) {
+        fprintf(stderr,
+                "ds4: token-row native-stream projection shape is "
+                "unqualified stage=%s tier=%d in=%llu out=%llu\n",
+                stage ? stage : "projection", logical_tier,
+                (unsigned long long)in_dim, (unsigned long long)out_dim);
+        return NULL;
+    }
+
+    const unsigned char *source = cuda_q8_warp_interleaved_primary_ptr(
+        model_map, offset, weight_bytes, in_dim, out_dim,
+        blocks, 0u, physical_device, 1);
+    const uint32_t layout = cuda_q8_native_primary_source_layout(
+        model_map, offset, weight_bytes, physical_device);
+    const uint32_t expected_layout = out_b_shape
+        ? DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32
+        : DS4_Q8_NATIVE_LAYOUT_ROW_WARP32;
+    if (!source || layout != expected_layout) {
+        fprintf(stderr,
+                "ds4: required token-row native-stream source unavailable "
+                "stage=%s tier=%d device=%d offset=%llu bytes=%llu "
+                "layout=%u expected-layout=%u\n",
+                stage ? stage : "projection", logical_tier, physical_device,
+                (unsigned long long)offset,
+                (unsigned long long)weight_bytes, (unsigned)layout,
+                (unsigned)expected_layout);
+        return NULL;
+    }
+    *source_layout = layout;
+
+    unsigned stage_id = 3u;
+    if (stage && strcmp(stage, "attn_q_b") == 0) stage_id = 0u;
+    else if (stage && strcmp(stage, "attn_output_a") == 0) stage_id = 1u;
+    else if (stage && strcmp(stage, "attn_output_b") == 0) stage_id = 2u;
+    static std::atomic<uint32_t> logged_mask(0u);
+    const uint32_t bit = stage_id < 4u && logical_tier >= 0 && logical_tier < 8
+        ? UINT32_C(1) << (stage_id * 8u + (uint32_t)logical_tier) : 0u;
+    const uint32_t old = bit
+        ? logged_mask.fetch_or(bit, std::memory_order_relaxed) : bit;
+    if (!bit || (old & bit) == 0u) {
+        fprintf(stderr,
+                "ds4: token-row native-stream dispatch stage=%s tier=%d "
+                "device=%d layout=%u resident-q8=%.2f MiB "
+                "persistent-f16=0 peer-weight-read=0\n",
+                stage ? stage : "projection", logical_tier, physical_device,
+                (unsigned)layout, (double)weight_bytes / 1048576.0);
+    }
+    return source;
 }
 
 static const unsigned char *cuda_q8_warp_interleaved_ptr(
@@ -22124,7 +22273,14 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
     const unsigned char *interleaved_primary = NULL;
     const char *wptr = NULL;
     if (g_cublas_ready && n_tok > 1) {
-        const float *w_f32 = forced_gemm_algo_active ? NULL :
+        const bool native_stream_requested =
+            cuda_token_rows_native_stream_tier_enabled(logical_tier) &&
+            label && strcmp(label, "attn_output_b") == 0;
+        if (native_stream_requested &&
+            !cuda_token_rows_native_stream_rows_qualified(
+                logical_tier, n_tok, "attn_output_b")) return 0;
+        const float *w_f32 =
+            forced_gemm_algo_active || native_stream_requested ? NULL :
             cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim,
                             out_dim, physical_device, label);
         if (w_f32) {
@@ -22152,11 +22308,48 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
                 physical_device);
         const __half *w_f16 = cuda_q8_f16_ptr_impl(
             model_map, weight_offset, weight_bytes, in_dim, out_dim,
-            physical_device, label, 0, NULL, partner_binding ? 0 : 1);
-        if (w_f16) {
+            physical_device, label, 0, NULL,
+            partner_binding || native_stream_requested ? 0 : 1);
+        uint32_t native_source_layout = DS4_Q8_NATIVE_LAYOUT_NONE;
+        const unsigned char *native_source =
+            !w_f16 && native_stream_requested
+                ? cuda_token_rows_native_stream_source(
+                      model_map, weight_offset, weight_bytes, in_dim, out_dim,
+                      blocks, logical_tier, physical_device, "attn_output_b",
+                      &native_source_layout)
+                : NULL;
+        if (!w_f16 && native_stream_requested && !native_source) return 0;
+        if (w_f16 || native_source) {
             const uint64_t xh_count = n_tok * in_dim;
-            __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "q8 f16 gemm activations");
+            const uint64_t xh_bytes = xh_count * sizeof(__half);
+            const uint64_t wh_bytes = in_dim * out_dim * sizeof(__half);
+            const uint64_t xh_offset = native_source
+                ? (wh_bytes + 255u) & ~UINT64_C(255) : 0u;
+            if (xh_offset > UINT64_MAX - xh_bytes) return 0;
+            const uint64_t scratch_bytes = xh_offset + xh_bytes;
+            unsigned char *scratch = (unsigned char *)(native_source
+                ? cuda_token_rows_native_stream_scratch(
+                      logical_tier, scratch_bytes,
+                      "attention output b weight and activations")
+                : cuda_tmp_alloc_on(
+                      logical_tier, scratch_bytes,
+                      "q8 f16 gemm activations"));
+            __half *xh = scratch ? (__half *)(scratch + xh_offset) : NULL;
             if (!xh) return 0;
+            const __half *w_f16_eff = w_f16;
+            if (native_source) {
+                __half *transient_w_f16 = (__half *)scratch;
+                const uint64_t wh_count = in_dim * out_dim;
+                dequant_q8_0_native_to_f16_kernel
+                    <<<(wh_count + 255u) / 256u, 256>>>(
+                        transient_w_f16, native_source, in_dim, out_dim,
+                        blocks, native_source_layout);
+                if (!cuda_ok(cudaGetLastError(),
+                             "attention output b native-stream dequant launch")) {
+                    return 0;
+                }
+                w_f16_eff = transient_w_f16;
+            }
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
@@ -22190,7 +22383,7 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
                                              (int)n_tok,
                                              (int)in_dim,
                                              &alpha,
-                                             w_f16,
+                                             w_f16_eff,
                                              CUDA_R_16F,
                                              (int)in_dim,
                                              xh,
@@ -22203,9 +22396,11 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
                                              CUDA_R_32F,
                                              gemm_algo);
             if (st == CUBLAS_STATUS_SUCCESS) {
-                cuda_q8_f16_binding_mark_used(
-                    model_map, weight_offset, weight_bytes, in_dim, out_dim,
-                    physical_device, physical_device);
+                if (!native_source) {
+                    cuda_q8_f16_binding_mark_used(
+                        model_map, weight_offset, weight_bytes, in_dim, out_dim,
+                        physical_device, physical_device);
+                }
                 return 1;
             }
             if (explicit_algo) {
@@ -26166,22 +26361,73 @@ static int cuda_attention_output_q8_batch_tensor_impl(
         long v = strtol(out_a_min_env, &endp, 10);
         if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
     }
+    const bool out_a_native_stream_requested =
+        cuda_token_rows_native_stream_tier_enabled(logical_tier) &&
+        !g_quality_mode && g_cublas_ready &&
+        n_tokens >= out_a_cublas_min_tokens &&
+        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL;
+    if (out_a_native_stream_requested &&
+        !cuda_token_rows_native_stream_rows_qualified(
+            logical_tier, n_tokens, "attn_output_a")) return 0;
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
-        out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, physical_device, "attn_output_a");
+        out_a_f16 = cuda_q8_f16_ptr_impl(
+            model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
+            physical_device, "attn_output_a", 0, NULL,
+            out_a_native_stream_requested ? 0 : 1);
     }
-    if (out_a_f16) {
+    uint32_t out_a_native_layout = DS4_Q8_NATIVE_LAYOUT_NONE;
+    const unsigned char *out_a_native =
+        !out_a_f16 && out_a_native_stream_requested
+            ? cuda_token_rows_native_stream_source(
+                  model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
+                  blocks_a, logical_tier, physical_device, "attn_output_a",
+                  &out_a_native_layout)
+            : NULL;
+    if (!out_a_f16 && out_a_native_stream_requested && !out_a_native) {
+        return 0;
+    }
+    if (out_a_f16 || out_a_native) {
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
-        const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
+        const uint64_t wh_bytes = group_dim * low_dim * sizeof(__half);
+        const uint64_t heads_h_offset = out_a_native
+            ? (wh_bytes + 255u) & ~UINT64_C(255) : 0u;
+        if (heads_h_offset > UINT64_MAX - heads_h_bytes) return 0;
+        const uint64_t heads_h_end = heads_h_offset + heads_h_bytes;
+        const uint64_t low_tmp_offset =
+            (heads_h_end + 255u) & ~UINT64_C(255);
+        if (low_tmp_count > UINT64_MAX / sizeof(float) ||
+            low_tmp_offset > UINT64_MAX - low_tmp_count * sizeof(float)) {
+            return 0;
+        }
         const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
-        void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output a cublas");
+        void *tmp = out_a_native
+            ? cuda_token_rows_native_stream_scratch(
+                  logical_tier, tmp_bytes,
+                  "attention output a weight and cublas workspace")
+            : cuda_tmp_alloc_on(
+                  logical_tier, tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
-        __half *heads_h = (__half *)tmp;
+        __half *heads_h = (__half *)((char *)tmp + heads_h_offset);
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
+        const __half *out_a_f16_eff = out_a_f16;
+        if (out_a_native) {
+            __half *transient_w_f16 = (__half *)tmp;
+            const uint64_t wh_count = group_dim * low_dim;
+            dequant_q8_0_native_to_f16_kernel
+                <<<(wh_count + 255u) / 256u, 256>>>(
+                    transient_w_f16, out_a_native, group_dim, low_dim,
+                    blocks_a, out_a_native_layout);
+            if (!cuda_ok(cudaGetLastError(),
+                         "attention output a native-stream dequant launch")) {
+                return 0;
+            }
+            out_a_f16_eff = transient_w_f16;
+        }
         attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
                 heads_h,
                 (const float *)heads->ptr,
@@ -26198,7 +26444,7 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                                                        (int)n_tokens,
                                                        (int)group_dim,
                                                        &alpha,
-                                                       out_a_f16,
+                                                       out_a_f16_eff,
                                                        CUDA_R_16F,
                                                        (int)group_dim,
                                                        (long long)rank * group_dim,
@@ -26222,9 +26468,11 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                 n_groups,
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
-        cuda_q8_f16_binding_mark_used(
-            model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
-            physical_device, physical_device);
+        if (!out_a_native) {
+            cuda_q8_f16_binding_mark_used(
+                model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
+                physical_device, physical_device);
+        }
     } else if (cuda_q8_warp_interleaved_primary_source_registered(
                    model_map, out_a_offset, out_a_bytes, physical_device)) {
         /* Tagged GGUF is an engine-wide representation.  The batched prefill
@@ -41759,6 +42007,11 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
     int partner_projected = 0;
     ds4_gpu_tensor scratch_q_half = {};
     ds4_gpu_tensor *q_half_eff = q_half;
+    const bool native_stream_requested =
+        cuda_token_rows_native_stream_tier_enabled(logical_tier);
+    if (native_stream_requested &&
+        !cuda_token_rows_native_stream_rows_qualified(
+            logical_tier, n_tok, "attn_q_b")) return 0;
     cuda_q8_f16_binding *partner_binding =
         cuda_q8_f16_runtime_partner_binding(
             model_map, weight_offset, weight_bytes, in_dim, out_dim,
@@ -41766,29 +42019,70 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
     const __half *w_f16 = cuda_q8_f16_ptr_impl(
         model_map, weight_offset, weight_bytes, in_dim, out_dim,
         physical_device, "attn_q_b", 0, NULL,
-        partner_binding ? 0 : 1);
-    if (w_f16) {
+        partner_binding || native_stream_requested ? 0 : 1);
+    uint32_t native_source_layout = DS4_Q8_NATIVE_LAYOUT_NONE;
+    const unsigned char *native_source = !w_f16 && native_stream_requested
+        ? cuda_token_rows_native_stream_source(
+              model_map, weight_offset, weight_bytes, in_dim, out_dim,
+              blocks, logical_tier, physical_device, "attn_q_b",
+              &native_source_layout)
+        : NULL;
+    if (!w_f16 && native_stream_requested && !native_source) return 0;
+    if (w_f16 || native_source) {
         const uint64_t xh_count = (uint64_t)n_tok * in_dim;
         const uint64_t xh_bytes = xh_count * sizeof(__half);
+        const uint64_t wh_bytes = in_dim * out_dim * sizeof(__half);
+        const uint64_t payload_offset = native_source
+            ? (wh_bytes + 255u) & ~UINT64_C(255) : 0u;
         __half *xh = NULL;
+        __half *transient_w_f16 = NULL;
+        unsigned char *scratch = NULL;
+        uint64_t scratch_bytes = 0u;
         if (!q_half_eff) {
-            const uint64_t xh_offset = (qh_bytes + 255u) & ~UINT64_C(255);
+            if (payload_offset > UINT64_MAX - qh_bytes) return 0;
+            const uint64_t qh_end = payload_offset + qh_bytes;
+            const uint64_t xh_offset = (qh_end + 255u) & ~UINT64_C(255);
             if (xh_offset > UINT64_MAX - xh_bytes) return 0;
-            unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
-                logical_tier, xh_offset + xh_bytes,
-                "attn q_b f16 output and activations");
+            scratch_bytes = xh_offset + xh_bytes;
+            scratch = (unsigned char *)(native_source
+                ? cuda_token_rows_native_stream_scratch(
+                      logical_tier, scratch_bytes,
+                      "attn q_b weight, output, and activations")
+                : cuda_tmp_alloc_on(
+                      logical_tier, scratch_bytes,
+                      "attn q_b f16 output and activations"));
             if (!scratch) return 0;
-            scratch_q_half.ptr = scratch;
+            scratch_q_half.ptr = scratch + payload_offset;
             scratch_q_half.bytes = qh_bytes;
             scratch_q_half.owner = 0;
             scratch_q_half.device_id = logical_tier;
             q_half_eff = &scratch_q_half;
             xh = (__half *)(scratch + xh_offset);
         } else {
-            xh = (__half *)cuda_tmp_alloc_on(
-                logical_tier, xh_bytes, "attn q_b f16 activations");
+            if (payload_offset > UINT64_MAX - xh_bytes) return 0;
+            scratch_bytes = payload_offset + xh_bytes;
+            scratch = (unsigned char *)(native_source
+                ? cuda_token_rows_native_stream_scratch(
+                      logical_tier, scratch_bytes,
+                      "attn q_b weight and activations")
+                : cuda_tmp_alloc_on(
+                      logical_tier, scratch_bytes,
+                      "attn q_b f16 activations"));
+            xh = scratch ? (__half *)(scratch + payload_offset) : NULL;
         }
         if (!xh) return 0;
+        const __half *w_f16_eff = w_f16;
+        if (native_source) {
+            transient_w_f16 = (__half *)scratch;
+            const uint64_t wh_count = in_dim * out_dim;
+            dequant_q8_0_native_to_f16_kernel
+                <<<(wh_count + 255u) / 256u, 256>>>(
+                    transient_w_f16, native_source, in_dim, out_dim,
+                    blocks, native_source_layout);
+            if (!cuda_ok(cudaGetLastError(),
+                         "attn q_b native-stream dequant launch")) return 0;
+            w_f16_eff = transient_w_f16;
+        }
         f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
             xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(),
@@ -41822,7 +42116,7 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
             CUBLAS_OP_T, CUBLAS_OP_N,
             (int)out_dim, (int)n_tok, (int)in_dim,
             &alpha,
-            w_f16, CUDA_R_16F, (int)in_dim,
+            w_f16_eff, CUDA_R_16F, (int)in_dim,
             xh, CUDA_R_16F, (int)in_dim,
             &beta,
             q_half_eff->ptr, CUDA_R_16F, (int)out_dim,
@@ -41834,9 +42128,11 @@ static int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_impl(
                     physical_device, (int)st);
             return 0;
         }
-        cuda_q8_f16_binding_mark_used(
-            model_map, weight_offset, weight_bytes, in_dim, out_dim,
-            physical_device, physical_device);
+        if (!native_source) {
+            cuda_q8_f16_binding_mark_used(
+                model_map, weight_offset, weight_bytes, in_dim, out_dim,
+                physical_device, physical_device);
+        }
         projected = 1;
     } else {
         if (!partner_binding) return 0;

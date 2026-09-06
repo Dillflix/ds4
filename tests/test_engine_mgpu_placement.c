@@ -45,6 +45,8 @@ bool ds4_test_cuda_tp_prefill_t32_heads_requested(void);
 bool ds4_test_cuda_tp_prefill_t32_heads_pair_enabled(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_token_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(int home_tier);
+bool ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(void);
+bool ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid(void);
 int ds4_test_cuda_tp_prefill_attn_pair_mode(int home_tier);
 bool ds4_test_cuda_tp_prefill_attn_rows_requested(void);
 bool ds4_test_cuda_tp_prefill_attn_rows_output_requested(void);
@@ -1039,6 +1041,27 @@ static void test_cuda_tp_prefill_attn_token_rows_selector(void) {
         save_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS");
     char *old_t32_heads =
         save_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS");
+    const char *weight_mode_name =
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE";
+    char *old_weight_mode = save_env_value(weight_mode_name);
+
+    unsetenv(weight_mode_name);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid() &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(),
+          "token-row projection weights default to the F16 rollback mode");
+    setenv(weight_mode_name, "f16", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid() &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(),
+          "explicit token-row F16 weight mode remains valid");
+    setenv(weight_mode_name, "native-stream", 1);
+    CHECK(ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid() &&
+          ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(),
+          "token-row native-stream weight mode is exact and explicit");
+    setenv(weight_mode_name, "native", 1);
+    CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid() &&
+          !ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(),
+          "misspelled token-row weight modes fail closed");
+    unsetenv(weight_mode_name);
 
     unsetenv(name);
     CHECK(!ds4_test_cuda_tp_prefill_attn_token_rows_requested(),
@@ -1149,6 +1172,7 @@ static void test_cuda_tp_prefill_attn_token_rows_selector(void) {
     restore_env_value(name, old);
     restore_env_value("DS4_CUDA_TP_PREFILL_ATTN_ROWS", old_attn_rows);
     restore_env_value("DS4_CUDA_TP_PREFILL_T32_HEADS", old_t32_heads);
+    restore_env_value(weight_mode_name, old_weight_mode);
 }
 
 static void test_cuda_tp_prefill_attn_rows_default(void) {

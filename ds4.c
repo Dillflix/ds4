@@ -15825,6 +15825,33 @@ static bool cuda_tp_prefill_attn_token_rows_env_enabled(void) {
 #endif
 }
 
+/* The initial token-row proof materializes complete F16 projection matrices
+ * on both members of the selected pair.  Keep that qualified implementation
+ * as the default/rollback arm, while an explicit native-stream mode retains
+ * the tagged native Q8 matrices and dequantizes one projection at a time into
+ * pre-reserved scratch.  The exact spelling is deliberately fail-closed in
+ * the startup planner below. */
+static bool cuda_tp_prefill_attn_token_rows_native_stream_enabled(void) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    return false;
+#else
+    const char *mode = getenv(
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    return mode && strcmp(mode, "native-stream") == 0;
+#endif
+}
+
+static bool cuda_tp_prefill_attn_token_rows_weight_mode_valid(void) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    return true;
+#else
+    const char *mode = getenv(
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    return !mode || !mode[0] || strcmp(mode, "f16") == 0 ||
+           strcmp(mode, "native-stream") == 0;
+#endif
+}
+
 static bool cuda_tp_prefill_t32_heads_pair_enabled(int home_tier) {
     return cuda_tp_prefill_t32_heads_env_enabled() && home_tier == 1;
 }
@@ -60572,9 +60599,10 @@ static int engine_append_q8_native_gguf_range(
 /* Tagged GGUF data is already in its final SM75 representation.  Plan one
  * ordinary selective-cache span for each final owner, plus borrowed execution
  * views over those same allocations.  Those views serve prefill, decode, and
- * fused paths without allocating or owning a second copy.  T32 remains
- * home-only, A is split by output rows, and B's file representation places its
- * two K halves in two contiguous spans. */
+ * fused paths without allocating or owning a second copy.  The base layout
+ * keeps T32 home-only, splits A by output rows, and stores B as two contiguous
+ * K halves.  The explicit native-stream override below instead installs one
+ * complete local Q8 view per selected token-row owner. */
 static int engine_plan_q8_native_gguf_tensor(
         const ds4_tensor      *t,
         uint32_t               path_class,
@@ -60592,6 +60620,42 @@ static int engine_plan_q8_native_gguf_tensor(
     const uint64_t full_blocks = t->dim[0] / 32u;
     const int home_device = g_gpu[home_tier].device_id;
     const int partner_device = g_gpu[partner_tier].device_id;
+
+    /* Native-stream token-row execution needs a complete local source on
+     * each owner, but only for the explicitly selected pair.  These are
+     * ordinary startup selective-cache spans borrowed by the native range
+     * table: no runtime replacement, freeing, or peer weight reads. */
+    const bool token_rows_native_stream =
+        cuda_tp_prefill_attn_token_rows_native_stream_enabled() &&
+        cuda_tp_prefill_attn_token_rows_pair_enabled(home_tier) &&
+        (path_class == ACCEL_Q8_CACHE_T32_Q_B ||
+         path_class == ACCEL_Q8_CACHE_OUTPUT_A ||
+         path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B);
+    if (token_rows_native_stream) {
+        const uint32_t source_layout =
+            path_class == ACCEL_Q8_CACHE_T256_OUTPUT_B
+                ? DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32
+                : DS4_Q8_NATIVE_LAYOUT_ROW_WARP32;
+        if (engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                home_tier, home_device, t->abs_offset, t->bytes) != 0 ||
+            engine_append_device_cache_span(
+                per_dev_ranges, per_dev_n, per_dev_cap,
+                partner_tier, partner_device, t->abs_offset, t->bytes) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                home_tier, home_device, t->abs_offset, t->bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, full_blocks, t->dim[1],
+                source_layout) != 0 ||
+            engine_append_q8_native_gguf_range(
+                per_dev_native, per_dev_native_n, per_dev_native_cap,
+                partner_tier, partner_device, t->abs_offset, t->bytes,
+                t->abs_offset, t->bytes, t->abs_offset,
+                full_blocks, 0u, full_blocks, t->dim[1],
+                source_layout) != 0) return -1;
+        return 1;
+    }
 
     if (path_class == ACCEL_Q8_CACHE_T32_Q_B) {
         if (engine_append_device_cache_span(
@@ -60835,6 +60899,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
     uint64_t required_token_rows_t32 = 0u;
     uint64_t required_token_rows_output_a = 0u;
     uint64_t required_token_rows_output_b = 0u;
+    uint64_t native_stream_token_rows_t32 = 0u;
+    uint64_t native_stream_token_rows_output_a = 0u;
+    uint64_t native_stream_token_rows_output_b = 0u;
     const char *partner_classes = getenv("DS4_CUDA_Q8_F16_PARTNER_CLASSES");
     if (!partner_classes || !partner_classes[0])
         partner_classes = "automatic:t32,t256,shared_down";
@@ -60897,6 +60964,24 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
     const bool token_rows_requested =
         token_rows_pairs_env && token_rows_pairs_env[0];
+    const char *token_rows_weight_mode_env = getenv(
+        "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
+    if (!cuda_tp_prefill_attn_token_rows_weight_mode_valid()) {
+        fprintf(stderr,
+                "ds4: invalid "
+                "DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE='%s'; "
+                "expected f16 or native-stream\n",
+                token_rows_weight_mode_env ? token_rows_weight_mode_env : "");
+        return -1;
+    }
+    const bool token_rows_native_stream =
+        cuda_tp_prefill_attn_token_rows_native_stream_enabled();
+    if (token_rows_native_stream && !token_rows_requested) {
+        fprintf(stderr,
+                "ds4: token-row native-stream weight mode requires an "
+                "explicit token-row pipeline pair selector\n");
+        return -1;
+    }
     if (token_rows_requested &&
         (!cuda_tp_decode || e->quality ||
          getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL ||
@@ -60933,6 +61018,10 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             token_rows_layer_count++;
         }
     }
+    const uint64_t token_rows_native_stream_layer_count =
+        token_rows_native_stream ? token_rows_layer_count : 0u;
+    const uint64_t token_rows_f16_extra_count =
+        token_rows_native_stream ? 0u : token_rows_layer_count;
     const bool split_attn_output =
         cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
     const bool split_attn_heads_legacy =
@@ -61108,7 +61197,19 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             required_full_prefill_binding ? -1 : fallback_device;
         bool ok = true;
 
-        if (native_pair_token_rows) {
+        if (native_pair_token_rows && token_rows_native_stream) {
+            /* The complete tagged native matrix is installed locally on both
+             * owners by engine_plan_q8_native_gguf_tensor.  Deliberately add
+             * no persistent F16 entry here: the runtime decodes one matrix at
+             * a time into startup-reserved scratch. */
+            if (path_class == ACCEL_Q8_CACHE_T32_Q_B) {
+                native_stream_token_rows_t32++;
+            } else if (path_class == ACCEL_Q8_CACHE_OUTPUT_A) {
+                native_stream_token_rows_output_a++;
+            } else {
+                native_stream_token_rows_output_b++;
+            }
+        } else if (native_pair_token_rows) {
             /* Contiguous token rows remain independently executable through
              * q_b and output A+B, so each pair member needs a complete local
              * projection binding.  These are required startup F16 bindings,
@@ -61252,33 +61353,52 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
         }
     }
     if (split_attn_token_rows &&
-        (required_token_rows_t32 != token_rows_layer_count ||
-         required_token_rows_output_a != token_rows_layer_count ||
-         required_token_rows_output_b != token_rows_layer_count)) {
+        ((token_rows_native_stream &&
+          (required_token_rows_t32 != 0u ||
+           required_token_rows_output_a != 0u ||
+           required_token_rows_output_b != 0u ||
+           native_stream_token_rows_t32 != token_rows_layer_count ||
+           native_stream_token_rows_output_a != token_rows_layer_count ||
+           native_stream_token_rows_output_b != token_rows_layer_count)) ||
+         (!token_rows_native_stream &&
+          (required_token_rows_t32 != token_rows_layer_count ||
+           required_token_rows_output_a != token_rows_layer_count ||
+           required_token_rows_output_b != token_rows_layer_count ||
+           native_stream_token_rows_t32 != 0u ||
+           native_stream_token_rows_output_a != 0u ||
+           native_stream_token_rows_output_b != 0u)))) {
         fprintf(stderr,
                 "ds4: TP-style prefill attention token-row binding inventory "
-                "is incomplete: layers=%llu T32=%llu A=%llu B=%llu\n",
+                "is incomplete: mode=%s layers=%llu required=%llu/%llu/%llu "
+                "native-stream=%llu/%llu/%llu\n",
+                token_rows_native_stream ? "native-stream" : "f16",
                 (unsigned long long)token_rows_layer_count,
                 (unsigned long long)required_token_rows_t32,
                 (unsigned long long)required_token_rows_output_a,
-                (unsigned long long)required_token_rows_output_b);
+                (unsigned long long)required_token_rows_output_b,
+                (unsigned long long)native_stream_token_rows_t32,
+                (unsigned long long)native_stream_token_rows_output_a,
+                (unsigned long long)native_stream_token_rows_output_b);
         free(plan);
         return -1;
     }
     if (e->model.sm75_dense_q8_layout ==
             DS4_TENSOR_LAYOUT_SM75_Q8_WARP32 &&
          (required_class_count[ACCEL_Q8_CACHE_T32_Q_B] !=
-             DS4_N_LAYER + required_t32_head_shards +
-                 token_rows_layer_count ||
+             DS4_N_LAYER - token_rows_native_stream_layer_count +
+                 required_t32_head_shards + token_rows_f16_extra_count ||
           required_class_count[ACCEL_Q8_CACHE_OUTPUT_A] !=
-              DS4_N_LAYER + required_rows_output_a +
-                  required_output_a_head_shards +
-                  token_rows_layer_count ||
+              DS4_N_LAYER - token_rows_native_stream_layer_count +
+                  required_rows_output_a + required_output_a_head_shards +
+                  token_rows_f16_extra_count ||
           required_class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B] !=
-              DS4_N_LAYER + token_rows_layer_count ||
-          required_count != 3u * DS4_N_LAYER + required_rows_output_a +
+              DS4_N_LAYER - token_rows_native_stream_layer_count +
+                  token_rows_f16_extra_count ||
+          required_count != 3u *
+                  (DS4_N_LAYER - token_rows_native_stream_layer_count) +
+              required_rows_output_a +
               required_t32_head_shards + required_output_a_head_shards +
-              3u * token_rows_layer_count)) {
+              3u * token_rows_f16_extra_count)) {
         fprintf(stderr,
                 "ds4: tagged native dense-Q8 produced an invalid required "
                 "execution-binding plan: T32=%llu A=%llu B=%llu total=%llu; "
@@ -61290,19 +61410,23 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
                 (unsigned long long)
                     required_class_count[ACCEL_Q8_CACHE_T256_OUTPUT_B],
                 (unsigned long long)required_count,
-                (unsigned long long)(DS4_N_LAYER +
-                                     required_t32_head_shards +
-                                     token_rows_layer_count),
-                (unsigned long long)(DS4_N_LAYER + required_rows_output_a +
-                                     required_output_a_head_shards +
-                                     token_rows_layer_count),
-                (unsigned long long)(DS4_N_LAYER +
-                                     token_rows_layer_count),
-                (unsigned long long)(3u * DS4_N_LAYER +
+                (unsigned long long)(
+                    DS4_N_LAYER - token_rows_native_stream_layer_count +
+                    required_t32_head_shards + token_rows_f16_extra_count),
+                (unsigned long long)(
+                    DS4_N_LAYER - token_rows_native_stream_layer_count +
+                    required_rows_output_a + required_output_a_head_shards +
+                    token_rows_f16_extra_count),
+                (unsigned long long)(
+                    DS4_N_LAYER - token_rows_native_stream_layer_count +
+                    token_rows_f16_extra_count),
+                (unsigned long long)(
+                    3u * (DS4_N_LAYER -
+                          token_rows_native_stream_layer_count) +
                                      required_rows_output_a +
                                      required_t32_head_shards +
                                      required_output_a_head_shards +
-                                     3u * token_rows_layer_count));
+                                     3u * token_rows_f16_extra_count));
         free(plan);
         return -1;
     }
@@ -61310,7 +61434,9 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             "ds4: CUDA q8 fp16 benefit plan candidates=%llu "
             "T32-q_b=%llu T256-output_b=%llu output_a=%llu shared_down=%llu "
             "other=%llu partner-fallback=%llu required-native=%llu "
-            "token-row-pair-mask=0x%x token-row-required=%llu/%llu/%llu "
+            "token-row-pair-mask=0x%x token-row-weight-mode=%s "
+            "token-row-required=%llu/%llu/%llu "
+            "token-row-native-stream=%llu/%llu/%llu "
             "partner-classes=%s "
             "partner-layers=%s "
             "home-order=%s partner-arithmetic=%s t256-placement=%s "
@@ -61325,9 +61451,13 @@ static int engine_plan_q8_f16_cache(ds4_engine *e, bool cuda_tp_decode) {
             (unsigned long long)partner_fallback_count,
             (unsigned long long)required_count,
             (unsigned)token_rows_pair_mask,
+            token_rows_native_stream ? "native-stream" : "f16",
             (unsigned long long)required_token_rows_t32,
             (unsigned long long)required_token_rows_output_a,
             (unsigned long long)required_token_rows_output_b,
+            (unsigned long long)native_stream_token_rows_t32,
+            (unsigned long long)native_stream_token_rows_output_a,
+            (unsigned long long)native_stream_token_rows_output_b,
             partner_classes,
             partner_layers,
             freeze_home_plan ? "frozen" : "partner-priority",
@@ -61722,10 +61852,18 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                 "resident through prefill\n");
     }
     if (q8_native_gguf) {
-        fprintf(stderr,
-                "ds4: tagged SM75 dense-Q8 GGUF installed through ordinary "
-                "single-owner residency (T32 home, A rows split, B K shards "
-                "split); runtime replacement disabled\n");
+        if (cuda_tp_prefill_attn_token_rows_native_stream_enabled()) {
+            fprintf(stderr,
+                    "ds4: tagged SM75 dense-Q8 GGUF installed through ordinary "
+                    "startup selective residency; selected token-row pair "
+                    "q_b/A/B sources are complete and local on both owners; "
+                    "runtime replacement and peer weight reads disabled\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: tagged SM75 dense-Q8 GGUF installed through ordinary "
+                    "single-owner residency (T32 home, A rows split, B K shards "
+                    "split); runtime replacement disabled\n");
+        }
     }
     if (engine_plan_q8_f16_cache(e, cuda_tp_decode) != 0) goto cleanup;
     rc = 0;
@@ -62207,6 +62345,14 @@ bool ds4_test_cuda_tp_prefill_attn_token_rows_requested(void) {
 
 bool ds4_test_cuda_tp_prefill_attn_token_rows_pair_enabled(int home_tier) {
     return cuda_tp_prefill_attn_token_rows_pair_enabled(home_tier);
+}
+
+bool ds4_test_cuda_tp_prefill_attn_token_rows_native_stream(void) {
+    return cuda_tp_prefill_attn_token_rows_native_stream_enabled();
+}
+
+bool ds4_test_cuda_tp_prefill_attn_token_rows_weight_mode_valid(void) {
+    return cuda_tp_prefill_attn_token_rows_weight_mode_valid();
 }
 
 int ds4_test_cuda_tp_prefill_attn_pair_mode(int home_tier) {
