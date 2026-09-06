@@ -31,6 +31,8 @@ Optional environment:
   DIAGNOSTIC_PREFILL_ISOLATION=0    1: PP4096 exact F32, direct compact
                                     prefill, and compact-storage/F32-consumer
                                     three-arm comparison
+  DIAGNOSTIC_COMMIT_AUDIT=0         1: PP4096 F32/compact committed owner-row
+                                    and partner-mirror binary comparison
   DIAGNOSTIC_DECODE_ISOLATION=0     1: compact PP512 one-token runs only,
                                     first without and then with snapshot
   DIAGNOSTIC_DECODE_PROFILE=0       1: Nsight Systems capture of the second
@@ -65,6 +67,7 @@ MIN_COMPACT_VRAM_SAVING_MIB=${MIN_COMPACT_VRAM_SAVING_MIB:-auto}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-1.0}
 DIAGNOSTIC_PACK_AUDIT=${DIAGNOSTIC_PACK_AUDIT:-0}
 DIAGNOSTIC_PREFILL_ISOLATION=${DIAGNOSTIC_PREFILL_ISOLATION:-0}
+DIAGNOSTIC_COMMIT_AUDIT=${DIAGNOSTIC_COMMIT_AUDIT:-0}
 DIAGNOSTIC_DECODE_ISOLATION=${DIAGNOSTIC_DECODE_ISOLATION:-0}
 DIAGNOSTIC_DECODE_PROFILE=${DIAGNOSTIC_DECODE_PROFILE:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -110,6 +113,7 @@ awk -v ratio="$MIN_THROUGHPUT_RATIO" \
     'BEGIN {exit !(ratio+0>0 && ratio+0<=1)}' ||
     die "MIN_THROUGHPUT_RATIO must be in (0,1]"
 for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
+            DIAGNOSTIC_COMMIT_AUDIT \
             DIAGNOSTIC_DECODE_ISOLATION \
             DIAGNOSTIC_DECODE_PROFILE \
             SKIP_BUILD CREATE_ARCHIVE; do
@@ -117,6 +121,7 @@ for flag in DIAGNOSTIC_PACK_AUDIT DIAGNOSTIC_PREFILL_ISOLATION \
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 (( DIAGNOSTIC_PACK_AUDIT + DIAGNOSTIC_PREFILL_ISOLATION +
+   DIAGNOSTIC_COMMIT_AUDIT +
    DIAGNOSTIC_DECODE_ISOLATION +
    DIAGNOSTIC_DECODE_PROFILE <= 1 )) ||
     die "select at most one diagnostic mode"
@@ -154,7 +159,7 @@ done
 
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR"/{runs,exact,telemetry,summary,provenance,nsys}
+mkdir -p "$OUTPUT_DIR"/{runs,exact,telemetry,summary,provenance,nsys,checkpoints}
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 phase=initialization
@@ -394,8 +399,16 @@ run_case() {
     local format=f32
     local -a audit_env=() cmd
     [[ $arm == compact* ]] && format=sm75-compact
-    if [[ $arm == compact* && ($kind == exact || $kind == pack-audit) ]]; then
+    if [[ $arm == compact* &&
+          ($kind == exact || $kind == pack-audit || $kind == commit-audit) ]]; then
         audit_env+=(DS4_CUDA_COMPACT_ATTN_PACK_AUDIT=1)
+    fi
+    if [[ $kind == commit-audit ]]; then
+        mkdir -p "$OUTPUT_DIR/checkpoints/$arm"
+        audit_env+=(
+            "DS4_METAL_GRAPH_DUMP_PREFIX=$OUTPUT_DIR/checkpoints/$arm/checkpoint"
+            DS4_METAL_GRAPH_DUMP_NAME=attn_comp_commit_owner,attn_comp_commit_mirror
+        )
     fi
     if [[ $arm == compact-materialized ]]; then
         audit_env+=(DS4_CUDA_COMPACT_ATTN_PREFILL_MATERIALIZE=1)
@@ -635,6 +648,68 @@ if [[ $DIAGNOSTIC_PREFILL_ISOLATION == 1 ]]; then
     } | tee "$OUTPUT_DIR/summary/prefill-isolation.txt"
     phase=finished
     printf 'Compact-KV PP4096 prefill isolation complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
+
+if [[ $DIAGNOSTIC_COMMIT_AUDIT == 1 ]]; then
+    phase=commit-audit
+    capture_gpu_health "$OUTPUT_DIR/initial-gpu.csv" ||
+        die "could not capture initial four-GPU health"
+    for arm in f32 compact; do
+        base="$OUTPUT_DIR/exact/$arm-commit-audit"
+        printf 'Compact-KV PP4096 committed-row audit arm=%s...\n' "$arm"
+        run_case "$arm" commit-audit 1 "$base" "" 4096 || {
+            tail -n 240 "$base.log" >&2 || true
+            die "$arm PP4096 committed-row audit run failed"
+        }
+    done
+
+    compare_commit_class() {
+        local class=$1
+        local f32_dir="$OUTPUT_DIR/checkpoints/f32"
+        local compact_dir="$OUTPUT_DIR/checkpoints/compact"
+        local f32_list="$OUTPUT_DIR/summary/f32-$class-files.txt"
+        local compact_list="$OUTPUT_DIR/summary/compact-$class-files.txt"
+        local inventory=false exact=false first=none file
+        find "$f32_dir" -maxdepth 1 -type f \
+            -name "checkpoint_attn_comp_commit_$class-*.bin" \
+            -printf '%f\n' | sort -V >"$f32_list"
+        find "$compact_dir" -maxdepth 1 -type f \
+            -name "checkpoint_attn_comp_commit_$class-*.bin" \
+            -printf '%f\n' | sort -V >"$compact_list"
+        local f32_count compact_count
+        f32_count=$(wc -l <"$f32_list")
+        compact_count=$(wc -l <"$compact_list")
+        if cmp -s "$f32_list" "$compact_list"; then
+            inventory=true
+            exact=true
+            while IFS= read -r file; do
+                if ! cmp -s "$f32_dir/$file" "$compact_dir/$file"; then
+                    exact=false
+                    first=$file
+                    break
+                fi
+            done <"$f32_list"
+        else
+            first=inventory
+        fi
+        printf '%s_inventory_equal=%s\n' "$class" "$inventory"
+        printf '%s_f32_files=%s\n' "$class" "$f32_count"
+        printf '%s_compact_files=%s\n' "$class" "$compact_count"
+        printf '%s_contents_bit_exact=%s\n' "$class" "$exact"
+        printf '%s_first_difference=%s\n' "$class" "$first"
+    }
+
+    {
+        printf 'mode=pp4096-committed-row-boundary\n'
+        printf 'representation=shipping-rounded-f32\n'
+        compare_commit_class owner
+        compare_commit_class mirror
+        printf 'acceptance_evidence=no\n'
+    } | tee "$OUTPUT_DIR/summary/commit-audit.txt"
+    phase=finished
+    printf 'Compact-KV PP4096 committed-row boundary audit complete: %s\n' \
+        "$OUTPUT_DIR"
     exit 0
 fi
 

@@ -5657,6 +5657,17 @@ because its selector disabled only the at-most-32-token hybrid indexed kernel
 and could not affect PP4096 prefill. Divergence is a diagnostic result rather
 than a runner failure; this is not promotion evidence.
 
+`DIAGNOSTIC_COMMIT_AUDIT=1` runs only the F32 and compact PP4096 arms and
+captures every just-committed compressed-attention row span after the mirror
+copy has been ordered. Compact owner and partner-mirror spans are expanded to
+the canonical shipping-rounded F32 representation before being written. The
+runner compares owner inventories/content separately from mirror
+inventories/content and reports the first differing checkpoint. An owner
+mismatch assigns the fault before transport (producer input, row destination,
+or owner commit); matching owners with a mirror mismatch assigns it to mirror
+placement/copy/order. The dump synchronization and files are diagnostic-only,
+so this mode is not timing or promotion evidence.
+
 The `20260906T002649Z` run completed the corrected continuation isolation: 516
 measured materializations covering 1024 staged rows were observed. Direct
 compact and materialized-F32 prefill were byte-identical to each other but not

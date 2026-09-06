@@ -22065,18 +22065,98 @@ static bool metal_graph_cuda_tp_attn_cache_sync_comp_rows(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (!metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il)) return true;
+    if (!g || il >= DS4_N_LAYER) return false;
     if (rows == 0) return true;
     if (first_row > g->layer_comp_cap[il] ||
         rows > g->layer_comp_cap[il] - first_row) return false;
-    const uint64_t row_bytes = metal_graph_attn_comp_cache_row_bytes(g);
-    return metal_graph_cuda_tp_attn_cache_copy_row(
-        g->layer_attn_comp_cache_tp[il],
+    const bool mirrored = metal_graph_cuda_tp_attn_cache_dup_layer_ready(g, il);
+    bool ok = true;
+    if (mirrored) {
+        const uint64_t row_bytes = metal_graph_attn_comp_cache_row_bytes(g);
+        ok = metal_graph_cuda_tp_attn_cache_copy_row(
+            g->layer_attn_comp_cache_tp[il],
+            g->layer_attn_comp_cache[il],
+            (uint64_t)first_row * row_bytes,
+            (uint64_t)rows * row_bytes,
+            il, first_row,
+            DS4_CUDA_TP_ATTN_CACHE_COMP);
+    }
+
+    /* Diagnostic-only committed-row boundary. The codec audit proves
+     * equivalence for the producer row presented to it, but does not prove
+     * that the F32 and compact graphs produced the same logical row or that a
+     * pair-local mirror received it at the same location. Expand each just-
+     * committed compact span back to canonical rounded F32 and feed owner and
+     * mirror through the ordinary dump hook. No synchronization or extra work
+     * is added unless these exact dump names are requested. */
+    const char *owner_name = "attn_comp_commit_owner";
+    const char *mirror_name = "attn_comp_commit_mirror";
+    const bool want_owner = ok &&
+        metal_graph_debug_wants(owner_name, il, first_row);
+    const bool want_mirror = ok && mirrored &&
+        metal_graph_debug_wants(mirror_name, il, first_row);
+    if (!want_owner && !want_mirror) return ok;
+
+    const int saved_tier = g->active_tier;
+    ds4_gpu_tensor *caches[2] = {
         g->layer_attn_comp_cache[il],
-        (uint64_t)first_row * row_bytes,
-        (uint64_t)rows * row_bytes,
-        il, first_row,
-        DS4_CUDA_TP_ATTN_CACHE_COMP);
+        g->layer_attn_comp_cache_tp[il]
+    };
+    const char *names[2] = {owner_name, mirror_name};
+    const bool wanted[2] = {want_owner, want_mirror};
+    for (uint32_t i = 0; ok && i < 2u; i++) {
+        if (!wanted[i]) continue;
+        ds4_gpu_tensor *cache = caches[i];
+        if (!cache) {
+            ok = false;
+            break;
+        }
+        const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
+        if (g->attn_comp_cache_format ==
+            DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) {
+            const int tier = ds4_gpu_tensor_device(cache);
+            ds4_gpu_tensor *stage = tier >= 0 && tier < DS4_MAX_GPUS
+                ? g->attn_comp_stage_by_tier[tier] : NULL;
+            if (tier < 0 || tier >= DS4_MAX_GPUS ||
+                rows > g->attn_comp_stage_cap || !stage ||
+                ds4_gpu_tensor_device(stage) != tier ||
+                ds4_gpu_set_current_device_fenced(tier) != 0 ||
+                !ds4_gpu_attn_compact_unpack_tensor(
+                    stage, 0u, cache, first_row, rows)) {
+                fprintf(stderr,
+                        "ds4: committed compact attention dump failed "
+                        "class=%s layer=%u first-row=%u rows=%u tier=%d\n",
+                        i == 0u ? "owner" : "mirror",
+                        il, first_row, rows, tier);
+                ok = false;
+                break;
+            }
+            metal_graph_debug_dump_tensor(
+                names[i], stage, count, il, first_row);
+        } else {
+            const uint64_t row_bytes =
+                metal_graph_attn_comp_cache_row_bytes(g);
+            ds4_gpu_tensor *view = ds4_gpu_tensor_view(
+                cache, (uint64_t)first_row * row_bytes,
+                (uint64_t)rows * row_bytes);
+            if (!view) {
+                ok = false;
+                break;
+            }
+            metal_graph_debug_dump_tensor(
+                names[i], view, count, il, first_row);
+            ds4_gpu_tensor_free(view);
+        }
+    }
+    if (saved_tier >= 0 && saved_tier < DS4_MAX_GPUS &&
+        ds4_gpu_set_current_device_fenced(saved_tier) != 0) {
+        fprintf(stderr,
+                "ds4: failed to restore CUDA tier after committed compact "
+                "attention dump: tier=%d\n",
+                saved_tier);
+        ok = false;
+    }
+    return ok;
 }
 
 static bool metal_graph_cuda_tp_attn_cache_sync_raw_row(
