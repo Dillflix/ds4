@@ -5826,6 +5826,27 @@ that valid run because its generic selector gate still required the obsolete
 hybrid-consumer summary; the indexed-decode mode now validates the exact-score
 and exact-indexed summaries that it actually requests.
 
+The `20260906T193434Z` full run completed both performance arms through PP32768
+and TG256 before the same obsolete generic selector rejected the compact arm.
+It reported 20,799 exact-score calls and 10,689 exact selected-row indexed
+calls, with no persistent-extra allocation.  Its completed telemetry measured
+162,469 MiB peak aggregate residency for F32 and 159,719 MiB for compact, a
+2,750 MiB saving versus the 2,701 MiB topology-derived expectation.  The
+performance payload is diagnostic rather than promotion evidence because the
+exact arms did not run and the candidate misses the 0.95 prefill gate at two
+frontiers:
+
+| Context | F32 prefill tok/s | Compact prefill tok/s | Prefill ratio | F32 steady decode tok/s | Compact steady decode tok/s | Decode ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 509.250 | 487.210 | 0.956721x | 30.370 | 29.640 | 0.975963x |
+| 4096 | 525.670 | 478.000 | 0.909316x | 24.610 | 25.360 | 1.030475x |
+| 32768 | 455.060 | 411.080 | 0.903353x | 21.920 | 22.040 | 1.005474x |
+
+The ordinary production/exact selector now requires the two exact compact
+decode summaries actually used by these runs instead of the bounded hybrid
+prototype summary.  The prefill regression remains a performance problem and
+is not hidden by this runner correction.
+
 ```bash
 MODEL="$PWD/gguf/ds4/DeepSeek-V4-Flash-0731-SM75-Q3A4-All-Q4-32-Down-SM75-Native-Q8.gguf" \
 PROMPT="$PWD/speed-bench/promessi_sposi.txt" \
