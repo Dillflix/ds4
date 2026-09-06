@@ -382,7 +382,7 @@ int main(void) {
                     HALF_TOK, POS0 + HALF_TOK) ||
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(q_split, 0u, candidate, q_bytes)) {
-        fprintf(stderr, "error: production-faithful q_b scratch runtime failed\n");
+        fprintf(stderr, "error: internal token-row q_b scratch runtime failed\n");
         goto cleanup;
     }
     const diff_metrics q_scratch_diff = compare_f32(
@@ -431,8 +431,7 @@ int main(void) {
     /* Save the full-range result as the baseline before its output tensor is
      * overwritten by the two ordered rectangular launches. */
     memcpy(reference, candidate, (size_t)heads_bytes);
-    if (
-        !ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+    if (!ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
             heads0, model, model_bytes, sinks_offset, q_ref0, raw, comp, 0u,
             0u, HALF_TOK, N_TOK, N_COMP, ATTN_WINDOW, ATTN_RATIO,
             N_HEAD, HEAD_DIM) ||

@@ -107,6 +107,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(boundary=|attention_boundary=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(boundary=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

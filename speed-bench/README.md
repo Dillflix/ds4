@@ -5974,6 +5974,27 @@ attention-row dispatch.  This mode is intentionally restricted to
 diagnostic evidence for the old internal-pair machinery, not a promotion gate
 for the rank-local row-owned design.
 
+The bounded PP4096 reference completed without a device loss.  The accepted
+control kept pair-0 attention off (`attention-pair-mask=0x2`) while splitting
+both indexers and measured 536.08 prefill tok/s.  The candidate enabled the
+older pair-0 attention-row path (`attention-pair-mask=0x3`) in addition to the
+qualified pair-1 T32 head shard, retained both indexer splits, produced
+byte-identical frontier logits, and measured 593.70 tok/s (1.107484x).  Peak
+system VRAM remained 42,803 MiB on GPU 0 in both arms.  The prior matched
+PP4096 head-shard-only run measured 542.34 versus 536.99 tok/s; because the two
+control measurements differ by less than 0.2%, the cross-run comparison
+suggests that pair-0 attention splitting accounts for roughly a further 9.5%
+over the head-shard-only candidate.  That attribution is informative but is
+not a paired isolation result.
+
+This successful short reference does not reverse the pair-0 production safety
+decision.  The candidate still logged `full-head-gather-to-home` on pair 0,
+and PP4096 does not reproduce the sustained cache growth and transfer count of
+the earlier device-loss workloads.  It demonstrates substantial unused
+pair-0 compute capacity and strengthens the performance case for replacing
+the gather implementation with rank-local row ownership through attention B;
+it does not establish the older internal-pair path as safe at 32K or longer.
+
 ```bash
 CTX_TOKENS=512 PAIR1_INDEXER_SPLIT=0 BOUNDARY_AUDIT_ONLY=1 \
 BOUNDARY_AUDIT_LAYER=22 \
@@ -5996,9 +6017,8 @@ bash ./speed-bench/cuda-sm75-t32-headshard-exactness.sh
 
 `cuda-sm75-token-row-arithmetic.sh` is a bounded single-GPU diagnostic for
 the production zero-prefix 512-row microbatch versus two ordered 256-row calls.
-It does
-not alter production dispatch.  With identical synthetic inputs and cached
-Q8-to-F16 weights, whose successful materialization is a hard setup gate, it
+It does not alter production dispatch.  With identical synthetic inputs and
+cached Q8-to-F16 weights, whose successful materialization is a hard setup gate, it
 reports bit mismatches independently at q_b's FP16
 projection and RMS/RoPE output, static-mixed attention, inverse RoPE, output
 A's low-rank result, the combined A+B result, and an isolated output-B GEMM.
@@ -6006,8 +6026,8 @@ The static-mixed comparison models the first zero-prefix chunk, where the
 control uses one full 512-row launch and token-row ownership uses two
 rectangular 256-row launches over the same full KV batch.
 The q_b check includes both explicit FP16-output tensors and the current
-internal token-row candidate's NULL/scratch form.  Arithmetic mismatches are evidence, not harness
-failures; setup and runtime errors remain fatal.  Compute Sanitizer reruns the
+internal token-row candidate's NULL/scratch form.  Arithmetic mismatches are
+evidence, not harness failures; setup and runtime errors remain fatal.  Compute Sanitizer reruns the
 q_b row-view and NULL/scratch boundary as a reduced memory-safety smoke; the
 ordinary run covers every listed arithmetic boundary at full shape.
 
