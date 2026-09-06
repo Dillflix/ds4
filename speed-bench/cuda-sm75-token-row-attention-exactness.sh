@@ -214,7 +214,8 @@ for gpu in 0 1 2 3; do
         printf 'gpu=%s\n' "$gpu"
         timeout 20s nvidia-smi -q -i "$gpu" | awk '
             /BAR1 Memory Usage/ { found = 1; print; next }
-            found && /Total/ { print; exit }
+            found && /Total/ { print; captured = 1; found = 0 }
+            END { if (!captured) exit 1 }
         '
     } >>"$OUTPUT_DIR/provenance/bar1-before.txt" ||
         die "could not capture GPU $gpu BAR1 inventory"
