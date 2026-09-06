@@ -5705,6 +5705,18 @@ Q construction, raw-KV append, compact owner commit, or peer mirror. The
 three-arm audit now adds the two missing boundaries around inverse RoPE and the
 materialized-F32 control needed to assign that interval precisely.
 
+The `20260906T054556Z` three-arm stage audit found the first difference in raw
+attention heads. Direct compact and materialized-F32 compact were byte-identical
+at every captured stage, while both differed from F32 beginning in token row
+12's heads. This excludes compact decode instructions and the inverse-RoPE and
+output-projection kernels. It does not yet prove the persistent attention inputs
+were identical: the earlier `ckv_stage_raw` payload contains only the current
+batch, while continuation attention also reads historical rows from the raw
+ring. The stage audit therefore now captures the complete persistent raw ring
+and an F32 expansion of every compressed-cache row immediately before the
+layer-6 attention launch. Comparing those read-boundary payloads distinguishes
+snapshot/restore or cache mutation from a dispatch/parameter discrepancy.
+
 The `20260906T002649Z` run completed the corrected continuation isolation: 516
 measured materializations covering 1024 staged rows were observed. Direct
 compact and materialized-F32 prefill were byte-identical to each other but not

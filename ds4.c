@@ -21427,6 +21427,54 @@ static void metal_graph_attn_comp_prefill_target_free(
     }
 }
 
+/* Diagnostic-only read boundary for continuation attention. Commit dumps
+ * establish what each producer wrote, but a continuation can still consume a
+ * different persistent cache after snapshot restore or later mutation. Expand
+ * the exact compact representation into a temporary F32 tensor so the stage
+ * audit compares the values presented to the attention consumer, not their
+ * physical encodings. No allocation or synchronization occurs unless this
+ * exact dump name is selected. */
+static bool metal_graph_debug_dump_attn_comp_cache_f32(
+        const char    *name,
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       rows,
+        uint32_t       pos0) {
+    if (!metal_graph_debug_wants(name, il, pos0)) return true;
+    if (!g || il >= DS4_N_LAYER || !g->layer_attn_comp_cache[il] ||
+        rows > g->layer_comp_cap[il]) return false;
+
+    const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
+    if (g->attn_comp_cache_format == DS4_GPU_ATTN_COMP_CACHE_F32) {
+        ds4_gpu_tensor *view = ds4_gpu_tensor_view(
+                g->layer_attn_comp_cache[il], 0u,
+                count * sizeof(float));
+        if (!view) return false;
+        metal_graph_debug_dump_tensor(name, view, count, il, pos0);
+        ds4_gpu_tensor_free(view);
+        return true;
+    }
+    if (g->attn_comp_cache_format !=
+        DS4_GPU_ATTN_COMP_CACHE_SM75_COMPACT) return false;
+
+    const int saved_tier = g->active_tier;
+    const int tier = ds4_gpu_tensor_device(g->layer_attn_comp_cache[il]);
+    bool ok = tier >= 0 && tier < DS4_MAX_GPUS &&
+              ds4_gpu_set_current_device_fenced(tier) == 0;
+    ds4_gpu_tensor *expanded = ok
+        ? ds4_gpu_tensor_alloc_ptr_on(tier, count * sizeof(float)) : NULL;
+    ok = ok && expanded &&
+         ds4_gpu_attn_compact_unpack_tensor(
+             expanded, 0u, g->layer_attn_comp_cache[il], 0u, rows) != 0;
+    if (ok) {
+        metal_graph_debug_dump_tensor(name, expanded, count, il, pos0);
+    }
+    ds4_gpu_tensor_free(expanded);
+    if (saved_tier >= 0 && saved_tier < DS4_MAX_GPUS &&
+        ds4_gpu_set_current_device_fenced(saved_tier) != 0) ok = false;
+    return ok;
+}
+
 /* The SM75 indexer cache is natively F16. Compressor/QAT kernels retain
  * their existing F32 arithmetic in a per-tier stage and commit each emitted
  * row once. Shipping WMMA prefill already rounds these K values to F16 inside
@@ -31942,6 +31990,26 @@ static bool metal_graph_encode_layer_attention_batch(
                     use_indexed_comp = true;
                 }
                 use_comp_mask = 1;
+            }
+            if (ok) {
+                metal_graph_debug_dump_tensor(
+                    "ckv_stage_raw_cache", g->layer_raw_cache[il],
+                    (uint64_t)g->raw_cap * DS4_N_HEAD_DIM, il, pos0);
+                ok = metal_graph_debug_dump_attn_comp_cache_f32(
+                    "ckv_stage_comp_cache", g, il, n_comp, pos0);
+                if (ok &&
+                    (metal_graph_debug_wants(
+                         "ckv_stage_raw_cache", il, pos0) ||
+                     metal_graph_debug_wants(
+                         "ckv_stage_comp_cache", il, pos0))) {
+                    fprintf(stderr,
+                            "ds4: compact KV attention read boundary "
+                            "layer=%u pos=%u tokens=%u raw=%u raw-cap=%u "
+                            "raw-start=%u comp=%u format=%u\n",
+                            il, pos0, n_tokens, n_raw, g->raw_cap,
+                            raw_start, n_comp,
+                            metal_graph_attn_comp_cache_format(g));
+                }
             }
             if (ok) {
                 if (use_indexed_comp) {

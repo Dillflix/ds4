@@ -420,7 +420,7 @@ run_case() {
         mkdir -p "$OUTPUT_DIR/checkpoints/$arm"
         audit_env+=(
             "DS4_METAL_GRAPH_DUMP_PREFIX=$OUTPUT_DIR/checkpoints/$arm/checkpoint"
-            DS4_METAL_GRAPH_DUMP_NAME=ckv_stage_input,ckv_stage_query,ckv_stage_raw,ckv_stage_heads,ckv_stage_unrope,ckv_stage_projected,ckv_stage_recurrent
+            DS4_METAL_GRAPH_DUMP_NAME=ckv_stage_input,ckv_stage_query,ckv_stage_raw,ckv_stage_raw_cache,ckv_stage_comp_cache,ckv_stage_heads,ckv_stage_unrope,ckv_stage_projected,ckv_stage_recurrent
             DS4_METAL_GRAPH_DUMP_LAYER=6
             DS4_METAL_GRAPH_DUMP_POS=512
         )
@@ -768,7 +768,7 @@ if [[ $DIAGNOSTIC_STAGE_AUDIT == 1 ]]; then
         printf 'attention_heads_dump_token_row=12\n'
         for arm in compact compact-materialized; do
             stage_first=none
-            for stage in input query raw heads unrope projected recurrent; do
+            for stage in input query raw raw_cache comp_cache heads unrope projected recurrent; do
                 file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
                 f32_file="$OUTPUT_DIR/checkpoints/f32/$file"
                 candidate_file="$OUTPUT_DIR/checkpoints/$arm/$file"
@@ -786,7 +786,7 @@ if [[ $DIAGNOSTIC_STAGE_AUDIT == 1 ]]; then
             printf '%s_first_divergent_stage=%s\n' "$arm" "$stage_first"
         done
         direct_materialized_first=none
-        for stage in input query raw heads unrope projected recurrent; do
+        for stage in input query raw raw_cache comp_cache heads unrope projected recurrent; do
             file="checkpoint_ckv_stage_${stage}-6_pos512.bin"
             direct_file="$OUTPUT_DIR/checkpoints/compact/$file"
             materialized_file="$OUTPUT_DIR/checkpoints/compact-materialized/$file"
