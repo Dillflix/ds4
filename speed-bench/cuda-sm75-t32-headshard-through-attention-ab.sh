@@ -14,6 +14,7 @@ STAGE_SPLIT=${STAGE_SPLIT:-22}
 CTX_TOKENS=${CTX_TOKENS:-32768}
 CTX_ALLOC=${CTX_ALLOC:-$((CTX_TOKENS + 1))}
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
+PIPELINE_MB=512
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-1800}
 MIN_THROUGHPUT_RATIO=${MIN_THROUGHPUT_RATIO:-0.90}
 TELEMETRY_INTERVAL_MS=${TELEMETRY_INTERVAL_MS:-200}
@@ -126,9 +127,9 @@ phase=manifest
         "$(git branch --show-current)"
     printf 'model=%s\nmodel_bytes=%s\nprompt=%s\n' \
         "$MODEL" "$(stat -c %s "$MODEL")" "$PROMPT"
-    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nprefill_chunk=%s\n' \
+    printf 'gpu_devices=%s\nstage_split=%s/%s\nctx_tokens=%s\nprefill_chunk=%s\npipeline_microbatch=%s\n' \
         "$GPU_DEVICES" "$STAGE_SPLIT" "$((43-STAGE_SPLIT))" \
-        "$CTX_TOKENS" "$PREFILL_CHUNK"
+        "$CTX_TOKENS" "$PREFILL_CHUNK" "$PIPELINE_MB"
     printf 'cache_audit_only=%s\npair1_indexer_split=%s\n' \
         "$CACHE_AUDIT_ONLY" "$PAIR1_INDEXER_SPLIT"
     printf 'boundary_audit_only=%s\nboundary_audit_layer=%s\n' \
@@ -185,7 +186,7 @@ for variant in "${variants[@]}"; do
         "${clean[@]}" \
         "DS4_CUDA_EP_STAGE_SPLIT=$STAGE_SPLIT" \
         DS4_CUDA_PREFILL_PIPELINE=1 \
-        DS4_CUDA_PREFILL_PIPELINE_MB=512 \
+        "DS4_CUDA_PREFILL_PIPELINE_MB=$PIPELINE_MB" \
         DS4_CUDA_PREFILL_PIPELINE_Q8_CACHE=1 \
         DS4_CUDA_TP_PREFILL_ATTN_HEADS=0 \
         "DS4_CUDA_TP_PREFILL_T32_HEADS=$enable" \
@@ -230,8 +231,11 @@ for variant in "${variants[@]}"; do
             die "$variant unexpectedly dispatched pair-0 indexer splitting at PP2048"
     fi
     if [[ $variant == headshard ]]; then
-        expected_q_input_bytes=$((PREFILL_CHUNK * 1024 * 4))
-        expected_current_kv_bytes=$((PREFILL_CHUNK * 512 * 4))
+        # The outer CLI prefill chunk is subdivided by the fixed production
+        # pipeline.  Dispatch transfer sizes follow that internal microbatch,
+        # not PREFILL_CHUNK.
+        expected_q_input_bytes=$((PIPELINE_MB * 1024 * 4))
+        expected_current_kv_bytes=$((PIPELINE_MB * 512 * 4))
         grep -Fq 'required-native=171/171' "$base.log" ||
             die "candidate did not materialize 21 pair-1 T32/A binding pairs"
         grep -Fq "CUDA prefill T32 head shard enabled: home=1 partner=3 input-copy-bytes=$expected_q_input_bytes query-gather-bytes=0 heads=32/32" \
@@ -467,12 +471,13 @@ done
 
 phase=summary
 python3 - "$OUTPUT_DIR" "$MIN_THROUGHPUT_RATIO" \
-    "$PAIR1_INDEXER_SPLIT" "$PREFILL_CHUNK" <<'PY'
+    "$PAIR1_INDEXER_SPLIT" "$PREFILL_CHUNK" "$PIPELINE_MB" <<'PY'
 import csv, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 minimum = float(sys.argv[2])
 pair1_indexer_split = bool(int(sys.argv[3]))
 prefill_chunk = int(sys.argv[4])
+pipeline_microbatch = int(sys.argv[5])
 
 def csv_row(name):
     rows = list(csv.DictReader((root / "production" / f"{name}.csv").open()))
@@ -523,10 +528,11 @@ with (root / "summary.txt").open("w") as f:
     f.write(f"control_model_cache_gib={control_cache:.2f}\n")
     f.write(f"headshard_model_cache_gib={headshard_cache:.2f}\n")
     f.write(f"prefill_chunk={prefill_chunk}\n")
-    f.write(f"query_input_transfer_bytes_per_pair1_layer_chunk={prefill_chunk * 1024 * 4}\n")
-    f.write(f"current_kv_transfer_bytes_per_pair1_layer_zero_prefix={prefill_chunk * 512 * 4}\n")
-    f.write("query_result_gather_bytes_per_pair1_layer_chunk=0\n")
-    f.write(f"partner_low_rank_return_bytes_per_pair1_layer_chunk={prefill_chunk * 4096 * 4}\n")
+    f.write(f"pipeline_microbatch={pipeline_microbatch}\n")
+    f.write(f"query_input_transfer_bytes_per_pair1_layer_microbatch={pipeline_microbatch * 1024 * 4}\n")
+    f.write(f"current_kv_transfer_bytes_per_pair1_layer_zero_prefix={pipeline_microbatch * 512 * 4}\n")
+    f.write("query_result_gather_bytes_per_pair1_layer_microbatch=0\n")
+    f.write(f"partner_low_rank_return_bytes_per_pair1_layer_microbatch={pipeline_microbatch * 4096 * 4}\n")
     f.write("pair1_indexer_policy=" +
             ("matched-split" if pair1_indexer_split else
              "matched-home-full-diagnostic") + "\n")

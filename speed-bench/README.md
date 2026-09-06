@@ -5891,16 +5891,27 @@ copy separately from the per-chunk 2 MiB normalized-q input and 8 MiB
 low-rank return.  The next promotion gate is the undumped PP32768 production
 A/B, which exercises pair-0 indexer splitting and sustained cache evolution.
 
-That PP2048 result used the harness's original fixed 512-token prefill chunk;
+That PP2048 result used the harness's original 512-token outer prefill chunk;
 it is therefore not directly comparable with the historical 612.43 tok/s
 high-water, which used a 2048-token chunk on the mixed15 model at PP32768 with
 both attention and indexer pairs split.  The harness now exposes
 `PREFILL_CHUNK` (512, 1024, or 2048) and records it in both the manifest and
-summary.  Its transfer assertions scale with the selected chunk.  Boundary
-audits remain fixed at 512 because their sampled-position protocol was built
-for that diagnostic shape.  Before the 32K promotion run, use PP4096 with a
-2048-token chunk to verify the production chunk shape across both the
-zero-prefix and subsequent compressed-history microbatches.
+summary.  The graph still subdivides that outer chunk into the fixed production
+512-row pipeline microbatch; head-shard transfer assertions and reporting use
+the internal microbatch size.  Boundary audits remain fixed at a 512-token
+outer chunk because their sampled-position protocol was built for that
+diagnostic shape.
+
+The PP4096 integration run with `PREFILL_CHUNK=2048` completed both workloads.
+It restored pair-1 indexer splitting in both arms and produced byte-identical
+frontier logits.  Control measured 536.99 tok/s and head sharding measured
+542.34 tok/s (1.009963x).  The archived failure was solely a stale post-run
+assertion that expected per-dispatch transfer sizes to scale with the outer
+chunk; the logs correctly reported the established 512-row internal
+microbatch.  Peak VRAM was 42,803 MiB in both arms on GPU 0.  Within pair 1,
+head sharding moved about 1.3 GiB from GPU 3 to GPU 2, with respective peaks of
+38,687 and 36,019 MiB.  This qualifies the integrated topology for the next
+undumped PP32768 production A/B.
 
 ```bash
 CTX_TOKENS=512 PAIR1_INDEXER_SPLIT=0 BOUNDARY_AUDIT_ONLY=1 \
