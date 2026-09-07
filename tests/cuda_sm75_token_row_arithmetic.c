@@ -1275,7 +1275,8 @@ int main(void) {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
     }
-    if (projection_chain_native_diagnostic) {
+    if (projection_chain_native_diagnostic ||
+        projection_chain_native_repeat_diagnostic) {
         (void)setenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT", "1", 1);
     } else {
