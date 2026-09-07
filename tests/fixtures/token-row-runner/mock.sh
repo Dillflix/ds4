@@ -30,7 +30,8 @@ case $tool in
             exit 0
         fi
         printf 'instrumented-launch\n' >>"$MOCK_TRACE"
-        [[ $1 == --tool && $2 == memcheck && $3 == --error-exitcode=99 ]]
+        [[ $1 == --tool && $2 == "$MOCK_EXPECT_TOOL" && $3 == --error-exitcode=99 ]]
+        printf 'instrumentation-tool=%s\n' "$2" >>"$MOCK_TRACE"
         shift 3
         set +e
         MOCK_INSTRUMENTED=1 "$@"

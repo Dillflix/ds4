@@ -10,6 +10,7 @@ CUDA_ARCH=${CUDA_ARCH:-sm_75}
 PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
 SANITIZER_ONLY=${SANITIZER_ONLY:-0}
+SANITIZER_TOOL=${SANITIZER_TOOL:-memcheck}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
@@ -64,6 +65,10 @@ for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+[[ $SANITIZER_TOOL == memcheck || $SANITIZER_TOOL == initcheck ]] ||
+    die "SANITIZER_TOOL must be memcheck or initcheck"
+[[ $SANITIZER_TOOL == memcheck || $SANITIZER_ONLY == 1 ]] ||
+    die "SANITIZER_TOOL=initcheck requires SANITIZER_ONLY=1"
 if (( SANITIZER_ONLY )); then
     (( RUN_SANITIZER )) || die "SANITIZER_ONLY=1 requires RUN_SANITIZER=1"
     [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]] ||
@@ -141,8 +146,10 @@ phase=manifest
     printf 'post_burnin_pair=%s\n' "$POST_BURNIN_PAIR"
     printf 'run_sanitizer=%s\nsanitizer_only=%s\nskip_build=%s\n' \
         "$RUN_SANITIZER" "$SANITIZER_ONLY" "$SKIP_BUILD"
+    printf 'sanitizer_tool=%s\n' "$SANITIZER_TOOL"
     if (( SANITIZER_ONLY )); then
-        printf 'execution_mode=memcheck-full-selected-scope\nuninstrumented_runs=0\nsanitizer_smoke=0\n'
+        printf 'execution_mode=%s-full-selected-scope\nuninstrumented_runs=0\nsanitizer_smoke=0\n' \
+            "$SANITIZER_TOOL"
     else
         printf 'execution_mode=ordinary-diagnostic\n'
     fi
@@ -252,7 +259,7 @@ if (( SANITIZER_ONLY )); then
     # Instrument the selected failing sequence once, without a preceding raw
     # execution or the Q_B-only SANITIZER_SMOKE early return.  clean_env also
     # removes either early-return selector if inherited from the caller.
-    diagnostic_command=(compute-sanitizer --tool memcheck --error-exitcode=99 "./$target")
+    diagnostic_command=(compute-sanitizer --tool "$SANITIZER_TOOL" --error-exitcode=99 "./$target")
 fi
 printf '%q ' timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
     "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/provenance/diagnostic-command.txt"
@@ -282,7 +289,7 @@ if (( SANITIZER_ONLY )); then
     ! grep -Eq '^=+ ERROR SUMMARY: [1-9][0-9]*' \
         "$OUTPUT_DIR/diagnostic.log" || {
             tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
-            die "full-scope Compute Sanitizer did not report a clean summary"
+            die "full-scope Compute Sanitizer $SANITIZER_TOOL did not report a clean summary"
         }
 fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/diagnostic.log" ||

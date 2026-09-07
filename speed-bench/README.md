@@ -6294,9 +6294,9 @@ two readbacks are necessary for GPU loss.  The earlier passing run was not a
 reliable control (and used an older binary).  No peer or native-stream path
 is required by this reproducer; its root cause remains unestablished.
 
-The next diagnostic is `SANITIZER_ONLY=1 RUN_SANITIZER=1`, restricted to
+`SANITIZER_ONLY=1 RUN_SANITIZER=1` is restricted to
 `DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned`.  It runs the selected
-fixture once directly under Compute Sanitizer memcheck, without an ordinary
+fixture once directly under the selected Compute Sanitizer tool, without an ordinary
 run first and without the `DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE` selector
 that stops the old smoke run after Q_B.  The prelude, working set, 1,024 B
 calls in batches of 10, and DEFAULT-512 / pinned-103-256 suffix remain intact.
@@ -6306,8 +6306,8 @@ The time limit below is larger only to allow instrumentation overhead.
 Reboot after the recorded GPU loss before attempting this diagnostic.  It
 may still lose the GPU; instrumentation changes execution timing and resource
 use, so even a clean pass does not qualify uninstrumented production.
-`diagnostic.log` contains both application and memcheck output.  The wrapper
-requires a successful tool/application exit, a clean memcheck summary, all
+`diagnostic.log` contains both application and sanitizer output.  The wrapper
+requires a successful tool/application exit, a clean sanitizer summary, all
 existing full-scope completion/exactness markers and healthy post-run checks.
 Final transition markers are matched as complete lines: an earlier
 `pre_suffix_transition_phase` must not satisfy a final suffix checkpoint.
@@ -6316,20 +6316,46 @@ launcher exit status and kernel/health evidence.  It never follows a failed run 
 another workload.  `SKIP_BUILD=1` below retains the existing failing executable
 if `make -q` confirms it is current.  This wrapper-only change does not alter
 its build prerequisites; do not automatically rebuild or rerun if that check
-fails.
+fails.  `SANITIZER_TOOL` defaults to `memcheck`.  Its only other accepted value
+is `initcheck`, which requires sanitizer-only mode; it cannot select an
+ordinary run followed by a smoke test.  Neither choice automatically runs any
+other tool or workload.
+
+The 2026-09-07 18:33 archive at `d3b86a2` confirms that the entire memcheck run
+completed: all 1,024 burn-in calls, DEFAULT N=512 and both final algorithm-103
+N=256 halves, with exact selected production comparisons, exit status 0,
+`ERROR SUMMARY: 0 errors`, no kernel entries and a successful GPU1 post-run
+health check.  `SKIP_BUILD=1` retained the executable, fingerprinted as
+`5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414`.
+This is a full instrumented pass, not a fix or proof that the uninstrumented
+workload is safe.  No blocking-launch option was requested.  The two existing
+informational DEFAULT-versus-103 comparison differences remained unchanged.
+
+The next diagnostic uses `SANITIZER_TOOL=initcheck` on that same executable,
+still only physical GPU1 with no peer or native-stream path.  Initcheck's
+default check covers uninitialized device global-memory reads, a different
+check from memcheck's invalid-access checking; it does not by itself rule out
+shared-memory synchronization hazards or driver/hardware faults.  See the
+[NVIDIA initcheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#initcheck-tool).
+The unchanged workload may still fail; no additional reboot is required by
+the clean memcheck result alone, but do not run on a host with a subsequent
+GPU fault.  The checksum guard below refuses to test a different executable.
 
 ```bash
+printf '%s  %s\n' \
+  '5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414' \
+  './tests/cuda_sm75_token_row_arithmetic' | sha256sum -c - &&
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned POST_BURNIN_PAIR=ab \
 OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
 CASE_TIMEOUT_SECONDS=1800 SANITIZER_ONLY=1 RUN_SANITIZER=1 \
-SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+SANITIZER_TOOL=initcheck SKIP_BUILD=1 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 
 `bash tests/test_token_row_runner.sh` tests this wrapper with CPU-only command
 doubles, including failure capture and prevention of an uninstrumented first
-run.  It does not execute CUDA or establish GPU correctness.
+run for both tools.  It does not execute CUDA or establish GPU correctness.
 
 Earlier component-comparison commands below are retained for reference, not
 the recommended next run:
