@@ -9,6 +9,7 @@ cd "$repo_dir"
 CUDA_ARCH=${CUDA_ARCH:-sm_75}
 PROFILE_GPU=${PROFILE_GPU:-0}
 RUN_SANITIZER=${RUN_SANITIZER:-1}
+SANITIZER_ONLY=${SANITIZER_ONLY:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
@@ -59,10 +60,15 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
     (( OUTPUT_AB_REPEAT_CALLS >= 2 )) ||
         die "OUTPUT_AB_REPEAT_CALLS must be at least 2 in repeat scope"
 fi
-for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
+if (( SANITIZER_ONLY )); then
+    (( RUN_SANITIZER )) || die "SANITIZER_ONLY=1 requires RUN_SANITIZER=1"
+    [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]] ||
+        die "SANITIZER_ONLY=1 requires output-b-production103-no-row-owned scope"
+fi
 for value_name in B_TIMING_ROUNDS B_TIMING_REPEATS B_TIMING_WARMUPS; do
     value=${!value_name}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$value_name must be a positive integer"
@@ -84,6 +90,9 @@ if (( RUN_SANITIZER )); then
     command -v compute-sanitizer >/dev/null 2>&1 ||
         die "compute-sanitizer not found"
 fi
+if (( SANITIZER_ONLY )); then
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
+fi
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
     die "output path already exists: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/provenance" "$OUTPUT_DIR/health"
@@ -93,9 +102,9 @@ phase=build
 finish() {
     status=$?
     trap - EXIT INT TERM HUP
-    printf 'state=%s\nexit_status=%s\nlast_phase=%s\n' \
+    printf 'state=%s\nexit_status=%s\nlast_phase=%s\ndiagnostic_exit_status=%s\n' \
         "$([[ $status == 0 ]] && printf finished || printf failed)" \
-        "$status" "$phase" >"$OUTPUT_DIR/run-status.txt"
+        "$status" "$phase" "${diagnostic_status:-not-run}" >"$OUTPUT_DIR/run-status.txt"
     if (( CREATE_ARCHIVE )); then
         archive="$OUTPUT_DIR.tar.gz"
         tar -C "$(dirname "$OUTPUT_DIR")" -czf "$archive" \
@@ -130,6 +139,13 @@ phase=manifest
         "$OUTPUT_AB_REPEAT_CALLS" "$OUTPUT_B_PRODUCTION103_CALLS" \
         "$OUTPUT_B_PRODUCTION103_BATCH"
     printf 'post_burnin_pair=%s\n' "$POST_BURNIN_PAIR"
+    printf 'run_sanitizer=%s\nsanitizer_only=%s\nskip_build=%s\n' \
+        "$RUN_SANITIZER" "$SANITIZER_ONLY" "$SKIP_BUILD"
+    if (( SANITIZER_ONLY )); then
+        printf 'execution_mode=memcheck-full-selected-scope\nuninstrumented_runs=0\nsanitizer_smoke=0\n'
+    else
+        printf 'execution_mode=ordinary-diagnostic\n'
+    fi
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -226,9 +242,24 @@ capture_gpu_health "$OUTPUT_DIR/health/pre-gpu.csv" ||
 arm_start=$(date --iso-8601=seconds)
 
 phase=diagnostic
+diagnostic_command=("./$target")
+if (( SANITIZER_ONLY )); then
+    phase=sanitizer-only
+    compute-sanitizer --version >"$OUTPUT_DIR/provenance/compute-sanitizer-version.txt" 2>&1 ||
+        die "could not capture Compute Sanitizer version"
+    sha256sum "./$target" >"$OUTPUT_DIR/provenance/diagnostic-sha256.txt" ||
+        die "could not fingerprint the diagnostic executable"
+    # Instrument the selected failing sequence once, without a preceding raw
+    # execution or the Q_B-only SANITIZER_SMOKE early return.  clean_env also
+    # removes either early-return selector if inherited from the caller.
+    diagnostic_command=(compute-sanitizer --tool memcheck --error-exitcode=99 "./$target")
+fi
+printf '%q ' timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
+    "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/provenance/diagnostic-command.txt"
+printf '\n' >>"$OUTPUT_DIR/provenance/diagnostic-command.txt"
 set +e
 timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
-    "${clean_env[@]}" "./$target" >"$OUTPUT_DIR/diagnostic.log" 2>&1
+    "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/diagnostic.log" 2>&1
 diagnostic_status=$?
 set -e
 capture_kernel_since "$arm_start" "$OUTPUT_DIR/health/kernel.log"
@@ -244,6 +275,15 @@ capture_gpu_health "$OUTPUT_DIR/health/post-gpu.csv" || {
 if (( diagnostic_status != 0 )); then
     tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
     die "token-row arithmetic diagnostic failed with status $diagnostic_status"
+fi
+if (( SANITIZER_ONLY )); then
+    grep -Eq '^=+ ERROR SUMMARY: 0 errors[[:space:]]*$' \
+        "$OUTPUT_DIR/diagnostic.log" &&
+    ! grep -Eq '^=+ ERROR SUMMARY: [1-9][0-9]*' \
+        "$OUTPUT_DIR/diagnostic.log" || {
+            tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
+            die "full-scope Compute Sanitizer did not report a clean summary"
+        }
 fi
 grep -Fq 'harness_status=ok' "$OUTPUT_DIR/diagnostic.log" ||
     die "diagnostic omitted success marker"
@@ -373,7 +413,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
             die "production-103 pinned-half replay used the wrong half algorithm"
         for transition in default-full512 \
             algo103-half0-256 algo103-half1-256; do
-            grep -Fq "pre_suffix_transition_phase=$transition-complete" \
+            grep -Fxq "pre_suffix_transition_phase=$transition-complete" \
                 "$OUTPUT_DIR/diagnostic.log" ||
                 die "production-103 pinned-half replay did not complete pre-suffix $transition"
         done
@@ -470,7 +510,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
     for transition in default-full512 \
         "${transition_prefix}-half0-256" \
         "${transition_prefix}-half1-256"; do
-        grep -Fq "suffix_transition_phase=$transition-complete" \
+        grep -Fxq "suffix_transition_phase=$transition-complete" \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 output-B replay did not complete $transition"
     done
@@ -613,7 +653,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
 fi
 cat "$OUTPUT_DIR/diagnostic.log"
 
-if (( RUN_SANITIZER )); then
+if (( RUN_SANITIZER && ! SANITIZER_ONLY )); then
     phase=sanitizer
     sanitizer_start=$(date --iso-8601=seconds)
     "${clean_env[@]}" \

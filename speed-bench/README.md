@@ -6182,24 +6182,22 @@ in batches of 10, which exceeds the old failing workload's total B launch
 count without introducing peer access, native dequantization, or a
 non-production algorithm.  `OUTPUT_B_PRODUCTION103_CALLS` and
 `OUTPUT_B_PRODUCTION103_BATCH` may adjust those bounded counts.  A clean result
-would clear production algorithm 103's local cumulative launch history and
-leave the mixed legacy sweep as a separate forensic suspect, not a production
-prerequisite.
+would show that this bounded launch history completed on that run, not clear
+the algorithm or establish the mixed legacy sweep as the cause.
 
 After the production-103 burn-in and the exact row-owned A+B pair, this scope
 checkpoints each operation in the historical DEFAULT suffix separately: first
 N=512, then the first N=256 half, then the second N=256 half.  The corresponding
-`suffix_transition_phase` marker identifies the first failing launch.  If all
-three complete whereas the unfenced group failed, the remaining trigger is the
-queued mixed-row-extent group rather than any individual DEFAULT shape.
+`suffix_transition_phase` marker identifies where failure is reported, not
+necessarily the defective instruction.  Passing separately checkpointed calls
+would motivate a fencing comparison, not prove a queued-group root cause.
 
 `DIAGNOSTIC_SCOPE=output-b-production103-pinned-half` preserves that entire
-replay through the now-cleared DEFAULT N=512 launch, but selects production
-algorithm 103 for the following N=256 halves.  If this arm stays healthy, the
-failing variable is the DEFAULT N=256 algorithm choice; if it still loses the
-GPU at the first half, the causal variable is the 512-to-256 shape/scratch
-transition rather than the GEMM selector.  It remains local to physical GPU1
-with no peer mapping, transfer, or native-stream materialization.
+replay through DEFAULT N=512, but selects production algorithm 103 for the
+following N=256 halves.  This compares the half-row selector without asserting
+that either the algorithm or the shape/scratch transition caused the failure.
+It remains local to physical GPU1 with no peer mapping, transfer, or
+native-stream materialization.
 
 The first version of this scope still allowed an earlier output A+B exactness
 boundary to queue DEFAULT N=512, N=256 and N=256 calls before the advertised
@@ -6207,25 +6205,26 @@ pinned-half suffix.  The 2026-09-07 04:57 run lost GPU1 at the synchronization
 for that earlier group, so it never exercised the intended algorithm-103
 halves.  The scope now checkpoints this first boundary too: DEFAULT N=512 is
 synchronized alone, then each N=256 half is selected as algorithm 103 and
-synchronized alone.  `pre_suffix_transition_phase` therefore identifies the
-actual failing operation instead of reporting the later observation point as
-an output-A failure.
+synchronized alone.  `pre_suffix_transition_phase` therefore narrows the
+failure-reporting boundary instead of labeling the whole group an output-A
+failure.
 
 The corrected run completed both pinned transitions at the first boundary,
 1,024 algorithm-103 N=256 calls, and the row-owned A+B pair.  It then completed
 DEFAULT N=512 and lost GPU1 at the following algorithm-103 N=256 call.  Thus
-algorithm 103 and the bare 512-to-256 transition are independently clean; the
-failure requires prior execution history.  The follow-up
+the same shape transition completed earlier in that run but failed later;
+prior execution history is a variable to investigate, not a proven cause.
+The follow-up
 `DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned` removes only the
 intervening row-owned A+B pair while preserving the cache, working set,
 pre-boundaries, 1,024-call burn-in, DEFAULT N=512 and pinned N=256 transition.
-Failure there clears the row-owned helper and isolates accumulated cuBLAS
-history plus the shape transition.  A pass makes the row-owned pair's state
-interaction necessary.
+Failure there shows that the omitted block is not necessary to reproduce the
+loss.  A single pass does not establish that block as necessary or causal.
 
-The no-row-owned run completed every checkpoint and left physical GPU1
-healthy.  Its earlier nonzero exit was a harness verdict error: the diagnostic
-intentionally compared algorithm-103 N=256 output with a later DEFAULT N=256
+The initial no-row-owned run (2026-09-07 16:02, `6e46681`) completed every
+checkpoint and left physical GPU1 healthy.  Its nonzero exit was a harness
+verdict error: the diagnostic intentionally compared algorithm-103 N=256
+output with a later DEFAULT N=256
 reference, which is not the asserted shipping equivalence.  The gate now
 requires the exact algorithm-103 split result and the final structured
 transition while treating that cross-algorithm comparison as informational.
@@ -6267,10 +6266,10 @@ defaults.  Only one selected mode runs per invocation.
 The A-only (16:38) and B-only (16:49) archives both reproduced GPU1 loss at
 the first final algorithm-103 N=256 transition, after exact post-burn-in
 outputs and a completed DEFAULT N=512 call.  Neither A nor B is individually
-required at the post-burn-in position to reproduce the loss.  All failing
-variants retain an explicit synchronization plus 16 MiB low and 8 MiB output
-readbacks, which the healthy no-row-owned skip variant omitted.  The user
-confirmed that `nvbandwidth` named in the B-only archive's subsequent GPU0
+required at the post-burn-in position to reproduce the loss.  Those variants
+retained an explicit synchronization plus 16 MiB low and 8 MiB output
+readbacks, which the initially healthy no-row-owned skip variant omitted.
+The user confirmed that `nvbandwidth` named in the B-only archive's subsequent GPU0
 timeout was started only after GPU1 failed; it is not evidence of a
 concurrent workload initiating that GPU1 failure.
 
@@ -6285,12 +6284,55 @@ not a globally compute-free run.  Completed-readback byte counters and
 zero-call assertions are required by the wrapper.  Production code and
 defaults are unchanged.
 
-Run only this selected variant after rebooting the failed host, with GPU1
-as the only visible CUDA device.  A failure would show that the post-burn-in
-projection calls themselves are unnecessary in this sequence, not prove
-which readback, synchronization, driver state, or hardware behavior caused
-it.  A pass would warrant comparing the omitted compute and associated
-memory activity; it would not by itself establish a root cause.
+The 17:21 `none` run completed burn-in and both readbacks, then failed at the
+final DEFAULT N=512 synchronization.  The 17:54 no-row-owned rerun at
+`69bca4e` also failed: it skipped that entire post-burn-in block and its two
+readbacks, completed DEFAULT N=512, then reported failure at the following
+algorithm-103 N=256 half0 synchronization.  GPU1 logged Xid 79 before GPU0's
+subsequent GSP timeout.  Thus neither the post-burn-in projections nor those
+two readbacks are necessary for GPU loss.  The earlier passing run was not a
+reliable control (and used an older binary).  No peer or native-stream path
+is required by this reproducer; its root cause remains unestablished.
+
+The next diagnostic is `SANITIZER_ONLY=1 RUN_SANITIZER=1`, restricted to
+`DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned`.  It runs the selected
+fixture once directly under Compute Sanitizer memcheck, without an ordinary
+run first and without the `DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE` selector
+that stops the old smoke run after Q_B.  The prelude, working set, 1,024 B
+calls in batches of 10, and DEFAULT-512 / pinned-103-256 suffix remain intact.
+No CUDA source, arithmetic, projection selector, or synchronization is changed.
+The time limit below is larger only to allow instrumentation overhead.
+
+Reboot after the recorded GPU loss before attempting this diagnostic.  It
+may still lose the GPU; instrumentation changes execution timing and resource
+use, so even a clean pass does not qualify uninstrumented production.
+`diagnostic.log` contains both application and memcheck output.  The wrapper
+requires a successful tool/application exit, a clean memcheck summary, all
+existing full-scope completion/exactness markers and healthy post-run checks.
+Final transition markers are matched as complete lines: an earlier
+`pre_suffix_transition_phase` must not satisfy a final suffix checkpoint.
+Failure archives retain the command, executable SHA-256, tool version,
+launcher exit status and kernel/health evidence.  It never follows a failed run with
+another workload.  `SKIP_BUILD=1` below retains the existing failing executable
+if `make -q` confirms it is current.  This wrapper-only change does not alter
+its build prerequisites; do not automatically rebuild or rerun if that check
+fails.
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned POST_BURNIN_PAIR=ab \
+OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
+CASE_TIMEOUT_SECONDS=1800 SANITIZER_ONLY=1 RUN_SANITIZER=1 \
+SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+`bash tests/test_token_row_runner.sh` tests this wrapper with CPU-only command
+doubles, including failure capture and prevention of an uninstrumented first
+run.  It does not execute CUDA or establish GPU correctness.
+
+Earlier component-comparison commands below are retained for reference, not
+the recommended next run:
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
