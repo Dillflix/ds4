@@ -1769,16 +1769,54 @@ int main(void) {
     /* Feed the identical full-reference heads into both output shapes.  low
      * exposes output A, while out exposes output B; this keeps an upstream
      * difference from being misattributed to either GEMM. */
-    if (!launch_output(out_full, low_full, model, model_bytes, out_a_offset,
-                       out_b_offset, heads_full, N_TOK) ||
-        !launch_output(out0, low0, model, model_bytes, out_a_offset,
-                       out_b_offset, heads_ref0, HALF_TOK) ||
-        !launch_output(out1, low1, model, model_bytes, out_a_offset,
-                       out_b_offset, heads_ref1, HALF_TOK) ||
-        !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(low_full, 0u, reference, low_bytes) ||
+    if (output_b_production103_pinned_half_diagnostic) {
+        select_b_algorithm(-1);
+        printf("pre_suffix_transition_phase=default-full512-submit\n");
+        fflush(stdout);
+        if (!launch_output(out_full, low_full, model, model_bytes,
+                           out_a_offset, out_b_offset, heads_full, N_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: pre-suffix DEFAULT full512 A+B failed\n");
+            goto cleanup;
+        }
+        printf("pre_suffix_transition_phase=default-full512-complete\n"
+               "pre_suffix_transition_phase=algo103-half0-256-submit\n");
+        fflush(stdout);
+        select_b_algorithm(103);
+        if (!launch_output(out0, low0, model, model_bytes, out_a_offset,
+                           out_b_offset, heads_ref0, HALF_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: pre-suffix algorithm-103 half0-256 A+B failed\n");
+            goto cleanup;
+        }
+        printf("pre_suffix_transition_phase=algo103-half0-256-complete\n"
+               "pre_suffix_transition_phase=algo103-half1-256-submit\n");
+        fflush(stdout);
+        if (!launch_output(out1, low1, model, model_bytes, out_a_offset,
+                           out_b_offset, heads_ref1, HALF_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: pre-suffix algorithm-103 half1-256 A+B failed\n");
+            goto cleanup;
+        }
+        printf("pre_suffix_transition_phase=algo103-half1-256-complete\n");
+        fflush(stdout);
+        select_b_algorithm(-1);
+    } else if (!launch_output(out_full, low_full, model, model_bytes,
+                              out_a_offset, out_b_offset, heads_full, N_TOK) ||
+               !launch_output(out0, low0, model, model_bytes, out_a_offset,
+                              out_b_offset, heads_ref0, HALF_TOK) ||
+               !launch_output(out1, low1, model, model_bytes, out_a_offset,
+                              out_b_offset, heads_ref1, HALF_TOK) ||
+               !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: output A+B boundary runtime failed\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(low_full, 0u, reference, low_bytes) ||
         !ds4_gpu_tensor_read(low_split, 0u, candidate, low_bytes)) {
-        fprintf(stderr, "error: output-A boundary runtime failed\n");
+        fprintf(stderr, "error: output-A boundary readback failed\n");
         goto cleanup;
     }
     const diff_metrics out_a_diff = compare_f32(

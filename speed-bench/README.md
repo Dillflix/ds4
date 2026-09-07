@@ -6201,6 +6201,16 @@ GPU at the first half, the causal variable is the 512-to-256 shape/scratch
 transition rather than the GEMM selector.  It remains local to physical GPU1
 with no peer mapping, transfer, or native-stream materialization.
 
+The first version of this scope still allowed an earlier output A+B exactness
+boundary to queue DEFAULT N=512, N=256 and N=256 calls before the advertised
+pinned-half suffix.  The 2026-09-07 04:57 run lost GPU1 at the synchronization
+for that earlier group, so it never exercised the intended algorithm-103
+halves.  The scope now checkpoints this first boundary too: DEFAULT N=512 is
+synchronized alone, then each N=256 half is selected as algorithm 103 and
+synchronized alone.  `pre_suffix_transition_phase` therefore identifies the
+actual failing operation instead of reporting the later observation point as
+an output-A failure.
+
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-pinned-half \

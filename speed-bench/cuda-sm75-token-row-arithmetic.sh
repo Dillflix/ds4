@@ -340,6 +340,12 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
         grep -Fq 'suffix_half_algorithm=103:CUBLAS_GEMM_ALGO3_TENSOR_OP' \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 pinned-half replay used the wrong half algorithm"
+        for transition in default-full512 \
+            algo103-half0-256 algo103-half1-256; do
+            grep -Fq "pre_suffix_transition_phase=$transition-complete" \
+                "$OUTPUT_DIR/diagnostic.log" ||
+                die "production-103 pinned-half replay did not complete pre-suffix $transition"
+        done
         transition_prefix=algo103
     else
         grep -Fq 'fidelity=working-set-production-algorithm-and-suffix-replay' \
