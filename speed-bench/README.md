@@ -6144,6 +6144,15 @@ checkpoints identify native dequantization, activation conversion, and GEMM;
 the arm still has no peer access or secondary CUDA context.  Run it only after
 the canonical one-launch rung preserves GPU health.
 
+`DIAGNOSTIC_SCOPE=output-a-native` isolates the other projection before any
+output-B work or workspace reuse.  It installs one ordinary local
+`ROW_WARP32` A source, expands it through the production native-stream path,
+and performs exactly one 256-row batched A projection into a guarded low-rank
+output.  Synchronization checkpoints cover native dequantization, head
+FP32-to-FP16 packing, the batched GEMM, and low-output unpacking.  The backend
+then returns before B is entered.  A clean result clears native A in isolation;
+it does not clear the subsequent A-to-B shared-workspace handoff.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6183,6 +6192,15 @@ launch in a fresh process:
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-b-native \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After both output-B arms are clean, isolate one native output-A launch before
+testing the combined A-to-B chain:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-a-native \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```

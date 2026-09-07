@@ -3630,6 +3630,32 @@ static bool cuda_output_b_local_diagnostic_checkpoint(
     return false;
 }
 
+static bool cuda_output_a_local_diagnostic_enabled(void) {
+    const char *enabled = getenv("DS4_CUDA_OUTPUT_A_LOCAL_DIAGNOSTIC");
+    return g_n_gpus == 1 && enabled && enabled[0] &&
+        strcmp(enabled, "0") != 0;
+}
+
+static bool cuda_output_a_local_diagnostic_checkpoint(
+        const char *stage, int physical_device) {
+    if (!cuda_output_a_local_diagnostic_enabled()) return true;
+    const cudaError_t err = cudaDeviceSynchronize();
+    fprintf(stderr,
+            "ds4: local output-A checkpoint stage=%s device=%d status=%s\n",
+            stage ? stage : "?", physical_device, cudaGetErrorString(err));
+    fflush(stderr);
+    if (err == cudaSuccess) return true;
+    (void)cudaGetLastError();
+    return false;
+}
+
+static bool cuda_output_a_only_local_diagnostic(void) {
+    const char *enabled = getenv(
+        "DS4_CUDA_OUTPUT_A_ONLY_LOCAL_DIAGNOSTIC");
+    return cuda_output_a_local_diagnostic_enabled() && enabled && enabled[0] &&
+        strcmp(enabled, "0") != 0;
+}
+
 /* Materialize one consumer's weight on its validated partner.  Return 1 on
  * admission, 0 for an ordinary capacity/policy miss, and -1 when CUDA state
  * is no longer safe for a native fallback.  Forced T256 placement calls this
@@ -26590,6 +26616,8 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                     blocks_a, out_a_native_layout, "attn_output_a")) {
                 return 0;
             }
+            if (!cuda_output_a_local_diagnostic_checkpoint(
+                    "native-dequant", physical_device)) return 0;
             out_a_f16_eff = transient_w_f16;
         }
         attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
@@ -26599,6 +26627,8 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                 n_groups,
                 group_dim);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
+        if (!cuda_output_a_local_diagnostic_checkpoint(
+                "heads-f32-to-f16", physical_device)) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmStridedBatchedEx(cuda_cublas_for_tier(logical_tier),
@@ -26625,6 +26655,8 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                                                        CUDA_R_32F,
                                                        CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention output a gemm")) return 0;
+        if (!cuda_output_a_local_diagnostic_checkpoint(
+                "cublas-gemm", physical_device)) return 0;
         attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
                 (float *)low->ptr,
                 low_packed,
@@ -26632,6 +26664,8 @@ static int cuda_attention_output_q8_batch_tensor_impl(
                 n_groups,
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
+        if (!cuda_output_a_local_diagnostic_checkpoint(
+                "low-unpack", physical_device)) return 0;
         if (!out_a_native) {
             cuda_q8_f16_binding_mark_used(
                 model_map, out_a_offset, out_a_bytes, group_dim, low_dim,
@@ -26722,6 +26756,16 @@ static int cuda_attention_output_q8_batch_tensor_impl(
     }
 
     if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+    if (cuda_output_a_only_local_diagnostic()) {
+        /* This bounded probe intentionally stops before output B can reuse
+         * the native-stream workspace.  A-only success therefore does not
+         * clear the A-to-B scratch-lifetime boundary. */
+        const int ok = out_a_native != NULL;
+        for (uint32_t i = 0; i < 3u; i++) {
+            if (prof_ev[i]) (void)cudaEventDestroy(prof_ev[i]);
+        }
+        return ok;
+    }
     /* Do not pre-resolve canonical B.  The generic dispatcher selects the
      * resident native-primary or F16 binding before its canonical fallback. */
     int ok = row_owned_exact_b
