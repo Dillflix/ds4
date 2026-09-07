@@ -355,6 +355,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ]]; then
     grep -Fq 'historical_mixed_algorithm_timing=off' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "production-103 output-B replay entered mixed-algorithm timing"
+    grep -Fq 'suffix_submission_fencing=checkpointed-default-transitions' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted transition checkpoints"
     grep -Fq 'production103_replay_conclusion=burnin-clean' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "production-103 output-B replay omitted its burn-in conclusion"
@@ -364,6 +367,11 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ]]; then
     grep -Fq 'suffix_replay_phase=production-row-owned-pair-complete' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "production-103 output-B replay missed the row-owned suffix"
+    for transition in default-full512 default-half0-256 default-half1-256; do
+        grep -Fq "suffix_transition_phase=$transition-complete" \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 output-B replay did not complete $transition"
+    done
     grep -Fq 'suffix_replay_phase=default-full-split-group-complete' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "production-103 output-B replay missed the DEFAULT suffix"
@@ -504,6 +512,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|production_b_|production103_replay_phase=|production103_replay_conclusion=|exhaustive_algorithm_sweep=|historical_timing_burn_in=|historical_mixed_algorithm_timing=|suffix_submission_fencing=|suffix_replay_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|production_b_|production103_replay_phase=|production103_replay_conclusion=|exhaustive_algorithm_sweep=|historical_timing_burn_in=|historical_mixed_algorithm_timing=|suffix_submission_fencing=|suffix_replay_phase=|suffix_transition_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

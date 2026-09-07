@@ -6186,6 +6186,13 @@ would clear production algorithm 103's local cumulative launch history and
 leave the mixed legacy sweep as a separate forensic suspect, not a production
 prerequisite.
 
+After the production-103 burn-in and the exact row-owned A+B pair, this scope
+checkpoints each operation in the historical DEFAULT suffix separately: first
+N=512, then the first N=256 half, then the second N=256 half.  The corresponding
+`suffix_transition_phase` marker identifies the first failing launch.  If all
+three complete whereas the unfenced group failed, the remaining trigger is the
+queued mixed-row-extent group rather than any individual DEFAULT shape.
+
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local
 `B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into

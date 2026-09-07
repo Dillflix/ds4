@@ -1554,7 +1554,7 @@ int main(void) {
                "production_b_burnin_batch=%u\n"
                "exhaustive_algorithm_sweep=off\n"
                "historical_mixed_algorithm_timing=off\n"
-               "suffix_submission_fencing=original-phase-boundaries\n",
+               "suffix_submission_fencing=checkpointed-default-transitions\n",
                (unsigned long long)(2u * (Q_DIM * IN_DIM +
                    LOW_DIM * GROUP_DIM + OUT_DIM * LOW_DIM)),
                (unsigned long long)(input_bytes + 2u * q_bytes +
@@ -2053,18 +2053,62 @@ int main(void) {
         actual_low_host[i] = (float)value / 4096.0f;
     }
     if (!ds4_gpu_tensor_write(low_full, 0u, actual_low_host, low_bytes) ||
-        !ds4_gpu_tensor_write(low_split, 0u, actual_low_host, low_bytes) ||
-        !ds4_gpu_attention_output_q8_batch_b_tensor(
-            out_full, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
-            low_full, N_TOK) ||
-        !ds4_gpu_attention_output_q8_batch_b_tensor(
-            out0, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
-            low_ref0, HALF_TOK) ||
-        !ds4_gpu_attention_output_q8_batch_b_tensor(
-            out1, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
-            low_ref1, HALF_TOK) ||
-        !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(out_full, 0u, reference, out_bytes) ||
+        !ds4_gpu_tensor_write(low_split, 0u, actual_low_host, low_bytes)) {
+        fprintf(stderr, "error: isolated output-B input reset failed\n");
+        goto cleanup;
+    }
+    if (output_b_production103_replay_diagnostic) {
+        printf("suffix_transition_phase=default-full512-submit\n");
+        fflush(stdout);
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out_full, model, model_bytes, out_b_offset,
+                LOW_DIM, OUT_DIM, low_full, N_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: production-103 to DEFAULT full512 transition "
+                    "failed\n");
+            goto cleanup;
+        }
+        printf("suffix_transition_phase=default-full512-complete\n"
+               "suffix_transition_phase=default-half0-256-submit\n");
+        fflush(stdout);
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out0, model, model_bytes, out_b_offset,
+                LOW_DIM, OUT_DIM, low_ref0, HALF_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: production-103 to DEFAULT half0-256 transition "
+                    "failed\n");
+            goto cleanup;
+        }
+        printf("suffix_transition_phase=default-half0-256-complete\n"
+               "suffix_transition_phase=default-half1-256-submit\n");
+        fflush(stdout);
+        if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                out1, model, model_bytes, out_b_offset,
+                LOW_DIM, OUT_DIM, low_ref1, HALF_TOK) ||
+            !ds4_gpu_synchronize()) {
+            fprintf(stderr,
+                    "error: production-103 to DEFAULT half1-256 transition "
+                    "failed\n");
+            goto cleanup;
+        }
+        printf("suffix_transition_phase=default-half1-256-complete\n");
+        fflush(stdout);
+    } else if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                   out_full, model, model_bytes, out_b_offset,
+                   LOW_DIM, OUT_DIM, low_full, N_TOK) ||
+               !ds4_gpu_attention_output_q8_batch_b_tensor(
+                   out0, model, model_bytes, out_b_offset,
+                   LOW_DIM, OUT_DIM, low_ref0, HALF_TOK) ||
+               !ds4_gpu_attention_output_q8_batch_b_tensor(
+                   out1, model, model_bytes, out_b_offset,
+                   LOW_DIM, OUT_DIM, low_ref1, HALF_TOK) ||
+               !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: isolated output-B boundary runtime failed\n");
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(out_full, 0u, reference, out_bytes) ||
         !ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
         fprintf(stderr, "error: isolated output-B boundary runtime failed\n");
         goto cleanup;
