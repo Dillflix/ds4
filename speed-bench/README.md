@@ -6136,6 +6136,14 @@ both canaries, finite/nonzero output, Compute Sanitizer, GPU identity, and
 kernel health.  This deliberately distinguishes an intrinsically unsafe
 row-owned B launch from cumulative corruption in the former full diagnostic.
 
+`DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
+guarded output but replaces the canonical FP16 binding with one ordinary local
+`B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into
+the bounded transient workspace, then the same algorithm-3 GEMM.  Separate
+checkpoints identify native dequantization, activation conversion, and GEMM;
+the arm still has no peer access or secondary CUDA context.  Run it only after
+the canonical one-launch rung preserves GPU health.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6167,6 +6175,15 @@ disabling the F16 cache, and normal dispatch remains DEFAULT.
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+If the canonical arm is clean, isolate the corresponding native-stream B
+launch in a fresh process:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-b-native \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 

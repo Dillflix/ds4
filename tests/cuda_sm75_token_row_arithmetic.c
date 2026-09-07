@@ -110,14 +110,16 @@ static void build_q8_rows(unsigned char *dst, uint64_t rows,
 
 /* Match the tagged GGUF row-warp32 encoding exactly: for each 32-block
  * group, store 32 scales followed by eight lane-major int8x4 word planes. */
-static void pack_q8_rows_warp32(unsigned char *dst,
-                                const unsigned char *src,
-                                uint64_t rows, uint64_t columns) {
-    const uint64_t blocks = columns / 32u;
-    const uint64_t row_bytes = blocks * 34u;
+static void pack_q8_rows_warp32_slice(
+        unsigned char *dst, const unsigned char *src, uint64_t rows,
+        uint64_t source_blocks, uint64_t source_block_start,
+        uint64_t blocks) {
+    const uint64_t source_row_bytes = source_blocks * 34u;
+    const uint64_t output_row_bytes = blocks * 34u;
     for (uint64_t row = 0u; row < rows; row++) {
-        const unsigned char *src_row = src + row * row_bytes;
-        unsigned char *dst_row = dst + row * row_bytes;
+        const unsigned char *src_row = src + row * source_row_bytes +
+            source_block_start * 34u;
+        unsigned char *dst_row = dst + row * output_row_bytes;
         for (uint64_t group = 0u; group < blocks / 32u; group++) {
             const unsigned char *src_group = src_row + group * 1088u;
             unsigned char *dst_group = dst_row + group * 1088u;
@@ -132,6 +134,27 @@ static void pack_q8_rows_warp32(unsigned char *dst,
             }
         }
     }
+}
+
+static void pack_q8_rows_warp32(unsigned char *dst,
+                                const unsigned char *src,
+                                uint64_t rows, uint64_t columns) {
+    const uint64_t blocks = columns / 32u;
+    pack_q8_rows_warp32_slice(dst, src, rows, blocks, 0u, blocks);
+}
+
+/* Match the tagged attention-output B encoding: the two K halves are
+ * contiguous matrix shards, and rows inside each shard use warp32 planes. */
+static void pack_q8_rows_b_kshards_warp32(
+        unsigned char *dst, const unsigned char *src,
+        uint64_t rows, uint64_t columns) {
+    const uint64_t blocks = columns / 32u;
+    const uint64_t half_blocks = blocks / 2u;
+    const uint64_t shard_bytes = rows * half_blocks * 34u;
+    pack_q8_rows_warp32_slice(
+        dst, src, rows, blocks, 0u, half_blocks);
+    pack_q8_rows_warp32_slice(
+        dst + shard_bytes, src, rows, blocks, half_blocks, half_blocks);
 }
 
 static diff_metrics compare_f32(const float *reference,
@@ -291,9 +314,9 @@ static int time_output_b(double *median_ms, ds4_gpu_tensor *out,
     return 1;
 }
 
-static int run_output_b_canonical_single_launch(
+static int run_output_b_single_launch(
         const unsigned char *model, uint64_t model_bytes,
-        uint64_t out_b_offset) {
+        uint64_t out_b_offset, int native_stream) {
     const uint64_t low_count = (uint64_t)HALF_TOK * LOW_DIM;
     const uint64_t low_bytes = low_count * sizeof(float);
     const uint64_t out_count = (uint64_t)HALF_TOK * OUT_DIM;
@@ -332,12 +355,14 @@ static int run_output_b_canonical_single_launch(
         goto cleanup;
     }
 
-    printf("diagnostic_scope=output-b-canonical-single-launch\n"
+    printf("diagnostic_scope=output-b-%s-single-launch\n"
            "n_tokens=%u\ninput_dim=%llu\noutput_dim=%u\n"
            "algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n"
            "projection_launches=1\npeer_access=none\n"
-           "native_stream=off\n",
-           HALF_TOK, (unsigned long long)LOW_DIM, OUT_DIM);
+           "native_stream=%s\n",
+           native_stream ? "native" : "canonical",
+           HALF_TOK, (unsigned long long)LOW_DIM, OUT_DIM,
+           native_stream ? "on" : "off");
     fflush(stdout);
 
     select_b_algorithm(3);
@@ -347,7 +372,8 @@ static int run_output_b_canonical_single_launch(
         !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(guarded, 0u, guarded_host, guarded_bytes)) {
         fprintf(stderr,
-                "error: canonical output-B single-launch probe failed\n");
+                "error: %s output-B single-launch probe failed\n",
+                native_stream ? "native-stream" : "canonical");
         goto cleanup;
     }
 
@@ -363,24 +389,32 @@ static int run_output_b_canonical_single_launch(
         guarded_host + OUTPUT_B_PROBE_GUARD_BYTES);
     uint64_t finite = 0u;
     uint64_t nonzero = 0u;
+    uint64_t output_hash = UINT64_C(1469598103934665603);
     for (uint64_t i = 0u; i < out_count; i++) {
         finite += isfinite(output[i]) != 0;
         nonzero += output[i] != 0.0f;
     }
+    for (uint64_t i = 0u; i < out_bytes; i++) {
+        output_hash ^= guarded_host[OUTPUT_B_PROBE_GUARD_BYTES + i];
+        output_hash *= UINT64_C(1099511628211);
+    }
     printf("canary_prefix_mismatches=%llu\n"
            "canary_suffix_mismatches=%llu\n"
-           "output_finite=%llu\noutput_nonzero=%llu\n",
+           "output_finite=%llu\noutput_nonzero=%llu\n"
+           "output_fnv1a64=%016llx\n",
            (unsigned long long)prefix_mismatches,
            (unsigned long long)suffix_mismatches,
            (unsigned long long)finite,
-           (unsigned long long)nonzero);
+           (unsigned long long)nonzero,
+           (unsigned long long)output_hash);
     if (prefix_mismatches || suffix_mismatches || finite != out_count ||
         nonzero != out_count) {
         fprintf(stderr, "error: output-B probe validation failed\n");
         goto cleanup;
     }
-    printf("diagnostic_conclusion=canonical-output-b-single-launch-clean\n"
-           "harness_status=ok\n");
+    printf("diagnostic_conclusion=%s-output-b-single-launch-clean\n"
+           "harness_status=ok\n",
+           native_stream ? "native-stream" : "canonical");
     status = 1;
 
 cleanup:
@@ -398,6 +432,10 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B") != NULL;
     const int output_b_canonical_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL") != NULL;
+    const int output_b_native_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE") != NULL;
+    const int output_b_diagnostic =
+        output_b_canonical_diagnostic || output_b_native_diagnostic;
     const uint64_t q_b_bytes = Q_DIM * (IN_DIM / 32u) * 34u;
     const uint64_t sinks_offset = q_b_bytes;
     const uint64_t sinks_bytes = N_HEAD * sizeof(float);
@@ -406,8 +444,10 @@ int main(void) {
     const uint64_t out_b_offset = out_a_offset + out_a_bytes;
     const uint64_t out_b_bytes = OUT_DIM * (LOW_DIM / 32u) * 34u;
     const uint64_t native_q_b_offset = out_b_offset + out_b_bytes;
-    const uint64_t model_bytes = native_q_b_offset +
+    const uint64_t native_out_b_offset = native_q_b_offset +
         (native_q_b_diagnostic ? q_b_bytes : 0u);
+    const uint64_t model_bytes = native_out_b_offset +
+        (output_b_native_diagnostic ? out_b_bytes : 0u);
     const uint64_t input_count = (uint64_t)N_TOK * IN_DIM;
     const uint64_t q_count = (uint64_t)N_TOK * Q_DIM;
     const uint64_t heads_count = q_count;
@@ -483,6 +523,11 @@ int main(void) {
     }
     build_q8_rows(model + out_a_offset, LOW_DIM, GROUP_DIM, 37u);
     build_q8_rows(model + out_b_offset, OUT_DIM, LOW_DIM, 53u);
+    if (output_b_native_diagnostic) {
+        pack_q8_rows_b_kshards_warp32(
+            model + native_out_b_offset, model + out_b_offset,
+            OUT_DIM, LOW_DIM);
+    }
     for (uint64_t i = 0u; i < input_count; i++) {
         const int value = (int)((i * 29u + (i >> 5u) * 17u +
             (i / IN_DIM) * 7u + 23u) % 257u) - 128;
@@ -521,7 +566,7 @@ int main(void) {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
     }
-    if (output_b_canonical_diagnostic) {
+    if (output_b_diagnostic) {
         (void)setenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC", "1", 1);
     } else {
         (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
@@ -533,16 +578,17 @@ int main(void) {
     }
     initialized = 1;
     if (!ds4_gpu_set_model_map(model, model_bytes) ||
-        (!output_b_canonical_diagnostic &&
+        (!output_b_diagnostic &&
          (!ds4_gpu_cache_q8_f16_range_on_device(
               model, model_bytes, 0u, q_b_bytes, IN_DIM, Q_DIM, 0,
               "attn_q_b") ||
           !ds4_gpu_cache_q8_f16_range_on_device(
               model, model_bytes, out_a_offset, out_a_bytes,
               GROUP_DIM, LOW_DIM, 0, "attn_output_a"))) ||
-        !ds4_gpu_cache_q8_f16_range_on_device(
-            model, model_bytes, out_b_offset, out_b_bytes,
-            LOW_DIM, OUT_DIM, 0, "attn_output_b")) {
+        (!output_b_native_diagnostic &&
+         !ds4_gpu_cache_q8_f16_range_on_device(
+             model, model_bytes, out_b_offset, out_b_bytes,
+             LOW_DIM, OUT_DIM, 0, "attn_output_b"))) {
         fprintf(stderr, "error: model/cache installation failed\n");
         goto cleanup;
     }
@@ -563,10 +609,37 @@ int main(void) {
             goto cleanup;
         }
     }
-    if (output_b_canonical_diagnostic) {
+    if (output_b_native_diagnostic) {
+        const ds4_tensor_range native_source = {
+            native_out_b_offset, out_b_bytes, 0};
+        const ds4_q8_native_range native_range = {
+            native_out_b_offset, out_b_bytes,
+            native_out_b_offset, out_b_bytes,
+            native_out_b_offset, LOW_DIM / 32u, 0u,
+            LOW_DIM / 32u, OUT_DIM,
+            DS4_Q8_NATIVE_LAYOUT_B_KSHARDS_WARP32, 1, 0};
+        if (ds4_gpu_device_cache_tensors(0, &native_source, 1) != 0 ||
+            ds4_gpu_device_cache_q8_native_tensors(
+                0, &native_range, 1) != 0) {
+            fprintf(stderr,
+                    "error: native output-B source installation failed\n");
+            goto cleanup;
+        }
+        (void)setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 1);
+        (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE",
+                     "native-stream", 1);
+        (void)setenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS",
+                     "0", 1);
+        (void)setenv(
+            "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
+    }
+    if (output_b_diagnostic) {
         if (!ds4_gpu_synchronize() ||
-            !run_output_b_canonical_single_launch(
-                model, model_bytes, out_b_offset)) {
+            !run_output_b_single_launch(
+                model, model_bytes,
+                output_b_native_diagnostic
+                    ? native_out_b_offset : out_b_offset,
+                output_b_native_diagnostic)) {
             goto cleanup;
         }
         status = 0;

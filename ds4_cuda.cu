@@ -22510,6 +22510,8 @@ static int cuda_matmul_q8_0_tensor_labeled_algo(
                         blocks, native_source_layout, "attn_output_b")) {
                     return 0;
                 }
+                if (!cuda_output_b_local_diagnostic_checkpoint(
+                        "native-dequant", physical_device)) return 0;
                 w_f16_eff = transient_w_f16;
             }
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
