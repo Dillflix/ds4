@@ -6161,6 +6161,11 @@ same transient arena, so this preserves production A-to-B ordering.  The first
 new fence is B's post-dequantization checkpoint: because A-only and B-only are
 already independently clean, a failure there isolates the combined workspace
 handoff.  Both low and final output allocations have independent guards.
+The combined setup also grows the ordinary selective-cache slab after A's
+borrowed native-Q8 view has been published.  The backend must rebase that view
+before freeing the old slab, and the runner requires the one-view rebase audit
+marker.  This is the regression guard for the Xid 31 virtual-read fault exposed
+by the original combined probe.
 
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill

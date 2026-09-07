@@ -8256,6 +8256,38 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
  * whose device matches cudaGetDevice().
  * ========================================================================= */
 
+static uint64_t cuda_q8_native_rebase_borrowed_cache_views(
+        int device_id, const void *old_base, size_t old_bytes,
+        void *new_base) {
+    if (!old_base || old_bytes == 0u || !new_base) return 0u;
+    const uintptr_t old_address = (uintptr_t)old_base;
+    uint64_t rebased = 0u;
+    const std::lock_guard<std::mutex> guard(
+        g_q8_warp_interleaved_mutex);
+
+    for (cuda_q8_warp_interleaved_range &r :
+             g_q8_warp_interleaved_ranges) {
+        if (!r.borrowed || !r.device_ptr || r.device_id != device_id) continue;
+        const uintptr_t address = (uintptr_t)r.device_ptr;
+        if (address < old_address) continue;
+        const uintptr_t delta = address - old_address;
+        if (delta > old_bytes || r.weight_bytes > old_bytes - delta) continue;
+        r.device_ptr = (unsigned char *)new_base + delta;
+        rebased++;
+    }
+    for (cuda_q8_native_primary_source_span &r :
+             g_q8_native_primary_source_spans) {
+        if (!r.borrowed || !r.device_ptr || r.device_id != device_id) continue;
+        const uintptr_t address = (uintptr_t)r.device_ptr;
+        if (address < old_address) continue;
+        const uintptr_t delta = address - old_address;
+        if (delta > old_bytes || r.bytes > old_bytes - delta) continue;
+        r.device_ptr = (unsigned char *)new_base + delta;
+        rebased++;
+    }
+    return rebased;
+}
+
 extern "C" int ds4_gpu_device_cache_tensors(int device_id,
                                              const ds4_tensor_range *ranges,
                                              int n_ranges) {
@@ -8363,6 +8395,22 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
                 g_cache_ranges[k].device_ptr =
                     grown + ((char *)g_cache_ranges[k].device_ptr - old_base);
             }
+        }
+        /* Native tagged-GGUF ranges borrow pointers into this same slab.
+         * Growing the ordinary residency must rebase those published views
+         * before the old allocation is released, just like g_cache_ranges.
+         * Otherwise a later incremental residency registration leaves a
+         * freed weight pointer that faults in the next cuBLAS consumer. */
+        const uint64_t native_rebased =
+            cuda_q8_native_rebase_borrowed_cache_views(
+                device_id, c.base, c.bytes, new_base);
+        if (native_rebased != 0u &&
+            getenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT") != NULL) {
+            fprintf(stderr,
+                    "ds4: rebased borrowed native-Q8 cache views "
+                    "device=%d count=%llu\n",
+                    device_id, (unsigned long long)native_rebased);
+            fflush(stderr);
         }
         (void)cudaFree(c.base);
     }

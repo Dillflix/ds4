@@ -853,6 +853,11 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
+    if (output_ab_native_diagnostic) {
+        (void)setenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT", "1", 1);
+    } else {
+        (void)unsetenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT");
+    }
     if (native_q_b_diagnostic) {
         (void)setenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
@@ -1533,6 +1538,7 @@ cleanup:
     (void)unsetenv("DS4_CUDA_OUTPUT_A_ONLY_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT");
     ds4_gpu_tensor_free(low_ref1);
     ds4_gpu_tensor_free(low_ref0);
     ds4_gpu_tensor_free(out1);

@@ -229,6 +229,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
     grep -Fq 'diagnostic_scope=output-ab-native-single-call' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe omitted its scope marker"
+    grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=1' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe did not exercise the borrowed-view rebase"
     grep -Fq 'attention_output_calls=1' "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe did not remain single-call"
     grep -Fq 'production_order=unfenced-a-to-b' \
@@ -279,6 +282,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|output_finite=|output_nonzero=|output_fnv1a64=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|output_finite=|output_nonzero=|output_fnv1a64=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"
