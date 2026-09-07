@@ -6193,6 +6193,22 @@ N=512, then the first N=256 half, then the second N=256 half.  The corresponding
 three complete whereas the unfenced group failed, the remaining trigger is the
 queued mixed-row-extent group rather than any individual DEFAULT shape.
 
+`DIAGNOSTIC_SCOPE=output-b-production103-pinned-half` preserves that entire
+replay through the now-cleared DEFAULT N=512 launch, but selects production
+algorithm 103 for the following N=256 halves.  If this arm stays healthy, the
+failing variable is the DEFAULT N=256 algorithm choice; if it still loses the
+GPU at the first half, the causal variable is the 512-to-256 shape/scratch
+transition rather than the GEMM selector.  It remains local to physical GPU1
+with no peer mapping, transfer, or native-stream materialization.
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-production103-pinned-half \
+OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local
 `B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into

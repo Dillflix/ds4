@@ -1094,9 +1094,16 @@ int main(void) {
     const int output_b_production103_replay_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_REPLAY") !=
         NULL;
+    const int output_b_production103_pinned_half_diagnostic =
+        getenv(
+            "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_PINNED_HALF") !=
+        NULL;
+    const int output_b_production103_burnin_diagnostic =
+        output_b_production103_replay_diagnostic ||
+        output_b_production103_pinned_half_diagnostic;
     const int output_b_working_set_replay_diagnostic =
         output_b_canonical_suffix_replay_diagnostic ||
-        output_b_production103_replay_diagnostic;
+        output_b_production103_burnin_diagnostic;
     const int output_b_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE") != NULL;
     const int output_a_native_diagnostic =
@@ -1191,12 +1198,12 @@ int main(void) {
                   256u, 4096u)
             : 1u;
     const uint32_t output_b_production103_calls =
-        output_b_production103_replay_diagnostic ?
+        output_b_production103_burnin_diagnostic ?
             positive_env_u32(
                 "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS",
                 1024u, 16384u) : 1u;
     const uint32_t output_b_production103_batch =
-        output_b_production103_replay_diagnostic ?
+        output_b_production103_burnin_diagnostic ?
             positive_env_u32(
                 "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH",
                 10u, 1024u) : 1u;
@@ -1539,9 +1546,9 @@ int main(void) {
                    2u * q_half_bytes + 2u * heads_bytes + 2u * low_bytes +
                    2u * out_bytes + raw_count * sizeof(float) +
                    comp_count * sizeof(float)));
-    } else if (output_b_production103_replay_diagnostic) {
-        printf("diagnostic_scope=output-b-production103-replay\n"
-               "fidelity=working-set-production-algorithm-and-suffix-replay\n"
+    } else if (output_b_production103_burnin_diagnostic) {
+        printf("diagnostic_scope=%s\n"
+               "fidelity=%s\n"
                "source_failure_archive=sm75-token-row-arithmetic-20260906T213618Z\n"
                "resident_f16_cache_bytes=%llu\n"
                "device_working_set_bytes=%llu\n"
@@ -1554,7 +1561,14 @@ int main(void) {
                "production_b_burnin_batch=%u\n"
                "exhaustive_algorithm_sweep=off\n"
                "historical_mixed_algorithm_timing=off\n"
+               "suffix_half_algorithm=%s\n"
                "suffix_submission_fencing=checkpointed-default-transitions\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "output-b-production103-pinned-half" :
+                   "output-b-production103-replay",
+               output_b_production103_pinned_half_diagnostic ?
+                   "working-set-production103-default512-pinned103-half" :
+                   "working-set-production-algorithm-and-suffix-replay",
                (unsigned long long)(2u * (Q_DIM * IN_DIM +
                    LOW_DIM * GROUP_DIM + OUT_DIM * LOW_DIM)),
                (unsigned long long)(input_bytes + 2u * q_bytes +
@@ -1562,7 +1576,9 @@ int main(void) {
                    2u * out_bytes + raw_count * sizeof(float) +
                    comp_count * sizeof(float)),
                output_b_production103_calls,
-               output_b_production103_batch);
+               output_b_production103_batch,
+               output_b_production103_pinned_half_diagnostic ?
+                   "103:CUBLAS_GEMM_ALGO3_TENSOR_OP" : "DEFAULT");
         fflush(stdout);
     }
 
@@ -1951,7 +1967,7 @@ int main(void) {
                fastest_exact_b_algorithm < 0 ? 0.0 :
                    shipping_full_ms / fastest_exact_b_half_ms);
     } else {
-        if (output_b_production103_replay_diagnostic) {
+        if (output_b_production103_burnin_diagnostic) {
             select_b_algorithm(103);
             printf("production103_replay_phase=burnin,event=submit,"
                    "calls=0,total=%u\n", output_b_production103_calls);
@@ -2042,7 +2058,10 @@ int main(void) {
     }
     if (output_b_working_set_replay_diagnostic) {
         printf("suffix_replay_phase=production-row-owned-pair-complete\n"
-               "suffix_replay_phase=default-full-split-group-submit\n");
+               "suffix_replay_phase=%s\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "default-full-pinned103-split-group-submit" :
+                   "default-full-split-group-submit");
         fflush(stdout);
     }
 
@@ -2057,7 +2076,7 @@ int main(void) {
         fprintf(stderr, "error: isolated output-B input reset failed\n");
         goto cleanup;
     }
-    if (output_b_production103_replay_diagnostic) {
+    if (output_b_production103_burnin_diagnostic) {
         printf("suffix_transition_phase=default-full512-submit\n");
         fflush(stdout);
         if (!ds4_gpu_attention_output_q8_batch_b_tensor(
@@ -2070,30 +2089,45 @@ int main(void) {
             goto cleanup;
         }
         printf("suffix_transition_phase=default-full512-complete\n"
-               "suffix_transition_phase=default-half0-256-submit\n");
+               "suffix_transition_phase=%s-half0-256-submit\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "algo103" : "default");
         fflush(stdout);
+        if (output_b_production103_pinned_half_diagnostic) {
+            select_b_algorithm(103);
+        }
         if (!ds4_gpu_attention_output_q8_batch_b_tensor(
                 out0, model, model_bytes, out_b_offset,
                 LOW_DIM, OUT_DIM, low_ref0, HALF_TOK) ||
             !ds4_gpu_synchronize()) {
             fprintf(stderr,
-                    "error: production-103 to DEFAULT half0-256 transition "
-                    "failed\n");
+                    "error: production-103 to %s half0-256 transition "
+                    "failed\n",
+                    output_b_production103_pinned_half_diagnostic ?
+                        "algorithm-103" : "DEFAULT");
             goto cleanup;
         }
-        printf("suffix_transition_phase=default-half0-256-complete\n"
-               "suffix_transition_phase=default-half1-256-submit\n");
+        printf("suffix_transition_phase=%s-half0-256-complete\n"
+               "suffix_transition_phase=%s-half1-256-submit\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "algo103" : "default",
+               output_b_production103_pinned_half_diagnostic ?
+                   "algo103" : "default");
         fflush(stdout);
         if (!ds4_gpu_attention_output_q8_batch_b_tensor(
                 out1, model, model_bytes, out_b_offset,
                 LOW_DIM, OUT_DIM, low_ref1, HALF_TOK) ||
             !ds4_gpu_synchronize()) {
             fprintf(stderr,
-                    "error: production-103 to DEFAULT half1-256 transition "
-                    "failed\n");
+                    "error: production-103 to %s half1-256 transition "
+                    "failed\n",
+                    output_b_production103_pinned_half_diagnostic ?
+                        "algorithm-103" : "DEFAULT");
             goto cleanup;
         }
-        printf("suffix_transition_phase=default-half1-256-complete\n");
+        printf("suffix_transition_phase=%s-half1-256-complete\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "algo103" : "default");
         fflush(stdout);
     } else if (!ds4_gpu_attention_output_q8_batch_b_tensor(
                    out_full, model, model_bytes, out_b_offset,
@@ -2118,7 +2152,10 @@ int main(void) {
     report_diff("output-b-structured-control-full512-vs-row256x2", "f32",
                 out_count, out_b_isolated_diff);
     if (output_b_working_set_replay_diagnostic) {
-        printf("suffix_replay_phase=default-full-split-group-complete\n");
+        printf("suffix_replay_phase=%s\n",
+               output_b_production103_pinned_half_diagnostic ?
+                   "default-full-pinned103-split-group-complete" :
+                   "default-full-split-group-complete");
         const int suffix_replay_ok =
             qh_diff.mismatches == 0u && q_diff.mismatches == 0u &&
             q_scratch_diff.mismatches == 0u &&
@@ -2132,8 +2169,11 @@ int main(void) {
             out_b_isolated_diff.mismatches == 0u;
         printf("suffix_replay_conclusion=%s\n",
                suffix_replay_ok ?
-                   (output_b_production103_replay_diagnostic ?
-                       "working-set-production103-burnin-and-suffix-clean" :
+                   (output_b_production103_burnin_diagnostic ?
+                       (output_b_production103_pinned_half_diagnostic ?
+                           "working-set-production103-default512-"
+                           "pinned103-halves-clean" :
+                           "working-set-production103-burnin-and-suffix-clean") :
                        "working-set-and-suffix-clean-without-burn-in") :
                    "unexpected-boundary-divergence");
         fflush(stdout);
