@@ -12,6 +12,18 @@ case $tool in
         esac
         ;;
     sudo) exit 1 ;; # Exercise unprivileged journal capture; never calls sudo.
+    python3)
+        # Test runner-to-helper wiring only. The real helper has its own Python
+        # tests; this double cannot execute any OS/GPU collection commands.
+        [[ $1 == */capture-sm75-gpu1-failure.py && $2 == --output &&
+           $4 == --executable && $5 == ./tests/cuda_sm75_token_row_arithmetic &&
+           $6 == --case-timeout && $8 == -- ]]
+        mkdir -p "$3"
+        printf '{"collection":"mock-partial-evidence"}\n' >"$3/summary.json"
+        [[ $MOCK_CASE != preflight ]] || exit 2
+        shift 8
+        MOCK_CAPTURE_MODE=1 "$@"
+        ;;
     journalctl)
         if [[ $MOCK_CASE == kernel-fault ]]; then
             printf 'NVRM: Xid (PCI:0000:03:00): 79, GPU has fallen off the bus.\n'
@@ -95,7 +107,7 @@ case $tool in
         [[ ${DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_NO_ROW_OWNED:-} == 1 ]]
         [[ ${DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS:-} == 1024 ]]
         [[ ${DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH:-} == 10 ]]
-        if [[ $MOCK_CASE == ordinary ]]; then
+        if [[ $MOCK_CASE == ordinary || ${MOCK_CAPTURE_MODE:-0} == 1 ]]; then
             [[ ! -v MOCK_INSTRUMENTED && ! -v DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE ]]
         elif [[ $MOCK_CASE == legacy && ! -v MOCK_INSTRUMENTED ]]; then
             [[ ! -v DS4_TOKEN_ROW_ARITHMETIC_SANITIZER_SMOKE ]]

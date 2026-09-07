@@ -6373,6 +6373,15 @@ The unchanged workload may still fail; no additional reboot is required by
 the clean instrumented results alone, but do not run on a host with a subsequent
 GPU fault.  The checksum guard below refuses to test a different executable.
 
+The racecheck command below is retained as historical reference, not the next
+run: the September 7 execution timed out without a completed racecheck summary.
+For the DCGM-disabled comparison, use the new **host-only failure capture**
+around the unchanged uninstrumented GPU1 executable. It records journal/application
+timelines, PCIe/BAR1 state, actual loaded CUDA libraries and bounded post-fault
+NVIDIA reports. See [GPU1 failure capture](sm75-gpu1-failure-capture.md) for its
+preflight gates, artifacts, command, runtime bounds and interpretation limits.
+`CAPTURE_FAILURE_CONTEXT` defaults to `0`; it changes no production CUDA path.
+
 ```bash
 printf '%s  %s\n' \
   '5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414' \

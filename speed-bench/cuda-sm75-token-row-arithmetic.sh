@@ -13,6 +13,7 @@ SANITIZER_ONLY=${SANITIZER_ONLY:-0}
 SANITIZER_TOOL=${SANITIZER_TOOL:-memcheck}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
+CAPTURE_FAILURE_CONTEXT=${CAPTURE_FAILURE_CONTEXT:-0}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-600}
 OUTPUT_AB_REPEAT_CALLS=${OUTPUT_AB_REPEAT_CALLS:-256}
@@ -61,7 +62,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
     (( OUTPUT_AB_REPEAT_CALLS >= 2 )) ||
         die "OUTPUT_AB_REPEAT_CALLS must be at least 2 in repeat scope"
 fi
-for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE; do
+for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE CAPTURE_FAILURE_CONTEXT; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -89,6 +90,16 @@ done
     die "OUTPUT_B_PRODUCTION103_BATCH must not exceed 1024"
 (( OUTPUT_B_PRODUCTION103_BATCH <= OUTPUT_B_PRODUCTION103_CALLS )) ||
     die "OUTPUT_B_PRODUCTION103_BATCH must not exceed OUTPUT_B_PRODUCTION103_CALLS"
+if (( CAPTURE_FAILURE_CONTEXT )); then
+    [[ $PROFILE_GPU == 1 && $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned &&
+       $RUN_SANITIZER == 0 && $SANITIZER_ONLY == 0 && $SKIP_BUILD == 1 &&
+       $CREATE_ARCHIVE == 1 && $OUTPUT_B_PRODUCTION103_CALLS == 1024 &&
+       $OUTPUT_B_PRODUCTION103_BATCH == 10 && $B_TIMING_ROUNDS == 7 &&
+       $B_TIMING_REPEATS == 10 && $B_TIMING_WARMUPS == 3 ]] ||
+        die "failure capture requires the unchanged GPU1 no-row-owned 1024/batch10 workload, no sanitizer, SKIP_BUILD=1, CREATE_ARCHIVE=1"
+    (( CASE_TIMEOUT_SECONDS <= 600 )) || die "failure capture timeout must not exceed 600 seconds"
+    command -v python3 >/dev/null 2>&1 || die "python3 not found"
+fi
 for tool in cat date env git grep journalctl make mkdir nproc nvidia-smi sudo tail tar timeout; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -96,7 +107,7 @@ if (( RUN_SANITIZER )); then
     command -v compute-sanitizer >/dev/null 2>&1 ||
         die "compute-sanitizer not found"
 fi
-if (( SANITIZER_ONLY )); then
+if (( SANITIZER_ONLY || CAPTURE_FAILURE_CONTEXT )); then
     command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
 fi
 [[ ! -e $OUTPUT_DIR && ! -e $OUTPUT_DIR.tar.gz ]] ||
@@ -138,7 +149,7 @@ phase=manifest
     printf 'date_utc=%s\ngit_commit=%s\ngit_branch=%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(git rev-parse HEAD)" \
         "$(git branch --show-current)"
-    nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
+    timeout --signal=TERM --kill-after=2 20s nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
     printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\noutput_ab_repeat_calls=%s\noutput_b_production103_calls=%s\noutput_b_production103_batch=%s\n' \
         "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS" \
@@ -148,6 +159,7 @@ phase=manifest
     printf 'run_sanitizer=%s\nsanitizer_only=%s\nskip_build=%s\n' \
         "$RUN_SANITIZER" "$SANITIZER_ONLY" "$SKIP_BUILD"
     printf 'sanitizer_tool=%s\n' "$SANITIZER_TOOL"
+    printf 'capture_failure_context=%s\n' "$CAPTURE_FAILURE_CONTEXT"
     if (( SANITIZER_ONLY )); then
         printf 'execution_mode=%s-full-selected-scope\nuninstrumented_runs=0\nsanitizer_smoke=0\n' \
             "$SANITIZER_TOOL"
@@ -230,7 +242,7 @@ fi
 
 capture_gpu_health() {
     local output=$1
-    timeout 20s nvidia-smi -i "$PROFILE_GPU" \
+    timeout --signal=TERM --kill-after=2 20s nvidia-smi -i "$PROFILE_GPU" \
         --query-gpu=index,pci.bus_id,uuid,memory.used,memory.free,power.limit \
         --format=csv,noheader,nounits >"$output" 2>&1
 }
@@ -239,9 +251,9 @@ capture_kernel_since() {
     local since=$1
     local output=$2
     if sudo -n true >/dev/null 2>&1; then
-        sudo -n journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
+        sudo -n timeout --signal=TERM --kill-after=2 20s journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
     else
-        journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
+        timeout --signal=TERM --kill-after=2 20s journalctl -k --since "$since" --no-pager >"$output" 2>&1 || true
     fi
 }
 
@@ -266,11 +278,19 @@ if (( SANITIZER_ONLY )); then
     fi
     diagnostic_command+=("./$target")
 fi
-printf '%q ' timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
+diagnostic_prefix=(timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS")
+if (( CAPTURE_FAILURE_CONTEXT )); then
+    phase=failure-context-capture
+    sha256sum "./$target" >"$OUTPUT_DIR/provenance/diagnostic-sha256.txt"
+    diagnostic_prefix=(python3 "$repo_dir/speed-bench/capture-sm75-gpu1-failure.py"
+        --output "$OUTPUT_DIR/failure-context" --executable "./$target"
+        --case-timeout "$CASE_TIMEOUT_SECONDS" --)
+fi
+printf '%q ' "${diagnostic_prefix[@]}" \
     "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/provenance/diagnostic-command.txt"
 printf '\n' >>"$OUTPUT_DIR/provenance/diagnostic-command.txt"
 set +e
-timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
+"${diagnostic_prefix[@]}" \
     "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/diagnostic.log" 2>&1
 diagnostic_status=$?
 set -e

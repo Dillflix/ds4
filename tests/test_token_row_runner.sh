@@ -11,7 +11,7 @@ mkdir -p "$test_dir/repo/speed-bench" "$test_dir/repo/tests" "$test_dir/bin"
 cp "$repo_dir/speed-bench/cuda-sm75-token-row-arithmetic.sh" "$test_dir/repo/speed-bench/"
 cp "$fixture_dir/mock.sh" "$test_dir/repo/tests/cuda_sm75_token_row_arithmetic"
 chmod +x "$test_dir/repo/tests/cuda_sm75_token_row_arithmetic"
-for tool in make git sudo journalctl nvidia-smi compute-sanitizer; do
+for tool in make git sudo journalctl nvidia-smi compute-sanitizer python3; do
     cp "$fixture_dir/mock.sh" "$test_dir/bin/$tool"
     chmod +x "$test_dir/bin/$tool"
 done
@@ -22,6 +22,7 @@ run_case() {
     local case_dir=$test_dir/$name mock_name=${name#initcheck-} status
     mock_name=${mock_name#synccheck-}
     mock_name=${mock_name#racecheck-}
+    mock_name=${mock_name#capture-}
     mkdir -p "$case_dir"
     : >"$case_dir/trace"
     set +e
@@ -34,6 +35,8 @@ run_case() {
         PROFILE_GPU=1 DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned \
         SANITIZER_ONLY=1 RUN_SANITIZER=1 SKIP_BUILD=1 CREATE_ARCHIVE=1 \
         SANITIZER_TOOL=memcheck \
+        CAPTURE_FAILURE_CONTEXT=0 CASE_TIMEOUT_SECONDS=600 \
+        B_TIMING_ROUNDS=7 B_TIMING_REPEATS=10 B_TIMING_WARMUPS=3 \
         OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
         TOKEN_ROW_ARITHMETIC_DIR="$case_dir/output" "$@" \
         bash "$test_dir/repo/speed-bench/cuda-sm75-token-row-arithmetic.sh" \
@@ -56,6 +59,10 @@ run_case() {
         [[ $mock_name != memcheck-error ]] || diagnostic_status=99
         [[ $mock_name != timeout ]] || diagnostic_status=124
         grep -Fxq "diagnostic_exit_status=$diagnostic_status" "$case_dir/output/run-status.txt"
+    elif [[ $mock_name == preflight ]]; then
+        [[ -s $case_dir/output.tar.gz ]]
+        grep -Fxq 'diagnostic_exit_status=2' "$case_dir/output/run-status.txt"
+        tar -tzf "$case_dir/output.tar.gz" | grep 'output/failure-context/summary.json' >/dev/null
     elif [[ $mock_name == stale-target ]]; then
         [[ -s $case_dir/output.tar.gz ]]
         [[ $(<"$case_dir/trace") == make ]]
@@ -139,4 +146,19 @@ run_case racecheck-ordinary-rejected 1 0 0 SANITIZER_TOOL=racecheck SANITIZER_ON
 run_case racecheck-disabled 1 0 0 SANITIZER_TOOL=racecheck RUN_SANITIZER=0
 run_case racecheck-wrong-scope 1 0 0 SANITIZER_TOOL=racecheck DIAGNOSTIC_SCOPE=full
 run_case racecheck-stale-target 1 0 0 SANITIZER_TOOL=racecheck
-printf 'All 62 CPU-only runner cases passed. No GPU validation performed.\n'
+run_case capture-clean 0 1 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0
+run_case capture-application-fault 1 1 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0
+run_case capture-preflight 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0
+for name in capture-clean capture-application-fault; do
+    [[ $(grep -cx python3 "$test_dir/$name/trace") == 1 ]]
+    [[ -s $test_dir/$name/output/provenance/diagnostic-sha256.txt ]]
+    tar -tzf "$test_dir/$name/output.tar.gz" | grep 'output/failure-context/summary.json' >/dev/null
+done
+for setting in CAPTURE_FAILURE_CONTEXT=2 PROFILE_GPU=0 DIAGNOSTIC_SCOPE=q-b \
+    RUN_SANITIZER=1 SKIP_BUILD=0 CREATE_ARCHIVE=0 OUTPUT_B_PRODUCTION103_CALLS=2048 \
+    OUTPUT_B_PRODUCTION103_BATCH=20 B_TIMING_ROUNDS=8 B_TIMING_REPEATS=11 \
+    B_TIMING_WARMUPS=4 CASE_TIMEOUT_SECONDS=601; do
+    run_case "capture-reject-${setting%%=*}" 1 0 0 CAPTURE_FAILURE_CONTEXT=1 \
+        SANITIZER_ONLY=0 RUN_SANITIZER=0 "$setting"
+done
+printf 'All 77 CPU-only runner cases passed. No GPU validation performed.\n'
