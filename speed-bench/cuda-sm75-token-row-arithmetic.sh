@@ -28,17 +28,19 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == output-ab-native ||
    $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
    $DIAGNOSTIC_SCOPE == projection-chain-native ||
+   $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, output-b-canonical, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
     die "OUTPUT_AB_REPEAT_CALLS must be a positive integer"
 (( OUTPUT_AB_REPEAT_CALLS <= 4096 )) ||
     die "OUTPUT_AB_REPEAT_CALLS must not exceed 4096"
-if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
+      $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ]]; then
     (( OUTPUT_AB_REPEAT_CALLS >= 2 )) ||
         die "OUTPUT_AB_REPEAT_CALLS must be at least 2 in repeat scope"
 fi
@@ -143,6 +145,10 @@ fi
 if [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE=1)
 fi
+if [[ $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE_REPEAT=1
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS="$OUTPUT_AB_REPEAT_CALLS")
+fi
 
 capture_gpu_health() {
     local output=$1
@@ -246,7 +252,8 @@ if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
       $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
-      $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
+      $DIAGNOSTIC_SCOPE == projection-chain-native ||
+      $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ]]; then
     expected_scope=output-ab-native-single-call
     expected_calls=1
     expected_reference_calls=0
@@ -261,6 +268,12 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
     elif [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
         expected_scope=projection-chain-native
         expected_conclusion=native-stream-projection-chain-clean
+    elif [[ $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ]]; then
+        expected_scope=projection-chain-native-repeat
+        expected_calls=$((OUTPUT_AB_REPEAT_CALLS + 1))
+        expected_reference_calls=1
+        expected_stress_calls=$OUTPUT_AB_REPEAT_CALLS
+        expected_conclusion=native-stream-projection-chain-repeat-clean
     fi
     grep -Fq "diagnostic_scope=$expected_scope" \
         "$OUTPUT_DIR/diagnostic.log" ||
@@ -268,11 +281,12 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
     grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=1' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe did not exercise the borrowed-view rebase"
-    if [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
+    if [[ $DIAGNOSTIC_SCOPE == projection-chain-native ||
+          $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ]]; then
         grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=2' \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "native projection chain missed its second borrowed-view rebase"
-        grep -Fq 'q_b_launches=1' "$OUTPUT_DIR/diagnostic.log" ||
+        grep -Fq "q_b_launches=$expected_calls" "$OUTPUT_DIR/diagnostic.log" ||
             die "native projection chain reported the wrong Q_B call count"
         grep -Fq 'q_b_to_a_sync=0' "$OUTPUT_DIR/diagnostic.log" ||
             die "native projection chain unexpectedly fenced Q_B-to-A"

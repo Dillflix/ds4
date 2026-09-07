@@ -6182,6 +6182,16 @@ chain through the shared bounded native-stream arena with no Q_B-to-A or A-to-B
 diagnostic fence.  The scope remains single-GPU and has no peer mappings; it is
 the final local lifetime/order gate before adding a second CUDA context.
 
+`DIAGNOSTIC_SCOPE=projection-chain-native-repeat` remains on the same single
+physical GPU with one CUDA context and no peer mappings.  It captures one
+synchronized Q_B → A → B reference, then queues `OUTPUT_AB_REPEAT_CALLS`
+complete projection chains (256 by default) without Q_B-to-A, A-to-B, or
+inter-chain diagnostic fences.  The final low-rank and projected outputs must
+remain bit-identical to the reference, and both guarded allocations must remain
+intact.  This is the production-frequency local cache/scratch-reuse gate; a
+later peer diagnostic tests a different multi-context/transport dimension and
+is warranted only after this local sequence is clean.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6258,6 +6268,17 @@ After the repeated A+B chain is clean, add Q_B while remaining local-only:
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=projection-chain-native \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After one Q_B → A → B chain is clean, repeat that entire chain while still
+remaining local-only:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=projection-chain-native-repeat \
+OUTPUT_AB_REPEAT_CALLS=256 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 

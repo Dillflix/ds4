@@ -633,6 +633,9 @@ static int run_output_ab_native_calls(
         goto cleanup;
     }
 
+    const int repeated_chain = q_b_chain && stress_calls > 1u;
+    const uint32_t total_calls =
+        stress_calls + (stress_calls > 1u ? 1u : 0u);
     printf("diagnostic_scope=%s\n"
            "n_tokens=%u\ngroups=%u\ngroup_dim=%u\nrank=%u\n"
            "low_dim=%llu\noutput_dim=%u\nreference_calls=%u\n"
@@ -640,6 +643,7 @@ static int run_output_ab_native_calls(
            "output_a_launches=%u\noutput_b_launches=%u\npeer_access=none\n"
            "native_stream=on\nproduction_order=unfenced-a-to-b\n"
            "handoff_sync_before_b=0\n",
+           repeated_chain ? "projection-chain-native-repeat" :
            q_b_chain ? "projection-chain-native" :
            stress_calls > 1u ? "output-ab-native-repeat" :
                                "output-ab-native-single-call",
@@ -652,18 +656,16 @@ static int run_output_ab_native_calls(
     fflush(stdout);
 
     if (q_b_chain) {
-        printf("q_b_launches=1\nq_b_to_a_sync=0\n");
+        printf("q_b_launches=%u\nq_b_to_a_sync=0\n",
+               total_calls);
         fflush(stdout);
-        if (!launch_q_b(heads, NULL, model, model_bytes, q_b_offset,
-                        input, HALF_TOK, POS0)) {
-            fprintf(stderr,
-                    "error: native-stream local Q_B-to-A launch failed\n");
-            goto cleanup;
-        }
     }
 
     if (stress_calls > 1u) {
-        if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+        if ((q_b_chain &&
+             !launch_q_b(heads, NULL, model, model_bytes, q_b_offset,
+                         input, HALF_TOK, POS0)) ||
+            !ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
                 out, low, NULL, NULL, model, model_bytes,
                 out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
                 OUT_DIM, heads, HALF_TOK) ||
@@ -678,7 +680,10 @@ static int run_output_ab_native_calls(
         }
     }
     for (uint32_t call = 0u; call < stress_calls; call++) {
-        if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+        if ((q_b_chain &&
+             !launch_q_b(heads, NULL, model, model_bytes, q_b_offset,
+                         input, HALF_TOK, POS0)) ||
+            !ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
                 out, low, NULL, NULL, model, model_bytes,
                 out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
                 OUT_DIM, heads, HALF_TOK)) {
@@ -785,6 +790,7 @@ static int run_output_ab_native_calls(
     }
     printf("diagnostic_conclusion=%s\n"
            "harness_status=ok\n",
+           repeated_chain ? "native-stream-projection-chain-repeat-clean" :
            q_b_chain ? "native-stream-projection-chain-clean" :
            stress_calls > 1u ? "native-stream-output-ab-repeat-clean" :
                                "native-stream-output-ab-single-call-clean");
@@ -821,11 +827,16 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE_REPEAT") != NULL;
     const int projection_chain_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE") != NULL;
+    const int projection_chain_native_repeat_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE_REPEAT") !=
+        NULL;
     const int output_ab_native_required =
         output_ab_native_diagnostic || output_ab_native_repeat_diagnostic ||
-        projection_chain_native_diagnostic;
+        projection_chain_native_diagnostic ||
+        projection_chain_native_repeat_diagnostic;
     const int native_q_b_required =
-        native_q_b_diagnostic || projection_chain_native_diagnostic;
+        native_q_b_diagnostic || projection_chain_native_diagnostic ||
+        projection_chain_native_repeat_diagnostic;
     const int output_a_native_required =
         output_a_native_diagnostic || output_ab_native_required;
     const int output_b_native_required =
@@ -891,14 +902,16 @@ int main(void) {
     int initialized = 0;
     int status = 1;
     const uint32_t output_ab_stress_calls =
-        output_ab_native_repeat_diagnostic
+        (output_ab_native_repeat_diagnostic ||
+         projection_chain_native_repeat_diagnostic)
             ? positive_env_u32(
                   "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS",
                   256u, 4096u)
             : 1u;
 
     if (output_ab_stress_calls == 0u ||
-        (output_ab_native_repeat_diagnostic &&
+        ((output_ab_native_repeat_diagnostic ||
+          projection_chain_native_repeat_diagnostic) &&
          output_ab_stress_calls < 2u)) {
         if (output_ab_stress_calls != 0u) {
             fprintf(stderr,
@@ -1125,7 +1138,8 @@ int main(void) {
                 model, model_bytes,
                 native_q_b_offset, native_out_a_offset, native_out_b_offset,
                 output_ab_stress_calls,
-                projection_chain_native_diagnostic)) {
+                projection_chain_native_diagnostic ||
+                projection_chain_native_repeat_diagnostic)) {
             goto cleanup;
         }
         status = 0;
