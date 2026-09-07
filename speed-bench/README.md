@@ -6211,6 +6211,18 @@ synchronized alone.  `pre_suffix_transition_phase` therefore identifies the
 actual failing operation instead of reporting the later observation point as
 an output-A failure.
 
+The corrected run completed both pinned transitions at the first boundary,
+1,024 algorithm-103 N=256 calls, and the row-owned A+B pair.  It then completed
+DEFAULT N=512 and lost GPU1 at the following algorithm-103 N=256 call.  Thus
+algorithm 103 and the bare 512-to-256 transition are independently clean; the
+failure requires prior execution history.  The follow-up
+`DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned` removes only the
+intervening row-owned A+B pair while preserving the cache, working set,
+pre-boundaries, 1,024-call burn-in, DEFAULT N=512 and pinned N=256 transition.
+Failure there clears the row-owned helper and isolates accumulated cuBLAS
+history plus the shape transition.  A pass makes the row-owned pair's state
+interaction necessary.
+
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-pinned-half \

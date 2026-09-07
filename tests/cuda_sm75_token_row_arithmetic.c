@@ -1094,10 +1094,14 @@ int main(void) {
     const int output_b_production103_replay_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_REPLAY") !=
         NULL;
+    const int output_b_production103_no_row_owned_diagnostic =
+        getenv(
+            "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_NO_ROW_OWNED") !=
+        NULL;
     const int output_b_production103_pinned_half_diagnostic =
         getenv(
             "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_PINNED_HALF") !=
-        NULL;
+        NULL || output_b_production103_no_row_owned_diagnostic;
     const int output_b_production103_burnin_diagnostic =
         output_b_production103_replay_diagnostic ||
         output_b_production103_pinned_half_diagnostic;
@@ -1563,9 +1567,14 @@ int main(void) {
                "historical_mixed_algorithm_timing=off\n"
                "suffix_half_algorithm=%s\n"
                "suffix_submission_fencing=checkpointed-default-transitions\n",
+               output_b_production103_no_row_owned_diagnostic ?
+                   "output-b-production103-no-row-owned" :
                output_b_production103_pinned_half_diagnostic ?
                    "output-b-production103-pinned-half" :
                    "output-b-production103-replay",
+               output_b_production103_no_row_owned_diagnostic ?
+                   "working-set-production103-default512-pinned103-half-"
+                   "without-row-owned-pair" :
                output_b_production103_pinned_half_diagnostic ?
                    "working-set-production103-default512-pinned103-half" :
                    "working-set-production-algorithm-and-suffix-replay",
@@ -2055,8 +2064,11 @@ int main(void) {
             fflush(stdout);
         }
         select_b_algorithm(-1);
-        printf("suffix_replay_phase=preconditioning-complete\n"
-               "suffix_replay_phase=production-row-owned-pair-submit\n");
+        printf("suffix_replay_phase=preconditioning-complete\n");
+        printf("suffix_replay_phase=%s\n",
+               output_b_production103_no_row_owned_diagnostic ?
+                   "production-row-owned-pair-skipped" :
+                   "production-row-owned-pair-submit");
         fflush(stdout);
     }
 
@@ -2064,39 +2076,47 @@ int main(void) {
      * two calls must reproduce both the already-exact A result and shipping
      * DEFAULT's full-row A+B result; testing only the diagnostic environment
      * selector would not prove that the graph-facing helper is wired safely. */
-    if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
-            out0, low0, NULL, NULL, model, model_bytes, out_a_offset,
-            out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref0,
-            HALF_TOK) ||
-        !ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
-            out1, low1, NULL, NULL, model, model_bytes, out_a_offset,
-            out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref1,
-            HALF_TOK) ||
-        !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(low_split, 0u, candidate, low_bytes)) {
-        fprintf(stderr, "error: dedicated row-owned output helper failed\n");
-        goto cleanup;
-    }
-    const diff_metrics row_owned_low_diff = compare_f32(
-        actual_low_host, candidate, low_count);
-    report_diff("output-a-shipping-full512-vs-row-owned-algo3-256x2",
-                "f32", low_count, row_owned_low_diff);
-    if (!ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
-        fprintf(stderr, "error: dedicated row-owned output readback failed\n");
-        goto cleanup;
-    }
-    const diff_metrics row_owned_output_diff = compare_f32(
-        shipping_b_host, candidate, out_count);
-    report_diff("output-a-plus-b-shipping-full512-vs-row-owned-algo3-256x2",
-                "f32", out_count, row_owned_output_diff);
-    if (row_owned_low_diff.mismatches || row_owned_output_diff.mismatches) {
-        fprintf(stderr,
-                "error: dedicated row-owned output helper failed exactness\n");
-        goto cleanup;
+    diff_metrics row_owned_low_diff = {0u, UINT64_MAX, 0.0, 0.0};
+    diff_metrics row_owned_output_diff = {0u, UINT64_MAX, 0.0, 0.0};
+    if (!output_b_production103_no_row_owned_diagnostic) {
+        if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+                out0, low0, NULL, NULL, model, model_bytes, out_a_offset,
+                out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref0,
+                HALF_TOK) ||
+            !ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+                out1, low1, NULL, NULL, model, model_bytes, out_a_offset,
+                out_b_offset, GROUP_DIM, RANK, N_GROUP, OUT_DIM, heads_ref1,
+                HALF_TOK) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(low_split, 0u, candidate, low_bytes)) {
+            fprintf(stderr, "error: dedicated row-owned output helper failed\n");
+            goto cleanup;
+        }
+        row_owned_low_diff = compare_f32(
+            actual_low_host, candidate, low_count);
+        report_diff("output-a-shipping-full512-vs-row-owned-algo3-256x2",
+                    "f32", low_count, row_owned_low_diff);
+        if (!ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
+            fprintf(stderr, "error: dedicated row-owned output readback failed\n");
+            goto cleanup;
+        }
+        row_owned_output_diff = compare_f32(
+            shipping_b_host, candidate, out_count);
+        report_diff(
+            "output-a-plus-b-shipping-full512-vs-row-owned-algo3-256x2",
+            "f32", out_count, row_owned_output_diff);
+        if (row_owned_low_diff.mismatches ||
+            row_owned_output_diff.mismatches) {
+            fprintf(stderr,
+                    "error: dedicated row-owned output helper failed exactness\n");
+            goto cleanup;
+        }
     }
     if (output_b_working_set_replay_diagnostic) {
-        printf("suffix_replay_phase=production-row-owned-pair-complete\n"
-               "suffix_replay_phase=%s\n",
+        if (!output_b_production103_no_row_owned_diagnostic) {
+            printf("suffix_replay_phase=production-row-owned-pair-complete\n");
+        }
+        printf("suffix_replay_phase=%s\n",
                output_b_production103_pinned_half_diagnostic ?
                    "default-full-pinned103-split-group-submit" :
                    "default-full-split-group-submit");
@@ -2208,10 +2228,13 @@ int main(void) {
         printf("suffix_replay_conclusion=%s\n",
                suffix_replay_ok ?
                    (output_b_production103_burnin_diagnostic ?
+                       (output_b_production103_no_row_owned_diagnostic ?
+                           "working-set-production103-transition-clean-"
+                           "without-row-owned-pair" :
                        (output_b_production103_pinned_half_diagnostic ?
                            "working-set-production103-default512-"
                            "pinned103-halves-clean" :
-                           "working-set-production103-burnin-and-suffix-clean") :
+                           "working-set-production103-burnin-and-suffix-clean")) :
                        "working-set-and-suffix-clean-without-burn-in") :
                    "unexpected-boundary-divergence");
         fflush(stdout);
