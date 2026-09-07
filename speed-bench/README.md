@@ -6223,6 +6223,26 @@ Failure there clears the row-owned helper and isolates accumulated cuBLAS
 history plus the shape transition.  A pass makes the row-owned pair's state
 interaction necessary.
 
+The no-row-owned run completed every checkpoint and left physical GPU1
+healthy.  Its earlier nonzero exit was a harness verdict error: the diagnostic
+intentionally compared algorithm-103 N=256 output with a later DEFAULT N=256
+reference, which is not the asserted shipping equivalence.  The gate now
+requires the exact algorithm-103 split result and the final structured
+transition while treating that cross-algorithm comparison as informational.
+This result makes the intervening row-owned pair necessary for the reproduced
+failure, but does not yet establish whether its arithmetic or its dedicated
+entry point is responsible.
+
+`DIAGNOSTIC_SCOPE=output-b-production103-generic-pair` restores the two
+post-burn-in N=256 A+B calls, their tensors, order, algorithm 103 B selection,
+and synchronization.  It changes only their invocation from the dedicated
+row-owned helper to the ordinary output helper with the diagnostic algorithm
+selector.  A healthy run implicates the dedicated row-owned/forced-B route;
+another loss means the two A+B calls themselves are sufficient after the
+1,024-call history, and the next split is A-only versus B-only.  Like the
+preceding rungs, this remains local to physical GPU1 with no peer access,
+native stream, transfer, or BAR1 exposure.
+
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-pinned-half \
@@ -6230,6 +6250,10 @@ OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
+
+Use the same command with
+`DIAGNOSTIC_SCOPE=output-b-production103-generic-pair` for the dedicated-entry
+point isolation.
 
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local

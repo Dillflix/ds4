@@ -37,9 +37,10 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
    $DIAGNOSTIC_SCOPE == output-b-production103-pinned-half ||
    $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ||
+   $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-production103-replay, output-b-production103-pinned-half, output-b-production103-no-row-owned, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-production103-replay, output-b-production103-pinned-half, output-b-production103-no-row-owned, output-b-production103-generic-pair, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
@@ -165,6 +166,11 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-pinned-half ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_NO_ROW_OWNED=1
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS="$OUTPUT_B_PRODUCTION103_CALLS"
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH="$OUTPUT_B_PRODUCTION103_BATCH")
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_GENERIC_PAIR=1
         DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS="$OUTPUT_B_PRODUCTION103_CALLS"
         DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH="$OUTPUT_B_PRODUCTION103_BATCH")
 fi
@@ -336,15 +342,19 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
       $DIAGNOSTIC_SCOPE == output-b-production103-pinned-half ||
-      $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]]; then
+      $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ||
+      $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
     grep -Fq "diagnostic_scope=$DIAGNOSTIC_SCOPE" \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "production-103 output-B replay omitted its scope marker"
     if [[ $DIAGNOSTIC_SCOPE == output-b-production103-pinned-half ||
-          $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]]; then
+          $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ||
+          $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
         expected_fidelity=working-set-production103-default512-pinned103-half
         if [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]]; then
             expected_fidelity+=-without-row-owned-pair
+        elif [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
+            expected_fidelity+=-generic-pair
         fi
         grep -Fq "fidelity=$expected_fidelity" \
             "$OUTPUT_DIR/diagnostic.log" ||
@@ -407,6 +417,10 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
         grep -Fq 'suffix_replay_phase=production-row-owned-pair-skipped' \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 no-row-owned replay entered the row-owned suffix"
+    elif [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
+        grep -Fq 'suffix_replay_phase=production-generic-algo103-pair-complete' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 generic-pair replay missed the generic A+B pair"
     else
         grep -Fq 'suffix_replay_phase=production-row-owned-pair-complete' \
             "$OUTPUT_DIR/diagnostic.log" ||
@@ -426,6 +440,13 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
         grep -Fq 'suffix_replay_conclusion=working-set-production103-transition-clean-without-row-owned-pair' \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 no-row-owned replay omitted its clean conclusion"
+    elif [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
+        grep -Fq 'suffix_replay_phase=default-full-pinned103-split-group-complete' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 generic-pair replay missed the pinned transition"
+        grep -Fq 'suffix_replay_conclusion=working-set-production103-transition-clean-with-generic-algo103-pair' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 generic-pair replay omitted its clean conclusion"
     elif [[ $DIAGNOSTIC_SCOPE == output-b-production103-pinned-half ]]; then
         grep -Fq 'suffix_replay_phase=default-full-pinned103-split-group-complete' \
             "$OUTPUT_DIR/diagnostic.log" ||
