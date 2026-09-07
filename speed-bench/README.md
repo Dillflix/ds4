@@ -6317,7 +6317,7 @@ another workload.  `SKIP_BUILD=1` below retains the existing failing executable
 if `make -q` confirms it is current.  This wrapper-only change does not alter
 its build prerequisites; do not automatically rebuild or rerun if that check
 fails.  `SANITIZER_TOOL` defaults to `memcheck`.  Its other accepted values
-are `initcheck` and `synccheck`, both of which require sanitizer-only mode;
+are `initcheck`, `synccheck`, and `racecheck`, which require sanitizer-only mode;
 they cannot select an ordinary run followed by a smoke test.  No choice
 automatically runs another tool or workload.
 
@@ -6347,14 +6347,28 @@ check from memcheck's invalid-access checking; it does not by itself rule out
 shared-memory synchronization hazards or driver/hardware faults.  See the
 [NVIDIA initcheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#initcheck-tool).
 
-The next diagnostic uses `SANITIZER_TOOL=synccheck` on the same executable
-and selected sequence.  It checks kernel synchronization primitives such as
+The 2026-09-07 19:27 archive at `251acae` confirms that synccheck completed
+the same entire sequence with the identical executable hash and Compute
+Sanitizer 2026.1.1.0: all 1,024 calls and three final transitions, exact selected
+production comparisons, exit 0, zero reported errors, no kernel entries and
+healthy GPU1 post-run inventory. Its application log matches the memcheck log.
+Synccheck checks kernel synchronization primitives such as
 `__syncthreads()` and `__syncwarp()`, not every stream/event dependency,
 allocation lifetime or shared-memory data race.  See the
 [NVIDIA synccheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#synccheck-tool).
-The runner change only permits that tool selection and retains the existing
-single-invocation, scope, completion, exactness and health gates.  It does not add
-fences, change any CUDA/build prerequisites, enable peers, or run racecheck.
+The next diagnostic selects `SANITIZER_TOOL=racecheck` with
+`--racecheck-report analysis` on this same executable and full selected sequence.
+It checks shared-memory access hazards, not general global-memory races or
+cross-stream dependencies. The wrapper requires a zero-hazard `RACECHECK SUMMARY`
+with zero errors and warnings; an `ERROR SUMMARY: 0 errors` alone is insufficient.
+Nonzero or contradictory summaries and warning/error reports fail even if the
+tool exits 0. Existing completion, exactness and health gates remain required.
+See the [NVIDIA racecheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#racecheck-tool).
+This wrapper-only change does not add fences, change CUDA/build prerequisites,
+enable peers, filter kernels, suppress hazards, or launch any follow-on workload.
+Global-memory ownership and stream/allocation ordering are being audited now;
+they are not deferred until a racecheck pass. See the
+[GPU1-only memory and ordering audit](sm75-gpu1-memory-ordering-audit.md).
 The unchanged workload may still fail; no additional reboot is required by
 the clean instrumented results alone, but do not run on a host with a subsequent
 GPU fault.  The checksum guard below refuses to test a different executable.
@@ -6367,13 +6381,14 @@ PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned POST_BURNIN_PAIR=ab \
 OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
 CASE_TIMEOUT_SECONDS=1800 SANITIZER_ONLY=1 RUN_SANITIZER=1 \
-SANITIZER_TOOL=synccheck SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+SANITIZER_TOOL=racecheck SKIP_BUILD=1 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 
 `bash tests/test_token_row_runner.sh` tests this wrapper with CPU-only command
 doubles, including failure capture and prevention of an uninstrumented first
-run for all three tools.  It does not execute CUDA or establish GPU correctness.
+run for all four tools. Racecheck cases also reject warning-only, contradictory,
+incomplete and wrong-tool summaries. These are wrapper tests, not GPU validation.
 
 Earlier component-comparison commands below are retained for reference, not
 the recommended next run:

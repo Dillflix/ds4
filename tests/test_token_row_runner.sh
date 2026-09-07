@@ -21,6 +21,7 @@ run_case() {
     shift 4
     local case_dir=$test_dir/$name mock_name=${name#initcheck-} status
     mock_name=${mock_name#synccheck-}
+    mock_name=${mock_name#racecheck-}
     mkdir -p "$case_dir"
     : >"$case_dir/trace"
     set +e
@@ -118,4 +119,24 @@ run_case synccheck-ordinary-rejected 1 0 0 SANITIZER_TOOL=synccheck SANITIZER_ON
 run_case synccheck-disabled 1 0 0 SANITIZER_TOOL=synccheck RUN_SANITIZER=0
 run_case synccheck-wrong-scope 1 0 0 SANITIZER_TOOL=synccheck DIAGNOSTIC_SCOPE=full
 run_case synccheck-stale-target 1 0 0 SANITIZER_TOOL=synccheck
-printf 'All 41 CPU-only runner cases passed. No GPU validation performed.\n'
+run_case racecheck-clean 0 1 1 SANITIZER_TOOL=racecheck MOCK_EXPECT_TOOL=racecheck
+grep -Fxq 'sanitizer_tool=racecheck' "$test_dir/racecheck-clean/output/manifest.txt"
+grep -Fxq 'execution_mode=racecheck-full-selected-scope' "$test_dir/racecheck-clean/output/manifest.txt"
+grep -Fxq 'uninstrumented_runs=0' "$test_dir/racecheck-clean/output/manifest.txt"
+grep -Fxq 'sanitizer_smoke=0' "$test_dir/racecheck-clean/output/manifest.txt"
+grep -Fq 'compute-sanitizer --tool racecheck --error-exitcode=99 --racecheck-report analysis' \
+    "$test_dir/racecheck-clean/output/provenance/diagnostic-command.txt"
+grep -Fxq 'instrumentation-tool=racecheck' "$test_dir/racecheck-clean/trace"
+! grep -Fq 'ERROR SUMMARY:' "$test_dir/racecheck-clean/output/diagnostic.log"
+run_case racecheck-summary-prefix 0 1 1 SANITIZER_TOOL=racecheck MOCK_EXPECT_TOOL=racecheck
+for failure in application-fault memcheck-error missing-summary contradictory-summary \
+    incomplete kernel-fault health-fault error-summary-only warning-summary error-summary \
+    contradictory-error-summary warning-body error-body fatal-body; do
+    run_case "racecheck-$failure" 1 1 1 SANITIZER_TOOL=racecheck MOCK_EXPECT_TOOL=racecheck
+done
+run_case racecheck-timeout 1 1 1 SANITIZER_TOOL=racecheck MOCK_EXPECT_TOOL=racecheck CASE_TIMEOUT_SECONDS=1
+run_case racecheck-ordinary-rejected 1 0 0 SANITIZER_TOOL=racecheck SANITIZER_ONLY=0
+run_case racecheck-disabled 1 0 0 SANITIZER_TOOL=racecheck RUN_SANITIZER=0
+run_case racecheck-wrong-scope 1 0 0 SANITIZER_TOOL=racecheck DIAGNOSTIC_SCOPE=full
+run_case racecheck-stale-target 1 0 0 SANITIZER_TOOL=racecheck
+printf 'All 62 CPU-only runner cases passed. No GPU validation performed.\n'

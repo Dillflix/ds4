@@ -66,8 +66,8 @@ for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE; do
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
 [[ $SANITIZER_TOOL == memcheck || $SANITIZER_TOOL == initcheck ||
-   $SANITIZER_TOOL == synccheck ]] ||
-    die "SANITIZER_TOOL must be memcheck, initcheck, or synccheck"
+   $SANITIZER_TOOL == synccheck || $SANITIZER_TOOL == racecheck ]] ||
+    die "SANITIZER_TOOL must be memcheck, initcheck, synccheck, or racecheck"
 [[ $SANITIZER_TOOL == memcheck || $SANITIZER_ONLY == 1 ]] ||
     die "SANITIZER_TOOL=$SANITIZER_TOOL requires SANITIZER_ONLY=1"
 if (( SANITIZER_ONLY )); then
@@ -260,7 +260,11 @@ if (( SANITIZER_ONLY )); then
     # Instrument the selected failing sequence once, without a preceding raw
     # execution or the Q_B-only SANITIZER_SMOKE early return.  clean_env also
     # removes either early-return selector if inherited from the caller.
-    diagnostic_command=(compute-sanitizer --tool "$SANITIZER_TOOL" --error-exitcode=99 "./$target")
+    diagnostic_command=(compute-sanitizer --tool "$SANITIZER_TOOL" --error-exitcode=99)
+    if [[ $SANITIZER_TOOL == racecheck ]]; then
+        diagnostic_command+=(--racecheck-report analysis)
+    fi
+    diagnostic_command+=("./$target")
 fi
 printf '%q ' timeout --signal=TERM --kill-after=10 "$CASE_TIMEOUT_SECONDS" \
     "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/provenance/diagnostic-command.txt"
@@ -285,9 +289,20 @@ if (( diagnostic_status != 0 )); then
     die "token-row arithmetic diagnostic failed with status $diagnostic_status"
 fi
 if (( SANITIZER_ONLY )); then
-    grep -Eq '^=+ ERROR SUMMARY: 0 errors[[:space:]]*$' \
-        "$OUTPUT_DIR/diagnostic.log" &&
-    ! grep -Eq '^=+ ERROR SUMMARY: [1-9][0-9]*' \
+    summary_name=ERROR
+    clean_summary='^=+ ERROR SUMMARY: 0 errors[[:space:]]*$'
+    if [[ $SANITIZER_TOOL == racecheck ]]; then
+        # Racecheck has its own summary. ERROR SUMMARY: 0 alone is not evidence
+        # that shared-memory hazard analysis completed. Warnings fail this gate
+        # even if the sanitizer exits successfully; do not suppress hazards.
+        summary_name=RACECHECK
+        clean_summary='^=+ RACECHECK SUMMARY: 0 hazards? displayed \(0 errors?, 0 warnings?\)[[:space:]]*$'
+    fi
+    summary_lines=$(grep -E "^=+ $summary_name SUMMARY:" \
+        "$OUTPUT_DIR/diagnostic.log" || true)
+    [[ -n $summary_lines ]] &&
+    ! grep -Ev "$clean_summary" <<<"$summary_lines" &&
+    ! grep -Eiq '^=+ (ERROR SUMMARY: [1-9][0-9]*|(warning|error|fatal):)' \
         "$OUTPUT_DIR/diagnostic.log" || {
             tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
             die "full-scope Compute Sanitizer $SANITIZER_TOOL did not report a clean summary"

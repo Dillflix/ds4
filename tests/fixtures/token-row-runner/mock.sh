@@ -33,6 +33,10 @@ case $tool in
         [[ $1 == --tool && $2 == "$MOCK_EXPECT_TOOL" && $3 == --error-exitcode=99 ]]
         printf 'instrumentation-tool=%s\n' "$2" >>"$MOCK_TRACE"
         shift 3
+        if [[ $MOCK_EXPECT_TOOL == racecheck ]]; then
+            [[ $1 == --racecheck-report && $2 == analysis ]]
+            shift 2
+        fi
         set +e
         MOCK_INSTRUMENTED=1 "$@"
         status=$?
@@ -42,7 +46,37 @@ case $tool in
         elif [[ $MOCK_CASE == memcheck-error ]]; then
             printf '========= ERROR SUMMARY: 1 error\n'
             exit 99
-        elif [[ $MOCK_CASE == contradictory-summary ]]; then
+        fi
+        if [[ $MOCK_EXPECT_TOOL == racecheck ]]; then
+            case $MOCK_CASE in
+                error-summary-only)
+                    printf '========= ERROR SUMMARY: 0 errors\n'
+                    exit "$status" ;;
+                warning-summary)
+                    printf '========= RACECHECK SUMMARY: 1 hazard displayed (0 errors, 1 warning)\n'
+                    exit "$status" ;;
+                error-summary)
+                    printf '========= RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)\n'
+                    exit "$status" ;;
+                contradictory-summary)
+                    printf '========= RACECHECK SUMMARY: 1 hazard displayed (0 errors, 1 warning)\n' ;;
+                contradictory-error-summary)
+                    printf '========= ERROR SUMMARY: 1 error\n' ;;
+                warning-body)
+                    printf '========= Warning: Race reported between Write and Read\n' ;;
+                error-body)
+                    printf '========= Error: Race reported between Write and Read\n' ;;
+                fatal-body)
+                    printf '========= FATAL: Hazard analysis incomplete\n' ;;
+            esac
+            if [[ $MOCK_CASE == summary-prefix ]]; then
+                printf '======== RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n'
+            else
+                printf '========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n'
+            fi
+            exit "$status"
+        fi
+        if [[ $MOCK_CASE == contradictory-summary ]]; then
             printf '========= ERROR SUMMARY: 1 error\n'
         fi
         if [[ $MOCK_CASE == summary-prefix ]]; then
