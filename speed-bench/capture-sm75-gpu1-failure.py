@@ -25,6 +25,13 @@ ROOT_PORTS = ["0000:00:02.0", "0000:00:03.0", "0000:80:02.0", "0000:80:03.0"]
 RETRAIN_UNIT = "retrain-gpu2-rootport.service"
 
 
+def normalize_boot_id(value):
+    value = value.strip()
+    if not re.fullmatch(r"(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", value, re.I):
+        raise ValueError("invalid kernel boot ID: " + value)
+    return value.replace("-", "").lower()
+
+
 def stamp():
     return {"utc_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()}
 
@@ -58,11 +65,12 @@ def fault_event(line):
 
 
 class Capture:
-    def __init__(self, output, executable, command, case_timeout):
+    def __init__(self, output, executable, command, case_timeout, preflight_only=False):
         self.output = Path(output)
         self.executable = Path(executable).resolve()
         self.command = command
         self.case_timeout = case_timeout
+        self.preflight_only = preflight_only
         self.summary = {"workload": "not-started", "workload_returncode": None,
                         "collection": "in-progress", "started": stamp(),
                         "first_fault": None, "commands": [], "issues": []}
@@ -75,6 +83,11 @@ class Capture:
         self.workload_process = None
         self.boot_id = None
         self.sudo_refresh_seconds = 60
+
+    def journal_command(self, *arguments):
+        # -b has an optional argument: an unrecognized following UUID can be
+        # parsed as a positional match. Use one explicit option with ID128 hex.
+        return ["journalctl", "--boot=" + normalize_boot_id(self.boot_id), *arguments]
 
     def save(self):
         self.output.mkdir(parents=True, exist_ok=True)
@@ -226,12 +239,14 @@ class Capture:
         if clients.strip():
             raise RuntimeError("another CUDA compute client is present")
         self.required("pre/gpu-details", ["nvidia-smi", "-q"])
-        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        raw_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.boot_id = normalize_boot_id(raw_boot_id)
+        self.summary["kernel_boot_id_raw"] = raw_boot_id
         self.summary["boot_id"] = self.boot_id
         self.summary["host"] = {"uname": list(os.uname()),
                                  "cmdline": Path("/proc/cmdline").read_text().strip()}
-        baseline = self.required("kernel-baseline", ["journalctl", "-b", self.boot_id, "-k",
-            "-o", "json", "--no-pager", "--show-cursor"], root=True)
+        baseline = self.required("kernel-baseline", self.journal_command("-k",
+            "-o", "json", "--no-pager", "--show-cursor"), root=True)
         cursors = re.findall(r"^-- cursor: (.+)$", baseline, re.M)
         if not cursors:
             raise RuntimeError("journal cursor unavailable; refusing an unobserved run")
@@ -240,8 +255,8 @@ class Capture:
         self.pci_snapshot("pre")
         if self.summary["issues"]:
             raise RuntimeError("baseline collection incomplete; do not spend a failure run without it")
-        self.required("pre/retrain-history", ["journalctl", "-b", self.boot_id, "--no-pager",
-            "-u", RETRAIN_UNIT, "-o", "short-monotonic"], root=True)
+        self.required("pre/retrain-history", self.journal_command("--no-pager",
+            "-u", RETRAIN_UNIT, "-o", "short-monotonic"), root=True)
         self.start_journal(cursors[-1])
 
     def observe_kernel(self, line):
@@ -255,8 +270,8 @@ class Capture:
         # orphaned privileged follower. Normal shutdown signals its owned sudo.
         self.journal_error = (self.output / "kernel-live.stderr.log").open("wb")
         self.journal_process = self.launch_collector(["sudo", "-n", "timeout", "--signal=TERM",
-            "--kill-after=2", str(self.case_timeout + 480), "journalctl", "-b", self.boot_id,
-            "-k", "--after-cursor=" + cursor, "-f", "-o", "json", "--no-pager"],
+            "--kill-after=2", str(self.case_timeout + 480), *self.journal_command(
+            "-k", "--after-cursor=" + cursor, "-f", "-o", "json", "--no-pager")],
             stdout=subprocess.PIPE, stderr=self.journal_error)
 
         def read():
@@ -367,8 +382,8 @@ class Capture:
             self.issue("application output reader did not finish; partial output retained")
 
     def postmortem(self):
-        _, kernel = self.run("post/kernel", ["journalctl", "-b", self.boot_id, "-k", "-o", "json",
-                                            "--no-pager"], root=True)
+        _, kernel = self.run("post/kernel", self.journal_command("-k", "-o", "json",
+                                            "--no-pager"), root=True)
         # Baseline was required fault-free. This also catches an event delivered
         # just as the binary exits, before the live reader has processed it.
         for line in kernel.splitlines():
@@ -418,6 +433,9 @@ class Capture:
         if self.interrupted.is_set():
             return 130
         if self.summary["workload"] == "not-started":
+            if (self.preflight_only and self.summary.get("preflight") == "passed"
+                    and not self.summary["issues"] and not self.fault.is_set()):
+                return 0
             return 2
         if self.fault.is_set():
             return 86
@@ -433,7 +451,9 @@ class Capture:
         self.save()
         try:
             self.preflight()
-            self.execute()
+            self.summary["preflight"] = "passed"
+            if not self.preflight_only:
+                self.execute()
         except Exception as error:
             self.issue(str(error))
             print("failure capture: " + str(error), file=sys.stderr, flush=True)
@@ -454,12 +474,14 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--executable", required=True)
     parser.add_argument("--case-timeout", type=int, required=True)
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="validate host collectors and exit without launching the CUDA executable")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command or not 1 <= args.case_timeout <= 600:
+    if (not command and not args.preflight_only) or not 1 <= args.case_timeout <= 600:
         parser.error("one command and a timeout of 1..600 seconds are required")
-    capture = Capture(args.output, args.executable, command, args.case_timeout)
+    capture = Capture(args.output, args.executable, command, args.case_timeout, args.preflight_only)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: capture.interrupted.set())
     return capture.capture()

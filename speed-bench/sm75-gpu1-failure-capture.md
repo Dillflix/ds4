@@ -118,6 +118,39 @@ before sharing outside this diagnostic collaboration.
 
 ## Run after the capture commit is available
 
+First validate the collectors on the Linux host **without launching the CUDA
+executable**. The 23:53:52 failure exposed another mock-test gap: the hyphenated
+kernel UUID passed as a separate `-b` argument was interpreted as a journal
+match. All four journal commands (baseline, service history, follow, postmortem)
+now share one builder that normalizes the ID and passes `--boot=<32 hex digits>`.
+Tests assert the real argument shape, not just a canned collector response.
+
+After pulling the approved fix, run this preflight-only check from the repo:
+
+```bash
+(
+sudo -v || exit
+capture_check_dir=$(mktemp -d "$PWD/sm75-capture-preflight.XXXXXX") || exit
+python3 ./speed-bench/capture-sm75-gpu1-failure.py \
+  --output "$capture_check_dir/capture" \
+  --executable ./tests/cuda_sm75_token_row_arithmetic \
+  --case-timeout 600 --preflight-only >"$capture_check_dir/console.log" 2>&1
+capture_check_status=$?
+cat "$capture_check_dir/console.log"
+printf 'preflight_exit_status=%s\n' "$capture_check_status"
+tar -C "$(dirname "$capture_check_dir")" -czf "$capture_check_dir.tar.gz" \
+  "$(basename "$capture_check_dir")" || exit
+printf 'Archive to return: %s.tar.gz\n' "$capture_check_dir"
+exit "$capture_check_status"
+)
+```
+
+This performs the existing read-only host/GPU inventory and sudo/journal checks,
+then stops its journal follower. It does not call the CUDA executable, run a
+benchmark, or trigger the post-failure NVIDIA report. Success records
+`preflight=passed` and `workload=not-started`. Failure still returns nonzero and
+retains partial evidence. Return this archive before a full reproducer run.
+
 Use the existing runner with these settings, after checking out/pulling the
 approved capture commit and recovering from any prior GPU fault. Do not rebuild
 if the hash gate rejects the executable; return the rejection archive instead.

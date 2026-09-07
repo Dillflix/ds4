@@ -16,6 +16,8 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "speed-bench/capture-sm75-gp
 spec = importlib.util.spec_from_file_location("capture_gpu1", MODULE_PATH)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+BOOT_UUID = "9c924780-6852-4748-89f0-12872d1656e6"
+BOOT_ID = "9c9247806852474889f012872d1656e6"
 
 
 def kernel_line(bdf="0000:81:00", code=79):
@@ -68,7 +70,7 @@ class PreflightTests(BaseTest):
 
         def read(path, *args, **kwargs):
             if str(path).replace("\\", "/").endswith("/proc/sys/kernel/random/boot_id"):
-                return "test-boot\n"
+                return BOOT_UUID + "\n"
             if str(path).replace("\\", "/").endswith("/proc/cmdline"):
                 return "pcie_aspm=off\n"
             return original(path, *args, **kwargs)
@@ -82,6 +84,13 @@ class PreflightTests(BaseTest):
         self.preflight()
         self.capture.start_journal.assert_called_once_with("cursor-123")
         self.capture.execute.assert_not_called()
+        self.assertEqual(self.capture.boot_id, BOOT_ID)
+        journal_calls = [call for call in self.capture.required.call_args_list
+                         if call.args[1][0] == "journalctl"]
+        self.assertEqual(len(journal_calls), 2)
+        for call in journal_calls:
+            self.assertEqual(call.args[1][1], "--boot=" + BOOT_ID)
+            self.assertNotIn("-b", call.args[1])
 
     def test_dcgm_active_rejected(self):
         self.responses["pre/dcgm"] = "dcgm.nv-hostengine enabled active -"
@@ -267,6 +276,21 @@ class ExecutionTests(BaseTest):
         self.assertEqual(launch.call_args.args[0], self.capture.command)
         self.assertTrue(launch.call_args.kwargs["start_new_session"])
 
+    def test_preflight_only_success_never_launches_executable(self):
+        self.capture.preflight_only = True
+        self.capture.execute = Mock(side_effect=AssertionError("must not launch"))
+        self.assertEqual(self.run_capture("raise AssertionError('must not run')"), 0)
+        self.capture.execute.assert_not_called()
+        self.capture.postmortem.assert_not_called()
+        self.assertIsNone(self.capture.workload_process)
+        self.assertEqual(self.capture.summary["workload"], "not-started")
+
+    def test_preflight_only_failure_is_not_success(self):
+        self.capture.preflight_only = True
+        self.capture.preflight.side_effect = RuntimeError("journal argument rejected")
+        self.assertEqual(self.run_capture("raise AssertionError('must not run')"), 2)
+        self.capture.postmortem.assert_not_called()
+
 
 class CollectorTests(BaseTest):
     def setUp(self):
@@ -295,7 +319,7 @@ class CollectorTests(BaseTest):
     def test_journal_uses_same_session_collector_launcher(self):
         process = Mock(stdout=io.BytesIO(b'{"MESSAGE":"healthy"}\n'))
         process.poll.return_value = None
-        self.capture.boot_id = "test-boot"
+        self.capture.boot_id = BOOT_UUID
         self.capture.launch_collector = Mock(return_value=process)
         self.capture.stop = Mock(return_value=True)
         try:
@@ -304,6 +328,8 @@ class CollectorTests(BaseTest):
             call = self.capture.launch_collector.call_args
             self.assertEqual(call.args[0][:2], ["sudo", "-n"])
             self.assertIn("--after-cursor=test-cursor", call.args[0])
+            self.assertIn("--boot=" + BOOT_ID, call.args[0])
+            self.assertNotIn("-b", call.args[0])
             self.assertNotIn("start_new_session", call.kwargs)
         finally:
             self.capture.finish()
@@ -360,7 +386,7 @@ class CollectorTests(BaseTest):
         self.assertIsNone(module.fault_event('{"MESSAGE": [65, 66]}'))
 
     def test_report_after_failure_once_with_safe_flags(self):
-        self.capture.boot_id = "test-boot"
+        self.capture.boot_id = BOOT_UUID
         self.capture.summary["workload"] = "failed"
         self.capture.run = Mock(return_value=({"returncode": 0}, ""))
         self.capture.pci_snapshot = Mock()
@@ -369,9 +395,11 @@ class CollectorTests(BaseTest):
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0].args[1], ["nvidia-bug-report.sh", "--safe-mode", "--extra-system-data"])
         self.assertEqual(reports[0].kwargs["seconds"], 120)
+        self.assertEqual(self.capture.run.call_args_list[0].args[1][:2],
+                         ["journalctl", "--boot=" + BOOT_ID])
 
     def test_success_does_not_launch_bug_report(self):
-        self.capture.boot_id = "test-boot"
+        self.capture.boot_id = BOOT_UUID
         self.capture.summary["workload"] = "exited-zero"
         self.capture.run = Mock(return_value=({"returncode": 0}, ""))
         self.capture.pci_snapshot = Mock()
@@ -379,7 +407,7 @@ class CollectorTests(BaseTest):
         self.assertFalse(any(c.args[0] == "nvidia-report/collector" for c in self.capture.run.call_args_list))
 
     def test_late_fault_in_post_journal_triggers_report(self):
-        self.capture.boot_id = "test-boot"
+        self.capture.boot_id = BOOT_UUID
         self.capture.summary["workload"] = "exited-zero"
         self.capture.summary["workload_returncode"] = 0
         self.capture.run = Mock(side_effect=lambda name, *a, **kw:
@@ -388,6 +416,15 @@ class CollectorTests(BaseTest):
         self.capture.postmortem()
         self.assertTrue(self.capture.fault.is_set())
         self.assertEqual(self.capture.result(), 86)
+
+    def test_boot_uuid_normalized_to_id128(self):
+        self.assertEqual(module.normalize_boot_id(BOOT_UUID), BOOT_ID)
+        self.assertEqual(module.normalize_boot_id(BOOT_ID.upper() + "\n"), BOOT_ID)
+
+    def test_malformed_boot_id_rejected(self):
+        for value in ("test-boot", "", "0" * 31, "x" * 32, "--boot=0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                module.normalize_boot_id(value)
 
 
 if __name__ == "__main__":
