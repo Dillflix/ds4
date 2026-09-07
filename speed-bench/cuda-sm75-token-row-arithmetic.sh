@@ -31,9 +31,10 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-canonical-replay ||
+   $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
@@ -132,6 +133,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_REPLAY=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_SUFFIX_REPLAY=1)
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE=1)
@@ -268,6 +272,37 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
         "$OUTPUT_DIR/diagnostic.log" ||
         die "canonical output-B replay omitted its clean conclusion"
 fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ]]; then
+    grep -Fq 'diagnostic_scope=output-b-canonical-suffix-replay' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay omitted its scope marker"
+    grep -Fq 'fidelity=working-set-and-suffix-replay-without-burn-in' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay omitted its fidelity marker"
+    grep -Fq 'resident_f16_cache_bytes=201326592' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay did not preserve the FP16 cache"
+    grep -Fq 'device_working_set_bytes=389283840' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay used the wrong working set"
+    grep -Fq 'peer_access=none' "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay unexpectedly enabled peer access"
+    grep -Fq 'exhaustive_algorithm_sweep=off' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay entered the exhaustive sweep"
+    grep -Fq 'suffix_submission_fencing=original-phase-boundaries' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay changed suffix fencing"
+    grep -Fq 'suffix_replay_phase=production-row-owned-pair-complete' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay missed the row-owned pair"
+    grep -Fq 'suffix_replay_phase=default-full-split-group-complete' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay missed the DEFAULT group"
+    grep -Fq 'suffix_replay_conclusion=working-set-and-suffix-clean-without-burn-in' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B suffix replay omitted its clean conclusion"
+fi
 if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     grep -Fq 'diagnostic_scope=output-a-native-single-launch' \
         "$OUTPUT_DIR/diagnostic.log" ||
@@ -401,6 +436,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|exhaustive_algorithm_sweep=|historical_timing_burn_in=|suffix_submission_fencing=|suffix_replay_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

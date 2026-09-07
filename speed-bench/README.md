@@ -6159,6 +6159,17 @@ suffix.  A clean pass clears only these nine independently fenced transitions.
 The next rung is a working-set- and suffix-faithful replay; cumulative burn-in
 and fresh-process algorithm/prefix bisection follow only if needed.
 
+`DIAGNOSTIC_SCOPE=output-b-canonical-suffix-replay` is that second rung.  It
+uses the full diagnostic's original 389,283,840-byte device working set and
+allocation order, executes its canonical Q_B, attention, inverse-RoPE and
+output-A preparation, and retains the original phase-boundary fencing for the
+two-call row-owned ALGO3 A+B pair followed by the grouped DEFAULT
+512+256+256 B suffix.  It remains physical-GPU-local: peer access, native
+streaming and NVLink are absent.  The exhaustive algorithm sweep and timing
+burn-in remain disabled, so a clean result isolates the missing causal factor
+to accumulated algorithm/timing history rather than incorrectly clearing the
+older local GPU1 failure.
+
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local
 `B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into
@@ -6256,6 +6267,16 @@ context-fault workload:
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-canonical-replay \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After that bounded rung passes, add the original device working set and
+submission suffix while still keeping the test local to physical GPU1:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-canonical-suffix-replay \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
