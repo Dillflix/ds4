@@ -6153,6 +6153,15 @@ FP32-to-FP16 packing, the batched GEMM, and low-output unpacking.  The backend
 then returns before B is entered.  A clean result clears native A in isolation;
 it does not clear the subsequent A-to-B shared-workspace handoff.
 
+`DIAGNOSTIC_SCOPE=output-ab-native` is the next local rung after both isolated
+projections pass.  It installs native A and B together and invokes the exact
+row-owned attention-output entry point once.  There is deliberately no
+diagnostic synchronization between A's low-output unpack and B's reuse of the
+same transient arena, so this preserves production A-to-B ordering.  The first
+new fence is B's post-dequantization checkpoint: because A-only and B-only are
+already independently clean, a failure there isolates the combined workspace
+handoff.  Both low and final output allocations have independent guards.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6201,6 +6210,15 @@ testing the combined A-to-B chain:
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-a-native \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+If native A is also clean, exercise one unfenced production-order A-to-B call
+on GPU1 without introducing peer access or repetition:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-ab-native \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```

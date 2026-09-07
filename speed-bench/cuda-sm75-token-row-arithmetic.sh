@@ -24,10 +24,11 @@ target=tests/cuda_sm75_token_row_arithmetic
 [[ $PROFILE_GPU =~ ^[0-9]+$ ]] || die "PROFILE_GPU must be an integer"
 [[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == q-b-native ||
    $DIAGNOSTIC_SCOPE == output-a-native ||
+   $DIAGNOSTIC_SCOPE == output-ab-native ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-b-canonical, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-b-canonical, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
@@ -119,6 +120,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-native ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_A_NATIVE=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE=1)
 fi
 
 capture_gpu_health() {
@@ -221,6 +225,34 @@ if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     grep -Fq 'canary_suffix_mismatches=0' "$OUTPUT_DIR/diagnostic.log" ||
         die "native output-A probe damaged its suffix canary"
 fi
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
+    grep -Fq 'diagnostic_scope=output-ab-native-single-call' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe omitted its scope marker"
+    grep -Fq 'attention_output_calls=1' "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe did not remain single-call"
+    grep -Fq 'production_order=unfenced-a-to-b' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe did not preserve production ordering"
+    grep -Fq 'handoff_sync_before_b=0' "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe unexpectedly fenced the handoff"
+    for stage in attn_output_a attn_output_b; do
+        grep -Fq "ds4: token-row native-stream dispatch stage=$stage" \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "native A-to-B probe missed $stage native-stream dispatch"
+    done
+    for checkpoint in native-dequant activation-f32-to-f16 cublas-gemm; do
+        grep -Fq "ds4: local output-B checkpoint stage=$checkpoint device=0 status=no error" \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "native A-to-B probe missed clean B $checkpoint checkpoint"
+    done
+    for canary in low_canary_prefix_mismatches \
+        low_canary_suffix_mismatches out_canary_prefix_mismatches \
+        out_canary_suffix_mismatches; do
+        grep -Fq "$canary=0" "$OUTPUT_DIR/diagnostic.log" ||
+            die "native A-to-B probe damaged $canary"
+    done
+fi
 cat "$OUTPUT_DIR/diagnostic.log"
 
 if (( RUN_SANITIZER )); then
@@ -247,6 +279,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|peer_access=|native_stream=|output_b=|canary_|low_finite=|low_nonzero=|low_fnv1a64=|output_finite=|output_nonzero=|output_fnv1a64=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|output_finite=|output_nonzero=|output_fnv1a64=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

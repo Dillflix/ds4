@@ -541,6 +541,169 @@ cleanup:
     return status;
 }
 
+static int run_output_ab_native_single_launch(
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t out_a_offset, uint64_t out_b_offset) {
+    const uint64_t heads_count =
+        (uint64_t)HALF_TOK * N_GROUP * GROUP_DIM;
+    const uint64_t heads_bytes = heads_count * sizeof(float);
+    const uint64_t low_count = (uint64_t)HALF_TOK * LOW_DIM;
+    const uint64_t low_bytes = low_count * sizeof(float);
+    const uint64_t out_count = (uint64_t)HALF_TOK * OUT_DIM;
+    const uint64_t out_bytes = out_count * sizeof(float);
+    const uint64_t guarded_low_bytes =
+        PROJECTION_PROBE_GUARD_BYTES + low_bytes +
+        PROJECTION_PROBE_GUARD_BYTES;
+    const uint64_t guarded_out_bytes =
+        PROJECTION_PROBE_GUARD_BYTES + out_bytes +
+        PROJECTION_PROBE_GUARD_BYTES;
+    float *heads_host = NULL;
+    unsigned char *guarded_low_host = NULL;
+    unsigned char *guarded_out_host = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *guarded_low = NULL;
+    ds4_gpu_tensor *guarded_out = NULL;
+    ds4_gpu_tensor *low = NULL;
+    ds4_gpu_tensor *out = NULL;
+    int status = 0;
+
+    heads_host = (float *)malloc((size_t)heads_bytes);
+    guarded_low_host = (unsigned char *)malloc((size_t)guarded_low_bytes);
+    guarded_out_host = (unsigned char *)malloc((size_t)guarded_out_bytes);
+    if (!heads_host || !guarded_low_host || !guarded_out_host) {
+        fprintf(stderr, "error: output A-to-B probe host allocation failed\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0u; i < heads_count; i++) {
+        const int value =
+            (int)((i * 47u + (i >> 7u) * 19u + 73u) % 521u) - 260;
+        heads_host[i] = (float)value / 4096.0f;
+    }
+    memset(guarded_low_host, 0xa5, (size_t)guarded_low_bytes);
+    memset(guarded_out_host, 0x5a, (size_t)guarded_out_bytes);
+
+    heads = ds4_gpu_tensor_alloc(heads_bytes);
+    guarded_low = ds4_gpu_tensor_alloc(guarded_low_bytes);
+    guarded_out = ds4_gpu_tensor_alloc(guarded_out_bytes);
+    low = guarded_low ? ds4_gpu_tensor_view(
+        guarded_low, PROJECTION_PROBE_GUARD_BYTES, low_bytes) : NULL;
+    out = guarded_out ? ds4_gpu_tensor_view(
+        guarded_out, PROJECTION_PROBE_GUARD_BYTES, out_bytes) : NULL;
+    if (!heads || !guarded_low || !guarded_out || !low || !out ||
+        !ds4_gpu_tensor_write(heads, 0u, heads_host, heads_bytes) ||
+        !ds4_gpu_tensor_write(
+            guarded_low, 0u, guarded_low_host, guarded_low_bytes) ||
+        !ds4_gpu_tensor_write(
+            guarded_out, 0u, guarded_out_host, guarded_out_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: output A-to-B probe setup failed\n");
+        goto cleanup;
+    }
+
+    printf("diagnostic_scope=output-ab-native-single-call\n"
+           "n_tokens=%u\ngroups=%u\ngroup_dim=%u\nrank=%u\n"
+           "low_dim=%llu\noutput_dim=%u\nattention_output_calls=1\n"
+           "output_a_launches=1\noutput_b_launches=1\npeer_access=none\n"
+           "native_stream=on\nproduction_order=unfenced-a-to-b\n"
+           "handoff_sync_before_b=0\n",
+           HALF_TOK, N_GROUP, GROUP_DIM, RANK,
+           (unsigned long long)LOW_DIM, OUT_DIM);
+    fflush(stdout);
+
+    if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+            out, low, NULL, NULL, model, model_bytes,
+            out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
+            OUT_DIM, heads, HALF_TOK) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            guarded_low, 0u, guarded_low_host, guarded_low_bytes) ||
+        !ds4_gpu_tensor_read(
+            guarded_out, 0u, guarded_out_host, guarded_out_bytes)) {
+        fprintf(stderr,
+                "error: native-stream output A-to-B single-call probe failed\n");
+        goto cleanup;
+    }
+
+    uint64_t low_prefix_mismatches = 0u;
+    uint64_t low_suffix_mismatches = 0u;
+    uint64_t out_prefix_mismatches = 0u;
+    uint64_t out_suffix_mismatches = 0u;
+    for (uint64_t i = 0u; i < PROJECTION_PROBE_GUARD_BYTES; i++) {
+        low_prefix_mismatches += guarded_low_host[i] != 0xa5u;
+        low_suffix_mismatches +=
+            guarded_low_host[PROJECTION_PROBE_GUARD_BYTES + low_bytes + i] !=
+            0xa5u;
+        out_prefix_mismatches += guarded_out_host[i] != 0x5au;
+        out_suffix_mismatches +=
+            guarded_out_host[PROJECTION_PROBE_GUARD_BYTES + out_bytes + i] !=
+            0x5au;
+    }
+    const float *low_output = (const float *)(
+        guarded_low_host + PROJECTION_PROBE_GUARD_BYTES);
+    const float *output = (const float *)(
+        guarded_out_host + PROJECTION_PROBE_GUARD_BYTES);
+    uint64_t low_finite = 0u;
+    uint64_t low_nonzero = 0u;
+    uint64_t out_finite = 0u;
+    uint64_t out_nonzero = 0u;
+    uint64_t low_hash = UINT64_C(1469598103934665603);
+    uint64_t out_hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0u; i < low_count; i++) {
+        low_finite += isfinite(low_output[i]) != 0;
+        low_nonzero += low_output[i] != 0.0f;
+    }
+    for (uint64_t i = 0u; i < out_count; i++) {
+        out_finite += isfinite(output[i]) != 0;
+        out_nonzero += output[i] != 0.0f;
+    }
+    for (uint64_t i = 0u; i < low_bytes; i++) {
+        low_hash ^= guarded_low_host[PROJECTION_PROBE_GUARD_BYTES + i];
+        low_hash *= UINT64_C(1099511628211);
+    }
+    for (uint64_t i = 0u; i < out_bytes; i++) {
+        out_hash ^= guarded_out_host[PROJECTION_PROBE_GUARD_BYTES + i];
+        out_hash *= UINT64_C(1099511628211);
+    }
+    printf("low_canary_prefix_mismatches=%llu\n"
+           "low_canary_suffix_mismatches=%llu\n"
+           "out_canary_prefix_mismatches=%llu\n"
+           "out_canary_suffix_mismatches=%llu\n"
+           "low_finite=%llu\nlow_nonzero=%llu\n"
+           "output_finite=%llu\noutput_nonzero=%llu\n"
+           "low_fnv1a64=%016llx\noutput_fnv1a64=%016llx\n",
+           (unsigned long long)low_prefix_mismatches,
+           (unsigned long long)low_suffix_mismatches,
+           (unsigned long long)out_prefix_mismatches,
+           (unsigned long long)out_suffix_mismatches,
+           (unsigned long long)low_finite,
+           (unsigned long long)low_nonzero,
+           (unsigned long long)out_finite,
+           (unsigned long long)out_nonzero,
+           (unsigned long long)low_hash,
+           (unsigned long long)out_hash);
+    if (low_prefix_mismatches || low_suffix_mismatches ||
+        out_prefix_mismatches || out_suffix_mismatches ||
+        low_finite != low_count || low_nonzero == 0u ||
+        out_finite != out_count || out_nonzero == 0u) {
+        fprintf(stderr, "error: output A-to-B probe validation failed\n");
+        goto cleanup;
+    }
+    printf("diagnostic_conclusion=native-stream-output-ab-single-call-clean\n"
+           "harness_status=ok\n");
+    status = 1;
+
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(guarded_out);
+    ds4_gpu_tensor_free(guarded_low);
+    ds4_gpu_tensor_free(heads);
+    free(guarded_out_host);
+    free(guarded_low_host);
+    free(heads_host);
+    return status;
+}
+
 int main(void) {
     const int native_q_b_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B") != NULL;
@@ -550,10 +713,16 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE") != NULL;
     const int output_a_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_A_NATIVE") != NULL;
+    const int output_ab_native_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE") != NULL;
+    const int output_a_native_required =
+        output_a_native_diagnostic || output_ab_native_diagnostic;
+    const int output_b_native_required =
+        output_b_native_diagnostic || output_ab_native_diagnostic;
     const int output_b_diagnostic =
         output_b_canonical_diagnostic || output_b_native_diagnostic;
     const int projection_diagnostic =
-        output_a_native_diagnostic || output_b_diagnostic;
+        output_a_native_required || output_b_diagnostic;
     const uint64_t q_b_bytes = Q_DIM * (IN_DIM / 32u) * 34u;
     const uint64_t sinks_offset = q_b_bytes;
     const uint64_t sinks_bytes = N_HEAD * sizeof(float);
@@ -565,9 +734,9 @@ int main(void) {
     const uint64_t native_out_a_offset = native_q_b_offset +
         (native_q_b_diagnostic ? q_b_bytes : 0u);
     const uint64_t native_out_b_offset = native_out_a_offset +
-        (output_a_native_diagnostic ? out_a_bytes : 0u);
+        (output_a_native_required ? out_a_bytes : 0u);
     const uint64_t model_bytes = native_out_b_offset +
-        (output_b_native_diagnostic ? out_b_bytes : 0u);
+        (output_b_native_required ? out_b_bytes : 0u);
     const uint64_t input_count = (uint64_t)N_TOK * IN_DIM;
     const uint64_t q_count = (uint64_t)N_TOK * Q_DIM;
     const uint64_t heads_count = q_count;
@@ -643,12 +812,12 @@ int main(void) {
     }
     build_q8_rows(model + out_a_offset, LOW_DIM, GROUP_DIM, 37u);
     build_q8_rows(model + out_b_offset, OUT_DIM, LOW_DIM, 53u);
-    if (output_a_native_diagnostic) {
+    if (output_a_native_required) {
         pack_q8_rows_warp32(
             model + native_out_a_offset, model + out_a_offset,
             LOW_DIM, GROUP_DIM);
     }
-    if (output_b_native_diagnostic) {
+    if (output_b_native_required) {
         pack_q8_rows_b_kshards_warp32(
             model + native_out_b_offset, model + out_b_offset,
             OUT_DIM, LOW_DIM);
@@ -691,7 +860,7 @@ int main(void) {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
     }
-    if (output_b_diagnostic) {
+    if (output_b_diagnostic || output_ab_native_diagnostic) {
         (void)setenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC", "1", 1);
     } else {
         (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
@@ -717,7 +886,7 @@ int main(void) {
           !ds4_gpu_cache_q8_f16_range_on_device(
               model, model_bytes, out_a_offset, out_a_bytes,
               GROUP_DIM, LOW_DIM, 0, "attn_output_a"))) ||
-        (!output_b_native_diagnostic && !output_a_native_diagnostic &&
+        (!output_b_native_required && !output_a_native_required &&
          !ds4_gpu_cache_q8_f16_range_on_device(
              model, model_bytes, out_b_offset, out_b_bytes,
              LOW_DIM, OUT_DIM, 0, "attn_output_b"))) {
@@ -741,7 +910,7 @@ int main(void) {
             goto cleanup;
         }
     }
-    if (output_a_native_diagnostic) {
+    if (output_a_native_required) {
         const ds4_tensor_range native_source = {
             native_out_a_offset, out_a_bytes, 0};
         const ds4_q8_native_range native_range = {
@@ -765,7 +934,7 @@ int main(void) {
         (void)setenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
     }
-    if (output_b_native_diagnostic) {
+    if (output_b_native_required) {
         const ds4_tensor_range native_source = {
             native_out_b_offset, out_b_bytes, 0};
         const ds4_q8_native_range native_range = {
@@ -805,6 +974,16 @@ int main(void) {
         if (!ds4_gpu_synchronize() ||
             !run_output_a_native_single_launch(
                 model, model_bytes, native_out_a_offset, out_b_offset)) {
+            goto cleanup;
+        }
+        status = 0;
+        goto cleanup;
+    }
+    if (output_ab_native_diagnostic) {
+        if (!ds4_gpu_synchronize() ||
+            !run_output_ab_native_single_launch(
+                model, model_bytes,
+                native_out_a_offset, native_out_b_offset)) {
             goto cleanup;
         }
         status = 0;

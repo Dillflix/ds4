@@ -26830,7 +26830,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
             out, low, group_tmp, low_tmp, model_map, model_size,
             out_a_offset, out_b_offset, group_dim, rank, n_groups,
             out_dim, heads, n_tokens, 1);
-    if (ok) {
+    if (ok && !cuda_output_a_only_local_diagnostic()) {
         const int logical_tier = ds4_tensor_device_idx(out);
         const int physical_device = logical_tier >= 0 && logical_tier < g_n_gpus
             ? g_gpu[logical_tier].device_id : -1;
