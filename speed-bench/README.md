@@ -6145,9 +6145,11 @@ DEFAULT full-512 then ordered 256+256 B projections, forced ALGO3 Tensor Op at
 both shapes, and a final DEFAULT full/split sequence.  ALGO3 Tensor Op is the
 production candidate at 256 rows; its 512-row call here is diagnostic coverage.
 Every individual projection is synchronized and guard-checked.  Each split
-result must be bit-identical to the matching half of its full-row result, must
-fully replace a poisoned selected region, and must leave the other row half
-untouched.
+call must fully replace a poisoned selected region and leave the other row half
+untouched.  The ALGO3 split results must also be bit-identical to the matching
+halves of the full-row result.  DEFAULT full/split differences are measured but
+are not an acceptance gate because the archived run already established that
+DEFAULT is row-shape dependent.
 
 This mode deliberately does not claim to reproduce the old fault.  It omits
 about 371.25 MiB of full-harness device working tensors, the prior Q_B/output-A

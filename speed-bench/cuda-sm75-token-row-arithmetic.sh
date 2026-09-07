@@ -254,9 +254,10 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
     ! grep -Eq 'selected_poison_words=[1-9][0-9]*' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "canonical output-B replay left selected output unwritten"
-    ! grep -Eq 'expected_bit_mismatches=[1-9][0-9]*' \
+    ! grep -Eq \
+        'replay_step=algo3-row[01]-256,event=complete.*expected_bit_mismatches=[1-9][0-9]*' \
         "$OUTPUT_DIR/diagnostic.log" ||
-        die "canonical output-B replay changed arithmetic across row extents"
+        die "canonical output-B replay changed ALGO3 arithmetic across row extents"
     grep -Fq 'fidelity=bounded-synchronized-transition-probe' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "canonical output-B replay omitted its bounded-fidelity marker"

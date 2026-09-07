@@ -522,15 +522,18 @@ static int output_b_replay_step(
             expected_bit_mismatches += actual_bits != expected_bits;
         }
     }
+    const int expected_match_required = expected_output && algorithm == 103;
     const int valid = prefix_mismatches == 0u &&
         suffix_mismatches == 0u && untouched_payload_mismatches == 0u &&
-        selected_poison_words == 0u && expected_bit_mismatches == 0u &&
+        selected_poison_words == 0u &&
+        (!expected_match_required || expected_bit_mismatches == 0u) &&
         finite == output_count && nonzero != 0u;
     printf("replay_step=%s,event=complete,status=%s,"
            "canary_prefix_mismatches=%llu,"
            "canary_suffix_mismatches=%llu,"
            "untouched_payload_mismatches=%llu,selected_poison_words=%llu,"
-           "expected_bit_mismatches=%llu,finite=%llu,nonzero=%llu,"
+           "expected_bit_mismatches=%llu,expected_match_required=%d,"
+           "finite=%llu,nonzero=%llu,"
            "fnv1a64=%016llx\n",
            stage, valid ? "ok" : "failed",
            (unsigned long long)prefix_mismatches,
@@ -538,6 +541,7 @@ static int output_b_replay_step(
            (unsigned long long)untouched_payload_mismatches,
            (unsigned long long)selected_poison_words,
            (unsigned long long)expected_bit_mismatches,
+           expected_match_required,
            (unsigned long long)finite,
            (unsigned long long)nonzero,
            (unsigned long long)output_hash);
