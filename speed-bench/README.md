@@ -6316,10 +6316,10 @@ launcher exit status and kernel/health evidence.  It never follows a failed run 
 another workload.  `SKIP_BUILD=1` below retains the existing failing executable
 if `make -q` confirms it is current.  This wrapper-only change does not alter
 its build prerequisites; do not automatically rebuild or rerun if that check
-fails.  `SANITIZER_TOOL` defaults to `memcheck`.  Its only other accepted value
-is `initcheck`, which requires sanitizer-only mode; it cannot select an
-ordinary run followed by a smoke test.  Neither choice automatically runs any
-other tool or workload.
+fails.  `SANITIZER_TOOL` defaults to `memcheck`.  Its other accepted values
+are `initcheck` and `synccheck`, both of which require sanitizer-only mode;
+they cannot select an ordinary run followed by a smoke test.  No choice
+automatically runs another tool or workload.
 
 The 2026-09-07 18:33 archive at `d3b86a2` confirms that the entire memcheck run
 completed: all 1,024 burn-in calls, DEFAULT N=512 and both final algorithm-103
@@ -6331,14 +6331,32 @@ This is a full instrumented pass, not a fix or proof that the uninstrumented
 workload is safe.  No blocking-launch option was requested.  The two existing
 informational DEFAULT-versus-103 comparison differences remained unchanged.
 
-The next diagnostic uses `SANITIZER_TOOL=initcheck` on that same executable,
-still only physical GPU1 with no peer or native-stream path.  Initcheck's
+The 2026-09-07 19:12 archive at `41a8daf` confirms that initcheck also completed
+the entire sequence on physical GPU1 using that identical executable hash
+and Compute Sanitizer 2026.1.1.0.  All 1,024 burn-in calls and all three final
+transitions completed, with exact selected production comparisons, exit 0,
+zero sanitizer errors, no kernel entries and a successful GPU1 post-run
+health check.  The application logs differ from the memcheck run only in
+model-copy timing.  The two informational cross-algorithm differences are
+unchanged.  Neither instrumented pass establishes the cause of the earlier
+uninstrumented GPU loss or qualifies production.
+
+Both runs used only physical GPU1 with no peer or native-stream path.  Initcheck's
 default check covers uninitialized device global-memory reads, a different
 check from memcheck's invalid-access checking; it does not by itself rule out
 shared-memory synchronization hazards or driver/hardware faults.  See the
 [NVIDIA initcheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#initcheck-tool).
+
+The next diagnostic uses `SANITIZER_TOOL=synccheck` on the same executable
+and selected sequence.  It checks kernel synchronization primitives such as
+`__syncthreads()` and `__syncwarp()`, not every stream/event dependency,
+allocation lifetime or shared-memory data race.  See the
+[NVIDIA synccheck documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#synccheck-tool).
+The runner change only permits that tool selection and retains the existing
+single-invocation, scope, completion, exactness and health gates.  It does not add
+fences, change any CUDA/build prerequisites, enable peers, or run racecheck.
 The unchanged workload may still fail; no additional reboot is required by
-the clean memcheck result alone, but do not run on a host with a subsequent
+the clean instrumented results alone, but do not run on a host with a subsequent
 GPU fault.  The checksum guard below refuses to test a different executable.
 
 ```bash
@@ -6349,13 +6367,13 @@ PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-production103-no-row-owned POST_BURNIN_PAIR=ab \
 OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
 CASE_TIMEOUT_SECONDS=1800 SANITIZER_ONLY=1 RUN_SANITIZER=1 \
-SANITIZER_TOOL=initcheck SKIP_BUILD=1 CREATE_ARCHIVE=1 \
+SANITIZER_TOOL=synccheck SKIP_BUILD=1 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 
 `bash tests/test_token_row_runner.sh` tests this wrapper with CPU-only command
 doubles, including failure capture and prevention of an uninstrumented first
-run for both tools.  It does not execute CUDA or establish GPU correctness.
+run for all three tools.  It does not execute CUDA or establish GPU correctness.
 
 Earlier component-comparison commands below are retained for reference, not
 the recommended next run:

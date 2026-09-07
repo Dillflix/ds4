@@ -20,6 +20,7 @@ run_case() {
     local name=$1 expected=$2 launches=$3 instrumented=$4
     shift 4
     local case_dir=$test_dir/$name mock_name=${name#initcheck-} status
+    mock_name=${mock_name#synccheck-}
     mkdir -p "$case_dir"
     : >"$case_dir/trace"
     set +e
@@ -100,4 +101,21 @@ run_case initcheck-timeout 1 1 1 SANITIZER_TOOL=initcheck MOCK_EXPECT_TOOL=initc
 run_case invalid-tool 1 0 0 SANITIZER_TOOL=unknown
 run_case initcheck-ordinary-rejected 1 0 0 SANITIZER_TOOL=initcheck SANITIZER_ONLY=0
 run_case initcheck-disabled 1 0 0 SANITIZER_TOOL=initcheck RUN_SANITIZER=0
-printf 'All 28 CPU-only runner cases passed. No GPU validation performed.\n'
+run_case synccheck-clean 0 1 1 SANITIZER_TOOL=synccheck MOCK_EXPECT_TOOL=synccheck
+grep -Fxq 'sanitizer_tool=synccheck' "$test_dir/synccheck-clean/output/manifest.txt"
+grep -Fxq 'execution_mode=synccheck-full-selected-scope' "$test_dir/synccheck-clean/output/manifest.txt"
+grep -Fxq 'uninstrumented_runs=0' "$test_dir/synccheck-clean/output/manifest.txt"
+grep -Fxq 'sanitizer_smoke=0' "$test_dir/synccheck-clean/output/manifest.txt"
+grep -Fq 'compute-sanitizer --tool synccheck --error-exitcode=99' \
+    "$test_dir/synccheck-clean/output/provenance/diagnostic-command.txt"
+grep -Fxq 'instrumentation-tool=synccheck' "$test_dir/synccheck-clean/trace"
+for failure in application-fault memcheck-error missing-summary contradictory-summary \
+    incomplete kernel-fault health-fault; do
+    run_case "synccheck-$failure" 1 1 1 SANITIZER_TOOL=synccheck MOCK_EXPECT_TOOL=synccheck
+done
+run_case synccheck-timeout 1 1 1 SANITIZER_TOOL=synccheck MOCK_EXPECT_TOOL=synccheck CASE_TIMEOUT_SECONDS=1
+run_case synccheck-ordinary-rejected 1 0 0 SANITIZER_TOOL=synccheck SANITIZER_ONLY=0
+run_case synccheck-disabled 1 0 0 SANITIZER_TOOL=synccheck RUN_SANITIZER=0
+run_case synccheck-wrong-scope 1 0 0 SANITIZER_TOOL=synccheck DIAGNOSTIC_SCOPE=full
+run_case synccheck-stale-target 1 0 0 SANITIZER_TOOL=synccheck
+printf 'All 41 CPU-only runner cases passed. No GPU validation performed.\n'

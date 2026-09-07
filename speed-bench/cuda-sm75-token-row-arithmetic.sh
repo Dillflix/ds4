@@ -65,10 +65,11 @@ for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
-[[ $SANITIZER_TOOL == memcheck || $SANITIZER_TOOL == initcheck ]] ||
-    die "SANITIZER_TOOL must be memcheck or initcheck"
+[[ $SANITIZER_TOOL == memcheck || $SANITIZER_TOOL == initcheck ||
+   $SANITIZER_TOOL == synccheck ]] ||
+    die "SANITIZER_TOOL must be memcheck, initcheck, or synccheck"
 [[ $SANITIZER_TOOL == memcheck || $SANITIZER_ONLY == 1 ]] ||
-    die "SANITIZER_TOOL=initcheck requires SANITIZER_ONLY=1"
+    die "SANITIZER_TOOL=$SANITIZER_TOOL requires SANITIZER_ONLY=1"
 if (( SANITIZER_ONLY )); then
     (( RUN_SANITIZER )) || die "SANITIZER_ONLY=1 requires RUN_SANITIZER=1"
     [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]] ||
