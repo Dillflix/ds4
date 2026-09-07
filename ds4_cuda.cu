@@ -26807,6 +26807,21 @@ static int cuda_attention_output_q8_batch_tensor_impl(
     }
 
     if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+    const char *canonical_a_only = getenv(
+        "DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC");
+    if (canonical_a_only && canonical_a_only[0] &&
+        strcmp(canonical_a_only, "0") != 0) {
+        /* Component isolation at the failing replay's post-burn-in position.
+         * Keep the ordinary A pack/GEMM/unpack and stream ordering above;
+         * add no checkpoint and never execute B.  Require the cached-F16,
+         * single-device path so fallback or native A cannot pass this probe. */
+        const int ok = g_n_gpus == 1 && out_a_f16 != NULL &&
+            out_a_native == NULL && !row_owned_exact_b;
+        for (uint32_t i = 0; i < 3u; i++) {
+            if (prof_ev[i]) (void)cudaEventDestroy(prof_ev[i]);
+        }
+        return ok;
+    }
     if (cuda_output_a_only_local_diagnostic()) {
         /* This bounded probe intentionally stops before output B can reuse
          * the native-stream workspace.  A-only success therefore does not

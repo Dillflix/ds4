@@ -19,6 +19,7 @@ B_TIMING_REPEATS=${B_TIMING_REPEATS:-10}
 B_TIMING_WARMUPS=${B_TIMING_WARMUPS:-3}
 OUTPUT_B_PRODUCTION103_CALLS=${OUTPUT_B_PRODUCTION103_CALLS:-1024}
 OUTPUT_B_PRODUCTION103_BATCH=${OUTPUT_B_PRODUCTION103_BATCH:-10}
+POST_BURNIN_PAIR=${POST_BURNIN_PAIR:-ab}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${TOKEN_ROW_ARITHMETIC_DIR:-$repo_dir/sm75-token-row-arithmetic-$stamp}
 target=tests/cuda_sm75_token_row_arithmetic
@@ -43,6 +44,11 @@ target=tests/cuda_sm75_token_row_arithmetic
     die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-production103-replay, output-b-production103-pinned-half, output-b-production103-no-row-owned, output-b-production103-generic-pair, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
+[[ $POST_BURNIN_PAIR == ab || $POST_BURNIN_PAIR == a || $POST_BURNIN_PAIR == b ]] ||
+    die "POST_BURNIN_PAIR must be ab, a, or b"
+[[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ||
+   $POST_BURNIN_PAIR == ab ]] ||
+    die "POST_BURNIN_PAIR=a or b requires output-b-production103-generic-pair scope"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
     die "OUTPUT_AB_REPEAT_CALLS must be a positive integer"
 (( OUTPUT_AB_REPEAT_CALLS <= 4096 )) ||
@@ -122,6 +128,7 @@ phase=manifest
         "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS" \
         "$OUTPUT_AB_REPEAT_CALLS" "$OUTPUT_B_PRODUCTION103_CALLS" \
         "$OUTPUT_B_PRODUCTION103_BATCH"
+    printf 'post_burnin_pair=%s\n' "$POST_BURNIN_PAIR"
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -171,6 +178,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-no-row-owned ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_GENERIC_PAIR=1
+        DS4_TOKEN_ROW_ARITHMETIC_POST_BURNIN_PAIR="$POST_BURNIN_PAIR"
         DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS="$OUTPUT_B_PRODUCTION103_CALLS"
         DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH="$OUTPUT_B_PRODUCTION103_BATCH")
 fi
@@ -420,7 +428,29 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
     elif [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
         grep -Fq 'suffix_replay_phase=production-generic-algo103-pair-complete' \
             "$OUTPUT_DIR/diagnostic.log" ||
-            die "production-103 generic-pair replay missed the generic A+B pair"
+            die "production-103 generic-pair replay missed the selected component pair"
+        grep -Fxq "post_burnin_pair=$POST_BURNIN_PAIR" "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 replay ran the wrong post-burn-in component"
+        grep -Fxq 'post_burnin_rows=256' "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 replay changed post-burn-in row extent"
+        grep -Fxq 'post_burnin_fencing=one-sync-after-both-calls' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 replay changed post-burn-in fencing"
+        expected_a_calls=2
+        expected_b_calls=2
+        [[ $POST_BURNIN_PAIR != a ]] || expected_b_calls=0
+        [[ $POST_BURNIN_PAIR != b ]] || expected_a_calls=0
+        grep -Fxq "post_burnin_a_calls=$expected_a_calls" "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 replay changed post-burn-in A calls"
+        grep -Fxq "post_burnin_b_calls=$expected_b_calls" "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 replay changed post-burn-in B calls"
+        if [[ $POST_BURNIN_PAIR == a ]]; then
+            grep -Fxq 'post_burnin_output_b=not-executed' "$OUTPUT_DIR/diagnostic.log" ||
+                die "production-103 A-only pair unexpectedly entered B"
+        fi
+        grep -Fxq "post_burnin_pair_conclusion=$POST_BURNIN_PAIR-transition-clean" \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "production-103 component replay omitted its clean conclusion"
     else
         grep -Fq 'suffix_replay_phase=production-row-owned-pair-complete' \
             "$OUTPUT_DIR/diagnostic.log" ||
@@ -598,4 +628,7 @@ fi
 phase=summary
 grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|production_b_|production103_replay_phase=|production103_replay_conclusion=|exhaustive_algorithm_sweep=|historical_timing_burn_in=|historical_mixed_algorithm_timing=|suffix_half_algorithm=|suffix_submission_fencing=|suffix_replay_phase=|suffix_transition_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
+if [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ]]; then
+    grep -E '^post_burnin_' "$OUTPUT_DIR/diagnostic.log" >>"$OUTPUT_DIR/summary.txt"
+fi
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

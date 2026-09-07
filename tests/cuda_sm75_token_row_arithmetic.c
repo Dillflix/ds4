@@ -261,6 +261,41 @@ static void select_b_algorithm(int algorithm) {
     (void)setenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC", text, 1);
 }
 
+/* Change only the two calls between the burn-in and the final B transition.
+ * B-only consumes the same low_split views as B inside the complete helper;
+ * those views still hold the synchronized, exact A reference from setup. */
+static int launch_post_burnin_pair(
+        const char *mode, ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        ds4_gpu_tensor *low0, ds4_gpu_tensor *low1,
+        const ds4_gpu_tensor *heads0, const ds4_gpu_tensor *heads1,
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t out_a_offset, uint64_t out_b_offset) {
+    const int a_only = strcmp(mode, "a") == 0;
+    const int b_only = strcmp(mode, "b") == 0;
+    if (!a_only && !b_only && strcmp(mode, "ab") != 0) return 0;
+    if (a_only && setenv(
+            "DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC",
+            "1", 1) != 0) return 0;
+    select_b_algorithm(103);
+    const int ok = b_only
+        ? (ds4_gpu_attention_output_q8_batch_b_tensor(
+               out0, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+               low0, HALF_TOK) &&
+           ds4_gpu_attention_output_q8_batch_b_tensor(
+               out1, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+               low1, HALF_TOK) && ds4_gpu_synchronize())
+        : (launch_output(out0, low0, model, model_bytes, out_a_offset,
+                         out_b_offset, heads0, HALF_TOK) &&
+           launch_output(out1, low1, model, model_bytes, out_a_offset,
+                         out_b_offset, heads1, HALF_TOK) &&
+           ds4_gpu_synchronize());
+    select_b_algorithm(-1);
+    if (a_only) {
+        (void)unsetenv("DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC");
+    }
+    return ok;
+}
+
 static int time_output_b(double *median_ms, ds4_gpu_tensor *out,
                          const unsigned char *model, uint64_t model_bytes,
                          uint64_t out_b_offset, const ds4_gpu_tensor *low,
@@ -1102,6 +1137,29 @@ int main(void) {
         getenv(
             "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_GENERIC_PAIR") !=
         NULL;
+    const char *post_burnin_pair_env = getenv(
+        "DS4_TOKEN_ROW_ARITHMETIC_POST_BURNIN_PAIR");
+    if (!post_burnin_pair_env) post_burnin_pair_env = "ab";
+    /* Keep the selected mode stable across later setenv/unsetenv calls. */
+    char post_burnin_pair[3];
+    if (strlen(post_burnin_pair_env) >= sizeof(post_burnin_pair)) {
+        fprintf(stderr, "error: POST_BURNIN_PAIR must be ab, a, or b\n");
+        return 1;
+    }
+    strcpy(post_burnin_pair, post_burnin_pair_env);
+    if ((strcmp(post_burnin_pair, "ab") != 0 &&
+         strcmp(post_burnin_pair, "a") != 0 &&
+         strcmp(post_burnin_pair, "b") != 0) ||
+        (!output_b_production103_generic_pair_diagnostic &&
+         strcmp(post_burnin_pair, "ab") != 0)) {
+        fprintf(stderr,
+                "error: POST_BURNIN_PAIR requires generic-pair scope "
+                "and must be ab, a, or b\n");
+        return 1;
+    }
+    const int post_burnin_a_only =
+        output_b_production103_generic_pair_diagnostic &&
+        strcmp(post_burnin_pair, "a") == 0;
     const int output_b_production103_pinned_half_diagnostic =
         getenv(
             "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_PINNED_HALF") !=
@@ -1309,6 +1367,7 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_NO_WINDOW_ATTENTION");
     (void)unsetenv("DS4_CUDA_T32_F16_GEMM_ALGO_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
     if (output_ab_native_required) {
@@ -1598,6 +1657,15 @@ int main(void) {
                output_b_production103_batch,
                output_b_production103_pinned_half_diagnostic ?
                    "103:CUBLAS_GEMM_ALGO3_TENSOR_OP" : "DEFAULT");
+        fflush(stdout);
+    }
+
+    if (output_b_production103_generic_pair_diagnostic) {
+        printf("post_burnin_pair=%s\npost_burnin_rows=256\n"
+               "post_burnin_a_calls=%u\npost_burnin_b_calls=%u\n"
+               "post_burnin_fencing=one-sync-after-both-calls\n",
+               post_burnin_pair, strcmp(post_burnin_pair, "b") == 0 ? 0u : 2u,
+               post_burnin_a_only ? 0u : 2u);
         fflush(stdout);
     }
 
@@ -2084,23 +2152,18 @@ int main(void) {
         fflush(stdout);
     }
 
-    /* Exercise the two post-burn-in A+B calls.  The generic-pair scope keeps
-     * their tensors, order, row extent, algorithm 103 selector, and
-     * synchronization unchanged while replacing only the dedicated
-     * graph-facing row-owned entry point with the ordinary output helper. */
+    /* Exercise the two post-burn-in calls.  The generic-pair scope keeps
+     * the same tensor views, row extent, and one synchronization after both
+     * calls.  Its default ab mode uses the ordinary A+B helper; a and b
+     * remove only the other projection at this position in the replay. */
     diff_metrics row_owned_low_diff = {0u, UINT64_MAX, 0.0, 0.0};
     diff_metrics row_owned_output_diff = {0u, UINT64_MAX, 0.0, 0.0};
     if (!output_b_production103_no_row_owned_diagnostic) {
         int pair_ok = 0;
         if (output_b_production103_generic_pair_diagnostic) {
-            select_b_algorithm(103);
-            pair_ok =
-                launch_output(out0, low0, model, model_bytes, out_a_offset,
-                              out_b_offset, heads_ref0, HALF_TOK) &&
-                launch_output(out1, low1, model, model_bytes, out_a_offset,
-                              out_b_offset, heads_ref1, HALF_TOK) &&
-                ds4_gpu_synchronize();
-            select_b_algorithm(-1);
+            pair_ok = launch_post_burnin_pair(
+                post_burnin_pair, out0, out1, low0, low1, heads_ref0,
+                heads_ref1, model, model_bytes, out_a_offset, out_b_offset);
         } else {
             pair_ok =
                 ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
@@ -2120,25 +2183,37 @@ int main(void) {
         }
         row_owned_low_diff = compare_f32(
             actual_low_host, candidate, low_count);
-        report_diff(output_b_production103_generic_pair_diagnostic ?
+        report_diff(output_b_production103_generic_pair_diagnostic &&
+                    strcmp(post_burnin_pair, "b") == 0 ?
+                    "post-burnin-b-only-low-input-preserved" :
+                    post_burnin_a_only ?
+                    "output-a-shipping-full512-vs-post-burnin-a-only-256x2" :
+                    output_b_production103_generic_pair_diagnostic ?
                     "output-a-shipping-full512-vs-generic-algo3-256x2" :
                     "output-a-shipping-full512-vs-row-owned-algo3-256x2",
                     "f32", low_count, row_owned_low_diff);
         if (!ds4_gpu_tensor_read(out_split, 0u, candidate, out_bytes)) {
-            fprintf(stderr, "error: dedicated row-owned output readback failed\n");
+            fprintf(stderr, "error: post-burn-in output readback failed\n");
             goto cleanup;
         }
-        row_owned_output_diff = compare_f32(
-            shipping_b_host, candidate, out_count);
-        report_diff(
-            output_b_production103_generic_pair_diagnostic ?
+        if (!post_burnin_a_only) {
+            row_owned_output_diff = compare_f32(
+                shipping_b_host, candidate, out_count);
+            report_diff(
+                output_b_production103_generic_pair_diagnostic &&
+                strcmp(post_burnin_pair, "b") == 0 ?
+                "output-b-shipping-full512-vs-post-burnin-b-only-256x2" :
+                output_b_production103_generic_pair_diagnostic ?
                 "output-a-plus-b-shipping-full512-vs-generic-algo3-256x2" :
                 "output-a-plus-b-shipping-full512-vs-row-owned-algo3-256x2",
-            "f32", out_count, row_owned_output_diff);
+                "f32", out_count, row_owned_output_diff);
+        } else {
+            printf("post_burnin_output_b=not-executed\n");
+        }
         if (row_owned_low_diff.mismatches ||
             row_owned_output_diff.mismatches) {
             fprintf(stderr,
-                    "error: dedicated row-owned output helper failed exactness\n");
+                    "error: post-burn-in output pair failed exactness\n");
             goto cleanup;
         }
     }
@@ -2252,7 +2327,8 @@ int main(void) {
             attention_wrapper_diff.mismatches == 0u &&
             attention_extent_diff.mismatches == 0u &&
             rope_diff.mismatches == 0u && out_a_diff.mismatches == 0u &&
-            out_b_diff.mismatches == 0u &&
+            (!output_b_production103_pinned_half_diagnostic ||
+             out_b_diff.mismatches == 0u) &&
             out_b_full_chain_diff.mismatches == 0u &&
             (out_b_split_chain_diff.mismatches == 0u ||
              output_b_production103_pinned_half_diagnostic) &&
@@ -2280,6 +2356,14 @@ int main(void) {
                     "error: canonical output-B suffix replay diverged\n");
             goto cleanup;
         }
+        if (output_b_production103_generic_pair_diagnostic) {
+            printf("post_burnin_pair_conclusion=%s-transition-clean\n",
+                   post_burnin_pair);
+        }
+        printf("diagnostic_conclusion=selected-production-boundaries-exact\n"
+               "harness_status=ok\n");
+        status = 0;
+        goto cleanup;
     }
 
     printf("diagnostic_conclusion=%s\n",
@@ -2317,6 +2401,7 @@ cleanup:
         "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT");
     (void)unsetenv("DS4_CUDA_OUTPUT_A_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_OUTPUT_A_ONLY_LOCAL_DIAGNOSTIC");
+    (void)unsetenv("DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT");

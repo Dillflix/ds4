@@ -6237,11 +6237,38 @@ entry point is responsible.
 post-burn-in N=256 A+B calls, their tensors, order, algorithm 103 B selection,
 and synchronization.  It changes only their invocation from the dedicated
 row-owned helper to the ordinary output helper with the diagnostic algorithm
-selector.  A healthy run implicates the dedicated row-owned/forced-B route;
-another loss means the two A+B calls themselves are sufficient after the
-1,024-call history, and the next split is A-only versus B-only.  Like the
+selector.  A healthy run would support investigating the dedicated
+row-owned/forced-B route; another loss would show that route is not required,
+making the next split A-only versus B-only.  Like the
 preceding rungs, this remains local to physical GPU1 with no peer access,
-native stream, transfer, or BAR1 exposure.
+native stream, or GPU-to-GPU transfer.
+
+The 2026-09-07 16:17 generic-pair archive reproduced the failure: burn-in and
+both generic A+B calls completed exactly, DEFAULT N=512 completed, and the
+first subsequent algorithm-103 N=256 call failed.  GPU1 logged Xid 79;
+GPU0 subsequently logged a GSP timeout, and the driver requested a node
+reboot.  The dedicated entry point is therefore not required to reproduce
+this local failure.  The observation does not establish whether the cause
+is application state, cuBLAS/driver state, or hardware response to the workload.
+
+Within `output-b-production103-generic-pair`, `POST_BURNIN_PAIR=ab` preserves
+that reproducer (the default).  `POST_BURNIN_PAIR=a` executes only the two
+ordinary A pack/GEMM/unpack operations at that same position, returning before
+B through a diagnostic-only, cached-FP16 local guard.  It introduces no
+internal synchronization; the original synchronization after both calls and
+readbacks remain.  `POST_BURNIN_PAIR=b` executes only B, using the identical
+low_split views and A-produced values already installed before burn-in.
+Both modes retain the 1,024 B calls, cache and scratch allocation history
+before the pair, and the final DEFAULT-512 / algorithm-103-256 transitions.
+The A-only arm verifies A output and explicitly marks B unexecuted; the B-only
+arm verifies preserved A input and B output.  Neither changes production
+defaults.  Only one selected mode runs per invocation.
+
+Start with `POST_BURNIN_PAIR=a` after rebooting the failed host.  If it
+reproduces the failure, A's pack/GEMM/unpack state is enough to trigger the
+later B transition in this sequence.  If it passes, the B-only counterpart
+tests whether B on the low_split views is enough; if both pass, investigate
+the combined A-to-B sequence.  Keep GPU1 as the only visible CUDA device.
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
