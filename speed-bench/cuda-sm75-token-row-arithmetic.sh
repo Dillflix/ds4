@@ -30,9 +30,10 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == projection-chain-native ||
    $DIAGNOSTIC_SCOPE == projection-chain-native-repeat ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
+   $DIAGNOSTIC_SCOPE == output-b-canonical-replay ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
@@ -128,6 +129,9 @@ if [[ $DIAGNOSTIC_SCOPE == q-b-native ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-canonical ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_REPLAY=1)
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE=1)
@@ -228,6 +232,40 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical ||
         die "$output_b_kind output-B probe damaged its prefix canary"
     grep -Fq 'canary_suffix_mismatches=0' "$OUTPUT_DIR/diagnostic.log" ||
         die "$output_b_kind output-B probe damaged its suffix canary"
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
+    grep -Fq 'diagnostic_scope=output-b-canonical-replay' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay omitted its scope marker"
+    grep -Fq 'resident_f16_cache_bytes=201326592' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay did not preserve the three-weight FP16 cache"
+    grep -Fq 'peer_access=none' "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay unexpectedly enabled peer access"
+    grep -Fq 'exhaustive_algorithm_sweep=off' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay unexpectedly entered the unsafe sweep"
+    grep -Fq 'replay_step=default-suffix-row1-256,event=complete,status=ok' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay did not complete its final synchronized step"
+    ! grep -Eq 'untouched_payload_mismatches=[1-9][0-9]*' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay overwrote an unselected row half"
+    ! grep -Eq 'selected_poison_words=[1-9][0-9]*' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay left selected output unwritten"
+    ! grep -Eq 'expected_bit_mismatches=[1-9][0-9]*' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay changed arithmetic across row extents"
+    grep -Fq 'fidelity=bounded-synchronized-transition-probe' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay omitted its bounded-fidelity marker"
+    grep -Fq 'original_device_working_set_reproduced=0' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay omitted its working-set limitation"
+    grep -Fq 'diagnostic_conclusion=canonical-output-b-replay-clean' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "canonical output-B replay omitted its clean conclusion"
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     grep -Fq 'diagnostic_scope=output-a-native-single-launch' \

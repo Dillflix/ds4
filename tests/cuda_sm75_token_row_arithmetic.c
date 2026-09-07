@@ -366,7 +366,7 @@ static int run_output_b_single_launch(
            native_stream ? "on" : "off");
     fflush(stdout);
 
-    select_b_algorithm(3);
+    select_b_algorithm(103);
     if (!ds4_gpu_attention_output_q8_batch_b_tensor(
             out, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
             low, HALF_TOK) ||
@@ -424,6 +424,271 @@ cleanup:
     ds4_gpu_tensor_free(guarded);
     ds4_gpu_tensor_free(low);
     free(guarded_host);
+    free(low_host);
+    return status;
+}
+
+static int output_b_replay_step(
+        const char *stage, int algorithm, ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *low, uint32_t n_tokens,
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t out_b_offset, ds4_gpu_tensor *guarded,
+        unsigned char *guarded_host, uint64_t guarded_bytes,
+        uint64_t output_offset, uint64_t output_bytes,
+        const unsigned char *expected_output) {
+    memset(guarded_host, 0xa5, (size_t)guarded_bytes);
+    if (!ds4_gpu_tensor_write(
+            guarded, 0u, guarded_host, guarded_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "error: canonical output-B replay reset failed at %s\n",
+                stage);
+        return 0;
+    }
+    select_b_algorithm(algorithm);
+    printf("replay_step=%s,event=submit,algorithm=%s,algorithm_id=%d,rows=%u\n",
+           stage, algorithm < 0 ? "default" : "algo3-tensor-op",
+           algorithm, n_tokens);
+    fflush(stdout);
+    if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+            out, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
+            low, n_tokens)) {
+        fprintf(stderr,
+                "error: canonical output-B replay submit failed at %s\n",
+                stage);
+        return 0;
+    }
+    if (!ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "error: canonical output-B replay synchronize failed at %s\n",
+                stage);
+        return 0;
+    }
+    if (!ds4_gpu_tensor_read(
+            guarded, 0u, guarded_host, guarded_bytes)) {
+        fprintf(stderr,
+                "error: canonical output-B replay readback failed at %s\n",
+                stage);
+        return 0;
+    }
+
+    uint64_t prefix_mismatches = 0u;
+    uint64_t suffix_mismatches = 0u;
+    uint64_t untouched_payload_mismatches = 0u;
+    uint64_t selected_poison_words = 0u;
+    uint64_t expected_bit_mismatches = 0u;
+    for (uint64_t i = 0u; i < PROJECTION_PROBE_GUARD_BYTES; i++) {
+        prefix_mismatches += guarded_host[i] != 0xa5u;
+        suffix_mismatches += guarded_host[
+            PROJECTION_PROBE_GUARD_BYTES +
+            (uint64_t)N_TOK * OUT_DIM * sizeof(float) + i] != 0xa5u;
+    }
+    const unsigned char *payload =
+        guarded_host + PROJECTION_PROBE_GUARD_BYTES;
+    for (uint64_t i = 0u; i < output_offset; i++) {
+        untouched_payload_mismatches += payload[i] != 0xa5u;
+    }
+    for (uint64_t i = output_offset + output_bytes;
+         i < (uint64_t)N_TOK * OUT_DIM * sizeof(float); i++) {
+        untouched_payload_mismatches += payload[i] != 0xa5u;
+    }
+    const float *output = (const float *)(
+        guarded_host + PROJECTION_PROBE_GUARD_BYTES + output_offset);
+    const uint64_t output_count = output_bytes / sizeof(float);
+    uint64_t finite = 0u;
+    uint64_t nonzero = 0u;
+    uint64_t output_hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0u; i < output_count; i++) {
+        finite += isfinite(output[i]) != 0;
+        nonzero += output[i] != 0.0f;
+    }
+    const unsigned char *output_raw = (const unsigned char *)output;
+    for (uint64_t i = 0u; i < output_count; i++) {
+        uint32_t bits = 0u;
+        memcpy(&bits, output_raw + i * sizeof(bits), sizeof(bits));
+        selected_poison_words += bits == UINT32_C(0xa5a5a5a5);
+    }
+    for (uint64_t i = 0u; i < output_bytes; i++) {
+        output_hash ^= output_raw[i];
+        output_hash *= UINT64_C(1099511628211);
+    }
+    if (expected_output) {
+        const float *expected = (const float *)expected_output;
+        for (uint64_t i = 0u; i < output_count; i++) {
+            uint32_t actual_bits = 0u;
+            uint32_t expected_bits = 0u;
+            memcpy(&actual_bits, output + i, sizeof(actual_bits));
+            memcpy(&expected_bits, expected + i, sizeof(expected_bits));
+            expected_bit_mismatches += actual_bits != expected_bits;
+        }
+    }
+    const int valid = prefix_mismatches == 0u &&
+        suffix_mismatches == 0u && untouched_payload_mismatches == 0u &&
+        selected_poison_words == 0u && expected_bit_mismatches == 0u &&
+        finite == output_count && nonzero != 0u;
+    printf("replay_step=%s,event=complete,status=%s,"
+           "canary_prefix_mismatches=%llu,"
+           "canary_suffix_mismatches=%llu,"
+           "untouched_payload_mismatches=%llu,selected_poison_words=%llu,"
+           "expected_bit_mismatches=%llu,finite=%llu,nonzero=%llu,"
+           "fnv1a64=%016llx\n",
+           stage, valid ? "ok" : "failed",
+           (unsigned long long)prefix_mismatches,
+           (unsigned long long)suffix_mismatches,
+           (unsigned long long)untouched_payload_mismatches,
+           (unsigned long long)selected_poison_words,
+           (unsigned long long)expected_bit_mismatches,
+           (unsigned long long)finite,
+           (unsigned long long)nonzero,
+           (unsigned long long)output_hash);
+    fflush(stdout);
+    if (!valid) {
+        fprintf(stderr,
+                "error: canonical output-B replay validation failed at %s\n",
+                stage);
+        return 0;
+    }
+    return 1;
+}
+
+static int run_output_b_canonical_replay(
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t out_b_offset) {
+    const uint64_t low_count = (uint64_t)N_TOK * LOW_DIM;
+    const uint64_t low_bytes = low_count * sizeof(float);
+    const uint64_t low_half_bytes = low_bytes / 2u;
+    const uint64_t out_bytes = (uint64_t)N_TOK * OUT_DIM * sizeof(float);
+    const uint64_t out_half_bytes = out_bytes / 2u;
+    const uint64_t guarded_bytes =
+        PROJECTION_PROBE_GUARD_BYTES + out_bytes +
+        PROJECTION_PROBE_GUARD_BYTES;
+    float *low_host = NULL;
+    unsigned char *full_host = NULL;
+    unsigned char *split_host = NULL;
+    ds4_gpu_tensor *low = NULL;
+    ds4_gpu_tensor *low0 = NULL;
+    ds4_gpu_tensor *low1 = NULL;
+    ds4_gpu_tensor *guarded_full = NULL;
+    ds4_gpu_tensor *guarded_split = NULL;
+    ds4_gpu_tensor *out_full = NULL;
+    ds4_gpu_tensor *out_split = NULL;
+    ds4_gpu_tensor *out0 = NULL;
+    ds4_gpu_tensor *out1 = NULL;
+    int status = 0;
+
+    low_host = (float *)malloc((size_t)low_bytes);
+    full_host = (unsigned char *)malloc((size_t)guarded_bytes);
+    split_host = (unsigned char *)malloc((size_t)guarded_bytes);
+    if (!low_host || !full_host || !split_host) {
+        fprintf(stderr,
+                "error: canonical output-B replay host allocation failed\n");
+        goto cleanup;
+    }
+    for (uint64_t i = 0u; i < low_count; i++) {
+        const int value =
+            (int)((i * 43u + (i >> 6u) * 17u + 61u) % 509u) - 254;
+        low_host[i] = (float)value / 4096.0f;
+    }
+    memset(full_host, 0xa5, (size_t)guarded_bytes);
+    memset(split_host, 0xa5, (size_t)guarded_bytes);
+
+    low = ds4_gpu_tensor_alloc(low_bytes);
+    low0 = low ? ds4_gpu_tensor_view(low, 0u, low_half_bytes) : NULL;
+    low1 = low ? ds4_gpu_tensor_view(
+        low, low_half_bytes, low_half_bytes) : NULL;
+    guarded_full = ds4_gpu_tensor_alloc(guarded_bytes);
+    guarded_split = ds4_gpu_tensor_alloc(guarded_bytes);
+    out_full = guarded_full ? ds4_gpu_tensor_view(
+        guarded_full, PROJECTION_PROBE_GUARD_BYTES, out_bytes) : NULL;
+    out_split = guarded_split ? ds4_gpu_tensor_view(
+        guarded_split, PROJECTION_PROBE_GUARD_BYTES, out_bytes) : NULL;
+    out0 = out_split ? ds4_gpu_tensor_view(
+        out_split, 0u, out_half_bytes) : NULL;
+    out1 = out_split ? ds4_gpu_tensor_view(
+        out_split, out_half_bytes, out_half_bytes) : NULL;
+    if (!low || !low0 || !low1 || !guarded_full || !guarded_split ||
+        !out_full || !out_split || !out0 || !out1 ||
+        !ds4_gpu_tensor_write(low, 0u, low_host, low_bytes) ||
+        !ds4_gpu_tensor_write(
+            guarded_full, 0u, full_host, guarded_bytes) ||
+        !ds4_gpu_tensor_write(
+            guarded_split, 0u, split_host, guarded_bytes) ||
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr, "error: canonical output-B replay setup failed\n");
+        goto cleanup;
+    }
+
+    printf("diagnostic_scope=output-b-canonical-replay\n"
+           "fidelity=bounded-synchronized-transition-probe\n"
+           "source_failure_archive=sm75-token-row-arithmetic-20260906T213618Z\n"
+           "n_tokens_full=%u\nn_tokens_half=%u\n"
+           "input_dim=%llu\noutput_dim=%u\n"
+           "resident_f16_cache_bytes=%llu\n"
+           "peer_access=none\nnative_stream=off\n"
+           "selected_algorithm=CUBLAS_GEMM_ALGO3_TENSOR_OP\n"
+           "exhaustive_algorithm_sweep=off\n"
+           "original_device_working_set_reproduced=0\n"
+           "original_cumulative_launch_history_reproduced=0\n"
+           "original_unfenced_submission_suffix_reproduced=0\n"
+           "synchronization=after-every-projection\n",
+           N_TOK, HALF_TOK, (unsigned long long)LOW_DIM, OUT_DIM,
+           (unsigned long long)(2u * (Q_DIM * IN_DIM +
+               LOW_DIM * GROUP_DIM + OUT_DIM * LOW_DIM)));
+    fflush(stdout);
+
+#define REPLAY_STEP(label, algorithm, output, input, rows, guarded, host, offset, bytes, expected) \
+    do { \
+        if (!output_b_replay_step( \
+                label, algorithm, output, input, rows, model, model_bytes, \
+                out_b_offset, guarded, host, guarded_bytes, offset, bytes, \
+                expected)) { \
+            goto cleanup; \
+        } \
+    } while (0)
+
+    REPLAY_STEP("default-prefix-full512", -1, out_full, low, N_TOK,
+                guarded_full, full_host, 0u, out_bytes, NULL);
+    REPLAY_STEP("default-prefix-row0-256", -1, out0, low0, HALF_TOK,
+                guarded_split, split_host, 0u, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES);
+    REPLAY_STEP("default-prefix-row1-256", -1, out1, low1, HALF_TOK,
+                guarded_split, split_host, out_half_bytes, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES + out_half_bytes);
+    REPLAY_STEP("algo3-full512", 103, out_full, low, N_TOK,
+                guarded_full, full_host, 0u, out_bytes, NULL);
+    REPLAY_STEP("algo3-row0-256", 103, out0, low0, HALF_TOK,
+                guarded_split, split_host, 0u, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES);
+    REPLAY_STEP("algo3-row1-256", 103, out1, low1, HALF_TOK,
+                guarded_split, split_host, out_half_bytes, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES + out_half_bytes);
+    REPLAY_STEP("default-suffix-full512", -1, out_full, low, N_TOK,
+                guarded_full, full_host, 0u, out_bytes, NULL);
+    REPLAY_STEP("default-suffix-row0-256", -1, out0, low0, HALF_TOK,
+                guarded_split, split_host, 0u, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES);
+    REPLAY_STEP("default-suffix-row1-256", -1, out1, low1, HALF_TOK,
+                guarded_split, split_host, out_half_bytes, out_half_bytes,
+                full_host + PROJECTION_PROBE_GUARD_BYTES + out_half_bytes);
+#undef REPLAY_STEP
+
+    printf("diagnostic_conclusion=canonical-output-b-replay-clean\n"
+           "harness_status=ok\n");
+    status = 1;
+
+cleanup:
+    select_b_algorithm(-1);
+    ds4_gpu_tensor_free(out1);
+    ds4_gpu_tensor_free(out0);
+    ds4_gpu_tensor_free(out_split);
+    ds4_gpu_tensor_free(out_full);
+    ds4_gpu_tensor_free(guarded_split);
+    ds4_gpu_tensor_free(guarded_full);
+    ds4_gpu_tensor_free(low1);
+    ds4_gpu_tensor_free(low0);
+    ds4_gpu_tensor_free(low);
+    free(split_host);
+    free(full_host);
     free(low_host);
     return status;
 }
@@ -817,6 +1082,8 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_NATIVE_Q_B") != NULL;
     const int output_b_canonical_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL") != NULL;
+    const int output_b_canonical_replay_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_REPLAY") != NULL;
     const int output_b_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE") != NULL;
     const int output_a_native_diagnostic =
@@ -841,8 +1108,10 @@ int main(void) {
         output_a_native_diagnostic || output_ab_native_required;
     const int output_b_native_required =
         output_b_native_diagnostic || output_ab_native_required;
-    const int output_b_diagnostic =
+    const int output_b_single_diagnostic =
         output_b_canonical_diagnostic || output_b_native_diagnostic;
+    const int output_b_diagnostic =
+        output_b_single_diagnostic || output_b_canonical_replay_diagnostic;
     const int projection_diagnostic =
         output_a_native_required || output_b_diagnostic;
     const uint64_t q_b_bytes = Q_DIM * (IN_DIM / 32u) * 34u;
@@ -1013,7 +1282,7 @@ int main(void) {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT");
     }
-    if (output_b_diagnostic || output_ab_native_diagnostic) {
+    if (output_b_single_diagnostic || output_ab_native_diagnostic) {
         (void)setenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC", "1", 1);
     } else {
         (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
@@ -1032,7 +1301,7 @@ int main(void) {
     }
     initialized = 1;
     if (!ds4_gpu_set_model_map(model, model_bytes) ||
-        (!projection_diagnostic &&
+        ((!projection_diagnostic || output_b_canonical_replay_diagnostic) &&
          (!ds4_gpu_cache_q8_f16_range_on_device(
               model, model_bytes, 0u, q_b_bytes, IN_DIM, Q_DIM, 0,
               "attn_q_b") ||
@@ -1111,7 +1380,16 @@ int main(void) {
         (void)setenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
     }
-    if (output_b_diagnostic) {
+    if (output_b_canonical_replay_diagnostic) {
+        if (!ds4_gpu_synchronize() ||
+            !run_output_b_canonical_replay(
+                model, model_bytes, out_b_offset)) {
+            goto cleanup;
+        }
+        status = 0;
+        goto cleanup;
+    }
+    if (output_b_single_diagnostic) {
         if (!ds4_gpu_synchronize() ||
             !run_output_b_single_launch(
                 model, model_bytes,

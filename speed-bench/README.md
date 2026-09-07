@@ -6136,6 +6136,27 @@ both canaries, finite/nonzero output, Compute Sanitizer, GPU identity, and
 kernel health.  This deliberately distinguishes an intrinsically unsafe
 row-owned B launch from cumulative corruption in the former full diagnostic.
 
+`DIAGNOSTIC_SCOPE=output-b-canonical-replay` is a bounded, synchronized first
+rung derived from the genuine local-only physical-GPU1 failure recorded by
+`sm75-token-row-arithmetic-20260906T213618Z`.  It installs the same canonical
+Q_B, output-A, and output-B FP16 weight-cache footprint (201,326,592 bytes) on
+one physical GPU, with native streaming and peer access disabled.  It executes
+DEFAULT full-512 then ordered 256+256 B projections, forced ALGO3 Tensor Op at
+both shapes, and a final DEFAULT full/split sequence.  ALGO3 Tensor Op is the
+production candidate at 256 rows; its 512-row call here is diagnostic coverage.
+Every individual projection is synchronized and guard-checked.  Each split
+result must be bit-identical to the matching half of its full-row result, must
+fully replace a poisoned selected region, and must leave the other row half
+untouched.
+
+This mode deliberately does not claim to reproduce the old fault.  It omits
+about 371.25 MiB of full-harness device working tensors, the prior Q_B/output-A
+touches, roughly 845 accumulated output-B submissions, the exhaustive
+algorithm sweep and timing history, and the original unfenced submission
+suffix.  A clean pass clears only these nine independently fenced transitions.
+The next rung is a working-set- and suffix-faithful replay; cumulative burn-in
+and fresh-process algorithm/prefix bisection follow only if needed.
+
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local
 `B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into
@@ -6223,6 +6244,17 @@ disabling the F16 cache, and normal dispatch remains DEFAULT.
 ```bash
 PROFILE_GPU=0 CUDA_ARCH=sm_75 RUN_SANITIZER=1 SKIP_BUILD=0 \
 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+Before interpreting native-stream results as clearing physical GPU1, run the
+bounded canonical-FP16 B transition probe derived from the earlier local
+context-fault workload:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-canonical-replay \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 
