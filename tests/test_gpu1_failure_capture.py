@@ -30,6 +30,10 @@ class BaseTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.folder = Path(self.temporary.name) / "capture"
         self.capture = module.Capture(self.folder, sys.executable, [sys.executable, "-c", "pass"], 1)
+        if sys.platform != "linux":
+            # Windows can run the CPU children, but cannot exercise POSIX
+            # process_group. The exact POSIX launch contract is tested below.
+            self.capture.launch_collector = lambda command, **kwargs: subprocess.Popen(command, **kwargs)
 
 
 class PreflightTests(BaseTest):
@@ -138,6 +142,13 @@ class PreflightTests(BaseTest):
                 self.capture.preflight()
         self.capture.required.assert_not_called()
 
+    def test_old_python_refused_before_any_host_query(self):
+        with patch.object(module.sys, "platform", "linux"), \
+             patch.object(module.sys, "version_info", (3, 10)):
+            with self.assertRaisesRegex(RuntimeError, "Python 3.11"):
+                self.capture.preflight()
+        self.capture.required.assert_not_called()
+
     def test_instrumentation_refused(self):
         with patch.object(module.sys, "platform", "linux"), \
              patch.object(module, "sha256", return_value=module.EXPECTED_SHA256), \
@@ -231,6 +242,31 @@ class ExecutionTests(BaseTest):
         self.assertIsNone(self.capture.workload_process)
         self.assertTrue((self.folder / "summary.json").exists())
 
+    def test_sudo_refresh_runs_only_during_owned_workload(self):
+        self.capture.sudo_refresh_seconds = 0.1
+        self.capture.run = Mock(return_value=({"returncode": 0, "timeout": False}, ""))
+        self.assertEqual(self.run_capture("import time; time.sleep(0.3)"), 0)
+        self.assertGreaterEqual(self.capture.run.call_count, 1)
+        for call in self.capture.run.call_args_list:
+            self.assertEqual(call.args[1], ["sudo", "-n", "-v"])
+            self.assertEqual(call.kwargs["seconds"], 5)
+
+    def test_failed_sudo_refresh_stops_before_more_work(self):
+        self.capture.sudo_refresh_seconds = 0.1
+        self.capture.run = Mock(return_value=({"returncode": 1, "timeout": False}, "password required"))
+        self.assertNotEqual(self.run_capture("import time; time.sleep(30)"), 0)
+        self.assertEqual(self.capture.summary["workload"], "stopped-on-collector-failure")
+        self.assertEqual(self.capture.summary["collection"], "partial")
+        self.capture.postmortem.assert_called_once()
+
+    def test_workload_launch_remains_unprivileged_and_separate_session(self):
+        original = subprocess.Popen
+        with patch.object(module.subprocess, "Popen", side_effect=original) as launch:
+            self.assertEqual(self.run_capture("pass"), 0)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(launch.call_args.args[0], self.capture.command)
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+
 
 class CollectorTests(BaseTest):
     def setUp(self):
@@ -242,6 +278,35 @@ class CollectorTests(BaseTest):
             "import sys; print('collector evidence', file=sys.stderr); sys.exit(3)"])
         self.assertEqual(result["returncode"], 3)
         self.assertIn("collector evidence", output)
+
+    def test_sudo_error_visible_without_opening_the_archive(self):
+        self.capture.run = Mock(return_value=({"returncode": 1, "timeout": False},
+                                             "sudo: a password is required\n"))
+        with self.assertRaisesRegex(RuntimeError, "pre/sudo: sudo: a password is required"):
+            self.capture.required("pre/sudo", ["sudo", "-n", "true"])
+
+    def test_collector_keeps_terminal_session_but_owns_process_group(self):
+        with patch.object(module.subprocess, "Popen") as launch:
+            module.Capture.launch_collector(["sudo", "-n", "true"], stdout=subprocess.PIPE)
+        self.assertFalse(launch.call_args.kwargs["start_new_session"])
+        self.assertEqual(launch.call_args.kwargs["process_group"], 0)
+        self.assertNotIn("preexec_fn", launch.call_args.kwargs)
+
+    def test_journal_uses_same_session_collector_launcher(self):
+        process = Mock(stdout=io.BytesIO(b'{"MESSAGE":"healthy"}\n'))
+        process.poll.return_value = None
+        self.capture.boot_id = "test-boot"
+        self.capture.launch_collector = Mock(return_value=process)
+        self.capture.stop = Mock(return_value=True)
+        try:
+            self.capture.start_journal("test-cursor")
+            self.capture.journal_reader.join(timeout=1)
+            call = self.capture.launch_collector.call_args
+            self.assertEqual(call.args[0][:2], ["sudo", "-n"])
+            self.assertIn("--after-cursor=test-cursor", call.args[0])
+            self.assertNotIn("start_new_session", call.kwargs)
+        finally:
+            self.capture.finish()
 
     def test_command_timeout_saves_partial_output(self):
         def stop(process):

@@ -74,6 +74,7 @@ class Capture:
         self.journal_error = None
         self.workload_process = None
         self.boot_id = None
+        self.sudo_refresh_seconds = 60
 
     def save(self):
         self.output.mkdir(parents=True, exist_ok=True)
@@ -84,6 +85,13 @@ class Capture:
     def issue(self, text):
         self.summary["issues"].append(text)
         self.save()
+
+    @staticmethod
+    def launch_collector(command, **kwargs):
+        # Own a process group for bounded cleanup WITHOUT setsid(): sudo's tty
+        # ticket belongs to the authenticated terminal session. Detaching the
+        # collector loses that ticket even immediately after `sudo -v`.
+        return subprocess.Popen(command, start_new_session=False, process_group=0, **kwargs)
 
     @staticmethod
     def stop(process):
@@ -118,8 +126,7 @@ class Capture:
         record = {"name": name, "argv": argv, "start": stamp(), "timeout": False}
         with path.open("wb") as log:
             try:
-                process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                           cwd=cwd, start_new_session=True)
+                process = self.launch_collector(argv, stdout=log, stderr=subprocess.STDOUT, cwd=cwd)
                 try:
                     record["returncode"] = process.wait(timeout=seconds + (4 if root else 0))
                     record["timeout"] = record["returncode"] == 124
@@ -140,7 +147,8 @@ class Capture:
     def required(self, name, command, **kwargs):
         record, text = self.run(name, command, **kwargs)
         if record["returncode"] != 0 or record["timeout"]:
-            raise RuntimeError("required preflight collector failed: " + name)
+            detail = text.strip()[-1000:] or "no collector output"
+            raise RuntimeError("required preflight collector failed: " + name + ": " + detail)
         return text
 
     def pci_snapshot(self, phase):
@@ -163,6 +171,8 @@ class Capture:
     def preflight(self):
         if sys.platform != "linux":
             raise RuntimeError("capture is Linux-only; do not launch a GPU workload here")
+        if sys.version_info < (3, 11):
+            raise RuntimeError("capture requires Python 3.11+ for same-session process groups")
         actual = sha256(self.executable)
         self.summary.update({"executable": str(self.executable), "executable_sha256": actual,
                              "command": self.command})
@@ -244,10 +254,10 @@ class Capture:
         # All-kernel follow; no CUDA/NVML polling. sudo's timeout bounds even an
         # orphaned privileged follower. Normal shutdown signals its owned sudo.
         self.journal_error = (self.output / "kernel-live.stderr.log").open("wb")
-        self.journal_process = subprocess.Popen(["sudo", "-n", "timeout", "--signal=TERM",
+        self.journal_process = self.launch_collector(["sudo", "-n", "timeout", "--signal=TERM",
             "--kill-after=2", str(self.case_timeout + 480), "journalctl", "-b", self.boot_id,
             "-k", "--after-cursor=" + cursor, "-f", "-o", "json", "--no-pager"],
-            stdout=subprocess.PIPE, stderr=self.journal_error, start_new_session=True)
+            stdout=subprocess.PIPE, stderr=self.journal_error)
 
         def read():
             try:
@@ -312,6 +322,8 @@ class Capture:
         reader.start()
         deadline = time.monotonic() + self.case_timeout
         next_snapshot = 0
+        next_sudo_refresh = time.monotonic() + self.sudo_refresh_seconds
+        sudo_refresh_count = 0
         reason = None
         with (self.output / "process-timeline.jsonl").open("w", encoding="utf-8") as log:
             while process.poll() is None:
@@ -331,6 +343,17 @@ class Capture:
                     if not self.summary["workload_terminated"]:
                         self.issue("owned workload would not terminate; possible uninterruptible task")
                     break
+                if time.monotonic() >= next_sudo_refresh:
+                    sudo_refresh_count += 1
+                    record, _ = self.run("sudo-refresh-" + str(sudo_refresh_count),
+                                         ["sudo", "-n", "-v"], seconds=5)
+                    if record["returncode"] != 0 or record["timeout"]:
+                        reason = "stopped-on-collector-failure"
+                        self.summary["stop_requested"] = stamp()
+                        self.summary["workload_terminated"] = self.stop(process)
+                        self.issue("cached sudo authorization could not be refreshed noninteractively")
+                        break
+                    next_sudo_refresh = time.monotonic() + self.sudo_refresh_seconds
                 if time.monotonic() >= next_snapshot:
                     log.write(json.dumps(self.process_snapshot(process.pid)) + "\n")
                     log.flush()

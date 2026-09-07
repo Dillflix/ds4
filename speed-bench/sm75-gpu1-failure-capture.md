@@ -40,6 +40,9 @@ The helper fails closed on a different executable fingerprint.
 Before launching it requires:
 
 - Cached `sudo` authorization (`sudo -v` in the launching terminal).
+- Python 3.11+ for separate process groups that retain the authenticated terminal
+  session. The captured host is Ubuntu 24.04; its system Python normally meets
+  this requirement. The helper checks before launching any GPU workload.
 - Both DCGM snap services disabled/inactive and no `nv-hostengine`,
   `nvbandwidth`, or retraining process in the initial process snapshot.
 - The existing retraining unit successfully finished: `active (exited)`,
@@ -58,6 +61,23 @@ retrain, retry, peer workload, or concurrent bandwidth test. Pre/post NVML queri
 are bounded; there is **no continuous all-GPU NVML polling** during execution.
 This reduces monitoring traffic but does not make observation zero-overhead.
 Process snapshots do not prove that no other process started between snapshots.
+
+The initial capture commit mistakenly used `start_new_session=True` for sudo
+collectors. That detached them from the terminal/session where `sudo -v` had
+authenticated; the 23:24:03 run stopped at `pre/sudo` with `sudo: a password is
+required`, before the CUDA executable launched. The fix uses `process_group=0`
+and `start_new_session=False` for collectors: isolated group cleanup without
+losing terminal-session authentication. It covers the live journal too, not
+just the first check. No sudoers changes, password piping or root benchmark are
+required. See [Python's subprocess process-group documentation](https://docs.python.org/3/library/subprocess.html)
+and [sudo's timestamp/session documentation](https://github.com/sudo-project/sudo/blob/main/docs/sudoers.man.in).
+
+While the owned workload runs, the helper renews the existing authorization with
+bounded `sudo -n -v` once per minute, so a short sudo timestamp timeout does not
+silently remove post-fault collection access. There is no password prompt or
+background renewal after the workload ends. Renewal failure stops the workload
+and marks collection partial. Preflight failures now include the collector's
+stderr in the console as well as retaining it in the archive.
 
 ## Failure handling and artifacts
 
@@ -121,3 +141,6 @@ CPU-only verification: `python3 tests/test_gpu1_failure_capture.py` and
 `bash tests/test_token_row_runner.sh`. These use fake host/driver collectors and
 synthetic CPU children; they do not qualify GPU stability or a Linux driver's
 response to termination. No production CUDA workload is run by either suite.
+Windows tests assert the POSIX launch arguments but cannot validate a real
+Linux terminal or sudo authentication policy. The initial mock-only tests did
+not cover the terminal/session distinction; that coverage gap is now explicit.
