@@ -13,6 +13,7 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-600}
+OUTPUT_AB_REPEAT_CALLS=${OUTPUT_AB_REPEAT_CALLS:-256}
 B_TIMING_ROUNDS=${B_TIMING_ROUNDS:-7}
 B_TIMING_REPEATS=${B_TIMING_REPEATS:-10}
 B_TIMING_WARMUPS=${B_TIMING_WARMUPS:-3}
@@ -25,12 +26,21 @@ target=tests/cuda_sm75_token_row_arithmetic
 [[ $DIAGNOSTIC_SCOPE == q-b || $DIAGNOSTIC_SCOPE == q-b-native ||
    $DIAGNOSTIC_SCOPE == output-a-native ||
    $DIAGNOSTIC_SCOPE == output-ab-native ||
+   $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-b-canonical, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, output-b-canonical, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
+[[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
+    die "OUTPUT_AB_REPEAT_CALLS must be a positive integer"
+(( OUTPUT_AB_REPEAT_CALLS <= 4096 )) ||
+    die "OUTPUT_AB_REPEAT_CALLS must not exceed 4096"
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+    (( OUTPUT_AB_REPEAT_CALLS >= 2 )) ||
+        die "OUTPUT_AB_REPEAT_CALLS must be at least 2 in repeat scope"
+fi
 for flag in RUN_SANITIZER SKIP_BUILD CREATE_ARCHIVE; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
@@ -87,8 +97,9 @@ phase=manifest
         "$(git branch --show-current)"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
-    printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\n' \
-        "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS"
+    printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\noutput_ab_repeat_calls=%s\n' \
+        "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS" \
+        "$OUTPUT_AB_REPEAT_CALLS"
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -123,6 +134,10 @@ if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE_REPEAT=1
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS="$OUTPUT_AB_REPEAT_CALLS")
 fi
 
 capture_gpu_health() {
@@ -225,15 +240,35 @@ if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     grep -Fq 'canary_suffix_mismatches=0' "$OUTPUT_DIR/diagnostic.log" ||
         die "native output-A probe damaged its suffix canary"
 fi
-if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
-    grep -Fq 'diagnostic_scope=output-ab-native-single-call' \
+if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
+      $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+    expected_scope=output-ab-native-single-call
+    expected_calls=1
+    expected_reference_calls=0
+    expected_stress_calls=1
+    expected_conclusion=native-stream-output-ab-single-call-clean
+    if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+        expected_scope=output-ab-native-repeat
+        expected_calls=$((OUTPUT_AB_REPEAT_CALLS + 1))
+        expected_reference_calls=1
+        expected_stress_calls=$OUTPUT_AB_REPEAT_CALLS
+        expected_conclusion=native-stream-output-ab-repeat-clean
+    fi
+    grep -Fq "diagnostic_scope=$expected_scope" \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe omitted its scope marker"
     grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=1' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe did not exercise the borrowed-view rebase"
-    grep -Fq 'attention_output_calls=1' "$OUTPUT_DIR/diagnostic.log" ||
-        die "native A-to-B probe did not remain single-call"
+    grep -Fq "reference_calls=$expected_reference_calls" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe reported the wrong reference-call count"
+    grep -Fq "stress_calls=$expected_stress_calls" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe reported the wrong stress-call count"
+    grep -Fq "attention_output_calls=$expected_calls" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe reported the wrong total call count"
     grep -Fq 'production_order=unfenced-a-to-b' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe did not preserve production ordering"
@@ -244,17 +279,28 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
             "$OUTPUT_DIR/diagnostic.log" ||
             die "native A-to-B probe missed $stage native-stream dispatch"
     done
-    for checkpoint in native-dequant activation-f32-to-f16 cublas-gemm; do
-        grep -Fq "ds4: local output-B checkpoint stage=$checkpoint device=0 status=no error" \
-            "$OUTPUT_DIR/diagnostic.log" ||
-            die "native A-to-B probe missed clean B $checkpoint checkpoint"
-    done
+    if [[ $DIAGNOSTIC_SCOPE == output-ab-native ]]; then
+        for checkpoint in native-dequant activation-f32-to-f16 cublas-gemm; do
+            grep -Fq "ds4: local output-B checkpoint stage=$checkpoint device=0 status=no error" \
+                "$OUTPUT_DIR/diagnostic.log" ||
+                die "native A-to-B probe missed clean B $checkpoint checkpoint"
+        done
+    fi
     for canary in low_canary_prefix_mismatches \
         low_canary_suffix_mismatches out_canary_prefix_mismatches \
         out_canary_suffix_mismatches; do
         grep -Fq "$canary=0" "$OUTPUT_DIR/diagnostic.log" ||
             die "native A-to-B probe damaged $canary"
     done
+    grep -Fq 'low_repeat_bit_mismatches=0' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe changed its repeated low output"
+    grep -Fq 'output_repeat_bit_mismatches=0' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe changed its repeated final output"
+    grep -Fq "diagnostic_conclusion=$expected_conclusion" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "native A-to-B probe omitted its clean conclusion"
 fi
 cat "$OUTPUT_DIR/diagnostic.log"
 
@@ -282,6 +328,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|output_finite=|output_nonzero=|output_fnv1a64=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

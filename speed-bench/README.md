@@ -6167,6 +6167,14 @@ before freeing the old slab, and the runner requires the one-view rebase audit
 marker.  This is the regression guard for the Xid 31 virtual-read fault exposed
 by the original combined probe.
 
+`DIAGNOSTIC_SCOPE=output-ab-native-repeat` is the next local-only rung.  It
+captures one synchronized native A+B reference and then queues
+`OUTPUT_AB_REPEAT_CALLS` complete A+B calls (256 by default) without diagnostic
+fences between calls.  One final synchronization validates both guarded
+outputs, and the final low-rank and projected tensors must be bit-identical to
+the reference.  This exercises cumulative native expansion, shared-workspace
+reuse, and cuBLAS handoff behavior on one physical GPU without peer access.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6225,6 +6233,16 @@ on GPU1 without introducing peer access or repetition:
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-ab-native \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After that single call is clean, stress the same local chain without
+inter-call fences:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-ab-native-repeat \
+OUTPUT_AB_REPEAT_CALLS=256 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 \
+SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 

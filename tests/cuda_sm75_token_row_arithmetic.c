@@ -541,9 +541,10 @@ cleanup:
     return status;
 }
 
-static int run_output_ab_native_single_launch(
+static int run_output_ab_native_calls(
         const unsigned char *model, uint64_t model_bytes,
-        uint64_t out_a_offset, uint64_t out_b_offset) {
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t stress_calls) {
     const uint64_t heads_count =
         (uint64_t)HALF_TOK * N_GROUP * GROUP_DIM;
     const uint64_t heads_bytes = heads_count * sizeof(float);
@@ -560,6 +561,8 @@ static int run_output_ab_native_single_launch(
     float *heads_host = NULL;
     unsigned char *guarded_low_host = NULL;
     unsigned char *guarded_out_host = NULL;
+    unsigned char *reference_low_host = NULL;
+    unsigned char *reference_out_host = NULL;
     ds4_gpu_tensor *heads = NULL;
     ds4_gpu_tensor *guarded_low = NULL;
     ds4_gpu_tensor *guarded_out = NULL;
@@ -570,7 +573,13 @@ static int run_output_ab_native_single_launch(
     heads_host = (float *)malloc((size_t)heads_bytes);
     guarded_low_host = (unsigned char *)malloc((size_t)guarded_low_bytes);
     guarded_out_host = (unsigned char *)malloc((size_t)guarded_out_bytes);
-    if (!heads_host || !guarded_low_host || !guarded_out_host) {
+    if (stress_calls > 1u) {
+        reference_low_host = (unsigned char *)malloc((size_t)low_bytes);
+        reference_out_host = (unsigned char *)malloc((size_t)out_bytes);
+    }
+    if (!heads_host || !guarded_low_host || !guarded_out_host ||
+        (stress_calls > 1u &&
+         (!reference_low_host || !reference_out_host))) {
         fprintf(stderr, "error: output A-to-B probe host allocation failed\n");
         goto cleanup;
     }
@@ -600,27 +609,56 @@ static int run_output_ab_native_single_launch(
         goto cleanup;
     }
 
-    printf("diagnostic_scope=output-ab-native-single-call\n"
+    printf("diagnostic_scope=%s\n"
            "n_tokens=%u\ngroups=%u\ngroup_dim=%u\nrank=%u\n"
-           "low_dim=%llu\noutput_dim=%u\nattention_output_calls=1\n"
-           "output_a_launches=1\noutput_b_launches=1\npeer_access=none\n"
+           "low_dim=%llu\noutput_dim=%u\nreference_calls=%u\n"
+           "stress_calls=%u\nattention_output_calls=%u\n"
+           "output_a_launches=%u\noutput_b_launches=%u\npeer_access=none\n"
            "native_stream=on\nproduction_order=unfenced-a-to-b\n"
            "handoff_sync_before_b=0\n",
+           stress_calls > 1u ? "output-ab-native-repeat" :
+                               "output-ab-native-single-call",
            HALF_TOK, N_GROUP, GROUP_DIM, RANK,
-           (unsigned long long)LOW_DIM, OUT_DIM);
+           (unsigned long long)LOW_DIM, OUT_DIM,
+           stress_calls > 1u ? 1u : 0u, stress_calls,
+           stress_calls + (stress_calls > 1u ? 1u : 0u),
+           stress_calls + (stress_calls > 1u ? 1u : 0u),
+           stress_calls + (stress_calls > 1u ? 1u : 0u));
     fflush(stdout);
 
-    if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
-            out, low, NULL, NULL, model, model_bytes,
-            out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
-            OUT_DIM, heads, HALF_TOK) ||
-        !ds4_gpu_synchronize() ||
+    if (stress_calls > 1u) {
+        if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+                out, low, NULL, NULL, model, model_bytes,
+                out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
+                OUT_DIM, heads, HALF_TOK) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(
+                low, 0u, reference_low_host, low_bytes) ||
+            !ds4_gpu_tensor_read(
+                out, 0u, reference_out_host, out_bytes)) {
+            fprintf(stderr,
+                    "error: native-stream output A-to-B reference failed\n");
+            goto cleanup;
+        }
+    }
+    for (uint32_t call = 0u; call < stress_calls; call++) {
+        if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
+                out, low, NULL, NULL, model, model_bytes,
+                out_a_offset, out_b_offset, GROUP_DIM, RANK, N_GROUP,
+                OUT_DIM, heads, HALF_TOK)) {
+            fprintf(stderr,
+                    "error: native-stream output A-to-B call %u/%u failed\n",
+                    call + 1u, stress_calls);
+            goto cleanup;
+        }
+    }
+    if (!ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(
             guarded_low, 0u, guarded_low_host, guarded_low_bytes) ||
         !ds4_gpu_tensor_read(
             guarded_out, 0u, guarded_out_host, guarded_out_bytes)) {
         fprintf(stderr,
-                "error: native-stream output A-to-B single-call probe failed\n");
+                "error: native-stream output A-to-B execution probe failed\n");
         goto cleanup;
     }
 
@@ -648,6 +686,8 @@ static int run_output_ab_native_single_launch(
     uint64_t out_nonzero = 0u;
     uint64_t low_hash = UINT64_C(1469598103934665603);
     uint64_t out_hash = UINT64_C(1469598103934665603);
+    uint64_t low_repeat_bit_mismatches = 0u;
+    uint64_t out_repeat_bit_mismatches = 0u;
     for (uint64_t i = 0u; i < low_count; i++) {
         low_finite += isfinite(low_output[i]) != 0;
         low_nonzero += low_output[i] != 0.0f;
@@ -664,13 +704,29 @@ static int run_output_ab_native_single_launch(
         out_hash ^= guarded_out_host[PROJECTION_PROBE_GUARD_BYTES + i];
         out_hash *= UINT64_C(1099511628211);
     }
+    if (stress_calls > 1u) {
+        for (uint64_t i = 0u; i < low_count; i++) {
+            low_repeat_bit_mismatches += memcmp(
+                reference_low_host + i * sizeof(float),
+                guarded_low_host + PROJECTION_PROBE_GUARD_BYTES +
+                    i * sizeof(float), sizeof(float)) != 0;
+        }
+        for (uint64_t i = 0u; i < out_count; i++) {
+            out_repeat_bit_mismatches += memcmp(
+                reference_out_host + i * sizeof(float),
+                guarded_out_host + PROJECTION_PROBE_GUARD_BYTES +
+                    i * sizeof(float), sizeof(float)) != 0;
+        }
+    }
     printf("low_canary_prefix_mismatches=%llu\n"
            "low_canary_suffix_mismatches=%llu\n"
            "out_canary_prefix_mismatches=%llu\n"
            "out_canary_suffix_mismatches=%llu\n"
            "low_finite=%llu\nlow_nonzero=%llu\n"
            "output_finite=%llu\noutput_nonzero=%llu\n"
-           "low_fnv1a64=%016llx\noutput_fnv1a64=%016llx\n",
+           "low_fnv1a64=%016llx\noutput_fnv1a64=%016llx\n"
+           "low_repeat_bit_mismatches=%llu\n"
+           "output_repeat_bit_mismatches=%llu\n",
            (unsigned long long)low_prefix_mismatches,
            (unsigned long long)low_suffix_mismatches,
            (unsigned long long)out_prefix_mismatches,
@@ -680,16 +736,21 @@ static int run_output_ab_native_single_launch(
            (unsigned long long)out_finite,
            (unsigned long long)out_nonzero,
            (unsigned long long)low_hash,
-           (unsigned long long)out_hash);
+           (unsigned long long)out_hash,
+           (unsigned long long)low_repeat_bit_mismatches,
+           (unsigned long long)out_repeat_bit_mismatches);
     if (low_prefix_mismatches || low_suffix_mismatches ||
         out_prefix_mismatches || out_suffix_mismatches ||
         low_finite != low_count || low_nonzero == 0u ||
-        out_finite != out_count || out_nonzero == 0u) {
+        out_finite != out_count || out_nonzero == 0u ||
+        low_repeat_bit_mismatches || out_repeat_bit_mismatches) {
         fprintf(stderr, "error: output A-to-B probe validation failed\n");
         goto cleanup;
     }
-    printf("diagnostic_conclusion=native-stream-output-ab-single-call-clean\n"
-           "harness_status=ok\n");
+    printf("diagnostic_conclusion=%s\n"
+           "harness_status=ok\n",
+           stress_calls > 1u ? "native-stream-output-ab-repeat-clean" :
+                               "native-stream-output-ab-single-call-clean");
     status = 1;
 
 cleanup:
@@ -700,6 +761,8 @@ cleanup:
     ds4_gpu_tensor_free(heads);
     free(guarded_out_host);
     free(guarded_low_host);
+    free(reference_out_host);
+    free(reference_low_host);
     free(heads_host);
     return status;
 }
@@ -715,10 +778,14 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_A_NATIVE") != NULL;
     const int output_ab_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE") != NULL;
+    const int output_ab_native_repeat_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE_REPEAT") != NULL;
+    const int output_ab_native_required =
+        output_ab_native_diagnostic || output_ab_native_repeat_diagnostic;
     const int output_a_native_required =
-        output_a_native_diagnostic || output_ab_native_diagnostic;
+        output_a_native_diagnostic || output_ab_native_required;
     const int output_b_native_required =
-        output_b_native_diagnostic || output_ab_native_diagnostic;
+        output_b_native_diagnostic || output_ab_native_required;
     const int output_b_diagnostic =
         output_b_canonical_diagnostic || output_b_native_diagnostic;
     const int projection_diagnostic =
@@ -779,6 +846,23 @@ int main(void) {
     ds4_gpu_tensor *low_ref0 = NULL, *low_ref1 = NULL;
     int initialized = 0;
     int status = 1;
+    const uint32_t output_ab_stress_calls =
+        output_ab_native_repeat_diagnostic
+            ? positive_env_u32(
+                  "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS",
+                  256u, 4096u)
+            : 1u;
+
+    if (output_ab_stress_calls == 0u ||
+        (output_ab_native_repeat_diagnostic &&
+         output_ab_stress_calls < 2u)) {
+        if (output_ab_stress_calls != 0u) {
+            fprintf(stderr,
+                    "error: repeated output A-to-B probe requires at least "
+                    "two stress calls\n");
+        }
+        goto cleanup;
+    }
 
     model = (unsigned char *)malloc((size_t)model_bytes);
     input_host = (float *)malloc((size_t)input_bytes);
@@ -853,7 +937,7 @@ int main(void) {
     (void)unsetenv("DS4_CUDA_ATTN_OUTPUT_B_F16_GEMM_ALGO_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
-    if (output_ab_native_diagnostic) {
+    if (output_ab_native_required) {
         (void)setenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT", "1", 1);
     } else {
         (void)unsetenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT");
@@ -984,11 +1068,12 @@ int main(void) {
         status = 0;
         goto cleanup;
     }
-    if (output_ab_native_diagnostic) {
+    if (output_ab_native_required) {
         if (!ds4_gpu_synchronize() ||
-            !run_output_ab_native_single_launch(
+            !run_output_ab_native_calls(
                 model, model_bytes,
-                native_out_a_offset, native_out_b_offset)) {
+                native_out_a_offset, native_out_b_offset,
+                output_ab_stress_calls)) {
             goto cleanup;
         }
         status = 0;
