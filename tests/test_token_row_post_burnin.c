@@ -30,6 +30,7 @@ static ds4_gpu_tensor test_out[2], test_low[2], test_heads[2];
 static const unsigned char test_model[16] = {0};
 static char trace[16];
 static unsigned trace_count, call_count, fail_call;
+static unsigned expected_calls;
 static int fail_sync;
 
 static void trace_op(char op) {
@@ -81,7 +82,7 @@ int ds4_gpu_attention_output_q8_batch_b_tensor(
 }
 
 int ds4_gpu_synchronize(void) {
-    assert(call_count == 2u);
+    assert(call_count == expected_calls);
     trace_op('S');
     return !fail_sync;
 }
@@ -92,6 +93,7 @@ static void run_case(const char *mode, const char *expected_trace,
     trace[0] = '\0';
     fail_call = failing_call;
     fail_sync = failing_sync;
+    expected_calls = strcmp(mode, "none") == 0 ? 0u : 2u;
     const int ok = launch_post_burnin_pair(
         mode, &test_out[0], &test_out[1], &test_low[0], &test_low[1],
         &test_heads[0], &test_heads[1], test_model, sizeof(test_model), 4u, 8u);
@@ -107,12 +109,14 @@ int main(void) {
     run_case("ab", "ABABS", 0u, 0, 1);
     run_case("a", "AAS", 0u, 0, 1);
     run_case("b", "BBS", 0u, 0, 1);
+    run_case("none", "S", 0u, 0, 1);
+    run_case("none", "S", 0u, 1, 0);
     run_case("bad", "", 0u, 0, 0);
     run_case("a", "A", 1u, 0, 0);
     run_case("a", "AA", 2u, 0, 0);
     run_case("b", "B", 1u, 0, 0);
     run_case("ab", "ABAB", 2u, 0, 0);
     run_case("a", "AAS", 0u, 1, 0);
-    puts("post-burn-in dispatch tests passed (9 cases; no CUDA runtime)");
+    puts("post-burn-in dispatch tests passed (11 cases; no CUDA runtime)");
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -263,7 +264,9 @@ static void select_b_algorithm(int algorithm) {
 
 /* Change only the two calls between the burn-in and the final B transition.
  * B-only consumes the same low_split views as B inside the complete helper;
- * those views still hold the synchronized, exact A reference from setup. */
+ * those views still hold the synchronized, exact A reference from setup.
+ * none retains this synchronization and the caller's two readbacks without
+ * entering either projection or touching their device scratch. */
 static int launch_post_burnin_pair(
         const char *mode, ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         ds4_gpu_tensor *low0, ds4_gpu_tensor *low1,
@@ -272,12 +275,13 @@ static int launch_post_burnin_pair(
         uint64_t out_a_offset, uint64_t out_b_offset) {
     const int a_only = strcmp(mode, "a") == 0;
     const int b_only = strcmp(mode, "b") == 0;
-    if (!a_only && !b_only && strcmp(mode, "ab") != 0) return 0;
+    const int no_projection = strcmp(mode, "none") == 0;
+    if (!a_only && !b_only && !no_projection && strcmp(mode, "ab") != 0) return 0;
     if (a_only && setenv(
             "DS4_CUDA_OUTPUT_A_CANONICAL_ONLY_LOCAL_DIAGNOSTIC",
             "1", 1) != 0) return 0;
     select_b_algorithm(103);
-    const int ok = b_only
+    const int ok = no_projection ? ds4_gpu_synchronize() : b_only
         ? (ds4_gpu_attention_output_q8_batch_b_tensor(
                out0, model, model_bytes, out_b_offset, LOW_DIM, OUT_DIM,
                low0, HALF_TOK) &&
@@ -1141,25 +1145,29 @@ int main(void) {
         "DS4_TOKEN_ROW_ARITHMETIC_POST_BURNIN_PAIR");
     if (!post_burnin_pair_env) post_burnin_pair_env = "ab";
     /* Keep the selected mode stable across later setenv/unsetenv calls. */
-    char post_burnin_pair[3];
+    char post_burnin_pair[5];
     if (strlen(post_burnin_pair_env) >= sizeof(post_burnin_pair)) {
-        fprintf(stderr, "error: POST_BURNIN_PAIR must be ab, a, or b\n");
+        fprintf(stderr, "error: POST_BURNIN_PAIR must be ab, a, b, or none\n");
         return 1;
     }
     strcpy(post_burnin_pair, post_burnin_pair_env);
     if ((strcmp(post_burnin_pair, "ab") != 0 &&
          strcmp(post_burnin_pair, "a") != 0 &&
-         strcmp(post_burnin_pair, "b") != 0) ||
+         strcmp(post_burnin_pair, "b") != 0 &&
+         strcmp(post_burnin_pair, "none") != 0) ||
         (!output_b_production103_generic_pair_diagnostic &&
          strcmp(post_burnin_pair, "ab") != 0)) {
         fprintf(stderr,
                 "error: POST_BURNIN_PAIR requires generic-pair scope "
-                "and must be ab, a, or b\n");
+                "and must be ab, a, b, or none\n");
         return 1;
     }
     const int post_burnin_a_only =
         output_b_production103_generic_pair_diagnostic &&
         strcmp(post_burnin_pair, "a") == 0;
+    const int post_burnin_none =
+        output_b_production103_generic_pair_diagnostic &&
+        strcmp(post_burnin_pair, "none") == 0;
     const int output_b_production103_pinned_half_diagnostic =
         getenv(
             "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_PINNED_HALF") !=
@@ -1663,9 +1671,12 @@ int main(void) {
     if (output_b_production103_generic_pair_diagnostic) {
         printf("post_burnin_pair=%s\npost_burnin_rows=256\n"
                "post_burnin_a_calls=%u\npost_burnin_b_calls=%u\n"
-               "post_burnin_fencing=one-sync-after-both-calls\n",
-               post_burnin_pair, strcmp(post_burnin_pair, "b") == 0 ? 0u : 2u,
-               post_burnin_a_only ? 0u : 2u);
+               "post_burnin_fencing=%s\n",
+               post_burnin_pair,
+               post_burnin_none || strcmp(post_burnin_pair, "b") == 0 ? 0u : 2u,
+               post_burnin_a_only || post_burnin_none ? 0u : 2u,
+               post_burnin_none ? "one-sync-with-no-projection-calls" :
+                   "one-sync-after-both-calls");
         fflush(stdout);
     }
 
@@ -2155,7 +2166,9 @@ int main(void) {
     /* Exercise the two post-burn-in calls.  The generic-pair scope keeps
      * the same tensor views, row extent, and one synchronization after both
      * calls.  Its default ab mode uses the ordinary A+B helper; a and b
-     * remove only the other projection at this position in the replay. */
+     * remove only the other projection at this position in the replay.
+     * none removes both projections but retains synchronization and both
+     * readbacks below, unlike the historical no-row-owned skip branch. */
     diff_metrics row_owned_low_diff = {0u, UINT64_MAX, 0.0, 0.0};
     diff_metrics row_owned_output_diff = {0u, UINT64_MAX, 0.0, 0.0};
     if (!output_b_production103_no_row_owned_diagnostic) {
@@ -2183,7 +2196,9 @@ int main(void) {
         }
         row_owned_low_diff = compare_f32(
             actual_low_host, candidate, low_count);
-        report_diff(output_b_production103_generic_pair_diagnostic &&
+        report_diff(post_burnin_none ?
+                    "post-burnin-no-projection-low-input-preserved" :
+                    output_b_production103_generic_pair_diagnostic &&
                     strcmp(post_burnin_pair, "b") == 0 ?
                     "post-burnin-b-only-low-input-preserved" :
                     post_burnin_a_only ?
@@ -2196,7 +2211,13 @@ int main(void) {
             fprintf(stderr, "error: post-burn-in output readback failed\n");
             goto cleanup;
         }
-        if (!post_burnin_a_only) {
+        if (output_b_production103_generic_pair_diagnostic) {
+            printf("post_burnin_readbacks=2\n"
+                   "post_burnin_readback_low_bytes=%" PRIu64 "\n"
+                   "post_burnin_readback_output_bytes=%" PRIu64 "\n",
+                   low_bytes, out_bytes);
+        }
+        if (!post_burnin_a_only && !post_burnin_none) {
             row_owned_output_diff = compare_f32(
                 shipping_b_host, candidate, out_count);
             report_diff(

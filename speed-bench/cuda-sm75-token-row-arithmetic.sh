@@ -44,11 +44,12 @@ target=tests/cuda_sm75_token_row_arithmetic
     die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-production103-replay, output-b-production103-pinned-half, output-b-production103-no-row-owned, output-b-production103-generic-pair, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
-[[ $POST_BURNIN_PAIR == ab || $POST_BURNIN_PAIR == a || $POST_BURNIN_PAIR == b ]] ||
-    die "POST_BURNIN_PAIR must be ab, a, or b"
+[[ $POST_BURNIN_PAIR == ab || $POST_BURNIN_PAIR == a ||
+   $POST_BURNIN_PAIR == b || $POST_BURNIN_PAIR == none ]] ||
+    die "POST_BURNIN_PAIR must be ab, a, b, or none"
 [[ $DIAGNOSTIC_SCOPE == output-b-production103-generic-pair ||
    $POST_BURNIN_PAIR == ab ]] ||
-    die "POST_BURNIN_PAIR=a or b requires output-b-production103-generic-pair scope"
+    die "POST_BURNIN_PAIR=a, b, or none requires output-b-production103-generic-pair scope"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
     die "OUTPUT_AB_REPEAT_CALLS must be a positive integer"
 (( OUTPUT_AB_REPEAT_CALLS <= 4096 )) ||
@@ -433,20 +434,30 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
             die "production-103 replay ran the wrong post-burn-in component"
         grep -Fxq 'post_burnin_rows=256' "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 replay changed post-burn-in row extent"
-        grep -Fxq 'post_burnin_fencing=one-sync-after-both-calls' \
+        expected_fencing=one-sync-after-both-calls
+        [[ $POST_BURNIN_PAIR != none ]] || expected_fencing=one-sync-with-no-projection-calls
+        grep -Fxq "post_burnin_fencing=$expected_fencing" \
             "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 replay changed post-burn-in fencing"
         expected_a_calls=2
         expected_b_calls=2
         [[ $POST_BURNIN_PAIR != a ]] || expected_b_calls=0
         [[ $POST_BURNIN_PAIR != b ]] || expected_a_calls=0
+        if [[ $POST_BURNIN_PAIR == none ]]; then
+            expected_a_calls=0
+            expected_b_calls=0
+        fi
         grep -Fxq "post_burnin_a_calls=$expected_a_calls" "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 replay changed post-burn-in A calls"
         grep -Fxq "post_burnin_b_calls=$expected_b_calls" "$OUTPUT_DIR/diagnostic.log" ||
             die "production-103 replay changed post-burn-in B calls"
-        if [[ $POST_BURNIN_PAIR == a ]]; then
+        for readback in readbacks=2 readback_low_bytes=16777216 readback_output_bytes=8388608; do
+            grep -Fxq "post_burnin_$readback" "$OUTPUT_DIR/diagnostic.log" ||
+                die "production-103 replay did not preserve both readbacks: $readback"
+        done
+        if [[ $POST_BURNIN_PAIR == a || $POST_BURNIN_PAIR == none ]]; then
             grep -Fxq 'post_burnin_output_b=not-executed' "$OUTPUT_DIR/diagnostic.log" ||
-                die "production-103 A-only pair unexpectedly entered B"
+                die "production-103 selected pair unexpectedly entered B"
         fi
         grep -Fxq "post_burnin_pair_conclusion=$POST_BURNIN_PAIR-transition-clean" \
             "$OUTPUT_DIR/diagnostic.log" ||

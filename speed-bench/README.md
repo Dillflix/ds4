@@ -6229,9 +6229,9 @@ intentionally compared algorithm-103 N=256 output with a later DEFAULT N=256
 reference, which is not the asserted shipping equivalence.  The gate now
 requires the exact algorithm-103 split result and the final structured
 transition while treating that cross-algorithm comparison as informational.
-This result makes the intervening row-owned pair necessary for the reproduced
-failure, but does not yet establish whether its arithmetic or its dedicated
-entry point is responsible.
+This run removed the intervening row-owned pair together with its explicit
+synchronization and two readbacks.  It therefore does not isolate arithmetic
+from synchronization or host-transfer activity at that position.
 
 `DIAGNOSTIC_SCOPE=output-b-production103-generic-pair` restores the two
 post-burn-in N=256 A+B calls, their tensors, order, algorithm 103 B selection,
@@ -6264,11 +6264,41 @@ The A-only arm verifies A output and explicitly marks B unexecuted; the B-only
 arm verifies preserved A input and B output.  Neither changes production
 defaults.  Only one selected mode runs per invocation.
 
-Start with `POST_BURNIN_PAIR=a` after rebooting the failed host.  If it
-reproduces the failure, A's pack/GEMM/unpack state is enough to trigger the
-later B transition in this sequence.  If it passes, the B-only counterpart
-tests whether B on the low_split views is enough; if both pass, investigate
-the combined A-to-B sequence.  Keep GPU1 as the only visible CUDA device.
+The A-only (16:38) and B-only (16:49) archives both reproduced GPU1 loss at
+the first final algorithm-103 N=256 transition, after exact post-burn-in
+outputs and a completed DEFAULT N=512 call.  Neither A nor B is individually
+required at the post-burn-in position to reproduce the loss.  All failing
+variants retain an explicit synchronization plus 16 MiB low and 8 MiB output
+readbacks, which the healthy no-row-owned skip variant omitted.  The user
+confirmed that `nvbandwidth` named in the B-only archive's subsequent GPU0
+timeout was started only after GPU1 failed; it is not evidence of a
+concurrent workload initiating that GPU1 failure.
+
+`POST_BURNIN_PAIR=none` fills this comparison gap.  It executes zero A or B
+calls at the post-burn-in position, but keeps one synchronization, both
+readbacks into the same host buffer, the low-value check, the structured-input
+reset, and the DEFAULT-512 / algorithm-103-256 transitions.  It does not
+reallocate or overwrite projection scratch at that position.  The output
+readback is retained but is not compared as a newly computed B result.
+Earlier A/B setup and the 1,024-call B burn-in remain unchanged: this is
+not a globally compute-free run.  Completed-readback byte counters and
+zero-call assertions are required by the wrapper.  Production code and
+defaults are unchanged.
+
+Run only this selected variant after rebooting the failed host, with GPU1
+as the only visible CUDA device.  A failure would show that the post-burn-in
+projection calls themselves are unnecessary in this sequence, not prove
+which readback, synchronization, driver state, or hardware behavior caused
+it.  A pass would warrant comparing the omitted compute and associated
+memory activity; it would not by itself establish a root cause.
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-production103-generic-pair POST_BURNIN_PAIR=none \
+OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
 
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
