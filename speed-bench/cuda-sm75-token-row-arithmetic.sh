@@ -27,10 +27,11 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == output-a-native ||
    $DIAGNOSTIC_SCOPE == output-ab-native ||
    $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
+   $DIAGNOSTIC_SCOPE == projection-chain-native ||
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, output-b-canonical, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, output-b-canonical, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
@@ -139,6 +140,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE_REPEAT=1
         DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS="$OUTPUT_AB_REPEAT_CALLS")
 fi
+if [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE=1)
+fi
 
 capture_gpu_health() {
     local output=$1
@@ -241,7 +245,8 @@ if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
         die "native output-A probe damaged its suffix canary"
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
-      $DIAGNOSTIC_SCOPE == output-ab-native-repeat ]]; then
+      $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
+      $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
     expected_scope=output-ab-native-single-call
     expected_calls=1
     expected_reference_calls=0
@@ -253,6 +258,9 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
         expected_reference_calls=1
         expected_stress_calls=$OUTPUT_AB_REPEAT_CALLS
         expected_conclusion=native-stream-output-ab-repeat-clean
+    elif [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
+        expected_scope=projection-chain-native
+        expected_conclusion=native-stream-projection-chain-clean
     fi
     grep -Fq "diagnostic_scope=$expected_scope" \
         "$OUTPUT_DIR/diagnostic.log" ||
@@ -260,6 +268,18 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native ||
     grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=1' \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe did not exercise the borrowed-view rebase"
+    if [[ $DIAGNOSTIC_SCOPE == projection-chain-native ]]; then
+        grep -Fq 'ds4: rebased borrowed native-Q8 cache views device=0 count=2' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "native projection chain missed its second borrowed-view rebase"
+        grep -Fq 'q_b_launches=1' "$OUTPUT_DIR/diagnostic.log" ||
+            die "native projection chain reported the wrong Q_B call count"
+        grep -Fq 'q_b_to_a_sync=0' "$OUTPUT_DIR/diagnostic.log" ||
+            die "native projection chain unexpectedly fenced Q_B-to-A"
+        grep -Fq 'ds4: token-row native-stream dispatch stage=attn_q_b' \
+            "$OUTPUT_DIR/diagnostic.log" ||
+            die "native projection chain missed Q_B native-stream dispatch"
+    fi
     grep -Fq "reference_calls=$expected_reference_calls" \
         "$OUTPUT_DIR/diagnostic.log" ||
         die "native A-to-B probe reported the wrong reference-call count"
@@ -328,6 +348,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

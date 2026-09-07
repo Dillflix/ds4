@@ -3604,6 +3604,9 @@ static bool cuda_token_rows_native_stream_local_checkpoint(
         const char *stage, int physical_device) {
     if (g_n_gpus != 1 ||
         !cuda_token_rows_native_stream_local_diagnostic()) return true;
+    const char *disabled = getenv(
+        "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT");
+    if (disabled && disabled[0] && strcmp(disabled, "0") != 0) return true;
     const cudaError_t err = cudaDeviceSynchronize();
     fprintf(stderr,
             "ds4: local native-stream checkpoint stage=%s device=%d "

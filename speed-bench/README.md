@@ -6175,6 +6175,13 @@ outputs, and the final low-rank and projected tensors must be bit-identical to
 the reference.  This exercises cumulative native expansion, shared-workspace
 reuse, and cuBLAS handoff behavior on one physical GPU without peer access.
 
+`DIAGNOSTIC_SCOPE=projection-chain-native` installs tagged native Q_B, output
+A, and output B together, requiring the one-view and two-view rebase events as
+the ordinary residency slab grows.  It then launches one 256-token Q_B → A → B
+chain through the shared bounded native-stream arena with no Q_B-to-A or A-to-B
+diagnostic fence.  The scope remains single-GPU and has no peer mappings; it is
+the final local lifetime/order gate before adding a second CUDA context.
+
 This diagnostic follows the first stable-pair production gate.  That run
 completed without a device loss and measured 465.03 versus 493.82 prefill
 tok/s (1.06191x), while honoring the 1 MiB q-input plus 4 MiB final-output
@@ -6243,6 +6250,14 @@ inter-call fences:
 PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=output-ab-native-repeat \
 OUTPUT_AB_REPEAT_CALLS=256 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 \
 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After the repeated A+B chain is clean, add Q_B while remaining local-only:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 DIAGNOSTIC_SCOPE=projection-chain-native \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```
 

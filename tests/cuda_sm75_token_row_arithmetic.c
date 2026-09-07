@@ -543,8 +543,8 @@ cleanup:
 
 static int run_output_ab_native_calls(
         const unsigned char *model, uint64_t model_bytes,
-        uint64_t out_a_offset, uint64_t out_b_offset,
-        uint32_t stress_calls) {
+        uint64_t q_b_offset, uint64_t out_a_offset, uint64_t out_b_offset,
+        uint32_t stress_calls, int q_b_chain) {
     const uint64_t heads_count =
         (uint64_t)HALF_TOK * N_GROUP * GROUP_DIM;
     const uint64_t heads_bytes = heads_count * sizeof(float);
@@ -559,11 +559,13 @@ static int run_output_ab_native_calls(
         PROJECTION_PROBE_GUARD_BYTES + out_bytes +
         PROJECTION_PROBE_GUARD_BYTES;
     float *heads_host = NULL;
+    float *input_host = NULL;
     unsigned char *guarded_low_host = NULL;
     unsigned char *guarded_out_host = NULL;
     unsigned char *reference_low_host = NULL;
     unsigned char *reference_out_host = NULL;
     ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *input = NULL;
     ds4_gpu_tensor *guarded_low = NULL;
     ds4_gpu_tensor *guarded_out = NULL;
     ds4_gpu_tensor *low = NULL;
@@ -571,13 +573,18 @@ static int run_output_ab_native_calls(
     int status = 0;
 
     heads_host = (float *)malloc((size_t)heads_bytes);
+    if (q_b_chain) {
+        input_host = (float *)malloc(
+            (size_t)((uint64_t)HALF_TOK * IN_DIM * sizeof(float)));
+    }
     guarded_low_host = (unsigned char *)malloc((size_t)guarded_low_bytes);
     guarded_out_host = (unsigned char *)malloc((size_t)guarded_out_bytes);
     if (stress_calls > 1u) {
         reference_low_host = (unsigned char *)malloc((size_t)low_bytes);
         reference_out_host = (unsigned char *)malloc((size_t)out_bytes);
     }
-    if (!heads_host || !guarded_low_host || !guarded_out_host ||
+    if (!heads_host || (q_b_chain && !input_host) ||
+        !guarded_low_host || !guarded_out_host ||
         (stress_calls > 1u &&
          (!reference_low_host || !reference_out_host))) {
         fprintf(stderr, "error: output A-to-B probe host allocation failed\n");
@@ -588,18 +595,35 @@ static int run_output_ab_native_calls(
             (int)((i * 47u + (i >> 7u) * 19u + 73u) % 521u) - 260;
         heads_host[i] = (float)value / 4096.0f;
     }
+    if (q_b_chain) {
+        for (uint64_t i = 0u; i < (uint64_t)HALF_TOK * IN_DIM; i++) {
+            const int value = (int)((i * 29u + (i >> 5u) * 17u +
+                (i / IN_DIM) * 7u + 23u) % 257u) - 128;
+            input_host[i] = (float)value / 128.0f;
+        }
+    }
     memset(guarded_low_host, 0xa5, (size_t)guarded_low_bytes);
     memset(guarded_out_host, 0x5a, (size_t)guarded_out_bytes);
 
     heads = ds4_gpu_tensor_alloc(heads_bytes);
+    input = q_b_chain
+        ? ds4_gpu_tensor_alloc(
+              (uint64_t)HALF_TOK * IN_DIM * sizeof(float))
+        : NULL;
     guarded_low = ds4_gpu_tensor_alloc(guarded_low_bytes);
     guarded_out = ds4_gpu_tensor_alloc(guarded_out_bytes);
     low = guarded_low ? ds4_gpu_tensor_view(
         guarded_low, PROJECTION_PROBE_GUARD_BYTES, low_bytes) : NULL;
     out = guarded_out ? ds4_gpu_tensor_view(
         guarded_out, PROJECTION_PROBE_GUARD_BYTES, out_bytes) : NULL;
-    if (!heads || !guarded_low || !guarded_out || !low || !out ||
-        !ds4_gpu_tensor_write(heads, 0u, heads_host, heads_bytes) ||
+    if (!heads || (q_b_chain && !input) || !guarded_low || !guarded_out ||
+        !low || !out ||
+        (!q_b_chain &&
+         !ds4_gpu_tensor_write(heads, 0u, heads_host, heads_bytes)) ||
+        (q_b_chain &&
+         !ds4_gpu_tensor_write(
+             input, 0u, input_host,
+             (uint64_t)HALF_TOK * IN_DIM * sizeof(float))) ||
         !ds4_gpu_tensor_write(
             guarded_low, 0u, guarded_low_host, guarded_low_bytes) ||
         !ds4_gpu_tensor_write(
@@ -616,6 +640,7 @@ static int run_output_ab_native_calls(
            "output_a_launches=%u\noutput_b_launches=%u\npeer_access=none\n"
            "native_stream=on\nproduction_order=unfenced-a-to-b\n"
            "handoff_sync_before_b=0\n",
+           q_b_chain ? "projection-chain-native" :
            stress_calls > 1u ? "output-ab-native-repeat" :
                                "output-ab-native-single-call",
            HALF_TOK, N_GROUP, GROUP_DIM, RANK,
@@ -625,6 +650,17 @@ static int run_output_ab_native_calls(
            stress_calls + (stress_calls > 1u ? 1u : 0u),
            stress_calls + (stress_calls > 1u ? 1u : 0u));
     fflush(stdout);
+
+    if (q_b_chain) {
+        printf("q_b_launches=1\nq_b_to_a_sync=0\n");
+        fflush(stdout);
+        if (!launch_q_b(heads, NULL, model, model_bytes, q_b_offset,
+                        input, HALF_TOK, POS0)) {
+            fprintf(stderr,
+                    "error: native-stream local Q_B-to-A launch failed\n");
+            goto cleanup;
+        }
+    }
 
     if (stress_calls > 1u) {
         if (!ds4_gpu_attention_output_q8_batch_row_owned_sm75_tensor(
@@ -749,6 +785,7 @@ static int run_output_ab_native_calls(
     }
     printf("diagnostic_conclusion=%s\n"
            "harness_status=ok\n",
+           q_b_chain ? "native-stream-projection-chain-clean" :
            stress_calls > 1u ? "native-stream-output-ab-repeat-clean" :
                                "native-stream-output-ab-single-call-clean");
     status = 1;
@@ -758,11 +795,13 @@ cleanup:
     ds4_gpu_tensor_free(low);
     ds4_gpu_tensor_free(guarded_out);
     ds4_gpu_tensor_free(guarded_low);
+    ds4_gpu_tensor_free(input);
     ds4_gpu_tensor_free(heads);
     free(guarded_out_host);
     free(guarded_low_host);
     free(reference_out_host);
     free(reference_low_host);
+    free(input_host);
     free(heads_host);
     return status;
 }
@@ -780,8 +819,13 @@ int main(void) {
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE") != NULL;
     const int output_ab_native_repeat_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_NATIVE_REPEAT") != NULL;
+    const int projection_chain_native_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_PROJECTION_CHAIN_NATIVE") != NULL;
     const int output_ab_native_required =
-        output_ab_native_diagnostic || output_ab_native_repeat_diagnostic;
+        output_ab_native_diagnostic || output_ab_native_repeat_diagnostic ||
+        projection_chain_native_diagnostic;
+    const int native_q_b_required =
+        native_q_b_diagnostic || projection_chain_native_diagnostic;
     const int output_a_native_required =
         output_a_native_diagnostic || output_ab_native_required;
     const int output_b_native_required =
@@ -799,7 +843,7 @@ int main(void) {
     const uint64_t out_b_bytes = OUT_DIM * (LOW_DIM / 32u) * 34u;
     const uint64_t native_q_b_offset = out_b_offset + out_b_bytes;
     const uint64_t native_out_a_offset = native_q_b_offset +
-        (native_q_b_diagnostic ? q_b_bytes : 0u);
+        (native_q_b_required ? q_b_bytes : 0u);
     const uint64_t native_out_b_offset = native_out_a_offset +
         (output_a_native_required ? out_a_bytes : 0u);
     const uint64_t model_bytes = native_out_b_offset +
@@ -885,7 +929,7 @@ int main(void) {
     shipping_b_host = reference + 2u * low_count + out_count;
 
     build_q8_rows(model, Q_DIM, IN_DIM, 17u);
-    if (native_q_b_diagnostic) {
+    if (native_q_b_required) {
         pack_q8_rows_warp32(
             model + native_q_b_offset, model, Q_DIM, IN_DIM);
     }
@@ -942,12 +986,19 @@ int main(void) {
     } else {
         (void)unsetenv("DS4_CUDA_Q8_NATIVE_REBASE_AUDIT");
     }
-    if (native_q_b_diagnostic) {
+    if (native_q_b_required) {
         (void)setenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC", "1", 1);
     } else {
         (void)unsetenv(
             "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
+    }
+    if (projection_chain_native_diagnostic) {
+        (void)setenv(
+            "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT", "1", 1);
+    } else {
+        (void)unsetenv(
+            "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT");
     }
     if (output_b_diagnostic || output_ab_native_diagnostic) {
         (void)setenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC", "1", 1);
@@ -982,7 +1033,7 @@ int main(void) {
         fprintf(stderr, "error: model/cache installation failed\n");
         goto cleanup;
     }
-    if (native_q_b_diagnostic) {
+    if (native_q_b_required) {
         const ds4_tensor_range native_source = {
             native_q_b_offset, q_b_bytes, 0};
         const ds4_q8_native_range native_range = {
@@ -1072,8 +1123,9 @@ int main(void) {
         if (!ds4_gpu_synchronize() ||
             !run_output_ab_native_calls(
                 model, model_bytes,
-                native_out_a_offset, native_out_b_offset,
-                output_ab_stress_calls)) {
+                native_q_b_offset, native_out_a_offset, native_out_b_offset,
+                output_ab_stress_calls,
+                projection_chain_native_diagnostic)) {
             goto cleanup;
         }
         status = 0;
@@ -1619,6 +1671,8 @@ cleanup:
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_WEIGHT_MODE");
     (void)unsetenv("DS4_CUDA_TP_PREFILL_ATTN_TOKEN_ROWS_PIPELINE_PAIRS");
     (void)unsetenv("DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_DIAGNOSTIC");
+    (void)unsetenv(
+        "DS4_CUDA_TOKEN_ROWS_NATIVE_STREAM_LOCAL_NO_CHECKPOINT");
     (void)unsetenv("DS4_CUDA_OUTPUT_A_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_OUTPUT_A_ONLY_LOCAL_DIAGNOSTIC");
     (void)unsetenv("DS4_CUDA_OUTPUT_B_LOCAL_DIAGNOSTIC");
