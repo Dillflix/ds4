@@ -6170,6 +6170,22 @@ burn-in remain disabled, so a clean result isolates the missing causal factor
 to accumulated algorithm/timing history rather than incorrectly clearing the
 older local GPU1 failure.
 
+`DIAGNOSTIC_SCOPE=output-b-production103-replay` is the next local GPU1 rung.
+It deliberately does not replay the old diagnostic's mixed cuBLAS algorithm
+sweep: production row-owned output B uses selector 103,
+`CUBLAS_GEMM_ALGO3_TENSOR_OP`, while selectors 104--106 were only additional
+exact candidates timed by that diagnostic.  This scope preserves the same
+201,326,592-byte canonical FP16 cache, 389,283,840-byte working set,
+Q_B/attention/output-A preparation, and historical suffix.  Before the suffix
+it executes 1,024 production-103 N=256 output-B calls by default, synchronized
+in batches of 10, which exceeds the old failing workload's total B launch
+count without introducing peer access, native dequantization, or a
+non-production algorithm.  `OUTPUT_B_PRODUCTION103_CALLS` and
+`OUTPUT_B_PRODUCTION103_BATCH` may adjust those bounded counts.  A clean result
+would clear production algorithm 103's local cumulative launch history and
+leave the mixed legacy sweep as a separate forensic suspect, not a production
+prerequisite.
+
 `DIAGNOSTIC_SCOPE=output-b-native` keeps that identical one-launch shape and
 guarded output but replaces the canonical FP16 binding with one ordinary local
 `B_KSHARDS_WARP32` source.  It uses the production group-int8x4 expansion into
@@ -6277,6 +6293,18 @@ submission suffix while still keeping the test local to physical GPU1:
 ```bash
 PROFILE_GPU=1 CUDA_ARCH=sm_75 \
 DIAGNOSTIC_SCOPE=output-b-canonical-suffix-replay \
+CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
+bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
+```
+
+After the working-set suffix replay passes, stress only the algorithm and row
+extent actually used by the production candidate before considering the old
+mixed-algorithm diagnostic history:
+
+```bash
+PROFILE_GPU=1 CUDA_ARCH=sm_75 \
+DIAGNOSTIC_SCOPE=output-b-production103-replay \
+OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
 CASE_TIMEOUT_SECONDS=600 RUN_SANITIZER=0 SKIP_BUILD=0 CREATE_ARCHIVE=1 \
 bash ./speed-bench/cuda-sm75-token-row-arithmetic.sh
 ```

@@ -17,6 +17,8 @@ OUTPUT_AB_REPEAT_CALLS=${OUTPUT_AB_REPEAT_CALLS:-256}
 B_TIMING_ROUNDS=${B_TIMING_ROUNDS:-7}
 B_TIMING_REPEATS=${B_TIMING_REPEATS:-10}
 B_TIMING_WARMUPS=${B_TIMING_WARMUPS:-3}
+OUTPUT_B_PRODUCTION103_CALLS=${OUTPUT_B_PRODUCTION103_CALLS:-1024}
+OUTPUT_B_PRODUCTION103_BATCH=${OUTPUT_B_PRODUCTION103_BATCH:-10}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT_DIR=${TOKEN_ROW_ARITHMETIC_DIR:-$repo_dir/sm75-token-row-arithmetic-$stamp}
 target=tests/cuda_sm75_token_row_arithmetic
@@ -32,9 +34,10 @@ target=tests/cuda_sm75_token_row_arithmetic
    $DIAGNOSTIC_SCOPE == output-b-canonical ||
    $DIAGNOSTIC_SCOPE == output-b-canonical-replay ||
    $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ||
+   $DIAGNOSTIC_SCOPE == output-b-production103-replay ||
    $DIAGNOSTIC_SCOPE == output-b-native ||
    $DIAGNOSTIC_SCOPE == full ]] ||
-    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-native, or full"
+    die "DIAGNOSTIC_SCOPE must be q-b, q-b-native, output-a-native, output-ab-native, output-ab-native-repeat, projection-chain-native, projection-chain-native-repeat, output-b-canonical, output-b-canonical-replay, output-b-canonical-suffix-replay, output-b-production103-replay, output-b-native, or full"
 [[ $CASE_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] ||
     die "CASE_TIMEOUT_SECONDS must be a positive integer"
 [[ $OUTPUT_AB_REPEAT_CALLS =~ ^[1-9][0-9]*$ ]] ||
@@ -54,6 +57,16 @@ for value_name in B_TIMING_ROUNDS B_TIMING_REPEATS B_TIMING_WARMUPS; do
     value=${!value_name}
     [[ $value =~ ^[1-9][0-9]*$ ]] || die "$value_name must be a positive integer"
 done
+for value_name in OUTPUT_B_PRODUCTION103_CALLS OUTPUT_B_PRODUCTION103_BATCH; do
+    value=${!value_name}
+    [[ $value =~ ^[1-9][0-9]*$ ]] || die "$value_name must be a positive integer"
+done
+(( OUTPUT_B_PRODUCTION103_CALLS <= 16384 )) ||
+    die "OUTPUT_B_PRODUCTION103_CALLS must not exceed 16384"
+(( OUTPUT_B_PRODUCTION103_BATCH <= 1024 )) ||
+    die "OUTPUT_B_PRODUCTION103_BATCH must not exceed 1024"
+(( OUTPUT_B_PRODUCTION103_BATCH <= OUTPUT_B_PRODUCTION103_CALLS )) ||
+    die "OUTPUT_B_PRODUCTION103_BATCH must not exceed OUTPUT_B_PRODUCTION103_CALLS"
 for tool in cat date env git grep journalctl make mkdir nproc nvidia-smi sudo tail tar timeout; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -102,9 +115,10 @@ phase=manifest
         "$(git branch --show-current)"
     nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total,power.limit \
         --format=csv
-    printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\noutput_ab_repeat_calls=%s\n' \
+    printf 'profile_gpu=%s\ndiagnostic_scope=%s\ncase_timeout_seconds=%s\noutput_ab_repeat_calls=%s\noutput_b_production103_calls=%s\noutput_b_production103_batch=%s\n' \
         "$PROFILE_GPU" "$DIAGNOSTIC_SCOPE" "$CASE_TIMEOUT_SECONDS" \
-        "$OUTPUT_AB_REPEAT_CALLS"
+        "$OUTPUT_AB_REPEAT_CALLS" "$OUTPUT_B_PRODUCTION103_CALLS" \
+        "$OUTPUT_B_PRODUCTION103_BATCH"
 } >"$OUTPUT_DIR/manifest.txt"
 git status --short >"$OUTPUT_DIR/provenance/git-status.txt"
 git diff --stat >"$OUTPUT_DIR/provenance/git-diff-stat.txt"
@@ -136,6 +150,11 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-replay ]]; then
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_SUFFIX_REPLAY=1)
+fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ]]; then
+    clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_REPLAY=1
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS="$OUTPUT_B_PRODUCTION103_CALLS"
+        DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH="$OUTPUT_B_PRODUCTION103_BATCH")
 fi
 if [[ $DIAGNOSTIC_SCOPE == output-b-native ]]; then
     clean_env+=(DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE=1)
@@ -303,6 +322,55 @@ if [[ $DIAGNOSTIC_SCOPE == output-b-canonical-suffix-replay ]]; then
         "$OUTPUT_DIR/diagnostic.log" ||
         die "canonical output-B suffix replay omitted its clean conclusion"
 fi
+if [[ $DIAGNOSTIC_SCOPE == output-b-production103-replay ]]; then
+    grep -Fq 'diagnostic_scope=output-b-production103-replay' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted its scope marker"
+    grep -Fq 'fidelity=working-set-production-algorithm-and-suffix-replay' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted its fidelity marker"
+    grep -Fq 'resident_f16_cache_bytes=201326592' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay did not preserve the FP16 cache"
+    grep -Fq 'device_working_set_bytes=389283840' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay used the wrong working set"
+    grep -Fq 'peer_access=none' "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay unexpectedly enabled peer access"
+    grep -Fq 'production_b_algorithm=103' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay used the wrong algorithm"
+    grep -Fq 'production_b_algorithm_name=CUBLAS_GEMM_ALGO3_TENSOR_OP' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted the production algorithm name"
+    grep -Fq "production_b_burnin_calls=$OUTPUT_B_PRODUCTION103_CALLS" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay used the wrong call count"
+    grep -Fq "production_b_burnin_batch=$OUTPUT_B_PRODUCTION103_BATCH" \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay used the wrong batch size"
+    grep -Fq 'exhaustive_algorithm_sweep=off' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay entered the non-production sweep"
+    grep -Fq 'historical_mixed_algorithm_timing=off' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay entered mixed-algorithm timing"
+    grep -Fq 'production103_replay_conclusion=burnin-clean' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted its burn-in conclusion"
+    grep -Fq 'boundary=output-b-production103-burnin-vs-shipping-half0,type=f32,values=1048576,status=exact' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B burn-in changed the shipping result"
+    grep -Fq 'suffix_replay_phase=production-row-owned-pair-complete' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay missed the row-owned suffix"
+    grep -Fq 'suffix_replay_phase=default-full-split-group-complete' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay missed the DEFAULT suffix"
+    grep -Fq 'suffix_replay_conclusion=working-set-production103-burnin-and-suffix-clean' \
+        "$OUTPUT_DIR/diagnostic.log" ||
+        die "production-103 output-B replay omitted its clean suffix conclusion"
+fi
 if [[ $DIAGNOSTIC_SCOPE == output-a-native ]]; then
     grep -Fq 'diagnostic_scope=output-a-native-single-launch' \
         "$OUTPUT_DIR/diagnostic.log" ||
@@ -436,6 +504,6 @@ if (( RUN_SANITIZER )); then
 fi
 
 phase=summary
-grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|exhaustive_algorithm_sweep=|historical_timing_burn_in=|suffix_submission_fencing=|suffix_replay_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
+grep -E '^(ds4: rebased borrowed native-Q8 cache views|ds4: local native-stream checkpoint|ds4: local output-A checkpoint|ds4: local output-B checkpoint|boundary=|b_algorithm=|first_shipping_exact_b_algorithm=|b_algorithm_conclusion=|b_timing|fastest_shipping_exact_b_|diagnostic_scope=|fidelity=|source_failure_archive=|resident_f16_cache_bytes=|device_working_set_bytes=|pre_suffix_|production_b_|production103_replay_phase=|production103_replay_conclusion=|exhaustive_algorithm_sweep=|historical_timing_burn_in=|historical_mixed_algorithm_timing=|suffix_submission_fencing=|suffix_replay_phase=|suffix_replay_conclusion=|n_tokens=|groups=|group_dim=|rank=|low_dim=|input_dim=|output_dim=|algorithm=|projection_launches=|q_b_launches=|q_b_to_a_sync=|reference_calls=|stress_calls=|attention_output_calls=|output_a_launches=|output_b_launches=|peer_access=|native_stream=|output_b=|production_order=|handoff_sync_before_b=|canary_|low_canary_|out_canary_|low_finite=|low_nonzero=|low_fnv1a64=|low_repeat_bit_mismatches=|output_finite=|output_nonzero=|output_fnv1a64=|output_repeat_bit_mismatches=|diagnostic_conclusion=|harness_status=)' \
     "$OUTPUT_DIR/diagnostic.log" >"$OUTPUT_DIR/summary.txt"
 printf 'SM75 token-row arithmetic diagnostic complete: %s\n' "$OUTPUT_DIR"

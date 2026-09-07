@@ -1091,6 +1091,12 @@ int main(void) {
     const int output_b_canonical_suffix_replay_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_CANONICAL_SUFFIX_REPLAY") !=
         NULL;
+    const int output_b_production103_replay_diagnostic =
+        getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_REPLAY") !=
+        NULL;
+    const int output_b_working_set_replay_diagnostic =
+        output_b_canonical_suffix_replay_diagnostic ||
+        output_b_production103_replay_diagnostic;
     const int output_b_native_diagnostic =
         getenv("DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_NATIVE") != NULL;
     const int output_a_native_diagnostic =
@@ -1184,7 +1190,26 @@ int main(void) {
                   "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_AB_REPEAT_CALLS",
                   256u, 4096u)
             : 1u;
+    const uint32_t output_b_production103_calls =
+        output_b_production103_replay_diagnostic ?
+            positive_env_u32(
+                "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS",
+                1024u, 16384u) : 1u;
+    const uint32_t output_b_production103_batch =
+        output_b_production103_replay_diagnostic ?
+            positive_env_u32(
+                "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH",
+                10u, 1024u) : 1u;
 
+    if (!output_b_production103_calls || !output_b_production103_batch ||
+        output_b_production103_batch > output_b_production103_calls) {
+        if (output_b_production103_calls &&
+            output_b_production103_batch > output_b_production103_calls) {
+            fprintf(stderr,
+                    "error: production-103 batch must not exceed call count\n");
+        }
+        goto cleanup;
+    }
     if (output_ab_stress_calls == 0u ||
         ((output_ab_native_repeat_diagnostic ||
           projection_chain_native_repeat_diagnostic) &&
@@ -1514,6 +1539,31 @@ int main(void) {
                    2u * q_half_bytes + 2u * heads_bytes + 2u * low_bytes +
                    2u * out_bytes + raw_count * sizeof(float) +
                    comp_count * sizeof(float)));
+    } else if (output_b_production103_replay_diagnostic) {
+        printf("diagnostic_scope=output-b-production103-replay\n"
+               "fidelity=working-set-production-algorithm-and-suffix-replay\n"
+               "source_failure_archive=sm75-token-row-arithmetic-20260906T213618Z\n"
+               "resident_f16_cache_bytes=%llu\n"
+               "device_working_set_bytes=%llu\n"
+               "peer_access=none\nnative_stream=off\n"
+               "pre_suffix_q_b_attention_output_a=on\n"
+               "production_b_algorithm=103\n"
+               "production_b_algorithm_name=CUBLAS_GEMM_ALGO3_TENSOR_OP\n"
+               "production_b_rows=256\n"
+               "production_b_burnin_calls=%u\n"
+               "production_b_burnin_batch=%u\n"
+               "exhaustive_algorithm_sweep=off\n"
+               "historical_mixed_algorithm_timing=off\n"
+               "suffix_submission_fencing=original-phase-boundaries\n",
+               (unsigned long long)(2u * (Q_DIM * IN_DIM +
+                   LOW_DIM * GROUP_DIM + OUT_DIM * LOW_DIM)),
+               (unsigned long long)(input_bytes + 2u * q_bytes +
+                   2u * q_half_bytes + 2u * heads_bytes + 2u * low_bytes +
+                   2u * out_bytes + raw_count * sizeof(float) +
+                   comp_count * sizeof(float)),
+               output_b_production103_calls,
+               output_b_production103_batch);
+        fflush(stdout);
     }
 
     /* q_b: identical rows and weights, only the cuBLAS N dimension and
@@ -1769,7 +1819,7 @@ int main(void) {
     report_diff("output-a-plus-b-row256x2-vs-synchronized-b-row256x2", "f32",
                 out_count, out_b_split_chain_diff);
 
-    if (!output_b_canonical_suffix_replay_diagnostic) {
+    if (!output_b_working_set_replay_diagnostic) {
         int exact_b_algorithm = -1;
         int exact_b_algorithms[sizeof(b_algorithms) / sizeof(b_algorithms[0])];
         size_t exact_b_algorithm_count = 0u;
@@ -1901,6 +1951,55 @@ int main(void) {
                fastest_exact_b_algorithm < 0 ? 0.0 :
                    shipping_full_ms / fastest_exact_b_half_ms);
     } else {
+        if (output_b_production103_replay_diagnostic) {
+            select_b_algorithm(103);
+            printf("production103_replay_phase=burnin,event=submit,"
+                   "calls=0,total=%u\n", output_b_production103_calls);
+            fflush(stdout);
+            for (uint32_t call = 0u;
+                 call < output_b_production103_calls; call++) {
+                if (!ds4_gpu_attention_output_q8_batch_b_tensor(
+                        out0, model, model_bytes, out_b_offset,
+                        LOW_DIM, OUT_DIM, low_ref0, HALF_TOK)) {
+                    fprintf(stderr,
+                            "error: production-103 output-B burn-in launch "
+                            "%u failed\n", call + 1u);
+                    goto cleanup;
+                }
+                const uint32_t completed = call + 1u;
+                if (completed % output_b_production103_batch == 0u ||
+                    completed == output_b_production103_calls) {
+                    if (!ds4_gpu_synchronize()) {
+                        fprintf(stderr,
+                                "error: production-103 output-B burn-in "
+                                "synchronize failed after %u calls\n",
+                                completed);
+                        goto cleanup;
+                    }
+                    printf("production103_replay_phase=burnin,event=complete,"
+                           "calls=%u,total=%u\n", completed,
+                           output_b_production103_calls);
+                    fflush(stdout);
+                }
+            }
+            if (!ds4_gpu_tensor_read(
+                    out0, 0u, candidate, out_row_half_bytes)) {
+                fprintf(stderr,
+                        "error: production-103 output-B burn-in readback failed\n");
+                goto cleanup;
+            }
+            const diff_metrics production103_diff = compare_f32(
+                shipping_b_host, candidate, out_count / 2u);
+            report_diff("output-b-production103-burnin-vs-shipping-half0",
+                        "f32", out_count / 2u, production103_diff);
+            if (production103_diff.mismatches) {
+                fprintf(stderr,
+                        "error: production-103 output-B burn-in diverged\n");
+                goto cleanup;
+            }
+            printf("production103_replay_conclusion=burnin-clean\n");
+            fflush(stdout);
+        }
         select_b_algorithm(-1);
         printf("suffix_replay_phase=preconditioning-complete\n"
                "suffix_replay_phase=production-row-owned-pair-submit\n");
@@ -1941,7 +2040,7 @@ int main(void) {
                 "error: dedicated row-owned output helper failed exactness\n");
         goto cleanup;
     }
-    if (output_b_canonical_suffix_replay_diagnostic) {
+    if (output_b_working_set_replay_diagnostic) {
         printf("suffix_replay_phase=production-row-owned-pair-complete\n"
                "suffix_replay_phase=default-full-split-group-submit\n");
         fflush(stdout);
@@ -1974,7 +2073,7 @@ int main(void) {
         reference, candidate, out_count);
     report_diff("output-b-structured-control-full512-vs-row256x2", "f32",
                 out_count, out_b_isolated_diff);
-    if (output_b_canonical_suffix_replay_diagnostic) {
+    if (output_b_working_set_replay_diagnostic) {
         printf("suffix_replay_phase=default-full-split-group-complete\n");
         const int suffix_replay_ok =
             qh_diff.mismatches == 0u && q_diff.mismatches == 0u &&
@@ -1989,7 +2088,9 @@ int main(void) {
             out_b_isolated_diff.mismatches == 0u;
         printf("suffix_replay_conclusion=%s\n",
                suffix_replay_ok ?
-                   "working-set-and-suffix-clean-without-burn-in" :
+                   (output_b_production103_replay_diagnostic ?
+                       "working-set-production103-burnin-and-suffix-clean" :
+                       "working-set-and-suffix-clean-without-burn-in") :
                    "unexpected-boundary-divergence");
         fflush(stdout);
         if (!suffix_replay_ok) {
