@@ -116,6 +116,25 @@ passing result. Preflight rejection still gets an archive but no GPU workload.
 The report contains host configuration and process/library names: review it
 before sharing outside this diagnostic collaboration.
 
+### Late child exit bookkeeping (September 8 offline correction)
+
+The 00:36 capture could not confirm termination in its initial bounded stop
+window, but its later `post/processes.log` showed owned PID 4312 as `Zs`.
+The original summary had not refreshed the child's exit status after collecting
+the postmortem. Do not interpret its null return code as evidence of a permanent
+uninterruptible process.
+
+At finalization, the helper now performs one nonblocking poll of its own child
+and records `workload_final_poll` with observation time and return code. If a
+previously unknown exit is now observed, `late_exit_observed` records that
+observation and `workload_returncode` is filled in. This timestamp is not the
+child's actual exit time. The original `workload_terminated=false` remains the
+result of the initial stop window; the fault reason and all partial-collection
+issues are preserved. No extra signal, waiting interval, retry or CUDA launch
+is added. A late zero exit cannot turn a faulted collection into a success.
+CPU tests cover late signal/zero exits, still-running children, ordinary clean
+exits, and an exit observed during postmortem cleanup.
+
 ## Run after the capture commit is available
 
 First validate the collectors on the Linux host **without launching the CUDA

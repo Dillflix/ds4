@@ -408,6 +408,22 @@ class Capture:
                 libraries[name] = {"unavailable": str(error)}
         self.summary["loaded_library_sha256"] = libraries
 
+    def observe_final_workload_status(self):
+        if self.workload_process is None:
+            return
+        # Popen.poll() performs only a nonblocking wait on this owned child.
+        # A child that outlived the initial stop bound can have exited during
+        # postmortem collection. Record that observation without another wait,
+        # signal, relaunch, or claiming the observation time is its exit time.
+        code = self.workload_process.poll()
+        observation = {**stamp(), "returncode": code}
+        self.summary["workload_final_poll"] = observation
+        if code is not None and self.summary["workload_returncode"] is None:
+            self.summary["late_exit_observed"] = observation.copy()
+            self.summary["workload_returncode"] = code
+        # Preserve workload_terminated=False (the initial bounded stop result),
+        # the original workload/fault reason and all partial-collection issues.
+
     def finish(self):
         if self.workload_process and self.workload_process.poll() is None:
             if not self.stop(self.workload_process):
@@ -423,6 +439,7 @@ class Capture:
             self.journal_error.close()
         if self.stream_error.is_set():
             self.issue("a live capture stream failed; partial evidence retained")
+        self.observe_final_workload_status()
         self.summary["collection"] = "partial" if self.summary["issues"] else "complete"
         self.summary["finished"] = stamp()
         self.save()

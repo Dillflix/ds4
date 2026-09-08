@@ -11,8 +11,26 @@ on executable SHA-256
 `5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414`.
 These results do not identify the root cause or qualify uninstrumented execution.
 The failing synchronization is an error-observation boundary, not identification
-of the defective instruction. Racecheck is the next instrumented run; the
-global-memory investigation below does not depend on it passing.
+of the defective instruction. The subsequent racecheck run (195635Z) timed out
+at 560/1024 calls and is not a completed clean result. A separate GPU2 Xid79 in
+that run does not qualify GPU1. Do not repeat the run merely to complete a list.
+
+## September 8 investigation update
+
+The same executable failed again in `20260908T003609Z`, with DCGM disabled and
+host-side capture enabled. GPU1 root-port Surprise Down/Fatal Error status became
+set; GPU1 Xid79 preceded GPU0's GSP timeout by about ten seconds. The final B-only
+half0 checkpoint still detects the application failure. This does not identify
+the causal instruction or clear software. See the dated
+[driver/hardware handoff](sm75-gpu1-driver-hardware-handoff-20260908.md),
+[full prelude source audit](sm75-gpu1-prelude-software-audit.md), and
+[runtime/software investigation](sm75-gpu1-runtime-software-investigation.md).
+
+The prelude audit extends the original tail review below, checks fixed-shape
+indexing and allocation accounting, and finds no demonstrated reachable
+application bounds/alias/lifetime defect. Actual streams, handles, allocation
+generations, compiled code and library internals remain unverified. The new
+offline archive analyzer and CPU checks do not launch CUDA or qualify stability.
 
 ## Source-backed findings in the output-B tail
 

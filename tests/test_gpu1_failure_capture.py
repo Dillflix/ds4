@@ -368,6 +368,73 @@ class CollectorTests(BaseTest):
             self.assertFalse(self.capture.stop(process))
         self.assertEqual(kill.call_count, 2)
 
+    def late_exit_capture(self, code):
+        self.capture.summary.update({"workload": "stopped-on-kernel-fault",
+            "workload_returncode": None, "workload_terminated": False,
+            "issues": ["owned workload would not terminate; possible uninterruptible task",
+                       "application output reader did not finish; partial output retained"]})
+        self.capture.fault.set()
+        self.capture.workload_process = Mock()
+        self.capture.workload_process.poll.return_value = code
+        self.capture.stop = Mock(return_value=False)
+
+    def test_postmortem_late_signal_exit_reaped_without_extra_wait_or_signal(self):
+        # Simulates the earlier stop bound expiring, then child exit during
+        # postmortem before finish() gets its next opportunity to poll.
+        self.late_exit_capture(-9)
+        self.capture.finish()
+        saved = json.loads((self.folder / "summary.json").read_text())
+        self.assertEqual(saved["workload_returncode"], -9)
+        self.assertEqual(saved["late_exit_observed"]["returncode"], -9)
+        self.assertGreater(saved["late_exit_observed"]["monotonic_ns"], 0)
+        self.assertFalse(saved["workload_terminated"])
+        self.assertEqual(saved["collection"], "partial")
+        self.assertEqual(len(saved["issues"]), 2)
+        self.assertEqual(saved["workload"], "stopped-on-kernel-fault")
+        self.assertEqual(self.capture.result(), 86)
+        self.capture.stop.assert_not_called()
+        self.capture.workload_process.wait.assert_not_called()
+        self.capture.workload_process.send_signal.assert_not_called()
+
+    def test_late_zero_exit_does_not_convert_fault_or_partial_to_success(self):
+        self.late_exit_capture(0)
+        self.capture.finish()
+        self.assertEqual(self.capture.summary["late_exit_observed"]["returncode"], 0)
+        self.assertEqual(self.capture.summary["collection"], "partial")
+        self.assertEqual(self.capture.result(), 86)
+
+    def test_still_unreaped_child_has_no_false_late_exit(self):
+        self.late_exit_capture(None)
+        self.capture.finish()
+        self.assertNotIn("late_exit_observed", self.capture.summary)
+        self.assertIsNone(self.capture.summary["workload_final_poll"]["returncode"])
+        self.assertIsNone(self.capture.summary["workload_returncode"])
+        self.capture.stop.assert_called_once_with(self.capture.workload_process)
+        self.capture.workload_process.wait.assert_not_called()
+        self.assertEqual(self.capture.result(), 86)
+
+    def test_known_clean_exit_not_mislabeled_late(self):
+        self.capture.summary.update({"workload": "exited-zero", "workload_returncode": 0})
+        self.capture.workload_process = Mock()
+        self.capture.workload_process.poll.return_value = 0
+        self.capture.stop = Mock()
+        self.capture.finish()
+        self.assertNotIn("late_exit_observed", self.capture.summary)
+        self.assertEqual(self.capture.summary["workload_final_poll"]["returncode"], 0)
+        self.assertEqual(self.capture.summary["collection"], "complete")
+        self.assertEqual(self.capture.result(), 0)
+        self.capture.stop.assert_not_called()
+
+    def test_final_poll_can_observe_exit_during_existing_final_cleanup(self):
+        self.late_exit_capture(None)
+        self.capture.workload_process.poll.side_effect = [None, -15]
+        self.capture.stop.return_value = True
+        self.capture.finish()
+        self.assertEqual(self.capture.summary["late_exit_observed"]["returncode"], -15)
+        self.assertFalse(self.capture.summary["workload_terminated"])
+        self.capture.stop.assert_called_once()
+        self.capture.workload_process.wait.assert_not_called()
+
     def test_first_fault_not_overwritten_by_followup_xid154(self):
         self.capture.observe_kernel(kernel_line(code=79))
         self.capture.observe_kernel(kernel_line(code=154))
