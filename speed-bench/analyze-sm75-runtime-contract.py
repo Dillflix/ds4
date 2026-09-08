@@ -364,7 +364,15 @@ def analyze_conversions(calls, history, violations, gaps, budget):
                 if address + length > pointer(allocation["base"]) + allocation["bytes"]:
                     detail["range_status"] = "out-of-bounds"
                     violations.append(_issue("conversion-exceeds-recorded-allocation", call, operand=operand))
-                if allocation["allocate_tid"] != call["tid"] or allocation.get("failed_free_calls"):
+                # This pass sees the completed history, including post-fault
+                # cleanup. A later failed free must not retroactively taint an
+                # earlier conversion. A failed free begun before this snapshot
+                # still leaves lifetime/order unresolved, including cross-thread
+                # overlap; it is not evidence of a successful deallocation.
+                budget.consume(len(allocation.get("failed_free_events", [])))
+                prior_failed_free = any(event["enter_seq"] < observation["seq"]
+                                        for event in allocation.get("failed_free_events", []))
+                if allocation["allocate_tid"] != call["tid"] or prior_failed_free:
                     gaps.append(_issue("conversion-allocation-lifetime-order-unresolved", call, operand=operand))
                 if allocation["free_exit_seq"] is not None:
                     gaps.append(_issue("conversion-free-vs-GPU-completion-unresolved", call, operand=operand))
@@ -529,6 +537,9 @@ def analyze_file(path):
                     allocation = live.get((call["pid"], pointer(args.get("ptr"))))
                     if allocation is not None:
                         allocation.setdefault("failed_free_calls", []).append(call["call_id"])
+                        allocation.setdefault("failed_free_events", []).append({
+                            "call_id": call["call_id"], "enter_seq": call["enter_seq"],
+                            "exit_seq": call["exit_seq"], "tid": call["tid"]})
                     gaps.append(_issue("failed-free-allocation-lifetime-unknown", call))
                 continue
             if api == "cudaSetDevice":

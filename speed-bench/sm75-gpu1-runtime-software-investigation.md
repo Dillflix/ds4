@@ -14,8 +14,12 @@ opt-in, same-ELF application-API instrumentation and its CPU-only qualification
 gate. It measures allocation/view lifetimes, conversion arguments, handle and
 context/stream state, and real call forwarding/completion at the known transition.
 This is concrete instrumentation work, not a declaration that uncollected runtime
-facts are resolved. No instrumented GPU run has yet qualified it; library-internal
-execution requires a separately reviewed timeline experiment.
+facts are resolved. The subsequent 03:42 UTC GPU1 failure capture measured these
+contracts at the known transition; see
+`sm75-gpu1-runtime-capture-findings-20260908.md`. No caller violation was detected,
+but library-internal execution remains unmeasured. `sm75-nsys-device-timeline.md`
+describes the next host-only profiler supervision gate; GPU timeline capture is
+not yet enabled. The sections below retain the earlier incident's stack/history.
 
 ## Established runtime, not inferred from nvidia-smi
 

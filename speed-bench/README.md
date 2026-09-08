@@ -6384,6 +6384,13 @@ preflight gates, artifacts, command, runtime bounds and interpretation limits.
 
 For the unresolved runtime pointer/lifetime and actual call-order questions,
 see [frozen-ELF runtime-contract tracing](sm75-runtime-contract-trace.md).
+
+The 2026-09-08 03:42 UTC capture reproduced the loss with recorded in-range
+operands and completed DEFAULT synchronization; see the
+[runtime capture findings](sm75-gpu1-runtime-capture-findings-20260908.md).
+The next implemented step is [host-only Nsight supervision qualification](sm75-nsys-device-timeline.md),
+using CPU fixtures with all API tracing disabled. It does not run the reproducer
+or enable GPU timeline capture yet. Do not infer race freedom from these checks.
 The optional interposer preserves the known GPU1-only workload and executable
 hash; it is a separately labeled instrumented experiment, not a production fix.
 First qualify its loading, ABI forwarding, and parser integration using the

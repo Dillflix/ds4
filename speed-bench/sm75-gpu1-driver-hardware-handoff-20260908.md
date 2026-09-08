@@ -10,6 +10,14 @@ posting publicly. Use a private vendor/support channel for the complete package.
 
 ## 1. Incident and requested assistance
 
+New evidence: `sm75-gpu1-runtime-capture-findings-20260908.md` adds the 03:42 UTC
+failure on driver 595.91.07/cuBLAS 13.4.1.3/cudart 13.2.86, with the same frozen
+ELF. It records in-range live operands, identical failing/successful GEMM argument
+sets and completed DEFAULT synchronization, followed by GPU1 Xid 79/root-port
+Surprise Down. Device execution inside the conversion/103 interval remains
+unresolved. This newer multi-component stack is not a one-variable comparison.
+The incident-specific details below continue to describe the original 00:36 run.
+
 A small, local-only CUDA/cuBLAS synthetic workload reproducibly loses physical
 GPU1 on a four-Quadro-RTX-8000 host. The latest run has no application peer access,
 native-Q8 streaming or row-owned pair execution. DCGM was disabled/inactive.

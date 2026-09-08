@@ -521,6 +521,37 @@ class AnalyzeTests(unittest.TestCase):
         report = self.analyze(trace.finish())
         self.assertIn("conversion-exceeds-recorded-allocation", codes(report, "violations"))
 
+    def test_later_failed_cleanup_does_not_taint_prior_conversion(self):
+        trace = Trace()
+        trace.standard_allocations()
+        trace.malloc(0x40000000, 8192*256*4)
+        trace.conversion()
+        trace.sync(status=719)
+        trace.call("cudaFree", {"ptr": "0x20000000"}, status=719)
+        report = self.analyze(trace.finish())
+        self.assertNotIn("conversion-allocation-lifetime-order-unresolved", codes(report))
+        self.assertIn("failed-free-allocation-lifetime-unknown", codes(report))
+
+    def test_prior_failed_free_still_taints_conversion(self):
+        trace = Trace()
+        trace.standard_allocations()
+        trace.malloc(0x40000000, 8192*256*4)
+        trace.call("cudaFree", {"ptr": "0x20000000"}, status=719)
+        trace.conversion()
+        report = self.analyze(trace.finish())
+        self.assertIn("conversion-allocation-lifetime-order-unresolved", codes(report))
+        self.assertIn("failed-free-allocation-lifetime-unknown", codes(report))
+
+    def test_overlapping_failed_free_still_taints_conversion(self):
+        trace = Trace()
+        trace.standard_allocations()
+        trace.malloc(0x40000000, 8192*256*4)
+        free = trace.enter("cudaFree", {"ptr": "0x20000000"}, tid=22)
+        trace.conversion()
+        trace.exit("cudaFree", free, status=719, tid=22)
+        report = self.analyze(trace.finish())
+        self.assertIn("conversion-allocation-lifetime-order-unresolved", codes(report))
+
     def test_conversion_unreadable_arguments_remain_unknown(self):
         trace = Trace()
         trace.conversion(argument_read_status="unreadable")
