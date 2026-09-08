@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -119,15 +120,19 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(self.c.stop_reason(-1), 'timeout')
 
     def test_stop_signals_verified_target_before_tree(self):
-        tree = Mock(alive=Mock(return_value=False), stop=Mock(return_value=[]), cleanup_issues=[])
+        self.c.directory.mkdir(parents=True)
+        tree = Mock(alive=Mock(side_effect=[True, False, False, False]), stop=Mock(return_value=[]),
+                    live_pids=Mock(return_value=[]), cleanup_issues=[])
         self.c.tree, self.c.profiler, self.c.admitted = tree, Mock(poll=Mock(return_value=0)), {'pid': 11}
         with patch.object(m.signal, 'SIGKILL', getattr(signal, 'SIGKILL', 9), create=True):
             self.c.stop_owned()
-        self.assertEqual(tree.method_calls[0][0], 'send')
-        self.assertEqual(tree.method_calls[0][1], (11, signal.SIGTERM))
+        tree.send.assert_called_once_with(11, signal.SIGTERM)
+        self.assertLess([x[0] for x in tree.method_calls].index('send'),
+                        [x[0] for x in tree.method_calls].index('stop'))
         tree.stop.assert_called_once()
 
     def test_survivors_make_collection_partial(self):
+        self.c.directory.mkdir(parents=True)
         self.c.tree = Mock(stop=Mock(return_value=[11]), cleanup_issues=[])
         self.c.profiler = Mock(poll=Mock(return_value=0))
         self.c.stop_owned()
@@ -153,7 +158,10 @@ class CaptureTests(unittest.TestCase):
             self.assertNotIn('actual_target_mapped_hashes', self.c.summary)
             self.assertEqual(self.c.summary['gate_mapped_hashes'][path], digest)
             self.c.target_verified = True
-            self.c.observe_mappings(11)
+            fake = Mock(st_dev=1, st_ino=2, st_size=3, st_mtime_ns=4, st_ctime_ns=5)
+            with patch.object(Path, 'stat', return_value=fake):
+                self.c.observe_mappings(11)
+                self.c.finish_workers()
             self.assertEqual(self.c.summary['actual_target_mapped_hashes'][path], digest)
 
     def test_transient_mapping_loss_not_silently_qualified(self):
@@ -262,6 +270,7 @@ class CaptureTests(unittest.TestCase):
             if stop_before_release:
                 stack.enter_context(patch.object(c, 'stop_reason', side_effect=[None, None, 'stopped-on-kernel-fault']))
             c.execute()
+            c.finish_workers()
         return c.summary, tree
 
     def test_mock_complete_session_preserves_target_and_profiler_separation(self):
@@ -288,6 +297,182 @@ class CaptureTests(unittest.TestCase):
         summary, _ = self.simulated_execute(profiler_code=137)
         self.assertEqual(summary['workload'], 'failed')
         self.assertIsNone(summary['workload_returncode'])
+
+    def test_blocked_hash_does_not_block_fault_checks_or_prefix_retention(self):
+        entered, release, copied = threading.Event(), threading.Event(), threading.Event()
+        path = self.root / 'libcublas-test'
+        path.write_bytes(b'data')
+        def digest(_):
+            entered.set()
+            if not release.wait(2): raise RuntimeError('test release timeout')
+            return 'verified'
+        with patch.object(m.base, 'sha256', side_effect=digest), \
+             patch.object(m.host, 'safe_files', return_value=([], [])):
+            hasher = m.MappingHasher()
+            copier = m.PrefixCollector(Mock(capture=Mock(side_effect=copied.set)), self.root)
+            try:
+                self.c.mapping_hasher, self.c.prefix_collector = hasher, copier
+                hasher.submit('actual_target_mapped_hashes', str(path), 'verified')
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(copied.wait(1))
+                self.c.fault.set()
+                self.assertEqual(self.c.stop_reason(float('inf')), 'stopped-on-kernel-fault')
+                self.assertNotIn('actual_target_mapped_hashes', self.c.summary)
+            finally:
+                release.set()
+                self.c.finish_workers()
+            self.assertEqual(self.c.summary['actual_target_mapped_hashes'][str(path)], 'verified')
+            self.assertTrue(self.c.summary['mapping_hasher']['stopped'])
+
+    def test_target_mapping_submits_without_synchronous_hash(self):
+        path = next(iter(m.RUNTIME))
+        self.c.target_verified = True
+        self.c.bundle_inventory = {}
+        self.c.mapping_hasher = Mock()
+        with patch.object(m, 'mapped_files', return_value=[path]), patch.object(m.base, 'sha256') as digest:
+            self.c.observe_mappings(11)
+            digest.assert_not_called()
+        self.c.mapping_hasher.submit.assert_called_once_with('actual_target_mapped_hashes', path, m.RUNTIME[path])
+        self.assertNotIn('actual_target_mapped_hashes', self.c.summary)
+
+    def test_hash_error_is_stop_reason_not_successful_coverage(self):
+        path = self.root / 'lib'
+        path.write_bytes(b'data')
+        with patch.object(m.base, 'sha256', return_value='wrong'):
+            self.c.mapping_hasher = m.MappingHasher()
+            self.c.mapping_hasher.submit('actual_target_mapped_hashes', str(path), 'expected')
+            self.assertTrue(self.c.mapping_hasher.failed.wait(1))
+            self.assertEqual(self.c.stop_reason(float('inf')), 'stopped-on-collector-failure')
+            self.c.finish_workers()
+        self.assertNotIn('actual_target_mapped_hashes', self.c.summary)
+        self.assertTrue(any('mismatch' in issue for issue in self.c.summary['issues']))
+
+    def test_changed_file_during_worker_hash_rejected(self):
+        path = self.root / 'lib'
+        path.write_bytes(b'data')
+        def digest(_):
+            path.write_bytes(b'changed size')
+            return 'expected'
+        with patch.object(m.base, 'sha256', side_effect=digest):
+            self.c.mapping_hasher = m.MappingHasher()
+            self.c.mapping_hasher.submit('actual_target_mapped_hashes', str(path), 'expected')
+            self.assertTrue(self.c.mapping_hasher.failed.wait(1))
+            self.c.finish_workers()
+        self.assertTrue(any('changed during' in issue for issue in self.c.summary['issues']))
+
+    def test_worker_job_limit(self):
+        worker = m.MappingHasher()
+        try:
+            worker.submitted = 256
+            with self.assertRaisesRegex(ValueError, 'job limit'): worker.submit('phase', 'path', None)
+        finally: worker.stop()
+
+    def test_pending_hashes_mark_evidence_incomplete(self):
+        self.c.mapping_hasher = Mock(submitted=5, stop=Mock(return_value=False), results=m.queue.Queue())
+        self.c.finish_workers()
+        self.assertIn('incomplete', self.c.summary['issues'][0])
+
+    def test_prefix_failure_requests_stop(self):
+        worker = m.PrefixCollector(Mock(capture=Mock(side_effect=OSError('disk error'))), self.root)
+        try:
+            self.assertTrue(worker.failed.wait(1))
+            self.c.prefix_collector = worker
+            self.assertEqual(self.c.stop_reason(float('inf')), 'stopped-on-collector-failure')
+            self.c.finish_workers()
+        finally: worker.stop()
+        self.assertIn('disk error', self.c.summary['issues'][0])
+
+    def test_prefix_capture_does_final_copy_after_stop_request(self):
+        seen = threading.Event()
+        values, state = [], [1]
+        def capture():
+            values.append(state[0])
+            seen.set()
+        with patch.object(m.host, 'safe_files', return_value=([], [])):
+            worker = m.PrefixCollector(Mock(capture=capture), self.root)
+            try:
+                self.assertTrue(seen.wait(1))
+                state[0] = 2
+            finally:
+                self.assertTrue(worker.stop())
+        self.assertEqual(values[-1], 2)
+
+    def test_blocked_prefix_copy_has_bounded_join_and_does_not_block_fault_check(self):
+        entered, release = threading.Event(), threading.Event()
+        def capture():
+            entered.set()
+            release.wait(2)
+        with patch.object(m.host, 'safe_files', return_value=([], [])):
+            worker = m.PrefixCollector(Mock(capture=capture), self.root)
+            try:
+                self.assertTrue(entered.wait(1))
+                self.c.prefix_collector = worker
+                self.c.fault.set()
+                self.assertEqual(self.c.stop_reason(float('inf')), 'stopped-on-kernel-fault')
+                self.assertFalse(worker.stop(seconds=0.01))
+            finally:
+                release.set()
+                self.assertTrue(worker.stop())
+
+    def simulated_shutdown(self, target_alive=False, profiler_exit_at=None):
+        self.c.directory.mkdir(parents=True)
+        elapsed = [0.0]
+        self.c.admitted = {'pid': 11}
+        self.c.tree = Mock(alive=Mock(return_value=target_alive),
+                           live_pids=Mock(return_value=[11] if target_alive else []),
+                           stop=Mock(return_value=[11] if target_alive else []), cleanup_issues=[])
+        self.c.profiler = Mock(poll=Mock(side_effect=lambda:
+            0 if profiler_exit_at is not None and elapsed[0] >= profiler_exit_at else None))
+        with patch.object(m.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(m.time, 'sleep', side_effect=lambda dt: elapsed.__setitem__(0, elapsed[0]+dt)), \
+             patch.object(m.signal, 'SIGKILL', getattr(signal, 'SIGKILL', 9), create=True):
+            self.c.stop_owned()
+            before = elapsed[0]
+            self.c.stop_owned()
+            self.assertEqual(before, elapsed[0])  # No second grace period.
+        return elapsed[0], self.c.summary['shutdown_timeline']
+
+    def test_profiler_may_finalize_after_old_five_second_limit(self):
+        elapsed, events = self.simulated_shutdown(profiler_exit_at=8)
+        self.assertGreaterEqual(elapsed, 8)
+        self.assertLess(elapsed, 9)
+        end = next(x for x in events if x['event'] == 'profiler-finalization-end')
+        self.assertFalse(end['deadline_expired'])
+        self.assertEqual(end['profiler_returncode'], 0)
+
+    def test_profiler_grace_has_hard_cap_and_is_not_restarted(self):
+        elapsed, events = self.simulated_shutdown()
+        self.assertGreaterEqual(elapsed, m.FINALIZE_SECONDS)
+        self.assertLess(elapsed, m.FINALIZE_SECONDS + 0.1)
+        self.assertTrue(next(x for x in events if x['event'] == 'profiler-finalization-end')['deadline_expired'])
+        self.c.tree.stop.assert_called_once()
+
+    def test_profiler_children_can_finalize_after_launcher_exits(self):
+        self.c.directory.mkdir(parents=True)
+        self.c.admitted = {'pid': 11}
+        elapsed = [0.0]
+        self.c.tree = Mock(alive=Mock(return_value=False), stop=Mock(return_value=[]), cleanup_issues=[],
+            live_pids=Mock(side_effect=lambda: [22] if elapsed[0] < 8 else []))
+        self.c.profiler = Mock(poll=Mock(return_value=0))
+        with patch.object(m.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(m.time, 'sleep', side_effect=lambda dt: elapsed.__setitem__(0, elapsed[0]+dt)), \
+             patch.object(m.signal, 'SIGKILL', getattr(signal, 'SIGKILL', 9), create=True):
+            self.c.stop_owned()
+        self.assertGreaterEqual(elapsed[0], 8)
+        self.assertLess(elapsed[0], 9)
+
+    def test_stuck_target_gets_no_profiler_grace(self):
+        elapsed, events = self.simulated_shutdown(target_alive=True)
+        self.assertLess(elapsed, 2.1)
+        self.assertNotIn('profiler-finalization-start', [x['event'] for x in events])
+
+    def test_timeline_write_failure_cannot_skip_owned_stop(self):
+        self.c.tree = Mock(stop=Mock(return_value=[]), cleanup_issues=[])
+        self.c.profiler = Mock(poll=Mock(return_value=0))
+        with patch.object(Path, 'open', side_effect=OSError('disk full')):
+            self.c.stop_owned()
+        self.c.tree.stop.assert_called_once()
+        self.assertTrue(any('timeline write failed' in x for x in self.c.summary['issues']))
 
 
 if __name__ == '__main__': unittest.main()

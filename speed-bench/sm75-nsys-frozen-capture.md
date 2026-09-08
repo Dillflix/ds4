@@ -1,7 +1,9 @@
 # Opt-in Nsight integration with the frozen GPU1 collector
 
-Status: implemented and CPU-mock tested; **integrated native preflight pending**.
-CUDA/cuBLAS correlation and GPU-loss retention are still unqualified. This is not
+Status: integrated native preflight passed at 17:44 UTC. The 17:56 UTC GPU1 run
+reproduced loss but **did not retain an importable device report**; both offline
+imports failed. The subsequent monitoring/shutdown revision is CPU-tested only.
+CUDA/cuBLAS correlation and GPU-loss retention remain unqualified. This is not
 a production fix or permission to run a peer/algorithm-sweep experiment.
 
 The reviewed `sm75-nsys-retention-18q7z_z2.tar.gz` passed normal, abrupt and timeout
@@ -42,9 +44,20 @@ sweep are not enabled. No CUDA source, binary or production default is changed.
   executable before releasing it. Verify the frozen ELF's same PID after exec.
   CUDA profiling may load injection libraries into the gate: record/check those
   maps rather than falsely declaring the profiler process to be the target.
+- During actual ELF execution, queue mapped-file hashes to a bounded-job worker;
+  record mapping observations separately from completed hashes. A hash mismatch
+  or worker failure requests stop, and pending hashes at bounded join make the
+  evidence incomplete. File metadata changes during hashing are rejected. This
+  remains on-disk validation, not executable-memory-page attestation. Gate hashes
+  and pinned-file checks still complete before release.
 - Stop the verified target through pidfds first on a fault, capture failure,
   interrupt or deadline; then bound profiler finalization/owned-tree cleanup.
-  Continue copying temporary prefixes during the finalization window. Kernel/PCI
+  Allow at most 30 seconds for profiler finalization ONLY after target exit is
+  observed. A stuck/unverified target gets no such grace, and repeated cleanup
+  never restarts the grace period. Record signals, target exit, profiler deadline,
+  return status and remaining processes in `nsys/shutdown-timeline.jsonl`.
+  A separate single-owner prefix worker copies during execution, finalization
+  and postmortem, including a final copy after cleanup. Kernel/PCI
   postmortem is attempted even if profiler cleanup encounters an error.
 - Never fill `workload_returncode` from the profiler return code. It remains null
   for this grandchild, with an explicit source label. Success requires verified
@@ -62,7 +75,12 @@ There is no claim that Nsight inserts no internal work or leaves scheduling inta
 The installed version's archived help supports these flags. A 100 ms flush cannot
 guarantee survival of the sub-millisecond failing tail or unfinished kernel records.
 
-## First run: integrated host preflight only
+## Archived preflight command (not a request for another GPU run)
+
+The command below remains available for host-only checking. Do not flip its
+preflight flag and repeat the failed GPU run merely because CPU tests pass.
+First resolve how actual CUDA records can be retained/imported; CPU fixture
+exports do not establish that. See `sm75-nsys-loss-findings-20260908.md`.
 
 After this change is pushed and pulled, run:
 
@@ -95,8 +113,8 @@ against a target, the CPU fixtures or the GPU executable**. No cold restart is
 requested for this check. Do not rebuild a stale/mismatched frozen binary to
 satisfy preflight; return the rejection evidence instead.
 
-After reviewing this archive, an explicit subsequent command can set
-`NSYS_PREFLIGHT_ONLY=0` for one instrumented GPU1 run. Do not make that change yet.
+Any later GPU run requires a separately reviewed recovery/coverage plan.
+Do not set `NSYS_PREFLIGHT_ONLY=0` based only on this document.
 The real run retains the 600-second total supervision deadline, plus bounded
 stop, postmortem and export. Host file hashing/archiving adds time; this is not a
 hard end-to-end wall-clock guarantee on a failing OS/device stack.
@@ -106,6 +124,9 @@ hard end-to-end wall-clock guarantee on a failing OS/device stack.
 - `failure-context/summary.json`: pins, controls, admitted/actual target identity,
   actual mapped-path hashes, separate profiler status/target-exit observation,
   first kernel fault and export result.
+- `mapping_hash_results` records asynchronous on-disk hash completion times;
+  `actual_target_mapping_observations` records the earlier sampling times. Never
+  substitute a queued observation for a completed hash or missing library map.
 - Existing kernel, process, PCI/AER and NVIDIA-report artifacts remain present.
 - `application-timeline.jsonl`: timestamped **mixed profiler/target stdout chunks**,
   not falsely labeled application API timestamps.
@@ -116,6 +137,12 @@ hard end-to-end wall-clock guarantee on a failing OS/device stack.
 - `nsys/report.nsys-rep`, `nsys/export`: report copies, bounded SQLite export,
   actual schema inventory. Export is deferred if owned exit is not established.
   Missing/incomplete export is an issue, never synthetic successful trace data.
+
+The worker intervals are best-effort: blocked filesystem reads, Python scheduling
+or OS failure can still delay capture. Worker joins are bounded at two seconds;
+unfinished work is explicitly incomplete. These changes remove synchronous
+library hashing and prefix copying from the supervision loop, not every possible
+host-side delay, and do not prove the previous five-second grace caused data loss.
 
 Next analysis must establish actual CUDA/cuBLAS/kernel correlation, context/stream
 identity, launch geometry, relevant transition coverage and how much of the failing

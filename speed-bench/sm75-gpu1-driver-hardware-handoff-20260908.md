@@ -10,6 +10,11 @@ posting publicly. Use a private vendor/support channel for the complete package.
 
 ## 1. Incident and requested assistance
 
+Latest supplement: `sm75-nsys-loss-findings-20260908.md` records the 17:56 UTC
+GPU1-only failure under Nsight, exact raw-archive hashes, subsequent failed
+offline imports, and retained injection storage for vendor-assisted recovery.
+No device-kernel attribution can be made from that incomplete capture.
+
 New evidence: `sm75-gpu1-runtime-capture-findings-20260908.md` adds the 03:42 UTC
 failure on driver 595.91.07/cuBLAS 13.4.1.3/cudart 13.2.86, with the same frozen
 ELF. It records in-range live operands, identical failing/successful GEMM argument

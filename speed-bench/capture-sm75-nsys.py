@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import queue
 import secrets
 import shutil
 import signal
@@ -46,6 +47,91 @@ CUDA_OPTIONS = ('--trace=cuda-sw,cublas-verbose', '--cuda-trace-scope=process-tr
                 '--cuda-trace-all-apis=true', '--cuda-memory-usage=true',
                 '--cuda-event-trace=false', '--cuda-flush-interval=100')
 CORE_LIBS = ('libcuda.so.', 'libcudart.so.', 'libcublas.so.', 'libcublasLt.so.')
+FINALIZE_SECONDS = 30
+
+
+class MappingHasher:
+    """Read-only hashing off the supervision loop; results consumed by owner.
+
+    A stuck file read cannot prevent target stop. A bounded join that leaves
+    this daemon alive is incomplete evidence, never a successful hash check.
+    """
+    def __init__(self):
+        self.jobs, self.results = queue.Queue(), queue.Queue()
+        self.cancel, self.failed = threading.Event(), threading.Event()
+        self.submitted = 0
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def submit(self, phase, path, expected):
+        if self.submitted >= 256:
+            raise ValueError('mapped hash job limit')
+        self.jobs.put((phase, path, expected))
+        self.submitted += 1
+
+    def run(self):
+        while not self.cancel.is_set():
+            try: job = self.jobs.get(timeout=0.05)
+            except queue.Empty: continue
+            if job is None: break
+            phase, path, expected = job
+            result = {'phase': phase, 'path': path, 'started': base.stamp()}
+            try:
+                before = Path(path).stat()
+                digest = base.sha256(path)
+                after = Path(path).stat()
+                signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                if signature(before) != signature(after):
+                    raise ValueError('mapped file changed during hashing: ' + path)
+                if expected is not None and digest != expected:
+                    raise ValueError('loaded component hash mismatch: ' + path)
+                result.update(sha256=digest, file_signature=signature(after))
+            except Exception as error:
+                result['error'] = str(error)
+                self.failed.set()
+            result['finished'] = base.stamp()
+            self.results.put(result)
+
+    def stop(self, seconds=2):
+        self.jobs.put(None)  # Drain already queued verification before exit.
+        self.thread.join(timeout=seconds)
+        self.cancel.set()
+        return not self.thread.is_alive()
+
+
+class PrefixCollector:
+    """Sole owner of PrefixStore: retention continues during other host I/O."""
+    def __init__(self, store, directory):
+        self.store, self.directory = store, directory
+        self.cancel, self.failed = threading.Event(), threading.Event()
+        self.error = None
+        self.completed = 0
+        self.max_capture_seconds = 0.0
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def capture(self):
+        started = time.monotonic()
+        self.store.capture()
+        _, excluded = host.safe_files(self.directory)
+        if excluded: raise RuntimeError('Nsight artifact size/type limit exceeded')
+        self.completed += 1
+        self.max_capture_seconds = max(self.max_capture_seconds, time.monotonic() - started)
+
+    def run(self):
+        try:
+            while not self.cancel.is_set():
+                self.capture()
+                self.cancel.wait(0.1)
+            self.capture()  # Last copy after owned cleanup/postmortem, not before it.
+        except Exception as error:
+            self.error = str(error)
+            self.failed.set()
+
+    def stop(self, seconds=2):
+        self.cancel.set()
+        self.thread.join(timeout=seconds)
+        return not self.thread.is_alive()
 
 
 def exact_environment(command, executable, inherited):
@@ -113,6 +199,10 @@ class NsightCapture(base.Capture):
         self.nsys = Path(nsys).resolve()
         self.profiler = None
         self.prefixes = None
+        self.prefix_collector = None
+        self.mapping_hasher = None
+        self.hash_results = 0
+        self.shutdown_started = False
         self.tree = None
         self.admitted = None
         self.target_verified = False
@@ -203,6 +293,9 @@ class NsightCapture(base.Capture):
     def stop_reason(self, deadline):
         if self.interrupted.is_set(): return 'interrupted'
         if self.fault.is_set(): return 'stopped-on-kernel-fault'
+        if ((self.mapping_hasher and self.mapping_hasher.failed.is_set()) or
+                (self.prefix_collector and self.prefix_collector.failed.is_set())):
+            return 'stopped-on-collector-failure'
         if (self.stream_error.is_set() or self.journal_process.poll() is not None or
                 not self.journal_reader.is_alive()): return 'stopped-on-collector-failure'
         if time.monotonic() >= deadline: return 'timeout'
@@ -221,39 +314,101 @@ class NsightCapture(base.Capture):
                 self.issue('mapped component vanished before hashing: ' + path)
                 self.recorded_paths.add(key)
                 continue
-            actual = base.sha256(path)
-            self.summary.setdefault(phase, {})[path] = actual
-            self.recorded_paths.add(key)
             expected = self.pinned.get(path, self.bundle_inventory.get(path))
-            if expected is not None and actual != expected:
-                raise ValueError('loaded component hash mismatch: ' + path)
             if re.search(r'/lib(?:cuda|cudart|cublas|nvidia)', path) and path not in RUNTIME:
                 raise ValueError('unreviewed CUDA/driver library mapped: ' + path)
+            self.recorded_paths.add(key)
+            if self.target_verified:
+                self.summary.setdefault('actual_target_mapping_observations', []).append(
+                    {'path': path, 'observed': base.stamp(), 'hash_mode': 'asynchronous-on-disk-file'})
+                if self.mapping_hasher is None: self.mapping_hasher = MappingHasher()
+                self.mapping_hasher.submit(phase, path, expected)
+            else:
+                # Gate is not released yet; no reproducer is executing here.
+                actual = base.sha256(path)
+                if expected is not None and actual != expected:
+                    raise ValueError('loaded component hash mismatch: ' + path)
+                self.summary.setdefault(phase, {})[path] = actual
+
+    def collect_hashes(self):
+        if not self.mapping_hasher: return
+        while True:
+            try: result = self.mapping_hasher.results.get_nowait()
+            except queue.Empty: break
+            self.hash_results += 1
+            self.summary.setdefault('mapping_hash_results', []).append(result)
+            if 'error' in result:
+                self.issue(result['error'])
+                self.stream_error.set()
+            else:
+                self.summary.setdefault(result['phase'], {})[result['path']] = result['sha256']
+
+    def finish_workers(self):
+        if self.mapping_hasher:
+            stopped = self.mapping_hasher.stop()
+            self.collect_hashes()
+            self.summary['mapping_hasher'] = {'stopped': stopped,
+                'submitted': self.mapping_hasher.submitted, 'results': self.hash_results}
+            if not stopped or self.hash_results != self.mapping_hasher.submitted:
+                self.issue('mapped hash verification incomplete after bounded join')
+        if self.prefix_collector:
+            stopped = self.prefix_collector.stop()
+            self.summary['prefix_collector'] = {'stopped': stopped,
+                'completed_captures': self.prefix_collector.completed,
+                'max_capture_seconds': self.prefix_collector.max_capture_seconds,
+                'error': self.prefix_collector.error}
+            if not stopped or self.prefix_collector.failed.is_set():
+                self.issue('prefix collector incomplete: ' + str(self.prefix_collector.error))
+
+    def shutdown_event(self, event, **details):
+        record = {**base.stamp(), 'event': event, **details}
+        self.summary.setdefault('shutdown_timeline', []).append(record)
+        try:
+            with (self.directory / 'shutdown-timeline.jsonl').open('a') as stream:
+                stream.write(json.dumps(record) + '\n')
+        except OSError as error:
+            # base.issue() writes summary.json; do not recurse into a failed
+            # filesystem before signaling the owned processes.
+            self.summary['issues'].append('shutdown timeline write failed: ' + str(error))
 
     def stop_owned(self):
         if not self.tree:
             if self.profiler and self.profiler.poll() is None:
                 self.profiler.kill()  # Only unreaped direct Popen child.
             return
+        if self.shutdown_started:
+            # Refresh late exits, but never restart a finalization grace period.
+            self.summary['surviving_owned_pids'] = self.tree.live_pids()
+            return
+        self.shutdown_started = True
         if self.admitted:
             pid = self.admitted['pid']
             for sig, duration in ((signal.SIGTERM, 1), (signal.SIGKILL, 1)):
+                if not self.tree.alive(pid): break
+                self.shutdown_event('target-signal', pid=pid, signal=int(sig))
                 self.tree.send(pid, sig)
                 until = time.monotonic() + duration
                 while self.tree.alive(pid) and time.monotonic() < until:
                     time.sleep(0.02)
-        # Let profiler finalize after target death, but never wait indefinitely.
-        until = time.monotonic() + 5
-        next_copy = 0
-        while self.profiler.poll() is None and time.monotonic() < until:
-            if self.prefixes and time.monotonic() >= next_copy:
-                try: self.prefixes.capture()
-                except Exception as error:
-                    self.issue('shutdown prefix retention failed: ' + str(error))
-                    break
-                next_copy = time.monotonic() + 0.1
-            time.sleep(0.05)
+        exited = bool(self.admitted and not self.tree.alive(self.admitted['pid']))
+        self.shutdown_event('target-exit-check', exited=exited)
+        # Additional time is for profiler finalization ONLY after target exit.
+        # It must not extend execution of a stuck/unverified GPU workload.
+        if exited:
+            self.shutdown_event('profiler-finalization-start', seconds=FINALIZE_SECONDS)
+            until = time.monotonic() + FINALIZE_SECONDS
+            pending = True
+            while time.monotonic() < until:
+                self.tree.scan()
+                pending = self.profiler.poll() is None or bool(self.tree.live_pids())
+                if not pending: break
+                time.sleep(0.05)
+            self.shutdown_event('profiler-finalization-end',
+                deadline_expired=pending,
+                profiler_returncode=self.profiler.poll())
+        self.shutdown_event('owned-tree-stop-start')
         survivors = self.tree.stop()
+        self.shutdown_event('owned-tree-stop-end', surviving_owned_pids=survivors)
         self.summary['surviving_owned_pids'] = survivors
         for issue in self.tree.cleanup_issues: self.issue(issue)
         if survivors: self.issue('owned profiler/target processes survived bounded stop')
@@ -270,6 +425,7 @@ class NsightCapture(base.Capture):
         tmp.mkdir(mode=0o700)
         prefixes = retention.PrefixStore(tmp, self.directory / 'retained-prefixes')
         self.prefixes = prefixes
+        self.prefix_collector = PrefixCollector(prefixes, self.directory)
         gate_path = self.directory / 'sm75-nsys-launch-gate.py'
         gate_argv = [sys.executable, '-I', str(gate_path), str(config)]
         options = [o for o in host.HOST_OPTIONS if not o.startswith('--trace=')]
@@ -306,12 +462,13 @@ class NsightCapture(base.Capture):
             reader.start()
             deadline = time.monotonic() + self.case_timeout
             admission_deadline = time.monotonic() + 30
-            next_sample = next_copy = 0
+            next_sample = 0
             refresh = time.monotonic() + self.sudo_refresh_seconds
             with (self.output / 'process-timeline.jsonl').open('x') as timeline:
                 while True:
                     self.tree.scan()
                     self.profiler.poll()
+                    self.collect_hashes()
                     reason = self.stop_reason(deadline)
                     if reason or overflow.is_set():
                         reason = reason or 'console-overflow'
@@ -357,12 +514,7 @@ class NsightCapture(base.Capture):
                             sample['owned'] = [i for i, _ in self.tree.members.values()]
                             timeline.write(json.dumps(sample) + '\n'); timeline.flush()
                             self.observe_mappings(pid)
-                            next_sample = time.monotonic() + 1
-                    if time.monotonic() >= next_copy:
-                        prefixes.capture()
-                        _, excluded = host.safe_files(self.directory)
-                        if excluded: raise RuntimeError('Nsight artifact size/type limit exceeded')
-                        next_copy = time.monotonic() + 0.1
+                            next_sample = time.monotonic() + 0.1
                     if time.monotonic() >= refresh:
                         self.required('sudo-refresh-' + str(time.monotonic_ns()), ['sudo', '-n', '-v'], seconds=5)
                         refresh = time.monotonic() + self.sudo_refresh_seconds
@@ -377,8 +529,6 @@ class NsightCapture(base.Capture):
         finally:
             self.summary['stop_reason'] = reason
             self.summary['stop_requested'] = base.stamp()
-            try: prefixes.capture()
-            except Exception as error: self.issue('prefix capture: ' + str(error))
             self.stop_owned()
             if reader:
                 reader.join(timeout=2)
@@ -412,6 +562,8 @@ class NsightCapture(base.Capture):
                 except Exception as error: self.issue('owned cleanup incomplete: ' + str(error))
                 try: self.postmortem()  # Preserve kernel/PCI evidence even if profiler cleanup fails.
                 except Exception as error: self.issue('postmortem incomplete: ' + str(error))
+            self.finish_workers()
+            if self.profiler:
                 try:
                     if self.admitted and self.tree:
                         self.summary['target_exit_observed'] = not self.tree.alive(self.admitted['pid'])
@@ -420,6 +572,7 @@ class NsightCapture(base.Capture):
                         self.summary['nsys_export'] = retention.export_report(self.nsys, self.directory)
                     else:
                         self.summary['nsys_export'] = {'status': 'deferred-owned-processes-not-confirmed-exited'}
+                    self.summary['nsys_export']['device_record_completeness'] = 'unknown-until-device-record-review'
                     if self.summary['nsys_export']['status'] != 'exported':
                         self.issue('Nsight report absent/incomplete; inspect retained prefixes and export status')
                     observed = self.summary.get('actual_target_mapped_hashes', {})
