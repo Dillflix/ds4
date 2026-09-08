@@ -349,7 +349,12 @@ def validate_case(result, console):
             not result.get("exec_identity_verified") or not result.get("target_exit_observed") or
             result.get("surviving_owned_pids") or not result.get("reader_finished") or
             result.get("log_overflow")):
-        raise RuntimeError("CPU exec/retention supervision failed")
+        detail = "; ".join(result.get("issues", [])) or (
+            "reason=%s exec_verified=%s target_exited=%s survivors=%s reader_finished=%s overflow=%s" %
+            (result.get("reason"), result.get("exec_identity_verified"),
+             result.get("target_exit_observed"), result.get("surviving_owned_pids"),
+             result.get("reader_finished"), result.get("log_overflow")))
+        raise RuntimeError("CPU exec/retention supervision failed: " + detail)
     if result["mode"] == "normal" and (result["profiler_returncode"] != 0 or
             "cpu_fixture_complete=normal" not in console):
         raise RuntimeError("normal CPU fixture did not complete")

@@ -15,11 +15,26 @@ def private_read(path, limit=32768):
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
                 info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > limit):
-            raise ValueError("invalid private gate file")
+            raise ValueError("invalid private gate file: path=%s mode=%04o uid=%s links=%s bytes=%s" %
+                             (path, stat.S_IMODE(info.st_mode), info.st_uid,
+                              info.st_nlink, info.st_size))
         data = stream.read(limit + 1)
         if len(data) > limit:
             raise ValueError("oversized gate file")
         return data.decode("utf-8")
+
+
+def private_json(path, value):
+    """Create private from the first instant, even if the profiler resets umask.
+
+    Do not change umask: exec must preserve the target's inherited process state.
+    O_EXCL also rejects an existing file/symlink instead of replacing evidence.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def fingerprint(path):
@@ -38,10 +53,7 @@ def main():
     fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
     ready = {"pid": os.getpid(), "ppid": os.getppid(), "starttime": int(fields[19]),
              "nonce": config["nonce"], "state": "waiting-before-exec"}
-    with (directory / "gate-ready.json").open("x") as stream:
-        json.dump(ready, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
+    private_json(directory / "gate-ready.json", ready)
     # No CUDA call, library loading, model access or workload initialization.
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
@@ -52,12 +64,9 @@ def main():
             if (not executable.is_absolute() or not stat.S_ISREG(executable.stat().st_mode)
                     or fingerprint(executable) != config["sha256"]):
                 raise ValueError("executable changed before exec")
-            with (directory / "exec-attempt.json").open("x") as stream:
-                json.dump({"pid": os.getpid(), "starttime": int(fields[19]),
-                           "monotonic_ns": time.monotonic_ns(),
-                           "sha256": config["sha256"]}, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
+            private_json(directory / "exec-attempt.json",
+                         {"pid": os.getpid(), "starttime": int(fields[19]),
+                          "monotonic_ns": time.monotonic_ns(), "sha256": config["sha256"]})
             os.execv(str(executable), [str(executable), *config["arguments"]])
         time.sleep(0.02)
     raise TimeoutError("gate was not released; workload not executed")

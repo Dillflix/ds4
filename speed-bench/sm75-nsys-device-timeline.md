@@ -171,6 +171,33 @@ pin the frozen executable and identified runtime stack, admit only its exact
 GPU1 environment, and qualify CUDA/cuBLAS correlation and incomplete device
 records. No new peer experiment, algorithm sweep or production change is implied.
 
+### First retention run: launch-gate permission defect
+
+Archive `sm75-nsys-retention-hjb8qrpk.tar.gz`, SHA-256
+`9bb7d0c21b865b325946f32635eb22f4c8957e2ae2ca8c6e17975fc68cd57a26`,
+contains 41 ordinary members. All 40 manifest artifact hashes/sizes verified;
+no excluded artifacts. The normal case stopped in 2.99 seconds with
+`invalid private gate file`, before admission/release/fixture exec.
+
+The collector-created configuration was mode `0600`, but the launcher's
+`gate-ready.json` was `0666`. The launcher's `Path.open("x")` relied on inherited
+umask rather than requesting private permissions explicitly. The permission
+check correctly rejected that file. No `gate-release`, `exec-attempt.json` or
+CPU fixture readiness exists in the archive. No observed owned processes survived
+cleanup. This is a capture-launcher defect, not a reproduced GPU fault.
+
+The fix creates both launcher JSON records with `os.open` flags
+`O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0600`, before writing. It does not relax the
+reader's owner/mode/type checks, chmod existing evidence, or alter the umask that
+the eventual target inherits. Portable regressions cover the archived `0666`
+failure, explicit creation mode, exclusive creation, both launcher call sites,
+and propagation of the precise saved failure into console output.
+
+The failed run nevertheless retained a 47,219-byte `.qdstrm` prefix and the
+67,453-byte source remaining after shutdown. Their completeness/importability is
+unknown. Final report export and all three completed CPU cases remain unqualified;
+rerun the same CPU-only retention command after applying this fix.
+
 ## Vendor documentation checked
 
 NVIDIA describes buffering/flush controls and warns that event tracing can add

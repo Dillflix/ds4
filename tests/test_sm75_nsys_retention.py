@@ -157,7 +157,7 @@ class RetentionTests(unittest.TestCase):
     def test_private_read_rejects_mode_or_owner_or_size(self):
         path = self.source / "config"
         path.write_bytes(b"{}")
-        for fields in ({"st_mode": stat.S_IFREG | 0o644}, {"st_uid": 2},
+        for fields in ({"st_mode": stat.S_IFREG | 0o644}, {"st_mode": stat.S_IFREG | 0o666}, {"st_uid": 2},
                        {"st_size": 999999}, {"st_nlink": 2}, {"st_mode": stat.S_IFIFO}):
             properties = dict(st_mode=stat.S_IFREG | 0o600, st_nlink=1, st_uid=1, st_size=2)
             properties.update(fields)
@@ -173,6 +173,61 @@ class RetentionTests(unittest.TestCase):
         with patch.object(m.os, "getuid", return_value=1, create=True), \
              patch.object(m.os, "fstat", return_value=info):
             self.assertEqual(m.gate.private_read(path), "{}")
+
+    def test_private_json_requests_0600_exclusively_without_changing_umask(self):
+        path = self.source / "ready.json"
+        real_open = os.open
+        with patch.object(m.gate.os, "open", wraps=real_open) as opened, \
+             patch.object(m.gate.os, "umask") as umask:
+            m.gate.private_json(path, {"state": "waiting-before-exec"})
+        opened.assert_called_once_with(path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        umask.assert_not_called()
+        self.assertEqual(json.loads(path.read_text()), {"state": "waiting-before-exec"})
+
+    def test_private_json_cannot_overwrite_existing_evidence(self):
+        path = self.source / "ready.json"
+        path.write_text("original evidence")
+        with self.assertRaises(FileExistsError):
+            m.gate.private_json(path, {"replacement": True})
+        self.assertEqual(path.read_text(), "original evidence")
+
+    def test_archived_0666_readiness_rejected_with_actionable_details(self):
+        # Native hjb8qrpk archive: the gate's open('x') inherited a permissive
+        # mask; collector config was 0600 but gate-ready.json was 0666.
+        path = self.source / "gate-ready.json"
+        path.write_text('{}')
+        info = Mock(st_mode=stat.S_IFREG | 0o666, st_nlink=1, st_uid=1000, st_size=126)
+        with patch.object(m.os, "getuid", return_value=1000, create=True), \
+             patch.object(m.os, "fstat", return_value=info):
+            with self.assertRaisesRegex(ValueError, "mode=0666 uid=1000"):
+                m.gate.private_read(path)
+
+    def test_both_gate_records_use_explicit_private_writer_before_exec(self):
+        executable = Path(m.sys.executable).resolve()
+        config_path = self.source / "gate-config.json"
+        config = {"executable": str(executable), "sha256": "expected", "nonce": "abc", "arguments": []}
+        (self.source / "gate-release").touch()
+        class ExecReached(Exception):
+            pass
+        with patch.object(m.gate.sys, "argv", ["gate", str(config_path)]), \
+             patch.object(m.gate, "private_read", side_effect=[json.dumps(config), "abc"]), \
+             patch.object(m.gate.Path, "read_text", return_value="10 (gate) S 9 " + "0 " * 17 + "123 0"), \
+             patch.object(m.gate, "fingerprint", return_value="expected"), \
+             patch.object(m.gate, "private_json") as write, \
+             patch.object(m.gate.os, "execv", side_effect=ExecReached) as execute:
+            with self.assertRaises(ExecReached):
+                m.gate.main()
+        self.assertEqual([c.args[0].name for c in write.call_args_list], ["gate-ready.json", "exec-attempt.json"])
+        self.assertEqual(write.call_args_list[0].args[1]["starttime"], 123)
+        self.assertEqual(write.call_args_list[1].args[1]["starttime"], 123)
+        execute.assert_called_once_with(str(executable), [str(executable)])
+
+    def test_console_validation_exposes_saved_session_error(self):
+        case = self.clean_case()
+        case["issues"] = ["invalid private gate file: mode=0666"]
+        with self.assertRaisesRegex(RuntimeError, "mode=0666"):
+            m.validate_case(case, "")
 
     def test_gate_rejects_unowned_or_dead_or_noninteger_pid(self):
         tree = Mock(members={10: ({}, 55)})
