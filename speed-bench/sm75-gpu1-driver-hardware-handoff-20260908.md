@@ -1,7 +1,9 @@
 # GPU1-only PCIe loss: driver and hardware investigation handoff
 
-Prepared 2026-09-08 from the captured 00:36 UTC incident. This is an investigation
-handoff, not a diagnosis of a defective card or authorization to run more tests.
+Prepared 2026-09-08 from the captured 00:36 UTC incident; updated with the
+01:29 UTC inventory and 01:47 UTC BMC follow-up. This remains an evidence-qualified
+investigation handoff, not a complete physical inventory, diagnosis of a defective
+card, or authorization to run more tests. See the inventory/binary supplement.
 No evidence has been submitted externally. Raw logs contain host identifiers,
 serial numbers, process/library paths and older incident history; review before
 posting publicly. Use a private vendor/support channel for the complete package.
@@ -55,10 +57,15 @@ Captured checkout: `039eef3e756412da0d2aec02ae0af835b2a09caf`.
 Frozen Linux executable: `tests/cuda_sm75_token_row_arithmetic`
 SHA-256:
 `5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414`.
-The Linux executable itself is NOT in the original archive. Obtain an exact copy
-from the host if the recipient needs it. Do not rebuild over it. The captured
-checkout is not proof of the compiler or original source commit that produced
-this previously built executable; its hash is the comparison invariant.
+The Linux executable itself is NOT in the original failure archive. Its exact
+14,619,104-byte copy is now preserved in the later inventory archive
+`sm75-investigation-inventory.kzJxuv.tar.gz`, under
+`sm75-investigation-inventory.kzJxuv/artifacts/cuda_sm75_token_row_arithmetic`.
+Inventory archive SHA-256:
+`c968dcaa24e14c3840185ab61b0c584a87cf2660f994599ae81cdcfb4317eb40`.
+The original and copied ELF hashes match the invariant above. Do not rebuild
+over it. Embedded compiler/DWARF evidence now supplies partial build provenance;
+it does not reconstruct every flag or prove the original source revision.
 
 | Evidence | Purpose |
 | --- | --- |
@@ -118,8 +125,21 @@ The owner reports all four GPUs are installed directly in the official ASUS
 ESC4000 G3 GPU cages: two cages, each containing two NVLink-paired GPUs. No
 aftermarket riser is reported; internal cage/backplane interconnect details are
 not independently mapped. VBIOS and clock configuration are unmodified to the
-best of the owner's knowledge. PSU model/capacity, per-card cable arrangement,
-BIOS settings/change history and physical inspection findings remain unconfirmed.
+best of the owner's knowledge. The owner confirms PSU1 is intentionally unplugged,
+and factory chassis fans are installed, connected and running; fan sensors are
+reported unreliable. Do not label expected PSU1 AC-lost/0 W or reported zero fan
+RPM as newly established faults. Other workloads reportedly load all four GPUs
+successfully, countering a simple aggregate-power-shortage explanation without
+establishing this failure's cause. PSU model/rating/input voltage, per-card cable
+arrangement, BIOS settings/change history and inspection findings remain unconfirmed.
+
+BMC firmware is 1.14 (auxiliary 02/00/00/00), ASUS product 0x0e73, IPMI 2.0.
+At 2026-09-08 01:47:26 UTC the BMC and host clocks agree at displayed precision.
+Its SEL has 3,000/3,000 entries, zero free bytes/units, 100% usage and overflow
+flagged. Last addition is 2025-09-07 06:18:23 UTC. Thus absent contemporary BMC
+events cannot exclude power/thermal/PCIe incidents. Do not redate old records,
+clear the log or change firmware as an incidental diagnostic step. DMI PSU
+records contain placeholders; FRU inventory failed with header version 0xff.
 
 Actual mapped runtime files (not merely the CUDA version printed by nvidia-smi):
 
@@ -248,8 +268,9 @@ late-reaping bookkeeping is a separate software issue, not the GPU-loss cause.
 
 Not collected: GPU instruction/API/stream trace; runtime pointer/allocation
 generations; detailed transient rail/power/temperature telemetry; definitive
-firmware-first error record; verified PSU/cable/riser configuration; the original
-ELF itself; exact original compiler provenance. Safe mode skips some dynamic
+firmware-first error record; verified PSU/cable/internal-cage routing; complete
+original build provenance. The ELF has since been preserved and inspected, and
+the full BMC log explains the lack of recent SEL evidence. Safe mode skips some dynamic
 queries. A report file's existence does not guarantee recovery of every internal
 GPU crash dump. These are explicit evidence gaps, not negative results.
 
@@ -309,37 +330,28 @@ See the accompanying software audit/status documents for code-level bounds,
 initialization, scratch ordering, CUDA/cuBLAS support and remaining runtime gaps.
 No root cause is established and no production path is qualified by this handoff.
 
-## 11. Immediate information request without executing CUDA
+## 11. Completed no-workload inventory and remaining gaps
 
-The owner has offered to obtain additional configuration evidence. Existing raw
-logs already contain VBIOS, board identities, reported clocks and PCI registers;
-do not rerun GPU queries just to reproduce those facts. The new host-only
-`collect-sm75-investigation-inventory.sh` instead collects the following gaps:
+The owner ran `collect-sm75-investigation-inventory.sh` with host inventory and
+ELF preservation enabled. It completed in 31 seconds without executing CUDA.
+The original archive remains unchanged. Results are analyzed in
+`sm75-gpu1-inventory-binary-supplement-20260908.md`:
 
-- Read-only DMI BIOS/system/baseboard/PSU records and BMC SEL, power-supply,
-  sensor and FRU records, if the optional tools are already installed.
-- ELF metadata and embedded CUDA code-object lists; installed runtime-package
-  ownership/versions; installed profiling-tool capabilities.
-- Explicit set/unset states for a limited list of relevant environment controls.
-- An optional byte-for-byte copy of the frozen executable, accepted only if the
-  original and copied SHA-256 match the pinned hash and the file is at most 128 MiB.
+- Host metadata is preserved; FRU is the sole failed inventory query. Physical
+  PSU identity/rating/input voltage and cable routing are still not established.
+- The subsequent read-only SEL capacity/clock query explains why current BMC
+  events are unavailable. Repeating an old-log query cannot recover missing events.
+- The exact ELF now supplies SM75 cubin/PTX, compiler-banner/DWARF, ABI dependency,
+  selected host-call disassembly and conversion-kernel SASS evidence.
+- Current runtime packages agree with mapped versions; installed Nsight Systems
+  capabilities are known. Package transaction history/vendor hash verification
+  and historical inherited environment values are not established.
+- Runtime streams, pointers/lifetimes, actual GEMM arguments and library kernel
+  selection remain unmeasured. No peer is needed for these software questions.
 
-This collector does not execute the diagnostic, invoke nvidia-smi, build code,
-install tools, contact a network, retrain/reset links, or alter clocks/services.
-Missing optional tools and query failures are archived as gaps. BMC/firmware
-records do not establish physical cable routing; owner/technician inspection
-may still be needed. Current environment/tool versions cannot reconstruct the
-historical process environment or prove the original compiler version.
-
-After the reviewed script is available in the Linux repository's speed-bench
-directory, the no-workload command is:
-
-```bash
-cd ~/ds4-iq2-q4 &&
-ROOT_HOST_INVENTORY=1 INCLUDE_EXECUTABLE=1 \
-bash ./speed-bench/collect-sm75-investigation-inventory.sh
-```
-
-It may request sudo once for the read-only host queries. Return the printed
-archive to this investigation; do not submit it externally without reviewing
-serial numbers, host identifiers and optional executable build paths.
+No repeat of that inventory or GPU run is requested here. The updated package
+retains explicit gaps rather than treating query success as a complete hardware
+history. A future trace needs a separately reviewed collector mode and stop
+conditions; the current helper's profiler/injection guards remain in force.
+Review host identifiers, serial numbers and executable build paths before any
+external sharing; use a private vendor/support channel for the complete evidence.

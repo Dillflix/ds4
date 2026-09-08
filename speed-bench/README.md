@@ -6382,6 +6382,16 @@ NVIDIA reports. See [GPU1 failure capture](sm75-gpu1-failure-capture.md) for its
 preflight gates, artifacts, command, runtime bounds and interpretation limits.
 `CAPTURE_FAILURE_CONTEXT` defaults to `0`; it changes no production CUDA path.
 
+For the unresolved runtime pointer/lifetime and actual call-order questions,
+see [frozen-ELF runtime-contract tracing](sm75-runtime-contract-trace.md).
+The optional interposer preserves the known GPU1-only workload and executable
+hash; it is a separately labeled instrumented experiment, not a production fix.
+First qualify its loading, ABI forwarding, and parser integration using the
+host-only build/fake-provider script. That step executes no GPU work and archives
+failures as well as successful qualification. Do not substitute a peer run or
+shortened arithmetic workload, and do not equate API coverage with library-internal
+kernel coverage or race freedom.
+
 ```bash
 printf '%s  %s\n' \
   '5c46e8b753855406abd9880d52d6d9361c290f264c0baaa88255c8680aa42414' \

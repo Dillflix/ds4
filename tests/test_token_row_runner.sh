@@ -36,6 +36,7 @@ run_case() {
         SANITIZER_ONLY=1 RUN_SANITIZER=1 SKIP_BUILD=1 CREATE_ARCHIVE=1 \
         SANITIZER_TOOL=memcheck \
         CAPTURE_FAILURE_CONTEXT=0 CASE_TIMEOUT_SECONDS=600 \
+        RUNTIME_CONTRACT_TRACE_LIBRARY= RUNTIME_CONTRACT_TRACE_SHA256= \
         B_TIMING_ROUNDS=7 B_TIMING_REPEATS=10 B_TIMING_WARMUPS=3 \
         OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
         TOKEN_ROW_ARITHMETIC_DIR="$case_dir/output" "$@" \
@@ -161,4 +162,18 @@ for setting in CAPTURE_FAILURE_CONTEXT=2 PROFILE_GPU=0 DIAGNOSTIC_SCOPE=q-b \
     run_case "capture-reject-${setting%%=*}" 1 0 0 CAPTURE_FAILURE_CONTEXT=1 \
         SANITIZER_ONLY=0 RUN_SANITIZER=0 "$setting"
 done
-printf 'All 77 CPU-only runner cases passed. No GPU validation performed.\n'
+trace_hash=1111111111111111111111111111111111111111111111111111111111111111
+run_case capture-runtime-clean 0 1 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so RUNTIME_CONTRACT_TRACE_SHA256="$trace_hash"
+grep -Fxq 'execution_mode=instrumented-runtime-contract' "$test_dir/capture-runtime-clean/output/manifest.txt"
+grep -Fxq 'uninstrumented_runs=0' "$test_dir/capture-runtime-clean/output/manifest.txt"
+grep -Fxq 'runtime-contract-option' "$test_dir/capture-runtime-clean/trace"
+run_case trace-without-capture 1 0 0 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so RUNTIME_CONTRACT_TRACE_SHA256="$trace_hash"
+run_case trace-without-hash 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so
+run_case trace-without-library 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    RUNTIME_CONTRACT_TRACE_SHA256="$trace_hash"
+run_case trace-bad-hash 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so RUNTIME_CONTRACT_TRACE_SHA256=invalid
+printf 'All 82 CPU-only runner cases passed. No GPU validation performed.\n'

@@ -9,6 +9,14 @@ was performed for this review. Proposed execution controls below are **not a
 request to run them now**. GPU loss requires host recovery and a deliberately
 selected, separately approved experiment, not an automatic retry sequence.
 
+Implementation follow-up: `sm75-runtime-contract-trace.md` describes the new
+opt-in, same-ELF application-API instrumentation and its CPU-only qualification
+gate. It measures allocation/view lifetimes, conversion arguments, handle and
+context/stream state, and real call forwarding/completion at the known transition.
+This is concrete instrumentation work, not a declaration that uncollected runtime
+facts are resolved. No instrumented GPU run has yet qualified it; library-internal
+execution requires a separately reviewed timeline experiment.
+
 ## Established runtime, not inferred from nvidia-smi
 
 The archive's `failure-context/process-timeline.jsonl` records the actual mapped
@@ -28,11 +36,14 @@ also in the summary. Mapping a JIT library does not prove that this particular
 kernel was JIT-compiled. Mapping cuBLASLt does not prove the application called
 its API: the reviewed B wrapper calls `cublasGemmEx`.
 
-The manifest records `SKIP_BUILD=1`. The run therefore proves executable
-identity and loaded runtime identity, **not the original NVCC version or
-effective compilation flags**. Current Makefile defaults are not a historical
-build log. Preserve the executable itself before changing toolchains; the
-diagnostic archive contains its fingerprint, not a copy of the binary.
+The manifest records `SKIP_BUILD=1`. The run alone therefore proves executable
+identity and loaded runtime identity, not original compilation flags. The later
+`sm75-investigation-inventory.kzJxuv.tar.gz` now preserves the exact ELF. Offline
+inspection finds an embedded CUDA 13.2.78 compiler banner and GCC 13.3/Broadwell
+DWARF producer information, compatible SM75 cubins/PTX and .so.13 dependencies.
+No RPATH/RUNPATH or PTDS/PTSZ imports were found. This is partial original-build
+evidence, not reconstruction of every flag/source revision. Full findings and
+limits are in `sm75-gpu1-inventory-binary-supplement-20260908.md`.
 
 ### SM75 support and release-note triage
 
@@ -94,9 +105,11 @@ mode, workspace, or algorithm while trying to measure the original failure.
 
 ## Evidence gaps that can be addressed without another GPU workload
 
-1. **Original executable/build provenance.** Obtain the exact pinned binary,
-   then inspect its ELF dependencies, RPATH/RUNPATH, build ID, compiler comment,
-   available DWARF producer fields, and embedded cubin/PTX targets. Use
+1. **Original executable/build provenance: initial inspection completed.** The
+   exact ELF is preserved. Dependencies, search tags, build ID, producer fields,
+   embedded code targets, selected host GEMM adapter and SM75 conversion SASS
+   have been inspected without execution. No defect was identified in that narrow
+   review. Dynamic arguments/library code and full build flags remain open. Use
    `readelf` and `cuobjdump` as file-inspection tools; do not execute the
    reproducer, run `make`, or infer its compiler from today's `nvcc --version`.
    `cuobjdump --list-elf` and `--list-ptx` distinguish embedded code objects;
@@ -161,8 +174,10 @@ guards or disguising the trace as the uninstrumented control.
 
 Nsight Systems can correlate CUDA APIs, kernels, copies, submitting threads,
 contexts and streams, and optionally allocation lifetimes and cuBLAS calls.
-Inspect the installed CLI's help/version before selecting supported options;
-current documentation is not proof of the host's tool version. Candidate
+The inventory now identifies installed version 2025.6.3.541-256337736014v0 and
+preserves its help. It advertises `cuda-sw`, `cublas`, process-tree scope,
+event-trace disablement, all-API/allocation tracking and flush controls. No trace
+mode has yet been run or qualified for this failure. Candidate
 features are CUDA plus cuBLAS tracing, `--cuda-memory-usage=true` and
 `--cuda-trace-all-apis=true`. Disable extra device event-completion tracing when
 testing ordering: NVIDIA warns that it can create false dependencies. Keep
@@ -244,6 +259,6 @@ from runtime failure; an exactness threshold must not conceal a hardware fault.
 - Driver/hardware investigation and software audit remain parallel: a PCIe
   Surprise Down event does not by itself exonerate software, and a library call
   preceding the error does not identify the physical fault's initiator.
-- No software avenue is declared exhausted. Unavailable runtime trace, original
-  binary inspection, package provenance, and vendor-private driver/cuBLAS
+- No software avenue is declared exhausted. Unavailable runtime trace, remaining
+  compiled-code/library inspection, package provenance, and vendor-private driver/cuBLAS
   investigation are explicitly pending; none justifies an unplanned reboot loop.

@@ -14,6 +14,8 @@ SANITIZER_TOOL=${SANITIZER_TOOL:-memcheck}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CAPTURE_FAILURE_CONTEXT=${CAPTURE_FAILURE_CONTEXT:-0}
+RUNTIME_CONTRACT_TRACE_LIBRARY=${RUNTIME_CONTRACT_TRACE_LIBRARY:-}
+RUNTIME_CONTRACT_TRACE_SHA256=${RUNTIME_CONTRACT_TRACE_SHA256:-}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
 CASE_TIMEOUT_SECONDS=${CASE_TIMEOUT_SECONDS:-600}
 OUTPUT_AB_REPEAT_CALLS=${OUTPUT_AB_REPEAT_CALLS:-256}
@@ -100,6 +102,11 @@ if (( CAPTURE_FAILURE_CONTEXT )); then
     (( CASE_TIMEOUT_SECONDS <= 600 )) || die "failure capture timeout must not exceed 600 seconds"
     command -v python3 >/dev/null 2>&1 || die "python3 not found"
 fi
+if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY || -n $RUNTIME_CONTRACT_TRACE_SHA256 ]]; then
+    [[ $CAPTURE_FAILURE_CONTEXT == 1 && -n $RUNTIME_CONTRACT_TRACE_LIBRARY &&
+       $RUNTIME_CONTRACT_TRACE_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
+        die "runtime contract tracing requires failure capture, an explicit library and its lowercase SHA256"
+fi
 for tool in cat date env git grep journalctl make mkdir nproc nvidia-smi sudo tail tar timeout; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -160,7 +167,11 @@ phase=manifest
         "$RUN_SANITIZER" "$SANITIZER_ONLY" "$SKIP_BUILD"
     printf 'sanitizer_tool=%s\n' "$SANITIZER_TOOL"
     printf 'capture_failure_context=%s\n' "$CAPTURE_FAILURE_CONTEXT"
-    if (( SANITIZER_ONLY )); then
+    if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY ]]; then
+        printf 'execution_mode=instrumented-runtime-contract\nuninstrumented_runs=0\n'
+        printf 'runtime_contract_trace_library=%s\nruntime_contract_trace_sha256=%s\n' \
+            "$RUNTIME_CONTRACT_TRACE_LIBRARY" "$RUNTIME_CONTRACT_TRACE_SHA256"
+    elif (( SANITIZER_ONLY )); then
         printf 'execution_mode=%s-full-selected-scope\nuninstrumented_runs=0\nsanitizer_smoke=0\n' \
             "$SANITIZER_TOOL"
     else
@@ -284,7 +295,13 @@ if (( CAPTURE_FAILURE_CONTEXT )); then
     sha256sum "./$target" >"$OUTPUT_DIR/provenance/diagnostic-sha256.txt"
     diagnostic_prefix=(python3 "$repo_dir/speed-bench/capture-sm75-gpu1-failure.py"
         --output "$OUTPUT_DIR/failure-context" --executable "./$target"
-        --case-timeout "$CASE_TIMEOUT_SECONDS" --)
+        --case-timeout "$CASE_TIMEOUT_SECONDS")
+    if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY ]]; then
+        phase=runtime-contract-capture
+        diagnostic_prefix+=(--runtime-trace-library "$RUNTIME_CONTRACT_TRACE_LIBRARY"
+            --runtime-trace-sha256 "$RUNTIME_CONTRACT_TRACE_SHA256")
+    fi
+    diagnostic_prefix+=(--)
 fi
 printf '%q ' "${diagnostic_prefix[@]}" \
     "${clean_env[@]}" "${diagnostic_command[@]}" >"$OUTPUT_DIR/provenance/diagnostic-command.txt"

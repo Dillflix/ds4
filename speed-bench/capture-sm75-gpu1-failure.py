@@ -7,11 +7,14 @@ The caller retains the existing workload validation and outer archive trap.
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -23,6 +26,64 @@ GPU1_UUID = "GPU-ba2c2d0b-6320-580f-208c-59e548ac9227"
 ENDPOINTS = ["0000:02:00.0", "0000:03:00.0", "0000:81:00.0", "0000:82:00.0"]
 ROOT_PORTS = ["0000:00:02.0", "0000:00:03.0", "0000:80:02.0", "0000:80:03.0"]
 RETRAIN_UNIT = "retrain-gpu2-rootport.service"
+TRACE_LIMIT = 64 * 1024 * 1024
+TRACE_ENV = "DS4_RUNTIME_TRACE_LOG"
+RUNTIME_CONTROLS = ("CUDA_MODULE_LOADING", "CUDA_FORCE_PTX_JIT", "CUDA_DISABLE_PTX_JIT",
+                    "CUDA_DEVICE_MAX_CONNECTIONS", "CUDA_DEVICE_ORDER", "CUDA_VISIBLE_DEVICES",
+                    "CUDA_LAUNCH_BLOCKING", "NVIDIA_TF32_OVERRIDE", "CUBLAS_WORKSPACE_CONFIG",
+                    "LD_LIBRARY_PATH")
+
+
+def valid_preload_path(path):
+    return not re.search(r"[\s:]", str(path))
+
+
+def trace_child_command(command, executable, inherited):
+    """Decode only our runner's env form; never preload a shell/env/profiler.
+
+    The original pinned ELF remains the directly owned PID. Reject alternate workloads,
+    arguments and selectors instead of tracing an accidental reduced test.
+    """
+    if not command or command[0] not in ("env", "/usr/bin/env", "/bin/env"):
+        raise ValueError("runtime trace requires the runner's explicit env command")
+    child_env = dict(inherited)
+    index = 1
+    while index < len(command):
+        item = command[index]
+        if item == "-u":
+            if index + 1 >= len(command) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", command[index + 1]):
+                raise ValueError("invalid env unset in runtime trace command")
+            child_env.pop(command[index + 1], None)
+            index += 2
+        elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", item):
+            key, value = item.split("=", 1)
+            if key in ("LD_PRELOAD", "LD_AUDIT", "CUDA_INJECTION64_PATH", "CUDA_ENABLE_COREDUMP_ON_EXCEPTION") or key.startswith(
+                    ("DS4_RUNTIME_TRACE", "CUBLAS_LOG", "CUPTI_", "NV_COMPUTE_SANITIZER")):
+                raise ValueError("runtime trace command contains unrelated instrumentation")
+            child_env[key] = value
+            index += 1
+        else:
+            break
+    if len(command[index:]) != 1 or Path(command[index]).resolve() != Path(executable).resolve():
+        raise ValueError("runtime trace must directly execute the pinned ELF without arguments")
+    expected = {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1",
+        "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_NO_ROW_OWNED": "1",
+        "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_CALLS": "1024",
+        "DS4_TOKEN_ROW_ARITHMETIC_OUTPUT_B_PRODUCTION103_BATCH": "10",
+        "B_TIMING_ROUNDS": "7", "B_TIMING_REPEATS": "10", "B_TIMING_WARMUPS": "3",
+    }
+    for key, value in expected.items():
+        if child_env.get(key) != value:
+            raise ValueError("runtime trace workload contract mismatch: " + key)
+    if any(key.startswith("DS4_") and key not in expected for key in child_env):
+        raise ValueError("runtime trace workload contains an extra DS4 selector")
+    if child_env.get("CUDA_LAUNCH_BLOCKING"):
+        raise ValueError("runtime trace must not add launch blocking")
+    # Physical identity was established by the same preflight inventory. UUID
+    # selection avoids another ordinal namespace in the interposer's observations.
+    child_env["CUDA_VISIBLE_DEVICES"] = GPU1_UUID
+    return [str(Path(executable).resolve())], child_env
 
 
 def normalize_boot_id(value):
@@ -65,12 +126,17 @@ def fault_event(line):
 
 
 class Capture:
-    def __init__(self, output, executable, command, case_timeout, preflight_only=False):
+    def __init__(self, output, executable, command, case_timeout, preflight_only=False,
+                 runtime_trace_library=None, runtime_trace_sha256=None):
         self.output = Path(output)
         self.executable = Path(executable).resolve()
         self.command = command
         self.case_timeout = case_timeout
         self.preflight_only = preflight_only
+        self.runtime_trace_library = Path(runtime_trace_library) if runtime_trace_library else None
+        self.runtime_trace_sha256 = runtime_trace_sha256
+        self.trace_command = None
+        self.trace_environment = None
         self.summary = {"workload": "not-started", "workload_returncode": None,
                         "collection": "in-progress", "started": stamp(),
                         "first_fault": None, "commands": [], "issues": []}
@@ -83,6 +149,110 @@ class Capture:
         self.workload_process = None
         self.boot_id = None
         self.sudo_refresh_seconds = 60
+
+    def prepare_runtime_trace(self):
+        if self.runtime_trace_library is None:
+            if self.runtime_trace_sha256:
+                raise ValueError("runtime trace SHA requires an explicit library")
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", self.runtime_trace_sha256 or ""):
+            raise ValueError("runtime trace requires an explicit lowercase SHA256")
+        source = self.runtime_trace_library
+        if source.is_symlink():
+            raise ValueError("runtime trace library must not be a symlink")
+        source = source.resolve(strict=True)
+        info = source.stat()
+        if (not stat.S_ISREG(info.st_mode) or not 64 <= info.st_size <= TRACE_LIMIT
+                or info.st_mode & 0o022 or info.st_uid not in (0, os.getuid())):
+            raise ValueError("runtime trace library must be a bounded, trusted-owner, non-group/world-writable file")
+        with source.open("rb") as stream:
+            header = stream.read(20)
+        if (header[:6] != b"\x7fELF\x02\x01" or header[16:20] != b"\x03\x00\x3e\x00"):
+            raise ValueError("runtime trace library must be an ELF64 x86-64 shared object")
+        if sha256(source) != self.runtime_trace_sha256:
+            raise ValueError("runtime trace library fingerprint mismatch")
+        argv, environment = trace_child_command(self.command, self.executable, os.environ)
+        directory = self.output / "runtime-trace"
+        directory.mkdir(mode=0o700, exist_ok=False)
+        copied = directory / "sm75-runtime-contract-trace.so"
+        with source.open("rb") as src, copied.open("xb") as dst:
+            shutil.copyfileobj(src, dst)
+        copied.chmod(0o500)
+        if sha256(copied) != self.runtime_trace_sha256:
+            raise ValueError("runtime trace copied-library fingerprint mismatch")
+        # Dynamic loader treats spaces/colons as LD_PRELOAD list delimiters.
+        if not valid_preload_path(copied.resolve()):
+            raise ValueError("runtime trace output path cannot contain whitespace or colons")
+        log_path = directory / "runtime-contract.jsonl"
+        environment["LD_PRELOAD"] = str(copied.resolve())
+        environment[TRACE_ENV] = str(log_path.resolve())
+        self.trace_command, self.trace_environment = argv, environment
+        self.summary["runtime_trace"] = {
+            "mode": "instrumented-runtime-contract", "library_source": str(source),
+            "library_copy": str(copied.resolve()), "library_sha256": self.runtime_trace_sha256,
+            "log": str(log_path.resolve()), "direct_workload_pid": True,
+            "added_device_synchronization": False,
+            "claims": "application API observations; not all internal library activity or a general race detector",
+        }
+        self.summary["execution_mode"] = "instrumented-runtime-contract"
+        self.summary["effective_runtime_controls"] = {
+            key: {"set": key in environment, "value": environment.get(key)} for key in RUNTIME_CONTROLS}
+        self.save()
+
+    def finalize_runtime_trace(self):
+        if self.trace_command is None or self.workload_process is None:
+            return
+        path = self.output / "runtime-trace/runtime-contract.jsonl"
+        if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= TRACE_LIMIT:
+            self.issue("runtime contract trace missing, invalid or oversized; no trace clearance")
+            return
+        detail = self.summary["runtime_trace"]
+        # Freeze exactly a bounded prefix before hashing/parsing. A faulted child
+        # may still be alive after stop bounds; never label a moving log immutable.
+        size = path.stat().st_size
+        if not 0 < size <= TRACE_LIMIT:
+            self.issue("runtime contract trace changed beyond its size bound")
+            return
+        snapshot = path.with_name("runtime-contract.snapshot.jsonl")
+        state = self.workload_process.poll()
+        detail.update({"snapshot_start": stamp(), "raw_bytes_at_snapshot_start": size,
+                       "child_returncode_at_snapshot": state, "snapshot_of_live_child": state is None})
+        try:
+            with path.open("rb") as source, snapshot.open("xb") as frozen:
+                remaining = size
+                while remaining:
+                    block = source.read(min(remaining, 1024 * 1024))
+                    if not block:
+                        raise RuntimeError("runtime trace shrank during snapshot")
+                    frozen.write(block)
+                    remaining -= len(block)
+            detail.update({"trace_bytes": size, "trace_sha256": sha256(snapshot),
+                           "analyzed_snapshot": str(snapshot), "snapshot_end": stamp()})
+        except Exception as error:
+            self.issue("runtime trace snapshot unavailable: " + str(error))
+            return
+        analyzer = Path(__file__).with_name("analyze-sm75-runtime-contract.py")
+        try:
+            spec = importlib.util.spec_from_file_location("sm75_runtime_contract_analysis", analyzer)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            analysis = module.analyze_file(snapshot)
+            (path.parent / "analysis.json").write_text(json.dumps(analysis, indent=2) + "\n", encoding="utf-8")
+            detail["analysis"] = "runtime-trace/analysis.json"
+            detail["analysis_status"] = analysis.get("status")
+            if analysis.get("process_ids") != [self.workload_process.pid]:
+                self.issue("runtime trace PID does not match the directly owned frozen ELF")
+            if not analysis.get("required_capture_present") or not analysis.get("trace_complete"):
+                self.issue("runtime trace coverage/envelope incomplete; retained as partial evidence")
+            if not analysis.get("expected_transition", {}).get("expected_transition_required_present"):
+                self.issue("runtime trace did not establish the required DEFAULT512-to-103/256 transition")
+            if not analysis.get("expected_transition", {}).get("postburnin_transition_required_present"):
+                self.issue("runtime trace did not establish the qualified post-burn-in DEFAULT512-to-103/256 transition")
+            if analysis.get("violations"):
+                self.issue("runtime trace recorded contract violations; inspect analysis.json")
+        except Exception as error:
+            self.issue("runtime trace analysis unavailable: " + str(error))
+        self.save()
 
     def journal_command(self, *arguments):
         # -b has an optional argument: an unrecognized following UUID can be
@@ -195,10 +365,14 @@ class Capture:
         # These alter execution/tooling and do not belong in this uninstrumented
         # comparison. Never dump the whole environment (which can hold secrets).
         forbidden = [key for key in os.environ if
-                     key in ("LD_PRELOAD", "CUDA_INJECTION64_PATH", "CUDA_ENABLE_COREDUMP_ON_EXCEPTION")
+                     key in ("LD_PRELOAD", "LD_AUDIT", "CUDA_INJECTION64_PATH", "CUDA_ENABLE_COREDUMP_ON_EXCEPTION")
                      or key.startswith(("CUBLAS_LOG", "CUPTI_", "NV_COMPUTE_SANITIZER"))]
         if any(os.environ[key] for key in forbidden):
             raise RuntimeError("remove inherited instrumentation: " + ", ".join(forbidden))
+        if any(key.startswith("DS4_RUNTIME_TRACE") and value for key, value in os.environ.items()):
+            raise RuntimeError("remove inherited runtime trace controls; use the explicit collector option")
+        self.summary["execution_mode"] = "uninstrumented-frozen-reproducer"
+        self.prepare_runtime_trace()
         self.required("pre/sudo", ["sudo", "-n", "true"], seconds=5)
         self.required("pre/report-tool", ["sh", "-c", "command -v nvidia-bug-report.sh"], root=True)
         services = self.required("pre/dcgm", ["snap", "services", "dcgm"])
@@ -315,8 +489,18 @@ class Capture:
     def execute(self):
         if self.fault.is_set() or self.interrupted.is_set():
             raise RuntimeError("fault or interrupt arrived before workload launch")
-        process = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+        if self.trace_command is not None:
+            # Detect changes between preflight and launch without executing a
+            # preliminary CUDA check or preloading any host collector subprocess.
+            if (sha256(self.executable) != EXPECTED_SHA256 or
+                sha256(self.summary["runtime_trace"]["library_copy"]) != self.runtime_trace_sha256):
+                raise RuntimeError("runtime trace artifacts changed after preflight")
+            process = subprocess.Popen(self.trace_command, env=self.trace_environment,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        else:
+            process = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
         self.workload_process = process
         self.summary.update({"workload": "running", "workload_pid": process.pid,
                              "workload_start": stamp()})
@@ -440,6 +624,7 @@ class Capture:
         if self.stream_error.is_set():
             self.issue("a live capture stream failed; partial evidence retained")
         self.observe_final_workload_status()
+        self.finalize_runtime_trace()
         self.summary["collection"] = "partial" if self.summary["issues"] else "complete"
         self.summary["finished"] = stamp()
         self.save()
@@ -493,12 +678,15 @@ def main():
     parser.add_argument("--case-timeout", type=int, required=True)
     parser.add_argument("--preflight-only", action="store_true",
                         help="validate host collectors and exit without launching the CUDA executable")
+    parser.add_argument("--runtime-trace-library", help="explicit opt-in to one instrumented frozen-ELF run")
+    parser.add_argument("--runtime-trace-sha256", help="required SHA256 of the separately built host interposer")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if (not command and not args.preflight_only) or not 1 <= args.case_timeout <= 600:
         parser.error("one command and a timeout of 1..600 seconds are required")
-    capture = Capture(args.output, args.executable, command, args.case_timeout, args.preflight_only)
+    capture = Capture(args.output, args.executable, command, args.case_timeout, args.preflight_only,
+                      args.runtime_trace_library, args.runtime_trace_sha256)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: capture.interrupted.set())
     return capture.capture()

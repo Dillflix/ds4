@@ -17,11 +17,19 @@ case $tool in
         # tests; this double cannot execute any OS/GPU collection commands.
         [[ $1 == */capture-sm75-gpu1-failure.py && $2 == --output &&
            $4 == --executable && $5 == ./tests/cuda_sm75_token_row_arithmetic &&
-           $6 == --case-timeout && $8 == -- ]]
+           $6 == --case-timeout ]]
         mkdir -p "$3"
         printf '{"collection":"mock-partial-evidence"}\n' >"$3/summary.json"
         [[ $MOCK_CASE != preflight ]] || exit 2
-        shift 8
+        shift 7
+        if [[ ${1:-} == --runtime-trace-library ]]; then
+            [[ $2 == /mock/tracer.so && $3 == --runtime-trace-sha256 &&
+               $4 == 1111111111111111111111111111111111111111111111111111111111111111 ]]
+            printf 'runtime-contract-option\n' >>"$MOCK_TRACE"
+            shift 4
+        fi
+        [[ $1 == -- ]]
+        shift
         MOCK_CAPTURE_MODE=1 "$@"
         ;;
     journalctl)
