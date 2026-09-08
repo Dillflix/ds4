@@ -1,8 +1,9 @@
 # GPU1 device timeline: qualification before GPU execution
 
-Status: **host-only supervision qualification implemented; CUDA capture is not
-yet enabled or qualified.** The original runner, frozen ELF and production code
-are unchanged. Do not wrap the reproducer in an ad-hoc `nsys profile` command.
+Status: **native host-only supervision passed; exec/retention/export integration
+implemented, awaiting native CPU-only qualification. CUDA capture is not enabled
+or qualified.** The original runner, frozen ELF and production code are unchanged.
+Do not wrap the reproducer in an ad-hoc `nsys profile` command.
 
 The [03:42 UTC trace](sm75-gpu1-runtime-capture-findings-20260908.md) establishes
 recorded caller contracts and DEFAULT completion, but cannot distinguish the
@@ -97,6 +98,78 @@ archive is the next evidence, not another full reproducer run.
    correct proprietary workspace contents. Exposed allocations do not establish
    semantic workspace ownership. Keep vendor-side library/driver investigation
    open alongside the exact local reproducer.
+
+## Native supervision evidence and next integration gate
+
+`sm75-nsys-host-yxpwbwlx.tar.gz` (SHA-256
+`ce10ae93c54d855a01a2eaafc1bbb759a50714020779f8c0b45b60332175b097`)
+passed the normal, abrupt and timeout CPU cases on installed Nsight
+2025.6.3.541. All 28 artifact hashes and the captured source copies matched.
+Actual target identity/ancestry was verified; there were no observed owned
+survivors. Each case emitted a final report. **The temporary `.qdstrm` paths
+printed in the logs were outside the archived tree.** Those reports were not
+exported by that gate. A successful final report does not establish retention
+when a GPU/driver failure prevents report finalization.
+
+The next script is `qualify-sm75-nsys-retention.py`, not another GPU reproducer.
+It has no user-selectable workload, peer, CUDA tracing, sudo, build or service
+control. It uses the same fixed three CPU fixtures and qualified pidfd ownership
+code, adding the following independently testable behaviors:
+
+- Launch Python through `sm75-nsys-launch-gate.py`. The gate waits without CUDA
+  work. Verify ancestry, live PID/starttime/UID, command line, Python executable
+  and nonce before release. The gate checks the executable hash again and uses
+  `execv`, preserving PID/starttime. Verify that same identity at fixture readiness.
+- Keep `profiler_returncode` separate from `target_exit_observed`. The target is
+  a grandchild: `target_exit_code` remains null, not a copied profiler code.
+  Normal-case success additionally requires the fixture's completion marker.
+- Set both `NSYS_TMPDIR` and Linux `TMPDIR` in the child environment to a private
+  `live-tmp` folder. No parent/global environment changes. Poll every 100 ms for
+  temporary-file changes and retain latest bounded prefixes even after Nsight
+  removes the original. This polling/copying is instrumentation overhead.
+- Prefix limits: 16 MiB/file, 128 MiB retained total, 64 observed paths. Prefixes
+  are explicitly **nontransactional, completeness unknown**; rewrites, size,
+  truncation and source changes during copy are recorded. No claim that a prefix
+  can be imported or that an unrecorded kernel never executed. Live originals and
+  final reports are also archived when confined ordinary files meet archive caps.
+  Periodic bounds are not a filesystem quota or guaranteed tail preservation.
+- Copy final reports before exporting them to SQLite with a 60-second bound.
+  Retain export status, report/database hashes and actual table/column metadata;
+  do not invent a CUDA schema from a CPU-only report. Absent/failed exports fail
+  the gate. No nonempty `.qdstrm` prefix retained across the cases also fails the
+  gate; merely retaining a lock or configuration file does not qualify retention.
+- Record observed profiler executable/library paths and hashes. Coverage is
+  explicitly incomplete for short-lived processes and CUDA injection components.
+  This is evidence for future stack pinning, not a complete bundle attestation.
+
+Run after this change is pushed and pulled:
+
+```bash
+(
+cd ~/ds4-iq2-q4 || exit
+git switch agent/sm75-row-owned-attention || exit
+git pull --ff-only || exit
+python3 -I ./speed-bench/qualify-sm75-nsys-retention.py
+)
+```
+
+Return `sm75-nsys-retention-*.tar.gz`, including a failed qualification. **No
+cold restart or GPU workload is needed.** Metadata commands are bounded at
+20 seconds each; each CPU case and each export at 60 seconds, plus bounded
+cleanup (roughly eight minutes worst-case before archiving; normally much less).
+No automatic retries. A pass still leaves `gpu_capture_qualified=false`.
+
+Portable tests (CPU mocks on the development host):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_sm75_nsys*.py'
+```
+
+Remaining production integration is deliberately not enabled by this gate:
+connect actual-target maps/fault stopping to the existing journal/PCI collector,
+pin the frozen executable and identified runtime stack, admit only its exact
+GPU1 environment, and qualify CUDA/cuBLAS correlation and incomplete device
+records. No new peer experiment, algorithm sweep or production change is implied.
 
 ## Vendor documentation checked
 
