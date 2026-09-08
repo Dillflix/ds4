@@ -1,9 +1,10 @@
 # GPU1 device timeline: qualification before GPU execution
 
-Status: **native host-only supervision passed; exec/retention/export integration
-implemented, awaiting native CPU-only qualification. CUDA capture is not enabled
-or qualified.** The original runner, frozen ELF and production code are unchanged.
-Do not wrap the reproducer in an ad-hoc `nsys profile` command.
+Status: **native CPU-only supervision and exec/retention/export qualification
+passed. Opt-in frozen-collector integration is implemented; integrated host
+preflight and CUDA correlation/GPU-loss retention remain unqualified.** See
+[integrated preflight](sm75-nsys-frozen-capture.md) for the next command. The frozen
+ELF and production code are unchanged. Do not use an ad-hoc `nsys profile` wrapper.
 
 The [03:42 UTC trace](sm75-gpu1-runtime-capture-findings-20260908.md) establishes
 recorded caller contracts and DEFAULT completion, but cannot distinguish the
@@ -153,7 +154,9 @@ python3 -I ./speed-bench/qualify-sm75-nsys-retention.py
 )
 ```
 
-Return `sm75-nsys-retention-*.tar.gz`, including a failed qualification. **No
+Historical qualification command above; `sm75-nsys-retention-18q7z_z2.tar.gz`
+has now passed and does not need repeating. Return `sm75-nsys-retention-*.tar.gz`,
+including a failed qualification, when explicitly investigating a changed gate. **No
 cold restart or GPU workload is needed.** Metadata commands are bounded at
 20 seconds each; each CPU case and each export at 60 seconds, plus bounded
 cleanup (roughly eight minutes worst-case before archiving; normally much less).

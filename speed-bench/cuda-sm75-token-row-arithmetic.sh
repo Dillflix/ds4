@@ -14,6 +14,9 @@ SANITIZER_TOOL=${SANITIZER_TOOL:-memcheck}
 SKIP_BUILD=${SKIP_BUILD:-0}
 CREATE_ARCHIVE=${CREATE_ARCHIVE:-1}
 CAPTURE_FAILURE_CONTEXT=${CAPTURE_FAILURE_CONTEXT:-0}
+NSYS_CAPTURE=${NSYS_CAPTURE:-0}
+NSYS_PREFLIGHT_ONLY=${NSYS_PREFLIGHT_ONLY:-0}
+NSYS_QUALIFICATION_ARCHIVE=${NSYS_QUALIFICATION_ARCHIVE:-}
 RUNTIME_CONTRACT_TRACE_LIBRARY=${RUNTIME_CONTRACT_TRACE_LIBRARY:-}
 RUNTIME_CONTRACT_TRACE_SHA256=${RUNTIME_CONTRACT_TRACE_SHA256:-}
 DIAGNOSTIC_SCOPE=${DIAGNOSTIC_SCOPE:-full}
@@ -64,7 +67,7 @@ if [[ $DIAGNOSTIC_SCOPE == output-ab-native-repeat ||
     (( OUTPUT_AB_REPEAT_CALLS >= 2 )) ||
         die "OUTPUT_AB_REPEAT_CALLS must be at least 2 in repeat scope"
 fi
-for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE CAPTURE_FAILURE_CONTEXT; do
+for flag in RUN_SANITIZER SANITIZER_ONLY SKIP_BUILD CREATE_ARCHIVE CAPTURE_FAILURE_CONTEXT NSYS_CAPTURE NSYS_PREFLIGHT_ONLY; do
     value=${!flag}
     [[ $value == 0 || $value == 1 ]] || die "$flag must be 0 or 1"
 done
@@ -107,6 +110,14 @@ if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY || -n $RUNTIME_CONTRACT_TRACE_SHA256 ]]
        $RUNTIME_CONTRACT_TRACE_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
         die "runtime contract tracing requires failure capture, an explicit library and its lowercase SHA256"
 fi
+if (( NSYS_CAPTURE )); then
+    [[ $CAPTURE_FAILURE_CONTEXT == 1 && -n $NSYS_QUALIFICATION_ARCHIVE &&
+       -z $RUNTIME_CONTRACT_TRACE_LIBRARY && -z $RUNTIME_CONTRACT_TRACE_SHA256 ]] ||
+        die "Nsight requires frozen failure capture, qualification archive, and no runtime interposer"
+elif [[ -n $NSYS_QUALIFICATION_ARCHIVE ]]; then
+    die "NSYS_QUALIFICATION_ARCHIVE requires NSYS_CAPTURE=1"
+fi
+(( NSYS_PREFLIGHT_ONLY == 0 || NSYS_CAPTURE == 1 )) || die "NSYS_PREFLIGHT_ONLY requires NSYS_CAPTURE=1"
 for tool in cat date env git grep journalctl make mkdir nproc nvidia-smi sudo tail tar timeout; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -167,7 +178,11 @@ phase=manifest
         "$RUN_SANITIZER" "$SANITIZER_ONLY" "$SKIP_BUILD"
     printf 'sanitizer_tool=%s\n' "$SANITIZER_TOOL"
     printf 'capture_failure_context=%s\n' "$CAPTURE_FAILURE_CONTEXT"
-    if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY ]]; then
+    if (( NSYS_CAPTURE )); then
+        printf 'execution_mode=instrumented-nsys-frozen-gpu1\nuninstrumented_runs=0\n'
+        printf 'nsys_preflight_only=%s\n' "$NSYS_PREFLIGHT_ONLY"
+        printf 'nsys_qualification_archive=%s\n' "$NSYS_QUALIFICATION_ARCHIVE"
+    elif [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY ]]; then
         printf 'execution_mode=instrumented-runtime-contract\nuninstrumented_runs=0\n'
         printf 'runtime_contract_trace_library=%s\nruntime_contract_trace_sha256=%s\n' \
             "$RUNTIME_CONTRACT_TRACE_LIBRARY" "$RUNTIME_CONTRACT_TRACE_SHA256"
@@ -296,6 +311,18 @@ if (( CAPTURE_FAILURE_CONTEXT )); then
     diagnostic_prefix=(python3 "$repo_dir/speed-bench/capture-sm75-gpu1-failure.py"
         --output "$OUTPUT_DIR/failure-context" --executable "./$target"
         --case-timeout "$CASE_TIMEOUT_SECONDS")
+    if (( NSYS_CAPTURE )); then
+        phase=nsys-failure-capture
+        diagnostic_prefix=(python3 "$repo_dir/speed-bench/capture-sm75-nsys.py"
+            --output "$OUTPUT_DIR/failure-context" --executable "./$target"
+            --case-timeout "$CASE_TIMEOUT_SECONDS"
+            --qualification-archive "$NSYS_QUALIFICATION_ARCHIVE")
+        if (( NSYS_PREFLIGHT_ONLY )); then
+            diagnostic_prefix+=(--preflight-only)
+        else
+            diagnostic_prefix+=(--run-frozen-gpu1)
+        fi
+    fi
     if [[ -n $RUNTIME_CONTRACT_TRACE_LIBRARY ]]; then
         phase=runtime-contract-capture
         diagnostic_prefix+=(--runtime-trace-library "$RUNTIME_CONTRACT_TRACE_LIBRARY"
@@ -324,6 +351,11 @@ capture_gpu_health "$OUTPUT_DIR/health/post-gpu.csv" || {
 if (( diagnostic_status != 0 )); then
     tail -n 240 "$OUTPUT_DIR/diagnostic.log" >&2
     die "token-row arithmetic diagnostic failed with status $diagnostic_status"
+fi
+if (( NSYS_PREFLIGHT_ONLY )); then
+    phase=nsys-preflight-complete
+    printf 'Nsight integrated preflight complete; GPU executable not launched.\n'
+    exit 0
 fi
 if (( SANITIZER_ONLY )); then
     summary_name=ERROR

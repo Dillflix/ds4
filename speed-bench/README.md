@@ -6388,11 +6388,13 @@ see [frozen-ELF runtime-contract tracing](sm75-runtime-contract-trace.md).
 The 2026-09-08 03:42 UTC capture reproduced the loss with recorded in-range
 operands and completed DEFAULT synchronization; see the
 [runtime capture findings](sm75-gpu1-runtime-capture-findings-20260908.md).
-Native [host-only Nsight supervision qualification](sm75-nsys-device-timeline.md)
-has passed. The next CPU-only gate verifies exec admission, temporary-prefix
-retention and bounded SQLite export using `qualify-sm75-nsys-retention.py`, with
-all API tracing disabled. It does not run the reproducer or enable GPU timeline
-capture yet. Do not infer race freedom from these checks.
+Native [host-only Nsight supervision/retention qualification](sm75-nsys-device-timeline.md)
+has passed, including exec admission, temporary prefixes and SQLite export. The
+next step is [integrated host preflight](sm75-nsys-frozen-capture.md):
+`NSYS_CAPTURE=1 NSYS_PREFLIGHT_ONLY=1` checks the frozen collector, receipt and
+runtime stack without launching the GPU executable. Actual Nsight execution is
+opt-in and remains unqualified for CUDA correlation/GPU-loss retention. Default
+behavior is unchanged. Do not infer race freedom from these checks.
 The optional interposer preserves the known GPU1-only workload and executable
 hash; it is a separately labeled instrumented experiment, not a production fix.
 First qualify its loading, ABI forwarding, and parser integration using the

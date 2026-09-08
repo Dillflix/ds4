@@ -15,13 +15,23 @@ case $tool in
     python3)
         # Test runner-to-helper wiring only. The real helper has its own Python
         # tests; this double cannot execute any OS/GPU collection commands.
-        [[ $1 == */capture-sm75-gpu1-failure.py && $2 == --output &&
+        [[ ( $1 == */capture-sm75-gpu1-failure.py || $1 == */capture-sm75-nsys.py ) && $2 == --output &&
            $4 == --executable && $5 == ./tests/cuda_sm75_token_row_arithmetic &&
            $6 == --case-timeout ]]
         mkdir -p "$3"
         printf '{"collection":"mock-partial-evidence"}\n' >"$3/summary.json"
         [[ $MOCK_CASE != preflight ]] || exit 2
         shift 7
+        if [[ ${1:-} == --qualification-archive ]]; then
+            [[ $2 == /mock/qualified.tar.gz ]]
+            [[ $3 == --run-frozen-gpu1 || $3 == --preflight-only ]]
+            printf 'nsys-capture-option\n' >>"$MOCK_TRACE"
+            if [[ $3 == --preflight-only ]]; then
+                printf 'nsys-preflight-no-launch\n' >>"$MOCK_TRACE"
+                exit 0
+            fi
+            shift 3
+        fi
         if [[ ${1:-} == --runtime-trace-library ]]; then
             [[ $2 == /mock/tracer.so && $3 == --runtime-trace-sha256 &&
                $4 == 1111111111111111111111111111111111111111111111111111111111111111 ]]

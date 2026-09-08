@@ -36,6 +36,7 @@ run_case() {
         SANITIZER_ONLY=1 RUN_SANITIZER=1 SKIP_BUILD=1 CREATE_ARCHIVE=1 \
         SANITIZER_TOOL=memcheck \
         CAPTURE_FAILURE_CONTEXT=0 CASE_TIMEOUT_SECONDS=600 \
+        NSYS_CAPTURE=0 NSYS_PREFLIGHT_ONLY=0 NSYS_QUALIFICATION_ARCHIVE= \
         RUNTIME_CONTRACT_TRACE_LIBRARY= RUNTIME_CONTRACT_TRACE_SHA256= \
         B_TIMING_ROUNDS=7 B_TIMING_REPEATS=10 B_TIMING_WARMUPS=3 \
         OUTPUT_B_PRODUCTION103_CALLS=1024 OUTPUT_B_PRODUCTION103_BATCH=10 \
@@ -60,6 +61,11 @@ run_case() {
         [[ $mock_name != memcheck-error ]] || diagnostic_status=99
         [[ $mock_name != timeout ]] || diagnostic_status=124
         grep -Fxq "diagnostic_exit_status=$diagnostic_status" "$case_dir/output/run-status.txt"
+    elif [[ $name == ns-integrated-preflight ]]; then
+        [[ -s $case_dir/output.tar.gz ]]
+        grep -Fxq 'nsys-preflight-no-launch' "$case_dir/trace"
+        grep -Fxq 'last_phase=nsys-preflight-complete' "$case_dir/output/run-status.txt"
+        grep -Fxq 'diagnostic_exit_status=0' "$case_dir/output/run-status.txt"
     elif [[ $mock_name == preflight ]]; then
         [[ -s $case_dir/output.tar.gz ]]
         grep -Fxq 'diagnostic_exit_status=2' "$case_dir/output/run-status.txt"
@@ -176,4 +182,20 @@ run_case trace-without-library 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 
     RUNTIME_CONTRACT_TRACE_SHA256="$trace_hash"
 run_case trace-bad-hash 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
     RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so RUNTIME_CONTRACT_TRACE_SHA256=invalid
-printf 'All 82 CPU-only runner cases passed. No GPU validation performed.\n'
+run_case capture-nsys-clean 0 1 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    NSYS_CAPTURE=1 NSYS_QUALIFICATION_ARCHIVE=/mock/qualified.tar.gz
+grep -Fxq 'execution_mode=instrumented-nsys-frozen-gpu1' "$test_dir/capture-nsys-clean/output/manifest.txt"
+grep -Fxq 'nsys-capture-option' "$test_dir/capture-nsys-clean/trace"
+run_case nsys-without-capture 1 0 0 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    NSYS_CAPTURE=1 NSYS_QUALIFICATION_ARCHIVE=/mock/qualified.tar.gz
+run_case nsys-without-receipt 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 NSYS_CAPTURE=1
+run_case nsys-mixed-trace 1 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    NSYS_CAPTURE=1 NSYS_QUALIFICATION_ARCHIVE=/mock/qualified.tar.gz \
+    RUNTIME_CONTRACT_TRACE_LIBRARY=/mock/tracer.so RUNTIME_CONTRACT_TRACE_SHA256="$trace_hash"
+run_case nsys-orphan-receipt 1 0 0 NSYS_QUALIFICATION_ARCHIVE=/mock/qualified.tar.gz
+run_case nsys-bad-flag 1 0 0 NSYS_CAPTURE=2
+run_case ns-integrated-preflight 0 0 0 CAPTURE_FAILURE_CONTEXT=1 SANITIZER_ONLY=0 RUN_SANITIZER=0 \
+    NSYS_CAPTURE=1 NSYS_PREFLIGHT_ONLY=1 NSYS_QUALIFICATION_ARCHIVE=/mock/qualified.tar.gz
+run_case nsys-preflight-orphan 1 0 0 NSYS_PREFLIGHT_ONLY=1
+run_case nsys-preflight-bad-flag 1 0 0 NSYS_PREFLIGHT_ONLY=2
+printf 'All 91 CPU-only runner cases passed. No GPU validation performed.\n'
